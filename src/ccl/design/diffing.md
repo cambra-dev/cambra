@@ -13,6 +13,32 @@ work will consume, not a pipeline pass.
 
 ---
 
+## Diffing at a glance
+
+Two compiled trees in, a classified node correspondence out, in four steps.
+
+1. **Hash every subterm by content, modulo α** (`content_hash`). A variable free
+   in the subterm is identified by its spelling, so a subterm hashes the same
+   wherever it sits and in whichever program.
+2. **Match the two trees on those hashes**, GumTree-style: anchor equal-hash
+   subtrees largest-first, anchor the two roots to each other, recover the
+   containers above an anchor by how much of it they hold, then close the
+   remaining gaps inside a paired container with tree edit distance.
+3. **Re-hash every matched node against the correspondence.** `resolved_hash`
+   identifies a free variable by which binder it resolves to, so a binding
+   renamed between versions is invisible; `payload_hash` takes the node's own
+   content alone, which separates "this node changed" from "something under it
+   did".
+4. **Classify** each correspondence on two axes, content and placement, and
+   reduce the result to `divergences()` — where the two programs disagree — and
+   `shared_roots()` — what they can compute once.
+
+The order is fixed: step 2 has no correspondence to resolve names through, and
+step 3 exists only because step 2 produced one. Matching never consults a
+classification.
+
+---
+
 ## Why the diff is semantic, not operational
 
 Standard deployment treats a new version as opaque: old code stops, new code
@@ -26,11 +52,17 @@ That buys three things:
 
 - **Sharing.** Unchanged parts of the computation have the same inputs and the
   same code, so they can be one execution and one storage entry.
-- **Retroactive change.** A branch point in the past is expressible in the same
-  framework as one in the future; both are statements about which version's
-  denotation applies at which commit timestamps.
-- **Branching as the user story.** v1 and v2 are sibling branches of a shared
-  history: old clients stay on v1, new clients move to v2, v1 eventually drains.
+- **A version's extent is a predicate over commit positions**, and the predicate
+  is not required to start at the present one. Applying v2 from a commit
+  timestamp already in the past is the same statement as applying it from a
+  future one, so a correction to history and a forward deployment are one
+  mechanism.
+- **Two versions run at once**, over overlapping ranges of the commit domain:
+  clients holding v1 keep being answered by v1 while new clients are answered by
+  v2, until nothing selects v1 any more. There is no branch *structure* — no
+  parent version, no ordering between v1 and v2 beyond the predicates each one
+  carries — so which version was written first says nothing about which applies
+  where.
 
 ---
 
@@ -46,9 +78,10 @@ the subterm and (b) the identity of variables *free* in it.
 
 Two independently compiled programs do not share their binders' identities.
 Before uniquification a source binder is a `Name::Raw` spelling, so the same
-source binder yields the same name in both versions — but after uniquification
-every binder carries a globally fresh `uid`, and identical code compares
-unequal. A hash meant to recognize "the same computation" across versions
+source binder yields the same name in both versions. After uniquification every
+binder carries a globally fresh **`uid`**, allocated in traversal order, so the
+same source binder gets a different one in each compilation and identical code
+compares unequal. A hash meant to recognize "the same computation" across versions
 therefore cannot hash a bound variable by its name at all. It hashes it
 positionally:
 
@@ -60,16 +93,33 @@ positionally:
 Lexical shadowing then falls out for free: a name resolves against the innermost
 enclosing binder, which is the one a reader would pick.
 
-The free-variable rule is crude: two distinct binders that share a spelling
-compare equal. It is isolated in one function (`hash_free_var`) so a finer
-cross-version binder correspondence can replace it without touching anything
-else.
+Under this rule a rename is a change: `x = 1; x + 2` → `y = 1; y + 2` hashes
+every mention of the binding differently, even though the two programs denote
+the same thing. That is correct for the matcher, which is looking for a
+subterm's twin and has no correspondence to consult, and wrong for the
+classifier, which does — hence the second hash below. Reordering two independent
+bindings is a separate problem, in the representation rather than the hash; see
+[Open threads](#open-threads).
 
-### Two hashes, two questions
+The free-variable rule is also crude in the other direction: two distinct
+binders that share a spelling compare equal. It is isolated in one function
+(`hash_free_var`) so a finer cross-version binder correspondence can replace it
+without touching anything else.
 
-The free-variable rule is the one place the hash's meaning is a choice rather
-than a consequence of the term, and two different questions want two different
-answers.
+### Three hashes, three questions
+
+Three questions come up, and each wants a different answer to "what is this
+node's identity". Everything else about the fold — the traversal, the De Bruijn
+treatment of bound variables, the type-awareness, the order-insensitivity — is
+shared, so the table below is the whole difference between them.
+
+| | `content_hash` | `resolved_hash` | `payload_hash` |
+| --- | --- | --- | --- |
+| Question | where else does this subterm appear? | is this the same computation? | did *this node* change? |
+| Used by | matching (phases 1–4) | classification (phase 5) | classification (phase 5) |
+| A **free variable** identified by | its spelling (`Name::base`) | the binder it resolves to | the binder it resolves to |
+| The node's **children** | fold in | fold in | left out |
+| Needs a correspondence | no | yes | yes |
 
 **Matching** asks *where else does this subterm appear?* — of two programs that
 do not share binder identities. That needs a **context-free** answer, so a
@@ -78,45 +128,63 @@ subterm hashes the same wherever it sits: free variables go by **spelling**
 
 **Classification** asks *is this the same computation?* — of two nodes already
 known to correspond. Spelling is both too strict and too loose for that. Too
-strict: renaming a binding is a denotational no-op, but every subterm mentioning
-it hashes differently, so `x = 1; x + 2` → `y = 1; y + 2` reports every mention
-changed even though the two roots hash equal. Too loose: two same-spelled
-variables bound to different things hash the same, so the hash has to be taken
-over the subterm together with its resolved bindings rather than over its AST
-text alone.
+strict: a rename hashes every mention differently, as above. Too loose: two
+same-spelled variables bound to different things hash the same, so the hash has
+to be taken over the subterm together with its resolved bindings rather than
+over its AST text alone.
 
 So classification uses `resolved_hash`, which identifies a free variable by
-**which binder it resolves to**, taken up to the correspondence: each binder
-carries a *class* token shared by its counterpart in the other program, and a
-free variable hashes to its binder's class. A renamed binding is then invisible,
-and a same-spelled binding of something else is not confused with it. This
-presupposes a correspondence, which is why it classifies a matching rather than
-producing one.
+**which binder it resolves to**, taken up to the correspondence. Each binder
+carries a **class**: a 64-bit token that a binder and its counterpart in the
+other program share, minted from the correspondence itself (a src binder's class
+is the index of the dst node its owner matched; an unmatched binder gets a token
+outside dst's index range, so it can never look like a match). A free variable
+hashes to the class of the binder it resolves to. A renamed binding is then
+invisible, and a same-spelled binding of something else is not confused with it.
+A node introducing several binders at once — a `LetRec` group — gives each its
+own class, keyed by position within the group, since they are distinct binders.
 
-*What this is not.* Threading the binder chain from the root and using raw De
-Bruijn indices throughout looks equivalent and is not: inserting a binder
-*above* a subterm shifts the index of every reference that reaches past it, so
-adding one statement would report the entire tail below it as changed.
+**Localizing** asks *did this node change, or only something under it?* — of a
+node already known to differ. `payload_hash` answers it by folding the node's
+own content and stopping there: its discriminant, its payload (a literal's
+value, an operator, a variant tag, a binder's annotation, a record's labels),
+and the classes its variable occurrences resolve to. Children are left out,
+which is the point. So is the node's inferred `ty`, which is computed from the
+payload and the children — folding it would report `let a = 1` → `let a = 2` at
+the `Let` as well as at the literal, since the `Let`'s type is the literal's
+singleton.
+
+*What binder classes are not.* Threading the binder chain from the root and
+using raw De Bruijn indices throughout looks equivalent and is not: inserting a
+binder *above* a subterm shifts the index of every reference that reaches past
+it, so adding one statement would report the entire tail below it as changed.
 Binder classes are stable under that, because they name the binder rather than
 the distance to it.
 
-*Direction of error.* Where the matching itself is suboptimal, resolved hashing
-reports change rather than sharing. Reordering two independent bindings, for
-instance, pairs the spine positionally, so the bindings genuinely do differ
-under the correspondence produced and the uses read as changed. That is the safe
-direction: over-reporting change costs a sharing opportunity, under-reporting it
-would make an unsound share.
+#### Direction of error
+
+Where the matching itself is suboptimal, resolved hashing reports change rather
+than sharing. Reordering two independent bindings, for instance, pairs the `let`
+**spine** — the chain of nested `Let` nodes a run of statements lowers to —
+positionally, so the bindings genuinely do differ under the correspondence
+produced and the uses read as changed. That is the safe direction:
+over-reporting change costs a sharing opportunity, under-reporting it makes an
+unsound share.
 
 ### Standalone hashing is the matcher's precondition
 
-Every subterm is hashed *standalone*: free variables are resolved against the
+Every node of the tree gets a hash, and each one is computed over that node's
+whole subterm: a node's hash folds its children's, so the root's hash covers the
+program. `hash_all` walks the tree once and returns the map.
+
+Each of those hashes is *standalone*: free variables are resolved against the
 empty environment, so a variable bound above the subterm counts as free. This is
 what lets a subterm match its twin in the other program regardless of how deeply
 each one sits — which is exactly what the top-down matcher needs.
 
 The cost is `O(𝑛 · depth)`, since each subterm's hash is recomputed with a fresh
 binder environment. That is comfortable for real programs even with their deep
-`let`-spine; the asymptotically tight scheme (Maziarz et al., *Hashing Modulo
+`let` spine; the asymptotically tight scheme (Maziarz et al., *Hashing Modulo
 Alpha-Equivalence*, PLDI 2021 — `O(𝑛 log²𝑛)`) slots in behind the same interface
 if a program ever grows large enough to feel it.
 
@@ -125,10 +193,21 @@ if a program ever grows large enough to feel it.
 A node's inferred type, its user annotation, its binders' types, and a `Cast`'s
 target all participate. Two terms differing only in a type are not the same
 computation — a change from `{Int | __elem >= 18}` to `{Int | __elem >= 21}` is
-a change to the program even though the term structure is untouched. Types are
-hashed with the same uid-robust discipline: refinement predicates (which are
-*terms* living in type positions) go back through the term hasher, `Fun`
-Pi-binder names are ignored, and a `ChanDom`'s channel name folds by spelling.
+a change to the program even though the term structure is untouched.
+
+This section describes `content_hash` and `resolved_hash`, which agree on all of
+it. `payload_hash` keeps the user annotation and drops the rest: a node's `ty`
+and a binder's `ty` because both are computed from the payload and the children,
+and a `Cast`'s target because the differ reaches that target's refinement
+predicate as a *child* of the cast — the one place `diff`'s child enumeration
+departs from `TypedExpr::walk_children` — so folding it here too would report one
+threshold edit at the literal and again at the cast above it.
+
+Types are hashed with the same **uid-robust** discipline as terms: no identity
+that varies between two compilations of one source reaches the hash. Refinement
+predicates (which are *terms* living in type positions) go back through the term
+hasher, `Fun` Pi-binder names are ignored, and a `ChanDom`'s channel name
+contributes its spelling rather than its `Name`.
 
 A `Fun`'s `FunKind` participates. `A ⇒ B` and `A ⤇ B` are different
 computations — a data function's domain is its data, which is what drives
@@ -142,13 +221,13 @@ and a resolved tree contains no `Infer`, so collapsing unresolved structure to
 one value is a safe fallback rather than a determinism hazard — the diff never
 runs mid-inference.
 
-### A rendered name is a hash the seam cannot reach
+### A name rendered into a string is past the point uid-robustness applies
 
-Uid-robustness lives in exactly one place: a free variable is identified by
-`Name::base()`, never by its `uid`. That holds as long as a name is a `Name`.
-Once a pass renders one into a `String`, the hash sees an ordinary string and
-the seam no longer applies — nothing downstream can tell a run-varying identity
-from a user-written one.
+Uid-robustness is enforced in exactly one place: a free variable is identified by
+`Name::base()`, never by its `uid`. That works only while the name is still a
+`Name`. Once a pass renders one into a `String` — a record label, a key — the
+hash sees an ordinary string, and nothing downstream can tell a run-varying
+identity from a user-written one.
 
 Loop planning is where this bites. The mutable variable record a `Transact`
 denotes is typed with `Name::field_key()` labels, and folding the binder uid in
@@ -160,14 +239,17 @@ unusable.
 The label has no need of a uid. It must be distinct only among the keys of one
 mutable variable record: every consumer resolves it against a `keys_map` built
 per `Transact` node, so accumulators in sibling loops live in different records
-and cannot collide. `field_key` is therefore the plain spelling, and that
-distinctness holds by construction — a key is either the user's own variable
-name, distinct within its block, or a label planning mints indexed by position
-(`acc0`, `acc1`).
+and cannot collide. `field_key` is therefore the plain spelling. That leaves the
+distinctness as a property of spellings rather than of construction — a key is
+the user's own variable name, distinct within its block; a label planning mints
+indexed by position (`acc0`, `acc1`); or a writer's reply tap (`to_<base>_<n>`),
+which shares the record with both — so each site that builds a record from these
+labels asserts it in debug (`register_record` in `planning/loops.rs`, the two
+`keys_map` inserts in `interpreter/operator_conversion.rs`).
 
 The general rule this leaves: **a name rendered into a string is an identity the
-hash cannot normalize**, so a pass that needs a label should derive it from
-something already stable, and state where its uniqueness is enforced.
+hash cannot normalize**, so a pass that needs a label derives it from something
+already stable and states where its uniqueness is enforced.
 
 ### Order-insensitivity where the language is
 
@@ -187,14 +269,15 @@ separates the two operations).
 ### Scoping comes from one place
 
 `hash_rel` extends the binder environment over exactly the scoped children, and
-which children those are is not decided in `content_hash.rs`. It folds over
+which children those are is not decided in `content_hash.rs`. It reads them from
 [`ccl/scope.rs`](../scope.rs)'s `for_each_scoped_item`, the crate's single
 statement of CCL's binding structure, which the free-variable walkers
 (`ccl_utils`'s `count_free` / `count_free_in_value`, `subst`'s `collect_expr_fv`)
-and capture-avoiding substitution (`Subst::rewrite_expr`) fold over too. The
-sharing matters most for the hash: a divergence would be a **correctness bug**,
-not a style question, because the hash would stop agreeing with α-equivalence
-and the differ would silently report identical programs as different.
+and capture-avoiding substitution (`Subst::rewrite_expr`) read from too. A
+divergence between the hash's idea of the binding structure and the language's
+would be a **correctness bug** rather than a style question: the hash would stop
+agreeing with α-equivalence, and the differ would report identical programs as
+different.
 
 `content_hash.rs` keeps the two things that are not scoping — a node's
 non-child payload (`hash_payload`, exhaustive so a new variant's payload must be
@@ -209,11 +292,19 @@ which is a property of their algebra.
 a GumTree-style matcher (Falleri et al., *Fine-grained and accurate source code
 differencing*, ASE 2014) run over the content hash, in five phases.
 
+Two words recur below and mean different things. A **subtree** is a node
+together with everything under it. A **container** is a node considered as the
+thing that holds other nodes — the word is used where the point is what a node
+contains rather than what it is, and every container is the root of a subtree.
+
 **1. Top-down anchoring.** Map the largest subtrees whose content hash is equal.
-Equal hash means isomorphic modulo α, so the whole subtree is shared and its
-descendants are mapped along with it (paired by hash, not position, so the
-order-insensitive nodes come out right). Tallest-first, so a big anchor claims
-its descendants before anything inside it is considered separately.
+Equal hash means isomorphic modulo α, so a single hash comparison at the root
+settles the whole subtree: the two are the same computation node for node, and
+the matcher maps the descendants along with it in one pass without comparing
+them again. Within that pass, corresponding descendants are found by pairing
+equal hashes rather than by position, so an order-insensitive node's children
+come out right. Tallest-first, so a big anchor claims its descendants before
+anything inside it is considered separately.
 
 *Duplicate resolution.* Small subtrees always repeat — `0`, `true`, `x`. Every
 equal-hash pairing is an equally valid "shared" classification, but not an
@@ -236,7 +327,7 @@ so two genuinely unrelated programs still correspond nowhere.
 **3. Bottom-up container recovery.** An interior node left unmatched is paired
 with the best same-kind candidate in the other tree that *contains* enough of
 its already-matched descendants, processed children-before-parents. This is what
-keeps an inserted statement from desynchronizing the whole `let`-spine below it:
+keeps an inserted statement from desynchronizing the whole `let` spine below it:
 the unchanged tail anchors in phase 1, and the containers above it are recovered
 here instead of being reported as wholesale rewrites.
 
@@ -257,35 +348,50 @@ innermost, the container that fits tightest.
 whole-subtree equality and by container similarity; neither can pair two
 subtrees that are nearly identical but differ somewhere inside. That gap is what
 makes a one-token edit read as a delete plus an insert. This phase closes it: as
-each container pair is established, compute the minimum-cost edit mapping between the
-two subtrees and adopt every pair it aligns whose nodes are same-kind and still
-unmatched. Node labels are content hashes, so relabelling is free when the
-hashes agree and costs one otherwise. Pairs from phases 2 and 3 are the only
-ones that need this — a phase-1 pair is isomorphic by construction, so there is
-nothing left unmatched beneath it.
+each container pair is established, compute the **tree** edit distance between
+the two subtrees — Zhang–Shasha, the tree analogue of Levenshtein, over trees
+rather than strings — and adopt every pair its minimum-cost script aligns whose
+nodes are same-kind and still unmatched. The **label** the distance compares at
+each node is that node's content hash, so relabelling is free when the hashes
+agree and costs one otherwise, alongside unit costs for deleting and inserting a
+node. Pairs from phases 2 and 3 are the only ones that need this — a phase-1
+pair is isomorphic by construction, so there is nothing left unmatched beneath
+it.
 
-The mapping is optimal under unit edit costs, computed with the Zhang–Shasha
-dynamic program. GumTree reaches for RTED, which computes the same optimal
-mapping faster by choosing a better decomposition strategy — the difference is
-asymptotic cost, not the result. Pairs above a size ceiling (100 nodes,
-GumTree's default) are skipped, since tree edit distance is `O(𝑛²𝑚²)` in the
-worst case; those keep only what phases 1–3 found.
+GumTree reaches for RTED, which computes the same optimal mapping faster by
+choosing a better decomposition strategy — the difference is asymptotic cost,
+not the result. Recovery declines when either subtree holds more than 100 nodes
+(GumTree's default), since tree edit distance is `O(𝑛²𝑚²)` in the worst case;
+those pairs keep only what phases 1–3 found, and their still-unmatched interiors
+are reported as deleted and new rather than aligned.
 
 **5. Classification along two axes.** Every correspondence is labelled with
 whether its **content** changed and whether its **placement** did. These are
 independent: a node can keep its content and move, or stay put and change.
 
-- *Content* is just hash equality: `Same` (identical computation, reusable
-  wholesale) or `Changed` (the same place in both programs with different
-  content — the divergence lives in the children).
-- *Placement* is the child-alignment step from Chawathe et al.'s edit-script
-  derivation, which GumTree inherits. A node is `InPlace` iff it hangs off the
-  corresponding parent and did not cross any of its matched siblings. Within
-  one matched container pair, "did not cross" is decided by taking a longest
-  increasing subsequence of the matched children's destination slots: the
-  children on it kept their relative order, and the rest are the minimum set of
-  moves that explains the permutation. Order-insensitive containers skip the
-  test entirely.
+*Content* compares two hashes, giving three outcomes:
+
+| `resolved_hash` | `payload_hash` | | |
+| --- | --- | --- | --- |
+| equal | equal | `Same` | identical computation, reusable wholesale |
+| differs | equal | `ChangedBelow` | the node's own content is intact; what differs is under it |
+| differs | differs | `Changed` | the node itself differs, whatever its children did |
+
+*Placement* is the child-alignment step from Chawathe et al.'s edit-script
+derivation, which GumTree inherits. A node is `InPlace` iff it hangs off the
+corresponding parent and kept its order relative to its matched siblings.
+Order-insensitive containers skip the test.
+
+Ordering is decided per matched container pair. Number the container's matched
+children by where their counterparts sit under the corresponding container in
+the other tree — a child's **destination position**. Taking the children in
+source order gives a sequence of destination positions, and a *longest
+increasing subsequence* of it is the largest set of children whose relative
+order both versions agree on. Those are `InPlace`; every child left off it is
+`Moved`, and the set left off is minimal, so the classification names the fewest
+moves that account for the permutation. Two children **cross** when one precedes
+the other in the source container and follows it in the destination; a
+crossing is what forces at least one of the pair off the subsequence.
 
 A source-only node is **deleted**; a target-only node is **new**. A relocated
 subtree is reported as moved once, at its root — its descendants stay in place
@@ -293,29 +399,42 @@ relative to it.
 
 ### The actionable form: divergences and shared roots
 
-The classification is complete but not minimal. Every *ancestor* of an edit has
-changed content, and every *descendant* of an inserted subtree is itself new —
-one literal edited at the bottom of a forty-binding spine leaves forty-two
-changed nodes, of which exactly one is the edit. A consumer that read `matched`
-directly would have to re-derive the interesting set every time, so the differ
-derives it once.
+The classification is complete but says the same thing many times. `Diff::matched`
+holds every node correspondence and `deleted` / `new` hold the unmatched nodes of each side, so
+every *ancestor* of an edit is in `matched` with changed content and every
+*descendant* of an inserted subtree is in `new` — one literal edited at the
+bottom of a forty-binding spine leaves forty-two changed correspondences, of
+which exactly one is the edit. A consumer reading `matched` directly would have
+to re-derive the interesting set every time, so the differ derives it once.
 
-**`divergences()`** is the minimal set of places the two programs disagree, at
-the granularity a version guard is placed. No divergence contains another,
-so the set partitions the disagreement: everything not under one corresponds.
-Three kinds —
+**`divergences()`** is the set of places the two programs disagree, at the
+granularity a version guard is placed. Three kinds —
 
-- *Changed* — both programs have a node here, its content differs, and nothing
-  below it differs. A changed node with a changed descendant is not a site: the
-  deeper node is the better explanation. Insertions and deletions do not
-  suppress it: a node whose own payload changed and which gained a child has
-  two separate things to say.
+- *Changed* — both programs have a node here and it is the node that changed.
+  Reported when the node's own content differs (`Content::Changed`), and also
+  when only its subtree differs (`Content::ChangedBelow`) and nothing under it
+  was reported — a reordering of unchanged children, or a type resolved from
+  outside the subtree, has nowhere deeper to point.
 - *Inserted* — the root of a subtree the new program has and the old does not.
   Reported where the new region begins, not once per node in it. The walk
   continues underneath: a matched node can sit inside a new region — a new
   expression wrapping content that survived — and what diverges under it still
   counts.
 - *Deleted* — the mirror image, at the root of what the old program had.
+
+Those two rules cut the set in each direction, and neither is a minimality
+theorem: the result is small on the shapes the tests measure, not provably
+smallest. A node whose own content is intact is not reported beside the child
+that explains it, so a container that only gained a statement yields one site,
+the insertion, rather than two. A node whose own content changed is reported
+even when a child changed too, so a record that relabelled one field and edited
+another yields both. Suppressing the second would be the unsound direction: a
+real change left with no site, hidden behind the one below it.
+
+Each kind is reported at its own root, so no two divergences of the same kind
+nest. Across kinds they can: a `Changed` may sit inside an `Inserted` or a
+`Deleted`, because the walk descends under a new region to find what survived
+inside it. A consumer placing one guard per divergence gets nested guards there.
 
 **`shared_roots()`** is the other side: every node whose content is unchanged
 and whose parent's is not — the largest subtrees the two versions have in
@@ -326,14 +445,26 @@ Reuse here means *the term is the same term*, which is what a unified tree
 needs. It does not mean the term evaluates to the same value in both versions:
 `let x = 1 in x` and `let x = 2 in x` share the body `x`, and that is right —
 the two `let`s are the divergence, and it is the binding that differs, not the
-read. Value-level sharing is the key-level storage question, decided at
-runtime, not a property of the tree.
+read. Whether the two versions' *values* can share one storage entry is decided
+per store key at runtime, by comparing what each version wrote; nothing in the
+tree answers it. See
+[The next analysis: divergence reachability](#the-next-analysis-divergence-reachability).
 
 ### Reading a diff
 
-A [`Diff`](../diff.rs) renders itself: it prints as an annotated tree of the
-**new** program, followed by whatever the old program had that the new one
-dropped.
+A [`Diff`](../diff.rs) renders itself as an annotated tree of the **new**
+program, followed by whatever the old program had that the new one dropped.
+
+Take these two versions:
+
+```
+# v1                      # v2
+a = 1                     a = 1
+a                         b = sum([i * 2 for i in [1,2,3]])
+                          a + b
+```
+
+Diffed at the lowered stage they render as:
 
 ```text
 2 shared · 1 changed · 1 moved · 0 deleted · 16 new
@@ -347,52 +478,84 @@ dropped.
       + b
 ```
 
-Markers are `=` unchanged, `~` content changed, `+` new, `-` deleted, and a
-trailing `»` for a node whose placement changed. Two rules keep it readable:
-an unchanged subtree is not descended into (it is unchanged all the way down),
-and a wholly-new or wholly-deleted region collapses to its root with a node
-count. A node that gained or lost only *itself* — a wrapper around content that
-survived — is not collapsed: above, the new `a + b` is shown with the reused
-`a` under it, because claiming that `a` changed would be false.
+Every line is one node of v2's tree, indented by its depth, and the marker in
+the first column says what the diff concluded about it:
 
-Each node is shown by rendering its subterm with `symbolic` and keeping the
-first line, cut to a fixed width. A leaf prints exactly; an interior node prints
-its head. That costs `O(𝑛²)` text and is an inspection surface, not a hot path —
-but it means the rendering cannot drift out of step with the AST the way a
-second, shallow node vocabulary would.
+| Marker | Meaning |
+| --- | --- |
+| `=` | matched, content unchanged |
+| `~` | matched, content changed — the node itself, or something under it |
+| `+` | in v2 only |
+| `-` | in v1 only, listed after the tree since it has no place in v2 |
+| `»` | suffix: this node's placement changed |
 
-### Worked example
+A node carries a column marker and, when it moved, the suffix: `= a »` is v1's
+`a` unchanged but relocated, which is what happens when `a` becomes the left
+operand of `a + b`. Only v2's side of a move is shown, because the rendering is
+v2's tree; the node's position in v1 is reached through `Match::src`.
 
-`v = 5` followed by `1 if v > 0 else 2`, with the guard threshold edited to
-`1`, diffed at the lowered stage. The ternary lowers to a guard-based `Case`,
-so both trees contain a literal `1` (the then-branch value) and, in the new
-version, a second literal `1` (the guard threshold):
+The trailing `…` is truncation, not a marker. Each line renders that node's
+subterm with `symbolic` and keeps the first line, cut to a fixed width, so a
+leaf prints exactly and an interior node prints its head — `let a = 1…` is the
+whole `let`, elided after its bound expression. That costs `O(𝑛²)` text and is
+an inspection surface rather than a hot path, but it keeps the rendering from
+drifting out of step with the AST the way a second, shallow node vocabulary
+would.
+
+Two rules keep the tree short. An unchanged subtree is not descended into, since
+it is unchanged all the way down. A wholly-new or wholly-deleted region collapses
+to its root with a node count — `(+12 nodes)` above. A node that appeared or
+vanished *around* content that survived does not collapse: the new `a + b` is
+shown with the reused `a` under it, because claiming `a` changed would be false.
+
+### Worked example: one literal, and the duplicates around it
+
+`1 if v > 0 else 2` with the guard threshold edited to `1`, diffed at the lowered
+stage:
 
 ```
-Changed/InPlace   let v = 5
-Same/InPlace      5      ->  5
-Changed/InPlace   { v > 0 → 1; true → 2 }  ->  { v > 1 → 1; true → 2 }
-Changed/InPlace   v > 0  ->  v > 1
-Same/InPlace      v      ->  v
-Changed/InPlace   0      ->  1
-Same/InPlace      1      ->  1
-Same/InPlace      true   ->  true
-Same/InPlace      2      ->  2
+# v1                      # v2
+v = 5                     v = 5
+1 if v > 0 else 2         1 if v > 1 else 2
 ```
 
-Nothing deleted, nothing new, nothing moved: one literal changed and the
-containers above it are marked as the places that changed with it. Both of the
-gap-closing phases are load-bearing here — duplicate resolution keeps the
+The ternary lowers to a guard-based `Case`, so v1 already contains a literal `1`
+as the then-branch value, and v2 contains a second one as the guard threshold.
+
+| v1 | | v2 | Content / Placement |
+| --- | --- | --- | --- |
+| `let v = 5` | ~ | `let v = 5` | `ChangedBelow` / `InPlace` |
+| `5` | = | `5` | `Same` / `InPlace` |
+| `{ v > 0 → 1; true → 2 }` | ~ | `{ v > 1 → 1; true → 2 }` | `ChangedBelow` / `InPlace` |
+| `v > 0` | ~ | `v > 1` | `ChangedBelow` / `InPlace` |
+| `v` | = | `v` | `Same` / `InPlace` |
+| `0` | ~ | `1` | `Changed` / `InPlace` |
+| `1` | = | `1` | `Same` / `InPlace` |
+| `true` | = | `true` | `Same` / `InPlace` |
+| `2` | = | `2` | `Same` / `InPlace` |
+
+Nothing deleted, nothing new, nothing moved. One node is `Changed` — the
+literal — and `divergences()` reports that one; the three `ChangedBelow`
+containers above it are reflecting it, not adding to it.
+
+Both gap-closing phases are load-bearing here. Duplicate resolution keeps the
 branch-body `1` matched to the branch-body `1` rather than to the new guard
-threshold, and optimal recovery pairs `0` with `1` instead of reporting a
-delete and an insert.
+threshold, and optimal recovery pairs `0` with `1` instead of reporting a delete
+and an insert.
 
 ---
 
 ## Which stage to diff
 
 `compile_to(code, stage)` compiles to a nominated pipeline stage and hands back
-the tree. Every stage runs through one `diff` core — nothing in the matcher is
+the tree. It runs `run_frontend`, the same function `compile_program` runs, with
+a stop stage instead of a continuation into operator conversion — so the tree a
+diff is taken over is the tree the real pipeline produces, and a program
+`compile_program` refuses yields no stage snapshot.
+`both_entry_points_compile_to_one_tree` pins that at `Planned` using this
+differ.
+
+Every stage runs through one `diff` core — nothing in the matcher is
 stage-specific, because the content hash is uid-robust and type-aware, which is
 exactly what one core needs to handle all of them.
 
@@ -419,8 +582,24 @@ diff at those stages reports the compiler's shape rather than the user's.
 
 ## How much to normalize
 
-Two programs can be the same computation written differently. The more of that
-the diff sees through, the more the two versions share — and the less
+Two questions want two different stages, and neither one dominates.
+
+**What runs together** is a question about the operator graph, so it is asked at
+`Planned` — the shape operator conversion consumes, and therefore the only stage
+where a claim about sharing compute is a claim about what executes. Anything a
+version guard or a shared store is derived from is read there.
+
+**Which source edit is this** is a question about the program the user wrote, so
+it is asked at the earliest stage that can see the edit at all. Every pass
+between the two rewrites the user's shape, and a rewrite spreads one edit over
+more of the tree: at `Planned` a comprehension's threshold change is four sites
+rather than one, and an accumulator's body change carries fourteen new nodes
+rather than two. Those extra sites are the same edit, reported once per place
+the compiler copied it to, which is signal about the graph and noise about the
+source.
+
+Two programs can also be the same computation written differently. The more of
+that the diff sees through, the more the two versions share — and the less
 localized the answer becomes when they genuinely differ. Choosing a stage is
 choosing where on that curve to sit; the compiler's own passes do the work, so
 there is no separate rewriting system to keep honest.
@@ -428,17 +607,18 @@ there is no separate rewriting system to keep honest.
 Divergences reported, measured on the refactors that occur. The counts are
 measurements rather than invariants: `inlining_erases_function_boundaries` and
 `inlining_costs_locality_in_a_shared_helper` pin the direction of each contrast,
-not the numbers.
+not the numbers. Each row names the pair it was measured on, so the numbers can
+be reproduced and a drift in them is visible.
 
-| Edit | `Inferred` | `Inlined` |
-| --- | --- | --- |
-| rename a binding | 0 | 0 |
-| extract a subexpression into a `def` | 6 | **0** |
-| edit a body inside a `def` called once | 1 | 1 |
-| edit a body inside a `def` called **twice**, one specialization | 1 | **2** |
-| edit a body inside a `def` called **twice**, two specializations | **2** | 4 |
-| reorder two independent bindings | 2 | 2 |
-| extract a subexpression into a `let` | 5 | 5 |
+| Edit | Measured on | `Inferred` | `Inlined` |
+| --- | --- | --- | --- |
+| rename a binding | `x = 1; y = x + 2; y` → `q = 1; y = q + 2; y` | 0 | 0 |
+| extract a subexpression into a `def` | `a = 1; (a + 2) * 3` → the same via `def g(y): y + 2` | 5 | **0** |
+| edit a body inside a `def` called once | `y + 2` → `y + 5`, one call site | 1 | 1 |
+| edit a body inside a `def` called **twice**, one specialization | the same edit, called at `a = 1 + 1` and `b = 2 + 2` | 1 | **2** |
+| edit a body inside a `def` called **twice**, two specializations | the same edit, called at `g(1)` and `g(2)` | **2** | 3 |
+| reorder two independent bindings | `a = 1; b = 2; a + b` → `b = 2; a = 1; a + b` | 2 | 2 |
+| extract a subexpression into a `let` | `(a + 2) * (a + 2)` → `t = a + 2; t * t` | 6 | 6 |
 
 Inlining is a trade, not an improvement: it makes moving code across a function
 boundary invisible, and in exchange reports an edit inside a shared helper once
@@ -461,7 +641,7 @@ polarity-complete and therefore sees an argument's *lower-bound* refinements. A
 literal argument carries its singleton, so `g(1)` and `g(2)` key apart and split
 the helper; `g(a)` and `g(b)` for two computed `Int`s key together and do not.
 Inlining then costs one further duplication per call site on top of whatever
-monomorphization already did — 1 → 2 in the shared row, 2 → 4 in the split one.
+monomorphization already did — 1 → 2 in the shared row, 2 → 3 in the split one.
 
 `Inferred` is therefore the earliest stage this differ offers, not a stage that
 has normalized nothing: the curve starts before its column.
@@ -469,18 +649,38 @@ has normalized nothing: the curve starts before its column.
 Below `Inlined` the trade continues — every pass that rewrites the user's shape
 spreads one edit over more of the tree. No test pins these counts either:
 
-| Edit | `Inlined` | `Channelized` | `LambdaElim` | `Planned` |
-| --- | --- | --- | --- | --- |
-| a literal | 1 | 1 | 1 | 1 |
-| a comprehension's filter threshold | 1 | 1 | 2 | 4 |
-| an accumulator loop's body | 2 (2 new) | 2 (2 new) | 2 (**14 new**) | 2 (14 new) |
-| a transactional register's write | 2 (2 new) | 2 (2 new) | 3 (8 new) | 3 (8 new) |
+| Edit | Measured on | `Inlined` | `Channelized` | `LambdaElim` | `Planned` |
+| --- | --- | --- | --- | --- | --- |
+| a literal | `a = 1; b = 2; a + b` → `b = 3` | 2 | 2 | 3 | 3 |
+| a comprehension's filter threshold | `FILTER_AGG` → `FILTER_AGG_21` (`>= 18` → `>= 21`) | 1 | 1 | 2 | **10** |
+| an accumulator loop's body | `ACCUM` → `acc + i * 2` | 1 (2 new) | 1 (2 new) | 1 (**14 new**) | 1 (14 new) |
+| a transactional register's write | `TXN` → `pool - r - 1` | 1 (2 new) | 1 (2 new) | 2 (8 new) | 2 (8 new) |
 
-So the default is the earliest stage that answers the question. The reason to
-reach past `Inlined` is not a better diff of the source — it is that `Planned`
-is the shape operator conversion consumes, so it is where a claim about *sharing
-compute* is actually a claim about the graph that runs. Diffing there answers a
-different question, not the same question better.
+Two of those columns need reading carefully.
+
+**A literal edit is two sites, not one, from `Inferred` down.** A literal's type
+is its singleton (`Int@2`), and that singleton rides the type of every *read* of
+the binding, so editing `b = 2` to `b = 3` changes the literal and every `b`
+that mentions it. Both are real: a consumer sharing the read would be sharing a
+value that differs.
+
+**The `Planned` cell for the filter threshold is 10 because a term inside a type
+is reported wherever that type is mentioned.** A comprehension filter lowers to
+a refinement predicate, which is a term living in a type. The differ gives that
+term one home — the `Cast` whose target holds it, reached as a child — but by
+`Planned` the same predicate rides the type of every operator the refined domain
+flows through: `sum`, `restrict`, and a `zip`/`const`/`ge` triple per leg. Each
+of those is a leaf, so each is its own site, and the count scales with how far
+the domain travels rather than with the size of the edit. Eight of the ten carry
+the *same* predicate term. Collapsing them is a real option — `Refinement`'s
+predicate is a shared `Rc` by design (`src/ccl/ty.rs`), so the mentions are
+identifiable — and it is not done here. See
+[Open threads](#open-threads).
+
+The rule this leaves: diff at the earliest stage that can see the edit, unless
+the answer is about the graph that runs, in which case diff at `Planned`.
+Reaching past `Inlined` is not a better diff of the source; it is a diff of a
+different object.
 
 ### What is not normalized
 
@@ -550,9 +750,9 @@ and it is what makes a second version cost the diff rather than 2×. Not built.
 
 **Substitution's transport mode still restates the scoping rules.**
 [`ccl/scope.rs`](../scope.rs) now holds them once and every *observing* walk
-folds over it, but `subst`'s `Subst::apply_expr_inner` — the mode that returns a
+reads from it, but `subst`'s `Subst::apply_expr_inner` — the mode that returns a
 rewritten copy rather than mutating in place — cannot: it rebuilds each node,
-and a rebuild is a per-variant `match` by construction. Folding it over the
+and a rebuild is a per-variant `match` by construction. Routing it through the
 shared walk would mean cloning the whole subtree at every binding node (clone
 the node, then overwrite its children), which turns substitution down a `let`
 spine from linear into quadratic in the spine's depth — the one shape Cambra
@@ -560,19 +760,50 @@ programs are reliably deep in. Its arms are guarded only by review; if a binding
 form is ever added, `scope.rs` is the compile error that should prompt a look
 here.
 
+**A term inside a type is reported at every node whose type mentions it.** A
+refinement predicate is a term, and the same predicate `Rc` rides the type of
+every node the refined domain reaches. The differ gives the term one home — the
+`Cast` whose target holds it — but the other mentions are leaves, so each is its
+own divergence, and one threshold edit is ten sites at `Planned` (measured in
+"How much to normalize"). Eight of those ten carry one predicate.
+
+The direction of a fix is available rather than speculative: `Refinement`'s
+predicate is a shared `Rc` by design (`src/ccl/ty.rs`), so a mention is
+identifiable by pointer, and a node whose only change is a predicate already
+reported at its home need not be its own site. What that costs is a
+correspondence between the two versions' predicates — `Rc` identity is
+per-compilation, so the two sides have to be related through the matching, which
+is the same circularity the free-variable seam has. Not attempted.
+
+Separately, the `sum` and `restrict` mentions in that measurement carry *three*
+distinct `Rc`s holding one predicate, where `Refinement::predicate`'s own doc
+comment says a predicate rides many slots as one shared `Rc`. Whether some pass
+rebuilds per occurrence there, or those are legitimately independent mints, is
+unexamined.
+
 **Child enumeration is written out twice.** `diff`'s `child_exprs` mirrors
 `TypedExpr::walk_children` arm for arm, differing only in that it descends into
 a `Cast` target's refinement predicate (a load-bearing term that
 `walk_children` treats as a type child). Both matches are exhaustive, so a new
-node variant is a compile error in both places — the duplication is visible
-rather than silent, which is why it stands.
+node variant is a compile error in both places.
 
-**A `let`-spine encodes an order it does not have.** A run of independent
-bindings is a dependency DAG, but CCL spells it as nested `Let`s, so reordering
-two of them changes the tree shape and the matcher pairs the spine by depth.
-The reads underneath then resolve to non-corresponding binders and report as
-changed — conservative, but noise (two divergences for two reordered bindings).
-**Decided: leave it.**
+The exhaustiveness is not the whole risk, and one defect has already come from
+the other half: nothing checks that a given walk picks the *right* one of the
+two. `subtree_entirely_in` and `size_note` walked `walk_children` while their
+callers walked `child_exprs`, so a deleted `Cast` whose predicate still held a
+matched node tested as wholly deleted. Both now walk `child_exprs`
+(`a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted`), and the
+selection stays a review-time judgment at each call site.
+
+**A `let` spine encodes an order it does not have.** A run of independent
+bindings is a dependency DAG, but CCL spells it as nested `Let`s. Order
+insensitivity does not reach it: that rule is about the *children of one node* —
+a `Record`'s fields, a `DisjointJoin`'s operands — and a run of bindings is not
+one node's children but a chain of nodes, each the body of the one above. So
+reordering two bindings changes the tree's shape rather than a child order, the
+matcher pairs the spine by depth, and the reads underneath resolve to
+non-corresponding binders and report as changed. Conservative, but noise: two
+divergences for two reordered bindings. **Decided: leave it.**
 
 *It is not a matcher-tuning problem.* Three plausible fixes were tried and
 measured, and none moved the reordering case:

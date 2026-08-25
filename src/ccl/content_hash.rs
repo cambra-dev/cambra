@@ -38,7 +38,7 @@
 //! the *innermost* enclosing binder, so a shadowed `Raw` name resolves to the
 //! binder a reader would pick.
 //!
-//! # Two hashes, one traversal
+//! # Three hashes, one traversal
 //!
 //! The free-variable seam ([`FreeVars`]) is the one place the hash's meaning is
 //! a choice, and the two choices answer different questions:
@@ -52,9 +52,15 @@
 //!   computation" actually means, but it presupposes a correspondence, so it is
 //!   for classifying a matching rather than producing one.
 //!
+//! [`payload_hash`] answers a third question over the same traversal: not "is
+//! this the same computation" but "did *this node* change", which a differ needs
+//! to report a disagreement at the node that owns it rather than at every
+//! ancestor. It resolves free variables like [`resolved_hash`] and folds the
+//! node's own content without its children.
+//!
 //! Everything else — the traversal, the De Bruijn treatment of bound variables,
-//! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Two
-//! hashes, two questions".
+//! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Three
+//! hashes, three questions".
 //!
 //! # Stage-agnostic by construction
 //!
@@ -104,7 +110,7 @@ pub fn content_hash(e: &TypedExpr) -> ContentHash {
 
 /// The α-invariant hash of `e` with its free variables resolved **through the
 /// enclosing scope** rather than by spelling — the classification counterpart
-/// to [`content_hash`]. See `src/ccl/design/diffing.md`, "Two hashes, two
+/// to [`content_hash`]. See `src/ccl/design/diffing.md`, "Three hashes, three
 /// questions".
 ///
 /// `scope` lists the binders `e` sits under, innermost last, each paired with a
@@ -114,6 +120,41 @@ pub fn content_hash(e: &TypedExpr) -> ContentHash {
 /// something else is not mistaken for it.
 pub fn resolved_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
     ContentHash(hash_rel(e, &mut Vec::new(), FreeVars::ByBinder(scope)))
+}
+
+/// The α-invariant hash of `e`'s **own** content: everything the node carries
+/// that is neither a child's content nor derived from one.
+///
+/// [`resolved_hash`] answers "is this the same computation", which a change
+/// anywhere below also answers no to. This answers the narrower question a
+/// differ needs to keep its set of disagreement sites minimal: did *this* node
+/// change, or is it only reflecting a change in a child that is already
+/// reported on its own?
+///
+/// Folds the node's discriminant, its payload ([`hash_payload`]: a literal's
+/// value, an operator, a binder's name and annotation, a cast target), the
+/// binders its variable occurrences resolve to, and its `user_annotation`.
+/// `scope` has the same meaning as in [`resolved_hash`].
+///
+/// Two things are deliberately left out. The children's hashes, which is the
+/// point. And the node's inferred `ty`, which is computed from the payload and
+/// the children — folding it would report `let a = 1` → `let a = 2` at the
+/// `Let` as well as at the literal, since the `Let`'s type is the literal's
+/// singleton. A type change with no payload or child change still surfaces:
+/// the *content* hash sees it, at the node whose type it is.
+pub fn payload_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
+    let free = FreeVars::ByBinder(scope);
+    let env = &mut Vec::new();
+    let mut h = DefaultHasher::new();
+    std::mem::discriminant(&e.node).hash(&mut h);
+    hash_payload(e, env, free, Fold::Own, &mut h);
+    for_each_scoped_item(e, &mut |item| match item {
+        ScopedItem::VarRef(name) => hash_name_ref(name, env, free, &mut h),
+        ScopedItem::KeyRef(name) => hash_key_ref(name, &mut h),
+        ScopedItem::Child { .. } => {}
+    });
+    hash_opt_type(e.user_annotation.as_ref(), env, free, &mut h);
+    ContentHash(h.finish())
 }
 
 /// How a variable that is *free* in the subterm being hashed is identified —
@@ -349,14 +390,33 @@ fn hash_opt_type<'a>(
 
 /// Hash a binder's declared type and user annotation. The binder's *name* is
 /// folded into the De Bruijn environment by the caller, not hashed here.
+///
+/// Under [`Fold::Own`] the inferred `ty` is skipped: for a `let` it is the bound
+/// expression's type, so folding it would report `let a = 1` → `let a = 2` at
+/// the `Let` as well as at the literal. The `user_annotation` is authored and
+/// stays either way.
 fn hash_binding<'a>(
     b: &'a TypedBinding,
     env: &mut Vec<&'a Name>,
     free: FreeVars<'_>,
+    fold: Fold,
     state: &mut DefaultHasher,
 ) {
-    hash_type(&b.ty, env, free, state);
+    if fold == Fold::Whole {
+        hash_type(&b.ty, env, free, state);
+    }
     hash_opt_type(b.user_annotation.as_ref(), env, free, state);
+}
+
+/// How much of a node's payload a fold takes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// Everything the node carries — what [`hash_rel`] wants, since the whole
+    /// subtree's identity is the question.
+    Whole,
+    /// Only what is authored at this node and not reachable as one of its
+    /// children or inferred from them — what [`payload_hash`] wants.
+    Own,
 }
 
 /// Hash a register-key *label* occurrence — a [`TypedExprNode::Transact`] key
@@ -389,6 +449,7 @@ fn hash_payload<'a>(
     e: &'a TypedExpr,
     env: &mut Vec<&'a Name>,
     free: FreeVars<'_>,
+    fold: Fold,
     h: &mut DefaultHasher,
 ) {
     use TypedExprNode as N;
@@ -422,27 +483,48 @@ fn hash_payload<'a>(
         // domain-refinement predicate — a load-bearing term (a comprehension's
         // filter/join condition). A cast is precisely a type-level change, so
         // the target must participate.
-        N::Cast { target, .. } => hash_type(target, env, free, h),
+        //
+        // It stays out of an [`Fold::Own`] fold: the differ hands that same
+        // predicate to its walk as a *child* (the one place its child set
+        // departs from `walk_children`), so folding the target here too would
+        // report one threshold edit twice — at the literal, and at the cast
+        // above it. A change confined to the rest of the target still surfaces
+        // at the cast, with nothing below it to explain it.
+        N::Cast { target, .. } => {
+            if fold == Fold::Whole {
+                hash_type(target, env, free, h);
+            }
+        }
         N::BinOp { op, .. } => op.hash(h),
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
         N::VariantCtor { tag, .. } => tag.hash(h),
         // Field *names* are folded together with their values in `hash_rel`,
         // which is what keeps `(a: 1, b: 2)` distinct from `(a: 2, b: 1)` under
-        // the order-insensitive fold.
-        N::Record(fields) => fields.len().hash(h),
+        // the order-insensitive fold. An [`Fold::Own`] fold has no children to
+        // pair them with, so it takes the names alone, sorted: a record's
+        // labels are its own content, and a rename over an edited sibling would
+        // otherwise go unreported.
+        N::Record(fields) => {
+            fields.len().hash(h);
+            if fold == Fold::Own {
+                let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                names.sort_unstable();
+                names.hash(h);
+            }
+        }
 
-        N::Lambda { param, .. } => hash_binding(param, env, free, h),
-        N::Let { binding, .. } => hash_binding(binding, env, free, h),
+        N::Lambda { param, .. } => hash_binding(param, env, free, fold, h),
+        N::Let { binding, .. } => hash_binding(binding, env, free, fold, h),
         // A mutable variable introduction binds exactly as a `let` does — the
         // history `Mut(V, D)` rides the binder's `ty`, so hashing the binding
         // covers the declaration's whole type-level content.
-        N::MutDecl { binding, .. } => hash_binding(binding, env, free, h),
-        N::For { target, .. } => hash_binding(target, env, free, h),
+        N::MutDecl { binding, .. } => hash_binding(binding, env, free, fold, h),
+        N::For { target, .. } => hash_binding(target, env, free, fold, h),
         N::LetRec { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
-                hash_binding(b, env, free, h);
+                hash_binding(b, env, free, fold, h);
             }
         }
         N::Case {
@@ -456,7 +538,7 @@ fn hash_payload<'a>(
                     Some(p) => {
                         1u8.hash(h);
                         p.tag.hash(h);
-                        hash_binding(&p.binding, env, free, h);
+                        hash_binding(&p.binding, env, free, fold, h);
                     }
                     None => 0u8.hash(h),
                 }
@@ -498,7 +580,7 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -
     use TypedExprNode as N;
     let mut h = DefaultHasher::new();
     std::mem::discriminant(&e.node).hash(&mut h);
-    hash_payload(e, env, free, &mut h);
+    hash_payload(e, env, free, Fold::Whole, &mut h);
 
     // Name occurrences fold as they are met; child hashes are collected in walk
     // order so the AC nodes below can canonicalize theirs first.

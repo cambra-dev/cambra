@@ -229,9 +229,14 @@ impl Name {
     /// two compilations of one source disagree. That made program diffing at
     /// and below loop planning unusable — see `src/ccl/design/diffing.md`.
     ///
-    /// The per-record uniqueness this relies on holds by construction: a key
-    /// spelling is either the user's own variable name, distinct within its
-    /// block, or a label planning mints indexed by position (`acc0`, `acc1`).
+    /// The per-record uniqueness this relies on is a property of spellings, not
+    /// of construction: a key spelling is either the user's own variable name,
+    /// distinct within its block, or a label planning mints indexed by position
+    /// (`acc0`, `acc1`), and a writer's `to_<base>_<n>` taps share the record
+    /// with both. Nothing in the type system rules a collision out, so each site
+    /// that builds a record from these labels asserts distinctness in debug:
+    /// `register_record` in `planning/loops.rs`, and the two `keys_map` inserts
+    /// in `interpreter/operator_conversion.rs`.
     pub fn field_key(&self) -> String {
         self.base().to_string()
     }

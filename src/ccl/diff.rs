@@ -33,9 +33,9 @@
 //! **placement** did ([`Placement`]). A source-only node is **deleted**; a
 //! target-only node is **new**.
 //!
-//! That classification is complete but not minimal — every *ancestor* of an
-//! edit has changed content, and every *descendant* of an inserted subtree is
-//! new. [`Diff::divergences`] reduces it to the places the programs actually
+//! That classification is complete but says the same thing many times — every
+//! *ancestor* of an edit has changed content, and every *descendant* of an
+//! inserted subtree is new. [`Diff::divergences`] reduces it to the places the programs actually
 //! disagree, and [`Diff::shared_roots`] to the largest pieces they have in
 //! common. Those two are the actionable form: the first says where a version
 //! guard goes, the second says what the two versions can compute once.
@@ -64,7 +64,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::mem::Discriminant;
 
-use super::content_hash::{cast_target_predicate, content_hash, resolved_hash};
+use super::content_hash::{cast_target_predicate, content_hash, payload_hash, resolved_hash};
 use super::context::{CompileError, CompileStage, compile_to};
 use super::scope::{ScopedItem, for_each_scoped_item};
 use super::{Name, TypedExpr};
@@ -74,21 +74,30 @@ use super::{Name, TypedExpr};
 /// GumTree default, applied to a different measure than GumTree's.
 const SIMILARITY_THRESHOLD: f64 = 0.5;
 
-/// Subtree-size ceiling for the optimal recovery step ([`recover`]). Tree edit
-/// distance is `O(n²m²)` in the worst case, so a pair of containers larger than
-/// this keeps only the matches steps 1–3 found; their unmatched interiors are
-/// reported as deleted/new rather than aligned. GumTree's default, for the same
-/// reason.
+/// Node-count ceiling for the optimal recovery step ([`recover`]), applied to
+/// each of the two subtrees it is asked to align.
+///
+/// Recovery runs Zhang–Shasha tree edit distance, which is `O(n²m²)` in the
+/// worst case. When either subtree holds more than this many nodes, recovery
+/// declines: the pair keeps whatever the top-down and bottom-up phases matched,
+/// and their still-unmatched interiors are reported as deleted and new rather
+/// than aligned node-for-node. GumTree's default, for the same reason.
 const MAX_RECOVERY_SIZE: u32 = 100;
 
-/// Whether a matched node's *content* changed. Orthogonal to [`Placement`]: a
-/// node can keep its content and move, or stay put and change.
+/// Whether a matched node's *content* changed, and if so whether the change is
+/// the node's own. Orthogonal to [`Placement`]: a node can keep its content and
+/// move, or stay put and change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Content {
     /// Equal content hash — identical computation, reusable wholesale.
     Same,
-    /// The node corresponds but its content differs. The actual divergence is
-    /// in the children — see [`Diff::divergences`] for the minimal set.
+    /// The subtree differs but the node's own content does not: same literal,
+    /// operator, binder, annotation and cast target, over children that
+    /// changed. The disagreement is under it and is reported there — see
+    /// [`Diff::divergences`].
+    ChangedBelow,
+    /// The node itself differs, by [`payload_hash`]. Its children may differ
+    /// too, and report separately.
     Changed,
 }
 
@@ -143,12 +152,11 @@ impl<'a> Diff<'a> {
         self.matched.iter().filter(|m| m.content == Content::Same)
     }
 
-    /// Correspondences that changed ([`Content::Changed`]) — "the same place in
-    /// both programs, different content".
+    /// Correspondences whose subtree changed — "the same place in both
+    /// programs, different content", whether the change is the node's own
+    /// ([`Content::Changed`]) or entirely below it ([`Content::ChangedBelow`]).
     pub fn updated(&self) -> impl Iterator<Item = &Match<'a>> {
-        self.matched
-            .iter()
-            .filter(|m| m.content == Content::Changed)
+        self.matched.iter().filter(|m| m.content != Content::Same)
     }
 
     /// Correspondences that were relocated ([`Placement::Moved`]), independent
@@ -170,63 +178,38 @@ impl<'a> Diff<'a> {
                 .all(|m| m.content == Content::Same && m.placement == Placement::InPlace)
     }
 
-    /// The **minimal** set of places the two programs disagree, in new-program
-    /// order (deletions, which have no place there, come last).
+    /// The places the two programs disagree, reduced to the node that owns each
+    /// disagreement, in new-program order (deletions, which have no place there,
+    /// come last).
     ///
     /// This is the actionable form of the diff, and where a version guard would
-    /// be placed. `matched`/`deleted`/`new` are complete but not
-    /// minimal: every *ancestor* of an edit has changed content too, and every
+    /// be placed. `matched`/`deleted`/`new` are complete but say the same thing
+    /// many times: every *ancestor* of an edit has changed content too, and every
     /// *descendant* of an inserted subtree is itself new. One literal edited at
     /// the bottom of a forty-binding spine leaves forty-two changed nodes, of
     /// which exactly one is the edit. Divergences report that one.
     ///
-    /// No divergence contains another, so the set partitions the disagreement
-    /// between the two programs: everything not under a divergence corresponds.
+    /// Two rules decide what is reported, and neither is a minimality theorem —
+    /// the set is small in the shapes the tests measure, not provably smallest:
+    ///
+    /// - A node whose own content is intact ([`Content::ChangedBelow`]) is
+    ///   reported only when nothing below it was, so the child that explains it
+    ///   is not joined by its container.
+    /// - A node whose own content changed ([`Content::Changed`]) is reported
+    ///   whatever its children did. Suppressing it would leave a real change with
+    ///   no site.
+    ///
+    /// Each kind is reported at its own root, so no two divergences of the same
+    /// kind nest. Across kinds they can: the walk descends under an inserted
+    /// region, because a new expression can wrap content that survived, so a
+    /// `Changed` may sit inside an `Inserted` or a `Deleted`. A consumer placing
+    /// a guard per divergence gets nested guards there.
     pub fn divergences(&self) -> Vec<Divergence<'a>> {
         let by_dst: HashMap<*const TypedExpr, &Match<'a>> = self
             .matched
             .iter()
             .map(|m| (m.dst as *const TypedExpr, m))
             .collect();
-        let mut out = Vec::new();
-
-        // A changed node is a site only when nothing *below* it changed — the
-        // deeper node is the better explanation. Insertions and deletions are
-        // reported at their own roots and do not suppress it: a node whose
-        // payload changed *and* which gained a child has two things to say.
-        /// Returns whether anything in this subtree reported a change.
-        fn walk<'a>(
-            e: &'a TypedExpr,
-            parent_matched: bool,
-            by_dst: &HashMap<*const TypedExpr, &Match<'a>>,
-            out: &mut Vec<Divergence<'a>>,
-        ) -> bool {
-            let Some(m) = by_dst.get(&(e as *const TypedExpr)) else {
-                // Target-only. It is the *root* of an inserted region exactly
-                // when the node above it is not also new. Keep descending
-                // regardless: a matched node can sit inside a new region — the
-                // new expression wrapping content that survived — and whatever
-                // diverges under it still has to be reported.
-                if parent_matched {
-                    out.push(Divergence::Inserted(e));
-                }
-                let mut changed = false;
-                for c in child_exprs(e) {
-                    changed |= walk(c, false, by_dst, out);
-                }
-                return changed;
-            };
-            let mut changed_below = false;
-            for c in child_exprs(e) {
-                changed_below |= walk(c, true, by_dst, out);
-            }
-            if m.content == Content::Changed && !changed_below {
-                out.push(Divergence::Changed(**m));
-                return true;
-            }
-            changed_below || m.content == Content::Changed
-        }
-        walk(self.dst_root, true, &by_dst, &mut out);
 
         let gone: HashSet<*const TypedExpr> = self
             .deleted
@@ -235,7 +218,91 @@ impl<'a> Diff<'a> {
             .collect();
         let mut roots: Vec<(&TypedExpr, bool)> = Vec::new();
         collect_deleted_roots(self.src_root, &gone, &mut roots);
+        // Deletions are found on the src side but suppress a site on the dst
+        // side: a node that lost a child has changed content, and the `Deleted`
+        // below it is the whole explanation. Map each deleted root's src parent
+        // to its dst counterpart so the walk can see that.
+        let deleted_roots: HashSet<*const TypedExpr> =
+            roots.iter().map(|(e, _)| *e as *const TypedExpr).collect();
+        let lost_a_child = self.parents_of(&deleted_roots);
+
+        let mut out = Vec::new();
+        /// Returns whether anything in this subtree — this node included — was
+        /// reported.
+        fn walk<'a>(
+            e: &'a TypedExpr,
+            parent_matched: bool,
+            by_dst: &HashMap<*const TypedExpr, &Match<'a>>,
+            lost_a_child: &HashSet<*const TypedExpr>,
+            out: &mut Vec<Divergence<'a>>,
+        ) -> bool {
+            let Some(m) = by_dst.get(&(e as *const TypedExpr)) else {
+                // Target-only. It is the *root* of an inserted region exactly
+                // when the node above it is not also new. Keep descending
+                // regardless: a matched node can sit inside a new region — the
+                // new expression wrapping content that survived — and whatever
+                // diverges under it still has to be reported.
+                let mut reported = parent_matched;
+                if parent_matched {
+                    out.push(Divergence::Inserted(e));
+                }
+                for c in child_exprs(e) {
+                    reported |= walk(c, false, by_dst, lost_a_child, out);
+                }
+                return reported;
+            };
+            let mut reported_below = lost_a_child.contains(&(e as *const TypedExpr));
+            for c in child_exprs(e) {
+                reported_below |= walk(c, true, by_dst, lost_a_child, out);
+            }
+            // The node's own content changed: that is a site regardless of what
+            // its children did — a renamed binder over an edited body has two
+            // things to say. A node whose own content is intact is a site only
+            // when nothing below was reported, which leaves the changes no
+            // child accounts for: a reordering, or a type resolved from outside.
+            if m.content == Content::Changed
+                || (m.content == Content::ChangedBelow && !reported_below)
+            {
+                out.push(Divergence::Changed(**m));
+                return true;
+            }
+            reported_below
+        }
+        walk(self.dst_root, true, &by_dst, &lost_a_child, &mut out);
+
         out.extend(roots.into_iter().map(|(e, _)| Divergence::Deleted(e)));
+        out
+    }
+
+    /// The dst counterparts of the src nodes that directly contain one of
+    /// `children`. Used to carry a src-side finding (a deletion) over to the
+    /// dst-side walk that decides sites.
+    fn parents_of(&self, children: &HashSet<*const TypedExpr>) -> HashSet<*const TypedExpr> {
+        let by_src: HashMap<*const TypedExpr, *const TypedExpr> = self
+            .matched
+            .iter()
+            .map(|m| (m.src as *const TypedExpr, m.dst as *const TypedExpr))
+            .collect();
+        let mut out = HashSet::new();
+        fn walk(
+            e: &TypedExpr,
+            children: &HashSet<*const TypedExpr>,
+            by_src: &HashMap<*const TypedExpr, *const TypedExpr>,
+            out: &mut HashSet<*const TypedExpr>,
+        ) {
+            let kids = child_exprs(e);
+            if kids
+                .iter()
+                .any(|c| children.contains(&(*c as *const TypedExpr)))
+                && let Some(dst) = by_src.get(&(e as *const TypedExpr))
+            {
+                out.insert(*dst);
+            }
+            for c in kids {
+                walk(c, children, by_src, out);
+            }
+        }
+        walk(self.src_root, children, &by_src, &mut out);
         out
     }
 
@@ -278,11 +345,18 @@ impl<'a> Diff<'a> {
 }
 
 /// One place the two programs disagree, at the granularity a version guard is
-/// placed. Minimal by construction: no divergence contains another.
+/// placed. Each kind is reported at its own root, so no two divergences of the
+/// same kind nest; across kinds a [`Changed`] can sit inside an [`Inserted`] or
+/// a [`Deleted`], because a new expression can wrap content that survived.
+///
+/// [`Changed`]: Divergence::Changed
+/// [`Inserted`]: Divergence::Inserted
+/// [`Deleted`]: Divergence::Deleted
 #[derive(Debug, Clone, Copy)]
 pub enum Divergence<'a> {
-    /// Both programs have a node here and its content differs, with nothing
-    /// below it differing — this is where the change actually is.
+    /// Both programs have a node here and this node is the one that changed:
+    /// either its own content differs ([`Content::Changed`]) or its subtree
+    /// differs with nothing under it reported ([`Content::ChangedBelow`]).
     Changed(Match<'a>),
     /// A subtree the new program has and the old one does not, at its root.
     Inserted(&'a TypedExpr),
@@ -977,6 +1051,22 @@ mod ted {
 
 /// The [`resolved_hash`] of every node of `t`, indexed the same way `t` is.
 ///
+/// Distinguishes the `j`th binder a node introduces from its siblings, without
+/// letting two nodes' classes collide: the multiplier is the 64-bit golden-ratio
+/// constant, so a one-bit change in either input spreads across the result.
+fn mix(class: u64, j: u64) -> u64 {
+    class.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ j
+}
+
+/// A node's two scope-resolved hashes: the whole subtree's, and the node's own.
+/// Comparing both is what separates "this node changed" from "something under it
+/// changed" — see [`Content`].
+#[derive(Debug, Clone, Copy, Default)]
+struct NodeHashes {
+    resolved: u64,
+    payload: u64,
+}
+
 /// Walks top-down carrying the binders each node sits under, each tagged with
 /// the class `class_of` gives its owner, so a free variable inside a subterm
 /// hashes to *which binder it resolves to* rather than to how that binder
@@ -989,15 +1079,18 @@ mod ted {
 /// target's refinement predicate, which is a type slot. That predicate sits in
 /// its cast's own scope, so an absent entry meaning "no binders" is exactly
 /// right for it.
-fn resolved_hashes(t: &Indexed<'_>, class_of: &dyn Fn(usize) -> u64) -> Vec<u64> {
+fn resolved_hashes(t: &Indexed<'_>, class_of: &dyn Fn(usize) -> u64) -> Vec<NodeHashes> {
     fn go<'a>(
         t: &Indexed<'a>,
         i: usize,
         scope: &mut Vec<(&'a Name, u64)>,
         class_of: &dyn Fn(usize) -> u64,
-        out: &mut [u64],
+        out: &mut [NodeHashes],
     ) {
-        out[i] = resolved_hash(t.nodes[i].expr, scope).0;
+        out[i] = NodeHashes {
+            resolved: resolved_hash(t.nodes[i].expr, scope).0,
+            payload: payload_hash(t.nodes[i].expr, scope).0,
+        };
 
         let mut introduced: HashMap<*const TypedExpr, Vec<&'a Name>> = HashMap::new();
         for_each_scoped_item(t.nodes[i].expr, &mut |item| {
@@ -1016,8 +1109,16 @@ fn resolved_hashes(t: &Indexed<'_>, class_of: &dyn Fn(usize) -> u64) -> Vec<u64>
             let added = introduced
                 .get(&(t.nodes[c].expr as *const TypedExpr))
                 .map_or(0, |names| {
-                    for n in names {
-                        scope.push((n, class));
+                    // Each binder a node introduces needs its own class: they
+                    // are distinct binders, and one token for the whole node
+                    // would make `letrec p = …; q = … in p` and `… in q` hash
+                    // equal — a `Content::Same` on two different computations,
+                    // which is the unsound direction (`src/ccl/design/diffing.md`,
+                    // "Direction of error"). Position within the group is the
+                    // correspondence, matching how `child_exprs` pairs the
+                    // group's definitions.
+                    for (j, n) in names.iter().enumerate() {
+                        scope.push((n, mix(class, j as u64)));
                     }
                     names.len()
                 });
@@ -1026,7 +1127,7 @@ fn resolved_hashes(t: &Indexed<'_>, class_of: &dyn Fn(usize) -> u64) -> Vec<u64>
         }
     }
 
-    let mut out = vec![0u64; t.len()];
+    let mut out = vec![NodeHashes::default(); t.len()];
     go(t, 0, &mut Vec::new(), class_of, &mut out);
     out
 }
@@ -1052,10 +1153,28 @@ fn classify<'a>(s: &Indexed<'a>, d: &Indexed<'a>, m: &Matching) -> Diff<'a> {
             Some(w) => out.matched.push(Match {
                 src: s.nodes[u].expr,
                 dst: d.nodes[w].expr,
-                content: if src_resolved[u] == dst_resolved[w] {
-                    Content::Same
-                } else {
-                    Content::Changed
+                content: {
+                    // `payload_hash` folds a subset of what `resolved_hash`
+                    // does, plus a record's labels — which `resolved_hash`
+                    // folds paired with the children they label. So an equal
+                    // subtree hash implies an equal payload hash, and the
+                    // `Same` arm below is safe to take on the subtree hash
+                    // alone. Were that to stop holding, a node whose own
+                    // content changed would classify `Same`: an unsound share,
+                    // the direction `src/ccl/design/diffing.md`, "Direction of
+                    // error" rules out.
+                    debug_assert!(
+                        src_resolved[u].resolved != dst_resolved[w].resolved
+                            || src_resolved[u].payload == dst_resolved[w].payload,
+                        "payload_hash must refine resolved_hash: equal subtrees, differing payloads",
+                    );
+                    if src_resolved[u].resolved == dst_resolved[w].resolved {
+                        Content::Same
+                    } else if src_resolved[u].payload == dst_resolved[w].payload {
+                        Content::ChangedBelow
+                    } else {
+                        Content::Changed
+                    }
                 },
                 placement: if in_place[u] {
                     Placement::InPlace
@@ -1251,19 +1370,32 @@ impl std::fmt::Display for Diff<'_> {
 /// still matched is a different thing entirely — a wrapper that appeared or
 /// vanished around content that survived — and collapsing it would claim its
 /// surviving children changed too.
+///
+/// Walks [`child_exprs`], not `all_children`, because that is the child set the
+/// differ indexed: a cast target's refinement predicate is a node the matcher
+/// can match and `all_children` does not reach. Testing the narrower set would
+/// call a cast wholly-gone while a matched node still lives in its predicate.
 fn subtree_entirely_in(e: &TypedExpr, set: &HashSet<*const TypedExpr>) -> bool {
-    set.contains(&(e as *const TypedExpr)) && e.all_children(|c| subtree_entirely_in(c, set))
+    set.contains(&(e as *const TypedExpr))
+        && child_exprs(e)
+            .into_iter()
+            .all(|c| subtree_entirely_in(c, set))
 }
 
 /// `    (+N nodes)` when `e` has descendants, so an elided subtree still
-/// reports how much it stands for; empty for a leaf.
+/// reports how much it stands for; empty for a leaf. Counts over
+/// [`child_exprs`], the differ's child set, so the note matches what collapsed.
 fn size_note(e: &TypedExpr) -> String {
     let mut n = 0;
     fn count(e: &TypedExpr, n: &mut usize) {
         *n += 1;
-        e.walk_children(|c| count(c, n));
+        for c in child_exprs(e) {
+            count(c, n);
+        }
     }
-    e.walk_children(|c| count(c, &mut n));
+    for c in child_exprs(e) {
+        count(c, &mut n);
+    }
     if n == 0 {
         String::new()
     } else {
@@ -1295,7 +1427,7 @@ fn render_node(
         Some(m) => {
             let mark = match m.content {
                 Content::Same => '=',
-                Content::Changed => '~',
+                Content::ChangedBelow | Content::Changed => '~',
             };
             let moved = if m.placement == Placement::Moved {
                 " »"
@@ -1305,7 +1437,7 @@ fn render_node(
             writeln!(f, "{indent}{mark} {}{moved}", head(e))?;
             // An unchanged subtree is unchanged all the way down; descending
             // would print it verbatim for no information.
-            if m.content == Content::Changed {
+            if m.content != Content::Same {
                 for c in child_exprs(e) {
                     render_node(f, c, depth + 1, by_dst, inserted)?;
                 }
@@ -1340,7 +1472,14 @@ fn collect_deleted_roots<'a>(
 mod tests {
     use super::*;
     use crate::ccl::content_hash::content_hash;
-    use crate::ccl::{ArithmeticKind, BinOpKind, Lit, TypedExpr, TypedExprNode};
+    use crate::ccl::{
+        ArithmeticKind, BaseType, BinOpKind, CompareKind, FunKind, Lit, Name, Refinement, Type,
+        TypedBinding, TypedExpr, TypedExprNode,
+    };
+    use indoc::indoc;
+    use std::rc::Rc;
+
+    use TypedExprNode as N;
 
     fn var(name: &str) -> TypedExpr {
         TypedExpr::var(name)
@@ -1594,13 +1733,8 @@ mod tests {
         // (a spurious insert), strand `0` (a spurious delete), and report a move
         // that never happened. Structural position picks the tuple slot, and
         // optimal recovery then reads the guard edit as `0 -> 1`.
-        let guard = |n: i64| {
-            TypedExpr::binop(
-                var("v"),
-                BinOpKind::Compare(crate::ccl::CompareKind::Greater),
-                int(n),
-            )
-        };
+        let guard =
+            |n: i64| TypedExpr::binop(var("v"), BinOpKind::Compare(CompareKind::Greater), int(n));
         let v1 = TypedExpr::tuple(vec![int(1), guard(0)]);
         let v2 = TypedExpr::tuple(vec![int(1), guard(1)]);
         let r = diff(&v1, &v2);
@@ -1693,20 +1827,65 @@ mod tests {
     // are born *below* the inferred stage — the mutability phases build them —
     // so no source program can exercise them here; `content_hash` covers them
     // structurally instead.
-    const FILTER_AGG: &str = "users = [\n  (name=\"alice\", age=30, score=85),\n  (name=\"bob\", age=17, score=92),\n]\nsum([u.score for u in users if u.age >= 18])\n";
-    const FILTER_AGG_21: &str = "users = [\n  (name=\"alice\", age=30, score=85),\n  (name=\"bob\", age=17, score=92),\n]\nsum([u.score for u in users if u.age >= 21])\n";
-    const GENERATORS: &str = "def positives(xs):\n    for x in xs:\n        if x > 0:\n            yield x\n\ndef squared(xs):\n    for x in xs:\n        yield x * x\n\nmax(squared(positives([-3, 4, -1, 2, 5, -7])))\n";
-    const JOIN: &str = "users = [(id=1, name=\"alice\"), (id=2, name=\"bob\")]\norders = [(user_id=1, amount=50), (user_id=2, amount=75)]\n[(customer=u.name, total=o.amount) for u in users for o in orders if u.id == o.user_id]\n";
-    const GROUPBY: &str = "sales = [(region=\"west\", amount=100), (region=\"east\", amount=50)]\n[sum([s.amount for s in g]) for g in groupby(sales, \\r -> r.region)]\n";
-    const ACCUM: &str = "acc := 0\nfor i in [1, 2, 3, 4, 5]:\n    acc := acc + i\nacc\n";
-    const TXN: &str = "pool: Mut(Int, Txn) := 100\nreqs = [1, 2, 3]\nfor r in reqs:\n    with begin():\n        pool := pool - r\n";
+    const FILTER_AGG: &str = indoc! {r#"
+        users = [
+          (name="alice", age=30, score=85),
+          (name="bob", age=17, score=92),
+        ]
+        sum([u.score for u in users if u.age >= 18])
+    "#};
+    const FILTER_AGG_21: &str = indoc! {r#"
+        users = [
+          (name="alice", age=30, score=85),
+          (name="bob", age=17, score=92),
+        ]
+        sum([u.score for u in users if u.age >= 21])
+    "#};
+    const GENERATORS: &str = indoc! {"
+        def positives(xs):
+            for x in xs:
+                if x > 0:
+                    yield x
+
+        def squared(xs):
+            for x in xs:
+                yield x * x
+
+        max(squared(positives([-3, 4, -1, 2, 5, -7])))
+    "};
+    const JOIN: &str = indoc! {r#"
+        users = [(id=1, name="alice"), (id=2, name="bob")]
+        orders = [(user_id=1, amount=50), (user_id=2, amount=75)]
+        [(customer=u.name, total=o.amount) for u in users for o in orders if u.id == o.user_id]
+    "#};
+    const GROUPBY: &str = indoc! {r#"
+        sales = [(region="west", amount=100), (region="east", amount=50)]
+        [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
+    "#};
+    const ACCUM: &str = indoc! {"
+        acc := 0
+        for i in [1, 2, 3, 4, 5]:
+            acc := acc + i
+        acc
+    "};
+    const TXN: &str = indoc! {"
+        pool: Mut(Int, Txn) := 100
+        reqs = [1, 2, 3]
+        for r in reqs:
+            with begin():
+                pool := pool - r
+    "};
 
     #[test]
     fn lowered_source_is_stable_across_independent_compilations() {
         // The point of diffing pre-uniquify on Raw names: lowering the same
         // source twice, through independent contexts, yields trees that diff as
         // identical — no spurious divergence from fresh binder identities.
-        let src = "x = 1\ny = x + 2\ny\n";
+        let src = indoc! {"
+            x = 1
+            y = x + 2
+            y
+        "};
         let (a, b) = (lower(src), lower(src));
         let r = diff(&a, &b);
         assert!(r.is_identical(), "{r:?}");
@@ -1719,8 +1898,16 @@ mod tests {
         // the changed leaf with its counterpart, so the edit reads as one
         // in-place update rather than a delete plus an insert — and nothing
         // around it is disturbed.
-        let v1 = lower("x = 1\ny = x + 2\ny\n");
-        let v2 = lower("x = 1\ny = x + 3\ny\n");
+        let v1 = lower(indoc! {"
+            x = 1
+            y = x + 2
+            y
+        "});
+        let v2 = lower(indoc! {"
+            x = 1
+            y = x + 3
+            y
+        "});
         let r = diff(&v1, &v2);
 
         assert!(r.deleted.is_empty(), "deleted: {:?}", r.deleted);
@@ -1754,8 +1941,15 @@ mod tests {
         // weighs the two subtrees *together* scores the root far too low to
         // pair — and the whole program reads as deleted-and-reinserted for a
         // one-statement edit. The roots correspond by construction instead.
-        let v1 = lower("a = 1\na\n");
-        let v2 = lower("a = 1\nb = sum([i * 2 for i in [1,2,3]])\na + b\n");
+        let v1 = lower(indoc! {"
+            a = 1
+            a
+        "});
+        let v2 = lower(indoc! {"
+            a = 1
+            b = sum([i * 2 for i in [1,2,3]])
+            a + b
+        "});
         let r = diff(&v1, &v2);
         assert!(
             r.deleted.is_empty(),
@@ -1781,10 +1975,19 @@ mod tests {
         // `def` body gains a statement. The enclosing container is matched on
         // *containment* of what it already had, not on its size relative to
         // what was added.
-        let v1 = lower("def f(x):\n    a = 1\n    a + x\nf(2)\n");
-        let v2 = lower(
-            "def f(x):\n    a = 1\n    b = sum([i * 2 for i in [1,2,3]])\n    a + x + b\nf(2)\n",
-        );
+        let v1 = lower(indoc! {"
+            def f(x):
+                a = 1
+                a + x
+            f(2)
+        "});
+        let v2 = lower(indoc! {"
+            def f(x):
+                a = 1
+                b = sum([i * 2 for i in [1,2,3]])
+                a + x + b
+            f(2)
+        "});
         let r = diff(&v1, &v2);
         assert!(
             r.deleted.is_empty(),
@@ -1803,8 +2006,15 @@ mod tests {
         // reuses `a`. The wholly-new `sum(…)` subtree collapses to one line
         // with a node count; the new `a + b` does *not*, because `a` survived
         // underneath it and hiding that would claim it changed.
-        let v1 = lower("a = 1\na\n");
-        let v2 = lower("a = 1\nb = sum([i * 2 for i in [1,2,3]])\na + b\n");
+        let v1 = lower(indoc! {"
+            a = 1
+            a
+        "});
+        let v2 = lower(indoc! {"
+            a = 1
+            b = sum([i * 2 for i in [1,2,3]])
+            a + b
+        "});
         let out = diff(&v1, &v2).to_string();
 
         assert!(
@@ -1832,8 +2042,17 @@ mod tests {
         // `let c = 9 in …` is dropped, but the statements under it survive. The
         // deleted wrapper must be reported on its own — not as a subtree of
         // everything it used to contain.
-        let v1 = lower("a = 1\nc = 9\nb = 2\na + b + c\n");
-        let v2 = lower("a = 1\nb = 2\na + b\n");
+        let v1 = lower(indoc! {"
+            a = 1
+            c = 9
+            b = 2
+            a + b + c
+        "});
+        let v2 = lower(indoc! {"
+            a = 1
+            b = 2
+            a + b
+        "});
         let d = diff(&v1, &v2);
         let out = d.to_string();
 
@@ -1856,10 +2075,27 @@ mod tests {
         // classification resolves a free variable to *which binder it means*
         // rather than to how that binder is spelled.
         for (a, b) in [
-            ("x = 1\ny = x + 2\ny\n", "q = 1\ny = q + 2\ny\n"),
             (
-                "users = [(name=\"a\", age=30)]\nsum([u.age for u in users])\n",
-                "users = [(name=\"a\", age=30)]\nsum([q.age for q in users])\n",
+                indoc! {"
+                    x = 1
+                    y = x + 2
+                    y
+                "},
+                indoc! {"
+                    q = 1
+                    y = q + 2
+                    y
+                "},
+            ),
+            (
+                indoc! {r#"
+                    users = [(name="a", age=30)]
+                    sum([u.age for u in users])
+                "#},
+                indoc! {r#"
+                    users = [(name="a", age=30)]
+                    sum([q.age for q in users])
+                "#},
             ),
         ] {
             let (v1, v2) = (lower(a), lower(b));
@@ -1879,8 +2115,17 @@ mod tests {
         // its binder rather than by the binder itself, every reference reaching
         // past the new one would shift and the whole tail would read as
         // changed.
-        let v1 = lower("a = 1\nb = 2\na + b\n");
-        let v2 = lower("a = 1\nc = 9\nb = 2\na + b\n");
+        let v1 = lower(indoc! {"
+            a = 1
+            b = 2
+            a + b
+        "});
+        let v2 = lower(indoc! {"
+            a = 1
+            c = 9
+            b = 2
+            a + b
+        "});
         let r = diff(&v1, &v2);
         assert!(r.deleted.is_empty(), "{r}");
         assert!(
@@ -1928,8 +2173,15 @@ mod tests {
     #[test]
     fn an_inserted_region_is_reported_at_its_root() {
         // 16 new nodes, one insertion.
-        let v1 = lower("a = 1\na\n");
-        let v2 = lower("a = 1\nb = sum([i * 2 for i in [1,2,3]])\na + b\n");
+        let v1 = lower(indoc! {"
+            a = 1
+            a
+        "});
+        let v2 = lower(indoc! {"
+            a = 1
+            b = sum([i * 2 for i in [1,2,3]])
+            a + b
+        "});
         let r = diff(&v1, &v2);
         assert!(r.new.len() > 10, "the inserted block is substantial");
 
@@ -1958,8 +2210,17 @@ mod tests {
 
     #[test]
     fn shared_roots_are_maximal_and_disjoint() {
-        let v1 = lower("a = 1\nb = 2\na + b\n");
-        let v2 = lower("a = 1\nc = 9\nb = 2\na + b\n");
+        let v1 = lower(indoc! {"
+            a = 1
+            b = 2
+            a + b
+        "});
+        let v2 = lower(indoc! {"
+            a = 1
+            c = 9
+            b = 2
+            a + b
+        "});
         let r = diff(&v1, &v2);
         let roots = r.shared_roots();
         assert!(!roots.is_empty());
@@ -2016,7 +2277,12 @@ mod tests {
         // mutation machinery leaks into the diff.
         assert_stable_and_localizing(
             ACCUM,
-            "acc := 0\nfor i in [1, 2, 3, 4, 5]:\n    acc := acc + i * 2\nacc\n",
+            indoc! {"
+                acc := 0
+                for i in [1, 2, 3, 4, 5]:
+                    acc := acc + i * 2
+                acc
+            "},
         );
     }
 
@@ -2027,7 +2293,13 @@ mod tests {
         // compilations, and an edit inside the block localizes to it.
         assert_stable_and_localizing(
             TXN,
-            "pool: Mut(Int, Txn) := 100\nreqs = [1, 2, 3]\nfor r in reqs:\n    with begin():\n        pool := pool - r - 1\n",
+            indoc! {"
+                pool: Mut(Int, Txn) := 100
+                reqs = [1, 2, 3]
+                for r in reqs:
+                    with begin():
+                        pool := pool - r - 1
+            "},
         );
     }
 
@@ -2080,12 +2352,21 @@ mod tests {
     #[test]
     fn conditional_branches_diff_cleanly() {
         // A ternary `1 if v > 0 else 2` lowers to a guard-based `Case`.
-        let base = "v = 5\n1 if v > 0 else 2\n";
+        let base = indoc! {"
+            v = 5
+            1 if v > 0 else 2
+        "};
         let (a, b) = (lower(base), lower(base));
         assert!(diff(&a, &b).is_identical());
 
         // Editing the else-branch value localizes to that literal.
-        let (e1, e2) = (lower(base), lower("v = 5\n1 if v > 0 else 3\n"));
+        let (e1, e2) = (
+            lower(base),
+            lower(indoc! {"
+                v = 5
+                1 if v > 0 else 3
+            "}),
+        );
         let r = diff(&e1, &e2);
         assert!(r.updated().any(|m| {
             matches!(m.src.node, TypedExprNode::Lit(Lit::Int(2)))
@@ -2093,7 +2374,13 @@ mod tests {
         }));
 
         // Editing the guard threshold localizes to that literal.
-        let (g1, g2) = (lower(base), lower("v = 5\n1 if v > 1 else 2\n"));
+        let (g1, g2) = (
+            lower(base),
+            lower(indoc! {"
+                v = 5
+                1 if v > 1 else 2
+            "}),
+        );
         let r = diff(&g1, &g2);
         assert!(r.updated().any(|m| {
             matches!(m.src.node, TypedExprNode::Lit(Lit::Int(0)))
@@ -2122,8 +2409,14 @@ mod tests {
         // diverges (`x: Int` vs `x: String`), so the *same* subterm no longer
         // matches: types carry signal the term structure alone does not. This
         // is the payoff of diffing post-inference.
-        let prog_int = "x = 1\n(x, x)\n";
-        let prog_str = "x = \"a\"\n(x, x)\n";
+        let prog_int = indoc! {"
+            x = 1
+            (x, x)
+        "};
+        let prog_str = indoc! {r#"
+            x = "a"
+            (x, x)
+        "#};
 
         // The `(x, x)` tuple is the root `let`'s body.
         let body = |e: &TypedExpr| match &e.node {
@@ -2147,8 +2440,16 @@ mod tests {
     fn inlining_erases_function_boundaries() {
         // Extracting a subexpression into a `def` is invisible once the
         // pipeline's own inlining has run: the two versions are the same tree.
-        let plain = "a = 1\n(a + 2) * 3\n";
-        let extracted = "def g(y):\n    y + 2\na = 1\ng(a) * 3\n";
+        let plain = indoc! {"
+            a = 1
+            (a + 2) * 3
+        "};
+        let extracted = indoc! {"
+            def g(y):
+                y + 2
+            a = 1
+            g(a) * 3
+        "};
 
         let (v1, v2) = (
             compile_to(plain, CompileStage::Inferred).unwrap(),
@@ -2183,8 +2484,20 @@ mod tests {
         // clone the helper during inference — the baseline would already be
         // delocalized, and the contrast below would not be inlining's doing.
         // See `src/ccl/design/diffing.md`, "How much to normalize".
-        let v1 = "def g(y):\n    y + 2\na = 1 + 1\nb = 2 + 2\ng(a) * g(b)\n";
-        let v2 = "def g(y):\n    y + 5\na = 1 + 1\nb = 2 + 2\ng(a) * g(b)\n";
+        let v1 = indoc! {"
+            def g(y):
+                y + 2
+            a = 1 + 1
+            b = 2 + 2
+            g(a) * g(b)
+        "};
+        let v2 = indoc! {"
+            def g(y):
+                y + 5
+            a = 1 + 1
+            b = 2 + 2
+            g(a) * g(b)
+        "};
 
         let (a, b) = (
             compile_to(v1, CompileStage::Inferred).unwrap(),
@@ -2220,7 +2533,14 @@ mod tests {
         // once a name is a record label no amount of uid-robustness in the
         // hasher can see through it.
         let corpus = [
-            ("pure", "a = 1\nb = 2\na + b\n"),
+            (
+                "pure",
+                indoc! {"
+                    a = 1
+                    b = 2
+                    a + b
+                "},
+            ),
             ("comprehension", FILTER_AGG),
             ("generators", GENERATORS),
             ("join", JOIN),
@@ -2249,6 +2569,270 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_container_that_only_gained_or_lost_a_child_is_not_a_site() {
+        // The insertion (or deletion) is the whole story: the container's own
+        // content — its operator, binder, annotation — did not change, so
+        // reporting it alongside would put a second guard around the first.
+        let (small, big) = (
+            TypedExpr::list(vec![var("a")]),
+            TypedExpr::list(vec![var("a"), int(7)]),
+        );
+        let grew = diff(&small, &big).divergences();
+        assert!(
+            matches!(grew.as_slice(), [Divergence::Inserted(_)]),
+            "a gained child is one site: {grew:?}",
+        );
+        let shrank = diff(&big, &small).divergences();
+        assert!(
+            matches!(shrank.as_slice(), [Divergence::Deleted(_)]),
+            "a lost child is one site: {shrank:?}",
+        );
+    }
+
+    #[test]
+    fn a_container_that_changed_and_gained_a_child_reports_both() {
+        // The suppression above is about a container whose *own* content is
+        // intact. A record that both relabelled a field and gained one has two
+        // things to say, and both are reported.
+        let rec = |fields: Vec<(&str, TypedExpr)>| {
+            TypedExpr::new(N::Record(
+                fields
+                    .into_iter()
+                    .map(|(n, e)| (n.to_string(), e))
+                    .collect(),
+            ))
+        };
+        let v1 = rec(vec![("a", var("x"))]);
+        let v2 = rec(vec![("b", var("x")), ("c", int(7))]);
+        let sites = diff(&v1, &v2).divergences();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert!(
+            sites
+                .iter()
+                .any(|d| matches!(d, Divergence::Changed(m) if matches!(m.dst.node, N::Record(_)))),
+            "the relabelling is a site: {sites:?}",
+        );
+        assert!(
+            sites.iter().any(|d| matches!(d, Divergence::Inserted(_))),
+            "the new field is a site: {sites:?}",
+        );
+    }
+
+    #[test]
+    fn a_relabelled_field_is_reported_beside_an_edited_sibling() {
+        // The under-report the payload fold exists to prevent: the edited
+        // literal is a site of its own, and the record's own change — its
+        // labels — must not be swallowed by it.
+        let rec = |a: &str, n: i64| {
+            TypedExpr::new(N::Record(vec![
+                (a.to_string(), var("x")),
+                ("c".to_string(), int(n)),
+            ]))
+        };
+        let (v1, v2) = (rec("a", 1), rec("b", 2));
+        let sites = diff(&v1, &v2).divergences();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+    }
+
+    #[test]
+    fn a_reordering_is_a_site_at_the_container() {
+        // Nothing below reports — every child corresponds and is unchanged —
+        // so the container is where the disagreement is.
+        let v1 = TypedExpr::tuple(vec![var("a"), var("b")]);
+        let v2 = TypedExpr::tuple(vec![var("b"), var("a")]);
+        let sites = diff(&v1, &v2).divergences();
+        assert!(
+            matches!(
+                sites.as_slice(),
+                [Divergence::Changed(m)] if matches!(m.dst.node, N::Tuple(_))
+            ),
+            "{sites:?}",
+        );
+    }
+
+    #[test]
+    fn a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted() {
+        // `child_exprs` descends into a cast target's refinement predicate — a
+        // comprehension filter or join condition, a term the matcher can match.
+        // The collapse tests must walk that same child set: over the narrower
+        // `all_children` the cast reads as wholly gone while a matched node is
+        // still live inside it, and `divergences()` then reports `Deleted` over
+        // a subtree that survives in part.
+        let pred = || {
+            TypedExpr::binop(
+                TypedExpr::var(Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                int(7),
+            )
+        };
+        let cast = TypedExpr::new(N::Cast {
+            value: Box::new(int(1)),
+            target: Type::Fun {
+                name: None,
+                kind: FunKind::Compute,
+                domain: Box::new(Type::Refinement(
+                    Box::new(Type::Base(BaseType::Int)),
+                    Refinement {
+                        predicate: Rc::new(pred()),
+                    },
+                )),
+                codomain: Box::new(Type::Base(BaseType::Int)),
+            },
+        });
+        // The cast goes away; its predicate term survives as a sibling.
+        let v1 = TypedExpr::tuple(vec![cast, pred(), int(0)]);
+        let v2 = TypedExpr::tuple(vec![pred(), int(0)]);
+        let r = diff(&v1, &v2);
+
+        // The matcher pairs one of the two identical predicate terms with v2's,
+        // leaving a `Cast` that is deleted at its root with a live node inside.
+        let gone: HashSet<*const TypedExpr> =
+            r.deleted.iter().map(|e| *e as *const TypedExpr).collect();
+        let mut roots = Vec::new();
+        collect_deleted_roots(&v1, &gone, &mut roots);
+        assert!(
+            roots.iter().any(|(e, _)| matches!(e.node, N::Cast { .. })),
+            "the cast is deleted:\n{r}",
+        );
+        // The invariant `subtree_entirely_in` exists to state: a root marked
+        // *whole* — the one that collapses in the rendering and stops the walk —
+        // has nothing matched under it.
+        let matched: HashSet<*const TypedExpr> = r
+            .matched
+            .iter()
+            .map(|m| m.src as *const TypedExpr)
+            .collect();
+        fn any_matched(e: &TypedExpr, matched: &HashSet<*const TypedExpr>) -> bool {
+            matched.contains(&(e as *const TypedExpr))
+                || child_exprs(e).into_iter().any(|c| any_matched(c, matched))
+        }
+        for (root, whole) in roots {
+            assert!(
+                !whole || !any_matched(root, &matched),
+                "a wholly-deleted root must not cover a matched node:\n{r}",
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_binders_of_one_group_are_distinct_classes() {
+        // Every binder a node introduces gets its own class token, so a use of
+        // one does not hash equal to a use of another. Without that, a
+        // `letrec`'s whole group collapsed to a single class and swapping which
+        // binding the body reads classified `Same` — an unsound share.
+        let group = |body: TypedExpr| {
+            TypedExpr::letrec(
+                vec![
+                    (TypedBinding::new_unannotated("p"), int(1)),
+                    (TypedBinding::new_unannotated("q"), int(2)),
+                ],
+                body,
+            )
+        };
+        let a = group(mul(var("p"), int(10)));
+        let b = group(mul(var("q"), int(10)));
+        let r = diff(&a, &b);
+        assert!(
+            !r.is_identical(),
+            "reading a different binding of the group is a change:\n{r}"
+        );
+        // And the divergence localizes to the variable, not to the `letrec`.
+        let sites = r.divergences();
+        assert_eq!(sites.len(), 1, "sites: {sites:?}");
+        assert!(
+            matches!(
+                &sites[0],
+                Divergence::Changed(m)
+                    if matches!(&m.dst.node, TypedExprNode::Var(n) if n.base() == "q")
+            ),
+            "sites: {sites:?}",
+        );
+    }
+
+    #[test]
+    fn a_swapped_pair_of_registers_is_not_a_shared_root() {
+        // The same defect on a real program: `channelize` emits one `LetRec`
+        // group per transaction, so two mutable registers were one class and a
+        // tuple returning them swapped claimed to be reusable wholesale.
+        let prog = |tail: &str| {
+            format!(
+                "{}{tail}\n",
+                indoc! {"
+                    a: Mut(Int, Txn) := 0
+                    b: Mut(Int, Txn) := 0
+                    for x in [1, 2]:
+                        with begin():
+                            a := a + x
+                            b := b + a
+                    "}
+            )
+        };
+        let (v1, v2) = (
+            prog("(await_final(a), await_final(b))"),
+            prog("(await_final(b), await_final(a))"),
+        );
+        for stage in [CompileStage::Channelized, CompileStage::Planned] {
+            let (a, b) = (
+                compile_to(&v1, stage).expect("v1"),
+                compile_to(&v2, stage).expect("v2"),
+            );
+            let r = diff(&a, &b);
+            assert!(
+                !r.is_identical(),
+                "a swapped pair of registers is a change at {stage:?}:\n{r}"
+            );
+            // The swap is one site — the tuple — rather than the whole
+            // recurrence: the two reads pair with their counterparts and move.
+            let sites = r.divergences();
+            assert!(
+                matches!(
+                    sites.as_slice(),
+                    [Divergence::Changed(m)] if matches!(m.dst.node, TypedExprNode::Tuple(_))
+                ),
+                "at {stage:?} the swap must localize to the tuple:\n{r}",
+            );
+            // And the tuple itself is not offered for reuse: its two elements
+            // returned swapped values.
+            assert!(
+                !r.shared_roots()
+                    .iter()
+                    .any(|m| matches!(m.src.node, TypedExprNode::Tuple(_))),
+                "at {stage:?} the swapped tuple is not reusable wholesale:\n{r}",
+            );
+        }
+    }
+
+    #[test]
+    fn compile_to_rejects_what_compile_program_rejects() {
+        // `compile_to` is a second path through the frontend, so a program the
+        // real pipeline refuses must not yield a stage snapshot: the differ
+        // would otherwise be handed a tree whose illegal construct was silently
+        // dropped, and two versions differing only in it would diff as
+        // identical. `x := 2` writes to an immutable binding, which
+        // `check_mut_write_targets` is what rejects.
+        let src = indoc! {"
+            x = 1
+            x := 2
+            x
+        "};
+        for stage in [
+            CompileStage::Inferred,
+            CompileStage::Inlined,
+            CompileStage::Channelized,
+            CompileStage::LambdaElim,
+            CompileStage::Planned,
+        ] {
+            assert!(
+                compile_to(src, stage).is_err(),
+                "a write to an immutable binding must be rejected at {stage:?}",
+            );
+        }
+        // `Lowered` is below every check by construction — it is the tree as
+        // lowering built it, and the write is still a `MutWrite` node there.
+        assert!(compile_to(src, CompileStage::Lowered).is_ok());
     }
 
     #[test]

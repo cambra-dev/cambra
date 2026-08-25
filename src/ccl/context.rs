@@ -3,6 +3,8 @@
 // builtins
 // ---------------------------------------------------------------------------
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
 use crate::chl_parser;
@@ -11,7 +13,7 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, channelize,
+        Expr, Name, channelize,
         infer::{
             InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
             check_pre_desugar, infer, typecheck,
@@ -25,7 +27,7 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
         operator_conversion::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
@@ -522,12 +524,13 @@ pub struct CompiledProgram {
     /// The post-desugar IR snapshot — the inspector's **downstream** pane, one
     /// pipeline stage *below* [`post_inference_ir`](Self::post_inference_ir).
     ///
-    /// This is `expr` captured **right after `channelize`** (which now runs
-    /// after `infer`/`inline`/`transact`/`letrec`): fully typed and structurally
-    /// final for the source view — no Defer/Feed/Define nodes remain, and the
-    /// channelization artifacts (`Compose` wrapper chains, `Copair`
-    /// fan-ins) are present. Because monomorphization ran earlier (inside
-    /// `infer`), this tree is post-mono like [`post_inference_ir`](Self::post_inference_ir).
+    /// This is `expr` captured at the [`Channelized`](CompileStage::Channelized)
+    /// boundary — after `channelize` and the as-of-read rewrite that completes
+    /// it: fully typed and structurally final for the source view, with no
+    /// Defer/Feed/Define nodes left and the channelization artifacts (`Compose`
+    /// wrapper chains, `Copair` fan-ins) present. Because monomorphization ran
+    /// earlier (inside `infer`), this tree is post-mono like
+    /// [`post_inference_ir`](Self::post_inference_ir).
     ///
     /// Every id preserved through inline/transact/letrec/desugar is shared with
     /// [`post_inference_ir`](Self::post_inference_ir).
@@ -579,12 +582,12 @@ impl CompiledProgram {
 /// Every main-tree node id reachable in `expr` (the `walk_children` node set,
 /// refinement-predicate interiors excluded — the domain the lineage steps and
 /// the pane projections reason about).
-pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
-    fn go(e: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
+pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
+    fn go(e: &Expr, acc: &mut HashSet<NodeId>) {
         acc.insert(e.node_id());
         e.walk_children(|c| go(c, acc));
     }
-    let mut acc = std::collections::HashSet::new();
+    let mut acc = HashSet::new();
     go(expr, &mut acc);
     acc
 }
@@ -609,17 +612,13 @@ fn assert_leaks_clean(leaks: &[Leak], boundary: &str) {
 /// check does not false-fire there). Returns `(id, node kind)` for each
 /// occurrence *beyond the first*.
 fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
-    fn walk(
-        e: &Expr,
-        seen: &mut std::collections::HashSet<NodeId>,
-        dups: &mut Vec<(NodeId, &'static str)>,
-    ) {
+    fn walk(e: &Expr, seen: &mut HashSet<NodeId>, dups: &mut Vec<(NodeId, &'static str)>) {
         if !seen.insert(e.node_id()) {
             dups.push((e.node_id(), e.node.kind_name()));
         }
         e.walk_children(|c| walk(c, seen, dups));
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut dups = Vec::new();
     walk(expr, &mut seen, &mut dups);
     dups
@@ -674,6 +673,82 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
     );
 }
 
+/// `check_pre_desugar` as a wall between two passes. It is the relaxed
+/// pre-desugar check, which permits the transient `Feed` / `Infer`-channel-domain
+/// types only channelization erases.
+///
+/// A failure is a compiler bug, with one exception: residual `Type::Infer`
+/// variables, which inference deliberately tolerates for a generalized
+/// definition the program never exercises at a concrete type (see
+/// `Type::Infer`'s invariant). That residue is an *ambiguous program* — a user
+/// error — so it is rendered as a diagnostic; anything else panics, naming
+/// `produced_by`.
+fn pre_desugar_wall(expr: &Expr, produced_by: &str) -> Result<(), Vec<CompileError>> {
+    check_pre_desugar(expr).map_err(|errs| {
+        if errs
+            .iter()
+            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
+        {
+            errs.into_compile_errors()
+        } else {
+            panic!("{produced_by} created invalid expr: {errs:?}")
+        }
+    })
+}
+
+/// The two user-facing mutability rules, checked on the fully-typed,
+/// still-`Mut`-bearing tree — after [`pre_desugar_wall`], before inlining.
+///
+/// Both need the pre-inline `Apply`/parameter structure and the coalesced `.ty`
+/// slots and `user_annotation`s. Unlike the surrounding [`pre_desugar_wall`]
+/// calls (compiler-bug backstops), these are user errors:
+///
+/// - `check_mut_discipline` — the second-class `Mut` discipline
+///   (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
+///   (downward-only)"): no aliasing or nesting a mutable reference.
+/// - `check_mut_write_targets` — every `:=` / `+=` write targets a mutable
+///   variable, never a shadowing rebind of an immutable. Load-bearing rather
+///   than a formality: lowering emits a `MutWrite` for any `x := e` whose name is
+///   already in scope, mutable variable or not (see `src/ccl/design/mutability.md`,
+///   "Mutability is the type (no lowering registry)"), so this is what rejects a
+///   write to an immutable binding — or to one monomorphization has since dropped.
+fn check_mut_rules(expr: &Expr) -> Result<(), Vec<CompileError>> {
+    check_mut_discipline(expr).map_err(|errs| errs.into_compile_errors())?;
+    check_mut_write_targets(expr).map_err(|errs| errs.into_compile_errors())
+}
+
+/// The transact phase's four rejections, run on the inlined, typed tree before
+/// [`transact_phase::run`] strips the sites they inspect.
+///
+/// - `check_no_nested_transactions` — a transactional writer reaching a `with
+///   begin():` block via a function call. The callee's inlined `For` would
+///   otherwise be silently absorbed into the outer block's read-your-writes env,
+///   dropping its commit.
+/// - `check_no_induction_only_transactions` — an induction accumulator written
+///   inside a block with no mutable variable write is a no-atomicity transaction.
+///   Rejected here, type-aware, rather than at lowering.
+/// - `check_no_guarded_induction_write_in_block` — a *guarded* induction write
+///   inside a committing block (`balance := …; if p: cnt += 1`) is not liftable
+///   and would be silently dropped from the decision record. A debug-only assert
+///   would miss it in release.
+/// - `check_await_final_linearity` — `await_final` consumes its mutable variable:
+///   no mention may follow its await. A statement-order rule lowering cannot see,
+///   since it builds its chain right-to-left, and a callee's mention only becomes
+///   a read, a write, or a `Begin` once inlined. (The companion rule, that a commit
+///   store may not depend on the completion of that same store, is decided per
+///   store and so lives inside the phase.)
+fn check_transact_rejections(
+    expr: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> Result<(), Vec<CompileError>> {
+    let reject = |msg: String| vec![CompileError::Unsupported(msg)];
+    transact_phase::check_no_nested_transactions(expr, txn_mut_vars).map_err(reject)?;
+    transact_phase::check_no_induction_only_transactions(expr, txn_mut_vars).map_err(reject)?;
+    transact_phase::check_no_guarded_induction_write_in_block(expr, txn_mut_vars)
+        .map_err(reject)?;
+    transact_phase::check_await_final_linearity(expr).map_err(reject)
+}
+
 /// A pipeline stage a program can be compiled to for diffing; the differ
 /// ([`crate::ccl::diff`]) accepts an [`Expr`] at any of them. See
 /// `src/ccl/design/diffing.md`, "Which stage to diff".
@@ -726,159 +801,67 @@ pub enum CompileStage {
     Planned,
 }
 
-/// Compile `code` to the given [`CompileStage`], ready to pass to
-/// [`crate::ccl::diff::diff`]. Sources — the pre-registered `stdin()` and any
-/// discovered during lowering — are registered for inference, so the result is
-/// reachable end-to-end from source.
-///
-/// Pair two results for a program diff (each tree must outlive the borrow), or
-/// use [`crate::ccl::diff::diff_programs`] for the common case:
-/// ```ignore
-/// let (a, b) = (compile_to(s1, CompileStage::Inferred)?, compile_to(s2, CompileStage::Inferred)?);
-/// let d = crate::ccl::diff::diff(&a, &b);
-/// ```
-///
-/// The prefix here mirrors [`compile_program`]'s frontend, stopping at the
-/// requested stage rather than continuing to the operator graph.
-///
-/// Choosing a stage is choosing how much of the compiler's own rewriting to
-/// diff through, and it is a trade in both directions — a later stage
-/// normalizes more away but spreads a single edit over more of the tree. See
-/// [`CompileStage`] and `src/ccl/design/diffing.md`, "How much to normalize".
-///
-/// The transaction, mutability and channelization phases are not separately
-/// selectable: they are one rewrite of the user's loops and feeds into `LetRec`
-/// recurrences, and stopping between them exposes a half-rewritten tree no
-/// consumer wants. [`Channelized`] is the point where that rewrite is complete.
-///
-/// [`Channelized`]: CompileStage::Channelized
-pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
-    let mut ctx = GlobalContext::new();
-    let mut errors: Vec<CompileError> = Vec::new();
-
-    let parse_result = chl_parser::parse_module(code);
-    errors.extend(parse_result.errors.into_iter().map(CompileError::Parse));
-    let Some(module) = parse_result.value else {
-        return Err(errors);
-    };
-    if module.body.is_empty() {
-        errors.push(CompileError::Lower(LoweringError::unsupported(
-            chl_parser::ast::Span::new(0, code.len()),
-            "empty program: file contains no top-level statements",
-        )));
-        return Err(errors);
-    }
-
-    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
-    errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
-    let Some(mut expr) = lower_result.value else {
-        return Err(errors);
-    };
-    // `Error` placeholders make the tree unfit for inference (and meaningless
-    // to diff), so bail on any earlier-stage error even at the `Lowered` stage.
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    if stage == CompileStage::Lowered {
-        return Ok(expr);
-    }
-
-    expr = uniquify::run(expr);
-    for (_name, source) in ctx.lowering_ctx().take_sources() {
-        let name = source.borrow().get_id().to_string();
-        let output_type = source.borrow().output_type();
-        // The source's data-function type is constructed inside
-        // `register_source_type` from the element type — the `Data` kind is
-        // intrinsic, not stamped here.
-        ctx.inference_ctx().register_source_type(&name, output_type);
-    }
-    // No lowering projection is threaded here — this entry point exists to hand a
-    // tree to the differ, not to render diagnostics — so an inference error keeps
-    // its blame node but degrades to a span-less `CompileError`.
-    if let Err(errors) = infer(&mut expr, ctx.inference_ctx()) {
-        return Err(errors
-            .into_iter()
-            .map(|located| CompileError::Infer {
-                error: located.error,
-                span: None,
-            })
-            .collect());
-    }
-    if stage == CompileStage::Inferred {
-        return Ok(expr);
-    }
-
-    let expr = inline::inline_capability_lambdas(expr);
-    if stage == CompileStage::Inlined {
-        return Ok(expr);
-    }
-
-    // The staged path exists to hand the differ a tree the real pipeline would
-    // also have produced, so it runs the transact phase's rejection checks too:
-    // a program `compile_program` refuses must not yield a stage snapshot here.
-    let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
-    transact_phase::check_no_nested_transactions(&expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    transact_phase::check_no_induction_only_transactions(&expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    transact_phase::check_await_final_linearity(&expr)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    let expr = transact_phase::run(expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    let expr = mut_elim::run(expr);
-    let mut expr = channelize::run(expr).errs()?;
-    transact_phase::rewrite_as_of_reads(&mut expr)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    if stage == CompileStage::Channelized {
-        return Ok(expr);
-    }
-
-    let expr = lambda_elim::run(expr).errs()?;
-    if stage == CompileStage::LambdaElim {
-        return Ok(expr);
-    }
-
-    debug_assert_eq!(
-        stage,
-        CompileStage::Planned,
-        "every CompileStage must be handled before this point",
-    );
-    Ok(planning::run(planning::plan_loops(expr)))
+/// What a frontend run hands back besides the tree at its stop stage.
+struct Frontend {
+    /// The tree at the requested [`CompileStage`].
+    expr: Expr,
+    /// The surface AST lowering consumed, retained for source-level queries.
+    module: chl_parser::ast::Module,
+    /// Sink bindings discovered during lowering. Drained before the sources,
+    /// which is the order [`LoweringContext`] requires.
+    sink_bindings: HashMap<String, Arc<dyn DataSink>>,
 }
 
-/// Compile a CHL program and return its operator graph plus subscribed outputs.
+/// The provenance a frontend run records when asked for it: the lowering
+/// projection every release `InferError` resolves its span against, and the IR
+/// snapshots the inspector's panes read.
 ///
-/// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
-/// per "output" of the program:
+/// Recording is the whole difference between the two entry points besides where
+/// they stop. [`compile_program`] asks for it; [`compile_to`] hands a tree to
+/// the differ and renders no diagnostics, so it passes `None` and the frontend
+/// skips the recorder session, the projection fold and the three clones.
+#[derive(Default)]
+struct FrontendRecord {
+    /// See [`CompiledProgram::lowering_projection`].
+    lowering_projection: SourceProjection,
+    /// See [`CompiledProgram::pre_inference_ir`]; taken at the [`Lowered`]
+    /// boundary, after α-uniquification.
+    ///
+    /// [`Lowered`]: CompileStage::Lowered
+    pre_inference_ir: Option<Expr>,
+    /// See [`CompiledProgram::post_inference_ir`]; taken at the [`Inferred`]
+    /// boundary.
+    ///
+    /// [`Inferred`]: CompileStage::Inferred
+    post_inference_ir: Option<Expr>,
+    /// See [`CompiledProgram::post_desugar_ir`]; taken at the [`Channelized`]
+    /// boundary.
+    ///
+    /// [`Channelized`]: CompileStage::Channelized
+    post_desugar_ir: Option<Expr>,
+}
+
+/// The compiler frontend: source in, a CCL tree at `stop` out.
 ///
-/// - **Pure programs** (no sinks): a single `("main", op)` entry whose
-///   producer is subscribed to `main_consumer`.  The caller drives the main
-///   loop by repeatedly calling [`TileProducer::get`] on that producer.
-/// - **Sink programs** (e.g. `http_serve`): one entry per sink field of the
-///   trailing `Record{…}`, each wired to a [`SinkConsumer`] that dispatches
-///   to the registered [`DataSink`](crate::interpreter::DataSink).  For
-///   sink-only programs the supplied `main_consumer` is dropped before
-///   returning.
-pub fn compile_program(
+/// **This is the only place the pass sequence and its checks are written.**
+/// [`compile_program`] runs it to `Planned` and continues into operator
+/// conversion; [`compile_to`] runs it to whichever stage a diff is being taken
+/// at and stops. A check added here therefore lands on both, which is what keeps
+/// a staged snapshot from being a tree the real pipeline would have rejected.
+///
+/// `record` selects whether the run also builds the inspector's
+/// [`FrontendRecord`]; nothing else about the two callers differs.
+fn run_frontend(
     ctx: &mut GlobalContext,
     code: &str,
-    main_consumer: Box<dyn Consumer>,
-) -> Result<CompiledProgram, Vec<CompileError>> {
-    // ---- User-facing failure points ----
-    //
-    // The pipeline now accumulates errors across the *parse* and *lower*
-    // stages before bailing: when the parser recovers from a syntax error
-    // it still produces a partial AST, which lowering can run on and report
-    // its own errors against. The combined list is returned in one pass so
-    // the user sees everything at once. Inference and downstream stages
-    // skip when anything earlier produced an error — they assume a well-
-    // typed CCL tree without `Error` placeholders.
-    //
-    // Stage-internal consistency checks (`typecheck`, `check_fully_typed`)
-    // keep their `.expect` because firing them means the compiler itself is
-    // wrong, not the user's input.
+    stop: CompileStage,
+    mut record: Option<&mut FrontendRecord>,
+) -> Result<Frontend, Vec<CompileError>> {
+    // The parse and lower stages accumulate errors before bailing: when the
+    // parser recovers from a syntax error it still produces a partial AST, which
+    // lowering can run on and report its own errors against, so the user sees
+    // everything at once. Inference and below assume a well-typed tree with no
+    // `Error` placeholders, so they are skipped when anything earlier failed.
     let mut errors: Vec<CompileError> = Vec::new();
 
     let parse_result = chl_parser::parse_module(code);
@@ -899,73 +882,88 @@ pub fn compile_program(
         return Err(errors);
     }
 
-    // The always-on lowering session: installed in every
-    // build for the whole of lowering. Its leaf entries (`tag_source`/
-    // `tag_machinery`) and copy-frame flushes (uncurry, compare-chain) record a
-    // `LoweringLog`, folded once at the handoff below into the always-on lowering
-    // projection. It must fully drain before the first pass (Mono) session opens.
-    let lowering_session = RecorderSession::lowering();
+    // The lowering session covers the whole of lowering. Its leaf entries
+    // (`tag_source` / `tag_machinery`) and copy-frame flushes (uncurry,
+    // compare-chain) record a `LoweringLog`, folded once at the handoff below
+    // into the lowering projection. It must fully drain before the first pass
+    // (Mono) session opens. Without a session installed the recorder is inert,
+    // which is what a run that wants no projection gets.
+    let session = record.is_some().then(RecorderSession::lowering);
     let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
-    let Some(mut expr) = lower_result.value else {
+    let Some(expr) = lower_result.value else {
         return Err(errors);
     };
-
-    // Anything wrong earlier in the pipeline means `expr` may contain
-    // `TypedExprNode::Error` placeholders; inference and below would
-    // panic on them via [`crate::unexpected_error_node!`]. Bail here.
+    // Anything wrong earlier means `expr` may contain `TypedExprNode::Error`
+    // placeholders; inference and below would panic on them via
+    // [`crate::unexpected_error_node!`], and they are meaningless to diff.
     if !errors.is_empty() {
         return Err(errors);
     }
 
-    // Drain sink bindings discovered during lowering before taking sources.
-    let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();
+    // Drain sink bindings before taking sources.
+    let sink_bindings = ctx.lowering_ctx().take_sink_bindings();
 
-    // Drain the lowering log and fold it once, at the lowering→pipeline
-    // handoff (before uniquify/inference, so the release `InferError` read timing
-    // is unchanged), into the always-on **lowering projection**: every lowered
-    // node's [`SourceAttribution`], keyed by NodeId. It is the base every later
-    // pane fold bottoms out in, and the source the release `InferError`
-    // diagnostics resolve against one-hop. `uniquify` preserves every id in
-    // place, so the projection's keys survive into the pre-inference pane.
-    //
-    // The fold's leak taxonomy enforces mint coverage: an unrecorded lowering
-    // mint surfaces as `Leak::Unexplained` (every output-tree node must be
-    // explained by a leaf or a copy). The checks are debug/test
-    // gated at the boundary via `assert_leaks_clean`; the fold itself is
-    // always-on (its product is release-critical).
-    // Id uniqueness is the precondition for keying anything by `NodeId`, so gate
-    // it before the fold that does exactly that: a duplicate here would silently
-    // collapse two nodes' attributions into one projection entry. Lowering's own
-    // copy sites (uncurry's template discharge, the chained-comparison operand
-    // freshens) are what make this a live risk at this boundary.
-    assert_unique_node_ids(&expr, "post-lowering");
-
-    let lowering_log = lowering_session.into_lowering_log();
-    let lowering_projection = {
+    if let (Some(rec), Some(session)) = (record.as_deref_mut(), session) {
+        // Fold the lowering log once, at the lowering→pipeline handoff and
+        // before uniquify/inference (so the release `InferError` read timing is
+        // unchanged), into the **lowering projection**: every lowered node's
+        // `SourceAttribution`, keyed by NodeId. It is the base every later pane
+        // fold bottoms out in. `uniquify` preserves every id in place, so the
+        // projection's keys survive into the pre-inference pane.
+        //
+        // Id uniqueness is the precondition for keying anything by `NodeId`, so
+        // gate it before the fold that does exactly that: a duplicate here would
+        // silently collapse two nodes' attributions into one projection entry.
+        // Lowering's own copy sites (uncurry's template discharge, the
+        // chained-comparison operand freshens) are what make this a live risk.
+        assert_unique_node_ids(&expr, "post-lowering");
+        let lowering_log = session.into_lowering_log();
         let output_ids = collect_tree_ids(&expr);
         let (projection, leaks) = collapse_lowering(&lowering_log, &output_ids);
+        // The fold's leak taxonomy enforces mint coverage: an unrecorded
+        // lowering mint surfaces as `Leak::Unexplained`. The checks are
+        // debug/test gated; the fold itself is always-on, its product being
+        // release-critical.
         assert_leaks_clean(&leaks, "lowering");
-        projection
-    };
+        rec.lowering_projection = projection;
+    }
 
+    let expr = run_passes(ctx, expr, stop, record)?;
+    Ok(Frontend {
+        expr,
+        module,
+        sink_bindings,
+    })
+}
+
+/// The pass sequence, from the lowered tree to `stop`.
+///
+/// Split out of [`run_frontend`] only so each stage boundary can `return` the
+/// tree; the two are one pipeline.
+fn run_passes(
+    ctx: &mut GlobalContext,
+    mut expr: Expr,
+    stop: CompileStage,
+    mut record: Option<&mut FrontendRecord>,
+) -> Result<Expr, Vec<CompileError>> {
     debug!("Lowered (pre-desugar):\n{}", symbolic(&expr));
+    if stop == CompileStage::Lowered {
+        return Ok(expr);
+    }
 
-    // α-uniquify all binders (Barendregt convention): every binding site gets
-    // a globally fresh `Name` uid, so shadowing ceases to exist before any
-    // pass that compares names. Must run before defer desugaring — desugar's
-    // rewrites splice and rename terms under the assumption that distinct
-    // binders are distinct names. (Desugar now runs after inference; see below.)
+    // α-uniquify all binders (Barendregt convention): every binding site gets a
+    // globally fresh `Name` uid, so shadowing ceases to exist before any pass
+    // that compares names. Must run before channelization, whose rewrites splice
+    // and rename terms under the assumption that distinct binders are distinct
+    // names.
     expr = uniquify::run(expr);
-
-    // Retain the pre-inference IR for the inspector's upstream pane before
-    // `infer` mutates `expr` in place. This is the source-shaped, pre-mono,
-    // still-hole-typed tree. Its ids resolve against the `lowering_projection`
-    // (the pre-mono originals). See `CompiledProgram::pre_inference_ir`.
-    let pre_inference_ir = expr.clone();
+    if let Some(rec) = record.as_deref_mut() {
+        rec.pre_inference_ir = Some(expr.clone());
+    }
 
     // Register every source (pre-registered + discovered during lowering) with
-    // inference and operator-conversion now that the full source set is known.
+    // inference and operator conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
@@ -975,234 +973,251 @@ pub fn compile_program(
         ctx.inference_ctx().register_source_type(&name, output_type);
         ctx.conversion_ctx().register_source(name, source);
     }
-
     debug!("Lowered:\n{}", symbolic(&expr));
 
     // Inference runs on the user-shaped tree — before channelize — so type
     // errors are reported against the program the user wrote, not the
     // channelized rewrite.
-    let infer_outcome = infer(&mut expr, ctx.inference_ctx());
-    // On failure, resolve each error's own blame node to a source span *here* —
-    // the lowering projection is in scope and holds the lowered attribution (this
-    // is the always-on release read: one hop, no fold). Every error names a node;
-    // an id the projection doesn't cover (a node minted after lowering, e.g. by
-    // monomorphization) degrades to a span-less diagnostic.
-    if let Err(errors) = infer_outcome {
+    //
+    // On failure, resolve each error's own blame node to a source span here
+    // (the release read: one hop, no fold). Every error names a node; an id the
+    // projection doesn't cover — a node minted after lowering, e.g. by
+    // monomorphization — degrades to a span-less diagnostic, as does every error
+    // on a run that recorded no projection.
+    if let Err(errors) = infer(&mut expr, ctx.inference_ctx()) {
+        let projection = record.as_deref().map(|rec| &rec.lowering_projection);
         return Err(errors
             .into_iter()
-            .map(|located| {
-                let span = lowering_projection
-                    .get(&located.node_id)
-                    .and_then(|attr| attr.spans.first().copied());
-                CompileError::Infer {
-                    error: located.error,
-                    span,
-                }
+            .map(|located| CompileError::Infer {
+                error: located.error,
+                span: projection
+                    .and_then(|p| p.get(&located.node_id))
+                    .and_then(|attr| attr.spans.first().copied()),
             })
             .collect());
     }
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
-    // Consistency wall between `infer` and `channelize`. It is the relaxed
-    // *pre-desugar* check (`check_pre_desugar`), which permits the transient
-    // `Feed` / `Infer`-channel-domain types only desugar can erase. A failure
-    // here is a compiler bug — with one exception: residual `Type::Infer`
-    // variables, which inference deliberately tolerates for a generalized
-    // definition the program never exercises at a concrete type (see
-    // `Type::Infer`'s invariant). That residue is an *ambiguous program* — a
-    // user error — so it is rendered as a diagnostic; anything else panics.
-    check_pre_desugar(&expr).map_err(|errs| {
-        if errs
-            .iter()
-            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
-        {
-            errs.into_compile_errors()
-        } else {
-            panic!("Inference created invalid expr: {errs:?}")
-        }
-    })?;
 
-    // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
-    // "No aliasing: `Mut` values are second-class (downward-only)") on the
-    // fully-typed, still-`Mut`-bearing tree — after the consistency wall,
-    // before inlining. It needs the pre-inline `Apply`/parameter structure
-    // (rule 1's argument check) and the coalesced `.ty` slots and
-    // `user_annotation`s. Unlike the surrounding `check_pre_desugar` walls
-    // (compiler-bug backstops), these are user errors: aliasing or nesting a
-    // mutable reference.
-    check_mut_discipline(&expr).map_err(|errs| errs.into_compile_errors())?;
+    // Consistency wall between `infer` and `channelize`, then the two mutability
+    // rules on the fully-typed, still-`Mut`-bearing tree.
+    pre_desugar_wall(&expr, "Inference")?;
+    check_mut_rules(&expr)?;
+    if let Some(rec) = record.as_deref_mut() {
+        rec.post_inference_ir = Some(expr.clone());
+    }
+    if stop == CompileStage::Inferred {
+        return Ok(expr);
+    }
 
-    // Enforce that every `:=` / `+=` write targets a mutable variable (a write is
-    // never a shadowing rebind of an immutable). Post-inference so binder types
-    // are resolved, post-`uniquify` so write targets carry their binder's
-    // α-unique name — see `check_mut_write_targets`. Load-bearing rather than a
-    // formality: lowering emits a `MutWrite` for any `x := e` whose name is already in
-    // scope, mutable variable or not (see `src/ccl/design/mutability.md`, "Mutability is the
-    // type (no lowering registry)"), so this is what rejects a write to an immutable
-    // binding — or to one monomorphization has since dropped.
-    check_mut_write_targets(&expr).map_err(|errs| errs.into_compile_errors())?;
-
-    // Inline UDFs *before* desugar: a defer-mediating UDF (`λ out → out << e`)
-    // or a cross-function writer is beta-reduced to its call site before
-    // desugar routes feeds and before the unified letrec phase folds writers,
+    // Inline UDFs *before* channelization: a defer-mediating UDF (`λ out → out
+    // << e`) or a cross-function writer is beta-reduced to its call site before
+    // channelize routes feeds and before the unified letrec phase folds writers,
     // both of which need their targets lexically present. Inlining runs on the
     // still-defer-bearing tree (Defer/Feed nodes and `Feed` types present) via
-    // the defer-aware `Subst` engine (which renames a fed-to handle on
-    // beta-reduction) and preserves defer-returning generators, so the
+    // the defer-aware `Subst` engine, which renames a fed-to handle on
+    // beta-reduction, and preserves defer-returning generators — so the
     // post-inline wall is the relaxed `check_pre_desugar`, not strict
     // `typecheck`.
-    // Retain the post-inference IR for the inspector before `inline` consumes
-    // `expr`. This is the source-shaped, fully-typed anchor (lambdas intact, not
-    // yet point-free; inline/transact/letrec/desugar/lambda_elim/planning have
-    // not run). `ast` (`join_planned`) is the *wrong* tree for a source
-    // view — `lambda_elim`/`planning` re-mint ids and produce execution shape.
-    // See `CompiledProgram::post_inference_ir`.
-    let post_inference_ir = expr.clone();
-
-    expr = inline::inline_capability_lambdas(expr);
+    let mut expr = inline::inline_capability_lambdas(expr);
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
-    check_pre_desugar(&expr).map_err(|errs| {
-        if errs
-            .iter()
-            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
-        {
-            errs.into_compile_errors()
-        } else {
-            panic!("UDF inlining created invalid expr: {errs:?}")
-        }
-    })?;
+    pre_desugar_wall(&expr, "UDF inlining")?;
+    if stop == CompileStage::Inlined {
+        return Ok(expr);
+    }
 
     // Transactional slice of the unified phase: rewrite every `with begin():`
-    // writer of a `Mut(_, Txn)` mutable variable into a `get_prev_txn`-guarded `LetRec`
-    // (histories + commit records over the commit domain), which
+    // writer of a `Mut(_, Txn)` mutable variable into a `get_prev_txn`-guarded
+    // `LetRec` (histories + commit records over the commit domain), which
     // `planning::plan_loops` destructures into the `Transact{…, Txn}` node
     // op-conversion compiles to the commit engine — unifying the transaction and
     // induction paths on one `LetRec` + recognition representation. Runs *before*
     // `mut_elim` so the induction phase never sees a transaction loop. See
     // src/ccl/design/mutability.md.
     //
-    // Being a transactional variable is the `Mut(_, Txn)` type; identity is the α-unique
-    // binder `Name`. Both are read off the *inlined, typed* tree — so a
-    // cross-function writer's mutable variables (its `transfer(a, b)` writes already
-    // beta-reduced to name `a`/`b`) are seen, and an unrelated local merely spelled
-    // like a mutable variable is not (its binder is a distinct `Name`). This replaces the
-    // lowering-time base-name registry.
+    // Being a transactional variable is the `Mut(_, Txn)` type; identity is the
+    // α-unique binder `Name`. Both are read off the *inlined, typed* tree — so a
+    // cross-function writer's mutable variables (its `transfer(a, b)` writes
+    // already beta-reduced to name `a`/`b`) are seen, and an unrelated local
+    // merely spelled like a mutable variable is not, its binder being a distinct
+    // `Name`.
     let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
-    // A transactional writer reaching a `with begin():` block via a function call
-    // is a nested transaction — the callee's inlined `For` would otherwise be
-    // silently absorbed into the outer block's read-your-writes env, dropping its
-    // commit. Reject it before the phase strips the sites.
-    transact_phase::check_no_nested_transactions(&expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    // An induction accumulator written inside a block with no mutable variable write is a
-    // no-atomicity transaction — rejected here (type-aware), not at lowering.
-    transact_phase::check_no_induction_only_transactions(&expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    // A *guarded* induction write inside a committing block (`balance := …; if p:
-    // cnt += 1`) is not liftable and would be silently dropped from the decision
-    // record — reject it before the phase runs (a debug-only assert would miss it
-    // in release).
-    transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_mut_vars)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    // `await_final` consumes its mutable variable: no mention may follow its await. A
-    // statement-order rule lowering cannot see — it builds its chain right-to-left —
-    // and a callee's mention only becomes a read, a write, or a `Begin` once inlined.
-    // (The companion rule, that a commit store may not depend on the completion of
-    // that same store, is decided per store and so lives inside the phase.)
-    transact_phase::check_await_final_linearity(&expr)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    check_transact_rejections(&expr, &txn_mut_vars)?;
     expr = transact_phase::run(expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
 
     // The unified letrec phase: direct-mirror mutation loops (`For` /
-    // `MutWrite`) become causal `LetRec` groups — mutable histories over
-    // the induction domain, per src/ccl/design/mutability.md. Runs after
-    // inlining (so cross-function writers land at their call sites) and
-    // *before* channelize, so a per-iteration feed inside a loop is
-    // hoisted to an ordinary feed of the loop's history for desugar to route.
-    // The tree still carries Defer/Feed here, so the walls are the relaxed
-    // pre-desugar check.
-    let phase_out = mut_elim::run(expr);
-    debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
-    check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
+    // `MutWrite`) become causal `LetRec` groups — mutable histories over the
+    // induction domain, per src/ccl/design/mutability.md. Runs after inlining, so
+    // cross-function writers land at their call sites, and *before* channelize,
+    // so a per-iteration feed inside a loop is hoisted to an ordinary feed of the
+    // loop's history for channelization to route. The tree still carries
+    // Defer/Feed here, so the wall is the relaxed pre-desugar check.
+    let expr = mut_elim::run(expr);
+    debug!("Letrec phase CCL:\n{}", symbolic(&expr));
+    check_pre_desugar(&expr).expect("letrec phase produced an inconsistent tree");
 
     // Feed channelization — the feed-routing step of the unified phase, run on
-    // the phase-emitted `LetRec` tree (recognition happens *after*
-    // `lambda_elim`, below). Every `let d = Defer in body` is rewritten to
-    // `let d = <channel> in body`, where `<channel>` is the `++`-union of the
-    // defer's `<<` / `<<=` contributions; a channel assembled from a group's
-    // taps binds inside the letrec body, below the binders it captures.
-    // After this, no Defer/Feed/Define nodes — and no `Feed`/`ChanDom` types —
-    // remain: channelization is type-preserving by construction and closes
-    // channel domains by substitution; the strict `typecheck` below is the
-    // release-visible enforcement.
-    let mut desugared = channelize::run(phase_out).errs()?;
-    debug!("Channelized:\n{}", symbolic(&desugared));
-    typecheck(&desugared).expect("channelize produced an ill-typed tree");
+    // the phase-emitted `LetRec` tree (recognition happens *after* `lambda_elim`,
+    // below). Every `let d = Defer in body` is rewritten to `let d = <channel> in
+    // body`, where `<channel>` is the `++`-union of the defer's `<<` / `<<=`
+    // contributions; a channel assembled from a group's taps binds inside the
+    // letrec body, below the binders it captures. After this, no
+    // Defer/Feed/Define nodes — and no `Feed`/`ChanDom` types — remain:
+    // channelization is type-preserving by construction and closes channel
+    // domains by substitution; the strict `typecheck` is the release-visible
+    // enforcement.
+    let mut expr = channelize::run(expr).errs()?;
+    debug!("Channelized:\n{}", symbolic(&expr));
+    typecheck(&expr).expect("channelize produced an ill-typed tree");
 
-    // Retain the post-channelize tree for the inspector's downstream pane. On the
-    // post-inference desugar order this snapshot is *downstream* of
-    // `post_inference_ir` (post-inline/transact/letrec/channelize); see the doc
-    // comment on `post_desugar_ir`.
-    let post_desugar_ir = desugared.clone();
-
-    // Fed-out mutable variable reads: rewrite a read-only reply that reads a mutable variable out of
-    // its block into an outer-indexed as-of join (an as-of read at the reading
-    // transaction's arbitrary commit position), *before* lambda elimination — so a
-    // computed reply (`resp << balance + 1`) stays a lambda the elim pass point-frees,
-    // rather than a point-free `const` a planning-time recognizer would have to
-    // reject. Uniform across the reading loop's domain. See
-    // `transact_phase::rewrite_as_of_reads`.
-    transact_phase::rewrite_as_of_reads(&mut desugared)
+    // Fed-out mutable variable reads: rewrite a read-only reply that reads a
+    // mutable variable out of its block into an outer-indexed as-of join (an
+    // as-of read at the reading transaction's arbitrary commit position),
+    // *before* lambda elimination — so a computed reply (`resp << balance + 1`)
+    // stays a lambda the elim pass point-frees, rather than a point-free `const`
+    // a planning-time recognizer would have to reject. Uniform across the reading
+    // loop's domain. See `transact_phase::rewrite_as_of_reads`.
+    transact_phase::rewrite_as_of_reads(&mut expr)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
+    typecheck(&expr).expect("as-of-read rewrite produced an ill-typed tree");
+    if let Some(rec) = record {
+        rec.post_desugar_ir = Some(expr.clone());
+    }
+    if stop == CompileStage::Channelized {
+        return Ok(expr);
+    }
 
-    let lambda_elim = lambda_elim::run(desugared).errs()?;
-    debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
-    debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
+    let expr = lambda_elim::run(expr).errs()?;
+    debug!("λ-eliminated CCL:\n{}", symbolic(&expr));
+    debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&expr));
+    // `typecheck` enforces hole-freeness as its first phase, so this call alone
+    // covers both checks.
+    typecheck(&expr).expect("type error after lambda elimination");
+    if stop == CompileStage::LambdaElim {
+        return Ok(expr);
+    }
 
-    // `typecheck` enforces hole-freeness as its first phase, so this call
-    // alone covers both checks.
-    typecheck(&lambda_elim).expect("type error after lambda elimination");
+    // Recognition: lower each causal group — now in its point-free normal form —
+    // onto the domain-parameterized `Transact` carrier (a `get_prev_txn`
+    // transaction group → `Transact{Txn}`; a `get_prev_seq` induction group →
+    // `Transact{iteration extent}`) so planning stages the writer sources and
+    // operator conversion picks the engine on the domain. Running post-elim is
+    // what keeps ONE letrec representation through channelize and lambda_elim;
+    // the point-free guard matcher re-checks causality here. See the `mut_elim`
+    // recognition docs.
+    let expr = planning::plan_loops(expr);
+    debug!("Letrec recognized CCL:\n{}", symbolic(&expr));
+    typecheck(&expr).expect("letrec recognition produced an ill-typed tree");
 
-    // Recognition: lower each causal group — now in its point-free normal
-    // form — onto the domain-parameterized `Transact` carrier (a
-    // `get_prev_txn` transaction group → `Transact{Txn}`; a `get_prev_seq`
-    // induction group → `Transact{iteration extent}`) so planning stages the
-    // writer sources and operator conversion picks the engine on the domain.
-    // Running post-elim is what keeps ONE letrec representation through
-    // channelize and lambda_elim; the point-free guard matcher re-checks
-    // causality at this wall. See the `mut_elim` recognition docs.
-    let recognized = planning::plan_loops(lambda_elim);
-    debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
-    typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
-
-    let join_planned = planning::run(recognized);
-    debug!(
-        "Join-planned CCL:\n{} : {}",
-        symbolic(&join_planned),
-        join_planned.ty
-    );
-    debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
-
-    // Planning is the one pass that introduces `iterate` / `restrict` /
-    // `Compose` staging, so re-checking its output catches a malformed tile
-    // graph an adjacency that doesn't chain would otherwise hide. Planning
-    // surfaces each iterated / join-satisfying extent on its producer
-    // (`refine_extent` / `set_extent`) and the strict checker
-    // matches the fresh refinements it mints by structural predicate
-    // equality, so the staging shapes now validate without re-blinding the
-    // check or peeling cast refinements.
-    typecheck(&join_planned).expect("type error after join planning");
-    // Invariant (debug): planning's `iterate`/`restrict` markers live in the
-    // term tree, never inside a type's refinement predicates — the substitution
-    // boundary strips the neutral `iterate` marker (`ccl_utils::strip_iterate_markers`),
-    // and a `restrict` reaching a predicate (a filtered source used in a refined
-    // domain) is unsupported and must surface loudly, not miscompile.
+    let expr = planning::run(expr);
+    debug!("Join-planned CCL:\n{} : {}", symbolic(&expr), expr.ty);
+    debug!("Join-planned CCL:\n{}", symbolic_typed(&expr));
+    // Planning is the one pass that introduces `iterate` / `restrict` / `Compose`
+    // staging, so re-checking its output catches a malformed tile graph an
+    // adjacency that doesn't chain would otherwise hide. Planning surfaces each
+    // iterated / join-satisfying extent on its producer (`refine_extent` /
+    // `set_extent`) and the strict checker matches the fresh refinements it mints
+    // by structural predicate equality, so the staging shapes validate without
+    // re-blinding the check or peeling cast refinements.
+    typecheck(&expr).expect("type error after join planning");
+    // Invariant (debug): planning's `iterate`/`restrict` markers live in the term
+    // tree, never inside a type's refinement predicates — the substitution
+    // boundary strips the neutral `iterate` marker
+    // (`ccl_utils::strip_iterate_markers`), and a `restrict` reaching a predicate
+    // (a filtered source used in a refined domain) is unsupported and must
+    // surface loudly, not miscompile.
     #[cfg(debug_assertions)]
-    crate::ccl::ccl_utils::debug_assert_no_iteration_markers(&join_planned);
+    crate::ccl::ccl_utils::debug_assert_no_iteration_markers(&expr);
+
+    debug_assert_eq!(
+        stop,
+        CompileStage::Planned,
+        "every CompileStage must be handled before this point",
+    );
+    Ok(expr)
+}
+
+/// Compile `code` to the given [`CompileStage`], ready to pass to
+/// [`crate::ccl::diff::diff`]. Sources — the pre-registered `stdin()` and any
+/// discovered during lowering — are registered for inference, so the result is
+/// reachable end-to-end from source.
+///
+/// Pair two results for a program diff (each tree must outlive the borrow), or
+/// use [`crate::ccl::diff::diff_programs`] for the common case:
+/// ```ignore
+/// let (a, b) = (compile_to(s1, CompileStage::Inferred)?, compile_to(s2, CompileStage::Inferred)?);
+/// let d = crate::ccl::diff::diff(&a, &b);
+/// ```
+///
+/// This runs [`run_frontend`] — the same passes and the same checks
+/// [`compile_program`] runs, stopping at `stage` rather than continuing into the
+/// operator graph. A program `compile_program` refuses therefore yields no stage
+/// snapshot here.
+///
+/// Choosing a stage is choosing how much of the compiler's own rewriting to diff
+/// through, and it is a trade in both directions — a later stage normalizes more
+/// away but spreads a single edit over more of the tree. See [`CompileStage`] and
+/// `src/ccl/design/diffing.md`, "How much to normalize".
+///
+/// The transaction, mutability and channelization phases are not separately
+/// selectable: they are one rewrite of the user's loops and feeds into `LetRec`
+/// recurrences, and stopping between them exposes a half-rewritten tree no
+/// consumer wants. [`Channelized`] is the point where that rewrite is complete.
+///
+/// [`Channelized`]: CompileStage::Channelized
+pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
+    let mut ctx = GlobalContext::new();
+    Ok(run_frontend(&mut ctx, code, stage, None)?.expr)
+}
+
+/// Compile a CHL program and return its operator graph plus subscribed outputs.
+///
+/// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
+/// per "output" of the program:
+///
+/// - **Pure programs** (no sinks): a single `("main", op)` entry whose
+///   producer is subscribed to `main_consumer`.  The caller drives the main
+///   loop by repeatedly calling [`TileProducer::get`] on that producer.
+/// - **Sink programs** (e.g. `http_serve`): one entry per sink field of the
+///   trailing `Record{…}`, each wired to a [`SinkConsumer`] that dispatches
+///   to the registered [`DataSink`](crate::interpreter::DataSink).  For
+///   sink-only programs the supplied `main_consumer` is dropped before
+///   returning.
+pub fn compile_program(
+    ctx: &mut GlobalContext,
+    code: &str,
+    main_consumer: Box<dyn Consumer>,
+) -> Result<CompiledProgram, Vec<CompileError>> {
+    // The frontend is [`run_frontend`], shared with [`compile_to`]: parse
+    // through join planning, plus every check between. Only the recording and
+    // the continuation past `Planned` are this function's own.
+    //
+    // Stage-internal consistency checks (`typecheck`, `check_pre_desugar`) keep
+    // their `.expect` inside the frontend because firing them means the compiler
+    // itself is wrong, not the user's input.
+    let mut record = FrontendRecord::default();
+    let frontend = run_frontend(ctx, code, CompileStage::Planned, Some(&mut record))?;
+    let Frontend {
+        expr: join_planned,
+        module,
+        sink_bindings: sink_bindings_registry,
+    } = frontend;
+    let FrontendRecord {
+        lowering_projection,
+        pre_inference_ir,
+        post_inference_ir,
+        post_desugar_ir,
+    } = record;
+    // The frontend fills all three whenever it is asked to record, and it ran to
+    // `Planned`, which is past every snapshot point.
+    let (Some(pre_inference_ir), Some(post_inference_ir), Some(post_desugar_ir)) =
+        (pre_inference_ir, post_inference_ir, post_desugar_ir)
+    else {
+        unreachable!("a recorded run to `Planned` passes every snapshot boundary")
+    };
 
     // Compile to one operator per field of the trailing record.  Pure
     // programs (no sinks) end up at this point with a bare expression at the
@@ -1295,6 +1310,7 @@ pub fn compile_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use rstest::rstest;
 
     /// Driver that runs `compile_program` for an error-only test, returning
@@ -1306,6 +1322,41 @@ mod tests {
         match compile_program(&mut ctx, code, consumer) {
             Ok(_) => panic!("expected compile error, got success"),
             Err(errs) => errs,
+        }
+    }
+
+    #[test]
+    fn both_entry_points_compile_to_one_tree() {
+        // `compile_to` and `compile_program` are one frontend, so the tree at
+        // `Planned` is the tree operator conversion consumes — node for node,
+        // modulo the fresh binder uids two independent compilations mint. If a
+        // pass or a check is ever added to only one of them, this diverges.
+        for code in [
+            indoc! {"
+                a = 1
+                b = 2
+                a + b
+            "},
+            indoc! {"
+                xs = [1, 2, 3]
+                sum([x * 2 for x in xs if x > 1])
+            "},
+            indoc! {"
+                acc := 0
+                for i in [1, 2, 3]:
+                    acc := acc + i
+                acc
+            "},
+        ] {
+            let mut ctx = GlobalContext::default();
+            let consumer: Box<dyn Consumer> = Box::new(|| {});
+            let program = compile_program(&mut ctx, code, consumer).expect(code);
+            let staged = compile_to(code, CompileStage::Planned).expect(code);
+            assert!(
+                crate::ccl::diff::diff(&program.ast, &staged).is_identical(),
+                "the two entry points disagree on:\n{code}\n{}",
+                crate::ccl::diff::diff(&program.ast, &staged),
+            );
         }
     }
 

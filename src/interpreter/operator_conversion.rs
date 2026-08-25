@@ -1528,7 +1528,7 @@ fn build_commit_store(
         // Seed tick 0 from the key's (literal or computed) init op.
         let init_op = convert_impl(&k.init, None, ctx)?;
         init_ops.push((runtime_key.clone(), init_op));
-        keys_map.insert(
+        let prior = keys_map.insert(
             field,
             KeyReadInfo {
                 runtime_key,
@@ -1536,6 +1536,11 @@ fn build_commit_store(
                 index: 0,            // unused for `commit` reads (keyed by `runtime_key`)
                 carry_forward: true, // mutable variable: value persists across commits
             },
+        );
+        debug_assert!(
+            prior.is_none(),
+            "commit-store key labels are distinct within one store; `Name::field_key` \
+             carries no uid, so distinctness is by spelling",
         );
     }
     let value_extent = match value_extents.len() {
@@ -1594,7 +1599,7 @@ fn build_commit_store(
         for (field, tap_ty) in taps {
             let tap_value_extent = ctx.extent_of(&tap_ty)?;
             write_keys.push(Value::String(field.clone().into()));
-            keys_map.insert(
+            let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
                     runtime_key: Value::String(field.clone().into()),
@@ -1605,6 +1610,13 @@ fn build_commit_store(
                     // taps to one defer don't smear across the shared clock.
                     carry_forward: false,
                 },
+            );
+            // A tap shares this map with the mutable-variable keys, so its
+            // `to_<base>_<n>` spelling must not collide with a variable's.
+            debug_assert!(
+                prior.is_none(),
+                "commit-store key labels are distinct within one store; `Name::field_key` \
+                 carries no uid, so distinctness is by spelling",
             );
             tap_fields.push(field);
         }
