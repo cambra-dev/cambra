@@ -174,23 +174,22 @@ const NUMERIC: &[TraitInstance] = &[
 /// construction because the row fixes both operand bases and the associated base at
 /// `Int`, leaving nothing for inference to resolve, the same reason
 /// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
-fn refinement_for_add(args: &[&TypedExpr]) -> TypedExpr {
-    if let [a1, a2] = args {
-        let int = prim(BaseType::Int);
-        TypedExpr::binop(
-            TypedExpr::var(Name::elem()).with_ty(int.clone()),
-            BinOpKind::Compare(CompareKind::Equals),
-            TypedExpr::binop(
-                (*a1).clone(),
-                BinOpKind::Arithmetic(ArithmeticKind::Add),
-                (*a2).clone(),
-            )
-            .with_ty(int),
-        )
-        .with_ty(prim(BaseType::Bool))
-    } else {
+fn refinement_for_add(args: &Vec<TypedExpr>) -> TypedExpr {
+    let [a1, a2] = &args[..] else {
         panic!("Addable is binary, so its instance's refinement receives two operands");
-    }
+    };
+    let int = prim(BaseType::Int);
+    TypedExpr::binop(
+        TypedExpr::var(Name::elem()).with_ty(int.clone()),
+        BinOpKind::Compare(CompareKind::Equals),
+        TypedExpr::binop(
+            a1.clone(),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            a2.clone(),
+        )
+        .with_ty(int),
+    )
+    .with_ty(prim(BaseType::Bool))
 }
 
 /// The numeric rows plus `(String, String) ⇝ String`.
@@ -1618,7 +1617,7 @@ mod tests {
     fn a_refinement_narrows_as_its_base() {
         let refined = Type::refined_one(
             Type::Base(BaseType::String),
-            crate::ccl::Refinement::born(Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(true)))),
+            Refinement::born(Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(true)))),
         );
         assert_eq!(offered_base(&refined), Some(&BaseType::String));
     }

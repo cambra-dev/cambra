@@ -1683,14 +1683,9 @@ pub type PredicateId = *const TypedExpr;
 /// it); nested refinements share it and shadow positionally.
 pub const REFINEMENT_BINDER: &str = "__elem";
 
-pub type RefinementTemplate = fn(&[&TypedExpr]) -> TypedExpr;
+pub type RefinementTemplate = fn(&Vec<TypedExpr>) -> TypedExpr;
 
 impl Refinement {
-    pub fn born_from_template(template: RefinementTemplate, args: &Vec<TypedExpr>) -> Self {
-        let args: Vec<&TypedExpr> = args.iter().collect();
-        Self::born(Rc::new(template(&args[..])))
-    }
-
     /// Construct a refinement over a **genuinely new** predicate term — one this
     /// call site is *creating*, with no prior refinement identity to preserve
     /// (a freshly-emitted filter, a synthesized loop-join condition, a compiled
@@ -1701,6 +1696,12 @@ impl Refinement {
     /// `Rc` sharing one `Rc` (see the note on [`Refinement::predicate`]).
     pub fn born(predicate: Rc<TypedExpr>) -> Self {
         Refinement { predicate }
+    }
+
+    /// Construct a refinement by applying a template function to a
+    /// list of argument expressions.
+    pub fn born_from_template(template: RefinementTemplate, args: &Vec<TypedExpr>) -> Self {
+        Self::born(Rc::new(template(args)))
     }
 
     /// Construct a refinement **deliberately sharing** an existing predicate

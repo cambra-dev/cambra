@@ -142,7 +142,7 @@ impl Typing for CheckCtx {
         &mut self,
         trait_: Trait,
         operand_types: &[&Type],
-        operand_exprs: &[&Expr],
+        _operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
