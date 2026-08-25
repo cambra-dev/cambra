@@ -853,17 +853,18 @@ pub(super) fn emit_apply<C: Typing>(
 fn require_single_obligation<C: Typing>(
     ctx: &mut C,
     trait_: Trait,
-    operands: &[&Type],
+    operand_types: &[&Type],
+    operand_exprs: &[&Expr],
     result: &OperatorResult,
     at: &dyn Fn() -> String,
 ) -> Result<Type, LocatedInferError> {
     match result {
         OperatorResult::Associated(name) => {
-            let ty = ctx.require_trait(trait_, operands, Some(*name), at)?;
+            let ty = ctx.require_trait(trait_, operand_types, operand_exprs, Some(*name), at)?;
             Ok(ty.expect("an operator asking for an association gets its position back"))
         }
         OperatorResult::Fixed(base) => {
-            ctx.require_trait(trait_, operands, None, at)?;
+            ctx.require_trait(trait_, operand_types, operand_exprs, None, at)?;
             Ok(Type::Base(base.clone()))
         }
     }
@@ -916,7 +917,7 @@ pub(super) fn emit_binop<C: Typing>(
     match sig {
         OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
         OpSignature::SingleObligation { trait_, result } => {
-            require_single_obligation(ctx, *trait_, &[&left_ty, &right_ty], result, &at)
+            require_single_obligation(ctx, *trait_, &[&left_ty, &right_ty], &[&left, &right], result, &at)
         }
     }
 }
@@ -931,7 +932,7 @@ pub(super) fn emit_unary<C: Typing>(
     match sig {
         OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
         OpSignature::SingleObligation { trait_, result } => {
-            require_single_obligation(ctx, *trait_, &[&inner_ty], result, &at)
+            require_single_obligation(ctx, *trait_, &[&inner_ty], &[&inner], result, &at)
         }
     }
 }
@@ -1263,7 +1264,7 @@ pub(super) fn emit_aggregate<C: Typing>(
     // is a pure requirement — `Comparable` associates nothing, and the result type
     // stays the scheme's.
     if kind == AggregateKind::Max {
-        ctx.require_trait(Trait::Comparable, &[&result], None, &at)?;
+        ctx.require_trait(Trait::Comparable, &[&result], &[&input], None, &at)?;
     }
     Ok(result)
 }

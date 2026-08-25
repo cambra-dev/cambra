@@ -75,7 +75,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name, Type,
+    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name, Refinement, RefinementTemplate, Type,
     TypedExpr,
 };
 
@@ -141,7 +141,7 @@ pub struct TraitInstance {
     /// a pure requirement.
     pub assoc: &'static [(Assoc, BaseType)],
     /// An optional function producing a refinement from the input expressions.
-    pub refinement: Option<fn(Vec<TypedExpr>) -> TypedExpr>,
+    pub refinement: Option<RefinementTemplate>,
 }
 
 impl TraitInstance {
@@ -174,16 +174,18 @@ const NUMERIC: &[TraitInstance] = &[
 /// construction because the row fixes both operand bases and the associated base at
 /// `Int`, leaving nothing for inference to resolve, the same reason
 /// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
-fn refinement_for_add(args: Vec<TypedExpr>) -> TypedExpr {
-    let [a1, a2] = <[TypedExpr; 2]>::try_from(args)
-        .expect("Addable is binary, so its instance's refinement receives two operands");
-    let int = prim(BaseType::Int);
-    TypedExpr::binop(
-        TypedExpr::var(Name::elem()).with_ty(int.clone()),
-        BinOpKind::Compare(CompareKind::Equals),
-        TypedExpr::binop(a1, BinOpKind::Arithmetic(ArithmeticKind::Add), a2).with_ty(int),
-    )
-    .with_ty(prim(BaseType::Bool))
+fn refinement_for_add(args: &[&TypedExpr]) -> TypedExpr {
+    if let [a1, a2] = args {
+        let int = prim(BaseType::Int);
+        TypedExpr::binop(
+            TypedExpr::var(Name::elem()).with_ty(int.clone()),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::binop((*a1).clone(), BinOpKind::Arithmetic(ArithmeticKind::Add), (*a2).clone()).with_ty(int),
+        )
+            .with_ty(prim(BaseType::Bool))
+    } else {
+        panic!("Addable is binary, so its instance's refinement receives two operands");
+    }
 }
 
 /// The numeric rows plus `(String, String) ⇝ String`.
@@ -365,6 +367,9 @@ pub struct TraitObligation {
     /// declares. Empty for a trait that is a pure requirement — the mechanism then
     /// still narrows and still rejects, it simply determines nothing.
     assoc: Vec<AssocPosition>,
+    /// The input arguments' actual expressions, to be substituted
+    /// into the output type if it has a refinement template.
+    input_exprs: Vec<TypedExpr>,
 }
 
 /// One associated position of an obligation: the name, the type standing in for it,
@@ -383,7 +388,7 @@ struct AssocPosition {
 impl TraitObligation {
     /// Record an instance of `trait_` whose associated names stand at the given type
     /// positions, with every instance still a candidate.
-    pub fn new(trait_: Trait, assoc: Vec<(Assoc, Type)>) -> Rc<TraitObligation> {
+    pub fn new(trait_: Trait, assoc: Vec<(Assoc, Type)>, input_exprs: Vec<TypedExpr>) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_,
@@ -396,6 +401,7 @@ impl TraitObligation {
                     deposited: Cell::new(false),
                 })
                 .collect(),
+            input_exprs,
         })
     }
 
@@ -426,6 +432,7 @@ impl TraitObligation {
                     deposited: Cell::new(p.deposited.get()),
                 })
                 .collect(),
+            input_exprs: original.input_exprs.clone(),
         })
     }
 
@@ -554,12 +561,25 @@ impl TraitObligation {
             if position.deposited.get() {
                 continue;
             }
-            let Some(settled) = self.agreed_assoc(position.name) else {
+            let Some((settled, maybe_refinement)) = self.agreed_assoc(position.name) else {
                 continue;
             };
             position.deposited.set(true);
             let target = position.ty.borrow().clone();
-            constrain_subtype(&Type::Base(settled), &target, cache)?;
+            let ty_base = Type::Base(settled);
+            let ty = match maybe_refinement {
+                Some(template) => {
+                    Type::Refinement(
+                        Box::new(ty_base),
+                        Refinement::born_from_template(
+                            template,
+                            &self.input_exprs,
+                        ),
+                    )
+                }
+                None => ty_base,
+            };
+            constrain_subtype(&ty, &target, cache)?;
         }
         Ok(())
     }
@@ -589,7 +609,7 @@ impl TraitObligation {
 
     /// The type every surviving instance associates with `name`, or `None` if
     /// they disagree — the condition a deposit waits on.
-    fn agreed_assoc(&self, name: Assoc) -> Option<BaseType> {
+    fn agreed_assoc(&self, name: Assoc) -> Option<(BaseType, Option<RefinementTemplate>)> {
         let candidates = self.candidates.borrow();
         let (first, rest) = candidates
             .split_first()
@@ -597,7 +617,7 @@ impl TraitObligation {
         let settled = first.assoc_ty(name)?;
         rest.iter()
             .all(|i| i.assoc_ty(name) == Some(settled))
-            .then(|| settled.clone())
+            .then(|| (settled.clone(), first.refinement.clone()))
     }
 }
 
@@ -1466,7 +1486,7 @@ mod tests {
 
         assert_eq!(
             ob.agreed_assoc(Assoc::Output),
-            Some(BaseType::Int),
+            Some((BaseType::Int, None)),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled",
         );
         let candidates = ob.candidates();

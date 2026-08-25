@@ -1683,7 +1683,17 @@ pub type PredicateId = *const TypedExpr;
 /// it); nested refinements share it and shadow positionally.
 pub const REFINEMENT_BINDER: &str = "__elem";
 
+pub type RefinementTemplate = fn(&[&TypedExpr]) -> TypedExpr;
+
 impl Refinement {
+    pub fn born_from_template(
+        template: RefinementTemplate,
+        args: &Vec<TypedExpr>
+    ) -> Self {
+        let args: Vec<&TypedExpr> = args.iter().collect();
+        Self::born(Rc::new(template(&args[..])))
+    }
+
     /// Construct a refinement over a **genuinely new** predicate term — one this
     /// call site is *creating*, with no prior refinement identity to preserve
     /// (a freshly-emitted filter, a synthesized loop-join condition, a compiled

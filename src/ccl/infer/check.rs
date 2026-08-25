@@ -141,7 +141,8 @@ impl Typing for CheckCtx {
     fn require_trait(
         &mut self,
         trait_: Trait,
-        operands: &[&Type],
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
@@ -163,7 +164,7 @@ impl Typing for CheckCtx {
         // [`Typing::require_sub`] reuses `TypeMismatch` here: the error vocabulary
         // describes the inconsistency, the wall supplies the interpretation. Measured
         // across the suite: it never fires.
-        let bases: Option<Vec<&BaseType>> = operands.iter().map(|t| offered_base(t)).collect();
+        let bases: Option<Vec<&BaseType>> = operand_types.iter().map(|t| offered_base(t)).collect();
         let Some(bases) = bases else {
             // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
             // still-`Infer` position under `Strictness::PreChannelize`) is not something
