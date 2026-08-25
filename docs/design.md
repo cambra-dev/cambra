@@ -14,7 +14,7 @@ This document is the guided tour: the language's important features, the archite
 - **[Sketched]** — an in-progress sketch; expect it to change. (The [spec](chl-spec.md) spells this marker **[Tentative]**.)
 - **[Open]** — a known question with no answer yet.
 
-When in doubt, [demo-programs.md](demo-programs.md) is the ground truth: every refinement about "what runs" is pinned there by an executable program and a test.
+When in doubt, [demo-programs.md](demo-programs.md) is the ground truth: every claim about "what runs" is pinned there by an executable program and a test.
 
 ## The shape of Cambra
 
@@ -197,7 +197,7 @@ The headline properties fall out rather than being bolted on. Operators that are
 
 ## What the architecture buys
 
-The connections between the layers above and the capabilities Cambra refinements:
+The connections between the layers above and the capabilities Cambra claims:
 
 - **Query-planner behaviour for whole programs.** Because the entire application lives in one typed core with no component boundaries, the planner sees everything — a filter can be pushed across what would be an API boundary in a conventional stack, because there is no boundary.
 - **Incremental views by construction.** Monotone tilings mean live aggregates are maintained, not recomputed. The materializable time-pinned view is the decided form of this — the history substrate is implemented, the transaction-handle read it needs is not yet (the ledger's `txn_kv` pins it).

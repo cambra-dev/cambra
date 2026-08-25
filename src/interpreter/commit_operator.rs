@@ -1739,7 +1739,7 @@ impl TileProducer for StoreValueStreamProducer {
         // frontier would otherwise duplicate a position through the `Memo` merge)
         // AND forward that prefix upstream to the store: a consumer that merged
         // commits `≤ max_tick` no longer needs them, so this read branch releases
-        // them. The store rerefinements a version only once *every* branch (this reader,
+        // them. The store reclaims a version only once *every* branch (this reader,
         // the writers) has released it — the cyclic `FanOut` intersects — so
         // forwarding here is safe and is what lets a long-lived collection log shed
         // its merged prefix. A terminal (`True`) release covers the whole
@@ -1862,7 +1862,7 @@ impl TileProducer for StoreFinalReadProducer {
         // A universal release from the one consumer of a scalar retires this read, and
         // releasing the store branch with it is safe: every other reader of the store
         // holds its own guard through the fan, which the fan intersects, so the store
-        // rerefinements a version only once all of them have released it too.
+        // reclaims a version only once all of them have released it too.
         if obsolete_guard.is_universal() {
             self.released = true;
             self.store_producer
@@ -3177,7 +3177,7 @@ impl TileProducer for TransactWriterProducer {
             .iter()
             .map(|o| o.as_ref().map(|(_, v)| v.clone()))
             .collect();
-        // Store-branch GC release. The store rerefinements a committed version only
+        // Store-branch GC release. The store reclaims a committed version only
         // once *every* consumer branch has released it (the cyclic `FanOut`
         // intersects the release guards; `gc_released_prefix` then drops the
         // released prefix, always keeping each key's latest write — the
@@ -3192,7 +3192,7 @@ impl TileProducer for TransactWriterProducer {
         //    is the load-bearing INVARIANT — a writer never releases a version it
         //    read — so backward validation's `read_as_of` at any pending
         //    proposal's snapshot still finds that proposal's recorded reads, and
-        //    because GC rerefinements only the intersection of *all* consumers'
+        //    because GC reclaims only the intersection of *all* consumers'
         //    releases, one writer's release can never strand another writer's (or
         //    a reader's) reads. Without this, a reading writer released nothing
         //    and pinned the commit log unbounded for its lifetime.
@@ -4170,7 +4170,7 @@ mod tests {
         assert_eq!(store_current(&tile, &acct("bob")), Some((2, int(20))));
     }
 
-    /// Read-side commit-log GC: `gc_released_prefix(through)` rerefinements released
+    /// Read-side commit-log GC: `gc_released_prefix(through)` reclaims released
     /// versions at ticks `≤ through`, keeping each key's latest write (the
     /// carry-forward source). This is the engine half of the long-lived-store
     /// bound — the same rule for a superseded scalar and a merged collection

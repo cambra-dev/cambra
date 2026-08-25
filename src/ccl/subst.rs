@@ -1733,7 +1733,7 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
     references_enclosing_function(codomain) || type_free_vars(codomain).contains(binder)
 }
 
-/// The functions a refinement-landing walk is inside of, and the memo that closes
+/// The functions a refinement-closing walk is inside of, and the memo that closes
 /// refinements against them (see `src/ccl/design/type-inference.md`, "Where the
 /// conversions run").
 ///

@@ -1725,10 +1725,10 @@ apply0(groups)
 }
 
 /// An undischarged group-by partition stores the key reference as a de Bruijn
-/// index and renders it as the key binder's name. The two spellings are the
+/// index and displays it as the key binder's name. The two spellings are the
 /// representation's contract end to end: identity is decided on the index, and
 /// the reader sees the name (`src/ccl/design/type-inference.md`, "A binder
-/// reference is stored in one of two forms" and "Rendering opens what it
+/// reference is stored in one of two forms" and "Display opens what it
 /// descended through").
 #[test]
 fn test_groupby_partition_stores_an_index_and_renders_the_binder() {

@@ -325,7 +325,7 @@ struct KeyCtx {
     truncations: usize,
     /// The functions the walk is inside of, and the closing memo over them. The same
     /// type `compact_go` threads, so a key and a compacted type cannot close one
-    /// refinement two ways. A refinement lands index-spelled, so two α-variant
+    /// refinement two ways. A refinement is stored index-spelled, so two α-variant
     /// instantiations key together and the memo shares their specialization.
     scope: RefinementScope,
 }
@@ -379,13 +379,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
-        // dependent-application discharge lands in the key as the predicate the
+        // dependent-application discharge is stored in the key as the predicate the
         // clone will actually carry — that is use-specific information, and two
         // uses discharging different arguments *should* key apart.
         Type::Refinement(inner, r) => {
             let mut k = key_go(inner, pol, subst_acc, ctx);
             let r = subst_acc.force_refinement(r);
-            // Landing closes, as in `compact_go`: the key stores the
+            // Storing closes, as in `compact_go`: the key stores the
             // index-spelled refinement, so α-variant instantiations key together.
             let r = ctx.scope.close(&r);
             if !k.refinements.contains(&r) {
@@ -872,7 +872,7 @@ mod refinement_closing_tests {
 
     /// **Acceptance: the key keeps distinct enclosing binders distinct.** The
     /// key does not carry the binder name (see [`SpecKey::fun`]); what records
-    /// which binder a refinement referenced is the landed index itself, and a
+    /// which binder a refinement referenced is the closed index itself, and a
     /// collapse here is an *under*-split — two uses sharing a specialization
     /// whose interior was resolved against the other's argument.
     #[test]

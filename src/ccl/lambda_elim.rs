@@ -424,7 +424,7 @@ fn build_value_case_cform(
 /// than from the enclosing `Case`.
 ///
 /// A `Compose`'s type has to *equal* the composition of its elements, so taking
-/// either end from the `Case` refinements something the elements do not provide. Each
+/// either end from the `Case` claims something the elements do not provide. Each
 /// end has its own way of diverging:
 ///
 /// - the **codomain**, because an arm's result can sit strictly below the arms'
@@ -786,7 +786,7 @@ fn elim_lambda_impl(
         //
         // The dependence test admits closed or name-spelled
         // (`subst::codomain_depends_on`), like coalesce's: a `body_ty` whose
-        // refinement landed closed references `param` as an index, and a name-only
+        // refinement stored closed references `param` as an index, and a name-only
         // test would drop the binder and strand it.
         Type::Fun {
             domain, codomain, ..

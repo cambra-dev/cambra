@@ -49,7 +49,7 @@ use crate::util::ScopeStack;
 /// hold a strong `Rc` to the others through its `RefCell<InferBounds>`. Once
 /// Pass 2 (coalesce) overwrites every `expr.ty` with a concrete,
 /// variable-free type, those cells become unreachable from the final AST but
-/// keep each other alive — reference counting alone never rerefinements the
+/// keep each other alive — reference counting alone never reclaims the
 /// cycle, so the whole variable graph leaks after each `infer()` run.
 ///
 /// The arena is a zero-field RAII guard over a thread-local capture buffer

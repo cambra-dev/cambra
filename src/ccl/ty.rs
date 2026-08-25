@@ -855,7 +855,7 @@ impl fmt::Display for TypeUnder<'_, '_> {
 /// Render `ty` inside `binders`, the functions the rendering has descended
 /// through. Threading them is what lets a refinement predicate print a
 /// reference to one of them by that function's own binder name rather than
-/// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Rendering opens
+/// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Display opens
 /// what it descended through").
 fn fmt_type(
     f: &mut fmt::Formatter<'_>,

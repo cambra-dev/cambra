@@ -1920,7 +1920,7 @@ assignment (`x: T = e`, `x <: T = e`), a mutable introduction
 (`x: Mut(V) := e`), and a `def` parameter — and mean the same thing in
 each. `<:` does not appear **inside a type literal**: it says how an
 annotation is read, and what it annotates is a term, so `{a <: Int}` is
-not a record type. That is a restriction on type literals, not a refinement
+not a record type. That is a restriction on type literals, not a claim
 that a binder is the only place an annotation can go — an inline
 annotation on an expression would carry both modes for the same reason a
 binder does.

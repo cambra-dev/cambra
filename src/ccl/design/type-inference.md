@@ -552,7 +552,7 @@ Two things make this load-bearing rather than housekeeping:
 - **The keepalive.** The memo keys on the `Rc`'s *address*
   (`PredicateId`), which is sound only while that address cannot be reused.
   Overwriting a slot can drop the last reference to the origin and free an
-  address a later `Rc::new` in the same walk rerefinements, at which point an
+  address a later `Rc::new` in the same walk reclaims, at which point an
   unrelated predicate collides with the entry and inherits its rebuild. `PredMemo`
   retains every origin for its own lifetime; that is why passes use it rather
   than a bare map.
@@ -598,7 +598,7 @@ A walk over the slot set must still cover it, because the passes that use
 `subst`), and — because an erasure and its own post-condition share that walk — a
 slot the walk misses is a slot the check cannot report on.
 
-The refinement is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
+The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
 stamps a distinct marker into every directly-carried `Type` in the AST and pins
 which ones the walk reaches. One is deliberately excluded — `Transact`'s `domain` —
 because that node is born by `plan_loops` after every pass on the walk, so covering
@@ -681,7 +681,7 @@ e.g. `make_restrict`).
 
 ### 3.2 The `InferArena`: who owns inference variables
 
-Recording `α <: β` pushes `Type::Infer(β)` into `α`'s bounds and `Type::Infer(α)` into `β`'s bounds (the shared-`Rc` linkage from §1). Mutual constraints — and self-recursive ones — therefore make each `InferVar` hold a *strong* `Rc` to the others through its `RefCell<InferBounds>`. After Pass 2 overwrites every `expr.ty` with a concrete, variable-free type, these cells become unreachable from the final AST yet keep one another alive: reference counting alone never rerefinements the cycle, so the entire variable graph would leak after each `infer()` run.
+Recording `α <: β` pushes `Type::Infer(β)` into `α`'s bounds and `Type::Infer(α)` into `β`'s bounds (the shared-`Rc` linkage from §1). Mutual constraints — and self-recursive ones — therefore make each `InferVar` hold a *strong* `Rc` to the others through its `RefCell<InferBounds>`. After Pass 2 overwrites every `expr.ty` with a concrete, variable-free type, these cells become unreachable from the final AST yet keep one another alive: reference counting alone never reclaims the cycle, so the entire variable graph would leak after each `infer()` run.
 
 **`InferArena` (`ccl/infer/`) is the single owner that breaks the cycle.** It retains one strong handle to *every* variable at the moment it is minted (captured through a thread-local mint sink wired into `InferVar::fresh`), and on `Drop` clears each variable's lower/upper bound lists — severing all bound edges so every refcount can reach zero. A flat `Vec` suffices: variables are never looked up by id (the `Type` carries the `Rc` directly), so the arena only enumerates them once, at teardown. Clearing bounds before the `Vec` drops handles self-cycles and N-way cycles uniformly. This is an end-of-inference lifetime invariant implemented as RAII: the arena is created at the top of `infer()` and drops on the `Ok` and error paths alike.
 
@@ -1074,8 +1074,8 @@ a bound recorded mid-solve is **open**, with references to telescope entries sto
 index counts the functions crossed from their codomain side between the reference and its binder,
 named and unnamed alike, so it survives `Type::without_pi_names`. Closing and opening are one walk
 each over the mixed type/term structure (`subst`'s `PiWalk`), reached through `close_pi_binder` and
-`open_pi_binder` at construction, descent and application, and through `RefinementScope` at landing.
-Those are the four kinds of site.
+`open_pi_binder` at construction, descent and application, and through `RefinementScope` as a
+refinement is stored. Those are the four kinds of site.
 
 **Construction closes.** The type constructors — `Type::pi`, `Type::pi_kinded`,
 `Type::pi_eliminated`, `Type::fun_like` — abstract the codomain they are given, and so does every
@@ -1089,18 +1089,19 @@ literal to set `kind` leaves a free binder name in a stored type.
 
 Two sites assemble a `Fun { name: Some(_), .. }` and close nothing, one on each side of the
 construction boundary. `emit_lambda`'s codomain is the live in-solve type, which stays name-spelled:
-its refinements accumulate behind an inference variable, and closing them is landing's job, so
+its refinements accumulate behind an inference variable, and they close when they are stored, so
 closing the reachable ones here would put an index-spelled refinement and a name-spelled one at a
-single position — what landing-close exists to prevent. `coalesce_compact_go`'s refinements arrive
-already closed, and the compact view it assembles from mirrors `Fun`s one-to-one, so a landed index
-counts to the function being built; closing is the identity there, and the `Fun` literal says so.
+single position — what closing at the store exists to prevent. `coalesce_compact_go`'s refinements
+arrive already closed, and the `CompactType` it assembles from mirrors `Fun`s one-to-one, so a
+closed index counts to the function being built; closing is the identity there, and the `Fun`
+literal says so.
 
-**Landing closes.** The compact and key walks close a refinement against the enclosing functions the
-walk is inside of, as it lands in the view, in the same two arms that force the edge substitutions
-into it (`force_refinement`). Landing is the only point that works: `CompactType::merge` dedups
-refinements while bounds fold, before any function is assembled, so a closed cast and a live emitted
-function meeting at one variable would otherwise put an index-spelled refinement and a name-spelled
-one at a single position. `subst::RefinementScope` is the state both walks thread — the
+**Storing closes.** `compact_go` and the `SpecKey` walk close a refinement against the enclosing
+functions the walk is inside of before storing it, in the same two arms that force the edge
+substitutions into it (`force_refinement`). The store is the only point that works:
+`CompactType::merge` dedups refinements while bounds fold, before any function is assembled, so a
+closed cast and a live emitted function meeting at one variable would otherwise put an index-spelled
+refinement and a name-spelled one at a single position. `subst::RefinementScope` is the state both walks thread — the
 enclosing-binder stack and the closing memo in one type, so the two cannot disagree about what a
 refinement closes against.
 
@@ -1142,7 +1143,7 @@ the stored, already-discharged type.
 Each identity site therefore compares like with like: whether a type is closed follows from which
 side of the construction boundary it sits on, not from when it arrives.
 
-#### Rendering opens what it descended through
+#### Display opens what it descended through
 
 An index is a stored form, not a read form. `Display for Type` threads the functions it descends
 through and prints a reference to one of them as that function's binder name, so a dependent type
@@ -1150,12 +1151,12 @@ reads with the spellings it had before indices existed:
 
     ((__gb_k: Int) ⤇ ({[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ x : Int → x) == __gb_k} ⤇ Int))
 
-A rendering that does not hold the function reads the spelling off the reference instead. A
+A display that does not hold the function reads the spelling off the reference instead. A
 `Name::PiBound` carries a `PiRef`: the index, plus the binder's spelling where the closing happened.
 Identity reads the index alone, so the spelling decides nothing and two equal references may print
 differently.
 
-A diagnostic is the rendering that does not hold the function. It blames a fragment rather than a
+A diagnostic is the display that does not hold the function. It blames a fragment rather than a
 whole type — `coalesce_compact_go`'s domain-join conflict reports the domains of the function it is
 half-way through assembling, and the function binding their references is further out in the walk,
 so there is nothing to descend through. Without the spelling on the reference, that domain reads

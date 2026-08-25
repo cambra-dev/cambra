@@ -191,7 +191,7 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
     // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
     // This lifts a term out of a *type* — the refined domain's predicate — into
-    // the term tree, while the predicate keeps its own copy on the type. Landing
+    // the term tree, while the predicate keeps its own copy on the type. Closing
     // the lifted ids as they are would put one id-set on two live terms, which
     // the predicate uniqueness walk reports at the next phase boundary.
     // `lambda_elim::run` rebuilds the term, re-minting every node, which is what
