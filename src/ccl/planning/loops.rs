@@ -9,7 +9,7 @@
 //! `Transact{domain: Txn}`. Causality is re-checked at this wall by
 //! [`crate::ccl::letrec::check_letrec_causal`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
@@ -398,6 +398,25 @@ fn tap_field(def: &Expr) -> String {
     }
 }
 
+/// The history record type a [`TypedExprNode::Transact`] node denotes: one field
+/// per store key, then the virtual keys its writers tap.
+///
+/// The labels must be distinct within the record. [`Name::field_key`] carries no
+/// uid, so that distinctness is by spelling rather than by construction, and a
+/// duplicate would put two keys at one projection — the read rewrites below
+/// would route both reads to whichever survived.
+fn hist_record(fields: Vec<(String, Type)>) -> Type {
+    debug_assert!(
+        {
+            let mut seen = HashSet::new();
+            fields.iter().all(|(n, _)| seen.insert(n.as_str()))
+        },
+        "history record labels must be distinct within one record: {:?}",
+        fields.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+    );
+    Type::Record(fields)
+}
+
 /// Destructure a transaction `LetRec` (from [`crate::ccl::transact_phase`],
 /// post-elim) into the `Transact{keys, writers, domain: Txn}` carrier. The
 /// group\'s bindings, by shape ([`classify_txn_binding`]): one **history** per
@@ -454,7 +473,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     for (_, field, stream_ty) in &taps {
         hist_field_tys.push((field.clone(), stream_ty.clone()));
     }
-    let hist_ty = Type::Record(hist_field_tys);
+    let hist_ty = hist_record(hist_field_tys);
 
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,
@@ -632,7 +651,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     for (f, vty) in &feed_fields {
         hist_field_tys.push((f.clone(), Type::fun(domain_ty.clone(), vty.clone())));
     }
-    let hist_ty = Type::Record(hist_field_tys);
+    let hist_ty = hist_record(hist_field_tys);
 
     let writer = WriterSite {
         read_keys: key_names.clone(),

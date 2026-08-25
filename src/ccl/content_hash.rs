@@ -38,7 +38,7 @@
 //! the *innermost* enclosing binder, so a shadowed `Raw` name resolves to the
 //! binder a reader would pick.
 //!
-//! # Two hashes, one traversal
+//! # Three hashes, one traversal
 //!
 //! The free-variable seam ([`FreeVars`]) is the one place the hash's meaning is
 //! a choice, and the two choices answer different questions:
@@ -52,9 +52,16 @@
 //!   computation" actually means, but it presupposes a correspondence, so it is
 //!   for classifying a matching rather than producing one.
 //!
+//! [`own_hash`] answers a third question over the same traversal: not "is this
+//! the same computation" but "did this node change", which a differ needs to
+//! report a disagreement at the node that owns it rather than at every ancestor.
+//! It resolves free variables like [`resolved_hash`] and folds only what is
+//! authored at the node — dropping its children, its inferred `ty`, and a
+//! binder's declared type, all three of which are derived from the first two.
+//!
 //! Everything else — the traversal, the De Bruijn treatment of bound variables,
-//! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Two
-//! hashes, two questions".
+//! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Three
+//! hashes, three questions".
 //!
 //! # Stage-agnostic by construction
 //!
@@ -62,7 +69,7 @@
 //! of [`crate::ccl::scope`], which cover **every** [`TypedExprNode`] variant —
 //! including the ones (`LetRec`, `Transact`) that exist only below the
 //! mutability phases. Nothing else is stage-sensitive, so one hash serves every
-//! [`CompileStage`](crate::ccl::context::CompileStage).
+//! [`Phase`](crate::ccl::context::Phase).
 //!
 //! # Complexity
 //!
@@ -104,16 +111,62 @@ pub fn content_hash(e: &TypedExpr) -> ContentHash {
 
 /// The α-invariant hash of `e` with its free variables resolved **through the
 /// enclosing scope** rather than by spelling — the classification counterpart
-/// to [`content_hash`]. See `src/ccl/design/diffing.md`, "Two hashes, two
+/// to [`content_hash`]. See `src/ccl/design/diffing.md`, "Three hashes, three
 /// questions".
 ///
-/// `scope` lists the binders `e` sits under, innermost last, each paired with a
-/// *class* token that corresponding binders of the two programs share. A free
-/// variable then hashes to the class of the binder it resolves to, so a binding
-/// renamed between versions is invisible, and a same-spelled binding of
-/// something else is not mistaken for it.
+/// `scope` lists the binders `e` sits under, innermost last, each paired with its
+/// *correspondent* — a token that corresponding binders of the two programs
+/// share. A free variable then hashes to the correspondent of the binder it
+/// resolves to, so a binding renamed between versions is invisible, and a
+/// same-spelled binding of something else is not mistaken for it.
 pub fn resolved_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
     ContentHash(hash_rel(e, &mut Vec::new(), FreeVars::ByBinder(scope)))
+}
+
+/// The α-invariant hash of what is **authored at** `e`: everything the node
+/// carries that is not derived from something else in the tree.
+///
+/// [`resolved_hash`] answers "is this the same computation", which a change
+/// anywhere below also answers no to. This answers the narrower question a
+/// differ needs to keep its set of disagreement sites minimal: did this node
+/// change, or is it only reflecting a change in a child that is already
+/// reported on its own?
+///
+/// Folds the node's discriminant, its payload ([`hash_payload`] under
+/// [`Fold::Own`]: a literal's value, an operator, a variant tag, a record's
+/// labels), the binders its variable occurrences resolve to, and its
+/// `user_annotation`. `scope` has the same meaning as in [`resolved_hash`].
+///
+/// Three things are left out, and derivedness rather than child-ness is what
+/// they have in common:
+///
+/// 1. the children's hashes, which is the point;
+/// 2. the node's inferred `ty`, computed from the payload and the children —
+///    folding it would report `let a = 1` → `let a = 2` at the `Let` as well as
+///    at the literal, since the `Let`'s type is the literal's singleton;
+/// 3. a binder's declared `ty`, on the same ground, and a `Cast`'s target,
+///    whose refinement predicate the differ reaches as a child of the cast.
+///
+/// A type change with no payload or child change still surfaces: the content
+/// hash sees it, at the node whose type it is.
+///
+/// A container therefore has close to no own content — a `Let`'s is its
+/// discriminant plus two `user_annotation`s, since its binder's name is De
+/// Bruijn and its type is skipped. That is the design working: a container is
+/// never a disagreement site on its own.
+pub fn own_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
+    let free = FreeVars::ByBinder(scope);
+    let env = &mut Vec::new();
+    let mut h = DefaultHasher::new();
+    std::mem::discriminant(&e.node).hash(&mut h);
+    hash_payload(e, env, free, Fold::Own, &mut h);
+    for_each_scoped_item(e, &mut |item| match item {
+        ScopedItem::VarRef(name) => hash_name_ref(name, env, free, &mut h),
+        ScopedItem::KeyRef(name) => hash_key_ref(name, &mut h),
+        ScopedItem::Child { .. } => {}
+    });
+    hash_opt_type(e.user_annotation.as_ref(), env, free, &mut h);
+    ContentHash(h.finish())
 }
 
 /// How a variable that is *free* in the subterm being hashed is identified —
@@ -126,9 +179,10 @@ pub enum FreeVars<'r> {
     /// is exactly what a matcher looking for a subterm's twin needs.
     BySpelling,
     /// By the identity of the binder it resolves to, taken up to a
-    /// correspondence between the two programs — `(name, class)` innermost
-    /// last. Context-sensitive, and only meaningful once a correspondence
-    /// exists, so this is for classifying a matching, not for producing one.
+    /// correspondence between the two programs — `(name, correspondent)`
+    /// innermost last. Context-sensitive, and only meaningful once a
+    /// correspondence exists, so this is for classifying a matching, not for
+    /// producing one.
     ByBinder(&'r [(&'r Name, u64)]),
 }
 
@@ -164,9 +218,9 @@ fn hash_free_var(name: &Name, free: FreeVars<'_>, state: &mut DefaultHasher) {
     match free {
         FreeVars::BySpelling => name.base().hash(state),
         FreeVars::ByBinder(scope) => match scope.iter().rev().find(|(n, _)| *n == name) {
-            Some((_, class)) => {
+            Some((_, correspondent)) => {
                 0u8.hash(state);
-                class.hash(state);
+                correspondent.hash(state);
             }
             None => {
                 1u8.hash(state);
@@ -176,23 +230,32 @@ fn hash_free_var(name: &Name, free: FreeVars<'_>, state: &mut DefaultHasher) {
     }
 }
 
-/// The domain-refinement predicate **term** carried by a cast `target` type,
-/// if any — the borrowing companion to
-/// [`crate::ccl::ccl_utils::cast_target_refinement`] (which clones).
+/// The domain-refinement predicate **terms** carried by a cast `target` type —
+/// the borrowing companion to
+/// [`crate::ccl::ccl_utils::cast_target_refinement`] (which clones the set).
 ///
 /// A refinement predicate is a *term* (`Rc<TypedExpr>` — the filter/join logic
 /// a comprehension lowers to), embedded in a type position. `hash_type` already
-/// folds it into a cast's hash; this borrowing accessor is what lets the
-/// *differ* descend into the predicate as a tree child (so an edit localizes to
+/// folds them into a cast's hash; this borrowing accessor is what lets the
+/// *differ* descend into each predicate as a tree child (so an edit localizes to
 /// it), rather than only flagging the enclosing cast as changed.
-pub(crate) fn cast_target_predicate(target: &Type) -> Option<&TypedExpr> {
+///
+/// A refined domain carries a [`RefinementSet`], whose physical order is
+/// meaningless by contract, so the predicates are returned in ascending
+/// [`content_hash`] order. A differ pairs a node's children by position, and
+/// one built off the set's own order would report two compilations of one
+/// program as disagreeing on which predicate is which.
+pub(crate) fn cast_target_predicates(target: &Type) -> Vec<&TypedExpr> {
     let Type::Fun { domain, .. } = target else {
-        return None;
+        return Vec::new();
     };
-    let Type::Refinement(_, refinement) = domain.as_ref() else {
-        return None;
+    let Type::Refinement(_, refinements) = domain.as_ref() else {
+        return Vec::new();
     };
-    Some(refinement.predicate.as_ref())
+    let mut predicates: Vec<&TypedExpr> =
+        refinements.iter().map(|r| r.predicate.as_ref()).collect();
+    predicates.sort_unstable_by_key(|p| content_hash(p).0);
+    predicates
 }
 
 /// Resolve and hash a variable *reference* (a use site, not a binder): a De
@@ -293,9 +356,17 @@ fn hash_type<'a>(
             openness.hash(state);
             hash_type_fields(fields, env, free, state);
         }
-        T::Refinement(base, refinement) => {
+        // A refinement set is a set: its physical order carries nothing, so the
+        // predicate hashes sort before they fold — the canonicalization
+        // `hash_rel` applies to its AC nodes.
+        T::Refinement(base, refinements) => {
             hash_type(base, env, free, state);
-            hash_rel(&refinement.predicate, env, free).hash(state);
+            let mut predicates: Vec<u64> = refinements
+                .iter()
+                .map(|r| hash_rel(&r.predicate, env, free))
+                .collect();
+            predicates.sort_unstable();
+            predicates.hash(state);
         }
         T::History {
             value,
@@ -349,14 +420,34 @@ fn hash_opt_type<'a>(
 
 /// Hash a binder's declared type and user annotation. The binder's *name* is
 /// folded into the De Bruijn environment by the caller, not hashed here.
+///
+/// Under [`Fold::Own`] the inferred `ty` is skipped: for a `let` it is the bound
+/// expression's type, so folding it would report `let a = 1` → `let a = 2` at
+/// the `Let` as well as at the literal. The `user_annotation` is authored and
+/// stays either way.
 fn hash_binding<'a>(
     b: &'a TypedBinding,
     env: &mut Vec<&'a Name>,
     free: FreeVars<'_>,
+    fold: Fold,
     state: &mut DefaultHasher,
 ) {
-    hash_type(&b.ty, env, free, state);
+    if fold == Fold::Whole {
+        hash_type(&b.ty, env, free, state);
+    }
     hash_opt_type(b.user_annotation.as_ref(), env, free, state);
+}
+
+/// How much of a node's payload a fold takes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// Everything the node carries — what [`hash_rel`] wants, since the whole
+    /// subtree's identity is the question.
+    Whole,
+    /// Only what is authored at this node and not derived from anything else
+    /// in the tree — what [`own_hash`] wants. Three exclusions, not one: the
+    /// children, the node's inferred `ty`, and a binder's declared `ty`.
+    Own,
 }
 
 /// Hash a register-key *label* occurrence — a [`TypedExprNode::Transact`] key
@@ -389,6 +480,7 @@ fn hash_payload<'a>(
     e: &'a TypedExpr,
     env: &mut Vec<&'a Name>,
     free: FreeVars<'_>,
+    fold: Fold,
     h: &mut DefaultHasher,
 ) {
     use TypedExprNode as N;
@@ -422,27 +514,48 @@ fn hash_payload<'a>(
         // domain-refinement predicate — a load-bearing term (a comprehension's
         // filter/join condition). A cast is precisely a type-level change, so
         // the target must participate.
-        N::Cast { target, .. } => hash_type(target, env, free, h),
+        //
+        // It stays out of an [`Fold::Own`] fold: the differ hands that same
+        // predicate to its walk as a *child* (the one place its child set
+        // departs from `walk_children`), so folding the target here too would
+        // report one threshold edit twice — at the literal, and at the cast
+        // above it. A change confined to the rest of the target still surfaces
+        // at the cast, with nothing below it to explain it.
+        N::Cast { target, .. } => {
+            if fold == Fold::Whole {
+                hash_type(target, env, free, h);
+            }
+        }
         N::BinOp { op, .. } => op.hash(h),
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
         N::VariantCtor { tag, .. } => tag.hash(h),
         // Field *names* are folded together with their values in `hash_rel`,
         // which is what keeps `(a: 1, b: 2)` distinct from `(a: 2, b: 1)` under
-        // the order-insensitive fold.
-        N::Record(fields) => fields.len().hash(h),
+        // the order-insensitive fold. An [`Fold::Own`] fold has no children to
+        // pair them with, so it takes the names alone, sorted: a record's
+        // labels are its own content, and a rename over an edited sibling would
+        // otherwise go unreported.
+        N::Record(fields) => {
+            fields.len().hash(h);
+            if fold == Fold::Own {
+                let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                names.sort_unstable();
+                names.hash(h);
+            }
+        }
 
-        N::Lambda { param, .. } => hash_binding(param, env, free, h),
-        N::Let { binding, .. } => hash_binding(binding, env, free, h),
+        N::Lambda { param, .. } => hash_binding(param, env, free, fold, h),
+        N::Let { binding, .. } => hash_binding(binding, env, free, fold, h),
         // A mutable variable introduction binds exactly as a `let` does — the
         // history `Mut(V, D)` rides the binder's `ty`, so hashing the binding
         // covers the declaration's whole type-level content.
-        N::MutDecl { binding, .. } => hash_binding(binding, env, free, h),
-        N::For { target, .. } => hash_binding(target, env, free, h),
+        N::MutDecl { binding, .. } => hash_binding(binding, env, free, fold, h),
+        N::For { target, .. } => hash_binding(target, env, free, fold, h),
         N::LetRec { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
-                hash_binding(b, env, free, h);
+                hash_binding(b, env, free, fold, h);
             }
         }
         N::Case {
@@ -456,7 +569,7 @@ fn hash_payload<'a>(
                     Some(p) => {
                         1u8.hash(h);
                         p.tag.hash(h);
-                        hash_binding(&p.binding, env, free, h);
+                        hash_binding(&p.binding, env, free, fold, h);
                     }
                     None => 0u8.hash(h),
                 }
@@ -498,7 +611,7 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -
     use TypedExprNode as N;
     let mut h = DefaultHasher::new();
     std::mem::discriminant(&e.node).hash(&mut h);
-    hash_payload(e, env, free, &mut h);
+    hash_payload(e, env, free, Fold::Whole, &mut h);
 
     // Name occurrences fold as they are met; child hashes are collected in walk
     // order so the AC nodes below can canonicalize theirs first.
@@ -554,7 +667,9 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, CompareKind, Refinement, Type};
+    use crate::ccl::{
+        ArithmeticKind, BaseType, BinOpKind, CompareKind, Refinement, RefinementSet, Type,
+    };
     use std::rc::Rc;
 
     fn var(name: &str) -> TypedExpr {
@@ -768,9 +883,9 @@ mod tests {
             );
             typed(Type::Refinement(
                 Box::new(Type::Base(BaseType::Int)),
-                Refinement {
+                RefinementSet::one(Refinement {
                     predicate: Rc::new(pred),
-                },
+                }),
             ))
         };
         assert_ne!(
@@ -791,12 +906,12 @@ mod tests {
         let y = Name::raw("y");
         let (e_x, e_y) = (add(var("x"), int(1)), add(var("y"), int(1)));
 
-        // Same binder class, different spellings: the same computation.
+        // Same binder correspondent, different spellings: the same computation.
         assert_eq!(
             resolved_hash(&e_x, &[(&x, 7)]),
             resolved_hash(&e_y, &[(&y, 7)]),
         );
-        // Same spelling, different binder classes: not the same computation.
+        // Same spelling, different binder correspondents: not the same computation.
         assert_ne!(
             resolved_hash(&e_x, &[(&x, 7)]),
             resolved_hash(&e_x, &[(&x, 8)]),
