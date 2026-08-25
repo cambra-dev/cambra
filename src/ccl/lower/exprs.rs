@@ -359,7 +359,7 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
 pub(super) fn lower_aug_binop(
     target_name: &str,
     op: AugOp,
-    value: &Spanned<ChlExpr>,
+    right_expr: Expr,
     stmt_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -368,7 +368,6 @@ pub(super) fn lower_aug_binop(
         stmt_span,
         "lower.aug_binop",
     );
-    let right_expr = lower_expr(value, ctx)?;
     let kind = match op {
         AugOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
         AugOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
@@ -404,11 +403,10 @@ pub(super) fn lower_feed(
 
 pub(super) fn lower_define(
     target: &Spanned<AssignTarget>,
-    value: &Spanned<ChlExpr>,
-    ctx: &mut LoweringContext,
+    value: Expr,
 ) -> Result<Expr, LoweringError> {
     let name = extract_name_target(target, "handle defining")?;
-    Ok(Expr::define(name, lower_expr(value, ctx)?))
+    Ok(Expr::define(name, value))
 }
 
 /// Lower a CHL unary expression to a CCL [`Expr::UnaryOp`].

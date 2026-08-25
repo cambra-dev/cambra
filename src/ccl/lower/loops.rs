@@ -839,7 +839,7 @@ fn lower_loop_body_chain(
                     return Err(in_loop_aug_assign_error(stmt.span, &name));
                 }
                 check_mut_write_context(&name, stmt.span, ctx)?;
-                let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
+                let val = lower_aug_binop(&name, *op, lower_expr(value, ctx)?, stmt.span, ctx)?;
                 let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
                 ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
             }

@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use cambra::interpreter::Value;
+use indoc::indoc;
 use rstest_log::rstest;
 
 use cambra::ccl::FieldKey;
@@ -276,6 +277,54 @@ match x:
     union("some", Value::Int(6))
 )]
 fn test_match_scalar(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// `match` in value position: a block right-hand side, and the one-line form
+// (`docs/chl-spec.md`, "The one-line form"). Both wrap the same `Stmt::Match`
+// the indented statement builds, so the two spellings and the statement form
+// yield one value.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// The indented block as an assignment's value.
+#[case(
+    indoc! {"
+        x = `some(7)
+        n = match x:
+            case `some(v):
+                v + 1
+            case `none:
+                0
+        n"},
+    Value::Int(8)
+)]
+// The one-line form, parenthesised because the value position has no bracket of
+// its own.
+#[case(
+    indoc! {"
+        x = `some(7)
+        n = (match x: case `some(v): v + 1 case `none: 0)
+        n"},
+    Value::Int(8)
+)]
+// A one-line `match` as a call argument — a bracket the source already carries.
+#[case(
+    indoc! {"
+        def double(k):
+            k * 2
+        x = `none
+        double(match x: case `some(v): v case `none: 21)"},
+    Value::Int(42)
+)]
+// A nested one-line `match` inside an arm body, under its own bracket.
+#[case(
+    indoc! {"
+        x = `some(`none)
+        n = (match x: case `some(w): (match w: case `some(v): v case `none: 3) case `none: 9)
+        n"},
+    Value::Int(3)
+)]
+fn test_match_as_an_assigned_value(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 

@@ -183,9 +183,51 @@ where
             .map_with(|s, e| (s, e.span()))
             .labelled("identifier");
 
+        // ---- One-line `match` (bracketed positions only) --------------
+        //
+        // `` match s: case `a: e case `b: e `` — the layout-free spelling of the
+        // `match` statement, whose arm bodies are single expressions. It is
+        // reachable only from `bracketed_expr` below, so a `)`, `]` or `}` is
+        // always in place to close the arm list.
+        //
+        // That bracket is what makes nesting unambiguous. An arm body is a
+        // plain `expr`, which cannot derive a one-line `match`, so a nested one
+        // needs a bracket of its own and two arm lists never compete for the
+        // same `case`. Without the requirement the arms after an inner `match`
+        // could belong to either it or the outer one, and the greedy reading
+        // leaves the outer `match` with no way to spell a later arm.
+        //
+        // Restricting the *arm body* instead would not hold: a lambda body, a
+        // ternary else-branch, an `<<` right operand and a `=>` codomain each
+        // recurse into the whole `expr`, so an inner `match` reappears through
+        // any of them.
+        let oneline_match = just(Token::Match)
+            .ignore_then(expr.clone())
+            .then_ignore(just(Token::Colon))
+            .then(match_arms(expr.clone().map_with(
+                |body: Spanned<Expr>, e| vec![Spanned::new(e.span(), Stmt::Expr(body))],
+            )))
+            .map_with(|(scrutinee, arms), e| {
+                let span = e.span();
+                Spanned::new(
+                    span,
+                    Expr::Block(Box::new(Spanned::new(
+                        span,
+                        Stmt::Match { scrutinee, arms },
+                    ))),
+                )
+            })
+            .boxed();
+
+        // Every position enclosed by a bracket — list and tuple elements, call
+        // arguments, a subscript index, a record field, a brace item, a
+        // refinement predicate, a comprehension clause. `match` is a keyword, so
+        // no `expr` can start with one and the choice needs no backtracking.
+        let bracketed_expr = choice((oneline_match, expr.clone())).boxed();
+
         // List literal / list comprehension. We parse the first element,
         // then peek for `for` (comprehension) vs `,` / `]` (list).
-        let list_elements = expr
+        let list_elements = bracketed_expr
             .clone()
             .separated_by(just(Token::Comma))
             .allow_trailing()
@@ -198,10 +240,10 @@ where
                         .map_err(|bad| Rich::custom(bad, "invalid comprehension target"))
                 }))
                 .then_ignore(just(Token::In))
-                .then(expr.clone())
+                .then(bracketed_expr.clone())
                 .map(|(target, iter)| CompClause::For { target, iter });
             let if_clause = just(Token::If)
-                .ignore_then(expr.clone())
+                .ignore_then(bracketed_expr.clone())
                 .map(CompClause::If);
             choice((for_clause, if_clause))
                 .repeated()
@@ -214,7 +256,7 @@ where
                 // Empty list `[]`.
                 just(Token::RBracket)
                     .map_with(|_, e| Spanned::new(e.span(), Expr::List(vec![])))
-                    .or(expr
+                    .or(bracketed_expr
                         .clone()
                         .then(choice((
                             // Comprehension: first element, then `for ...`
@@ -256,7 +298,7 @@ where
         // `(x, y)`, `(x == y)`) falls through to a group/tuple.
         let record_field = ident_only
             .then_ignore(just(Token::Eq))
-            .then(expr.clone())
+            .then(bracketed_expr.clone())
             .map(|((name, name_span), value)| RecordField {
                 name,
                 name_span,
@@ -277,7 +319,8 @@ where
                 just(Token::RParen).map_with(|_, e| Spanned::new(e.span(), Expr::Tuple(vec![]))),
                 // Record value `(name=value, …)`.
                 paren_record,
-                expr.clone()
+                bracketed_expr
+                    .clone()
                     .then(choice((
                         // Generator expression `(expr for ...)`.
                         comp_clauses.clone().map(GroupTail::Gen),
@@ -327,9 +370,11 @@ where
         // because it is the token that distinguishes the form. Whether a
         // *missing* one is an error depends on the position, so that judgment is
         // the caller's (see `brace_type`) and rides out as the `bool`.
-        let brace_item = expr
-            .clone()
-            .then(just(Token::Colon).ignore_then(expr.clone()).or_not());
+        let brace_item = bracketed_expr.clone().then(
+            just(Token::Colon)
+                .ignore_then(bracketed_expr.clone())
+                .or_not(),
+        );
         let brace_group = just(Token::LBrace)
             .ignore_then(
                 brace_item
@@ -339,9 +384,14 @@ where
                     // A `where p` clause turns the brace into a refinement type
                     // `{ T where p }` (§6.4). It binds looser than everything in
                     // `p`, which extends to the closing `}` (newlines are already
-                    // suppressed inside brackets, §1.4), so `expr` greedily
-                    // consumes the predicate up to `}`.
-                    .then(just(Token::Where).ignore_then(expr.clone()).or_not()),
+                    // suppressed inside brackets, §1.4), so `bracketed_expr`
+                    // greedily consumes the predicate up to `}`. A one-line
+                    // `match` predicate takes that `}` as its arm-list terminator.
+                    .then(
+                        just(Token::Where)
+                            .ignore_then(bracketed_expr.clone())
+                            .or_not(),
+                    ),
             )
             .then_ignore(just(Token::RBrace))
             .validate(|((items, trailing_comma), refinement), e, emitter| {
@@ -580,7 +630,7 @@ where
         .boxed();
 
         // ---- Postfix: call, subscript, attribute ---------------------
-        let call_args = expr
+        let call_args = bracketed_expr
             .clone()
             .separated_by(just(Token::Comma))
             .allow_trailing()
@@ -591,7 +641,7 @@ where
         // the index itself (`xs[0]`); several become a tuple (`Mut(Int, Txn)`
         // — the multi-argument type-annotation form), matching Python's
         // `a[i, j]` tuple-index convention.
-        let subscript = expr
+        let subscript = bracketed_expr
             .clone()
             .separated_by(just(Token::Comma))
             .allow_trailing()
@@ -1083,69 +1133,16 @@ where
         //
         // The arm list is itself an indented block, so a `match` is two levels
         // of layout: `Indent` for the arms, then each arm's own `block` for its
-        // body. A pattern spells its tag exactly as a constructor does — ``
-        // `tag(binder) `` — so an arm reads as the inverse of what it matches.
-        let match_ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
-        // `case _:` is the **default arm**, and takes no backtick: `_` is not a
-        // tag, it is the absence of one. Accepting it here rather than as a tag
-        // named `_` is what keeps it from silently matching nothing (no
-        // constructor can spell that name).
-        let case_pattern = choice((
-            just(Token::Backtick).ignore_then(match_ident),
-            select! { Token::Ident(s) if s.as_str() == "_" => s }.map_with(|s, e| (s, e.span())),
-        ));
-        // The payload position takes a name or `_`. `_` is the **unused-binder**
-        // spelling — the arm has a payload and declines to read it — so it is mapped
-        // to `Ignored` rather than to a variable called `_`: nothing may refer to it.
-        let case_binder = choice((
-            select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
-            match_ident.map(|(name, _)| Some(name)),
-        ));
-        let case_arm = just(Token::Case)
-            .ignore_then(case_pattern)
-            .then(
-                case_binder
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not(),
-            )
-            .then_ignore(just(Token::Colon))
-            .then(block.clone())
-            .then_ignore(just(Token::Newline).repeated())
-            .validate(|(((tag, tag_span), binder), body), e, emitter| {
-                if tag.as_str() == "_" {
-                    if binder.is_some() {
-                        emitter.emit(Rich::custom(
-                            e.span(),
-                            "the default arm `case _:` binds no payload: the tags it \
-                             covers have different payload types",
-                        ));
-                    }
-                    return MatchArm {
-                        pattern: None,
-                        body,
-                    };
-                }
-                let payload = match binder {
-                    Some(Some(name)) => PayloadPattern::Named(name),
-                    Some(None) => PayloadPattern::Ignored,
-                    None => PayloadPattern::Absent,
-                };
-                MatchArm {
-                    pattern: Some(MatchPattern {
-                        tag,
-                        tag_span,
-                        payload,
-                    }),
-                    body,
-                }
-            });
-
+        // body. The arms themselves come from `match_arms`, shared with the
+        // one-line form in `expression()`.
         let match_stmt = just(Token::Match)
             .ignore_then(expr.clone())
             .then_ignore(just(Token::Colon))
             .then_ignore(just(Token::Newline))
             .then_ignore(just(Token::Indent).labelled("indented `case` arms"))
-            .then(case_arm.repeated().at_least(1).collect::<Vec<_>>())
+            .then(match_arms(
+                block.clone().then_ignore(just(Token::Newline).repeated()),
+            ))
             .then_ignore(just(Token::Dedent))
             .map_with(|(scrutinee, arms), e| {
                 Spanned::new(e.span(), Stmt::Match { scrutinee, arms })
@@ -1189,17 +1186,11 @@ where
             });
 
         // ---- def name(params): body ---------------------------------
-        // `x: T` (exact) or `x <: T` (bounded) — the mode is the only difference.
-        let annotation_mode = choice((
-            just(Token::Colon).to(AnnotationMode::Exact),
-            just(Token::LtColon).to(AnnotationMode::Bounded),
-        ));
         let param = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
             .labelled("parameter name")
             .then(
-                annotation_mode
-                    .clone()
+                annotation_mode()
                     .then(expr.clone())
                     .map(|(mode, ty)| TypeAnnotation { mode, ty })
                     .or_not(),
@@ -1240,14 +1231,6 @@ where
 
         let pass_stmt = just(Token::Pass).map_with(|_, e| Spanned::new(e.span(), Stmt::Pass));
 
-        // Augmented assignment: `target OP= value`.
-        let aug_op = choice((
-            just(Token::PlusEq).to(AugOp::Add),
-            just(Token::MinusEq).to(AugOp::Sub),
-            just(Token::StarEq).to(AugOp::Mul),
-            just(Token::DoubleSlashEq).to(AugOp::FloorDiv),
-        ));
-
         // Statement-level rules that begin with an expression. We parse
         // a comma-separated *list* of expressions first (so bare-tuple
         // targets `a, b = …` and bare-tuple expression statements
@@ -1270,87 +1253,30 @@ where
                     Spanned::new(e.span(), Expr::Tuple(elts))
                 }
             });
+        // `try_map_with` so an LHS that doesn't reduce to a binding pattern
+        // (e.g. `1 + 2 = x`) becomes a parse error rather than a lowering-time
+        // rejection. Expression statements (`AssignTail::None`) keep the full
+        // `Expr` shape.
         let expr_or_assign = bare_tuple
-            .then(choice((
-                just(Token::Eq)
-                    .ignore_then(expr.clone())
-                    .map(AssignTail::Plain),
-                // An annotated binding: `: ty` (exact) or `<: ty` (bounded),
-                // then `=` (immutable) or `:=` (mutable). The annotation's mode
-                // and the assignment operator are independent choices.
-                annotation_mode
-                    .then(expr.clone())
-                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
-                    .then(choice((
-                        just(Token::Eq)
-                            .ignore_then(expr.clone())
-                            .map(|v| (false, v)),
-                        just(Token::ColonEq)
-                            .ignore_then(expr.clone())
-                            .map(|v| (true, v)),
-                    )))
-                    .map(|(ann, (mutable, val))| {
-                        if mutable {
-                            AssignTail::MutAnnotated(ann, val)
-                        } else {
-                            AssignTail::Annotated(ann, val)
-                        }
-                    }),
-                // `:= value` — a bare mutable assignment (no annotation).
-                just(Token::ColonEq)
-                    .ignore_then(expr.clone())
-                    .map(AssignTail::MutPlain),
-                aug_op
-                    .then(expr.clone())
-                    .map(|(op, val)| AssignTail::Aug(op, val)),
-                just(Token::LShiftEq)
-                    .ignore_then(expr.clone())
-                    .map(AssignTail::Define),
-                empty().to(AssignTail::None),
-            )))
-            // `try_map_with` so an LHS that doesn't reduce to a binding
-            // pattern (e.g. `1 + 2 = x`) becomes a parse error rather than
-            // a lowering-time rejection. Expression statements
-            // (`AssignTail::None`) keep the full `Expr` shape.
-            .try_map_with(|(target, tail), e| {
-                let span = e.span();
-                let to_target = |t| {
-                    expr_to_assign_target(t)
-                        .map_err(|bad| Rich::custom(bad, "invalid assignment target"))
-                };
-                let stmt = match tail {
-                    AssignTail::Plain(value) => Stmt::Assign {
-                        target: to_target(target)?,
-                        value,
-                    },
-                    AssignTail::Annotated(ann, val) => Stmt::AnnAssign {
-                        target: to_target(target)?,
-                        annotation: ann,
-                        value: val,
-                    },
-                    AssignTail::MutPlain(value) => Stmt::MutAssign {
-                        target: to_target(target)?,
-                        annotation: None,
-                        value,
-                    },
-                    AssignTail::MutAnnotated(ann, val) => Stmt::MutAssign {
-                        target: to_target(target)?,
-                        annotation: Some(ann),
-                        value: val,
-                    },
-                    AssignTail::Aug(op, val) => Stmt::AugAssign {
-                        target: to_target(target)?,
-                        op,
-                        value: val,
-                    },
-                    AssignTail::Define(value) => Stmt::Define {
-                        target: to_target(target)?,
-                        value,
-                    },
-                    AssignTail::None => Stmt::Expr(target),
-                };
-                Ok(Spanned::new(span, stmt))
+            .clone()
+            .then(assign_tail(expr.clone(), expr.clone()).or(empty().to(AssignTail::None)))
+            .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
+
+        // `x = if c: … else: …` and `x = match v: …` — a block statement on the
+        // right of an assignment, whose value is the block's own
+        // (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`"). The block's
+        // `Dedent` ends the statement, so this form takes no `stmt_terminator`
+        // and cannot ride `simple_stmt`. It is tried before `simple_stmt`, which
+        // reparses the target when the right-hand side turns out to be an
+        // ordinary expression.
+        let block_value =
+            choice((if_stmt.clone(), match_stmt.clone())).map(|stmt: Spanned<Stmt>| {
+                let span = stmt.span;
+                Spanned::new(span, Expr::Block(Box::new(stmt)))
             });
+        let block_assign = bare_tuple
+            .then(assign_tail(block_value, expr.clone()))
+            .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
 
         // A simple statement ends in either `Newline` or `;` (Python-style
         // one-liners: `x = 1; y = 2`). A statement followed by `;` may also
@@ -1411,6 +1337,7 @@ where
             for_stmt,
             with_stmt,
             def_stmt,
+            block_assign,
             simple_stmt,
         ))
         .labelled("statement")
@@ -1438,6 +1365,196 @@ enum AssignTail {
 
 /// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
 ///
+/// What follows an assignment target, over parsers for the right-hand side and
+/// for an annotation's type.
+///
+/// Two right-hand sides reach this: an expression, and a block statement in
+/// value position ([`Expr::Block`]). They differ in nothing else, so the six
+/// assignment operators and the annotation grammar are written here once.
+///
+/// [`AssignTail::None`] — the bare expression statement — is not among the
+/// alternatives, because it would match the empty input and so make every
+/// caller succeed. A caller that wants it appends `empty().to(AssignTail::None)`.
+fn assign_tail<'src, I, R, T>(rhs: R, ty: T) -> impl Parser<'src, I, AssignTail, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    R: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+    T: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    let aug_op = choice((
+        just(Token::PlusEq).to(AugOp::Add),
+        just(Token::MinusEq).to(AugOp::Sub),
+        just(Token::StarEq).to(AugOp::Mul),
+        just(Token::DoubleSlashEq).to(AugOp::FloorDiv),
+    ));
+    choice((
+        just(Token::Eq)
+            .ignore_then(rhs.clone())
+            .map(AssignTail::Plain),
+        // An annotated binding: `: ty` (exact) or `<: ty` (bounded), then `=`
+        // (immutable) or `:=` (mutable). The annotation's mode and the
+        // assignment operator are independent choices.
+        annotation_mode()
+            .then(ty)
+            .map(|(mode, ty)| TypeAnnotation { mode, ty })
+            .then(choice((
+                just(Token::Eq).ignore_then(rhs.clone()).map(|v| (false, v)),
+                just(Token::ColonEq)
+                    .ignore_then(rhs.clone())
+                    .map(|v| (true, v)),
+            )))
+            .map(|(ann, (mutable, val))| {
+                if mutable {
+                    AssignTail::MutAnnotated(ann, val)
+                } else {
+                    AssignTail::Annotated(ann, val)
+                }
+            }),
+        // `:= value` — a bare mutable assignment (no annotation).
+        just(Token::ColonEq)
+            .ignore_then(rhs.clone())
+            .map(AssignTail::MutPlain),
+        aug_op
+            .then(rhs.clone())
+            .map(|(op, val)| AssignTail::Aug(op, val)),
+        just(Token::LShiftEq)
+            .ignore_then(rhs)
+            .map(AssignTail::Define),
+    ))
+}
+
+/// `x: T` (exact) or `x <: T` (bounded) — the mode is the only difference.
+fn annotation_mode<'src, I>() -> impl Parser<'src, I, AnnotationMode, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+{
+    choice((
+        just(Token::Colon).to(AnnotationMode::Exact),
+        just(Token::LtColon).to(AnnotationMode::Bounded),
+    ))
+}
+
+/// Build the statement an assignment target and its [`AssignTail`] denote.
+///
+/// Errors when the target does not reduce to a binding pattern, carrying the
+/// offending sub-expression's span.
+fn assign_stmt<'src>(
+    target: Spanned<Expr>,
+    tail: AssignTail,
+    span: Span,
+) -> Result<Spanned<Stmt>, Rich<'src, Token, Span>> {
+    let to_target =
+        |t| expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid assignment target"));
+    let stmt = match tail {
+        AssignTail::Plain(value) => Stmt::Assign {
+            target: to_target(target)?,
+            value,
+        },
+        AssignTail::Annotated(ann, val) => Stmt::AnnAssign {
+            target: to_target(target)?,
+            annotation: ann,
+            value: val,
+        },
+        AssignTail::MutPlain(value) => Stmt::MutAssign {
+            target: to_target(target)?,
+            annotation: None,
+            value,
+        },
+        AssignTail::MutAnnotated(ann, val) => Stmt::MutAssign {
+            target: to_target(target)?,
+            annotation: Some(ann),
+            value: val,
+        },
+        AssignTail::Aug(op, val) => Stmt::AugAssign {
+            target: to_target(target)?,
+            op,
+            value: val,
+        },
+        AssignTail::Define(value) => Stmt::Define {
+            target: to_target(target)?,
+            value,
+        },
+        AssignTail::None => Stmt::Expr(target),
+    };
+    Ok(Spanned::new(span, stmt))
+}
+
+/// The `case` arms of a `match`, over a parser for how an arm's body is spelled.
+///
+/// Two spellings reach this: an indented block (the statement form) and a
+/// single expression (the one-line form). They differ in the body and in
+/// nothing else, so the pattern grammar and the default-arm rule are written
+/// here once and both spellings build the same [`MatchArm`].
+///
+/// The arm list is greedy over `case` and stops at the first token that cannot
+/// begin an arm. `case` is a keyword, so no arm body can continue across one.
+///
+/// A pattern spells its tag exactly as a constructor does — `` `tag(binder) ``
+/// — so an arm reads as the inverse of what it matches. `case _:` is the
+/// **default arm**, and takes no backtick: `_` is not a tag, it is the absence
+/// of one. Accepting it here rather than as a tag named `_` is what keeps it
+/// from silently matching nothing, since no constructor can spell that name.
+///
+/// The payload position takes a name or `_`. `_` is the **unused-binder**
+/// spelling — the arm has a payload and declines to read it — so it maps to
+/// [`PayloadPattern::Ignored`] rather than to a variable called `_`: nothing
+/// may refer to it.
+fn match_arms<'src, I, B>(body: B) -> impl Parser<'src, I, Vec<MatchArm>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    B: Parser<'src, I, Vec<Spanned<Stmt>>, PErr<'src>> + Clone,
+{
+    let match_ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
+    let case_pattern = choice((
+        just(Token::Backtick).ignore_then(match_ident),
+        select! { Token::Ident(s) if s.as_str() == "_" => s }.map_with(|s, e| (s, e.span())),
+    ));
+    let case_binder = choice((
+        select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
+        match_ident.map(|(name, _)| Some(name)),
+    ));
+    just(Token::Case)
+        .ignore_then(case_pattern)
+        .then(
+            case_binder
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not(),
+        )
+        .then_ignore(just(Token::Colon))
+        .then(body)
+        .validate(|(((tag, tag_span), binder), body), e, emitter| {
+            if tag.as_str() == "_" {
+                if binder.is_some() {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "the default arm `case _:` binds no payload: the tags it \
+                         covers have different payload types",
+                    ));
+                }
+                return MatchArm {
+                    pattern: None,
+                    body,
+                };
+            }
+            let payload = match binder {
+                Some(Some(name)) => PayloadPattern::Named(name),
+                Some(None) => PayloadPattern::Ignored,
+                None => PayloadPattern::Absent,
+            };
+            MatchArm {
+                pattern: Some(MatchPattern {
+                    tag,
+                    tag_span,
+                    payload,
+                }),
+                body,
+            }
+        })
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+}
+
 /// CHL binding patterns are bare names and (possibly-nested) tuples of
 /// patterns. We parse the LHS as a full expression so the regular grammar
 /// (with its error recovery) handles it, then narrow to the binding-pattern
@@ -1462,6 +1579,7 @@ fn expr_to_assign_target(spanned: Spanned<Expr>) -> Result<Spanned<AssignTarget>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::{formatdoc, indoc};
 
     fn parse_e(src: &str) -> Spanned<Expr> {
         parse_expression(src)
@@ -2103,6 +2221,168 @@ mod tests {
             }
             other => panic!("expected Match, got {other:?}"),
         }
+    }
+
+    /// A one-line `match` in a bracket parses to an [`Expr::Block`] over the
+    /// same [`Stmt::Match`] the indented form builds.
+    #[test]
+    fn oneline_match_is_a_block_expression() {
+        let e = parse_e("(match v: case `some(n): n case `none: 0)");
+        let Expr::Block(stmt) = &e.node else {
+            panic!("expected a Block expression, got {:?}", e.node)
+        };
+        let Stmt::Match { scrutinee, arms } = &stmt.node else {
+            panic!("expected a Match statement, got {:?}", stmt.node)
+        };
+        assert!(matches!(scrutinee.node, Expr::Name(_)));
+        assert_eq!(arms.len(), 2);
+        assert_eq!(
+            arms[0].pattern.as_ref().expect("tagged arm").payload,
+            PayloadPattern::Named("n".into())
+        );
+        assert_eq!(
+            arms[1].pattern.as_ref().expect("tagged arm").payload,
+            PayloadPattern::Absent
+        );
+        // Each arm body is its single expression, held as a one-statement block.
+        for arm in arms {
+            assert_eq!(arm.body.len(), 1);
+            assert!(matches!(arm.body[0].node, Stmt::Expr(_)));
+        }
+    }
+
+    /// The one-line form is reachable only from a bracketed position, so an
+    /// unbracketed one is not a `match` with a missing body — the `match`
+    /// statement is what the parser is in, and it wants indented arms.
+    #[test]
+    fn oneline_match_outside_a_bracket_is_rejected() {
+        let result = parse_module("x = match v: case `a: 1 case `b: 2");
+        assert!(
+            !result.errors.is_empty(),
+            "an unbracketed one-line `match` has no reading"
+        );
+    }
+
+    /// A nested one-line `match` needs a bracket of its own. Without it the arms
+    /// after the inner `match` could belong to either arm list, and the greedy
+    /// reading would leave the outer `match` no way to spell a later arm.
+    #[test]
+    fn nested_oneline_match_needs_its_own_bracket() {
+        let bare = parse_module("x = (match v: case `a(w): match w: case `p: 1 case `b: 0)");
+        assert!(
+            !bare.errors.is_empty(),
+            "an unbracketed nested one-line `match` has no reading"
+        );
+
+        let bracketed = parse_m(indoc! {"
+            x = (match v: case `a(w): (match w: case `p: 1) case `b: 0)
+            x"});
+        let Stmt::Assign { value, .. } = &bracketed.body[0].node else {
+            panic!("expected an assignment, got {:?}", bracketed.body[0].node)
+        };
+        let Expr::Block(outer) = &value.node else {
+            panic!("expected a Block expression, got {:?}", value.node)
+        };
+        let Stmt::Match { arms, .. } = &outer.node else {
+            panic!("expected a Match statement, got {:?}", outer.node)
+        };
+        assert_eq!(arms.len(), 2, "the outer arm list keeps its second arm");
+        assert!(matches!(
+            arms[0].body[0].node,
+            Stmt::Expr(Spanned {
+                node: Expr::Block(_),
+                ..
+            })
+        ));
+    }
+
+    /// A one-line `match` reaches every bracketed position, including the one
+    /// the layout rules put out of reach of the indented form: a refinement
+    /// predicate, where `{…}` suppresses the newlines the arms would need.
+    #[test]
+    fn oneline_match_reaches_every_bracketed_position() {
+        for src in [
+            "x = (match v: case `a: 1)",
+            "x = f(match v: case `a: 1)",
+            "x = [match v: case `a: 1]",
+            "x = xs[match v: case `a: 1]",
+            "x = (f=match v: case `a: 1)",
+            "x: {Int where match _: case `a: True} = 1",
+            "x = [y for y in match v: case `a: [1]]",
+        ] {
+            let result = parse_module(src);
+            assert!(
+                result.errors.is_empty(),
+                "expected `{src}` to parse, got {:#?}",
+                result.errors
+            );
+        }
+    }
+
+    /// `x = if c: … else: …` and `x = match v: …` — a block statement on the
+    /// right of an assignment, wrapped in the same [`Expr::Block`] the one-line
+    /// form uses.
+    #[test]
+    fn block_statement_on_the_right_of_an_assignment() {
+        let m = parse_m(indoc! {"
+            x = if c:
+                1
+            else:
+                2
+            x
+        "});
+        let Stmt::Assign { value, .. } = &m.body[0].node else {
+            panic!("expected an assignment, got {:?}", m.body[0].node)
+        };
+        let Expr::Block(stmt) = &value.node else {
+            panic!("expected a Block expression, got {:?}", value.node)
+        };
+        let Stmt::If {
+            branches,
+            else_body,
+        } = &stmt.node
+        else {
+            panic!("expected an If statement, got {:?}", stmt.node)
+        };
+        assert_eq!(branches.len(), 1);
+        assert!(else_body.is_some());
+    }
+
+    /// Every assignment operator takes a block right-hand side: they share one
+    /// `assign_tail`, so the block form is not a property of `=`.
+    #[test]
+    fn every_assignment_operator_takes_a_block_right_hand_side() {
+        for op in ["=", ": Int =", ":=", ": Int :=", "+=", "<<="] {
+            let src = formatdoc! {"
+                x {op} if c:
+                    1
+                else:
+                    2
+                x"};
+            let result = parse_module(&src);
+            assert!(
+                result.errors.is_empty(),
+                "expected `x {op} <block>` to parse, got {:#?}",
+                result.errors
+            );
+        }
+    }
+
+    /// The block right-hand side ends at its `Dedent`, and the statement after
+    /// it starts a new line with no terminator in between.
+    #[test]
+    fn a_statement_follows_a_block_right_hand_side() {
+        let m = parse_m(indoc! {"
+            x = match v:
+                case `a(n):
+                    n
+                case `b:
+                    0
+            y = x + 1
+            y
+        "});
+        assert_eq!(m.body.len(), 3);
+        assert!(matches!(m.body[1].node, Stmt::Assign { .. }));
     }
 
     /// `case _:` is the default arm, not a tag named `_` — `_` lexes as an ordinary

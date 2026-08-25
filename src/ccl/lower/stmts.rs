@@ -365,7 +365,8 @@ pub(super) fn lower_final_stmt(
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
-            let val = lower_aug_binop(&name, *op, value, last.span, ctx)?;
+            let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
+            let val = lower_aug_binop(&name, *op, rhs, last.span, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
         // A bare `x := e` as the final statement is a mutable-variable *write* when `x` is
@@ -386,7 +387,7 @@ pub(super) fn lower_final_stmt(
         {
             let name = extract_name_target(target, "mutable assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
-            let val = lower_expr(value, ctx)?;
+            let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
         // A standalone `with begin():` as the program's final statement: one
@@ -404,6 +405,30 @@ pub(super) fn lower_final_stmt(
             "last statement must be a bare expression, if/else, or \
                  for/yield generator loop",
         )),
+    }
+}
+
+/// Lower the right-hand side of an assignment.
+///
+/// A [`ChlExpr::Block`] right-hand side — `x = if c: … else: …`, `x = match v:
+/// …` — is the block statement it wraps, lowered in the scope the assignment
+/// sits in. Those names are what a `for` inside one of the block's branches
+/// consults to tell a loop-carried accumulator from a branch-local
+/// ([`find_mutation_loop_vars`]); reaching the block through [`lower_expr`]
+/// would lose them, and the loop would be read as a generator.
+///
+/// A loop body and a `with begin():` block lower an assignment's value with
+/// [`lower_expr`] instead, and so drop the scope. Neither admits a nested
+/// `for`, so nothing there depends on it.
+fn lower_assigned_value(
+    value: &Spanned<ChlExpr>,
+    preceding: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &value.node {
+        ChlExpr::Block(stmt) => lower_final_stmt(stmt, preceding, outer_bindings, ctx),
+        _ => lower_expr(value, ctx),
     }
 }
 
@@ -510,7 +535,7 @@ pub(super) fn lower_middle_stmt(
         // top-level `=` to a name that is *also* a live mutable variable just shadows it.
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
-            let val = lower_expr(value, ctx)?;
+            let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(Expr::let_bind(name, val, body), stmt.span))
         }
         ChlStmt::AnnAssign {
@@ -538,7 +563,7 @@ pub(super) fn lower_middle_stmt(
                 ));
             }
             let annotation_ty = lower_type_annotation(annotation, ctx)?;
-            let val = lower_expr(value, ctx)?;
+            let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
                 stmt.span,
@@ -569,7 +594,7 @@ pub(super) fn lower_middle_stmt(
             if annotation.is_none() {
                 check_mut_write_context(&name, stmt.span, ctx)?;
             }
-            let val = lower_expr(value, ctx)?;
+            let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             // A bare `x := e` where `x` is already in scope is a *write*, not a
             // declaration: emit a `MutWrite` marker (mutability checked
             // post-inference; the unified phase turns it into a recurrence in a
@@ -639,13 +664,15 @@ pub(super) fn lower_middle_stmt(
             // otherwise it is a bare mutable write whose target-is-a-mutable check
             // runs post-inference.
             check_mut_write_context(&name, stmt.span, ctx)?;
-            let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
+            let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
+            let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
             let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
             Ok(ctx.tag_image(Expr::expr_stmt(write, body), stmt.span))
         }
         // `x <<= e` — defer-define statement, distinct from AugAssign.
         ChlStmt::Define { target, value } => {
-            let lowered = lower_define(target, value, ctx)?;
+            let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
+            let lowered = lower_define(target, rhs)?;
             let define = ctx.tag_image(lowered, stmt.span);
             Ok(ctx.tag_image(Expr::expr_stmt(define, body), stmt.span))
         }
@@ -1576,6 +1603,7 @@ mod tests {
     use super::super::test_helpers::*;
     use super::super::*;
     use crate::ccl::symbolic::symbolic;
+    use indoc::indoc;
     use rstest::rstest;
 
     // -----------------------------------------------------------------------
@@ -1853,6 +1881,160 @@ x";
         assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 
+    // -----------------------------------------------------------------------
+    // `if`/`match` in value position: a block right-hand side, and the one-line
+    // `match`. Both arrive as `ChlExpr::Block` and lower to the `Case` the
+    // ternary and the tail-position statement forms already produce.
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // A block `if` on the right of an assignment is the `Case` the tail-position
+    // form lowers to, bound by the assignment's `let`.
+    #[case(
+        indoc! {"
+            x = if c:
+                1
+            else:
+                2
+            x"},
+        indoc! {"
+            let x = { c → 1; true → 2 }
+            in x"}
+    )]
+    // The elif chain is one `Case`, exactly as at statement level.
+    #[case(
+        indoc! {"
+            x = if a:
+                1
+            elif b:
+                2
+            else:
+                3
+            x"},
+        indoc! {"
+            let x = { a → 1; b → 2; true → 3 }
+            in x"}
+    )]
+    // A branch is a full block: its own bindings, and its last statement's value.
+    #[case(
+        indoc! {"
+            x = if c:
+                a = 1
+                a + 1
+            else:
+                2
+            x"},
+        indoc! {"
+            let x = { c → let a = 1
+            in a + 1; true → 2 }
+            in x"}
+    )]
+    // A block `match` right-hand side, and the one-line spelling of the same
+    // dispatch, lower alike.
+    #[case(
+        indoc! {"
+            x = match v:
+                case `a(n):
+                    n
+                case `b:
+                    0
+            x"},
+        indoc! {"
+            let x = match v { `a(n) → n; `b(__match_payload_0) → 0 }
+            in x"}
+    )]
+    #[case(
+        indoc! {"
+            x = (match v: case `a(n): n case `b: 0)
+            x"},
+        indoc! {"
+            let x = match v { `a(n) → n; `b(__match_payload_0) → 0 }
+            in x"}
+    )]
+    // A nested one-line `match` carries its own bracket, and nests in the IR.
+    #[case(
+        indoc! {"
+            x = (match v: case `a(w): (match w: case `p: 1) case `b: 0)
+            x"},
+        indoc! {"
+            let x = match v { `a(w) → match w { `p(__match_payload_0) → 1 }; \
+            `b(__match_payload_1) → 0 }
+            in x"}
+    )]
+    fn test_lower_block_value(#[case] code: &str, #[case] expected: &str) {
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    /// A block right-hand side is the same `Case` the ternary builds, so the two
+    /// spellings of a two-way choice lower to one node.
+    #[test]
+    fn test_block_if_and_ternary_agree() {
+        let lower = |code: &str| {
+            let stmts = parse_module(code);
+            symbolic(
+                &lower_stmts(&stmts, &mut LoweringContext::default())
+                    .into_result()
+                    .expect("lowering failed"),
+            )
+        };
+        assert_eq!(
+            lower(indoc! {"
+                x = if c:
+                    1
+                else:
+                    2
+                x"}),
+            lower(indoc! {"
+                x = 1 if c else 2
+                x"})
+        );
+    }
+
+    /// A `for` inside a branch of a block right-hand side sees the names bound
+    /// above the assignment, so a write to one of them reads as the
+    /// loop-carried accumulator it is rather than as a branch-local.
+    /// `lower_assigned_value` is what carries that scope in.
+    #[test]
+    fn test_block_right_hand_side_sees_the_enclosing_scope() {
+        let stmts = parse_module(indoc! {"
+            acc := 0
+            x = if c:
+                for i in [1, 2]:
+                    acc += i
+                acc
+            else:
+                0
+            x"});
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
+        let rendered = symbolic(&ccl);
+        assert!(
+            rendered.contains("acc :="),
+            "the loop writes the outer accumulator, got: {rendered}"
+        );
+    }
+
+    /// A bare `if` has no value on the false path, in an assignment as anywhere
+    /// else that requires one.
+    #[test]
+    fn test_block_right_hand_side_without_else_rejected() {
+        let stmts = parse_module(indoc! {"
+            x = if c:
+                1
+            x"});
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message, .. } = &err;
+        assert!(
+            message.contains("if without else"),
+            "expected the missing-else rejection, got: {message}"
+        );
+    }
+
     /// A colon-free brace group `{T, U}` is structural *type* syntax; it has no
     /// term-level value, so it is rejected in value position (it is accepted as
     /// a tuple type in annotation position — see `lower_type_annotation`).
@@ -1892,9 +2074,12 @@ x";
     /// rides `user_annotation` (still `Hole`-typed pre-inference), so the test
     /// reads the annotation back off the `Let` and renders *its* type — one
     /// string that surfaces the base, the predicate, and the resolved subject.
+    ///
+    /// Each case is the annotated binding alone; the trailing `x` that makes it
+    /// a program is appended below.
     #[rstest]
     // Flat refinement: the predicate's `_` becomes `__elem`.
-    #[case("x: {Int where _ != 0} = 5\nx", "{Int | __elem != 0}")]
+    #[case("x: {Int where _ != 0} = 5", "{Int | __elem != 0}")]
     // Nested refinement: both levels' `_` resolve to `__elem`, and the
     // save/restore of `in_refinement_predicate` around the inner annotation
     // keeps the flag from leaking — the outer `_` still lowers to `__elem`
@@ -1902,13 +2087,22 @@ x";
     // refinement set: both predicates restrict the same element, so the source's
     // nesting carries nothing the set does not.
     #[case(
-        "x: { {Int where _ != 1} where _ != 0} = 5\nx",
+        "x: { {Int where _ != 1} where _ != 0} = 5",
         "{Int | __elem != 0, __elem != 1}"
+    )]
+    // A one-line `match` as the predicate. The refinement's braces are the
+    // bracket that closes the arm list, so the predicate needs no parentheses of
+    // its own; `{…}` suppresses newlines, which is what puts the indented `match`
+    // out of reach here (`docs/chl-spec.md`, "6.4 Refinement syntax").
+    #[case(
+        "x: {{`a | `b} where match _: case `a: True case `b: False} = v",
+        "{{`a | `b} | match __elem { `a(__match_payload_0) → true; \
+         `b(__match_payload_1) → false }}"
     )]
     fn test_lower_refinement_annotation(#[case] code: &str, #[case] expected_ty: &str) {
         use crate::ccl::{Type, TypedExprNode};
 
-        let stmts = parse_module(code);
+        let stmts = parse_module(&format!("{code}\nx"));
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
             .expect("lowering failed");

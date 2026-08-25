@@ -258,6 +258,7 @@ Python's `ast.Module`; the name is historical.)
 
 ```ebnf
 statement       ::= simple_stmt NEWLINE
+                 |  block_assign_stmt
                  |  compound_stmt
 
 simple_stmt     ::= return_stmt
@@ -279,17 +280,32 @@ aug_assign_stmt ::= assign_target aug_op expression
 define_stmt     ::= assign_target "<<=" expression
 expr_stmt       ::= expression
 
+-- The same six assignment forms with a block statement on the right (§4.3).
+-- The block's DEDENT ends the statement, so no NEWLINE follows it.
+block_assign_stmt ::= assign_target "=" block_value
+                   |  assign_target ":" expression "=" block_value
+                   |  assign_target [ ":" expression ] ":=" block_value
+                   |  assign_target aug_op block_value
+                   |  assign_target "<<=" block_value
+
+block_value     ::= if_stmt | match_stmt
+
 aug_op          ::= "+=" | "-=" | "*=" | "//="
 
 assign_target   ::= ident
                  |  "(" assign_target ( "," assign_target )* [ "," ] ")"
                  |  assign_target ( "," assign_target )+ [ "," ]
 
-compound_stmt   ::= if_stmt | for_stmt | with_stmt | def_stmt
+compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
 
 if_stmt         ::= "if" expression ":" block
                     ( "elif" expression ":" block )*
                     [ "else" ":" block ]
+
+match_stmt      ::= "match" expression ":" NEWLINE INDENT case_arm+ DEDENT
+case_arm        ::= "case" case_pattern ":" block
+case_pattern    ::= "`" ident [ "(" ( ident | "_" ) ")" ]
+                 |  "_"
 
 for_stmt        ::= "for" assign_target "in" expression ":" block
 
@@ -360,6 +376,15 @@ expression ::= lambda_expr | yield_expr | feed_expr
              | ternary | bool_or | bool_and | bool_not
              | comparison | log_or | log_xor | log_and | collection_union
              | sum_expr | product | unary | postfix | atom
+
+-- Every position a bracket encloses: a list or tuple element, a call argument,
+-- a subscript index, a record field, a brace item, a refinement predicate, a
+-- comprehension clause. The one-line `match` (§4.10) is legal only here, so the
+-- enclosing `)`, `]` or `}` always closes its arm list. The bracketed atom forms
+-- in §2.4 recurse through this production rather than through `expression`.
+bracketed_expression ::= oneline_match | expression
+
+oneline_match ::= "match" expression ":" ( "case" case_pattern ":" expression )+
 ```
 
 ### 2.4 Atoms
@@ -1282,6 +1307,30 @@ is supported at any nesting depth.
 (the mutation `:=` is a statement, §1.8). **No multi-target chained
 assignment** (`a = b = c` is not in the grammar).
 
+**A block statement may sit on the right.** Every form in the table above
+accepts an `if` chain or a `match` where it accepts an expression, and binds
+that block's value — its last statement's, by the rule in §4.5:
+
+```python
+label = if score > 90:
+    "high"
+elif score > 50:
+    "mid"
+else:
+    "low"
+
+n = match msg:
+    case `ping(seq):
+        seq
+    case `close:
+        0
+```
+
+The block's DEDENT ends the statement, so nothing follows it on the line. Every
+branch must produce a value, and an `if` with no `else` is rejected (§4.5); a
+one-line spelling of the same thing is the ternary (§3.6) or, for `match`, the
+bracketed form in §4.10.
+
 Annotated assignment **requires** a value (`x: T` alone is a parse error,
 unlike Python's bare type-only declarations).
 
@@ -1417,8 +1466,9 @@ else:
     block_else
 ```
 
-`if`/`elif`/`else` is a *statement*; for an expression form use the
-ternary (§3.6).
+`if`/`elif`/`else` is a statement. It is value-yielding by position: as the
+last statement of a block, and on the right of an assignment (§4.3). The
+one-line spelling of the same choice is the ternary (§3.6).
 
 The branches are tried in source-text priority: the value of the
 statement is the value of the block under the first guard that holds,
@@ -1432,9 +1482,9 @@ non-winning blocks contribute no effects.
 
 Each branch's block is itself a statement block. When the `if` chain
 occurs in a position that requires a value (function body, program
-value), every branch — including `else` — must end in a value-yielding
-statement, and the missing-`else` case is rejected as "if used as an
-expression, all branches must produce a value."
+value, an assignment's right-hand side), every branch — including `else` —
+must end in a value-yielding statement, and the missing-`else` case is
+rejected as "if used as an expression, all branches must produce a value."
 
 ### 4.6 `for` — iteration
 
@@ -1663,16 +1713,42 @@ and bare calls. Dispatching per element is written as a `def` that matches
 on its parameter and is called from the loop or a comprehension, which is
 the same first-match rule reached through a call.
 
-> **Direction [Tentative].** What is missing is a **one-line** spelling, not
-> expression-ness: a `match` in a value position yields a value as an `if`
-> chain does (§4.5). The candidate spelling is the block with its line breaks
-> removed — `` match scrut: case `foo(x): x case `bar(y): to_x(y) `` — where
-> `case` delimits the arms, so no separator is needed. It waits on a one-line
-> block rule, which no block statement has today (`if c: x` does not parse
-> either), so the rule to settle is layout's rather than `match`'s. Tuple
-> destructuring on assignment targets (§4.3) is unaffected and remains the
-> only other pattern-like form.
->
+#### The one-line form
+
+```
+match scrut: case `foo(x): x case `bar(y): to_x(y)
+```
+
+The block with its line breaks removed, and an expression in place of each
+arm's block. `case` delimits the arms, so no separator is needed, and the arm
+list runs to the first token that cannot begin an arm.
+
+**A one-line `match` is legal only inside a bracket** — `(…)`, `[…]`, `{…}` —
+so a `)`, `]` or `}` is always in place to close the arm list. That covers a
+call argument, a list or tuple element, a subscript index, a record field, a
+comprehension clause, and a refinement predicate (§6.4). In a value position
+that has no bracket of its own, the parentheses are written:
+
+```python
+n = (match msg: case `ping(seq): seq case `close: 0)
+```
+
+The bracket is what makes nesting readable. An arm body is an ordinary
+expression, which cannot itself derive a one-line `match`, so a nested one
+carries its own bracket and two arm lists never compete for the same `case`.
+Without the requirement, `` match a: case `p: match b: case `q: 1 case `r: 2 ``
+has two readings, and under the greedy one the outer `match` has no way to
+spell an arm after `` `p ``.
+
+Restricting the arm body instead of requiring the bracket does not hold: a
+lambda body, a ternary else-branch, an `<<` right operand and a `=>` codomain
+each take a whole expression, so an inner `match` reappears through any of
+them.
+
+The indented and one-line forms differ in the arm body and in nothing else:
+same arms, same partition rule, same value.
+
+> **Direction [Tentative].**
 > `_` is accepted as an unused binder in a **pattern payload** only.
 > Extending it to every binder position — a lambda parameter, a `for` target,
 > a tuple destructuring slot — is **[Tentative]**. It needs a written rule for
@@ -2098,20 +2174,16 @@ A `match` over `_` is the idiomatic way to refine a variant:
 { { `some{Int} | `none } where
     match _:
         case `some(x): x > 0
-        case `none: true
+        case `none: True
 }
 ```
 
-> **[Open]** — the layout of that `match`. Newlines and indentation are
-> **ignored** inside brackets (§1.4), so a `match` written inside `{…}`
-> gets no `INDENT`/`DEDENT` to delimit its arms: the arms above are
-> readable to a human but invisible to the layout rules, and the parser
-> would have to delimit each arm by the next `case` or the closing brace
-> instead. That is parseable — neither token can continue an expression —
-> but it is a second, delimiter-derived block discipline for `match`
-> alongside the indentation-derived one it has today (§4.10). A
-> **single-line `match`** form would collapse the two; its spelling is
-> undecided, and so is any expression form of `match` at all (§4.10).
+That `match` is the one-line form (§4.10). Newlines and indentation are
+ignored inside brackets (§1.4), so a `match` written inside `{…}` gets no
+`INDENT`/`DEDENT` to delimit its arms; the refinement's own `}` closes the arm
+list instead, and the line breaks above are for the reader. The predicate needs
+no parentheses of its own, because the braces are already the bracket the
+one-line form requires.
 
 `_` is the value being refined, so a predicate that mentions *another* value
 relies on that value having a name where the refinement sits. In a function
@@ -2913,11 +2985,9 @@ with parser-level support that lowering rejects:
   would replace the built-in `Option(T)` with a prelude definition
   (**[Tentative]**, §3.15, §6.1).
 - **Pattern matching** beyond a `match` arm's single tag — `match` / `case`
-  tag dispatch over a variant is implemented (§4.10), but patterns are
-  shallow: no nesting, no literal patterns, and no per-arm guard. `match` is a
-  statement only; an expression form is **[Open]**, and the layout rules
-  (§1.4) force the question for a `match` inside a refinement predicate
-  (§6.4).
+  tag dispatch over a variant is implemented (§4.10), in both the indented and
+  the one-line form, but patterns are shallow: no nesting, no literal patterns,
+  and no per-arm guard.
 - **Destructuring patterns** beyond tuples — record, variant, and
   wildcard patterns in assignment targets and `for` binders (a `match`
   arm's tag pattern is §4.10), and per-component annotations with `:`
