@@ -74,9 +74,13 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::ccl::{BaseType, FieldKey, InferVar, InferVarId, Type};
+use crate::ccl::{
+    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name, Type,
+    TypedExpr,
+};
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
+use super::prim;
 
 /// A trait: a named requirement on types, together with any types it associates
 /// with them.
@@ -127,7 +131,7 @@ pub enum Assoc {
 }
 
 /// One instance: the types it accepts, and what it associates with them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TraitInstance {
     /// The accepted types, positionally. A slice rather than a fixed array because
     /// arity is the trait's business — every operator trait is binary today, and an
@@ -136,6 +140,8 @@ pub struct TraitInstance {
     /// The types this instance associates, by name. Empty for a trait that is
     /// a pure requirement.
     pub assoc: &'static [(Assoc, BaseType)],
+    /// An optional function producing a refinement from the input expressions.
+    pub refinement: Option<fn(Vec<TypedExpr>) -> TypedExpr>,
 }
 
 impl TraitInstance {
@@ -151,26 +157,51 @@ const NUMERIC: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[(Assoc::Output, BaseType::Int)],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[(Assoc::Output, BaseType::UInt)],
+        refinement: None,
     },
 ];
+
+/// The bare predicate `__elem == a1 + a2` for the `Addable(Int, Int ⇝ Int)` row: the
+/// result is the sum of the operands the instance accepted.
+///
+/// Bare in the sense of [`crate::ccl::ccl_utils::refine_with_bare`] — [`Name::elem`] is
+/// free, and the refinement it lands in is what binds it. Every node is typed at
+/// construction because the row fixes both operand bases and the associated base at
+/// `Int`, leaving nothing for inference to resolve, the same reason
+/// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
+fn refinement_for_add(args: Vec<TypedExpr>) -> TypedExpr {
+    let [a1, a2] = <[TypedExpr; 2]>::try_from(args)
+        .expect("Addable is binary, so its instance's refinement receives two operands");
+    let int = prim(BaseType::Int);
+    TypedExpr::binop(
+        TypedExpr::var(Name::elem()).with_ty(int.clone()),
+        BinOpKind::Compare(CompareKind::Equals),
+        TypedExpr::binop(a1, BinOpKind::Arithmetic(ArithmeticKind::Add), a2).with_ty(int),
+    )
+    .with_ty(prim(BaseType::Bool))
+}
 
 /// The numeric rows plus `(String, String) ⇝ String`.
 const NUMERIC_OR_STRING: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[(Assoc::Output, BaseType::Int)],
+        refinement: Some(refinement_for_add),
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[(Assoc::Output, BaseType::UInt)],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::String, BaseType::String],
         assoc: &[(Assoc::Output, BaseType::String)],
+        refinement: None,
     },
 ];
 
@@ -185,18 +216,22 @@ const COMPARABLE: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::String, BaseType::String],
         assoc: &[],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::Bool, BaseType::Bool],
         assoc: &[],
+        refinement: None,
     },
 ];
 
@@ -205,6 +240,7 @@ const COMPARABLE: &[TraitInstance] = &[
 const NEGATABLE: &[TraitInstance] = &[TraitInstance {
     args: &[BaseType::Int],
     assoc: &[(Assoc::Output, BaseType::Int)],
+    refinement: None,
 }];
 
 /// The bases an aggregate can order, matching `max`'s merge in `ccl/mod.rs`. Unary
@@ -213,14 +249,17 @@ const ORDERED: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int],
         assoc: &[],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::UInt],
         assoc: &[],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::String],
         assoc: &[],
+        refinement: None,
     },
 ];
 
@@ -1430,12 +1469,15 @@ mod tests {
             Some(BaseType::Int),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled",
         );
-        assert_eq!(
-            ob.candidates(),
-            vec![TraitInstance {
-                args: &[BaseType::Int, BaseType::Int],
-                assoc: &[(Assoc::Output, BaseType::Int)],
-            }]
+        let candidates = ob.candidates();
+        let [only] = candidates.as_slice() else {
+            panic!("(Int, Int) ⇝ Int is the only Addable row left, got {candidates:?}");
+        };
+        assert_eq!(only.args, &[BaseType::Int, BaseType::Int]);
+        assert_eq!(only.assoc, &[(Assoc::Output, BaseType::Int)]);
+        assert!(
+            only.refinement.is_some(),
+            "the integer row pins its output to the sum of its operands",
         );
     }
 
@@ -1534,9 +1576,7 @@ mod tests {
     fn a_refinement_narrows_as_its_base() {
         let refined = Type::refined_one(
             Type::Base(BaseType::String),
-            crate::ccl::Refinement::born(Rc::new(crate::ccl::TypedExpr::lit(
-                crate::ccl::Lit::Bool(true),
-            ))),
+            crate::ccl::Refinement::born(Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(true)))),
         );
         assert_eq!(offered_base(&refined), Some(&BaseType::String));
     }
