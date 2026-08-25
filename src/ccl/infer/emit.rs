@@ -916,9 +916,14 @@ pub(super) fn emit_binop<C: Typing>(
     let at = || "BinOp".to_string();
     match sig {
         OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
-        OpSignature::SingleObligation { trait_, result } => {
-            require_single_obligation(ctx, *trait_, &[&left_ty, &right_ty], &[&left, &right], result, &at)
-        }
+        OpSignature::SingleObligation { trait_, result } => require_single_obligation(
+            ctx,
+            *trait_,
+            &[&left_ty, &right_ty],
+            &[&left, &right],
+            result,
+            &at,
+        ),
     }
 }
 

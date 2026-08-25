@@ -75,8 +75,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name, Refinement, RefinementTemplate, Type,
-    TypedExpr,
+    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name,
+    Refinement, RefinementTemplate, Type, TypedExpr,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -180,9 +180,14 @@ fn refinement_for_add(args: &[&TypedExpr]) -> TypedExpr {
         TypedExpr::binop(
             TypedExpr::var(Name::elem()).with_ty(int.clone()),
             BinOpKind::Compare(CompareKind::Equals),
-            TypedExpr::binop((*a1).clone(), BinOpKind::Arithmetic(ArithmeticKind::Add), (*a2).clone()).with_ty(int),
+            TypedExpr::binop(
+                (*a1).clone(),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                (*a2).clone(),
+            )
+            .with_ty(int),
         )
-            .with_ty(prim(BaseType::Bool))
+        .with_ty(prim(BaseType::Bool))
     } else {
         panic!("Addable is binary, so its instance's refinement receives two operands");
     }
@@ -388,7 +393,11 @@ struct AssocPosition {
 impl TraitObligation {
     /// Record an instance of `trait_` whose associated names stand at the given type
     /// positions, with every instance still a candidate.
-    pub fn new(trait_: Trait, assoc: Vec<(Assoc, Type)>, input_exprs: Vec<TypedExpr>) -> Rc<TraitObligation> {
+    pub fn new(
+        trait_: Trait,
+        assoc: Vec<(Assoc, Type)>,
+        input_exprs: Vec<TypedExpr>,
+    ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_,
@@ -568,15 +577,10 @@ impl TraitObligation {
             let target = position.ty.borrow().clone();
             let ty_base = Type::Base(settled);
             let ty = match maybe_refinement {
-                Some(template) => {
-                    Type::Refinement(
-                        Box::new(ty_base),
-                        Refinement::born_from_template(
-                            template,
-                            &self.input_exprs,
-                        ),
-                    )
-                }
+                Some(template) => Type::Refinement(
+                    Box::new(ty_base),
+                    Refinement::born_from_template(template, &self.input_exprs),
+                ),
                 None => ty_base,
             };
             constrain_subtype(&ty, &target, cache)?;
@@ -1445,6 +1449,13 @@ mod tests {
     use super::*;
     use crate::ccl::infer::solver::fresh_var;
 
+    /// The operand expressions an obligation substitutes into an instance's
+    /// refinement template. Two variables suffice: no test here inspects the
+    /// resulting predicate's shape, only that narrowing and depositing succeed.
+    fn operands() -> Vec<TypedExpr> {
+        vec![TypedExpr::var("x"), TypedExpr::var("y")]
+    }
+
     /// Both narrowing orders reach the same answer — the property that lets the
     /// obligation be resolved incrementally instead of by a final sweep.
     #[rstest::rstest]
@@ -1452,7 +1463,11 @@ mod tests {
     #[case(&[(1, BaseType::Int), (0, BaseType::Int)])]
     fn narrowing_is_order_independent(#[case] steps: &[(u8, BaseType)]) {
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Addable, vec![(Assoc::Output, out.clone())]);
+        let ob = TraitObligation::new(
+            Trait::Addable,
+            vec![(Assoc::Output, out.clone())],
+            operands(),
+        );
         let mut cache = ConstrainCache::new();
 
         for (pos, base) in steps {
@@ -1467,7 +1482,7 @@ mod tests {
                 .borrow()
                 .lower()
                 .iter()
-                .any(|b| b.ty == Type::Base(BaseType::Int)),
+                .any(|b| b.ty.peel_refinements() == &Type::Base(BaseType::Int)),
             "the settled output type is deposited as a lower bound on O",
         );
     }
@@ -1478,16 +1493,23 @@ mod tests {
     #[test]
     fn one_known_operand_settles_an_agreed_output() {
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Addable, vec![(Assoc::Output, out.clone())]);
+        let ob = TraitObligation::new(
+            Trait::Addable,
+            vec![(Assoc::Output, out.clone())],
+            operands(),
+        );
         let mut cache = ConstrainCache::new();
 
         ob.narrow(1, &BaseType::Int, &mut cache)
             .expect("Int is addable");
 
-        assert_eq!(
-            ob.agreed_assoc(Assoc::Output),
-            Some((BaseType::Int, None)),
-            "(Int, Int) ⇝ Int is the only row left, so its Output is settled",
+        assert!(
+            matches!(
+                ob.agreed_assoc(Assoc::Output),
+                Some((BaseType::Int, Some(_)))
+            ),
+            "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
+             that row refines its output by the operands' sum",
         );
         let candidates = ob.candidates();
         let [only] = candidates.as_slice() else {
@@ -1510,7 +1532,7 @@ mod tests {
     /// not just here.
     #[test]
     fn a_comparison_associates_nothing() {
-        let ob = TraitObligation::new(Trait::Equatable, Vec::new());
+        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), operands());
         let mut cache = ConstrainCache::new();
 
         ob.try_deposit(&mut cache).expect("nothing to deposit");
@@ -1530,7 +1552,7 @@ mod tests {
     #[test]
     fn incompatible_operands_have_no_instance() {
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Orderable, vec![(Assoc::Output, out)]);
+        let ob = TraitObligation::new(Trait::Orderable, vec![(Assoc::Output, out)], operands());
         let mut cache = ConstrainCache::new();
 
         ob.narrow(0, &BaseType::Int, &mut cache)

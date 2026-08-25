@@ -1686,10 +1686,7 @@ pub const REFINEMENT_BINDER: &str = "__elem";
 pub type RefinementTemplate = fn(&[&TypedExpr]) -> TypedExpr;
 
 impl Refinement {
-    pub fn born_from_template(
-        template: RefinementTemplate,
-        args: &Vec<TypedExpr>
-    ) -> Self {
+    pub fn born_from_template(template: RefinementTemplate, args: &Vec<TypedExpr>) -> Self {
         let args: Vec<&TypedExpr> = args.iter().collect();
         Self::born(Rc::new(template(&args[..])))
     }
