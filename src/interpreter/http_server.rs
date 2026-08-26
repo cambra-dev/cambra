@@ -41,6 +41,8 @@ use crate::interpreter::{
 type RouteSender = Sender<Option<(SmolStr, tiny_http::Request)>>;
 
 /// Routing table shared between the dispatcher thread and the [`SharedHttpServer`] handle.
+// shared-state-ok: the I/O boundary, not the operator graph — side effects live
+// at the edge, and no operator reads this.
 type RouteMap = Arc<Mutex<HashMap<(String, String), RouteSender>>>;
 
 /// A single `tiny_http::Server` shared by all `http_serve` calls on the same port.
@@ -184,6 +186,8 @@ pub fn reserve_test_port() -> u16 {
     /// Every lock this process holds.  The reservation must outlive the call —
     /// the server binds later, inside `compile_program` — and a test has no
     /// scope to keep a guard in, so the locks live until the process exits.
+    // shared-state-ok: port reservations for the test harness, held open for the
+    // process's lifetime. Outside the operator graph entirely — no operator reads it.
     static RESERVED: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
     let dir = std::env::temp_dir();
@@ -236,6 +240,10 @@ pub fn reserve_test_port() -> u16 {
 /// the CCL program produces a response for them.
 pub struct HttpServerSharedState {
     /// Map from request index to the still-open `tiny_http::Request`.
+    // shared-state-ok: the external-world boundary, where side effects live by
+    // design. It holds the *socket* a request arrived on, not a value the program
+    // computed: the request's data reaches the sink as a tile like anything else,
+    // and this is what the reply is finally written to.
     pending: Mutex<HashMap<usize, tiny_http::Request>>,
 }
 

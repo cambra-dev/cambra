@@ -24,12 +24,15 @@ Concretely:
   reads the prev-acc directly from a `Rc<RefCell<...>>` instead of
   through `get`") is a violation, even if it works on the test cases at
   hand.  Cyclic graphs go through `FanOut::new_cyclic` and the
-  re-entrancy machinery on `FanOutShared` — see
-  [`Recurse`]'s docs for the contract — but the data on the wire is
-  still a [`Tile`].
-- Constructor-time wiring (e.g., `Recurse::recursive_input_setter`)
-  passes `TileOperator` handles, not raw values.  The operator graph is
-  static; values flow through it at `get` time.
+  re-entrancy machinery on `FanOutShared` — see [`FanOutReentrancy`]'s
+  docs for the contract — but the data on the wire is still a [`Tile`].
+  A cyclic pull is served the fan's cached snapshot rather than
+  re-entering the inner producer, which is why such a cycle advances one
+  step per outer pull.
+- Constructor-time wiring (a [`CycleSlot`], filled through its
+  `setter` once the rest of the cycle exists) passes `TileOperator`
+  handles, not raw values.  The operator graph is static; values flow
+  through it at `get` time.
 - Side effects (I/O, sinks, notifications) live at the boundary —
   `compile_program` wires a `SinkConsumer` to the final operator, and
   `Scheduler::check_for_notifications` drives them.  Operators

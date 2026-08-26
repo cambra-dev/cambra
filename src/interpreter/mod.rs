@@ -41,6 +41,8 @@ pub trait Consumer {
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
+// shared-state-ok: this is what makes a shared *notification* handle a consumer;
+// a wakeup carries no value, so it is not a dataflow edge.
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
     fn notify(&mut self) {
         self.borrow_mut().notify()

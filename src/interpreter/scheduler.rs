@@ -22,6 +22,26 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 /// (and that a producer can clone to re-arm on its next pull).
 pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
 
+/// Share one operator's consumer between several of its inputs.
+///
+/// An operator with more than one input has a single downstream consumer to wake,
+/// so the handle has to be shared. This is the one way to build that handle.
+pub fn shared_consumer(mut consumer: Box<dyn Consumer>) -> SharedConsumer {
+    Rc::new(RefCell::new(move || consumer.notify()))
+}
+
+/// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
+/// an input whose notifications should reach the operator's own consumer.
+///
+/// The closure is not ceremony: a `Box<Rc<RefCell<dyn Consumer>>>` is not itself a
+/// `Consumer`, because the blanket impl over `Rc<RefCell<C>>` needs a *sized* `C`,
+/// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
+/// impl something sized to bite on.
+pub fn forwarding_consumer(shared: &SharedConsumer) -> Box<dyn Consumer> {
+    let shared = shared.clone();
+    Box::new(move || shared.borrow_mut().notify())
+}
+
 #[derive(Clone, Default)]
 pub struct WakeupQueue(Rc<RefCell<Vec<SharedConsumer>>>);
 
