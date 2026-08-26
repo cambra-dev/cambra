@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ccl::{BaseType, HistoryKind, InferVar, InferVarId, Type};
+use crate::ccl::{HistoryKind, InferVar, InferVarId, Type};
 
 use super::compact::{CompactGraph, CompactType, CompactVariant};
 use crate::ccl::FieldKey;
@@ -29,6 +29,15 @@ pub enum CoalesceError {
     /// The solver rejects this rather than inventing an anonymous (untagged)
     /// sum from the collision — a genuinely tagged `Variant` is a single
     /// shape and never triggers this.
+    ///
+    /// Two products that share no field are the same conflict read one level
+    /// down: a positive merge intersects field sets, so the merged product has
+    /// no fields, and there is no zero-field product for it to be. Unit is a
+    /// *base* type, which a product reaches only through an operation that says
+    /// so (`docs/chl-spec.md`, "6.6 The empty product is unit"), so answering
+    /// `Unit` would drop every field with nothing in the program marking the
+    /// loss. `details` names the empty field set rather than the operands, which
+    /// the merge has already consumed by the time the position materializes.
     IncompatibleBounds {
         /// `true` = positive polarity (lower bounds forming a union);
         /// `false` = negative polarity (upper bounds forming an intersection).
@@ -136,7 +145,8 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     let mut shapes: Vec<Type> = Vec::new();
 
     if let Some(rec) = &ct.rec {
-        shapes.push(materialize_record(rec, polarity)?);
+        let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
+        shapes.push(materialize_record(rec, polarity, &vars)?);
     }
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity)?);
@@ -376,6 +386,11 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
     ct
 }
 
+/// How a position's polarity reads in a diagnostic.
+fn polarity_word(polarity: bool) -> &'static str {
+    if polarity { "produced" } else { "required" }
+}
+
 /// Materialize a variant contribution into [`Type::Variant`], preserving tag
 /// order by name (BTreeMap iterates in key order, so output is stable).
 /// Payloads coalesce at the same polarity as the outer (covariant depth).
@@ -395,13 +410,21 @@ fn materialize_variant(variant: &CompactVariant, polarity: bool) -> Result<Type,
 fn materialize_record(
     rec: &BTreeMap<FieldKey, CompactType>,
     polarity: bool,
+    vars: &[InferVarId],
 ) -> Result<Type, CoalesceError> {
-    // The product of zero fields is unit — the one representation of the empty
-    // product (`docs/chl-spec.md`, "6.6 The empty product is unit"). A record
-    // variable that accumulated no field demands is that product, not an empty
-    // tuple: `Tuple([])` and `Record([])` are not valid types.
+    // No zero-field product exists, and `Unit` is not one: it is a base type, and
+    // a product reaches it only through an operation that says so
+    // (`docs/chl-spec.md`, "6.6 The empty product is unit"). Answering `Unit` here
+    // would be the silent arrival that section rules out. A positive merge
+    // intersects field sets, so an empty map is what products sharing no field
+    // merge to — bounds with no common shape, which is what
+    // `IncompatibleBounds` already says.
     if rec.is_empty() {
-        return Ok(Type::Base(BaseType::Unit));
+        return Err(CoalesceError::IncompatibleBounds {
+            polarity,
+            vars: vars.to_vec(),
+            details: format!("{} products sharing no field", polarity_word(polarity)),
+        });
     }
     let all_index = rec.keys().all(|k| matches!(k, FieldKey::Index(_)));
     let all_name = rec.keys().all(|k| matches!(k, FieldKey::Name(_)));
