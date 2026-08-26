@@ -345,6 +345,18 @@ pub enum Builtin {
     /// holds, never eagerly at a rejected position.
     FilterValues,
 
+    /// `map_filter : ((𝑘: 𝐾) ⤇ (𝐼 ⇒ Bool)) ⇒ ((𝑘: 𝐾) ⤇ ({𝑖: 𝐼 | 𝑝(𝑘, 𝑖)} ⤇ 𝑉))` — a
+    /// filter on the **inner collections** of a partition, one outer key at a time.
+    ///
+    /// `Apply(p, MapFilter)` requires `input=Some(_)`, the curried collection to
+    /// filter. [`Self::Restrict`] and [`Self::FilterValues`] both narrow a single
+    /// domain; neither reaches the inner domain of a curried function, where the
+    /// surviving elements differ per key. Planning emits this when a refinement rides
+    /// the inner collection's domain under the outer key's binder, which is what a
+    /// per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produces.
+    /// Compiles to the `MapFilter` tile operator.
+    MapFilter,
+
     // Aggregations (codomain of a function-typed input → scalar).
     /// `sum : ∀α. (α ⤇ Int) ⇒ Int` — fold a collection's `Int` codomain.
     Sum,
@@ -606,6 +618,7 @@ impl Builtin {
             Self::Neg => "neg",
             Self::NotFn => "not_fn",
             Self::FilterValues => "filter_values",
+            Self::MapFilter => "map_filter",
             Self::Sum => "sum",
             Self::Max => "max",
             Self::FinalOrDefault => "final_or_default",

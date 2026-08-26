@@ -1635,6 +1635,15 @@ impl<'a> PiWalk<'a> {
         if memoizable && let Some(done) = self.memo.get(&key) {
             if !Rc::ptr_eq(done, &r.predicate) {
                 *r = crate::ccl::Refinement::sharing(done);
+                // A memo hit is a rewrite, and an enclosing predicate's walk reads
+                // this counter to decide whether its own clone was touched. Leaving
+                // the hit uncounted makes that decision depend on visit order: the
+                // same nested refinement converts by walking (counted) when its
+                // occurrence is reached first and by hit (uncounted) when a sibling
+                // reached it first, so an enclosing predicate whose only conversions
+                // are nested keeps its unconverted `Rc` and silently retains
+                // references in the coordinate the walk was asked to leave.
+                self.changed += 1;
             }
             return;
         }
@@ -2547,7 +2556,7 @@ mod rewrite_tests {
 #[cfg(test)]
 mod locally_nameless_tests {
     use super::*;
-    use crate::ccl::{BaseType, Lit, Refinement};
+    use crate::ccl::{BaseType, Lit, Refinement, RefinementSet};
 
     fn int() -> Type {
         Type::Base(BaseType::Int)
@@ -2680,6 +2689,48 @@ mod locally_nameless_tests {
             "the inner function's own index is untouched by the outer close",
         );
         assert!(is_pi_bound(predicate_of(&ts[1]), 0));
+    }
+
+    /// A conversion a **memo hit** applies counts as a rewrite, so an enclosing
+    /// predicate whose only converted reference sits in a nested refinement keeps the
+    /// converted clone rather than its original term.
+    ///
+    /// Both physical orders are built: which of walking and hitting a sibling's memo
+    /// entry converts the nested occurrence depends on which member the set holds
+    /// first, and the converted type must not.
+    #[test]
+    fn a_nested_conversion_applied_from_the_memo_is_kept() {
+        for reversed in [false, true] {
+            let k = Name::fresh("k");
+            let shared = Rc::new(TypedExpr::var(k.clone()));
+            // A predicate that reaches the binder only through a nested refinement in
+            // one of its type slots, sharing the sibling's predicate term.
+            let nested = TypedExpr::lit(Lit::Int(1))
+                .with_ty(Type::refined_one(int(), Refinement::sharing(&shared)));
+            let members = [
+                Refinement::sharing(&shared),
+                Refinement::born(Rc::new(nested)),
+            ];
+            let mut ordered = members;
+            if reversed {
+                ordered.reverse();
+            }
+            let mut set = RefinementSet::new();
+            for r in ordered {
+                set.insert(r);
+            }
+
+            let closed = close_pi_binder(&k, &Type::refined(int(), set));
+            let enclosing = closed
+                .refinements()
+                .iter()
+                .find(|r| matches!(r.predicate.node, TypedExprNode::Lit(_)))
+                .expect("the enclosing predicate survives the close");
+            assert!(
+                is_pi_bound(predicate_of(&enclosing.predicate.ty), 0),
+                "reversed={reversed}: the nested reference is closed",
+            );
+        }
     }
 
     /// Occurrences sharing one predicate `Rc` leave sharing one `Rc`, and a
