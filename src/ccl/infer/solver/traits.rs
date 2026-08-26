@@ -174,6 +174,7 @@ const NUMERIC: &[TraitInstance] = &[
 /// construction because the row fixes both operand bases and the associated base at
 /// `Int`, leaving nothing for inference to resolve, the same reason
 /// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
+#[cfg(feature = "refinement-experimental")]
 fn refinement_for_add(args: &Vec<TypedExpr>) -> TypedExpr {
     let [a1, a2] = &args[..] else {
         panic!("Addable is binary, so its instance's refinement receives two operands");
@@ -193,11 +194,32 @@ fn refinement_for_add(args: &Vec<TypedExpr>) -> TypedExpr {
 }
 
 /// The numeric rows plus `(String, String) ⇝ String`.
+#[cfg(feature = "refinement-experimental")]
 const NUMERIC_OR_STRING: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[(Assoc::Output, BaseType::Int)],
         refinement: Some(refinement_for_add),
+    },
+    TraitInstance {
+        args: &[BaseType::UInt, BaseType::UInt],
+        assoc: &[(Assoc::Output, BaseType::UInt)],
+        refinement: None,
+    },
+    TraitInstance {
+        args: &[BaseType::String, BaseType::String],
+        assoc: &[(Assoc::Output, BaseType::String)],
+        refinement: None,
+    },
+];
+
+/// The numeric rows plus `(String, String) ⇝ String`.
+#[cfg(not(feature = "refinement-experimental"))]
+const NUMERIC_OR_STRING: &[TraitInstance] = &[
+    TraitInstance {
+        args: &[BaseType::Int, BaseType::Int],
+        assoc: &[(Assoc::Output, BaseType::Int)],
+        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],

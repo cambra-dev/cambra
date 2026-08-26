@@ -30,6 +30,10 @@ deep-typecheck = []
 # `cambra-inspector` turns this on; plain `cambra` builds compile zero serde.
 serde = ["dep:serde"]
 
+# Add refinements to primitive operations and allow SMT-checking for
+# subtype constraints with refinements.
+refinement-experimental = []
+
 [dev-dependencies]
 # Self dev-dependency so the integration tests (separate crates) can see the
 # `test-helpers`-gated helpers. Cargo unifies this with the library under test.
