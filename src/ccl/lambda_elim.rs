@@ -786,7 +786,7 @@ fn elim_lambda_impl(
         //
         // The dependence test admits closed or name-spelled
         // (`subst::codomain_depends_on`), like coalesce's: a `body_ty` whose
-        // refinement stored closed references `param` as an index, and a name-only
+        // refinement landed closed references `param` as an index, and a name-only
         // test would drop the binder and strand it.
         Type::Fun {
             domain, codomain, ..

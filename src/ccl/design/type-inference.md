@@ -1074,8 +1074,8 @@ a bound recorded mid-solve is **open**, with references to telescope entries sto
 index counts the functions crossed from their codomain side between the reference and its binder,
 named and unnamed alike, so it survives `Type::without_pi_names`. Closing and opening are one walk
 each over the mixed type/term structure (`subst`'s `PiWalk`), reached through `close_pi_binder` and
-`open_pi_binder` at construction, descent and application, and through `RefinementScope` as a
-refinement is stored. Those are the four kinds of site.
+`open_pi_binder` at construction, descent and application, and through `RefinementScope` in the
+compact and key walks. Those are the four kinds of site.
 
 **Construction closes.** The type constructors — `Type::pi`, `Type::pi_kinded`,
 `Type::pi_eliminated`, `Type::fun_like` — abstract the codomain they are given, and so does every
@@ -1089,21 +1089,20 @@ literal to set `kind` leaves a free binder name in a stored type.
 
 Two sites assemble a `Fun { name: Some(_), .. }` and close nothing, one on each side of the
 construction boundary. `emit_lambda`'s codomain is the live in-solve type, which stays name-spelled:
-its refinements accumulate behind an inference variable, and they close when they are stored, so
-closing the reachable ones here would put an index-spelled refinement and a name-spelled one at a
-single position — what closing at the store exists to prevent. `coalesce_compact_go`'s refinements
-arrive already closed, and the `CompactType` it assembles from mirrors `Fun`s one-to-one, so a
-closed index counts to the function being built; closing is the identity there, and the `Fun`
-literal says so.
+its refinements accumulate behind an inference variable, and the compact and key walks are what
+close them, so closing the reachable ones here would put an index-spelled refinement and a
+name-spelled one at a single position — what closing in those walks exists to prevent.
+`coalesce_compact_go`'s refinements arrive already closed, and the `CompactType` it assembles from
+mirrors `Fun`s one-to-one, so a closed index counts to the function being built; closing is the
+identity there, and the `Fun` literal says so.
 
-**Storing closes.** `compact_go` and the `SpecKey` walk close a refinement against the enclosing
-functions the walk is inside of before storing it, in the same two arms that force the edge
-substitutions into it (`force_refinement`). The store is the only point that works:
-`CompactType::merge` dedups refinements while bounds fold, before any function is assembled, so a
-closed cast and a live emitted function meeting at one variable would otherwise put an index-spelled
-refinement and a name-spelled one at a single position. `subst::RefinementScope` is the state both walks thread — the
-enclosing-binder stack and the closing memo in one type, so the two cannot disagree about what a
-refinement closes against.
+**A refinement closes against the enclosing functions of the walk carrying it.** `compact_go` and
+the `SpecKey` walk both do so in the same two arms that force the edge substitutions into it
+(`force_refinement`). Nothing earlier can: `CompactType::merge` dedups refinements while bounds
+fold, before any function is assembled, so a closed cast and a live emitted function meeting at one
+variable would otherwise put an index-spelled refinement and a name-spelled one at a single
+position. `subst::RefinementScope` is the state both walks thread — the enclosing-binder stack and
+the closing memo in one type, so the two cannot disagree about what a refinement closes against.
 
 **Descent opens.** Walking under a binder converts that binder's indices back to a name. The `Fun`/
 `Fun` codomain edge opens each side at its own binder name and carries the correspondence as a

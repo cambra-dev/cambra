@@ -298,16 +298,29 @@ impl Name {
     /// The display spelling. Total over every variant; never use it for an
     /// identity decision — that is what `Name` equality is for, and for a
     /// [`Name::PiBound`] the spelling is metadata that identity ignores
-    /// outright ([`PiRef`]). A `PiBound` carrying no hint has no spelling to
-    /// give and returns the `#` marker; its index needs a formatter, so it
-    /// surfaces through [`Display`](fmt::Display) (`#0`).
+    /// outright ([`PiRef`]).
+    ///
+    /// A hint-less [`Name::PiBound`] has no spelling to give, and the bare `#`
+    /// it falls back to reads as a name while dropping the index that carries
+    /// the whole content. Every reference a conversion mints carries the binder
+    /// it abstracted ([`Name::pi_bound`]), so the case is [`PiRef::bare`]'s
+    /// alone — a test naming a reference directly. The assertion holds that:
+    /// a caller wanting the index wants [`Display`](fmt::Display) (`#0`), which
+    /// needs a formatter and so cannot be answered here.
     pub fn base(&self) -> &str {
         match self {
             Name::Raw(s) => s,
             Name::Unique { base, .. } => base,
             Name::Synthetic { kind, .. } => kind.stem(),
             Name::Reserved(r) => r.spelling(),
-            Name::PiBound(r) => r.hint.as_deref().unwrap_or("#"),
+            Name::PiBound(r) => {
+                debug_assert!(
+                    r.hint.is_some(),
+                    "a hint-less PiBound has no base spelling: `#` would read as a name and \
+                     drops the index — render it through Display instead",
+                );
+                r.hint.as_deref().unwrap_or("#")
+            }
         }
     }
 

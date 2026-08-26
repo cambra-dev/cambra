@@ -390,13 +390,11 @@ pub(crate) fn bound_scope_gaps(
     telescope: &Telescope,
     bound: &Bound,
 ) -> std::collections::BTreeSet<crate::ccl::Name> {
-    let mut free = subst::type_free_vars(&bound.ty);
-    free.retain(|n| {
-        !telescope.contains(n)
-            && !bound.ty_subst.binders().any(|b| b == n)
-            && !bound.self_subst.binders().any(|b| b == n)
-    });
-    free
+    subst::scope_gaps(&bound.ty, |n| {
+        telescope.contains(n)
+            || bound.ty_subst.binders().any(|b| b == n)
+            || bound.self_subst.binders().any(|b| b == n)
+    })
 }
 
 /// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`

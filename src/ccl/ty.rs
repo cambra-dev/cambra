@@ -2199,6 +2199,46 @@ mod tests {
         );
     }
 
+    /// A reference the binder captures is not a free reference that happens to
+    /// share its spelling. `λ p → p > 1` and `λ q → p > 1` pair `p` with `q`, so
+    /// the left `p` resolves to the binder while the right `p` resolves outside
+    /// it — [`paired_refs_match`]'s mixed arm, and the one that makes the
+    /// relation *sound* rather than merely coarse: equating these would let a
+    /// refinement mentioning an enclosing binder be deduped against one that
+    /// binds the name itself, capturing the free reference.
+    ///
+    /// Hash is unconstrained here. The `Eq`/`Hash` contract runs one way — equal
+    /// refinements hash alike — so a hash coarser than this distinction is
+    /// sound, which is why only equality is asserted.
+    #[test]
+    fn a_captured_reference_is_not_a_free_one_of_the_same_spelling() {
+        let gt_one = |referenced: &str| {
+            TypedExpr::binop(
+                TypedExpr::var(crate::ccl::Name::raw(referenced)),
+                BinOpKind::Compare(CompareKind::Greater),
+                TypedExpr::lit(Lit::Int(1)),
+            )
+        };
+        let binds_it = TypedExpr::lambda(
+            crate::ccl::Name::raw("p"),
+            Type::Base(BaseType::Int),
+            gt_one("p"),
+        );
+        let leaves_it_free = TypedExpr::lambda(
+            crate::ccl::Name::raw("q"),
+            Type::Base(BaseType::Int),
+            gt_one("p"),
+        );
+        assert!(
+            !eq_refinement_predicate(&binds_it, &leaves_it_free),
+            "a bound reference and a free one of the same spelling are two restrictions"
+        );
+        assert!(
+            !eq_refinement_predicate(&leaves_it_free, &binds_it),
+            "and the relation is symmetric, so the mirrored arm rejects too"
+        );
+    }
+
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
     /// only in the *target's* domain-refinement predicate denote different
     /// refinements: the nested filter is semantic, not inference metadata, so

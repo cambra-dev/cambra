@@ -892,13 +892,25 @@ pub(super) fn check_scope_valid(
     scope: &std::collections::BTreeSet<Name>,
     errors: &mut Vec<LocatedInferError>,
 ) {
-    let free = crate::ccl::subst::type_free_vars(&expr.ty);
-    if !free.is_subset(scope) {
+    // The construction boundary holds from the outside too: a coalesced type is
+    // stored, so every dependent function in it spells its own binder as an index.
+    // The opening tripwires (`subst::open_codomain`, this file's `Fun`/`Fun` arm)
+    // fire once a name-spelled reference has already escaped its binder; this
+    // catches the type that carries one before anything reads it.
+    debug_assert!(
+        crate::ccl::subst::name_spelled_stored_binders(&expr.ty).is_empty(),
+        "a stored function's codomain references its own binder by name ({:?}): built \
+         field-wise instead of through `Type::pi`/`pi_kinded`/`fun_like`, which close — at {}",
+        crate::ccl::subst::name_spelled_stored_binders(&expr.ty),
+        symbolic(expr),
+    );
+    let unbound = crate::ccl::subst::scope_gaps(&expr.ty, |n| scope.contains(n));
+    if !unbound.is_empty() {
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
                 at: symbolic(expr),
                 ty: expr.ty.clone(),
-                unbound: free.difference(scope).map(|n| n.to_string()).collect(),
+                unbound: unbound.iter().map(|n| n.to_string()).collect(),
             },
             node_id: expr.node_id(),
         });
@@ -2412,10 +2424,15 @@ mod tests {
         );
     }
 
-    // Appendix case K: the same refinement is accepted when the referenced
-    // binder is bound on the path — by the enclosing lambda for the body
-    // node, and by the Pi binder name for the lambda's own dependent type
-    // (`(x: Int) ⇒ {Int | v > x}`).
+    // Appendix case K: the same refinement is accepted when the referenced binder
+    // is bound on the path. The two nodes reach that differently, which is the
+    // point of the case: the body's `x` is a name the enclosing lambda binds, and
+    // the lambda's own dependent type spells its `x` as an index, so the type
+    // contributes no free name at all.
+    //
+    // The type is built through `Type::pi` rather than as a `Fun` literal because
+    // the literal does not close, and a stored function carrying its own binder by
+    // name is what `name_spelled_stored_binders` rejects at this same walk.
     #[cfg(debug_assertions)]
     #[test]
     fn scope_check_accepts_enclosing_binder() {
@@ -2423,12 +2440,11 @@ mod tests {
         let mut body = lit_int(1);
         body.ty = refined_int(TypedExpr::var("x"));
         let mut lam = TypedExpr::lambda("x", Type::Base(BaseType::Int), body);
-        lam.ty = Type::Fun {
-            name: Some("x".into()),
-            kind: crate::ccl::ty::FunKind::Compute,
-            domain: Box::new(Type::Base(BaseType::Int)),
-            codomain: Box::new(refined_int(TypedExpr::var("x"))),
-        };
+        lam.ty = Type::pi(
+            "x",
+            Type::Base(BaseType::Int),
+            refined_int(TypedExpr::var("x")),
+        );
         let mut errors = Vec::new();
         check_scope_valid(&lam, &std::collections::BTreeSet::new(), &mut errors);
         assert_eq!(errors, vec![]);

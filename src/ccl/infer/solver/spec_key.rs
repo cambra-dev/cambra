@@ -307,7 +307,25 @@ struct KeyCtx {
     /// Variables whose bounds are currently being walked, per polarity — the same
     /// key `compact_type`'s cycle guard uses, and for the same reason: a variable
     /// legitimately appears at both polarities in one type.
+    ///
+    /// Deliberately coarser than `memo`'s key, which also carries the enclosing
+    /// binders. The two agree because reaching one variable twice in one descent
+    /// *at different enclosing binders* means the walk crossed a function between
+    /// the two arrivals, so the variable occurs under a function in its own bound
+    /// chain — a recursive type, which `coalesce_compact` rejects
+    /// (`CoalesceError::RecursiveType`). The cycles that do occur are var-to-var
+    /// (`?a <: ?b` with `?b <: ?a`), which cross no binder and so re-enter at the
+    /// scope they left. `visiting_scopes` checks that in debug builds.
+    ///
+    /// The guard cannot simply take `memo`'s key: it is what bounds the walk, and
+    /// a cycle that grew the binder stack on each turn would never repeat a finer
+    /// key.
     visiting: HashSet<(InferVarId, bool)>,
+    /// The enclosing binders each in-flight visit was entered at, so a cut can
+    /// check it is cutting a same-scope re-entry rather than silently coarsening
+    /// the key — the invariant stated on `visiting`.
+    #[cfg(debug_assertions)]
+    visiting_scopes: HashMap<(InferVarId, bool), Vec<Option<Name>>>,
     /// Completed keys per `(variable, polarity, enclosing binders)`, for
     /// variables reached under the identity substitution.
     ///
@@ -325,7 +343,7 @@ struct KeyCtx {
     truncations: usize,
     /// The functions the walk is inside of, and the closing memo over them. The same
     /// type `compact_go` threads, so a key and a compacted type cannot close one
-    /// refinement two ways. A refinement is stored index-spelled, so two α-variant
+    /// refinement two ways. A refinement lands index-spelled, so two α-variant
     /// instantiations key together and the memo shares their specialization.
     scope: RefinementScope,
 }
@@ -339,6 +357,8 @@ struct KeyCtx {
 pub fn spec_key(ty: &Type) -> SpecKey {
     let mut ctx = KeyCtx {
         visiting: HashSet::new(),
+        #[cfg(debug_assertions)]
+        visiting_scopes: HashMap::new(),
         memo: HashMap::new(),
         truncations: 0,
         scope: RefinementScope::default(),
@@ -379,14 +399,15 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
-        // dependent-application discharge is stored in the key as the predicate the
+        // dependent-application discharge lands in the key as the predicate the
         // clone will actually carry — that is use-specific information, and two
         // uses discharging different arguments *should* key apart.
         Type::Refinement(inner, r) => {
             let mut k = key_go(inner, pol, subst_acc, ctx);
             let r = subst_acc.force_refinement(r);
-            // Storing closes, as in `compact_go`: the key stores the
-            // index-spelled refinement, so α-variant instantiations key together.
+            // Closed against the walk's enclosing binders, as in `compact_go`: the
+            // key stores the index-spelled refinement, so α-variant instantiations
+            // key together.
             let r = ctx.scope.close(&r);
             if !k.refinements.contains(&r) {
                 k.refinements.push(r);
@@ -492,9 +513,21 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 // ordinary). Drop the back-edge: whatever it would contribute is
                 // already on the path that reached it. Recorded so the partial
                 // result this produces is never cached.
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(
+                    ctx.visiting_scopes.get(&visit_key).map(Vec::as_slice),
+                    Some(ctx.scope.enclosing()),
+                    "the cycle guard is cutting a re-entry at different enclosing binders, \
+                     so it is coarsening the key the memo distinguishes — that needs the \
+                     variable to occur under a function in its own bound chain, which \
+                     `coalesce_compact` rejects as a recursive type",
+                );
                 ctx.truncations += 1;
                 return KeyView::default();
             }
+            #[cfg(debug_assertions)]
+            ctx.visiting_scopes
+                .insert(visit_key, ctx.scope.enclosing().to_vec());
             let bounds = {
                 let b = state.bounds.borrow();
                 Rc::clone(if pol { b.lower() } else { b.upper() })
@@ -509,6 +542,8 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 acc.union(key_go(&b.ty, pol, &inner_acc, ctx));
             }
             ctx.visiting.remove(&visit_key);
+            #[cfg(debug_assertions)]
+            ctx.visiting_scopes.remove(&visit_key);
             if memoizable && ctx.truncations == truncations_before {
                 ctx.memo.insert(memo_key, acc.clone());
             }
@@ -823,6 +858,8 @@ mod tests {
     fn fresh_ctx() -> KeyCtx {
         KeyCtx {
             visiting: HashSet::new(),
+            #[cfg(debug_assertions)]
+            visiting_scopes: HashMap::new(),
             memo: HashMap::new(),
             truncations: 0,
             scope: RefinementScope::default(),

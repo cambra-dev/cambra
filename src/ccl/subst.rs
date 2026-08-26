@@ -7,7 +7,8 @@
 //!
 //! * A **context** annotates a type or metavariable — the binders it may
 //!   legitimately mention. It is a *checking* device only (free vars ⊆ context);
-//!   it transforms nothing. See [`well_formed`].
+//!   it transforms nothing. See [`scope_gaps`], which reports what a context
+//!   does not account for.
 //! * A **substitution** ([`Subst`]) is a context morphism `Γ_src → Γ_dst` that
 //!   rides on a constraint edge and *rewrites* a term/type as it propagates.
 //!   Two flavours:
@@ -1381,11 +1382,62 @@ fn collect_expr_fv(
     });
 }
 
-/// A type is well-formed in context `ctx` iff every free term variable of its
-/// refinement predicates is bound there. The scope-validity assertion of the
-/// proposal (§6.2) is exactly this check.
-pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
-    type_free_vars(ty).is_subset(ctx)
+/// Every stored dependent function in `ty` whose codomain still references its
+/// own binder **by name** rather than as an index.
+///
+/// The construction boundary's invariant, from the outside: a `Fun` built through
+/// `Type::pi`/`pi_kinded`/`fun_like` closes, while a field-wise literal does not,
+/// and nothing in the type enforces which one a caller reached for. A stored type
+/// carrying the name spelling is what the two opening tripwires only notice later,
+/// once a reference has already escaped its binder.
+///
+/// Note this asks about the codomain alone: [`type_free_vars`] on the whole `Fun`
+/// binds the Pi name over the codomain, which is the very reference in question.
+#[cfg(debug_assertions)]
+pub fn name_spelled_stored_binders(ty: &Type) -> Vec<Binder> {
+    fn go(ty: &Type, out: &mut Vec<Binder>, visited: &mut BTreeSet<PredicateId>) {
+        if let Type::Fun {
+            name: Some(b),
+            codomain,
+            ..
+        } = ty
+            && type_free_vars(codomain).contains(b)
+        {
+            out.push(b.clone());
+        }
+        match ty {
+            Type::Refinement(base, r) => {
+                go(base, out, visited);
+                if visited.insert(r.predicate_id()) {
+                    expr_go(&r.predicate, out, visited);
+                }
+            }
+            _ => ty.walk_children(|c| go(c, out, visited)),
+        }
+    }
+    fn expr_go(e: &TypedExpr, out: &mut Vec<Binder>, visited: &mut BTreeSet<PredicateId>) {
+        go(&e.ty, out, visited);
+        e.walk_children(|c| expr_go(c, out, visited));
+    }
+    let mut out = Vec::new();
+    go(ty, &mut out, &mut BTreeSet::new());
+    out
+}
+
+/// The free term variables of `ty`'s refinement predicates that `in_scope` does
+/// not account for. Empty iff `ty` is well-formed there.
+///
+/// One spelling for the whole family: the end-of-inference scope check
+/// (`infer::solve`'s `check_scope_valid`) and the record-time closure check
+/// (`infer_var`'s `bound_scope_gaps`) differ only in what they count as in scope, and both need the gap set rather than a yes/no — the first
+/// to name the unbound variables in its diagnostic, the second because every
+/// member is an error. `in_scope` is a predicate rather than a set so a caller
+/// whose scope is not one (a telescope plus two substitution domains) needs no
+/// set built to ask.
+pub fn scope_gaps(ty: &Type, in_scope: impl Fn(&Binder) -> bool) -> BTreeSet<Binder> {
+    let mut free = type_free_vars(ty);
+    free.retain(|n| !in_scope(n));
+    free
 }
 
 // ---- locally nameless: closing and opening a Pi binder ----
@@ -1960,8 +2012,8 @@ mod tests {
         let bad = Type::Refinement(Box::new(Type::infer()), Refinement::born(Rc::new(pred)));
         let only_x: BTreeSet<Binder> = [Name::raw("x")].into_iter().collect();
         let only_k: BTreeSet<Binder> = [Name::raw("k")].into_iter().collect();
-        assert!(!well_formed(&bad, &only_x));
-        assert!(well_formed(&bad, &only_k));
+        assert!(!scope_gaps(&bad, |n| only_x.contains(n)).is_empty());
+        assert!(scope_gaps(&bad, |n| only_k.contains(n)).is_empty());
     }
 
     // G — capture is a Barendregt violation, not something to α-rename

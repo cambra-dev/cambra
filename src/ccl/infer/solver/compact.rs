@@ -775,14 +775,14 @@ fn compact_go(
         // compacted position — the propagation path. The accumulated
         // substitution is *forced* on the refinement: it rebuilds the predicate
         // with its free binders rewritten (e.g. discharging a dependent
-        // application's argument) before the refinement is stored at the position.
+        // application's argument) before the refinement lands in the position.
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
         Type::Refinement(inner, r) => {
             let mut ct = compact_go(inner, pol, subst_acc, parents, st);
             let r = subst_acc.force_refinement(r);
-            // Storing closes: references to the walk's enclosing binders
-            // become indices before the refinement is compared or stored.
+            // References to the walk's enclosing binders become indices
+            // before the refinement is compared or stored.
             let r = st.scope.close(&r);
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
@@ -810,7 +810,7 @@ fn compact_go(
                 None => subst_acc.clone(),
             };
             // Entering the codomain crosses this function — named or not, it
-            // deepens what a refinement stored below closes against.
+            // deepens what a refinement landing below closes against.
             st.scope.enter(name.clone());
             let cod = compact_go(c, pol, &cod_acc, None, st);
             st.scope.exit();
@@ -1282,14 +1282,14 @@ mod refinement_closing_tests {
     }
 
     /// **Acceptance: merging α-variant dependent bounds is canonical.**
-    /// Without closing at the store, the merged fun shape kept the *first arrival's*
-    /// binder while the refinement sets unioned both α-copies of one
-    /// constraint, coalescing to the order-dependent — and dangling —
-    /// `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`. With refinements closing
-    /// as they land (`CompactState::scope`), α-variants compact identically:
-    /// the copies dedup and nothing dangles. The binder *slot* is display
-    /// metadata and still follows arrival (`na.or(nb)`), so the equality is
-    /// modulo `without_pi_names`.
+    /// Without closing against the walk's enclosing binders, the merged fun
+    /// shape kept the *first arrival's* binder while the refinement sets unioned
+    /// both α-copies of one constraint, coalescing to the order-dependent — and
+    /// dangling — `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`. With each
+    /// refinement closed against them as it lands (`CompactState::scope`),
+    /// α-variants compact identically: the copies dedup and nothing dangles. The
+    /// binder *slot* is display metadata and still follows arrival
+    /// (`na.or(nb)`), so the equality is modulo `without_pi_names`.
     #[test]
     fn alpha_variant_bound_merge_is_canonical() {
         use crate::ccl::infer::solver::{
@@ -1337,8 +1337,8 @@ mod refinement_closing_tests {
         );
     }
 
-    /// **Acceptance: closing at the store keeps distinct enclosing binders
-    /// distinct.** A predicate referencing the *inner* binder denotes a
+    /// **Acceptance: closing against the walk's enclosing binders keeps distinct
+    /// binders distinct.** A predicate referencing the *inner* binder denotes a
     /// different type from one referencing the *outer*, and the two must not
     /// compact alike. Conflating them shares a specialization silently: two
     /// uses reach one clone whose interior was resolved against the other's
@@ -1362,7 +1362,8 @@ mod refinement_closing_tests {
         assert_ne!(
             compact_type(&nested("y")).term,
             compact_type(&nested("x")).term,
-            "closing at the store must not conflate the inner and outer Pi binders"
+            "closing against the walk's enclosing binders must not conflate the inner and \
+             outer Pi binders"
         );
     }
 }
