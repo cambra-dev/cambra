@@ -1311,7 +1311,7 @@ redundant, and Σ has to satisfy both.
 
 **Mechanics.** The decision is split across two phases, and the split is forced. At
 the compact merge, a positive join accumulates its domain **alternatives**
-(`CompactFun::domains`, unioned and deduplicated by `union_domains` — never met)
+(`CompactFun::domains`, a `DomainSet` — unioned and deduplicated, never met)
 whatever the slot's kind, because two questions are open there. Whether the
 alternatives are really two domains is open: a compact domain still carries
 inference-variable identity that `simplify_type` may merge afterwards, so two

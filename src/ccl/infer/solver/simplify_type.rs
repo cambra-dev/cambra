@@ -325,6 +325,8 @@ fn simplify_reconstruct(
     let new_fun = ct.fun.map(|cf| CompactFun {
         name: cf.name,
         kind: cf.kind,
+        // Rebuilt through `FromIterator`, which deduplicates: merging variables can
+        // make two previously-distinct alternatives equal.
         domains: cf
             .domains
             .into_iter()
@@ -354,6 +356,8 @@ fn simplify_reconstruct(
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+
     use super::super::compact::KindMerge;
     use super::*;
     use crate::ccl::{BaseType, InferVar};
@@ -363,7 +367,7 @@ mod tests {
         Some(CompactFun {
             name: None,
             kind: KindMerge::Compute,
-            domains: vec![dom],
+            domains: crate::ccl::infer::solver::compact::DomainSet::one(dom),
             codomain: Box::new(cod),
         })
     }
@@ -399,7 +403,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a kept in dom");
         assert!(cod_s.vars.contains(&uid_a), "a kept in cod");
@@ -431,7 +435,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.is_empty(), "a absorbed in dom");
         assert!(cod_s.vars.is_empty(), "a absorbed in cod");
@@ -466,7 +470,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
         let cod_s = &cf.codomain;
         assert_eq!(dom_s.vars.len(), 1, "one var after merge in dom");
         assert_eq!(cod_s.vars.len(), 1, "one var after merge in cod");
@@ -498,7 +502,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a preserved in dom");
         assert!(cod_s.vars.contains(&uid_a), "a preserved in cod");
