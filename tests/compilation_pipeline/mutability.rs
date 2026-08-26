@@ -1545,3 +1545,112 @@ fn a_mut_param_still_binds_a_mut_var() {
         cambra::interpreter::Value::Int(1),
     );
 }
+
+#[test]
+fn a_non_mut_parameter_annotation_is_enforced_in_a_curried_function() {
+    check_compile_error(
+        indoc! {r#"
+            def f(a: Int, m: Mut(Int)):
+                m := 1
+
+            total: Mut(Int) := 0
+            f("hello", total)
+            total
+        "#},
+        "Type mismatch for Apply: expected Int, found String",
+    );
+}
+
+#[test]
+fn a_declared_curried_parameter_still_accepts_its_own_type() {
+    check_scalar(
+        indoc! {r#"
+            def f(a: Int, m: Mut(Int)):
+                m := a
+
+            total: Mut(Int) := 0
+            f(3, total)
+            total
+        "#},
+        Value::Int(3),
+    );
+}
+
+/// The curried chain is genuinely nested, so the annotation's scope holds the
+/// parameters to its left — why `reject_annotation_references` skips this path.
+/// The reference resolves: the diagnostic names the refinement it could not
+/// discharge rather than an unbound variable. A forward reference names a binder
+/// no enclosing scope holds, so it is an ordinary unbound variable and nothing
+/// needs to reject it.
+#[test]
+fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
+    check_compile_error(
+        indoc! {r#"
+            def f(a: Int, c: {Int where _ >= a}, m: Mut(Int)):
+                m := c
+
+            total: Mut(Int) := 0
+            f(1, 5, total)
+            total
+        "#},
+        "expected {Int | __elem >= a}",
+    );
+    check_compile_error(
+        indoc! {r#"
+            def f(c: {Int where _ >= b}, b: Int, m: Mut(Int)):
+                m := c
+
+            total: Mut(Int) := 0
+            f(5, 1, total)
+            total
+        "#},
+        "Unbound variable: 'b'",
+    );
+}
+
+#[test]
+fn a_feed_parameter_annotation_constrains_what_is_fed() {
+    check_compile_error(
+        indoc! {r#"
+            def fw(c: Mut(Int), o: Feed(String)):
+              o << c
+              c += 1
+            x := 0
+            out = defer()
+            for i in [1, 2, 3]:
+              fw(x, out)
+            out
+        "#},
+        "expected String, found Int",
+    );
+}
+
+#[test]
+fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
+    check_compile_error(
+        indoc! {r#"
+            def fw(c: Mut(Int), o <: Feed(Int)):
+              o << c
+              c += 1
+            x := 0
+            out = defer()
+            for i in [1, 2, 3]:
+              fw(x, out)
+            out
+        "#},
+        "bounds a feed parameter by its own type",
+    );
+    check_compile_error(
+        indoc! {r#"
+            def fw(c: Mut(Int), o: Feed(Int, Int)):
+              o << c
+              c += 1
+            x := 0
+            out = defer()
+            for i in [1, 2, 3]:
+              fw(x, out)
+            out
+        "#},
+        "`Feed` takes one type argument: `Feed(T)`",
+    );
+}

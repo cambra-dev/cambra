@@ -63,6 +63,57 @@ fn mut_param_history_type(
     }
 }
 
+/// If `param` is annotated `Feed(T)` (a pass-by-reference deferred output),
+/// return its history type `Feed(T)`.
+///
+/// The `Append` sibling of [`mut_param_history_type`]: both annotations name a
+/// [`Type::History`] carrier rather than an ordinary type, which is why neither
+/// reaches [`lower_type_annotation`] — a `Feed` there is still an unknown type
+/// application, so this recognizes it only in parameter position.
+///
+/// The domain is left inferred for the reason a `Mut` parameter's is: the call
+/// site's argument pins it, and leaving it open lets one writer serve feeds at
+/// different extents.
+fn feed_param_history_type(
+    param: &Param,
+    ctx: &mut LoweringContext,
+) -> Option<Result<Type, LoweringError>> {
+    let annotation = param.annotation.as_ref()?;
+    let ChlExpr::Call { func, args } = &annotation.ty.node else {
+        return None;
+    };
+    let ChlExpr::Name(head) = &func.node else {
+        return None;
+    };
+    if head.as_str() != "Feed" {
+        return None;
+    }
+    // Exact for the reason `Mut` is: `Type::History` is invariant in both
+    // payloads, so `<:` admits exactly what `:` does and claims nothing more.
+    if annotation.mode == AnnotationMode::Bounded {
+        return Some(Err(LoweringError::unsupported(
+            param.name_span,
+            format!(
+                "`{} <: Feed(…)` bounds a feed parameter by its own type: `Feed` is \
+                 invariant in its value type, so `<:` claims nothing `:` does not. \
+                 Write `{}: Feed(…)`",
+                param.name, param.name
+            ),
+        )));
+    }
+    let [value] = args.as_slice() else {
+        return Some(Err(LoweringError::unsupported(
+            annotation.ty.span,
+            "`Feed` takes one type argument: `Feed(T)`",
+        )));
+    };
+    Some(lower_type_expr(value, ctx).map(|t| Type::History {
+        value: Box::new(t),
+        domain: Box::new(Type::Hole),
+        kind: crate::ccl::HistoryKind::Append,
+    }))
+}
+
 /// Validate that the function or lambda has at least one parameter.
 ///
 /// The CHL parser already rejects `*args`, `**kwargs`, keyword-only and
@@ -166,21 +217,37 @@ pub(super) fn uncurry_params(
         .iter()
         .any(|p| mut_param_history_type(p, ctx).is_some())
     {
-        return Ok(params.iter().rev().fold(body_expr, |acc, param| {
-            let param_ty = match mut_param_history_type(param, ctx) {
-                Some(Ok((mut_ty, _is_txn))) => mut_ty,
-                _ => Type::Hole,
+        return params.iter().rev().try_fold(body_expr, |acc, param| {
+            // A `Mut(…)`/`Feed(…)` annotation names a history carrier rather than
+            // an ordinary type, so it lowers here and not through
+            // `lower_type_annotation`. A malformed `Mut(…)` already returned from
+            // `lower_function_body`; a malformed `Feed(…)` surfaces here.
+            let history_ty = match mut_param_history_type(param, ctx) {
+                Some(Ok((mut_ty, _is_txn))) => Some(mut_ty),
+                _ => match feed_param_history_type(param, ctx) {
+                    Some(Ok(feed_ty)) => Some(feed_ty),
+                    Some(Err(e)) => return Err(e),
+                    None => None,
+                },
             };
+            let param_ty = history_ty.clone().unwrap_or(Type::Hole);
             let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
-            if matches!(param_ty, Type::History { .. })
-                && let TypedExprNode::Lambda { param: p, .. } = &mut lam.node
-            {
-                p.declare(param_ty);
+            if let TypedExprNode::Lambda { param: p, .. } = &mut lam.node {
+                match (history_ty, &param.annotation) {
+                    // The carrier is both the binder type and its declaration.
+                    (Some(_), _) => p.declare(param_ty),
+                    // Every other annotation is a checking-mode declaration, as in
+                    // the single-parameter arm: attach it so `emit_lambda` binds the
+                    // parameter at its declared type and an ill-typed argument is
+                    // rejected at the call site.
+                    (None, Some(ann)) => p.declare(lower_type_annotation(ann, ctx)?),
+                    (None, None) => {}
+                }
             }
             // Each curried lambda images one written parameter; the outermost
             // is re-tagged identically by the `def`/lambda caller.
-            ctx.tag_image(lam, fn_span)
-        }));
+            Ok(ctx.tag_image(lam, fn_span))
+        });
     }
 
     // Mint the tuple name after `body_expr` is lowered so that inner
