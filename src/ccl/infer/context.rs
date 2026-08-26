@@ -386,10 +386,13 @@ impl Typing for InferCtx {
         // Only a requested association gets a variable for the obligation to settle;
         // a pure requirement determines nothing and mints none.
         let wanted = assoc.map(|name| (name, self.fresh()));
+        // Open a provenance recording to cover the cloning of the
+        // operand_exprs into the obligation.
+        let _f = crate::ccl::provenance::copy_frame("require_trait");
         let obligation = TraitObligation::new(
             trait_,
             wanted.clone().into_iter().collect(),
-            operand_exprs.iter().cloned().cloned().collect(),
+            operand_exprs.iter().map(|e| (*e).clone()).collect()
         );
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);

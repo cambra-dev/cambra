@@ -449,6 +449,9 @@ impl TraitObligation {
     /// deposit already made rides the freshened bound onto the copy, so redoing it
     /// would record the same fact twice.
     pub(super) fn new_from(original: &Rc<TraitObligation>) -> Rc<TraitObligation> {
+        // We need a provenance recording here for the cloning of
+        // input_exprs into the new obligation.
+        let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation");
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_: original.trait_,
