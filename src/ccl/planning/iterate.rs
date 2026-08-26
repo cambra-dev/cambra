@@ -160,7 +160,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
         // iteration site (op-conversion compiles it with `input=None`), so wrap
-        // it; the `source` is a mutable variable read (`__reg.k`), not an iteration source,
+        // it; the `source` is a mutable variable read (`__hist.k`), not an iteration source,
         // and is left alone. A `Var` trigger is already iterate-wrapped at its
         // let-site, so `wrap_with_iterate`'s `is_iteration_bearing` check makes
         // this a no-op there; a raw `[unit]` singleton (the standalone terminal
@@ -226,7 +226,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
             }
         }
         // Each transaction writer's source is iterated internally by the
-        // mutable variable engine (`Recurse` for an induction accumulator); op-conversion
+        // mutable variable engine (the induction store for an accumulator); op-conversion
         // compiles it with `input=None`, so wrap it like a loop source.
         TypedExprNode::Transact { writers, .. } => {
             for w in writers.iter_mut() {
@@ -1157,7 +1157,7 @@ mod tests {
         // previous-accumulator read.  The exact body shape doesn't matter for
         // this test — we only check the writer `source` gets iterate-wrapped.
         let body = Expr::var("acc").with_ty(int.clone());
-        let reg_ty = Type::Record(vec![(
+        let hist_ty = Type::Record(vec![(
             "acc".to_string(),
             fun_ty(Type::UIntRange(3), int.clone()),
         )]);
@@ -1174,7 +1174,7 @@ mod tests {
             }],
             domain: Type::UIntRange(3),
         })
-        .with_ty(reg_ty);
+        .with_ty(hist_ty);
 
         insert_iterate_recurse(&mut expr);
 

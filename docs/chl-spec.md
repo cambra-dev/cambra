@@ -1117,7 +1117,7 @@ A CHL **program** is its top-level block (§2.1): a sequence of
 statements. Each non-terminal statement either introduces a binding
 visible to the remainder of the block, or performs an effect (a feed
 into a deferred output). The block's *value* is the value of its final
-expression statement; if the program mutable variables any sinks (e.g.
+expression statement; if the program registers any sinks (e.g.
 `http_serve`), the program value is implicitly a record of those sinks
 instead.
 
@@ -2580,21 +2580,21 @@ around `reserve` + `quote` + the feed).
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
-- **A `Txn` mutable variable is read only inside a `with begin():` block.** A bare
-  read outside one is an error. Reading inside a block pins a
-  **snapshot-consistent** view: several mutable variable reads in one block see
-  one commit snapshot — the reason the block is required.
+- **A `Txn` mutable variable is read only inside a `with begin():` block.** A
+  bare read outside one is an error, and stays one: the block is what pins a
+  **snapshot-consistent** view, so that several mutable variable reads in one
+  block see one commit snapshot. A read that wants no snapshot has the two terms
+  below instead — an as-of read fed out of a block, or `await_final`.
 - **As-of read.** A mutable variable read fed *out* of a block that does not
   itself write that mutable variable is an **as-of read at an arbitrary commit
   position** — the mutable variable's value as of wherever the reading transaction
   lands in the commit order, replied indexed by the *reading* loop. This
   is uniform whether the reader is a live request stream, a finite loop,
   or the synthesized singleton of a standalone read.
-- **Terminal read — `await_final(x)` [Decided].** `await_final(x)` waits for
-  `x`'s whole commit history to complete and yields its final value (§8.6). It
-  is the only terminal read of a mutable variable: every other read is an
-  arbitrary as-of sample, so a program that means the final value has to say
-  so.
+- **Terminal read — `await_final(x)`.** `await_final(x)` waits for `x`'s whole
+  commit history to complete and yields its final value (§8.6). It is the only
+  terminal read of a mutable variable: every other read is an arbitrary as-of
+  sample, so a program that means the final value has to say so.
 
 ### 8.4 Feeds are the second form of mutability
 
@@ -2677,7 +2677,7 @@ Consequences a program may rely on:
   bound the result with `await_final`. An order-sensitive body with no such
   edge has nondeterministic denotation, by design.
 
-### 8.6 `await_final` [Decided]
+### 8.6 `await_final`
 
 `await_final(x)` is a builtin call on a transactional mutable variable
 `x: Mut(V, Txn)`, an expression of type `V`: the mutable variable's **final

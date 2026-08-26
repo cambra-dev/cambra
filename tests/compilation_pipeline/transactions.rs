@@ -1024,7 +1024,7 @@ fn await_final_bound_then_read_in_a_feed_loop_stays_final() {
 
 /// Bound to a name and used downstream: the await need not be the program's tail.
 /// The letrec splice moves above the `let` that reads the history binding, which is
-/// what keeps `reg_pool` in scope there.
+/// what keeps `hist_pool` in scope there.
 #[test]
 fn await_final_bound_then_computed_with() {
     check_tile(
@@ -1274,8 +1274,8 @@ fn await_final_of_an_induction_accumulator_rejected() {
 /// The shape a single program-wide store made impossible: `b`'s seed names `a`'s
 /// completion, so with one store `b`'s tick-0 value would await the store `b` itself
 /// writes. No block mentions `a` and `b` together, so they partition into two stores
-/// and the dependency is an ordinary one-way edge between two letrecs — `reg_a` bound
-/// outside, `reg_b`'s seed reading it. `a` reaches 1 + 1 = 2, seeding `b`, which
+/// and the dependency is an ordinary one-way edge between two letrecs — `hist_a` bound
+/// outside, `hist_b`'s seed reading it. `a` reaches 1 + 1 = 2, seeding `b`, which
 /// reaches 3.
 #[test]
 fn a_mut_var_seeded_from_another_store_s_final_value() {
@@ -1538,7 +1538,7 @@ fn registers_written_in_one_block_share_a_store() {
 
 /// **Snapshot consistency** holds a store together too, and writes alone do not show it:
 /// nothing writes both mutable variables, but one block reads both, latching them at a
-/// single frontier, so they must come from one mutable variable record. The writers are
+/// single frontier, so they must come from one history record. The writers are
 /// exactly those of `unrelated_mut_vars_get_separate_stores` — only this read is added.
 ///
 /// The read stays a `with begin():` block because it *is* the subject; what is dropped is
@@ -1564,7 +1564,7 @@ fn mut_vars_read_together_share_a_store() {
     assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
 }
 
-/// A register a *writing* block reads to decide its commit is read at that commit's
+/// A mutable variable a *writing* block reads to decide its commit is read at that commit's
 /// snapshot, so the read alone pulls it into the store — no write to `limit` is
 /// needed. (`limit` is never written, so it is a read-only key of the store. The key
 /// order is the block's footprint order, which is where the guard reads them, not the
@@ -1922,8 +1922,9 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
 // Read rules and rejected shapes
 // ---------------------------------------------------------------------------
 
-/// A transactional mutable variable may be read only inside a `with begin():` block; a
-/// bare read outside one is rejected with a hint to wrap it in a block.
+/// A transactional mutable variable may be read only inside a `with begin():` block, and
+/// that is permanent rather than a current limitation (the CHL spec, "8.3 Reads"). The
+/// diagnostic names both legal reads: wrap it in a block, or `await_final` it.
 #[test]
 fn bare_txn_read_outside_tx_rejected() {
     check_compile_error(
@@ -1934,6 +1935,27 @@ fn bare_txn_read_outside_tx_rejected() {
             pool
         "#},
         "read transactional variable `pool` inside a `with begin():` block",
+    );
+}
+
+/// The gate follows a `Mut(_, Txn)` **parameter** into the callee: a by-reference pass is
+/// the one mention lowering lets through, and it hands the callee a mutable variable in
+/// its own right, so a read of it there obeys the same rule. Reading only inside a block
+/// is permanent (the CHL spec, "8.3 Reads"), so it holds through a function boundary as
+/// well as at the top level.
+#[test]
+fn bare_read_of_a_mut_param_outside_a_block_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            def draw(p: Mut(Int, Txn), amt):
+                before = p
+                with begin():
+                    p := p - amt
+            pool: Mut(Int, Txn) := 100
+            draw(pool, 10)
+            await_final(pool)
+        "#},
+        "read transactional variable `p` inside a `with begin():` block",
     );
 }
 
@@ -2234,18 +2256,18 @@ fn induction_write_inside_begin_block_rejected() {
 
 /// A *guarded* induction write in a **mixed** block — one that *does* commit a
 /// transactional mutable variable — is rejected. `check_no_induction_only_transactions`
-/// passes (the block commits `reg`), but the guarded `cnt += 1` is not liftable
+/// passes (the block commits `total`), but the guarded `cnt += 1` is not liftable
 /// by `partition_spine` and would be silently dropped from the decision record.
 /// A dedicated pre-check (`check_no_guarded_induction_write_in_block`) catches it.
 #[test]
 fn guarded_induction_write_in_mixed_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            reg: Mut(Int, Txn) := 0
+            total: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for x in [1, 2, 3]:
                 with begin():
-                    reg := reg + x
+                    total := total + x
                     if x >= 2:
                         cnt := cnt + 1
             cnt
@@ -2313,17 +2335,17 @@ fn txn_writer_called_inside_block_rejected() {
 /// PR-2 registry leak (same class as PR-1's mutable-registry leak): a
 /// `Mut(_, Txn)` mutable variable declared *inside* a `def` body must not leak into the
 /// transactional registry and falsely gate a like-spelled top-level local. The
-/// def-body scope snapshots and restores *both* mutable variable registries, so `reg`
+/// def-body scope snapshots and restores *both* mutable variable registries, so `v`
 /// outside `f` is an ordinary local (assignable, readable).
 #[test]
 fn txn_mut_var_in_def_body_does_not_leak_to_outer_local() {
     check_scalar(
         indoc! {r#"
             def f(x):
-                reg: Mut(Int, Txn) := 0
+                v: Mut(Int, Txn) := 0
                 x
-            reg = 5
-            reg
+            v = 5
+            v
         "#},
         cambra::interpreter::Value::Int(5),
     );
@@ -2527,7 +2549,7 @@ fn commit_decision_reads_induction_accumulator() {
 /// trailing read, which is an arbitrary as-of sample — so the committed values
 /// are deterministic: `pool` draws down `100 → 97 → 94` over commit ticks 1, 2.
 /// Exercises the writer's deferred-wakeup convergence: the broadcast `cnt`'s
-/// `ExtractFinal` is empty until its loop's `Recurse` drains, so the writer
+/// `ExtractFinal` is empty until its loop's own cycle drains, so the writer
 /// re-arms itself on the wakeup queue each not-ready pull rather than deadlocking
 /// on the stalled commit frontier; the in-block reply demands each commit and
 /// drives that convergence.
@@ -2582,7 +2604,7 @@ fn broadcast_read_races_a_second_writer() {
 }
 
 /// Broadcast off a finite **async** (data-source) sibling loop. `cnt` counts a
-/// `TestDataSource`'s three elements — a loop whose `Recurse` converges only as
+/// `TestDataSource`'s three elements — a loop that converges only as
 /// the source's data arrives (via scheduler notifications), not synchronously.
 /// The txn decision reads `cnt`'s value (broadcast, 3), observed via an in-block
 /// reply — one commit, `pool = 100 − 3 = 97` at commit tick 1. This is the case

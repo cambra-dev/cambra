@@ -70,7 +70,7 @@ fn http_computed_live_read() {
 /// A *multi-variable* live cross-endpoint read: `GET /get` replies `a + b`,
 /// reading **two** live mutable variables in one block. Snapshot consistency (§I-c)
 /// requires both reads to come from one commit snapshot — served by a single
-/// bundled `as_of((trigger, __reg))` folding the whole store at one frontier,
+/// bundled `as_of((trigger, __hist))` folding the whole store at one frontier,
 /// the reply projecting each mutable variable off the latched snapshot record. A `POST
 /// /set` writes both mutable variables, so `a + b` reflects the latest committed values.
 #[test]

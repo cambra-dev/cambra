@@ -8,13 +8,13 @@ feeds one idea, the surface syntax, and how the compiler realizes them.
 
 ## The idea in one line
 
-A mutable variable **is** a function from a **sequencing domain** (a time axis) to a value.
+A mutable variable is a function from a **sequencing domain** (a time axis) to a value.
 "Mutation" is the incremental revelation of that function's values as the domain advances;
 "reading the variable" is looking up a value at a position. Sequential rebinding, loop
-accumulation, and concurrent transactions are then *one* model over three domains, not three
+accumulation, and concurrent transactions are then one model over three domains, not three
 mechanisms.
 
-A **feed** (a reply or yield, written `<<`) is the *same* object — a function over the same
+A **feed** (a reply or yield, written `<<`) is the same object — a function over the same
 kind of domain — and is therefore **the second form of mutability**, not a separate concept:
 `o << e` is surface-impure exactly as `x := e` is (action-at-a-distance on a channel bound
 elsewhere; both break referential transparency). The two forms differ only in their
@@ -79,10 +79,10 @@ the failure `:=` exists to make impossible.
 The structural difference between the two causal accessors mirrors a difference between the two
 kinds of variable:
 
-- An **induction variable** has exactly one writer (its loop), and its domain *is* that writer's
+- An **induction variable** has exactly one writer (its loop), and its domain is that writer's
   domain. Its history binding is directly the recurrence:
   `cnt = λ 𝑟 → get_prev_seq(cnt, 𝑟, init) + 1`.
-- A **transactional variable**'s domain (`Txn`) is *not* any writer's domain — writers iterate
+- A **transactional variable**'s domain (`Txn`) is no writer's domain — writers iterate
   request streams, and an oracle assigns each transaction a commit time. So its history is defined
   *indirectly*, through **commit records**: each writing site produces one `{time, write}` record
   per iteration, and the variable's history searches those records by time. The commit-time oracle
@@ -118,7 +118,7 @@ about to constrain is a handle position.
   off the head of the spine — and lowering resolves the operand by name as it does a write
   target, so the mention never becomes a value position at all.
 
-A lambda's result is deliberately *not* dereffed: that is where rule 2 catches a function
+A lambda's result is not dereffed, which is where rule 2 catches a function
 returning a `Mut`, and dereffing would silently accept the escape by turning it into a
 read.
 
@@ -128,8 +128,8 @@ introduction's body** report their continuation's *value* — they emit it as a 
 operand — so a program ending in a read of its accumulator has that accumulator's value
 rather than a handle. Their coalesce-time lifted type derefs for the same reason
 (`solve.rs`): a lift that copied the continuation's type verbatim would re-stamp the node
-with the handle the read just looked through, leaving the node's recorded type
-contradicting the rule that typed it. A **`Let` body** is the one tail that does *not*
+with the handle the read looked through, leaving the node's recorded type
+contradicting the rule that typed it. A **`Let` body** is the one tail that does not
 deref: a `Let` owns nothing — it cannot even bind a mutable variable — so it reports whatever its
 body reports, handle included, which is what leaves rule 2 an escape to catch. The same
 deref would hide an escape one line away from the boundary: reading the
@@ -174,7 +174,7 @@ Two surface facts are load-bearing for the realization and worth restating here:
   [as-of-read rewrite](#replies-live-cross-endpoint-reads-and-commit-ordered-taps) and the
   [`AsOf` engine](#the-runtime-engines) below.
 
-> **Design commitment — transactional mutability is deliberately *unordered*.** There is no
+> **Design commitment — transactional mutability is unordered.** There is no
 > ordering guarantee between transactions on the same `Txn` variable beyond the existence of *a*
 > commit order the runtime picks; a program may not assume one transaction serializes before
 > another, and nothing in the compiler or engine should impose such an order. The arbitrary-position
@@ -198,8 +198,8 @@ these markers; `mut_elim` + `channelize` rewrite it into **pure CCL** — the ma
 the rest of the pipeline runs on. This is the concrete input→output contract of the mutability
 eliminator, stated by content rather than by a "mirrors CHL" adjective.)
 
-- `For { target, iter, body }` — **every** statement `for` loop, generator / side-effecting /
-  mutation alike (comprehensions keep their expression lowering). Lowering does *not* distinguish
+- `For { target, iter, body }` — every statement `for` loop, generator / side-effecting /
+  mutation alike (comprehensions keep their expression lowering). Lowering does not distinguish
   the loop kinds — that classification is the phase's, post-inference (see
   [Mutability is the type](#mutability-is-the-type-no-lowering-registry)). Value `Unit`;
   `iter : 𝐼 ⇒ 𝑇`, `target : 𝑇` bound in `body`.
@@ -207,13 +207,13 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   binding `x` as a mutable variable over `body`. The declaring half of `:=`, paired with
   `MutWrite` for its writing half; before it existed the introduction was a `Let`
   carrying a `Mut` annotation, and every pass that had to recognize one consulted
-  that annotation as a proxy for the declaration. It is the **only** node that binds
+  that annotation as a proxy for the declaration. It is the only node that binds
   a mutable variable (a pass-by-reference `Mut` parameter aside), which is what makes
   "is this binder mutable?" a question about the node rather than about a type that
   happened to survive inference.
-- `MutWrite { name, value }` — one write to a variable. Value `Unit`. Its target **must** be
+- `MutWrite { name, value }` — one write to a variable. Value `Unit`. Its target must be
   `Mut`-typed: inference peels the target's `Mut(𝑉, 𝐷)` and requires `value ⊑ 𝑉`; a write whose
-  target is *not* `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
+  target is not `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
   rejected, not silently turned into `x = x + e`). `x += e` lowers to `MutWrite(x, x + e)`, the
   embedded read being the in-context read.
 - `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
@@ -232,7 +232,7 @@ residue, and planning/op-conversion never see them.
 
 ### Mutability is the type (no lowering registry)
 
-Whether a name denotes a mutable variable is carried **only** by the mutable-variable type
+Whether a name denotes a mutable variable is carried by the mutable-variable type alone
 `Type::History { kind: Overwrite }` (displayed `Mut(𝑉, 𝐷)`), and is therefore known
 only after inference. Lowering never tracks it — there is no lowering-side mutable-variable registry. This is
 what keeps lowering a pure representation change: it emits the markers above by *shape and scope
@@ -240,9 +240,9 @@ alone*, and every decision that needs mutability happens later, keyed on the typ
 
 Lowering's two choices, both scope-only:
 
-- **Introduction vs. write.** `x := e` where `x` is *not* in scope is an introduction — a
+- **Introduction vs. write.** `x := e` where `x` is out of scope is an introduction — a
   `let x = e` whose binding is stamped `Mut(𝑉, 𝐷)` (`𝐷 = Txn` iff annotated `Mut(𝑉, Txn)`, else a
-  `Hole` the phase resolves). `x := e` / `x += e` where `x` *is* in scope is a write — a bare
+  `Hole` the phase resolves). `x := e` / `x += e` where `x` is in scope is a write — a bare
   `MutWrite(x, e)`. The choice is membership in the ambient scope set (which lowering already
   threads for other reasons); it consults no mutability record.
 - **Loop shape.** Every `for` becomes a `For` marker (above). Lowering does not decide
@@ -267,7 +267,7 @@ Everything mutability-dependent is then a post-inference decision on the `Type::
 
 The payoff: lowering has one loop path and one write path, no `is_mutable`/`with_shadowed`
 book-keeping, and no base-name scoping scaffolding — a shadowing parameter spelled like an outer
-mutable variable is just a different binding with its own (non-`Mut`) type, handled by ordinary inference.
+mutable variable is a different binding with its own (non-`Mut`) type, handled by ordinary inference.
 
 ### `Mut` is a CCL type
 
@@ -297,7 +297,7 @@ Typing:
 - **Reads deref at the rule that emits them**: `cnt + 1`, `f(cnt)` for an `Int` parameter, and a
   trailing `cnt` all read, and each reads because the rule typing that position asks for a value
   operand (`emit::emit_value_read`). Only a position that *expects* `Mut` — a pass-by-reference
-  argument, a write's target — receives the handle. `Mut(𝑉) <: 𝑉` is deliberately not a subtyping
+  argument, a write's target — receives the handle. `Mut(𝑉) <: 𝑉` is not a subtyping
   fact; see [A mutable variable read is an explicit operation](#a-mutable-variable-read-is-an-explicit-operation)
   for why putting it in the relation could not distinguish a read from a handle passed along.
   After inlining, no `Mut`-expecting positions remain, so the phase's rewrite is purely structural
@@ -333,7 +333,7 @@ introduction every write targets. The discipline:
 3. A plain `=` off a mutable **reads** it: `b = a` binds `b` at `a`'s value — a
    snapshot, exactly as any other value position reads a mutable variable. This is not a
    rule but a consequence: `emit_let` reads through an initializer that is a mutable variable, so a
-   `Let` *cannot* bind a register and the alias is unrepresentable rather than
+   `Let` cannot bind a mutable variable, so the alias is unrepresentable rather than
    rejected. Writing through the copy (`b += 1`) is then the ordinary
    write-to-a-non-mutable error, which blames the write instead of the binding.
    The only mutable variable binders are `MutDecl` (a `:=` introduction) and a
@@ -343,7 +343,7 @@ introduction every write targets. The discipline:
 One structural check after inference enforces the two rules. The real fault line is the **merge law**,
 not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
 runtime) a `Txn` mutable variable by the commit operator's timestamped merge — so multiple writers are
-already the semantics and aliasing is benign; that is why `Feed` deliberately stays first-class (it
+already the semantics and aliasing is benign; that is why `Feed` stays first-class (it
 is returned in `http_serve`'s tuple). *Last-write-wins* mutability instead needs a **resolvable
 writer set** — but that requirement is fundamental only for an **induction** accumulator, which
 compiles to a single-writer `InductionStore` changelog. A `Txn` mutable variable already tolerates an open writer set (its
@@ -399,7 +399,7 @@ commit record for time `𝑡`). Every cycle must contain a causal edge — equiv
 non-causal-reference subgraph is acyclic. A structural check enforces this; op-conversion treats an
 unrecognized non-causal cycle as a compile error rather than attempting fixpoint iteration.
 
-`LetRec` is deliberately more general than mutability needs: `while` loops (recursion over a
+`LetRec` is more general than mutability needs: `while` loops (recursion over a
 condition-bounded prefix of `Nat`), recursively-defined collections, and general structural
 recursion all target the same node.
 
@@ -439,7 +439,7 @@ A decision is a **choice**, and the two things it chooses between carry differen
 carries a write set, a denial carries nothing. Today that is encoded as a record with a `commit:
 Bool` beside a `writes` field that is meaningless when `commit` is false — a product standing in for
 a sum, so nothing stops a reader consulting `writes` on a denied decision. The direction is the sum
-itself, `` `commit(writes) `` / `` `abort(unit) ``, which makes the write set reachable *only* on the
+itself, `` `commit(writes) `` / `` `abort(unit) ``, which makes the write set reachable on the
 granting path.
 
 What exists today is the algebra that shape needs, in both directions:
@@ -464,7 +464,7 @@ are, so the mutable variable's value space is their **join**: a `` `none `` seed
 the two-tag sum `` {`none | `some{Int}} `` with the arm that did not occur left empty, and every
 emission is built at that declared space rather than at the width of whichever alternative occurred.
 ``acc := `some(𝑖)`` under a `` `none `` seed, and a conditional write choosing between tags, are both
-just that.
+instances of it.
 
 ## Compilation pipeline
 
@@ -482,7 +482,7 @@ CHL source
                         by substitution; eliminates Feed / Defer)
   → as-of-read rewrite (bare history reads fed out of read-only blocks → AsOf)
   → lambda_elim        (the LetRec travels through — bodies point-freed, group intact)
-  → typecheck          (strict wall)
+  → typecheck          (strict, no relaxations)
   → plan_loops         (planning/loops.rs: point-free letrec patterns → the Transact carrier;
                         causality re-checked by the point-free matcher)
   → planning           (stages the carrier's writer sources) → simplify
@@ -504,7 +504,7 @@ and `plan_loops` splits scaffold from body structurally, lifting the body
 **verbatim**. The `Transact` carrier is born at loop planning and spans only
 `plan_loops` → planning → op-conversion.
 
-Inlining runs **before** `mut_elim`: a UDF that writes a `Mut` parameter or feeds a `Feed` parameter
+Inlining runs before `mut_elim`: a UDF that writes a `Mut` parameter or feeds a `Feed` parameter
 is beta-reduced to its call site, where `mut_elim` sees its writes and feeds in the scope of the
 mutable variables and channels they target. Generators survive inlining because surface-CCL lowering
 leaves nothing to lose — a generator body is `For` + `Feed` nodes against an implicit result feed,
@@ -703,11 +703,11 @@ Reading it off:
   indexed by the GET request loop. This is the **same store-level-timestamp mechanism** the `AsOf`
   sections describe as "a sample at an arbitrary observation-time position": the read takes a timestamp
   at its observation point and returns the committed prefix as of that time — described uniformly here
-  and there, not as rival semantics. `read_at_get` is deliberately *not* a `begin_<site>` oracle: a
+  and there, not as rival semantics. `read_at_get` is not a `begin_<site>` oracle: a
   read-only block mints none — it commits nothing, produces no `{time, write}` record, and takes no
   commit slot (`begin_<site>`/`BeginTxn` is the *writer* oracle only). It is pure composition, no
   commit record, no write set. **External consistency** is a real property of this same mechanism (not
-  a competing guarantee): a GET issued *after* a POST's `ok`-reply lands at an observation time ≥ that
+  a competing guarantee): a GET issued once a POST's `ok`-reply has landed reads at an observation time ≥ that
   POST's commit (arrival-order monotonicity), so a client that sees `ok 2` then GETs observes `≥ 2`;
   a read with no such causal ordering samples an *arbitrary* position among concurrent commits — which
   is all the "arbitrary as-of" of the `AsOf` sections means.
@@ -734,12 +734,9 @@ this section states how the letrec model *delivers* them.
   rejects — see the caveat there); only `Txn`-domain variables participate in the atomic commit. A
   program that needs the counter transactionally consistent with the mutable variable declares it
   `Mut(Int, Txn)`.
-- **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
-  writer sources do. A fed-out `Txn` mutable variable read reads as-of its own position in the commit
-  clock and does not wait for completeness. The one term that waits for a mutable variable's
-  completeness is [`await_final`](#await_final), and it is well-defined because it closes the writer
-  set: the mutable variable is unreferenceable afterward, so no later writer can extend the history it
-  just declared complete.
+- **Liveness.** Induction domains are finite or stream-complete; a `Txn` history completes when the
+  writers of its key do. Only [`await_final`](#await_final) waits for that completion; every other
+  read is an as-of sample.
 
 ## Ordering and concurrency
 
@@ -754,7 +751,7 @@ remain open in the model.
 is why dispatch on the sequencing domain is load-bearing (not an optimization):
 
 - **Induction (`InductionStore`)** reads position `𝑖-1`, so it is a *strict total-order data-dependence
-  chain*: necessarily sequential, independent iterations **not** reordered.
+  chain*: necessarily sequential, with independent iterations left in order.
 - **`Txn` (commit operator)** has a *serial denotation* (a total commit order, each transaction reading
   the prefix strictly before its time) but a *concurrent engine* (optimistic concurrency), correct iff
   observationally equivalent to that denotation. Disjoint footprints commit concurrently.
@@ -808,12 +805,12 @@ causal matcher (`letrec::check_letrec_causal`).
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ (Key ⇀ Value)`. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
-  the current store (backward / optimistic concurrency) *before* allocating a timestamp — a valid
+  the current store (backward / optimistic concurrency) ahead of allocating a timestamp — a valid
   proposal commits and consumes a tick, a stale one is skipped and retries against the advanced
   snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. `release` is the
   commit acknowledgment (the retry signal rides the existing producer/consumer channel). The store
   compacts by the MVCC law and GCs the released prefix.
-- **`AsOf`** — the as-of (temporal) join: **every** fed-out `Txn` mutable variable read, regardless of the
+- **`AsOf`** — the as-of (temporal) join: every fed-out `Txn` mutable variable read, regardless of the
   reading loop's domain. Given a *trigger* (the reading loop — the positions to sample at) and a
   *source* (the store), it latches, for each trigger position, the store's value as of the moment
   that position is first observed. The output is indexed by the **trigger** (the outer reading loop),
@@ -842,15 +839,15 @@ Dispatch on the sequencing domain is load-bearing, not an optimization.
 
 A consumer reading "as of `𝑡`" must know no further commits will land at `≤ 𝑡`. The runtime already
 carries this: function tiles hold a `domain_predicate` marking the complete region of the domain. A
-watermark *is* a `domain_predicate` advancing over `Txn`. Conflict validation — which depends on
-which value combinations were observed — is deliberately engine-level, above the tiling algebra,
+watermark is a `domain_predicate` advancing over `Txn`. Conflict validation — which depends on
+which value combinations were observed — is engine-level, above the tiling algebra,
 because that is exactly what domain predicates cannot express.
 
 ## Concurrency and distribution
 
 The transactional case is the concurrent sequencing domain, and most of it falls out of the
 algebra: out-of-order commits are fine (`⊕` is commutative; writes at distinct timestamps are
-compatible tiles), and watermarks are `domain_predicate`s over `Txn`. What is *not* in the algebra
+compatible tiles), and watermarks are `domain_predicate`s over `Txn`. What the algebra lacks
 is conflict validation (read-set dependence), which is the engine's job. The design generalizes to
 distributed execution with no model change: the compiler knows the full set of writes a transaction
 *could* perform, so distributed commit can be decided from complete local knowledge rather than a
@@ -864,7 +861,7 @@ affordable by that complete compile-time knowledge.
 - **Nested `for` loops** — lexicographic product domains; data-dependent bounds meet the
   refinement-types work as dependent sums.
 - **Mutable collections** — sigma types (`List[𝑇] = Σ 𝐼 . 𝐼 ⤇ 𝑇`) as letrec bindings; the
-  append-only `Appendable` case first, as a commit stream whose history *is* the collection. This
+  append-only `Appendable` case first, as a commit stream whose history is the collection. This
   is also what first-class `Mut` (returning or storing references) needs: carrying mutable variable identity in
   types is a sigma/index-types question. Until then the second-class discipline is the aliasing
   firewall.
@@ -933,7 +930,7 @@ standalone read), which demand-drives this convergence: each committed reply pul
 advances the sibling loop, exactly as an in-block reply drives the writer in the co-indexed case. The
 co-indexed and non-cross paths are untouched.
 
-(Note the asymmetry: the broadcast **source** — the sibling induction loop's accumulator — *does*
+(The asymmetry: the broadcast **source** — the sibling induction loop's accumulator — does
 have a final, read via `ExtractFinal`, because an induction loop terminates and its final value is
 denotable. The result **mutable variable** does not: a `Txn` mutable variable has no final-value term, so reads of it
 are `AsOf`, never `ExtractFinal`.)
@@ -970,7 +967,7 @@ request-indexed, but not commit-ordered. To gate or commit-order a reply, put it
 
 The **terminal read of a transactional mutable variable**. Surface, semantics, and the
 unreferenceable-after rule are specified in the
-[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided); in the [ordering
+[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final); in the [ordering
 model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the commit-domain analog of
 loop completion — a **completeness** edge on the `Txn` domain.
 
@@ -1109,7 +1106,7 @@ guard-rejected position. See `../../interpreter/design-operators.md`.
 
 Both a **finite** loop and an **async** (streaming) source drive an induction accumulator — the
 model treats a finite domain as a stream that terminates (§Liveness) — and every induction accumulator
-uses *one* realization: the changelog `InductionStore`. Plain, conditional, and feed-carrying loops
+uses one realization: the changelog `InductionStore`. Plain, conditional, and feed-carrying loops
 over finite or async extents all route through it. The
 driver reads its source by absolute domain position (async domains arrive unordered), reclaims the
 consumed prefix as it advances, and carries reply feeds as `__fire`-gated taps — see *Induction
@@ -1181,7 +1178,7 @@ mutually exclusive and, taken together with the implicit empty arm of a guard th
 exhaustive: exactly one path runs per transaction.
 
 Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
-**one** decision variant, whose `` `commit ``/`` `abort `` tag and per-tap fire fields are path conditions
+one decision variant, whose `` `commit ``/`` `abort `` tag and per-tap fire fields are path conditions
 and whose per-key writes are `Case`s over the local branch guards — so every path is evaluated in
 one straight-line writer body and one transaction is still one decision. Walking a block threads
 `(path, env)` (read-your-writes) and the block denotes
@@ -1216,7 +1213,7 @@ transaction appends the tap only where its fire gate holds. A single-guard feed 
 path == commit) and a spine feed omit the field and fire with their transaction — so unconditional
 programs keep their fire-field-free shape.
 
-A write key written *only* conditionally (an absolute `k := 𝑒` inside a `Case` arm, never read) is
+A write key written conditionally and never read (an absolute `k := 𝑒` inside a `Case` arm) is
 finalized into the *read* set by `collect_footprint`, so it has a snapshot to **carry** on the paths
 its arm does not fire; a read-modify-write already reads the key, and a purely spine (unconditional)
 write needs no carry and stays write-only.
@@ -1275,22 +1272,23 @@ zero-or-one times.
 
 **Why this is sound where per-path writer sites *inside* one block are not** (contrast the "one
 decision record per transaction" verdict above): the guard `𝑝` is a **source-domain** predicate —
-evaluated on the request element *before* the transaction, not on its snapshot — so it may
+evaluated on the request element ahead of the transaction, not on its snapshot — so it may
 legitimately restrict the source; each branch's block is a **distinct transaction** with its own
 `begin_<site>`, so distinct serialization points are correct rather than a violation; and atomicity
 is intact — still one snapshot, one commit, one write-set per transaction. The whole difference is
 "two transactions" vs. "one transaction, two paths".
 
-**Footgun — a variable-reading guard is not an atomic check.** These are *not* equivalent:
+**A guard reading the variable is rejected, so the non-atomic check is unwritable.** Of these two,
+only (B) is a program:
 
 ```text
-if balance > 0: with begin(): balance -= req      # (A) non-atomic pre-check
+if balance > 0: with begin(): balance -= req      # (A) rejected: `balance` is read outside a block
 with begin(): if balance > 0: balance -= req       # (B) atomic — checked in the snapshot
 ```
 
-In (A) `balance > 0` is a **live/as-of read outside the transaction** — a TOCTOU pre-check that can
-go stale between the read and the commit. It is faithfully compilable (the guard becomes a gating
-as-of read deciding whether the transaction fires), but it is not an atomic guard, and a user who
-wrote (A) most likely meant (B), the in-block deny guard. This form should at least be documented,
-ideally linted (a variable-reading guard on a conditional transaction) with a pointer at (B).
+(A) would be a TOCTOU pre-check, stale between the read and the commit. It does not compile, and not
+because conditional transactions are unbuilt: a `Txn` variable is read only inside a `with begin():`
+block, permanently (the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)), so the guard is
+rejected at lowering whatever becomes of the conditional around it. That leaves (B) as the only way
+to write the check, which is the atomic one, so there is no footgun here to lint.
 

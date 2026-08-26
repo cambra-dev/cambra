@@ -1473,8 +1473,8 @@ pub fn compile_program(
     // inlining (so cross-function writers land at their call sites) and
     // *before* channelize, so a per-iteration feed inside a loop is
     // hoisted to an ordinary feed of the loop's history for channelize to route.
-    // The tree still carries Defer/Feed here, so the walls are the relaxed
-    // pre-channelize check.
+    // The tree still carries Defer/Feed here, so the check is the relaxed
+    // pre-channelize one.
     // Isolated pane pair over `mut_elim` alone — the phase whose fate prediction
     // driver capture is meant to delete.
     let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);

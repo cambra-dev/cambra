@@ -66,8 +66,8 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
         .expect("pipeline test expects a `main` output");
     // A single `get` is not always enough to fully drain a producer.  Some
     // tile operators advance their internal state by one step per pull
-    // (notably the mutation-loop `Recurse` cycle, where each pull of the
-    // body op records one more position into the recurrence cache).
+    // (notably a mutation loop's store/drive cycle, where each pull decides one
+    // more position of the recurrence).
     // Loop until the producer reports a terminal tile, with a generous
     // iteration cap to catch the regression where the cycle stops making
     // progress without converging.
