@@ -73,6 +73,17 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 /// Let-bindings are compiled by converting the bound expression to an operator, memoising it, and
 /// pushing a FanOut into the scope to share it between uses.
 ///
+/// `curry` has no arm. The projecting inner comprehension over a group produces one
+/// and is discharged before this pass, by the exponential-eta rule in
+/// [`crate::ccl::simplify`]. A `curry` that survives — from a curried function the
+/// program never fully applies — reaches the catch-all `Apply` arm and errors there;
+/// see `src/ccl/design/optimization.md`, "Limitations". What is missing is the
+/// combinator rather than the shape: a curried data function is a tiling
+/// (`CurriedFunction`), which planning's group-by rewrite builds from `converse`. A
+/// curried *compute* function has no counterpart, and the kind is why — a tile
+/// carries values, not closures, and a compute function has no data behind it to
+/// materialize.
+///
 /// Currently unsupported:
 /// - Recursion
 pub fn convert_to_operators(
