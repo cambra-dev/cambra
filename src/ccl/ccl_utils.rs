@@ -797,27 +797,127 @@ pub fn bare_predicate_of_fn(base: &Type, predicate: Expr) -> Expr {
     Expr::apply(elem, predicate).with_ty(Type::Base(BaseType::Bool))
 }
 
-/// Re-point every [`TypedExprNode::Cast`]'s `target` type slot at the cast
-/// node's own `expr.ty`. A cast's recorded type *is* its target type, so the
-/// two are equal by construction — but the `target` carries its **own**
-/// immutable refinement-predicate `Rc`, and lambda elimination rebuilds the
-/// predicate on `expr.ty` without touching `target`, so they drift apart. The
-/// post-pass `typecheck` reconstructs a cast from its `target`
-/// ([`cast_target_refinement`]) and compares against the recorded `expr.ty`;
-/// re-syncing after that pass keeps the match exact.
+/// Restore every [`TypedExprNode::Cast`]'s canonical type split after a
+/// rebuild pass: the `target` keeps its **born** refinements on the rebuilt view's
+/// shape and bases; the node type carries the value's domain refinements ∪ born
+/// ([`canonical_cast_ty`] — the same rule coalesce applies). Bottom-up, so a
+/// cast value that is itself a cast presents its canonical type to its parent.
 ///
-/// Only lambda elimination needs it. Inlining and planning each ran it too, and
-/// removing those calls changes no test — a whole-tree repair after a pass is
-/// weaker than writing both copies at the rewrite, which is what
-/// [`sync_cast_target_kind`] does for the arrow kind.
-pub fn sync_cast_targets(expr: &mut Expr) {
-    if matches!(expr.node, TypedExprNode::Cast { .. }) {
-        let ty = expr.ty.clone();
-        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
-            *target = ty;
+/// A pass that rebuilds node types wholesale (lambda elimination's composition
+/// typing, `simplify`'s rule rewrites, planning's point-free compilation)
+/// re-derives `expr.ty` from surrounding term structure — and where inference
+/// left route-dependent types in eq-blind slots (a lambda param annotation,
+/// say), that re-derivation is route-dependent too. Installing the rebuilt
+/// view wholesale into `target` (the previous behaviour) therefore made a
+/// cast's *refinements* route-dependent — the defect the coalesce-time
+/// canonicalization retired — while dropping the view's refinements from `expr.ty`
+/// left the recorded type disagreeing with the post-pass typecheck's
+/// reconstruction (value-refinements ∪ target-refinements). Deriving both slots from
+/// the term repairs both at once.
+pub fn canonicalize_cast_types(expr: &mut Expr) {
+    expr.walk_children_mut(canonicalize_cast_types);
+    match &expr.node {
+        TypedExprNode::Cast { .. } => {
+            let view = expr.ty.clone();
+            if let TypedExprNode::Cast { value, target } = &mut expr.node {
+                let born = std::mem::replace(target, Type::Hole);
+                *target = canonical_cast_ty(&born, None, view.clone());
+                expr.ty = canonical_cast_ty(&born, Some(&value.ty), view);
+            }
         }
+        // A chain's type is derived from its ends (`emit_compose`): the domain
+        // comes from the head, the codomain from the tail. A head cast whose
+        // domain was just canonicalized owes the chain its domain — the
+        // post-pass typecheck's reconcile is exact on domain refinements (a
+        // recorded domain may be neither wider nor narrower than the derived
+        // one, by contravariance meeting the covariant reconcile), so the
+        // recorded chain type must follow.
+        //
+        // Follow only where the difference is *refinements on the same base* — the
+        // one thing cast canonicalization moves — and only on the domain. A
+        // structurally different recorded end, or a codomain refined beyond
+        // the tail's (a conditional leg's realization pin, planning's
+        // `refine_codomain`), is a deliberate statement this pass has no
+        // license to rewrite; overwriting one miscompiles (observed: a
+        // comprehension over a conditional summing the unfiltered extent).
+        // The kind and Pi name stay recorded for the same reason (`Data`
+        // pins, dependent binders).
+        TypedExprNode::Compose(elts) => {
+            if let Some(head) = elts.first()
+                && matches!(head.node, TypedExprNode::Cast { .. })
+                && let Some(head_dom) = head.ty.domain()
+                && let Type::Fun { domain, .. } = &mut expr.ty
+                && **domain != head_dom
+                && domain.peel_refinements() == head_dom.peel_refinements()
+            {
+                **domain = head_dom;
+            }
+        }
+        _ => {}
     }
-    expr.walk_children_mut(sync_cast_targets);
+}
+
+/// The canonical type of a `Cast` node: the `view`'s shape and bases (the
+/// coalesced view at inference time; the rebuilt type after a rebuild pass),
+/// carrying the refinements the **term** determines — the value's own domain refinements
+/// plus the `born` target's refinement set. Inference and the rebuild passes
+/// resolve a cast's bases; they do not decide its refinements.
+///
+/// A cast is an *assertion*: `cast(value, {𝐷 | 𝑝} ⇒ 𝑉)` asserts exactly `𝑝` on
+/// top of whatever its value already established, and both parts are fixed by
+/// the term — the born refinements when the cast was written (lowering's filter, a
+/// group-by's key equation), the value's refinements by the value's own type, which
+/// is already canonical by induction (both callers walk bottom-up). The graph
+/// view of the same position accumulates the same union on the ordinary route
+/// — the upcast `value <: target` is how the value's refinements flow in — but
+/// *which* refinements an occurrence's variable accumulates depends on the route
+/// bounds took through the graph: an embedded copy of a cast (a comprehension
+/// source cloned into a filter predicate) has its own variable, and under an
+/// adversarial bound order it coalesces bare, or decorated with a sibling
+/// layer's filter. Installing the view wholesale (the previous behaviour)
+/// therefore made a cast's *identity* route-dependent — which refinement
+/// equality, deliberately cast-target-aware, then refused to dedup. Deriving
+/// the refinements from the term instead is route-independent and agrees with the
+/// view on every deterministic route.
+///
+/// When the view's refinements already equal the term-derived set, the view is
+/// installed wholesale — preserving the predicate-`Rc` sharing between the
+/// target and the node type that planning's compile-once relies on.
+/// `value_ty: None` computes the canonical *target* (born refinements alone);
+/// `Some` computes the canonical node *type* (value's domain refinements ∪ born).
+pub(crate) fn canonical_cast_ty(born: &Type, value_ty: Option<&Type>, view: Type) -> Type {
+    let born_refinements = match born.domain() {
+        Some(d) => d.refinements().to_vec(),
+        None => return view,
+    };
+    let Some(view_dom) = view.domain() else {
+        return view;
+    };
+    // The term-determined refinement set: value's domain refinements (type position
+    // only) ∪ born refinements.
+    let mut canon_refinements: RefinementSet = value_ty
+        .and_then(|t| t.domain())
+        .map(|d| d.refinements().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    canon_refinements.extend(born_refinements);
+    let view_refinements = view_dom.refinements();
+    let same = canon_refinements.len() == view_refinements.len()
+        && view_refinements
+            .iter()
+            .all(|r| canon_refinements.contains(r));
+    if same {
+        return view;
+    }
+    let cod = view
+        .codomain()
+        .expect("a type with a domain has a codomain");
+    Type::fun_like(
+        &view,
+        Type::refined(view_dom.peel_refinements().clone(), canon_refinements),
+        cod,
+    )
 }
 
 /// Carry a re-typed node's [`FunKind`](crate::ccl::ty::FunKind) onto its `target`,

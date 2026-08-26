@@ -559,6 +559,16 @@ fn try_pairwise_in_compose(
     // a rewrite that overwrote them with a type derived from the surrounding term
     // would make the assertion track its own consumer.
     crate::ccl::ccl_utils::sync_cast_target_kind(expr);
+    // Nor may the collapsed node inherit the chain's interface type wholesale: a
+    // cast's refinements are term-determined (its type is the value's domain refinements ∪
+    // the target's born refinements), while the chain's recorded type was derived from
+    // neighbour types — which can be route-dependent where inference left
+    // route-dependent slots. Keep the chain's shape and bases, restore the
+    // term-determined refinements, reading a `target` whose kind now matches.
+    if let TypedExprNode::Cast { value, target } = &expr.node {
+        let view = expr.ty.clone();
+        expr.ty = crate::ccl::ccl_utils::canonical_cast_ty(target, Some(&value.ty), view);
+    }
     expr.user_annotation = user_annotation;
     true
 }
