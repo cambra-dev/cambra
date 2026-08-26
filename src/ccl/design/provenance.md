@@ -508,7 +508,7 @@ serves panes.
 Every phase instrumented so far reduces to one of two forms.
 
 **Rule-table phase → one wrapper combinator.** `simplify::ruled` wraps all
-thirteen rule invocations, with **no rule body edited at all**:
+every rule invocation, with **no rule body edited at all**:
 
 ```rust
 fn ruled(label: RewriteLabel, expr: &mut Expr, rule: impl FnOnce(&mut Expr) -> bool) -> bool {
@@ -523,7 +523,7 @@ rather than every *firing* costs one push and pop when the rule declines. The
 
 **Recursive traversal → one recording at each traversal entry.**
 `planning::iterate` names the marker site it rewrites, and `transact_phase`'s
-fourteen recordings are one per rewrite it performs. A recording takes only an
+recordings are one per rewrite it performs. A recording takes only an
 **id**, so a site that has already moved `expr.node` out can still open one —
 read `expr.node_id()` before the destructure.
 
@@ -540,6 +540,35 @@ Three refinements the shapes above do not cover:
   the same node** inside the arm. The two write disjoint sets of rows on one
   parent, which is what two rewrites attributed to one node should look like. A
   recording carries one label and one nature for its whole extent by design.
+
+#### Choosing between `Expansion` and `Machinery`
+
+**`Expansion` when the products are what the source construct denotes;
+`Machinery` when they are one way of carrying it out.** The two are decided per
+site and nothing in the compiler branches on the answer, so a site that does not
+say which reading it took leaves the next reader to guess.
+
+Planning's two recognizers are the pair that makes the line concrete, and they
+land on opposite sides. `planning.groupby` is `Expansion`: the bucketize chain
+`converse(c ≫ key) ≫ map(c)` is what `groupby(c, key)` *means*, and a reader
+following the attribution back to the `groupby` call is seeing that call
+unfolded. `planning.hash_join` is `Machinery`: the user wrote a two-source
+comprehension with an equality guard, the join plan is one strategy for
+materialising it — picked off the domain's refinement structure, and replaced by
+`iterate`-then-`restrict` when the structure does not permit it — and nothing in
+the source names a join.
+
+The same line elsewhere: `lambda_elim.filter` is `Expansion` because a
+comprehension's `if` guard becoming a domain refinement is that guard; `simplify`
+is `Machinery` because an algebraic rewrite has no source counterpart at all.
+
+`Nature::Source` is not on this axis. It is structural and lowering-only — a node
+is `Source` exactly when it is the root of a lowered `Spanned<ChlExpr>` — so no
+phase ever chooses it (see [The seam](#the-seam)).
+
+`planning_labels_carry_their_declared_nature` (`src/ccl/panes.rs`) pins both
+planning answers, so flipping one is a test edit rather than a silent change to
+what the wire says.
 
 **And a caution about what the gate can tell you.** `Unrecorded == 0` is a
 *coverage* property — was anything recording when a node was minted — not a
@@ -712,8 +741,7 @@ becomes whatever the caller compiles — point it at the test suite and it cover
 every program there instead of the handful `context.rs`'s `corpus()` lists. That
 sample is what let two recording gaps live: `transact_phase` calling
 `mut_elim::fold_induction_loop` with nothing recording, and `flatten_spine`'s
-value-position writer hoist. Both are shapes the eleven listed programs do not
-have. CI runs with it on; it costs about 4% of the test step.
+value-position writer hoist. Both are shapes the listed programs do not have. CI runs with it on; it costs about 4% of the test step.
 
 It gates `gated_pane_pairs()`, which is now every pair: the leak classes hold at
 zero from the lowering handoff to the end of the pipeline over whatever the
@@ -733,7 +761,8 @@ not otherwise. The `planning` span went for that reason: it ran
 list is `Planning` alone, so the wider gated pair measured the same phase and
 keeping both invited trusting the wrong one.
 
-`letrec` and `mutelim` stay because their pair bundles four phases. Both sit
+`letrec` and `mutelim` stay because their pair bundles more phases than either
+span isolates. Both sit
 inside `post-inference → post-channelize`, over `Inline`, `Transact`, `Letrec` and
 `Channelize`, and `mutelim` runs `post-transact..post-letrec`, isolating `Letrec`.
 That pair holding at zero reports nothing about how much of `mut_elim` alone its
@@ -780,7 +809,7 @@ bit is what says so until every phase in the pair records.
   **`label`, unlike `nature`, has no rule: it is per-rule judgment, and carries no
   cross-site guarantee.** Making `Source` structural moved the judgment call from
   `nature` onto `label` rather than removing it, and the disagreement moved with
-  it: an `ExprStmt` at a statement's span is `"lower.image"` at five sites and
+  it: an `ExprStmt` at a statement's span is `"lower.image"` at several sites and
   `tag_machinery(…, "lower.stmt_seq")` at nine — the same node kind in the same
   span role, tagged both ways. So the guarantee is stated weakly on purpose.
   `"lower.image"` means *the rule that minted this node considered it an image*,
@@ -834,7 +863,7 @@ bit is what says so until every phase in the pair records.
   The first entry is the anchor — it has no predecessor, and its projection is
   the lowering projection rather than a fold product. Read `PANES` for the
   current set rather than a list here; today it runs `pre-inference` through
-  `post-planning`, six panes and five pairs. Projections chain: each pair folds
+  `post-planning`. Projections chain: each pair folds
   against the projection of the pane above it, so the first pair whose phases do
   not record leaves every pane below it with nothing to carry forward.
 - **The pane leak gate.** `gate_leaks` asserts the whole `Leak` vector empty at
@@ -849,7 +878,7 @@ bit is what says so until every phase in the pair records.
   `pane_pair_folds_have_no_structural_leaks` over the programs `corpus()` lists,
   on every test run, and `CAMBRA_PROVENANCE_GATE=1` over whatever the caller
   compiles, which is strictly stronger because the wider corpus reaches shapes
-  the eleven listed programs do not.
+  the listed programs do not.
 
   **The flag does not license a nonzero residue where it is false.** A leak is a
   bug wherever it appears; the flag says whether an assertion has been turned on.

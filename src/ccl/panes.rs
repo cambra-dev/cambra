@@ -386,7 +386,7 @@ mod tests {
     }
 
     /// **Capture totality**, as a corpus-wide property rather than a per-phase
-    /// assertion: both pane pairs materialize and fold over every corpus
+    /// assertion: every pane pair materializes and folds over every corpus
     /// program, every output-pane node has an origin (`Unrecorded == 0`), and
     /// no node's ancestry dangles (`DanglingParent == 0`).
     ///
@@ -672,7 +672,7 @@ mod tests {
         }
     }
 
-    /// All four phases inside the second pane pair explain what they produce.
+    /// Every phase inside the second pane pair explains what it produces.
     ///
     /// The interesting programs are the ones that drive a *whole-program*
     /// rewrite, where naming one node is least obviously applicable: a
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn the_second_pane_pair_explains_every_node_its_phases_produce() {
         /// Reaches `transact_phase` or `channelize` — the whole-program
-        /// rewrites, and the last two phases to adopt the recorder.
+        /// rewrites, where naming one node is least obviously applicable.
         const WHOLE_PROGRAM_REWRITES: &[&str] = &["transaction", "feed_loop", "generator_pipeline"];
         for (name, code) in corpus() {
             let panes = compile_ok(&code).materialize_panes();
@@ -796,7 +796,7 @@ mod tests {
                 Phase::Planning,
                 Phase::Transact
             ],
-            "the transaction fixture is rewritten by exactly these seven phases",
+            "the transaction fixture is rewritten by exactly these phases",
         );
     }
 
@@ -899,7 +899,7 @@ mod tests {
     /// done
     /// ```
     ///
-    /// With capture on it also materializes and folds both panes, since that is
+    /// With capture on it also materializes and folds the panes, since that is
     /// the cost the design actually incurs.
     #[test]
     #[ignore = "measurement, not an assertion; see the doc comment for the driver"]
@@ -951,5 +951,86 @@ mod tests {
             );
         }
         eprintln!("[perf capture={capture}] TOTAL compile {total_compile:?} fold {total_fold:?}");
+    }
+
+    /// **Planning's two recognizers carry the `Nature` they were assigned.**
+    /// Both replace a term-tree site that images a source construct, and they
+    /// answer the `Expansion`/`Machinery` question differently: a bucketize
+    /// chain is what `groupby` denotes, while a hash join is one way of
+    /// materialising a comprehension the user never wrote as a join. The tag
+    /// rides the wire, so a consumer reads the difference as meaningful and a
+    /// silent flip is a change to what the inspector claims about the source.
+    /// See `design/provenance.md`, "Choosing between `Expansion` and
+    /// `Machinery`".
+    ///
+    /// Asserting both labels are *present* is the second half: this fixture
+    /// exists to put both recognizers on one tree, and a program that stopped
+    /// reaching one would otherwise pass the nature check vacuously.
+    #[test]
+    fn planning_labels_carry_their_declared_nature() {
+        use crate::ccl::provenance::{Nature, RewriteLabel};
+
+        let program = compile_ok(include_str!(
+            "../../tests/programs/join_then_groupby/program.cambra"
+        ));
+        let mut seen: std::collections::BTreeMap<RewriteLabel, Nature> = Default::default();
+        for id in collect_tree_ids(&program.ast) {
+            let Some(tag) = program.provenance_table.tag_in(id, &[Phase::Planning]) else {
+                continue;
+            };
+            // One label, one nature: a recording carries both for its whole
+            // extent, so two natures under one label means two sites disagree.
+            if let Some(prev) = seen.insert(tag.label, tag.nature) {
+                assert_eq!(
+                    prev, tag.nature,
+                    "label {} is recorded at two different natures",
+                    tag.label,
+                );
+            }
+        }
+        assert_eq!(
+            seen.get("planning.groupby"),
+            Some(&Nature::Expansion),
+            "the bucketize chain is what `groupby` denotes, so its rewrite expands \
+             a source construct; labels seen: {:?}",
+            seen,
+        );
+        assert_eq!(
+            seen.get("planning.hash_join"),
+            Some(&Nature::Machinery),
+            "a hash join is a materialization strategy for a comprehension, not \
+             something the source names; labels seen: {:?}",
+            seen,
+        );
+    }
+
+    /// **One `Phase::Planning` scope covers both halves of planning.**
+    /// `compile_program` runs `plan_loops` and `planning::run` inside a single
+    /// scope. A regression that scoped `run` alone leaves `plan_loops`'
+    /// recognition rewrites writing into no table; the leak gate catches that as
+    /// a count of unexplained nodes, and this names which half stopped
+    /// recording.
+    ///
+    /// The two halves are told apart by label: `planning.recognize` is
+    /// `plan_loops` turning a causal `LetRec` into a `Transact`, and
+    /// `planning.iterate` is `run` wrapping an iteration site.
+    #[test]
+    fn one_planning_scope_covers_recognition_and_iteration() {
+        let (_, code) = corpus()
+            .into_iter()
+            .find(|(name, _)| *name == "transaction")
+            .expect("the corpus carries the transaction fixture");
+        let program = compile_ok(&code);
+        let labels: std::collections::BTreeSet<_> = collect_tree_ids(&program.ast)
+            .into_iter()
+            .filter_map(|id| program.provenance_table.tag_in(id, &[Phase::Planning]))
+            .map(|tag| tag.label)
+            .collect();
+        for expected in ["planning.recognize", "planning.iterate"] {
+            assert!(
+                labels.contains(expected),
+                "no `{expected}` row survives into the post-planning pane; labels seen: {labels:?}",
+            );
+        }
     }
 }

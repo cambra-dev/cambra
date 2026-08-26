@@ -358,7 +358,7 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
 /// keyed on the node the rule is about to rewrite.
 ///
 /// This is the whole of simplify's provenance instrumentation: **one combinator,
-/// applied uniformly to all thirteen rules**, and no rule body changes at all.
+/// applied uniformly to every rule**, and no rule body changes at all.
 /// That is possible because a recording declares nothing — it names the node in
 /// the slot and lets the construction hooks report the rest. In particular:
 ///

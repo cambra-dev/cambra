@@ -468,7 +468,7 @@ impl LoweringContext {
     /// `tag_machinery` is **the lowering author's judgment about their own rule**.
     /// There is no rule to apply, and the codebase does not agree with itself: the
     /// same node kind at the same span role is tagged both ways — an `ExprStmt` at
-    /// a statement's span is `"lower.image"` at five sites and
+    /// a statement's span is `"lower.image"` at several sites and
     /// `"lower.stmt_seq"` at nine.
     ///
     /// So the guarantee is deliberately weak, and stating it is the point:

@@ -1092,6 +1092,11 @@ pub(super) fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
     // keeps that refinement's own parentage — a clone's copy carries the node it
     // was freshened from, not the node named here.
     //
+    // `Nature::Machinery`: a hash join is one *strategy* for materialising this
+    // site, chosen off the domain's type structure, and the user wrote a
+    // comprehension rather than a join. Contrast `planning.groupby`, which is
+    // `Expansion` because its bucketize chain is what `groupby` denotes.
+    //
     // Not a fusion: the site's original value-producer is kept rather than
     // consumed, spliced in as the second element of the compose below with its
     // id intact. The arms the plan reads come from the domain **type**, and a

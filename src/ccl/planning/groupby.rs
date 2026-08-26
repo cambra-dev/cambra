@@ -24,12 +24,18 @@ pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
     // what the user's `groupby(...)` became and what the chain now stands in
     // for; the lifted key keeps its own parentage, since a clone's copy carries
     // the predicate node it was freshened from rather than the node named here.
-    // `Nature::Expansion` for the same reason.
+    //
+    // `Nature::Expansion`: the bucketize chain is what `groupby` *denotes*, so
+    // the rewrite expands a construct the user wrote. Contrast
+    // `planning.hash_join`, which is `Machinery` because a hash join is a
+    // materialization strategy for a site the user wrote as a comprehension.
     //
     // Scoped to the *attempt* and closed before the child walk. Recursing under
-    // it would make a nested site's products descend from this one; a
-    // non-matching node mints nothing, so wrapping the attempt costs a push and
-    // a pop.
+    // it would make a nested site's products descend from this one. A
+    // non-matching node writes no rows here: the matcher bails on node shape
+    // before it reaches anything that mints, and the type work it does reach
+    // (`open_codomain`) opens its own `subst.*` recordings, so wrapping the
+    // attempt costs a push and a pop.
     let rewritten = {
         let _g = provenance::enter(
             expr.node_id(),
