@@ -405,6 +405,31 @@ mod tests {
     // Regular function definition tests
     // -----------------------------------------------------------------------
 
+    /// A refinement may name any binder the annotation's own scope holds. A
+    /// parameter's annotation is read in the scope enclosing the binder, so the
+    /// parameter itself is not among them and a reference to it is an ordinary
+    /// unbound variable — pinned end to end by `type_scope_self` and
+    /// `type_annotation_naming_a_parameter_is_unbound` in
+    /// `tests/compilation_pipeline/type_annotations.rs`.
+    #[rstest]
+    // An enclosing `let` binding: in scope, and discharged to its definiens as
+    // the type leaves that scope.
+    #[case::outer_let("n = 5\ndef f(a: Int, c: {Int where _ >= n}):\n    c\n\nf\n")]
+    // The *output* annotation may name a parameter: it rides a `let` inside the
+    // lambda, so uncurrying rewrites it to the tuple projection along with the
+    // body.
+    #[case::output_annotation("def f(a: Int, b: Int) => {Int where _ >= a}:\n    a + b\n\nf\n")]
+    // An enclosing `def`'s parameter: a curried binder, so the telescope is real.
+    #[case::enclosing_param(
+        "def g(k: Int):\n    def h(x: {Int where _ >= k}):\n        x\n    h\n\ng\n"
+    )]
+    fn a_refinement_may_reference_a_binder_outside_the_parameter_list(#[case] code: &str) {
+        let stmts = parse_module(code);
+        lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering accepts a reference to a binder outside the parameter list");
+    }
+
     #[rstest]
     // Simple function: body is a single expression.
     #[case(

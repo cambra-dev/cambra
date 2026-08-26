@@ -19,6 +19,7 @@ use alloc_probe::allocations;
 use cambra::ccl::{
     infer::{TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
+    uniquify,
 };
 use cambra::chl_parser;
 
@@ -45,7 +46,11 @@ fn inference_allocations(code: &str) -> usize {
         .into_result()
         .expect("parse")
         .body;
-    let mut expr = lower_stmts(&stmts, &mut lctx).into_result().expect("lower");
+    let expr = lower_stmts(&stmts, &mut lctx).into_result().expect("lower");
+    // Uniquify outside the measurement window, as the pipeline does before
+    // `infer`: inference allocates against α-unique binders in the product, so
+    // measuring it on source spellings measures a tree it never sees.
+    let mut expr = uniquify::run(expr);
     let mut ictx = TypeInferenceContext::new();
     let mut typed = false;
     let allocs = allocations(|| typed = infer(&mut expr, &mut ictx).is_ok());

@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::subst::Subst;
+use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{
     BaseType, HistoryKind, InferVarId, Name, Openness, Refinement, Type, fresh_infer_var_id,
 };
@@ -636,6 +636,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
         collapse,
+        scope: RefinementScope::default(),
     };
     let term = compact_go(ty, true, &Subst::id(), None, &mut st);
     CompactGraph {
@@ -714,6 +715,13 @@ struct CompactState {
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
+    /// The functions the walk is inside of, and the closing memo over them
+    /// (`src/ccl/design/type-inference.md`, "Where the conversions run"): a
+    /// refinement's references to enclosing binders become indices before
+    /// `merge_refinements` compares refinements, so a closed cast and a live emitted
+    /// function meeting at one variable spell one refinement one way. `key_go` threads
+    /// the same type, so a key and a compacted type agree.
+    scope: RefinementScope,
 }
 
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
@@ -773,6 +781,9 @@ fn compact_go(
         Type::Refinement(inner, r) => {
             let mut ct = compact_go(inner, pol, subst_acc, parents, st);
             let r = subst_acc.force_refinement(r);
+            // References to the walk's enclosing binders become indices
+            // before the refinement is compared or stored.
+            let r = st.scope.close(&r);
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
             }
@@ -798,7 +809,11 @@ fn compact_go(
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
+            // Entering the codomain crosses this function — named or not, it
+            // deepens what a refinement landing below closes against.
+            st.scope.enter(name.clone());
             let cod = compact_go(c, pol, &cod_acc, None, st);
+            st.scope.exit();
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
@@ -1243,6 +1258,112 @@ mod tests {
         assert!(
             rec.is_empty(),
             "positive payload merge intersects fields; got {rec:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refinement_closing_tests {
+    use super::*;
+    use crate::ccl::infer::solver::test_helpers::dep_pred;
+    use crate::ccl::ty::FunKind;
+    use crate::ccl::{Refinement, TypedExprNode};
+
+    fn dep_fun(binder: &str) -> Type {
+        Type::Fun {
+            name: Some(Name::raw(binder)),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(dep_pred(binder)),
+            )),
+        }
+    }
+
+    /// **Acceptance: merging α-variant dependent bounds is canonical.**
+    /// Without closing against the walk's enclosing binders, the merged fun
+    /// shape kept the *first arrival's* binder while the refinement sets unioned
+    /// both α-copies of one constraint, coalescing to the order-dependent — and
+    /// dangling — `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`. With each
+    /// refinement closed against them as it lands (`CompactState::scope`),
+    /// α-variants compact identically: the copies dedup and nothing dangles. The
+    /// binder *slot* is display metadata and still follows arrival
+    /// (`na.or(nb)`), so the equality is modulo `without_pi_names`.
+    #[test]
+    fn alpha_variant_bound_merge_is_canonical() {
+        use crate::ccl::infer::solver::{
+            ConstrainCache, coalesce_compact, constrain_subtype, fresh_var, simplify_type,
+        };
+        let coalesce_with_order = |first: &Type, second: &Type| {
+            let v = fresh_var(0);
+            constrain_subtype(&v, first, &mut ConstrainCache::new()).unwrap();
+            constrain_subtype(&v, second, &mut ConstrainCache::new()).unwrap();
+            coalesce_compact(&simplify_type(compact_type(&v))).unwrap()
+        };
+        let (fx, fy) = (dep_fun("x"), dep_fun("y"));
+        let a = coalesce_with_order(&fx, &fy);
+        let b = coalesce_with_order(&fy, &fx);
+        assert_eq!(
+            a.without_pi_names(),
+            b.without_pi_names(),
+            "α-variant bound merge must be arrival-order-independent"
+        );
+        // The α-copies collapsed: one refinement layer, spelled as the index,
+        // nothing dangling.
+        let Type::Fun { codomain, .. } = &a else {
+            panic!("expected a function, got {a}");
+        };
+        let Type::Refinement(base, r) = &**codomain else {
+            panic!("expected exactly one refinement layer, got {codomain}");
+        };
+        assert!(
+            !matches!(&**base, Type::Refinement(..)),
+            "the two α-copies of one constraint must dedup to one layer, got {codomain}"
+        );
+        assert!(
+            crate::ccl::subst::type_free_vars(&a).is_empty(),
+            "no refinement may dangle on a free binder name: {a}"
+        );
+        let TypedExprNode::BinOp { right, .. } = &r.predicate.node else {
+            panic!(
+                "expected the dependent refinement, got {}",
+                crate::ccl::symbolic::symbolic(&r.predicate)
+            );
+        };
+        assert!(
+            matches!(&right.node, TypedExprNode::Var(n) if n.pi_bound_index() == Some(0)),
+            "the refinement's binder reference lands as the index #0"
+        );
+    }
+
+    /// **Acceptance: closing against the walk's enclosing binders keeps distinct
+    /// binders distinct.** A predicate referencing the *inner* binder denotes a
+    /// different type from one referencing the *outer*, and the two must not
+    /// compact alike. Conflating them shares a specialization silently: two
+    /// uses reach one clone whose interior was resolved against the other's
+    /// argument.
+    #[test]
+    fn closing_keeps_distinct_binders_distinct() {
+        let nested = |referenced: &str| Type::Fun {
+            name: Some(Name::raw("x")),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Fun {
+                name: Some(Name::raw("y")),
+                kind: FunKind::Data,
+                domain: Box::new(Type::UIntRange(4)),
+                codomain: Box::new(Type::Refinement(
+                    Box::new(Type::Base(BaseType::Int)),
+                    Refinement::born(dep_pred(referenced)),
+                )),
+            }),
+        };
+        assert_ne!(
+            compact_type(&nested("y")).term,
+            compact_type(&nested("x")).term,
+            "closing against the walk's enclosing binders must not conflate the inner and \
+             outer Pi binders"
         );
     }
 }

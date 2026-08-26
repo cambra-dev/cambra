@@ -6,9 +6,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::infer::solver::{
-    ConstrainCache, PolyScheme, constrain_subtype, fresh_var, fun, type_level,
-};
+use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fun, type_level};
+use crate::ccl::infer_var::{Telescope, TelescopeWalk};
 use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -145,6 +144,11 @@ pub(super) struct InferCtx {
     /// that shared an id across a `let` RHS boundary would silently take the first
     /// level it saw.
     shared_holes: RefCell<HashMap<u32, Type>>,
+    /// The binders in lexical scope at the current emission position — what
+    /// [`Typing::fresh`] stamps on each minted variable as its telescope.
+    /// Extended and restored by `scoped` / `scoped_let` in lockstep with
+    /// [`scopes`](Self::scopes).
+    telescope: Telescope,
 }
 
 impl InferCtx {
@@ -161,6 +165,7 @@ impl InferCtx {
             lit_singletons: HashMap::new(),
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
+            telescope: Telescope::empty(),
         }
     }
 
@@ -182,9 +187,22 @@ impl InferCtx {
     /// wrappers (refinements ride the lattice as refinements) — is
     /// kept, recursing to normalize nested holes.
     pub(super) fn normalize_annotation(&self, ty: &Type) -> Type {
+        self.normalize_annotation_in(ty, &self.telescope)
+    }
+
+    /// [`normalize_annotation`](Self::normalize_annotation)'s recursion, with
+    /// the telescope threaded as a value: descending into a named function's
+    /// codomain extends it with the Pi binder, so a variable minted inside a
+    /// dependent annotation carries the binder in scope — the annotation's
+    /// refinements reference it, and the bounds recording them close against the
+    /// holder (`src/ccl/design/type-inference.md`, "Where the conversions
+    /// run"). The method takes `&self`, so the extension rides the recursion
+    /// rather than the context.
+    fn normalize_annotation_in(&self, ty: &Type, telescope: &Telescope) -> Type {
         match ty {
-            // A `Hole` annotation means "infer this" → fresh variable.
-            Type::Hole => fresh_var(self.level),
+            // A `Hole` annotation means "infer this" → fresh variable, at
+            // the current lexical position (it carries the live telescope).
+            Type::Hole => Type::Infer(crate::ccl::InferVar::fresh_in(self.level, telescope)),
             // A `SharedHole` means "infer this, and it is the same one as that":
             // the *first* occurrence of an id mints the variable and every later
             // one reuses it. That identity is the entire mechanism — it is how a
@@ -194,7 +212,9 @@ impl InferCtx {
                 .shared_holes
                 .borrow_mut()
                 .entry(*id)
-                .or_insert_with(|| fresh_var(self.level))
+                .or_insert_with(|| {
+                    Type::Infer(crate::ccl::InferVar::fresh_in(self.level, telescope))
+                })
                 .clone(),
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
@@ -216,8 +236,8 @@ impl InferCtx {
                 )
             }
             Type::BoundedHole(bound) => {
-                let v = fresh_var(self.level);
-                let bound = self.normalize_annotation(bound);
+                let v = Type::Infer(crate::ccl::InferVar::fresh_in(self.level, telescope));
+                let bound = self.normalize_annotation_in(bound, telescope);
                 // A **local** cache, not `self.cache`: this method takes `&self`,
                 // and the memo exists only to break recursion on cyclic bounds.
                 // `v` is brand new, so the sole action is pushing one upper edge —
@@ -233,33 +253,44 @@ impl InferCtx {
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
-            Type::Refinement(inner, r) => {
-                Type::Refinement(Box::new(self.normalize_annotation(inner)), r.clone())
-            }
+            Type::Refinement(inner, r) => Type::Refinement(
+                Box::new(self.normalize_annotation_in(inner, telescope)),
+                r.clone(),
+            ),
             // Structural types are already solver-ready; recurse to
-            // normalize any nested holes/refinements.
+            // normalize any nested holes/refinements. A named function's binder
+            // is in scope in its codomain — the annotation's own Pi
+            // extends the telescope for the variables minted there.
             Type::Fun {
                 name,
                 kind,
                 domain: d,
                 codomain: c,
-            } => Type::Fun {
-                name: name.clone(),
-                kind: kind.clone(),
-                domain: Box::new(self.normalize_annotation(d)),
-                codomain: Box::new(self.normalize_annotation(c)),
-            },
-            Type::Tuple(ts) => {
-                Type::Tuple(ts.iter().map(|t| self.normalize_annotation(t)).collect())
+            } => {
+                let cod_telescope = match name {
+                    Some(b) => telescope.extended(b.clone()),
+                    None => telescope.clone(),
+                };
+                Type::Fun {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    domain: Box::new(self.normalize_annotation_in(d, telescope)),
+                    codomain: Box::new(self.normalize_annotation_in(c, &cod_telescope)),
+                }
             }
+            Type::Tuple(ts) => Type::Tuple(
+                ts.iter()
+                    .map(|t| self.normalize_annotation_in(t, telescope))
+                    .collect(),
+            ),
             Type::Record(fs) => Type::Record(
                 fs.iter()
-                    .map(|(n, t)| (n.clone(), self.normalize_annotation(t)))
+                    .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
                     .collect(),
             ),
             Type::Variant(tags, openness) => Type::Variant(
                 tags.iter()
-                    .map(|(k, t)| (k.clone(), self.normalize_annotation(t)))
+                    .map(|(k, t)| (k.clone(), self.normalize_annotation_in(t, telescope)))
                     .collect(),
                 *openness,
             ),
@@ -271,8 +302,8 @@ impl InferCtx {
                 domain,
                 kind,
             } => Type::History {
-                value: Box::new(self.normalize_annotation(value)),
-                domain: Box::new(self.normalize_annotation(domain)),
+                value: Box::new(self.normalize_annotation_in(value, telescope)),
+                domain: Box::new(self.normalize_annotation_in(domain, telescope)),
                 kind: *kind,
             },
             // Leaves and existing inference vars pass through unchanged.
@@ -303,6 +334,12 @@ impl InferCtx {
     }
 }
 
+impl TelescopeWalk for InferCtx {
+    fn telescope_mut(&mut self) -> &mut Telescope {
+        &mut self.telescope
+    }
+}
+
 impl Typing for InferCtx {
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
@@ -317,11 +354,15 @@ impl Typing for InferCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        fresh_var(self.level)
+        Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
-        scheme.instantiate(self.level)
+        // `Typing::instantiate` is the operator-scheme path: the template's
+        // variables stand nowhere, so the instantiation takes this position's
+        // telescope. (A let-generalized binding instantiates directly via
+        // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
+        scheme.instantiate_in(self.level, &self.telescope)
     }
 
     fn normalize(&mut self, ann: &Type) -> Type {
@@ -388,7 +429,7 @@ impl Typing for InferCtx {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
             },
         );
-        let r = f(self);
+        let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
     }
@@ -436,7 +477,7 @@ impl Typing for InferCtx {
         };
         self.scopes.push_scope();
         self.scopes.bind(name, Binding { scheme });
-        let r = f(self);
+        let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
     }
@@ -470,7 +511,48 @@ impl Typing for InferCtx {
         // annotation's refinement of an inferred variable, and the refinement rule
         // flows that deficit onto it rather than rejecting. What changes is *when* a
         // genuine conflict surfaces: at coalesce rather than immediately.
-        let ann_simple = self.normalize_annotation(ann);
+        // An unnamed annotation function over a *named* inferred one adopts the
+        // inferred Pi binder before normalizing — the same preservation
+        // `emit_cast` performs on a cast value's binder, for the same reason: a
+        // dependent codomain flowing into the annotation's codomain slot
+        // references the binder, and the adopted name is what gives that edge
+        // its correspondence and puts the binder in the telescope of the
+        // variables normalization mints inside the codomain (the group-by
+        // lowering's `data_fun(key_ty, Hole)` annotation over `λ __gb_k → …`
+        // is the exercising case). The adopted name is a spelling and an
+        // opening address; the annotation states no claim of its own about the
+        // binder.
+        //
+        // One layer: the outermost function only, so an annotation nested two
+        // dependent functions deep adopts the outer binder and not the inner. No
+        // shape reaching here carries two — a nested group-by resolves to
+        // `(Int ⤇ (Int ⤇ Int))`, with the key binders discharged — and the
+        // recursion would need the annotation and the inferred type to agree on
+        // depth, which nothing establishes at this edge.
+        let adopted;
+        let ann_to_normalize = match (inferred.peel_refinements(), ann.peel_refinements()) {
+            (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
+                let mut named = ann.clone();
+                // Name the unrefined function layer `peel_refinements` matched;
+                // refinement wrappers stay outside it. The walk peels exactly what
+                // that match peeled, so it lands on that same function.
+                let mut cur: &mut Type = &mut named;
+                while let Type::Refinement(inner, _) = cur {
+                    cur = inner;
+                }
+                let Type::Fun { name, .. } = cur else {
+                    unreachable!(
+                        "`peel_refinements` matched a `Fun` on this annotation, and \
+                         this walk peels the same `Refinement` layers, so it lands on it"
+                    )
+                };
+                *name = Some(b.clone());
+                adopted = named;
+                &adopted
+            }
+            _ => ann,
+        };
+        let ann_simple = self.normalize_annotation(ann_to_normalize);
         // Snapshot the inferred type before the annotation bounds are added so
         // the error shows what was actually inferred, not the partially
         // modified state after a failed constrain_subtype.
@@ -576,13 +658,86 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        v.bounds
-            .borrow_mut()
-            .lower_mut()
-            .push(crate::ccl::Bound::with_subst(
-                result,
-                crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
-            ));
+        let bound = crate::ccl::Bound::with_subst(
+            result,
+            crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
+        );
+        // The dependent-apply push is emission's, so it is always the live solve.
+        crate::ccl::infer_var::observe_bound_scope(
+            v,
+            "lower",
+            &bound,
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
+        v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::Name;
+    use crate::ccl::infer::typing::Typing;
+    use crate::ccl::provenance::NodeId;
+
+    /// A variable minted inside `scoped` carries the binder in its telescope,
+    /// and one minted outside does not. This is the threading end to end
+    /// through the emission context.
+    #[test]
+    fn fresh_variables_carry_the_live_telescope() {
+        let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        let k = Name::raw("k");
+        let n = Name::raw("n");
+        let inside = ctx.scoped(&k, &Type::Hole, |c| {
+            c.scoped(&n, &Type::Hole, |c| c.fresh())
+        });
+        let outside = ctx.fresh();
+        let (Type::Infer(iv), Type::Infer(ov)) = (&inside, &outside) else {
+            panic!("fresh yields Type::Infer");
+        };
+        assert!(iv.telescope.contains(&k) && iv.telescope.contains(&n));
+        assert!(
+            !ov.telescope.contains(&k),
+            "scoped restores the telescope on exit"
+        );
+    }
+
+    /// An unnamed annotation function over a named inferred one adopts the
+    /// inferred binder, and the variables normalization mints in the
+    /// annotation's codomain carry it. Without the adoption those variables
+    /// have no telescope entry for the binder, so a dependent refinement flowing
+    /// into the codomain slot is an open bound at the moment it is recorded —
+    /// the group-by lowering's `data_fun(key_ty, Hole)` annotation over
+    /// `λ __gb_k → …` is the exercising case.
+    #[test]
+    fn an_unnamed_annotation_adopts_the_inferred_pi_binder() {
+        let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        let k = Name::raw("__gb_k");
+        let inferred = Type::pi_kinded(
+            k.clone(),
+            Type::Base(crate::ccl::BaseType::Int),
+            Type::infer(),
+            crate::ccl::FunKind::Data,
+        );
+        let ann = Type::data_fun(Type::Base(crate::ccl::BaseType::Int), Type::Hole);
+        let bound = ctx
+            .bind_annotation(&inferred, &ann)
+            .expect("the annotation relates to the inferred function");
+        let Type::Fun { name, codomain, .. } = &bound else {
+            panic!("expected a function, got {bound}");
+        };
+        assert_eq!(
+            name.as_ref(),
+            Some(&k),
+            "the annotation adopts the inferred binder"
+        );
+        let Type::Infer(cod) = &**codomain else {
+            panic!("a `Hole` codomain normalizes to a variable, got {codomain}");
+        };
+        assert!(
+            cod.telescope.contains(&k),
+            "a variable minted in the adopted function's codomain carries the binder"
+        );
     }
 }

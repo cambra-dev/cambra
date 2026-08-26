@@ -21,7 +21,9 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
+use crate::ccl::{
+    BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, Type,
+};
 
 use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
@@ -143,13 +145,64 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
+    /// Which derivation this cache serves. The representation poses two questions
+    /// and they do not have the same answer in all three
+    /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
+    derivation: Derivation,
+}
+
+/// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
+/// draws an edge, which is what those questions are answered against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Derivation {
+    /// Emission and its specialization pins — where a recorded bound becomes
+    /// solved output.
+    LiveSolve,
+    /// A pass-boundary re-derivation over a whole tree: it reconciles types two
+    /// passes spelled in different coordinates, but every binder the tree's
+    /// refinements reference is a binder the walk itself can enter.
+    PostPass,
+    /// A probe over a sub-tree cut from its context: `debug_typecheck`'s
+    /// per-operation check, its one caller. Its refinements reference binders the
+    /// absent context holds, which no walk of the sub-tree can see, so the
+    /// closure invariant is not a record-time error here. Planning's in-place
+    /// checks of a morphism it has just built do not need the excuse: a
+    /// morphism carries its own binder, so they take
+    /// [`PostPass`](Self::PostPass), which enforces.
+    SubTree,
+}
+
+impl Derivation {
+    /// Whether bounds recorded through this derivation must close against the
+    /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
+    /// Every derivation over a self-contained tree does. Only a sub-tree probe
+    /// is excused, because its absent context is what carries the binders.
+    pub(crate) fn enforces_closure(self) -> bool {
+        self != Derivation::SubTree
+    }
+
+    /// Whether a closed `Fun`/`Fun` codomain opens unconditionally rather than
+    /// only toward a side carrying inference variables. A re-derivation is
+    /// reconciling two passes' spellings of one type; the live solve is not, and
+    /// opening a ground pair at display names lets a free reference sharing a
+    /// binder's spelling capture the reopened index.
+    fn opens_unconditionally(self) -> bool {
+        self != Derivation::LiveSolve
+    }
 }
 
 impl ConstrainCache {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::for_derivation(Derivation::LiveSolve)
+    }
+
+    /// The cache for one of the re-derivations — see [`Derivation`] for what
+    /// each one changes.
+    pub fn for_derivation(derivation: Derivation) -> Self {
         Self {
             edges: HashMap::new(),
+            derivation,
         }
     }
 
@@ -514,6 +567,62 @@ fn constrain_go_impl(
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
             };
+            // Descent opens (`src/ccl/design/type-inference.md`, "Where the
+            // conversions run"): a *closed* codomain — one whose refinements
+            // reference this function's binder as indices — opens at its own
+            // binder name before the edge decomposes it, so the bounds
+            // recorded on inner variables are name-spelled against their
+            // telescopes and the correspondence above applies to them.
+            //
+            // On the live solve, opening is gated on the **opposite** side
+            // carrying inference variables: only a live side records
+            // bounds, so only there would a dangling index land. A ground
+            // closed-closed pair compares index-to-index instead — opening it
+            // at display names would let an unrelated *free* reference that
+            // happens to share the binder's spelling capture the reopened
+            // index (found by the differential oracle; with uniquified
+            // binders the collision needs the same uid, which *is* the same
+            // binder, but the ground relation must not depend on that
+            // convention). A post-pass re-derivation opens unconditionally: it
+            // reconciles types that different passes spelled in different
+            // forms (a closed function's codomain against a rebuilt,
+            // discharged one). Which derivation this is
+            // ([`Derivation`]) answers both this and the record sites'
+            // question, so the two read one field rather than two flags.
+            // The pre-scan keeps the common codomain that does not reference
+            // this function untouched — the same dependence test descent and
+            // application ask everywhere else.
+            let open = |n: &Option<Name>, c: &Type, other: &Type| -> Option<Type> {
+                // An unnamed function whose codomain references it by index has no
+                // binder to open at, so the reference reaches the codomain edge and
+                // compares against the other side's name — a mismatch reported as a
+                // type error rather than as the malformed input it is. The same
+                // tripwire guards `subst::open_codomain`, the rebuild passes' entry
+                // to this conversion. A binder dropped off a closed function arms it:
+                // `Type::without_pi_names`, or a pass rebuilding a `Fun` and filtering
+                // the name slot.
+                debug_assert!(
+                    n.is_some() || !crate::ccl::subst::references_enclosing_function(c),
+                    "an unnamed function's codomain references it: the index has no \
+                     binder to open at, so the codomain edge compares an index \
+                     against a name",
+                );
+                match n {
+                    Some(b)
+                        if crate::ccl::subst::references_enclosing_function(c)
+                            && (cache.derivation.opens_unconditionally()
+                                || crate::ccl::subst::type_contains_infer(other)) =>
+                    {
+                        Some(crate::ccl::subst::open_pi_binder(
+                            &crate::ccl::subst::Mapping::Rename(b.clone()),
+                            c,
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+            let c0_opened = open(n0, c0, c1);
+            let c1_opened = open(n1, c1, c0);
             // The domain edge. A *compute* domain is contravariant: it is a
             // parameter, nothing can enumerate it, and accepting more inputs than
             // demanded only under-promises. A **data** domain is *invariant* — it is
@@ -546,7 +655,13 @@ fn constrain_go_impl(
             } else {
                 constrain_go(d1, d0, sr, sl, cache)?;
             }
-            constrain_go(c0, c1, &cod_sl, sr, cache)
+            constrain_go(
+                c0_opened.as_ref().map_or(&**c0, |c| c),
+                c1_opened.as_ref().map_or(&**c1, |c| c),
+                &cod_sl,
+                sr,
+                cache,
+            )
         }
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
@@ -678,9 +793,10 @@ fn constrain_go_impl(
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
+                let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
+                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.derivation);
                 let mut s = lv.bounds.borrow_mut();
-                s.upper_mut()
-                    .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
+                s.upper_mut().push(bound);
                 Rc::clone(s.lower())
             };
             // A var-var edge carries the watch downward (see `link_watches`); the
@@ -712,9 +828,10 @@ fn constrain_go_impl(
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
+                let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
+                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.derivation);
                 let mut s = rv.bounds.borrow_mut();
-                s.lower_mut()
-                    .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
+                s.lower_mut().push(bound);
                 Rc::clone(s.upper())
             };
             // Deliver the contribution to any trait obligation this variable is an
@@ -1065,8 +1182,10 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 return Type::Infer(Rc::clone(existing));
             }
             // Conservative approximation: a fresh variable at the target
-            // level, linked to the original by the appropriate bound.
-            let nvs = InferVar::fresh(target_level);
+            // level, linked to the original by the appropriate bound. It
+            // proxies the original, so it inherits the original's telescope —
+            // the bounds copied below close against the same scope.
+            let nvs = InferVar::fresh_in(target_level, &tv.telescope);
             cache.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
 
@@ -1162,7 +1281,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             let nvs = cached_pos
                 .clone()
                 .or_else(|| cached_neg.clone())
-                .unwrap_or_else(|| InferVar::fresh(target_level));
+                .unwrap_or_else(|| InferVar::fresh_in(target_level, &tv.telescope));
             // Which bound links does the reused proxy already carry? A polar
             // proxy under the `true` key has the positive link (`tv <: proxy`);
             // under the `false` key, the negative link (`proxy <: tv`). A fresh
@@ -1252,6 +1371,84 @@ mod tests {
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
     };
+
+    /// `{Int | escaped}` — a refinement naming a uniquified binder that nothing in
+    /// scope binds, the shape the closure invariant rejects.
+    #[cfg(debug_assertions)]
+    fn escaped_refinement() -> Type {
+        crate::ccl::ccl_utils::refine_with_bare(
+            Type::Base(BaseType::Int),
+            &TypedExpr::var(Name::fresh("escaped")),
+        )
+    }
+
+    /// The `Fun`/`Fun` opening does not fire between two ground sides, so a free
+    /// reference sharing a binder's display spelling cannot capture the reopened
+    /// index.
+    ///
+    /// `(x: Int) ⇒ {Int | __elem == #0}` and `Int ⇒ {Int | __elem == x}` state
+    /// different refinements: one is about the function's own argument, the other about
+    /// whatever binds `x` outside the type. Opening the closed side at its
+    /// display name spells both `__elem == x` and reads them as one. Uniquified
+    /// binders make the collision need the same uid, which is the same binder,
+    /// and the ground relation must not depend on that convention.
+    #[test]
+    fn a_ground_pair_does_not_open_at_a_shared_spelling() {
+        let x = Name::raw("x");
+        let refinement = |referenced: &Name| {
+            Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(Rc::new(TypedExpr::binop(
+                    TypedExpr::var(Name::elem()),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    TypedExpr::var(referenced.clone()),
+                ))),
+            )
+        };
+        // Construction closes the reference into `#0`.
+        let closed = Type::pi(x.clone(), Type::Base(BaseType::Int), refinement(&x));
+        // The same spelling, free: no function in this type binds it.
+        let free = Type::fun(Type::Base(BaseType::Int), refinement(&x));
+        assert!(
+            crate::ccl::subst::type_free_vars(&free).contains(&x),
+            "the right side's reference must be free for this to be the capture case"
+        );
+        assert!(
+            constrain_subtype(&closed, &free, &mut ConstrainCache::new()).is_err(),
+            "a closed refinement about the function's own binder does not satisfy one \
+             about a free name that shares its spelling"
+        );
+    }
+
+    /// A whole-tree re-derivation enforces the closure invariant, exactly as the
+    /// live solve does: the tree it walks holds every binder its refinements name, so
+    /// a reference to one it does not is the escape the invariant catches.
+    ///
+    /// This is what a `Derivation::SubTree` cache is excused from. The two
+    /// tests together are why that excuse is narrow: a probe over a sub-tree
+    /// has no context to hold the binder, and a walk over the whole tree does.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "open bound recorded")]
+    fn a_whole_tree_re_derivation_enforces_the_closure_invariant() {
+        let escaped = escaped_refinement();
+        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+        let v = fresh_var(0);
+        let _ = constrain_subtype(&escaped, &v, &mut cache);
+    }
+
+    /// A sub-tree probe records the same bound without complaint: its refinements
+    /// reference binders the context it was cut from holds, and no walk of the
+    /// sub-tree can enter them.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_sub_tree_probe_admits_a_reference_its_context_binds() {
+        let escaped = escaped_refinement();
+        let mut cache = ConstrainCache::for_derivation(Derivation::SubTree);
+        let v = fresh_var(0);
+        constrain_subtype(&escaped, &v, &mut cache)
+            .expect("a sub-tree's free reference is admitted");
+    }
 
     /// The tripwire is armed for the one place the record/variant arms and the
     /// trivial-equality short-circuit can disagree.

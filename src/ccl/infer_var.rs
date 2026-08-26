@@ -288,6 +288,202 @@ impl InferBounds {
     }
 }
 
+/// The binders in lexical scope at an inference variable's creation,
+/// innermost first — the context a bound recorded on the variable must close
+/// against. See `src/ccl/design/type-inference.md`, "Scoped inference
+/// variables: a stored bound closes against a telescope".
+///
+/// A persistent cons list: extending shares the tail, so every variable
+/// minted under one scope holds the same nodes and entering a binder costs
+/// one allocation, not a copy per variable. Entries are binder
+/// [`Name`](crate::ccl::Name)s — uniquified, so membership is a name lookup;
+/// a shadowing binder is a separate entry with a distinct uid and shadows
+/// nothing here.
+#[derive(Clone, Default)]
+pub struct Telescope(Option<Rc<TelescopeNode>>);
+
+struct TelescopeNode {
+    binder: crate::ccl::Name,
+    parent: Telescope,
+}
+
+impl Telescope {
+    /// The empty scope — no binders. What test-minted and solver-internal
+    /// placeholder variables carry.
+    pub fn empty() -> Self {
+        Telescope(None)
+    }
+
+    /// This scope with `binder` entered — the innermost entry of the result.
+    pub fn extended(&self, binder: crate::ccl::Name) -> Self {
+        Telescope(Some(Rc::new(TelescopeNode {
+            binder,
+            parent: self.clone(),
+        })))
+    }
+
+    /// Whether `name` is a binder in this scope.
+    pub fn contains(&self, name: &crate::ccl::Name) -> bool {
+        let mut cur = &self.0;
+        while let Some(node) = cur {
+            if node.binder == *name {
+                return true;
+            }
+            cur = &node.parent.0;
+        }
+        false
+    }
+
+    /// The binders, innermost first.
+    pub fn iter(&self) -> impl Iterator<Item = &crate::ccl::Name> {
+        let mut cur = &self.0;
+        std::iter::from_fn(move || {
+            let node = cur.as_ref()?;
+            cur = &node.parent.0;
+            Some(&node.binder)
+        })
+    }
+}
+
+impl fmt::Debug for Telescope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// A walk carrying a [`Telescope`] as it descends: the emission and check walks,
+/// whose `scoped` / `scoped_let` enter a binder around a sub-walk.
+///
+/// Entering owns the restore. A site that extends the scope and returns without
+/// restoring it leaves every later variable recording a scope it does not sit in,
+/// and the closure check then admits a bound that references a binder out of scope.
+/// One implementation of the save/restore is one place that can get it wrong.
+pub(crate) trait TelescopeWalk {
+    /// The walk's live scope.
+    fn telescope_mut(&mut self) -> &mut Telescope;
+
+    /// Run `f` with `binder` entered, restoring the scope on the way out.
+    fn under_binder<R>(&mut self, binder: &crate::ccl::Name, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        let extended = self.telescope_mut().extended(binder.clone());
+        let saved = std::mem::replace(self.telescope_mut(), extended);
+        let r = f(self);
+        *self.telescope_mut() = saved;
+        r
+    }
+}
+
+/// The free term variables of a bound's type not accounted for where the
+/// bound is being recorded: not in the holder's telescope, and not in either
+/// edge substitution's domain (a discharge's binders are bound by the edge —
+/// the suspension is the application that closes them).
+///
+/// The gap set of the record-time closure check
+/// (`src/ccl/design/type-inference.md`, "The invariant"), and every member is
+/// an error. A program source is never one: a source reference is a
+/// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
+/// [`subst::type_free_vars`] does not report it.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn bound_scope_gaps(
+    telescope: &Telescope,
+    bound: &Bound,
+) -> std::collections::BTreeSet<crate::ccl::Name> {
+    subst::scope_gaps(&bound.ty, |n| {
+        telescope.contains(n)
+            || bound.ty_subst.binders().any(|b| b == n)
+            || bound.self_subst.binders().any(|b| b == n)
+    })
+}
+
+/// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`
+/// names. Debug builds only, and inert unless the variable is set; one line
+/// per open name, so the file enumerates every open bound the run stored.
+///
+/// A line the enforcement excused reads `OPEN(sub-tree)`: the derivation was a
+/// probe over a sub-tree, whose free references its absent context binds. The
+/// tag is what keeps the log a measurement of escapes rather than a count of
+/// sub-tree checks.
+///
+/// Takes the [`Derivation`] rather than a decision about it: which derivations
+/// enforce is one question with one answer
+/// ([`Derivation::enforces_closure`]), and a caller passing a bool would be the
+/// second place it is answered.
+///
+/// Runs at every recorded bound rather than once per pass, so the blame is a
+/// variable and a name rather than a tree walked after the fact. The cost
+/// is one [`subst::type_free_vars`] walk per edge, measured at ~4% of debug-build
+/// inference time; it allocates only for a bound whose type carries a refinement,
+/// since an empty `BTreeSet` does not allocate. Narrowing it to a pass boundary is
+/// what `check_scope_valid` already does, and what this check exists to precede.
+///
+/// [`Derivation::enforces_closure`]: crate::ccl::infer::solver::Derivation
+pub(crate) fn observe_bound_scope(
+    holder: &InferVar,
+    side: &'static str,
+    bound: &Bound,
+    derivation: crate::ccl::infer::solver::Derivation,
+) {
+    let enforce = derivation.enforces_closure();
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::OnceLock;
+        static LOG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        let log_path = LOG.get_or_init(|| std::env::var_os("CAMBRA_TELESCOPE_LOG").map(Into::into));
+        if log_path.is_none() && !enforce {
+            return;
+        }
+        let gaps = bound_scope_gaps(&holder.telescope, bound);
+        if gaps.is_empty() {
+            return;
+        }
+        // The record-time closure invariant, as an internal error on the live
+        // solve (see `src/ccl/design/type-inference.md`, "The invariant"). Every
+        // gap is an error: a bound's free term variables are the telescope's
+        // entries and the edge substitutions' domains, and a program source is
+        // not among them because a source reference is a
+        // [`crate::ccl::TypedExprNode::Source`] node rather than a variable.
+        if enforce && let Some(open) = gaps.iter().next() {
+            panic!(
+                "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
+                 `{}` but is neither in the holder's telescope {:?} nor discharged by \
+                 the edge's substitutions — the bound left its binder's scope \
+                 without a mediating discharge (see type-inference.md, \"The invariant\")",
+                holder.uid, bound.ty, holder.telescope,
+            );
+        }
+        let Some(path) = log_path else {
+            return;
+        };
+        use std::io::Write;
+        let mut out = String::new();
+        for n in &gaps {
+            out.push_str(&format!(
+                "OPEN{} ?{} {side} free={n} telescope={:?} ty={}\n",
+                if enforce { "" } else { "(sub-tree)" },
+                holder.uid,
+                holder.telescope,
+                bound.ty
+            ));
+        }
+        if std::env::var_os("CAMBRA_TELESCOPE_BT").is_some() {
+            out.push_str(&format!("{}\n", std::backtrace::Backtrace::force_capture()));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(out.as_bytes());
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (holder, side, bound, enforce);
+    }
+}
+
 /// A type inference variable: an unknown type the solver pins down by
 /// accumulating subtyping bounds.
 ///
@@ -302,6 +498,9 @@ pub struct InferVar {
     pub uid: InferVarId,
     /// Scope level at which the variable was minted.
     pub level: Level,
+    /// The binders in lexical scope at creation — immutable like `uid` and
+    /// `level`, and what a recorded bound must close against.
+    pub telescope: Telescope,
     /// Mutable lower/upper bound lists.
     pub bounds: RefCell<InferBounds>,
     /// Trait obligations this variable is an operand of, with the position it
@@ -377,10 +576,21 @@ impl InferVar {
     /// handle and can clear its bounds at teardown, breaking the `Rc` cycles
     /// that mutual subtyping constraints create. With no active arena (e.g.
     /// direct use in unit tests) registration is a no-op.
+    /// Scope-free: the telescope is empty. For test minting and
+    /// solver-internal placeholders with no lexical position; a variable
+    /// proxying or freshening an existing one inherits that one's telescope
+    /// via [`fresh_in`](Self::fresh_in), and emission mints through
+    /// `InferCtx::fresh`, which passes the live scope.
     pub fn fresh(level: Level) -> Rc<InferVar> {
+        Self::fresh_in(level, &Telescope::empty())
+    }
+
+    /// Mint a fresh variable carrying `telescope` as its scope.
+    pub fn fresh_in(level: Level, telescope: &Telescope) -> Rc<InferVar> {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             level,
+            telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),
             watches: RefCell::new(Vec::new()),
         });
@@ -455,6 +665,109 @@ mod tests {
             Rc::strong_count(&reader),
             1,
             "the holder no longer references the bounds it dropped"
+        );
+    }
+
+    /// A telescope is a scope path: membership sees every enclosing entry, a
+    /// shadowing binder is a separate entry, and extension shares the tail
+    /// rather than copying it.
+    #[test]
+    fn telescope_membership_and_sharing() {
+        use crate::ccl::Name;
+        let outer = Telescope::empty().extended(Name::raw("k"));
+        let inner = outer.extended(Name::raw("n"));
+        assert!(inner.contains(&Name::raw("k")));
+        assert!(inner.contains(&Name::raw("n")));
+        assert!(!outer.contains(&Name::raw("n")));
+        assert!(!inner.contains(&Name::raw("m")));
+        assert_eq!(
+            inner.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["n", "k"],
+            "innermost first"
+        );
+    }
+
+    /// The record-time closure check: a bound's free reference is covered by
+    /// the holder's telescope or by an edge substitution's domain, and
+    /// anything else is a gap. [`observe_bound_scope`] logs the gap set and,
+    /// on a derivation that enforces, rejects it.
+    #[test]
+    fn bound_scope_gaps_sees_telescope_and_edge_domains() {
+        use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
+        use std::rc::Rc as StdRc;
+        let dep = |referenced: &str| {
+            Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(StdRc::new(TypedExpr::binop(
+                    TypedExpr::var(Name::elem()),
+                    crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+                    TypedExpr::var(Name::raw(referenced)),
+                ))),
+            )
+        };
+        let scope = Telescope::empty().extended(Name::raw("k"));
+
+        // Covered by the telescope.
+        assert!(bound_scope_gaps(&scope, &Bound::conc(dep("k"))).is_empty());
+        // Covered by the edge substitution's domain: the discharge binds it.
+        let discharged = Bound::with_subst(
+            dep("x"),
+            Subst::discharge(Name::raw("x"), TypedExpr::lit(Lit::Int(7))),
+        );
+        assert!(bound_scope_gaps(&scope, &discharged).is_empty());
+        // Covered by neither: the open bound the design retires.
+        let gaps = bound_scope_gaps(&scope, &Bound::conc(dep("y")));
+        assert_eq!(
+            gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["y"]
+        );
+    }
+
+    /// The record-time closure invariant is an internal error on the live
+    /// solve: recording a bound whose free reference is a *uniquified* name
+    /// covered by neither the holder's telescope nor the edge's substitutions
+    /// panics. Debug builds only — the check rides `debug_assertions`, like
+    /// `check_scope_valid`.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "open bound recorded")]
+    fn recording_an_open_bound_is_an_internal_error() {
+        use crate::ccl::{Name, Refinement, TypedExpr};
+        use std::rc::Rc as StdRc;
+        let dep = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(StdRc::new(TypedExpr::var(Name::fresh("escaped")))),
+        );
+        let holder = InferVar::fresh(0);
+        observe_bound_scope(
+            &holder,
+            "lower",
+            &Bound::conc(dep),
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
+    }
+
+    /// A [`Name::Raw`] gap is an internal error like any other. The form does
+    /// not excuse it: a source reference is a
+    /// [`crate::ccl::TypedExprNode::Source`] node rather than a variable, so a
+    /// raw gap is a reference some pass failed to rewrite — the dangling refinement
+    /// this check exists to catch.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "open bound recorded")]
+    fn a_raw_gap_is_an_internal_error() {
+        use crate::ccl::{Name, Refinement, TypedExpr};
+        use std::rc::Rc as StdRc;
+        let dep = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(StdRc::new(TypedExpr::var(Name::raw("a")))),
+        );
+        let holder = InferVar::fresh(0);
+        observe_bound_scope(
+            &holder,
+            "lower",
+            &Bound::conc(dep),
+            crate::ccl::infer::solver::Derivation::LiveSolve,
         );
     }
 

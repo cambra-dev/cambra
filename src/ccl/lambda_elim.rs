@@ -778,15 +778,25 @@ fn elim_lambda_impl(
     let body_ty = body.ty.clone();
     let result_ty = match fun_ty_or_hole(param_ty, &body_ty) {
         // `fun_ty_or_hole` builds a bare combinator type, so both the Pi binder
-        // and the kind are re-attached here: the binder when `param` survives in
-        // the codomain's refinement, the kind always, since the caller is the one
-        // that knows whether this morphism denotes a collection.
+        // and the kind are re-attached here: the binder when the codomain
+        // depends on `param`, the kind always, since the caller is the one that
+        // knows whether this morphism denotes a collection. Attaching the
+        // binder closes the codomain (`Type::pi_kinded`), which is what keeps this
+        // function in the same form as the recorded type it replaces.
+        //
+        // The dependence test admits closed or name-spelled
+        // (`subst::codomain_depends_on`), like coalesce's: a `body_ty` whose
+        // refinement landed closed references `param` as an index, and a name-only
+        // test would drop the binder and strand it.
+        Type::Fun {
+            domain, codomain, ..
+        } if crate::ccl::subst::codomain_depends_on(param, &body_ty) => {
+            Type::pi_kinded(param, *domain, *codomain, fun_kind.clone())
+        }
         Type::Fun {
             domain, codomain, ..
         } => Type::Fun {
-            name: crate::ccl::subst::type_free_vars(&body_ty)
-                .contains(param)
-                .then(|| param.clone()),
+            name: None,
             kind: fun_kind.clone(),
             domain,
             codomain,
@@ -911,14 +921,9 @@ fn elim_lambda_impl(
             })
             .with_ty(body_ty.clone());
             // The Pi keeps the eliminated lambda's own kind: a group-by partition
-            // function denotes a collection, and `Type::pi` mints the capability
-            // kind, which would flatten it.
-            let result_pi = Type::Fun {
-                name: Some(param.clone()),
-                kind: fun_kind,
-                domain: Box::new(param_ty.clone()),
-                codomain: Box::new(body_ty.clone()),
-            };
+            // function denotes a collection, so the arrow stays `⤇` rather than
+            // flattening to the capability arrow.
+            let result_pi = Type::pi_kinded(param, param_ty.clone(), body_ty.clone(), fun_kind);
             let const_fn = Expr::builtin(Builtin::Const)
                 .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
             return Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi));
@@ -929,13 +934,13 @@ fn elim_lambda_impl(
             let elim_arg = elim_lambda_kinded(ctx, param, param_ty, *argument, fun_kind.clone())?;
             let elim_fn = elim_lambda_kinded(ctx, param, param_ty, *function, fun_kind.clone())?;
             let pair = zip_pair(elim_arg, elim_fn);
-            // apply: Tuple([B, B→C]) → C; its domain is the codomain of pair
+            // apply: Tuple([B, B→C]) → C; its domain is the codomain of pair.
+            // The transformer sits under the pair's binder, so its domain speaks
+            // the opened form `body_ty` is already in.
             let apply_ty = match &pair.ty {
-                Type::Fun {
-                    domain: _,
-                    codomain: cod,
-                    ..
-                } => fun_ty_or_hole(cod, &body_ty),
+                Type::Fun { codomain: cod, .. } => {
+                    fun_ty_or_hole(&crate::ccl::subst::open_codomain(&pair.ty, cod), &body_ty)
+                }
                 _ => Type::Hole,
             };
             let apply_var = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
