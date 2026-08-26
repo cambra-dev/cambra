@@ -933,6 +933,20 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
         if let TypedExprNode::Cast { target, .. } = &e.node {
             from_ty(target, acc);
         }
+        // A binder's declared type and its annotation are type slots too. This
+        // walk and `TypedExpr::walk_type_slots` enumerate the same domain, and
+        // must: the rewriting passes reach predicates through `walk_type_slots`,
+        // so anything it covers and this does not is a predicate a pass may
+        // rebuild while the fold has never enumerated the original — which reads
+        // as `DanglingParent` against an id the input pane demonstrably holds.
+        // `f: (Int => {Int where _ == 9}) = …` is the shape: the predicate rides
+        // the `let` binder's annotation and nothing else.
+        e.walk_binders(|b| {
+            from_ty(&b.ty, acc);
+            if let Some(ann) = &b.user_annotation {
+                from_ty(ann, acc);
+            }
+        });
         e.walk_children(|c| from_expr(c, acc));
     }
 
