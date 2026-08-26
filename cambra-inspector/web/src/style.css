@@ -85,6 +85,63 @@ body {
   flex: 1 1 auto;
 }
 
+/* The pane filter: a button in the header, its checkbox list absolutely
+   positioned beneath. z-index clears CodeMirror's own tooltip layer (500) and
+   the tree's resolved-type tooltip (10). */
+.pane-menu {
+  position: relative;
+}
+.pane-menu-button {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.pane-menu-button:hover {
+  background: rgba(127, 127, 127, 0.12);
+  color: var(--fg);
+}
+.pane-menu-panel {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 1000;
+  min-width: 13rem;
+  display: flex;
+  flex-direction: column;
+  padding: 0.3rem;
+  background: var(--bg-header);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+/* `display: flex` above outranks the UA sheet's [hidden] rule, so the closed
+   state needs saying explicitly. */
+.pane-menu-panel[hidden] {
+  display: none;
+}
+.pane-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.35rem;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.pane-menu-item:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+/* The last visible pane: its box is disabled, since the layout is never empty. */
+.pane-menu-item:has(input:disabled) {
+  color: var(--fg-muted);
+  cursor: default;
+}
+
 /* N-pane layout: each pane gets an equal share (flex: 1 1 0). */
 .panels {
   display: flex;
@@ -99,7 +156,13 @@ body {
   min-height: 0;
   border-right: 1px solid var(--border);
 }
-.panel:last-child {
+.panel.hidden {
+  display: none;
+}
+/* Not `:last-child` — that is DOM order, so hiding the rightmost pane would
+   leave a border against the window edge. renderApp marks the last *visible*
+   panel instead. */
+.panel.last-visible {
   border-right: none;
 }
 .panel.tree {

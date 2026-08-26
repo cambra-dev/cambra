@@ -7,10 +7,12 @@
 
 // @vitest-environment jsdom
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { EditorView } from "@codemirror/view";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   byteLineStarts,
+  describePanes,
   diagnosticLines,
   formatSpan,
   lineCol,
@@ -21,6 +23,7 @@ import { Store } from "./store";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
+import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
 describe("byteLineStarts / lineCol (byte offsets)", () => {
   it("records the byte offset of each line start (ASCII)", () => {
@@ -130,5 +133,142 @@ describe("renderApp: degraded snapshot (failed compile)", () => {
     // an IR tree.
     expect(root.querySelectorAll(".pane-copy").length).toBe(2);
     expect(root.querySelector(".pane-copy")?.textContent).toBe("Copy");
+  });
+});
+
+describe("describePanes", () => {
+  const listMin = fixture(listMinJson);
+  const failed = fixture(failedJson);
+
+  it("names the source pane first, then one pane per pipeline pane in order", () => {
+    // Source-first is not cosmetic: it is mounted first, so the CodeMirror
+    // editor lays out against a panel that is briefly the whole row.
+    const store = new Store(listMin);
+    expect(describePanes(store).map((p) => p.id)).toEqual([
+      "source",
+      ...store.panes.map((s) => s.id),
+    ]);
+  });
+
+  it("badges the holes pane and nothing else", () => {
+    const panes = describePanes(new Store(listMin));
+    const badged = panes.filter((p) => p.badge !== undefined);
+    expect(badged.map((p) => p.id)).toEqual(["pre-inference"]);
+    expect(badged[0].badge).toBe("pre-inference (holes)");
+  });
+
+  it("replaces the IR panes with a diagnostics pane on a degraded snapshot", () => {
+    expect(describePanes(new Store(failed)).map((p) => p.id)).toEqual(["source", "diagnostics"]);
+  });
+});
+
+describe("renderApp: pane visibility", () => {
+  const listMin = fixture(listMinJson);
+
+  let root: HTMLElement;
+
+  const panelFor = (id: string): HTMLElement =>
+    root.querySelector(`.panel[data-pane-id="${id}"]`)!;
+  const boxFor = (id: string): HTMLInputElement =>
+    root.querySelector(`.pane-menu-panel input[value="${id}"]`)!;
+  const toggle = (id: string, checked: boolean): void => {
+    const box = boxFor(id);
+    box.checked = checked;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  beforeAll(stubLayout);
+
+  beforeEach(() => {
+    // This environment's `window.localStorage` is a stub with no methods, so
+    // install a working one: renderApp persists the hidden set through it, and
+    // each test starts from an empty store.
+    const entries = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      value: {
+        getItem: (key: string) => entries.get(key) ?? null,
+        setItem: (key: string, value: string) => void entries.set(key, value),
+      },
+      configurable: true,
+    });
+
+    document.body.replaceChildren();
+    root = document.createElement("div");
+    document.body.appendChild(root);
+    renderApp(root, new Store(listMin));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    Reflect.deleteProperty(window, "localStorage");
+  });
+
+  it("tags one panel per descriptor with its pane id", () => {
+    const ids = [...root.querySelectorAll<HTMLElement>(".panel")].map((p) => p.dataset.paneId);
+    expect(ids).toEqual(describePanes(new Store(listMin)).map((p) => p.id));
+  });
+
+  it("hides a pane without unmounting its view", () => {
+    const panel = panelFor("post-inference");
+    expect(panel.querySelector(".tree-root")).not.toBeNull();
+
+    toggle("post-inference", false);
+
+    expect(panel.classList.contains("hidden")).toBe(true);
+    // The view stays: rebuilding it would leak its store subscription and lose
+    // every expand/collapse the user set.
+    expect(panel.querySelector(".tree-root")).not.toBeNull();
+  });
+
+  it("keeps a hidden pane tracking the selection, so revealing it is instant", () => {
+    const panel = panelFor("post-inference");
+    toggle("post-inference", false);
+
+    // Select through a visible pane; the hidden one must follow.
+    root.querySelector<HTMLElement>('.panel[data-pane-id="pre-inference"] .tree-row')!.click();
+
+    expect(panel.querySelectorAll(".tree-row.selected, .tree-row.linked").length).toBeGreaterThan(0);
+  });
+
+  it("shows a hidden pane again", () => {
+    toggle("post-inference", false);
+    toggle("post-inference", true);
+    expect(panelFor("post-inference").classList.contains("hidden")).toBe(false);
+  });
+
+  it("re-measures the CodeMirror editor when the source pane is revealed", () => {
+    // A hidden editor never measured against a real box, and does not reliably
+    // measure itself on reveal.
+    const measure = vi.spyOn(EditorView.prototype, "requestMeasure");
+    toggle("source", false);
+    measure.mockClear();
+
+    toggle("source", true);
+    expect(measure).toHaveBeenCalled();
+  });
+
+  it("moves the last-visible marker off a hidden rightmost pane", () => {
+    const panels = [...root.querySelectorAll<HTMLElement>(".panel")];
+    const last = panels[panels.length - 1];
+    expect(last.classList.contains("last-visible")).toBe(true);
+
+    toggle(last.dataset.paneId!, false);
+
+    expect(last.classList.contains("last-visible")).toBe(false);
+    expect(panels[panels.length - 2].classList.contains("last-visible")).toBe(true);
+  });
+
+  it("persists the hidden set across a re-render", () => {
+    toggle("post-inference", false);
+
+    const next = document.createElement("div");
+    document.body.appendChild(next);
+    renderApp(next, new Store(listMin));
+
+    expect(
+      next.querySelector<HTMLElement>('.panel[data-pane-id="post-inference"]')!.classList.contains(
+        "hidden",
+      ),
+    ).toBe(true);
   });
 });

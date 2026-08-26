@@ -7,10 +7,12 @@
 //     Ctrl/Cmd-click goto-def, diagnostic squiggles, and the resolved selection
 //     highlight (see sourceView.ts);
 //   - one collapsible, cross-linked IR tree per pipeline pane (treeView.ts),
-//     ordered upstream -> downstream (pre-inference, post-inference,
-//     post-channelize);
+//     ordered upstream -> downstream;
 //   - or — on a degraded/failed snapshot — a diagnostics list in place of the
 //     trees. Squiggles still render in the editor in the degraded case.
+//
+// `describePanes` names that set once, and both the layout and the header's
+// filter menu (paneMenu.ts) iterate it. A hidden pane keeps its view.
 //
 // Every interaction is a pure client-side lookup over the snapshot the client
 // already loaded: zero round-trips, offline-capable. The shared selection in
@@ -19,6 +21,13 @@
 
 import "./style.css";
 import { copyToClipboard } from "./clipboard";
+import { renderPaneMenu } from "./paneMenu";
+import {
+  PaneVisibility,
+  browserStorage,
+  loadHiddenPanes,
+  saveHiddenPanes,
+} from "./paneVisibility";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { TreeView, serializeTree } from "./treeView";
@@ -99,7 +108,12 @@ export function renderDiagnostics(
   parent.appendChild(box);
 }
 
-function renderHeader(parent: HTMLElement, snap: Snapshot): void {
+function renderHeader(
+  parent: HTMLElement,
+  snap: Snapshot,
+  panes: readonly PaneDescriptor[],
+  visibility: PaneVisibility,
+): void {
   const header = el("div", "header");
   header.appendChild(el("span", "title", "Cambra Inspector"));
   header.appendChild(el("span", "name", snap.source.name));
@@ -109,18 +123,95 @@ function renderHeader(parent: HTMLElement, snap: Snapshot): void {
 
   // The payload describes the program, with no execution and no values.
   header.appendChild(el("span", "badge", "static (no values)"));
+
+  header.appendChild(el("span", "spacer"));
+  renderPaneMenu(header, panes, visibility);
   parent.appendChild(header);
 }
 
-export interface PaneSpec {
+export interface PaneDescriptor {
+  // Stable identity: "source", "diagnostics", or a stage id. Keys visibility
+  // and its persisted set.
+  id: string;
+  // The pane's one name — its title bar and its row in the filter menu.
+  label: string;
+  badge?: string;
   // The `.panel` modifier class: "source" or "tree".
   paneClass: string;
-  title: string;
-  badge?: string;
   // The pane's plain-text rendering, produced on click rather than at render
   // time — serializing every tree on load would cost the whole IR for a button
   // most sessions never press.
   copyText: () => string;
+  // Build the pane's view into its body, once. A view that cannot lay itself
+  // out while its panel is `display: none` returns a callback to run whenever
+  // the pane is revealed.
+  mount: (body: HTMLElement) => (() => void) | void;
+}
+
+/**
+ * Every pane the layout renders, in order: the source pane, then one per
+ * pipeline stage — or, on a degraded snapshot, a single diagnostics pane.
+ *
+ * Source is first and mounted first, and that ordering is load-bearing:
+ * CodeMirror lays out against its panel's size, so the editor is built while
+ * its panel is the only one in the row.
+ */
+export function describePanes(store: Store): PaneDescriptor[] {
+  const snap = store.snapshot;
+  const panes: PaneDescriptor[] = [
+    {
+      id: "source",
+      label: "Source",
+      paneClass: "source",
+      // The editor's document is built from this same string, but read it from
+      // the snapshot: `Text` normalizes line breaks on construction, so a CRLF
+      // source would come back from CodeMirror with the CRs stripped.
+      copyText: () => snap.source.text,
+      mount: (body) => {
+        const view = new SourceView(body, store);
+        // A revealed editor has never measured against a real box, and it does
+        // not reliably measure itself: CodeMirror's ResizeObserver path drops a
+        // resize within 75ms of a docView update, and a selection made while
+        // hidden leaves a scrollTarget that defeats its hidden-editor bailout.
+        return () => view.view.requestMeasure();
+      },
+    },
+  ];
+
+  // A degraded snapshot (failed compile) ships no panes: diagnostics take the
+  // place of the IR panes. Squiggles still render in the editor.
+  if (snap.meta.payloadKind === "failed" || store.panes.length === 0) {
+    const lineStarts = byteLineStarts(snap.source.text);
+    panes.push({
+      id: "diagnostics",
+      label: "Diagnostics",
+      paneClass: "tree",
+      copyText: () => serializeDiagnostics(snap.diagnostics, lineStarts),
+      mount: (body) => renderDiagnostics(body, snap.diagnostics, lineStarts),
+    });
+    return panes;
+  }
+
+  for (const pane of store.panes) {
+    // Holes-kind panes (still hole-typed, pre-inference) carry a badge
+    // mirroring the static-no-values one.
+    const holes = pane.kind === "holes";
+    const nodesOf = () => (pane.nodes.length > 0 ? store.indicesFor(pane.id)?.nodeById : undefined);
+    panes.push({
+      id: pane.id,
+      label: pane.label,
+      badge: holes ? "pre-inference (holes)" : undefined,
+      paneClass: "tree",
+      copyText: () => {
+        const nodes = nodesOf();
+        return nodes ? serializeTree(pane.root, nodes) : "";
+      },
+      mount: (body) => {
+        if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.root);
+      },
+    });
+  }
+  return panes;
 }
 
 // How long the copy button holds its post-click state before reverting.
@@ -156,73 +247,78 @@ function renderCopyButton(copyText: () => string): HTMLButtonElement {
   return button;
 }
 
-// One pane (header title + optional badge + copy button + scrollable body).
-// Returns the body element so the caller can mount a SourceView / TreeView.
-function renderPane(panels: HTMLElement, spec: PaneSpec): HTMLElement {
-  const panel = el("div", `panel ${spec.paneClass}`);
+interface MountedPane {
+  panel: HTMLElement;
+  reveal: (() => void) | void;
+}
+
+// One pane: title + optional badge + copy button + scrollable body, with its
+// view mounted into that body.
+function renderPane(panels: HTMLElement, pane: PaneDescriptor): MountedPane {
+  const panel = el("div", `panel ${pane.paneClass}`);
+  // The pane's identity in the DOM, so the menu and the tests never re-derive
+  // it from a class name.
+  panel.dataset.paneId = pane.id;
+
   const head = el("div", "panel-title");
-  head.appendChild(el("span", "panel-title-text", spec.title));
-  if (spec.badge) head.appendChild(el("span", "pane-badge", spec.badge));
-  head.appendChild(renderCopyButton(spec.copyText));
+  head.appendChild(el("span", "panel-title-text", pane.label));
+  if (pane.badge) head.appendChild(el("span", "pane-badge", pane.badge));
+  head.appendChild(renderCopyButton(pane.copyText));
   panel.appendChild(head);
+
   const body = el("div", "panel-body");
   panel.appendChild(body);
   panels.appendChild(panel);
-  return body;
+
+  return { panel, reveal: pane.mount(body) };
 }
 
 export function renderApp(root: HTMLElement, store: Store): void {
-  const snap = store.snapshot;
+  const panes = describePanes(store);
+
+  // A storage that throws on access degrades the filter to one session.
+  const storage = browserStorage();
+  const visibility = new PaneVisibility(
+    panes.map((pane) => pane.id),
+    storage ? loadHiddenPanes(storage) : [],
+  );
+
   root.replaceChildren();
-  renderHeader(root, snap);
+  renderHeader(root, store.snapshot, panes, visibility);
 
   const panels = el("div", "panels");
   root.appendChild(panels);
 
-  // The editor's document is built from this same string, but read it from the
-  // snapshot rather than from CodeMirror: `Text` normalizes line breaks on
-  // construction, so a CRLF source would come back with the CRs stripped.
-  const sourceBody = renderPane(panels, {
-    paneClass: "source",
-    title: "Source",
-    copyText: () => snap.source.text,
-  });
+  // Mounted in order, each panel appended before the next is built — the source
+  // editor measures itself against a panel that is briefly the whole row.
+  const mounted = panes.map((pane) => renderPane(panels, pane));
 
-  // A degraded snapshot (failed compile) ships no panes: show diagnostics in
-  // place of the IR panes. Squiggles still render in the editor below.
-  const failed = snap.meta.payloadKind === "failed" || store.panes.length === 0;
-
-  // Source first (the editor lays out against its panel's final size). The
-  // source view wires hover/goto-def/squiggles/selection over the store; the
-  // squiggle path works even when there are no panes (degraded snapshot).
-  new SourceView(sourceBody, store);
-
-  if (failed) {
-    const diagBody = renderPane(panels, {
-      paneClass: "tree",
-      title: "Diagnostics",
-      copyText: () => serializeDiagnostics(snap.diagnostics, byteLineStarts(snap.source.text)),
+  // Hidden panes keep their views. Tearing one down would leak its store
+  // subscription (neither view keeps the unsubscribe handle), lose every
+  // expand/collapse in a tree, and come back blank — the views react to
+  // selection *changes*, and `setSelection` early-returns on an equal one.
+  const applyVisibility = (): void => {
+    const lastVisible = panes.reduce(
+      (last, pane, i) => (visibility.isVisible(pane.id) ? i : last),
+      -1,
+    );
+    mounted.forEach(({ panel, reveal }, i) => {
+      const visible = visibility.isVisible(panes[i].id);
+      const wasHidden = panel.classList.contains("hidden");
+      panel.classList.toggle("hidden", !visible);
+      // `.panel.last-visible` drops the divider on the rightmost pane. It
+      // cannot be `:last-child`: that is DOM order, so hiding the rightmost
+      // pane would leave a border against the window edge.
+      panel.classList.toggle("last-visible", i === lastVisible);
+      if (visible && wasHidden) reveal?.();
     });
-    renderDiagnostics(diagBody, snap.diagnostics, byteLineStarts(snap.source.text));
-    return;
-  }
+  };
 
-  // One tree pane per pane entry, ordered upstream -> downstream. Holes-kind
-  // panes (still hole-typed, pre-inference) carry a badge mirroring the
-  // static-no-values one.
-  for (const pane of store.panes) {
-    const holes = pane.kind === "holes";
-    const body = renderPane(panels, {
-      paneClass: "tree",
-      title: pane.label,
-      badge: holes ? "pre-inference (holes)" : undefined,
-      copyText: () => {
-        const nodes = store.indicesFor(pane.id)?.nodeById;
-        return nodes && pane.nodes.length > 0 ? serializeTree(pane.root, nodes) : "";
-      },
-    });
-    if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.root);
+  visibility.subscribe(applyVisibility);
+  if (storage) {
+    visibility.subscribe(() => saveHiddenPanes(storage, visibility.hiddenIds()));
   }
+  applyVisibility();
 }
 
 async function main(): Promise<void> {
