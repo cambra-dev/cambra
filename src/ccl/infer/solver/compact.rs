@@ -296,7 +296,18 @@ pub struct CompactType {
     /// exactly like `rec`: more refinements ⇒ subtype (`{T | p, q} <: {T | p}`), so
     /// at positive polarity the sets are *intersected* and at negative
     /// *unioned* (see [`CompactType::merge`]).
-    pub refinements: RefinementSet,
+    ///
+    /// `None` and `Some(empty)` are **distinct**, the same distinction
+    /// [`rec`](Self::rec) draws and for the same reason. `None` is "no refinement
+    /// contribution here" and is the merge identity: a hole imposes nothing, and
+    /// a bare variable's content is its identity alone
+    /// ([`CompactType::from_var`]). `Some(empty)` is a *value* that guarantees
+    /// nothing, which is absorbing under the positive intersect — `Int` joined
+    /// with `{Int | p}` really is `Int`. Collapsing the two makes a bare
+    /// variable erase the refinements a sibling bound established, so every
+    /// value-shaped contribution is built from [`CompactType::value`] and only
+    /// the two non-values keep the `None`.
+    pub refinements: Option<RefinementSet>,
     /// History-handle `(value, domain, kind)`, if a [`Type::History`]
     /// contributed here — a mutable variable (`kind: Overwrite`) or a feed channel
     /// (`kind: Feed`).
@@ -356,8 +367,30 @@ impl CompactVariant {
 }
 
 impl CompactType {
+    /// No contribution at all — ⊤. Every slot is the merge identity, including
+    /// the refinement slot, so merging this into a position leaves it unchanged. The
+    /// two callers are a `Hole` and a dropped spurious-cycle bound; a value with
+    /// no refinements is [`Self::value`], not this.
     fn empty() -> Self {
         Self::default()
+    }
+
+    /// A contribution that **is** a value, as opposed to the two that are not: a
+    /// hole (⊤, no information) and a bare variable ([`Self::from_var`], whose
+    /// content is its identity alone). Both of those keep
+    /// [`refinements`](Self::refinements) at `None`, the merge identity, which is
+    /// what [`Self::default`] gives; a value carries a refinement set even when it is
+    /// empty, because "guarantees nothing" is itself information and is absorbing
+    /// under the positive intersect.
+    ///
+    /// Every value-shaped arm of [`compact_go`] builds from this, so the reading
+    /// a contribution gets is decided where the contribution is made rather than
+    /// re-derived by inspecting it later.
+    pub(super) fn value() -> Self {
+        Self {
+            refinements: Some(RefinementSet::default()),
+            ..Self::default()
+        }
     }
 
     /// Merge two CompactTypes at the given polarity.
@@ -369,16 +402,10 @@ impl CompactType {
     /// - `fun`: recursively merge each side, flipping polarity on the
     ///   domain.
     ///
-    /// A side that [`imposes_nothing`](Self::imposes_nothing) is the identity for
-    /// the whole merge, not just component-wise: see that method for why the
-    /// refinement set makes this necessary.
+    /// - `refinements`: `None` is the identity; two present sets intersect at
+    ///   positive polarity and union at negative
+    ///   ([`merge_refinements`](Self::merge_refinements)).
     pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
-        if lhs.imposes_nothing() {
-            return rhs.absorbing_vars_of(lhs);
-        }
-        if rhs.imposes_nothing() {
-            return lhs.absorbing_vars_of(rhs);
-        }
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
         let mut atoms = lhs.atoms;
@@ -398,7 +425,11 @@ impl CompactType {
             (None, f) | (f, None) => f,
             (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b)),
         };
-        let refinements = Self::merge_refinements(pol, lhs.refinements, rhs.refinements);
+        let refinements = match (lhs.refinements, rhs.refinements) {
+            // `None` is the identity, exactly as for the shape slots above.
+            (None, r) | (r, None) => r,
+            (Some(a), Some(b)) => Some(Self::merge_refinements(pol, a, b)),
+        };
         // History children merge componentwise at the outer polarity
         // (invariance was already enforced when the constraint edges were
         // recorded). Two histories at one position share a kind — a mutable variable and a
@@ -424,46 +455,6 @@ impl CompactType {
             refinements,
             history_slot,
         }
-    }
-
-    /// Whether this contribution says nothing about the position at all — an
-    /// unresolved variable and nothing else.
-    ///
-    /// Each *shape* component already has a `None` that acts as the merge identity
-    /// ("no record component here imposes nothing"). The refinement set has no such
-    /// sentinel: it is a `Vec`, so "no refinement is known of this" and "this is
-    /// known to carry no refinement" are the same empty value. Under the positive
-    /// intersection the second reading wins and erases the other side's refinements
-    /// — so a bare variable bound, which knows nothing, would silently discard the
-    /// singleton a sibling bound established. Recognising the whole contribution as
-    /// the identity is what keeps the two readings apart.
-    ///
-    /// The variables themselves are still carried across by
-    /// [`absorbing_vars_of`](Self::absorbing_vars_of); they are this
-    /// contribution's only content, and they join at every polarity.
-    fn imposes_nothing(&self) -> bool {
-        let CompactType {
-            vars: _,
-            atoms,
-            rec,
-            var,
-            fun,
-            refinements,
-            history_slot,
-        } = self;
-        atoms.is_empty()
-            && rec.is_none()
-            && var.is_none()
-            && fun.is_none()
-            && refinements.is_empty()
-            && history_slot.is_none()
-    }
-
-    /// Take the variable identities of a contribution that
-    /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
-    fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
-        self.vars.extend(identity.vars);
-        self
     }
 
     /// Merge two refinement sets. The set-op tracks
@@ -568,7 +559,7 @@ impl CompactType {
         atoms.insert(a);
         Self {
             atoms,
-            ..Self::default()
+            ..Self::value()
         }
     }
 
@@ -632,10 +623,57 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         scope: RefinementScope::default(),
     };
     let term = compact_go(ty, true, &Subst::id(), None, &mut st);
+    debug_assert!(
+        refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
+        "a position carrying content must carry a refinement slot: only a hole and a \
+         bare variable leave it absent"
+    );
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
     }
+}
+
+/// Whether every position in `ct` that carries content also carries a refinement
+/// slot — the post-condition of the walk above.
+///
+/// The slot's `None` belongs to exactly the two contributions that are not
+/// values, a hole ([`CompactType::empty`]) and a bare variable
+/// ([`CompactType::from_var`]), and neither carries content. Nothing in the type
+/// system says so: every value-shaped arm has to be built from
+/// [`CompactType::value`], across a dozen construction sites. A position that
+/// carried content with the slot absent would read as the merge identity and so
+/// *absorb* a sibling bound's refinements instead of intersecting with none of its
+/// own, which is the collapse [`CompactType::refinements`] documents — `Int`
+/// joined with `{Int | p}` would keep `p`.
+///
+/// Variable contributions are not content: a bare variable's whole content is
+/// its identity, so `vars` is the one populated field the slot may accompany as
+/// `None`.
+fn refinement_slot_present(ct: &CompactType) -> bool {
+    let carries_content = !ct.atoms.is_empty()
+        || ct.rec.is_some()
+        || ct.var.is_some()
+        || ct.fun.is_some()
+        || ct.history_slot.is_some();
+    if carries_content && ct.refinements.is_none() {
+        return false;
+    }
+    ct.rec
+        .iter()
+        .flat_map(|m| m.values())
+        .all(refinement_slot_present)
+        && ct
+            .var
+            .iter()
+            .flat_map(|v| v.tags.values())
+            .all(refinement_slot_present)
+        && ct.fun.iter().all(|f| {
+            f.domains.iter().all(refinement_slot_present) && refinement_slot_present(&f.codomain)
+        })
+        && ct.history_slot.iter().all(|(value, domain, _)| {
+            refinement_slot_present(value) && refinement_slot_present(domain)
+        })
 }
 
 /// The variables whose bounds the current path is walking, as a chain of stack
@@ -778,7 +816,9 @@ fn compact_go(
                 // References to the walk's enclosing binders become indices
                 // before the refinement is compared or stored.
                 let r = st.scope.close(&r);
-                ct.refinements.insert(r);
+                ct.refinements
+                    .get_or_insert_with(RefinementSet::default)
+                    .insert(r);
             }
             ct
         }
@@ -814,7 +854,7 @@ fn compact_go(
                     domains: vec![dom],
                     codomain: Box::new(cod),
                 }),
-                ..Default::default()
+                ..CompactType::value()
             }
         }
         // Tuples and records share the structural `rec` representation,
@@ -826,7 +866,7 @@ fn compact_go(
             }
             CompactType {
                 rec: Some(compacted),
-                ..Default::default()
+                ..CompactType::value()
             }
         }
         Type::Record(fs) => {
@@ -839,7 +879,7 @@ fn compact_go(
             }
             CompactType {
                 rec: Some(compacted),
-                ..Default::default()
+                ..CompactType::value()
             }
         }
         Type::Variant(tags, openness) => {
@@ -856,7 +896,7 @@ fn compact_go(
                     tags: compacted,
                     openness: *openness,
                 }),
-                ..Default::default()
+                ..CompactType::value()
             }
         }
         // A history's children compact at the same polarity as the reference —
@@ -873,7 +913,7 @@ fn compact_go(
             let domain = compact_go(domain, pol, subst_acc, None, st);
             CompactType {
                 history_slot: Some((Box::new(value), Box::new(domain), *kind)),
-                ..Default::default()
+                ..CompactType::value()
             }
         }
         Type::Infer(state) => {
@@ -948,23 +988,18 @@ fn compact_go(
             // pass)").
             let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
             drop(s);
-            // Walk bounds, transitively expanding. We fold the bounds'
-            // contributions *without* seeding from the variable's own identity
-            // (`CompactType::from_var(uid)`) and inject the var id only at the
-            // end. Seeding with `from_var` would mix the variable's *empty*
-            // refinement set into the merge, and at positive polarity `merge`
-            // *intersects* refinement sets (`merge_refinements`) — so the empty
-            // seed would intersect away every bound's refinements (∅ is absorbing under
-            // intersection). The variable identity must be refinement-*neutral*;
-            // `rec`/`var`/`fun` get this for free from their `None` merge
-            // identity, but refinement sets have no such sentinel, so we keep
-            // the var out of the structural fold.
+            // Walk bounds, transitively expanding, seeded from the variable's own
+            // identity: `from_var` is not a value, so it imposes nothing at any
+            // slot and the fold's first step is the identity but for carrying the
+            // uid ([`CompactType::refinements`] for why the refinement slot needs the
+            // same `None` the shape slots have).
+            //
             // Whether this variable is the *position* being materialized, which is
             // the only place the opposite-polarity collapse below may happen
             // ([`fallback_allowed`]).
             let allow_fallback = fallback_allowed(parents, st);
             let new_parents = ParentPath { uid, prev: parents };
-            let mut bound: Option<CompactType> = None;
+            let mut bound = CompactType::from_var(uid);
             for b in primary_bounds.iter() {
                 // Compose this edge's morphisms onto the accumulator before
                 // descending: a bound reached transitively through `v → w → …`
@@ -972,10 +1007,7 @@ fn compact_go(
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                 let bc = compact_go(&b.ty, pol, &inner_acc, Some(&new_parents), st);
-                bound = Some(match bound {
-                    None => bc,
-                    Some(acc) => CompactType::merge(pol, acc, bc),
-                });
+                bound = CompactType::merge(pol, bound, bc);
             }
             // Opposite-polarity fallback: walk the other side too if the
             // primary walk did not produce any concrete (atom / shape)
@@ -988,7 +1020,7 @@ fn compact_go(
             // var reaching coalesce is monomorphically determined (one type or
             // an `IncompatibleBounds` error). See the rationale above, and
             // [`fallback_allowed`] for why it happens only at a position.
-            let no_concrete = bound.as_ref().is_none_or(|b| {
+            let no_concrete = {
                 let CompactType {
                     atoms,
                     rec,
@@ -999,7 +1031,7 @@ fn compact_go(
                     // below, rather than deciding whether it fires.
                     vars: _,
                     refinements: _,
-                } = b;
+                } = &bound;
                 // A variant shape counts as concrete only at a **positive**
                 // position, where it is the value's own tags — read off the lower
                 // bounds, it is what the thing *is*, and the fallback firing past
@@ -1017,7 +1049,7 @@ fn compact_go(
                     && fun.is_none()
                     && history_slot.is_none()
                     && !var_is_shape
-            });
+            };
             if no_concrete && allow_fallback {
                 let mut recovered: Option<CompactType> = None;
                 for b in opposite_bounds.iter() {
@@ -1040,23 +1072,19 @@ fn compact_go(
                     // domain. (At a positive position `no_concrete` now implies
                     // there is no shape at all to lose.)
                     //
-                    // Refinements union instead of intersecting, because an empty
-                    // set is absorbing under the positive intersection (the same
-                    // hazard the `from_var` seed avoids above) — and a demanded
+                    // Refinements union instead of intersecting: a demanded
                     // predicate is checked against the value the fallback found,
                     // so both hold of it.
-                    if let Some(primary) = bound.take() {
-                        recovered.vars.extend(primary.vars);
-                        recovered.refinements.extend(primary.refinements);
+                    recovered.vars.extend(std::mem::take(&mut bound.vars));
+                    if let Some(demanded) = bound.refinements.take() {
+                        recovered
+                            .refinements
+                            .get_or_insert_with(RefinementSet::default)
+                            .extend(demanded);
                     }
-                    bound = Some(recovered);
+                    bound = recovered;
                 }
             }
-            // Inject the variable's own identity (refinement-neutral) so it
-            // shows up in the CompactType — equivalent to the old `from_var`
-            // seed for `vars`, but without polluting the refinement merge.
-            let mut bound = bound.unwrap_or_else(CompactType::empty);
-            bound.vars.insert(uid);
             st.in_process.remove(&key);
             // Recursive types: store the bound under the placeholder
             // variable and emit a reference.
@@ -1249,6 +1277,38 @@ mod tests {
             "positive payload merge intersects fields; got {rec:?}"
         );
     }
+
+    /// `None` and `Some(empty)` in the refinement slot are different merges, which is
+    /// what [`CompactType::value`] exists to keep apart. A bare variable knows
+    /// nothing about refinements, so a sibling bound's refinement passes through; a value
+    /// that carries no refinement guarantees nothing, and an empty set is absorbing
+    /// under the positive intersect, so the same refinement is erased.
+    #[test]
+    fn a_bare_variable_is_refinement_neutral_and_an_unrefined_value_is_not() {
+        use crate::ccl::Refinement;
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+
+        let refinement = Refinement::born(dep_pred("x"));
+        let refined = CompactType {
+            refinements: Some(RefinementSet::one(refinement.clone())),
+            ..CompactType::value()
+        };
+        assert_eq!(
+            CompactType::merge(
+                true,
+                CompactType::from_var(fresh_infer_var_id()),
+                refined.clone()
+            )
+            .refinements,
+            Some(RefinementSet::one(refinement)),
+            "a bare variable must not erase a sibling bound's refinement"
+        );
+        assert_eq!(
+            CompactType::merge(true, CompactType::value(), refined).refinements,
+            Some(RefinementSet::new()),
+            "a value carrying no refinement erases it: an empty set is absorbing under intersect"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1359,5 +1419,51 @@ mod refinement_closing_tests {
             "closing against the walk's enclosing binders must not conflate the inner and \
              outer Pi binders"
         );
+    }
+}
+
+#[cfg(test)]
+mod refinement_slot_tests {
+    use super::*;
+
+    /// The two contributions that are not values carry no refinement slot, and the
+    /// checker accepts them: a hole imposes nothing and a bare variable's whole
+    /// content is its identity.
+    #[test]
+    fn a_hole_and_a_bare_variable_need_no_refinement_slot() {
+        assert!(refinement_slot_present(&CompactType::empty()));
+        assert!(refinement_slot_present(&CompactType::from_var(InferVarId(
+            0
+        ))));
+    }
+
+    /// The violation the post-condition exists for, which no test program
+    /// reaches and nothing in the type system forbids: content with the slot
+    /// absent, which merges as the identity and absorbs a sibling's refinements.
+    #[test]
+    fn content_without_a_refinement_slot_is_rejected() {
+        let bad = CompactType {
+            refinements: None,
+            ..CompactType::from_atom(AtomKey::Prim(BaseType::Int))
+        };
+        assert!(!refinement_slot_present(&bad));
+        assert!(refinement_slot_present(&CompactType::from_atom(
+            AtomKey::Prim(BaseType::Int)
+        )));
+    }
+
+    /// Nested, so a violation below the root is caught: the walk builds every
+    /// payload from the same arms.
+    #[test]
+    fn a_violation_below_the_root_is_rejected() {
+        let bad = CompactType {
+            refinements: None,
+            ..CompactType::from_atom(AtomKey::Prim(BaseType::Int))
+        };
+        let outer = CompactType {
+            rec: Some([(FieldKey::Index(0), bad)].into_iter().collect()),
+            ..CompactType::value()
+        };
+        assert!(!refinement_slot_present(&outer));
     }
 }
