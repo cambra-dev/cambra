@@ -244,8 +244,8 @@ mod tests {
         out
     }
 
-    /// Walk `parents` back from `id` until it reaches an id in `roots`, or runs
-    /// out of rows. `None` when the ancestry never reaches one.
+    /// Whether walking `parents` back from `id` reaches an id in `roots` before
+    /// running out of rows.
     fn resolves_into(table: &ProvenanceTable, id: NodeId, roots: &HashSet<NodeId>) -> bool {
         let mut frontier = vec![id];
         let mut seen = HashSet::new();

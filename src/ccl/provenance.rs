@@ -579,7 +579,7 @@ pub type SourceProjection = HashMap<NodeId, SourceAttribution>;
 /// span. A `DanglingParent` count over a zero `Unrecorded` count says the scopes
 /// are open and that some producer upstream of the span never rowed the ids
 /// those recordings name. That reading is what holds the first pane pair out of
-/// the gate; see `MaterializedPanes::gated_pane_pairs` in `crate::ccl::context`.
+/// the gate; see `MaterializedPanes::gated_pane_pairs` in `crate::ccl::panes`.
 ///
 /// Each class is reported once per distinct id. [`fold`] sorts and dedups its
 /// vector, so a dangling parent that four rows name is one entry.
@@ -1123,21 +1123,20 @@ struct Row {
 /// enumerates them — so the fold must explain them and this table must hold their
 /// rows (`design/provenance.md`, "Walking the ids").
 ///
-/// This was a `TODO(predicate-rows)` and is now done for two of the three
-/// crossings: a term entering a predicate is recorded (lowering sweeps the
-/// finished term; inference records `singleton_predicate` against its literal),
-/// and a
-/// predicate being rewritten is recorded. The third — planning **raising** a
-/// predicate back into the main tree — is not, and lands with the planning
-/// commit; those nodes are minted below the last pane, so no pane pair gates them
-/// yet.
+/// **All three crossings of the predicate boundary record.** *Entry*: lowering
+/// sweeps the finished term, and inference records `singleton_predicate` against
+/// its literal. *Transformation*: `PredMemo::rebuild` either carries the ids or
+/// records against the node whose type holds the predicate. *Raising* — planning
+/// lifting a term back into the main tree — attributes the raised material to the
+/// predicate rather than to the term-tree site, because a clone's copy names the
+/// node it was freshened from (`design/provenance.md`, "Walking the ids").
 ///
-/// It was a **population** change, not a schema change: these ids already had
-/// addresses here, so no column moved. The prior measurement that justified it
-/// stands as the attribution evidence — over the eleven-program corpus at the
-/// `post-inference..join-planned` audit span the residue was 1184
-/// [`Leak::DanglingParent`] edges and nothing else, every one a predicate-interior
-/// id of the input tree, and admitting them took every gated class to zero.
+/// Admitting these ids was a **population** change, not a schema change: they
+/// already had addresses here, so no column moved. The measurement that justified
+/// it, at the `post-inference..join-planned` audit span: the residue was
+/// [`Leak::DanglingParent`] edges and nothing else, every one a
+/// predicate-interior id of the input tree, and admitting them took every gated
+/// class to zero.
 ///
 /// The backing store is a plain map on purpose: the row *semantics* above are
 /// what a reader has to check, and a paged/interned column encoding would be a

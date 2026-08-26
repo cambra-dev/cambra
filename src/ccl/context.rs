@@ -563,7 +563,7 @@ pub struct CompiledProgram {
     /// `via` is what a fold between two panes restricts by. The phases that record are
     /// [`Phase::Infer`] (everything monomorphization mints inside `infer`, which
     /// bridges the pre-inference ⇄ post-inference panes) and [`Phase::Inline`],
-    /// [`Phase::Transact`], [`Phase::Letrec`], [`Phase::Channelize`] (the four phases
+    /// [`Phase::Transact`], [`Phase::Letrec`], [`Phase::Channelize`] (the phases
     /// between the post-inference and post-channelize snapshots) — see [`PANES`],
     /// which declares which phases each pane pair folds.
     ///
@@ -995,7 +995,7 @@ pub(crate) fn provenance_capture_enabled() -> bool {
     !std::env::var(PROVENANCE_ENV).is_ok_and(|v| v == "0") && provenance_audit_span().is_none()
 }
 
-/// Whether every compile folds both pane pairs and gates the leak classes,
+/// Whether every compile folds every pane pair and gates the leak classes,
 /// rather than only the programs a test asks about.
 ///
 /// **What this buys.** The always-on gate is
@@ -1006,7 +1006,7 @@ pub(crate) fn provenance_capture_enabled() -> bool {
 /// another loop's accumulator) and `flatten_spine`'s value-position writer hoist
 /// both sat outside it. With this on, the corpus is every program the caller
 /// compiles — point it at `tests/compilation_pipeline` and the gate covers the
-/// whole suite instead of eleven programs.
+/// whole suite instead of the programs `corpus()` lists.
 ///
 /// Off by default because it folds the table twice per compile, which is
 /// superlinear work the ordinary pipeline does not need; CI turns it on. It is
@@ -1040,15 +1040,16 @@ fn recorded<R>(capture: bool, phase: Phase, f: impl FnOnce() -> R) -> R {
 /// A driver-capture audit over one span of the pipeline: install a phase recorder at
 /// the input pane, fold at the output pane, and print what the capture explains.
 ///
-/// Opt-in via `CAMBRA_PROVENANCE_AUDIT=1` so the whole test suite can run either
+/// Opt-in by naming a span in `CAMBRA_PROVENANCE_AUDIT` — the spans opened below
+/// are `full`, `letrec` and `mutelim` — so the whole test suite can run either
 /// way. It is a **measurement**, not a gate: nothing declares a fate, so every
 /// genuinely-dead input id reaches the audit through the fold's death
 /// collection, which it counts apart from the [`Leak`]s that really are
 /// recording bugs.
 ///
 /// A span survives gating when its enclosing pair bundles more phases than the
-/// span does: the `letrec` and `mutelim` spans below isolate phases inside the
-/// four-phase `post-inference → post-channelize` pair. See
+/// span does: the `letrec` and `mutelim` spans below each isolate a phase inside
+/// the `post-inference → post-channelize` pair. See
 /// `src/ccl/design/provenance.md`, "What gating every pair does not retire".
 struct ProvenanceAudit {
     span: &'static str,
@@ -1407,8 +1408,8 @@ fn run_passes(
     lowering_projection: &SourceProjection,
     panes: &mut BTreeMap<Phase, Expr>,
 ) -> Result<Expr, Vec<CompileError>> {
-    // Phase recording for the rows the pane folds read. One scope per phase,
-    // opened and closed in place: a phase scope is per-thread and
+    // Phase recording for the rows the pane-pair folds read. One scope per
+    // phase, opened and closed in place: a phase scope is per-thread and
     // non-reentrant, so the scopes are sequential, never nested.
     let capture_provenance = record && provenance_capture_enabled();
 
@@ -1663,13 +1664,13 @@ fn run_passes(
     // Running post-elim is what keeps ONE letrec representation through
     // channelize and lambda_elim; the point-free guard matcher re-checks
     // causality at this wall. See the `mut_elim` recognition docs.
-    let recognized = recorded(capture_provenance, Phase::Planning, || {
-        planning::plan_loops(lambda_elim)
-    });
-    debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
-    typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
-
+    // One scope over both halves of planning: they tag identically, and the
+    // typecheck between them mints nothing, so splitting would buy a window in
+    // which a recording writes nothing and nothing says why.
     let join_planned = recorded(capture_provenance, Phase::Planning, || {
+        let recognized = planning::plan_loops(lambda_elim);
+        debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
+        typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
         planning::run(recognized)
     });
     // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
