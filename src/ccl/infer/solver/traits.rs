@@ -76,7 +76,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name,
-    Refinement, RefinementTemplate, Type, TypedExpr,
+    Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -578,7 +578,9 @@ impl TraitObligation {
             let ty = match maybe_refinement {
                 Some(template) => Type::Refinement(
                     Box::new(ty_base),
-                    Refinement::born_from_template(template, &self.input_exprs),
+                    RefinementSet::one(
+                        Refinement::born_from_template(template, &self.input_exprs)
+                    ),
                 ),
                 None => ty_base,
             };
