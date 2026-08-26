@@ -9,9 +9,16 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { byteLineStarts, formatSpan, lineCol, renderApp } from "./main";
+import {
+  byteLineStarts,
+  diagnosticLines,
+  formatSpan,
+  lineCol,
+  renderApp,
+  serializeDiagnostics,
+} from "./main";
 import { Store } from "./store";
-import { fixture } from "./__fixtures__/helpers";
+import { fixture, stubLayout } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
 
@@ -51,19 +58,48 @@ describe("formatSpan", () => {
   });
 });
 
+describe("serializeDiagnostics", () => {
+  const starts = byteLineStarts("ab\ncd\n");
+  const diag = (message: string, span: { start: number; end: number } | null) => ({
+    severity: "error",
+    stage: "Infer",
+    message,
+    span,
+    labels: [],
+  });
+
+  it("renders severity · stage, message, and the line:col span", () => {
+    expect(serializeDiagnostics([diag("mismatched types", { start: 0, end: 4 })], starts)).toBe(
+      "error · Infer\nmismatched types\n1:1–2:2",
+    );
+  });
+
+  it("renders 'no span' for a spanless diagnostic", () => {
+    expect(serializeDiagnostics([diag("boom", null)], starts)).toBe("error · Infer\nboom\nno span");
+  });
+
+  it("separates cards with a blank line", () => {
+    const text = serializeDiagnostics([diag("one", null), diag("two", null)], starts);
+    expect(text).toBe("error · Infer\none\nno span\n\nerror · Infer\ntwo\nno span");
+  });
+
+  it("reports the empty case with the text the pane itself shows", () => {
+    // The pane's `.empty` row and this string come from one constant; asserting
+    // both against the same literal is what keeps them from drifting apart.
+    expect(serializeDiagnostics([], starts)).toBe("No diagnostics, but the IR is unavailable.");
+  });
+
+  it("is built from the same lines the pane renders", () => {
+    const d = diag("mismatched types", { start: 0, end: 4 });
+    expect(serializeDiagnostics([d], starts)).toBe(diagnosticLines(d, starts).join("\n"));
+  });
+});
+
 describe("renderApp: degraded snapshot (failed compile)", () => {
   const failed = fixture(failedJson);
 
-  beforeAll(() => {
-    // CodeMirror's SourceView (rendered even in the degraded case) calls these.
-    (Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = () => {};
-    const emptyRects = () => ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} });
-    const emptyRect = () => ({ top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0, x: 0, y: 0 });
-    (Range.prototype as unknown as { getClientRects: () => unknown }).getClientRects = emptyRects as never;
-    (Range.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = emptyRect as never;
-    (Element.prototype as unknown as { getClientRects: () => unknown }).getClientRects = emptyRects as never;
-    (Element.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = emptyRect as never;
-  });
+  // CodeMirror's SourceView renders even in the degraded case.
+  beforeAll(stubLayout);
 
   it("renders a diagnostics list (with the error message) and no tree panes", () => {
     const root = document.createElement("div");
@@ -82,5 +118,17 @@ describe("renderApp: degraded snapshot (failed compile)", () => {
 
     // No IR tree panes render in the degraded case.
     expect(root.querySelectorAll(".tree-root").length).toBe(0);
+  });
+
+  it("gives both degraded panes a copy button", () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+
+    renderApp(root, new Store(failed));
+
+    // Source and Diagnostics — the copy affordance is not a property of having
+    // an IR tree.
+    expect(root.querySelectorAll(".pane-copy").length).toBe(2);
+    expect(root.querySelector(".pane-copy")?.textContent).toBe("Copy");
   });
 });

@@ -29,6 +29,51 @@ export function resolvedTypeTooltip(
   return `\`${localType}\` resolves to \`${resolved.join(" | ")}\``;
 }
 
+// Indentation per depth level in `serializeTree`.
+const TREE_INDENT = "  ";
+
+/**
+ * A pane's node table as plain text — one line per rendered row, `TREE_INDENT`
+ * per depth level, no trailing newline. This is what the pane's copy button
+ * yields.
+ *
+ * A line is the row's spans joined by a single space, which is what the row's
+ * flex `gap` renders: `` 0: Lit(Int(1)) : Int@1 #13 ``. The twisty is dropped
+ * because the indentation already carries the structure, and because it states
+ * a collapse state the text has no notion of — the whole tree is serialized
+ * regardless of what is expanded, so a copy does not depend on click history
+ * (`renderSelection` expands ancestors as a side effect of selecting).
+ *
+ * Refinement-predicate children are walked like any other. `renderNode` gives
+ * them rows, so filtering on the `predicate` flag here would silently make the
+ * copy disagree with the pane it claims to reproduce. It walks from `root`
+ * through the child edges with the same on-path guard `renderNode` uses, so a
+ * node reached from several positions appears once per position, exactly as the
+ * pane draws it.
+ */
+export function serializeTree(root: number, nodeById: Map<number, IrNode>): string {
+  const lines: string[] = [];
+  const walk = (id: number, edge: string | null, depth: number, onPath: Set<number>): void => {
+    const node = nodeById.get(id);
+    if (!node) return;
+    const parts: string[] = [];
+    if (edge !== null) parts.push(`${edge}:`);
+    parts.push(node.label);
+    parts.push(`: ${node.type}`);
+    parts.push(`#${node.nodeId}`);
+    lines.push(TREE_INDENT.repeat(depth) + parts.join(" "));
+    const childPath = new Set(onPath).add(id);
+    // The same derived label `renderNode` draws: a value child's index in
+    // `children`, and nothing for a predicate.
+    for (const [i, child] of node.children.entries()) {
+      if (onPath.has(child.id)) continue;
+      walk(child.id, child.predicate ? null : String(i), depth + 1, childPath);
+    }
+  };
+  walk(root, null, 0, new Set());
+  return lines.join("\n");
+}
+
 function el(tag: string, className?: string, text?: string): HTMLElement {
   const node = document.createElement(tag);
   if (className) node.className = className;

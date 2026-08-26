@@ -40,6 +40,7 @@ See [Running it](../README.md#running-it). No `cargo`? After `npm run build`,
 | **Click** a node row in the IR tree | Selects the node — highlights its source span in the editor and scrolls to it. The tree → source cross-link. |
 | **Click the ▸ / ▾ twisty** on a tree row | Expands / collapses that subtree (distinct from selecting the row). |
 | **Hover a squiggle** or gutter marker in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
+| **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
 
 The header shows the program name, the snapshot kind (`post-inference`, or
 `failed` when the program has errors), and a **static (no values)** badge — M1
@@ -94,7 +95,14 @@ CI via `./ci.sh web`):
   set / provenance / goto-def name) and `resolveSourceClick` (plain vs.
   Ctrl/Cmd-click goto-def), which the CodeMirror handlers call directly.
 - `main.test.ts` — the byte-based `byteLineStarts`/`lineCol`/`formatSpan`
-  arithmetic and a jsdom degraded-render test over `failed.snapshot.json`.
+  arithmetic, `serializeDiagnostics` (the Diagnostics pane's copy text, asserted
+  against the same `diagnosticLines` the pane renders from), and a jsdom
+  degraded-render test over `failed.snapshot.json`.
+- `treeView.test.ts` — `resolvedTypeTooltip`, and `serializeTree`: the copy
+  grammar row by row, the two-space indent, the included `where.N` predicate
+  subtrees, and a fixture case pinning one line per rendered node.
+- `clipboard.test.ts` — `copyToClipboard`'s three outcomes: an absent API, a
+  successful write, and a refused one.
 - `wireValidate.test.ts` — `validateSnapshot` accepts every real fixture and
   throws (naming the path) on malformed payloads; this is the runtime
   replacement for the old unchecked `as Snapshot` cast.
@@ -133,6 +141,8 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
 - `treeView.ts` — one collapsible IR tree pane, parameterized by `paneId`,
   rendered by walking the pane's node table from `root`, cross-linked to every
   other pane.
+- `clipboard.ts` — the one impure clipboard call, isolated so the serializers
+  that feed it stay DOM-free and directly testable.
 - `main.ts` — fetch `/api/snapshot`, build the store, render the source pane +
   one tree pane per pane entry.
 
