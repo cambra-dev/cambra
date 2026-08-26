@@ -1502,8 +1502,7 @@ pub(super) fn lower_match(
     }
     // The `Case` images the `match` statement. A statement is not a
     // `Spanned<ChlExpr>`, so it has no `Source` node — `tag_image` is the image
-    // marker at `Nature::Machinery` (`src/ccl/design/provenance.md`, "The seam
-    // (`src/ccl/context.rs`)").
+    // marker at `Nature::Machinery` (`src/ccl/design/provenance.md`, "The seam").
     Ok(ctx.tag_image(
         Expr::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(scrutinee_expr)),

@@ -812,8 +812,7 @@ fn lower_loop_body_chain(
     // Every node this chain mints is recorded: an unrecorded lowering mint is a
     // `Leak::Unrecorded` at the lowering boundary. A statement's own image gets
     // `tag_image`; the `ExprStmt` that sequences one statement before the rest is
-    // manufactured plumbing (`src/ccl/design/provenance.md`, "The seam
-    // (`src/ccl/context.rs`)").
+    // manufactured plumbing (`src/ccl/design/provenance.md`, "The seam").
     let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), for_span, "lower.loop_unit");
     for stmt in body_stmts.iter().rev() {
         chain = match &stmt.node {
