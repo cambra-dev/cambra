@@ -143,18 +143,42 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     }
     if let Some(cf) = &ct.fun {
         use super::compact::KindMerge;
-        // Materialize the codomain once (covariant) and each domain alternative
-        // (contravariant), deduplicating at the `Type` level. This is where the
+        // Materialize the codomain once (covariant), then read the domain
+        // alternatives a positive join accumulated under the *resolved* kind — the
+        // one place that reading is available, which is why `CompactFun::merge`
+        // does not take it (see there).
+        //
+        // A compute function has one domain: its alternatives meet
+        // contravariantly, and the meet runs in compact space, before
+        // materialization, because that is where a meet is defined. A `Data`
+        // domain *is* the data, so its alternatives never meet — they are
+        // materialized and deduplicated at the `Type` level, which is where the
         // "same domain or not?" question is actually decided: the compact-time
         // `CompactType ==` dedup in `union_domains` cannot settle it, because a
         // compact domain still carries variable identity that `simplify_type` may
-        // merge afterwards, so two identical domains can arrive as two alternatives.
+        // merge afterwards, so two identical domains can arrive as two
+        // alternatives. A conflicted slot keeps every alternative for its
+        // diagnostic.
         let c = coalesce_compact_go(&cf.codomain, polarity)?;
         let mut doms: Vec<Type> = Vec::new();
-        for d in &cf.domains {
-            let dt = coalesce_compact_go(d, !polarity)?;
-            if !doms.contains(&dt) {
-                doms.push(dt);
+        match cf.kind {
+            KindMerge::Compute | KindMerge::Unknown => {
+                if let Some(met) = cf
+                    .domains
+                    .iter()
+                    .cloned()
+                    .reduce(|acc, d| CompactType::merge(!polarity, acc, d))
+                {
+                    doms.push(coalesce_compact_go(&met, !polarity)?);
+                }
+            }
+            KindMerge::Data | KindMerge::Conflict => {
+                for d in &cf.domains {
+                    let dt = coalesce_compact_go(d, !polarity)?;
+                    if !doms.contains(&dt) {
+                        doms.push(dt);
+                    }
+                }
             }
         }
         // Strip the Pi binder unless the codomain actually depends on it
@@ -200,7 +224,11 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             // merge, where "unrequired" still had to stay distinct from
             // "required to be a capability" (`KindMerge::Unknown`).
             KindMerge::Unknown | KindMerge::Compute => {
-                debug_assert_eq!(doms.len(), 1, "compute fun accumulated domain alternatives");
+                debug_assert_eq!(
+                    doms.len(),
+                    1,
+                    "the compute reading met its alternatives above"
+                );
                 shapes.push(Type::Fun {
                     name: kept_name,
                     kind: crate::ccl::ty::FunKind::Compute,
