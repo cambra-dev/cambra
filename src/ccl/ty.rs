@@ -597,8 +597,15 @@ pub enum Type {
     /// the part this type commits to — see that type for why a sum needs the
     /// distinction where a record does not.
     Variant(Vec<(FieldKey, Type)>, Openness),
-    /// A refinement of another type
-    Refinement(Box<Type>, Refinement),
+    /// A base type narrowed by the conjunction of a [`RefinementSet`]'s refinements.
+    ///
+    /// **Invariants**, both established by [`Type::refined`] (which every
+    /// construction site should go through rather than building this variant
+    /// directly): the set is non-empty, and the base is not itself a
+    /// `Refinement` — nested layers flatten into one set, so `{{𝑇 | 𝑝} | 𝑞}` is
+    /// unrepresentable and the question "which layer is outermost" cannot be
+    /// asked. See [`RefinementSet`] for why that question had no good answer.
+    Refinement(Box<Type>, RefinementSet),
     /// Pre-inference placeholder stamped by lowering on every new node.
     ///
     /// Invariant: every `Hole` must be eliminated by the end of inference.
@@ -953,16 +960,24 @@ fn fmt_type(
         // and spelling it out puts one in front of the reader at every literal.
         // Every other refinement prints in the general form.
         //
-        // The predicate renders inside `binders`, so a reference to an
-        // enclosing function prints as that function's binder name.
-        Type::Refinement(t, r) => match singleton_value(ty) {
+        // Refinements render comma-separated (`{Int | p, q}`) — a conjunction.
+        // Sorted, because the set is unordered: a rendering must not depend
+        // on which order refinements happened to be inserted in, or a diagnostic
+        // (or a test comparing rendered types) would see a difference that
+        // the type system says is not there.
+        //
+        // Each refinement renders inside `binders`, so a reference to an enclosing
+        // function prints as that function's binder name.
+        Type::Refinement(t, refinements) => match singleton_value(ty) {
             Some(lit) => write!(f, "{}@{}", at(t, binders), symbolic::symbolic(lit)),
-            None => write!(
-                f,
-                "{{{} | {}}}",
-                at(t, binders),
-                symbolic::symbolic_under(&r.predicate, binders)
-            ),
+            None => {
+                let mut rendered: Vec<String> = refinements
+                    .iter()
+                    .map(|r| symbolic::symbolic_under(&r.predicate, binders))
+                    .collect();
+                rendered.sort();
+                write!(f, "{{{} | {}}}", at(t, binders), rendered.join(", "))
+            }
         },
         Type::Hole => write!(f, "_"),
         // A hole with an identity renders as one: `_#0` and `_#1` are distinct
@@ -994,13 +1009,11 @@ fn fmt_type(
 /// rule that handles refinements handles this one unchanged — and this recognizes
 /// the shape just well enough to print it as what it means.
 fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
-    let Type::Refinement(base, r) = ty else {
+    let Type::Refinement(_, refinements) = ty else {
         return None;
     };
-    // Exactly one layer: a further-refined singleton is not one.
-    if matches!(base.as_ref(), Type::Refinement(..)) {
-        return None;
-    }
+    // Exactly one refinement: a base carrying further restrictions is not a singleton.
+    let r = refinements.sole()?;
     let TypedExprNode::BinOp {
         left,
         op: crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
@@ -1247,7 +1260,45 @@ impl Type {
         }
     }
 
-    /// Look through every outer [`Type::Refinement`] layer, returning the bare
+    /// Build `base` narrowed by `refinements` — **the** way to construct a
+    /// [`Type::Refinement`], establishing both of its invariants.
+    ///
+    /// Empty `refinements` yields `base` unrefined (a position claiming nothing is
+    /// its base type), and a `base` that is already refined has its refinements
+    /// merged in rather than stacked on top, so refinement sets never nest.
+    /// Flattening is sound because every refinement at a position restricts the same
+    /// underlying element: a refinement narrows which values inhabit a type, it
+    /// does not change them, so an outer refinement's [`REFINEMENT_BINDER`] ranges
+    /// over exactly the values the inner one does.
+    pub fn refined(base: Type, refinements: RefinementSet) -> Type {
+        if refinements.is_empty() {
+            return base;
+        }
+        match base {
+            Type::Refinement(inner, existing) => {
+                Type::Refinement(inner, existing.union(&refinements))
+            }
+            bare => Type::Refinement(Box::new(bare), refinements),
+        }
+    }
+
+    /// [`Type::refined`] with a single refinement — the common case at a site that
+    /// mints one predicate.
+    pub fn refined_one(base: Type, refinement: Refinement) -> Type {
+        Type::refined(base, RefinementSet::one(refinement))
+    }
+
+    /// The refinements carried at this position — empty for an unrefined type, so a
+    /// caller can compare or filter what two positions demand without
+    /// case-splitting on whether either is refined.
+    pub fn refinements(&self) -> &[Refinement] {
+        match self {
+            Type::Refinement(_, refinements) => refinements.as_slice(),
+            _ => &[],
+        }
+    }
+
+    /// Look through the [`Type::Refinement`] wrapper, returning the bare
     /// structural type underneath. Borrowing and non-allocating; refinements
     /// nested inside the structure are left in place.
     ///
@@ -1261,11 +1312,12 @@ impl Type {
     /// is a different operation: it *drops* refinements rather than looking past them,
     /// allocates, and is only meaningful on a resolved type.
     pub fn peel_refinements(&self) -> &Type {
-        let mut cur = self;
-        while let Type::Refinement(inner, _) = cur {
-            cur = inner;
+        match self {
+            // One layer suffices: `Type::refined` flattens, so a refinement's
+            // base is never itself refined.
+            Type::Refinement(inner, _) => inner,
+            other => other,
         }
-        cur
     }
 
     /// The value type of the mutable variable this denotes, or `None` if it is not
@@ -1389,8 +1441,8 @@ impl Type {
                     .collect(),
                 *openness,
             ),
-            Type::Refinement(base, r) => {
-                Type::Refinement(Box::new(base.without_pi_names()), r.clone())
+            Type::Refinement(base, refinements) => {
+                Type::refined(base.without_pi_names(), refinements.clone())
             }
             Type::History {
                 value,
@@ -1756,14 +1808,25 @@ fn eq_cast_target_predicates(
         ccl_utils::cast_target_refinement(t2),
     ) {
         (None, None) => true,
-        (Some(r1), Some(r2)) => {
-            if Rc::ptr_eq(&r1.predicate, &r2.predicate) {
-                return true;
-            }
-            // Under the *enclosing* pairing: a nested predicate may reference a
-            // binder the outer predicate introduced (a comprehension inside a
-            // filter), and that reference resolves by position like any other.
-            eq_refinement_predicate_go(&r1.predicate, &r2.predicate, pairs)
+        // Set equality, whose member comparison is `Refinement`'s own, run
+        // **under the enclosing pairing**: a nested predicate may reference a
+        // binder the outer predicate introduced (a comprehension inside a
+        // filter), and that reference resolves by position like any other, so
+        // the comparison cannot start a fresh pairing the way
+        // `RefinementSet`'s own `PartialEq` does. Deduplicated on both sides
+        // ([`RefinementSet::insert`]), so equal cardinality plus one-way
+        // containment is mutual containment — the same argument that impl
+        // makes. The mutual recursion terminates on tree shape: predicates are
+        // acyclic `Rc<TypedExpr>`s, so a cast target cannot contain the term
+        // comparing it.
+        (Some(s1), Some(s2)) => {
+            s1.len() == s2.len()
+                && s1.iter().all(|r1| {
+                    s2.iter().any(|r2| {
+                        Rc::ptr_eq(&r1.predicate, &r2.predicate)
+                            || eq_refinement_predicate_go(&r1.predicate, &r2.predicate, pairs)
+                    })
+                })
         }
         _ => false,
     }
@@ -2073,6 +2136,320 @@ impl std::hash::Hash for Refinement {
     }
 }
 
+/// The refinements carried at one refined position: an **unordered set** of
+/// [`Refinement`]s, deduplicated by their structural [`PartialEq`].
+///
+/// A refined type narrows its base by the *conjunction* of these refinements, and
+/// conjunction is commutative, idempotent, and associative — so a set is the
+/// honest carrier and a chain of nested `{{𝑇 | 𝑝} | 𝑞}` layers was not. That
+/// chain gave one representation three incompatible readings: a *set* to
+/// subtyping (the deficit machinery compares layers as a set), a *stack* to
+/// planning (whichever layer sat outermost drove which restrict it built), and
+/// an *identity* to `SpecKey` and the recorded-vs-recomputed walls (`Type`'s
+/// derived equality is position-sensitive). Layers accumulated in constraint
+/// *arrival* order, so the stack reading made typing depend on the order two
+/// bounds happened to meet at a variable. Set semantics deletes the degree of
+/// freedom rather than pinning it to a canonical order: there is no position to
+/// read, so planning is free to apply predicates in whatever order it likes
+/// (cheapest filter first, say) without changing an identity.
+///
+/// The invariant, maintained by [`insert`](Self::insert) and relied on by
+/// [`PartialEq`]: **no two members are equal**. Given that, mutual containment
+/// reduces to equal length plus one-way containment.
+#[derive(Debug, Clone, Default)]
+pub struct RefinementSet(Vec<Refinement>);
+
+/// Whether to build refinement sets in reversed physical order — the
+/// order-independence **stress knob**, driven by `CAMBRA_REFINEMENT_ORDER=reverse`.
+///
+/// Set semantics makes the backing `Vec`'s order meaningless by contract, but
+/// two classes of order-dependence survive a representation change that the
+/// type system cannot catch: a consumer that *iterates* the set and lets the
+/// order reach something observable, and a dedup that keeps the
+/// first-inserted of two `eq`-equal members whose (type-blind-equal) predicate
+/// terms carry different embedded type slots. Flipping the physical order
+/// globally and re-running the suite is the only way to exercise both. Reading
+/// it once into a `LazyLock` keeps the check to a cached bool, and it is
+/// `debug_assertions`-only so a release compiler cannot be perturbed by the
+/// environment.
+#[cfg(debug_assertions)]
+fn stress_reversed() -> bool {
+    static REVERSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("CAMBRA_REFINEMENT_ORDER").as_deref() == Ok("reverse")
+    });
+    *REVERSED
+}
+
+#[cfg(not(debug_assertions))]
+fn stress_reversed() -> bool {
+    false
+}
+
+impl RefinementSet {
+    /// The empty set — an unrefined position.
+    pub fn new() -> Self {
+        RefinementSet(Vec::new())
+    }
+
+    /// The singleton set carrying one refinement.
+    pub fn one(r: Refinement) -> Self {
+        RefinementSet(vec![r])
+    }
+
+    /// Add a refinement, keeping the set deduplicated. Returns whether it was new.
+    ///
+    /// A refinement already present is dropped rather than replacing the incumbent:
+    /// the two are equal as *restrictions* ([`eq_refinement_predicate`]), and
+    /// keeping the incumbent preserves whatever predicate `Rc` sharing the
+    /// position already had.
+    pub fn insert(&mut self, r: Refinement) -> bool {
+        if self.0.contains(&r) {
+            return false;
+        }
+        if stress_reversed() {
+            self.0.insert(0, r);
+        } else {
+            self.0.push(r);
+        }
+        true
+    }
+
+    /// Add every refinement of `other`.
+    pub fn extend(&mut self, other: impl IntoIterator<Item = Refinement>) {
+        for r in other {
+            self.insert(r);
+        }
+    }
+
+    /// The union of two sets — the position carries every refinement either side
+    /// imposes.
+    /// This is the *meet* of the refined types (a narrower value satisfies
+    /// more), so it is what a negative-polarity merge performs.
+    pub fn union(mut self, other: &RefinementSet) -> Self {
+        self.extend(other.iter().cloned());
+        self
+    }
+
+    /// The intersection — only the refinements *both* sides guarantee, which is
+    /// what a value known to be one of two things reliably carries (the
+    /// positive-polarity merge, and the *join* of the refined types).
+    pub fn intersect(&self, other: &RefinementSet) -> Self {
+        RefinementSet(
+            self.0
+                .iter()
+                .filter(|r| other.contains(r))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, r: &Refinement) -> bool {
+        self.0.contains(r)
+    }
+
+    pub fn as_slice(&self) -> &[Refinement] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Refinement> {
+        self.0.iter()
+    }
+
+    /// Rewrite every refinement's predicate in place, then re-establish the dedup
+    /// invariant.
+    ///
+    /// The passes that rewrite predicates — substitution forcing, predicate
+    /// compilation, binder conversion, node typing — cannot change *which*
+    /// positions are refined, but they can make two distinct refinements **equal**:
+    /// a substitution mapping two binders onto one term, or a compilation
+    /// normalizing two spellings of one predicate. The set would then hold a
+    /// duplicate, and [`PartialEq`] reads cardinality, so two sets equal as sets
+    /// would compare unequal — and a set is an identity at the trivial-equality
+    /// short-circuit, at cache keys, and at the recorded-vs-recomputed walls.
+    /// Re-deduplicating after the walk is what makes the invariant hold by
+    /// construction instead of being re-argued at each of the eight rewrite sites.
+    ///
+    /// No program in the suite reaches a collapsing rewrite, in either physical
+    /// order; the dedup is what would notice one starting to, and
+    /// `a_rewrite_that_collapses_two_refinements_leaves_a_set` reaches it directly.
+    ///
+    /// The closure sees each refinement's **physical** index, for a caller pairing
+    /// per-position context onto the walk ([`application_elem_types`]).
+    pub fn rewrite_each(&mut self, mut f: impl FnMut(usize, &mut Refinement)) {
+        let outcome = self.try_rewrite_each(|i, r| {
+            f(i, r);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        debug_assert!(outcome.is_ok(), "an infallible rewrite cannot fail");
+    }
+
+    /// [`rewrite_each`](Self::rewrite_each) for a rewrite that can fail. The
+    /// dedup runs whether or not the walk completed, so a set is never left
+    /// holding a duplicate on the error path.
+    pub fn try_rewrite_each<E>(
+        &mut self,
+        mut f: impl FnMut(usize, &mut Refinement) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut outcome = Ok(());
+        for (i, r) in self.0.iter_mut().enumerate() {
+            if let Err(e) = f(i, r) {
+                outcome = Err(e);
+                break;
+            }
+        }
+        if self.0.len() > 1 {
+            let mut kept = Vec::with_capacity(self.0.len());
+            for r in self.0.drain(..) {
+                if !kept.contains(&r) {
+                    kept.push(r);
+                }
+            }
+            self.0 = kept;
+        }
+        outcome
+    }
+
+    /// The sole refinement, or `None` if the set does not hold exactly one.
+    ///
+    /// For the positions built with exactly one predicate by construction — a
+    /// `cast` target's domain refinement, a literal singleton's pin — where
+    /// "the" refinement is a real notion rather than a position in a chain.
+    pub fn sole(&self) -> Option<&Refinement> {
+        match self.0.as_slice() {
+            [r] => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// Walk `refinements` in **application order**: each refinement paired with the type its
+/// element has at the point that refinement applies — `base` narrowed by every refinement
+/// applied before it.
+///
+/// A refinement set is unordered as a *fact* about a value, but materializing it is a
+/// pipeline — planning emits one `restrict` per refinement — and a pipeline is
+/// sequential: stage 𝑘 reads elements already narrowed by stages 1..𝑘-1, so its
+/// element type is not the bare base. Planning therefore *chooses* an order here.
+/// Which order is free (any of them yields a well-typed pipeline for the same
+/// final domain, and a cost model could pick the cheapest filter first); what is
+/// not free is choosing *differently* in two places, since the types along the
+/// pipeline and the predicates compiled for it must agree. Every site that
+/// lowers or types that pipeline goes through this function, so they agree by
+/// construction rather than by coincidence.
+pub fn application_order<'a>(
+    refinements: &'a [Refinement],
+    base: &'a Type,
+) -> impl Iterator<Item = (&'a Refinement, Type)> + 'a {
+    // Planning's chosen order is a deterministic function of the refinements'
+    // *content* — their rendered predicates — never of the set's physical
+    // (insertion) order, which carries no meaning. Any order yields a correct
+    // pipeline; choosing one that ignores insertion order keeps the built term
+    // reproducible however the refinements happened to accumulate, and matches the
+    // order `Display` renders a refinement set in. A cost model is free to replace
+    // this key (cheapest filter first) without touching identity.
+    let mut ordered: Vec<&Refinement> = refinements.iter().collect();
+    // `sort_by_cached_key`, not `sort_by_key`: rendering a predicate walks its whole
+    // term tree and allocates, and `sort_by_key` recomputes the key at every
+    // comparison.
+    ordered.sort_by_cached_key(|r| symbolic::symbolic(&r.predicate));
+    let mut narrowed = RefinementSet::new();
+    ordered.into_iter().map(move |r| {
+        let elem_ty = Type::refined(base.clone(), narrowed.clone());
+        narrowed.insert(r.clone());
+        (r, elem_ty)
+    })
+}
+
+/// [`application_order`]'s element types, indexed by each refinement's **physical**
+/// position in `refinements`.
+///
+/// For the sites that rewrite refinements *in place* and so must walk the set in its
+/// own order. The application order is a permutation of the physical one, so
+/// zipping [`application_order`]'s types straight onto a physical-order walk
+/// pairs refinements with the wrong element type whenever the two orders differ —
+/// silently, since both sequences have the same length. This does the
+/// permutation explicitly.
+pub fn application_elem_types(refinements: &[Refinement], base: &Type) -> Vec<Type> {
+    let mut out = vec![base.clone(); refinements.len()];
+    for (r, elem_ty) in application_order(refinements, base) {
+        // `application_order` borrows the very slice it was handed, so pointer
+        // identity locates the refinement exactly — `PartialEq` would not, being
+        // type-blind and therefore able to match a sibling.
+        let idx = refinements
+            .iter()
+            .position(|c| std::ptr::eq(c, r))
+            .expect("application_order yields borrows into `refinements`");
+        out[idx] = elem_ty;
+    }
+    out
+}
+
+impl PartialEq for RefinementSet {
+    /// Set equality. Sound as stated because both sides are deduplicated
+    /// ([`insert`](RefinementSet::insert)), so equal cardinality plus one-way
+    /// containment is mutual containment.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().all(|r| other.0.contains(r))
+    }
+}
+
+impl Eq for RefinementSet {}
+
+impl std::hash::Hash for RefinementSet {
+    /// Order-insensitive, as [`PartialEq`] demands: each member's hash is
+    /// folded in with a commutative operation. `wrapping_add` rather than
+    /// `XOR` because XOR lets two hash-colliding members cancel to the empty
+    /// set's hash; the length is mixed in for the same reason.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut combined: u64 = 0;
+        for r in &self.0 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(r, &mut h);
+            combined = combined.wrapping_add(std::hash::Hasher::finish(&h));
+        }
+        std::hash::Hash::hash(&self.0.len(), state);
+        std::hash::Hash::hash(&combined, state);
+    }
+}
+
+impl FromIterator<Refinement> for RefinementSet {
+    fn from_iter<I: IntoIterator<Item = Refinement>>(iter: I) -> Self {
+        let mut out = RefinementSet::new();
+        out.extend(iter);
+        out
+    }
+}
+
+impl IntoIterator for RefinementSet {
+    type Item = Refinement;
+    type IntoIter = std::vec::IntoIter<Refinement>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RefinementSet {
+    type Item = &'a Refinement;
+    type IntoIter = std::slice::Iter<'a, Refinement>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl From<Refinement> for RefinementSet {
+    fn from(r: Refinement) -> Self {
+        RefinementSet::one(r)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2239,6 +2616,48 @@ mod tests {
         );
     }
 
+    /// [`application_elem_types`] permutes, it does not zip.
+    ///
+    /// [`application_order`] walks refinements in *content* order; a site that
+    /// rewrites refinements in place walks them in *physical* order. Both sequences
+    /// have the same length, so zipping one onto the other pairs refinements with
+    /// the wrong element type silently whenever the orders differ. Built here
+    /// with physical order deliberately the reverse of content order.
+    #[test]
+    fn application_elem_types_follow_the_refinement_not_the_position() {
+        let refinement = |name: &str| {
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(name),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::lit(Lit::Int(1)),
+            )))
+        };
+        // Physical order [b, a]; content order sorts to [a, b].
+        let (a, b) = (refinement("a"), refinement("b"));
+        let refinements = vec![b.clone(), a.clone()];
+        let base = Type::Base(BaseType::Int);
+
+        let by_position = application_elem_types(&refinements, &base);
+        let by_content: Vec<Type> = application_order(&refinements, &base)
+            .map(|(_, t)| t)
+            .collect();
+
+        // `a` applies first, so it sees the bare base; `b` sees the base
+        // narrowed by `a`. Indexed physically, that is [narrowed, bare].
+        assert_eq!(by_position[1], base, "`a` (physical index 1) applies first");
+        assert_eq!(
+            by_position[0],
+            Type::refined(base.clone(), RefinementSet::one(a)),
+            "`b` (physical index 0) applies second, under `a`"
+        );
+        // The naive zip would have handed `b` the bare base — the two
+        // sequences are genuinely different, so this test has teeth.
+        assert_ne!(
+            by_position, by_content,
+            "physical and content order must differ here, or this pins nothing"
+        );
+    }
+
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
     /// only in the *target's* domain-refinement predicate denote different
     /// refinements: the nested filter is semantic, not inference metadata, so
@@ -2275,6 +2694,89 @@ mod tests {
         );
     }
 
+    /// A rewrite that makes two refinements equal leaves a *set*, not a bag.
+    ///
+    /// [`RefinementSet::rewrite_each`]'s callers rewrite predicates in place, and a
+    /// substitution mapping two binders onto one term collapses two refinements into
+    /// one. `PartialEq` reads cardinality, so a surviving duplicate would make two
+    /// sets equal as sets compare unequal.
+    #[test]
+    fn a_rewrite_that_collapses_two_refinements_leaves_a_set() {
+        let eq_to = |name: &str| {
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(crate::ccl::Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::var(crate::ccl::Name::raw(name)),
+            )))
+        };
+        let mut set = RefinementSet::new();
+        set.insert(eq_to("x"));
+        set.insert(eq_to("y"));
+        assert_eq!(set.len(), 2, "two distinct predicates, two refinements");
+
+        // The collapsing rewrite: both binder references become `z`.
+        set.rewrite_each(|_, r| *r = eq_to("z"));
+
+        assert_eq!(
+            set.len(),
+            1,
+            "the collapsed pair is one refinement: {set:?}"
+        );
+        assert_eq!(
+            set,
+            RefinementSet::one(eq_to("z")),
+            "and equals the set built with one insert"
+        );
+    }
+
+    /// The same equality from the other side: two cast-target vintages that
+    /// render identically stay two refinements.
+    ///
+    /// [`eq_refinement_predicate`] compares a cast's target predicate because
+    /// that predicate is a semantic filter rather than inference metadata
+    /// (pinned above by `refinement_eq_distinguishes_cast_target_predicates`).
+    /// A resolved `ty` slot makes the rendering elide the target, so the two
+    /// vintages are indistinguishable in a diagnostic — and a [`RefinementSet`]
+    /// still holds both, because collapsing them would let refinement-deficit
+    /// matching accept an unsatisfied demand.
+    ///
+    /// A pass that decides a cast's refinements from route-dependent context can
+    /// mint such a pair out of *one* refinement, and dedup then correctly refuses to
+    /// collapse it — which surfaces as a recorded type disagreeing with its
+    /// recomputation while printing the same. No corpus program reaches that pair
+    /// (instrumenting [`RefinementSet::insert`] for a member rendering alike without
+    /// being `eq` counts zero in both physical orders, because a refinement's binding
+    /// is its index rather than its spelling), so the hazard is in the pass rather
+    /// than in the equality pinned here, and closing it is a separate change.
+    #[test]
+    fn cast_target_vintages_render_alike_but_do_not_dedup() {
+        // Two casts of one value, differing *only* in their targets' domain
+        // refinement — the shape a discharge mints at two comprehension depths.
+        let vintage = |marker: i64| {
+            let target = ccl_utils::refined_data_fun(
+                Type::Base(BaseType::Int),
+                TypedExpr::lit(Lit::Int(marker)),
+                Type::Base(BaseType::Int),
+            );
+            Refinement::born(Rc::new(
+                ccl_utils::make_cast(TypedExpr::lit(Lit::Int(0)), target)
+                    .with_ty(Type::Base(BaseType::Int)),
+            ))
+        };
+        let (a, b) = (vintage(1), vintage(2));
+        assert_eq!(
+            symbolic::symbolic(&a.predicate),
+            symbolic::symbolic(&b.predicate),
+            "the two vintages must be indistinguishable in the rendering"
+        );
+        assert_ne!(a, b, "cast-target predicates distinguish the two vintages");
+
+        let mut set = RefinementSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 2, "vintages do not dedup: {set:?}");
+    }
+
     /// A shape test looks *through* a refinement: a refined mutable variable is still
     /// one and a refined channel is still a channel. Nothing in the pipeline
     /// wraps a handle today — a handle type is built structurally rather than
@@ -2284,7 +2786,7 @@ mod tests {
     #[test]
     fn handle_accessors_see_through_a_refinement() {
         let refinement = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
-        let refine = |t: Type| Type::Refinement(Box::new(t), refinement.clone());
+        let refine = |t: Type| Type::refined_one(t, refinement.clone());
         let int = Type::Base(BaseType::Int);
         let mut_var = Type::History {
             value: Box::new(int.clone()),
@@ -2504,7 +3006,8 @@ mod tests {
                 TypedExpr::var(crate::ccl::Name::elem()),
                 BinOpKind::Compare(CompareKind::Equals),
                 TypedExpr::var(k.clone()),
-            ))),
+            )))
+            .into(),
         );
         let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refined);
         assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
@@ -2520,10 +3023,11 @@ mod tests {
 
         // Stored, though, it is the index: the spelling is metadata that
         // identity ignores, so the refinement is α-canonical.
-        let Type::Refinement(_, r) = &**codomain else {
+        let Type::Refinement(_, refinements) = &**codomain else {
             panic!("expected the refinement");
         };
-        let TypedExprNode::BinOp { right, .. } = &r.predicate.node else {
+        let refinement = refinements.sole().expect("one refinement");
+        let TypedExprNode::BinOp { right, .. } = &refinement.predicate.node else {
             panic!("expected the dependent refinement");
         };
         let TypedExprNode::Var(reference) = &right.node else {
@@ -2544,7 +3048,7 @@ mod tests {
     fn an_unnamed_crossing_still_counts_when_rendering() {
         let refined = Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
-            Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::pi_bound_bare(1)))),
+            Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::pi_bound_bare(1)))).into(),
         );
         // (k: Int) ⇒ (Int ⇒ {Int | #1}) — one unnamed crossing in between.
         let ty = Type::Fun {

@@ -225,7 +225,7 @@ fn freshen_level(ty: &Type) -> Level {
         Type::Infer(v) => v.level,
         _ => 0,
     };
-    if let Type::Refinement(_, r) = ty {
+    for r in ty.refinements() {
         lvl = lvl.max(predicate_level(&r.predicate));
     }
     ty.walk_children(|c| lvl = lvl.max(freshen_level(c)));
@@ -328,15 +328,18 @@ pub fn freshen_above(
             domain: Box::new(freshen_above(lim, domain, target, cache)),
             kind: *kind,
         },
-        Type::Refinement(inner, r) => Type::Refinement(
-            Box::new(freshen_above(lim, inner, target, cache)),
+        Type::Refinement(inner, refinements) => Type::refined(
+            freshen_above(lim, inner, target, cache),
             // Faithfully freshen the predicate's own type slots through the same
             // `cache`, so a specialization's predicate is a proper freshen
             // instance — its slots are the clone's fresh variables, driven
             // concrete by the use's pin — rather than sharing the definition's
             // unresolved ones. Immutable predicate terms are acyclic, so this
             // cannot loop.
-            freshen_refinement_predicate(lim, r, target, cache),
+            refinements
+                .iter()
+                .map(|r| freshen_refinement_predicate(lim, r, target, cache))
+                .collect(),
         ),
         Type::Infer(tv) => {
             if let Some(existing) = cache.vars.get(&tv.uid) {
@@ -748,8 +751,8 @@ mod tests {
             TypedExpr::lit(crate::ccl::Lit::Bool(true))
                 .with_ty(Type::Infer(Rc::clone(&quantified))),
         );
-        let refined_domain = Type::Refinement(
-            Box::new(Type::UIntRange(3)), // ground base: hides the predicate's level
+        let refined_domain = Type::refined_one(
+            Type::UIntRange(3), // ground base: hides the predicate's level
             Refinement::sharing(&predicate),
         );
         let ty = Type::Fun {
@@ -770,7 +773,7 @@ mod tests {
         let Type::Fun { domain, .. } = &fresh else {
             panic!("expected a function type");
         };
-        let Type::Refinement(_, r) = &**domain else {
+        let [r] = domain.refinements() else {
             panic!("expected the refinement to survive freshening");
         };
         let Type::Infer(v) = &r.predicate.ty else {

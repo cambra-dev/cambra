@@ -838,14 +838,16 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         e.walk_children(|c| ids_of(c, out));
     }
     fn from_ty(t: &Type, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        if let Type::Refinement(_, r) = t {
-            let key = Rc::as_ptr(&r.predicate) as usize;
-            if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
-                let mut s = HashSet::new();
-                ids_of(&r.predicate, &mut s);
-                slot.insert(s);
+        if let Type::Refinement(_, rs) = t {
+            for r in rs.iter() {
+                let key = Rc::as_ptr(&r.predicate) as usize;
+                if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
+                    let mut s = HashSet::new();
+                    ids_of(&r.predicate, &mut s);
+                    slot.insert(s);
+                }
+                from_expr_ty(&r.predicate, acc);
             }
-            from_expr_ty(&r.predicate, acc);
         }
         t.walk_children(|c| from_ty(c, acc));
     }
@@ -910,8 +912,12 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut std::collections::HashSet<NodeId>) {
-        if let Type::Refinement(_, r) = t {
-            from_expr(&r.predicate, acc);
+        if let Type::Refinement(_, refinements) = t {
+            // Every refinement's predicate rides the slot, so every one of them
+            // carries ids the projections must explain.
+            for r in refinements.iter() {
+                from_expr(&r.predicate, acc);
+            }
         }
         t.walk_children(|c| from_ty(c, acc));
     }

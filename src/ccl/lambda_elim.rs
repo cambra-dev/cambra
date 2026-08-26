@@ -1627,7 +1627,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let source_domain = target_elim.ty.domain().unwrap();
             let source_codomain = target_elim.ty.codomain().unwrap();
             let refinement = Refinement::born(Rc::new(pred_on_source));
-            let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
+            let refined_domain = Type::refined_one(source_domain, refinement);
             // A **domain-only** rewrite of the source, so it keeps the source's
             // own function type: `fun_like`, not a bare `Type::fun`, which would rebuild
             // a collection as a capability (`src/ccl/design/type-inference.md`,
@@ -2047,7 +2047,7 @@ mod tests {
         // a dedicated AST field. `substitute` must descend through the type
         // (via `substitute_in_type`) into the predicate body.
         let refinement = Refinement::born(Rc::new(refinement_pred));
-        let refined_param = Type::Refinement(Box::new(int_ty()), refinement);
+        let refined_param = Type::refined_one(int_ty(), refinement);
         let expr = Expr::lambda("x", int_ty(), Expr::var("x").with_ty(int_ty()))
             .with_ty(fun_ty(refined_param, int_ty()));
 
@@ -2058,9 +2058,9 @@ mod tests {
         // Extract the refinement predicate from the result's domain type to
         // verify substitution descended into it.
         let pred_after_subst = match &result.ty {
-            Type::Fun { domain, .. } => match domain.as_ref() {
-                Type::Refinement(_, r) => (*r.predicate).clone(),
-                other => panic!("expected refined domain, got {other}"),
+            Type::Fun { domain, .. } => match domain.refinements() {
+                [r] => (*r.predicate).clone(),
+                _ => panic!("expected a singly-refined domain, got {domain}"),
             },
             other => panic!("expected function type, got {other}"),
         };
@@ -2179,7 +2179,7 @@ mod tests {
 
         // Uncorrelated refinement (a Bool constant predicate) on the param.
         let refinement = Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty)));
-        let refined_y_ty = Type::Refinement(Box::new(int_ty()), refinement);
+        let refined_y_ty = Type::refined_one(int_ty(), refinement);
         let body = var("y").with_ty(int_ty());
 
         // Eliminate λ y → y over the refined domain.
@@ -2234,10 +2234,7 @@ mod tests {
 
         // Tuple([Int, {Int | __elem > x}]): the predicate rides only the second
         // component, so `any`-vs-`all` is observable.
-        let tuple_ty = Type::Tuple(vec![
-            int_ty(),
-            Type::Refinement(Box::new(int_ty()), refinement),
-        ]);
+        let tuple_ty = Type::Tuple(vec![int_ty(), Type::refined_one(int_ty(), refinement)]);
 
         // Lit(42) typed with the tuple above — the expression node itself has no
         // free vars, so both answers come entirely from `is_free_in_type`.

@@ -33,9 +33,9 @@ use super::*;
 ///    so no extra marker is added.
 /// 2. **Iterate-then-restricts chain** (the [`wrap_with_iterate`]
 ///    fallback) — build the source by *applying* one `restrict(p)`
-///    filter per refinement layer (innermost first) to a chain-head
-///    `Apply(true ▷ const, Iterate)`, then compose the body onto it:
-///    `(iterate ▷ (p_inner ▷ restrict) ▷ … ▷ (p_outer ▷ restrict)) ≫
+///    filter per refinement, in [`crate::ccl::application_order`], to a
+///    chain-head `Apply(true ▷ const, Iterate)`, then compose the body
+///    onto it: `(iterate ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)) ≫
 ///    body`.  Each `restrict` *applies* to its upstream (it is a
 ///    function transformer, not a composed morphism — see
 ///    [`make_restrict`]).  Unrefined sites get just the chain-head
@@ -394,8 +394,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
-    // The recording names the site being wrapped. The predicate `fresh_copy` below lands
-    // as a `Copy` of the term it lifts out of the type.
+    // The recording names the site being wrapped.
     //
     // These rows reach no table in a normal compile: `compile_program` calls
     // `planning::run` outside every pass scope it opens, so they land only under
@@ -405,47 +404,35 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
         "planning.iterate",
         provenance::Nature::Machinery,
     );
-    // Walk every nested `Type::Refinement` layer (innermost ⊇ outermost,
-    // each layer's predicate must hold), collecting the predicates
-    // outer-to-inner; reverse to inner-to-outer.  Then emit a uniform
-    // chain: one chain-head `iterate(true)` over the unrefined base
-    // (op-conversion's `IterateExtent`), followed by one
-    // `restrict(p_inner)`, `restrict(p_next)`, … per refinement layer,
-    // narrowing the domain layer by layer.  Unrefined sites get just
-    // the iterate.
-    // Recover each layer's point-free predicate function from its bare
-    // `__elem ▷ p` form — that is what `make_restrict` filters with (the
-    // refinement type it then re-stamps stays bare).
-    let mut preds: Vec<Expr> = Vec::new();
-    let mut current = &domain_ty;
-    while let Type::Refinement(base, refinement) = current {
-        // Lifting a predicate out of a *type* and into the term tree: one
-        // predicate `Rc` reached from two iteration sites would otherwise land
-        // twice. `fn_of_bare_predicate` already returns an owned, freshened term
-        // on both its paths — the fast path clones the function subterm, the slow
-        // path η-expands and runs `lambda_elim` — so the lift is already a
-        // distinct node-set and needs no second copy here. (It needed one when
-        // `Clone` preserved ids; the trailing `fresh_copy()` was load-bearing
-        // then, and cloning again now would duplicate a whole tree per
-        // refinement layer for nothing.)
-        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate));
-        current = base.as_ref();
-    }
-    preds.reverse();
+    // Every refinement at the position must hold, so each becomes a filter and
+    // the pipeline narrows stage by stage.  `application_order` picks the order —
+    // any is correct for the same final domain, and choosing it in one place is
+    // what makes the predicates compiled for this pipeline agree with its types.
+    // The chain is uniform: one chain-head `iterate(true)` over the unrefined base
+    // (op-conversion's `IterateExtent`), then one `restrict(pₖ)` per refinement.
+    // Unrefined sites get just the iterate.
+    let base = domain_ty.peel_refinements();
     let body = take(expr);
-    // Build the iteration source by applying one `restrict(p)` per
-    // refinement layer (innermost first) to a chain-head `iterate(true)`
-    // over the unrefined base.  Each `restrict` is a function transformer
-    // *applied* to its upstream (not composed): `make_restrict` narrows
-    // the domain layer by layer while preserving the codomain, so `source`
-    // ends with type `{{…{D | p_inner} …} | p_outer} ⇒ D` — the full
-    // refinement on the domain.  The value-producing `body` is then
+    // Build the iteration source by applying one `restrict(p)` per refinement to a
+    // chain-head `iterate(true)` over the unrefined base.  Each `restrict` is a
+    // function transformer *applied* to its upstream (not composed):
+    // `make_restrict` narrows the domain by one refinement while preserving the
+    // codomain, so `source` ends with type `{D | p₁, …, pₙ} ⇒ D` — the site's
+    // full refinement set on the domain.  The value-producing `body` is then
     // composed onto that source as a genuine CCC morphism.
+    //
+    // Each refinement's predicate function is recovered from its bare `__elem ▷ p`
+    // form against the element type that stage of the pipeline actually sees —
+    // the base narrowed by the refinements applied before it (`application_order`,
+    // which `compile_predicates_in_type` walks identically so the compiled
+    // predicates match these stages). Any order of the refinements yields a
+    // well-typed pipeline for the same final domain; the order is planning's to
+    // choose, which is what lets the refinement set itself stay unordered.
     let site_ty = body.ty.clone();
-    let source = preds.into_iter().fold(
-        make_iterate(trivially_true_predicate(current.clone())),
-        |upstream, pred| make_restrict(pred, upstream),
-    );
+    let mut source = make_iterate(trivially_true_predicate(base.clone()));
+    for (r, elem_ty) in crate::ccl::application_order(domain_ty.refinements(), base) {
+        source = make_restrict(fn_of_bare_predicate(&elem_ty, &r.predicate), source);
+    }
     // An iteration source produces the refined extent it iterates, so its
     // codomain is the *site's* refined domain `{D | p}`, mirroring
     // `make_iterate`'s `{D | p} ⇒ {D | p}` symmetry. Surfacing the refinement
@@ -875,12 +862,13 @@ mod tests {
 
     #[test]
     fn test_wrap_with_iterate_nested_refinements_emits_chain() {
-        // `{{D | p_inner} | p_outer} ⇒ Int` builds the iteration source by
-        // *applying* one restrict per refinement layer (inner first) to a
-        // chain-head trivially-true iterate, then composes `body` onto it:
-        //   restrict(p_outer)(restrict(p_inner)(iterate(true))) ≫ body.
-        // So the outermost application narrows by `p_outer`, its upstream
-        // narrows by `p_inner`, and the innermost upstream is the iterate.
+        // `{D | p₁, p₂} ⇒ Int` builds the iteration source by *applying* one
+        // restrict per refinement, in `application_order`, to a chain-head
+        // trivially-true iterate, then composes `body` onto it:
+        //   restrict(p₂)(restrict(p₁)(iterate(true))) ≫ body.
+        // So the outermost application narrows by the last refinement in that
+        // order, its upstream by the first, and the innermost upstream is the
+        // iterate.
         let int = int_ty();
         let inner_pred = var("p_inner").with_ty(fun_ty(Type::UIntRange(3), bool_ty()));
         let outer_pred = var("p_outer").with_ty(fun_ty(Type::UIntRange(3), bool_ty()));
