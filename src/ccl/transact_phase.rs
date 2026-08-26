@@ -1740,8 +1740,10 @@ fn check_store_acyclicity(
             if let Some(k) = clash(&awaited_in(e, &marked), store) {
                 return Err(format!(
                     "a `with begin():` block's {what} depends on `await_final({0})`, and the \
-                     block commits into `{0}`'s own store — it would await a history it has not \
-                     finished writing",
+                     block commits into `{0}`'s own store — one store is one recurrence, so a \
+                     value read out of it cannot feed a writer back into it. (Two transactional \
+                     mutable variables land in one store only when some `with begin():` block \
+                     mentions them together, reads included.)",
                     k.base()
                 ));
             }
