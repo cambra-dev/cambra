@@ -1313,11 +1313,11 @@ that block's value — its last statement's, by the rule in §4.5:
 
 ```python
 label = if score > 90:
-    "high"
-elif score > 50:
-    "mid"
-else:
-    "low"
+      "high"
+  elif score > 50:
+      "mid"
+  else:
+      "low"
 
 n = match msg:
     case `ping(seq):
