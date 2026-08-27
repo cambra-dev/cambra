@@ -2001,6 +2001,10 @@ pub fn compile_program(
     // tail of the `Let*` chain rather than a `Record`; we synthesise a single
     // `("main", op)` entry for them so the rest of the function operates
     // uniformly on `Vec<(name, op)>`.
+    // Assign every mutable variable its identity before anything is built from the
+    // tree, so a store is built under the identity `state_conflicts` checked this
+    // version against. Both conversion entries below need it.
+    ctx.conversion_ctx().set_var_paths(&join_planned);
     let per_field_ops = if sink_bindings_registry.is_empty() {
         let op = convert_to_operators(&join_planned, ctx.conversion_ctx()).errs()?;
         vec![("main".to_string(), op)]

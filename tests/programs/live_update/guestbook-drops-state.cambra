@@ -1,8 +1,0 @@
-sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
-
-for entry in sign_reqs:
-    sign_resps << entry + "\n"
-
-for req in peek_reqs:
-    peek_resps << "peek\n"

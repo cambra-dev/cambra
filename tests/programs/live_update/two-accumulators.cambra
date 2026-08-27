@@ -1,9 +1,0 @@
-left := ""
-right := ""
-
-reqs, resps = http_serve("{PORT}", "POST", "/bump")
-
-for x in reqs:
-    left := left + "a"
-    right := right + "B"
-    resps << left + "|" + right + "\n"

@@ -39,8 +39,8 @@ use crate::ccl::{
     diff::diff,
 };
 use crate::interpreter::{
-    Consumer, Value,
-    operator_conversion::{ReuseTally, StateConflict, TRANSACTION_STORE_ID},
+    Consumer,
+    operator_conversion::{ReuseTally, StateConflict},
     tile_operators::TileProducer,
 };
 
@@ -48,26 +48,6 @@ use crate::interpreter::{
 ///
 /// Called once per version: each compilation subscribes its own.
 pub type MainConsumerFactory<'a> = &'a dyn Fn() -> Box<dyn Consumer>;
-
-/// Name a mutable variable the way its author can recognize it.
-///
-/// Both kinds carry their own spelling as their key: a transactional variable
-/// always did, and an induction accumulator does now that the write set is
-/// keyed by the variable written. A loop's accumulator is qualified by the
-/// source its loop reads, which is what tells two loops' variables apart when
-/// they share a name; a transactional one is not qualified at all, because every
-/// commit store in a program shares one bucket.
-fn describe_variable(store_id: &str, key: &Value) -> String {
-    let key = match key {
-        Value::String(name) => name.to_string(),
-        other => format!("{other:?}"),
-    };
-    if store_id == TRANSACTION_STORE_ID {
-        format!("transactional variable `{key}`")
-    } else {
-        format!("`{key}`, of the loop over `{store_id}`")
-    }
-}
 
 /// A compiled program being driven, and the version-swap operation over it.
 pub struct LiveProgram {
@@ -205,13 +185,15 @@ impl LiveProgram {
             let mut lines: Vec<String> = conflicts
                 .iter()
                 .map(|c| {
-                    let what = describe_variable(c.store(), c.key());
+                    let what = c.path();
                     match c {
                         StateConflict::Dropped { .. } => {
                             format!("{what} is no longer declared")
                         }
-                        StateConflict::Moved { now, .. } => {
-                            format!("{what} now belongs to `{now}` instead")
+                        StateConflict::Moved { held, declared, .. } => {
+                            format!(
+                                "{what} counted positions in {held} and now counts them in {declared}"
+                            )
                         }
                         StateConflict::Retyped { held, declared, .. } => {
                             format!("{what} is now {declared} rather than {held}")
@@ -222,8 +204,8 @@ impl LiveProgram {
             lines.sort();
             return Err(vec![CompileError::Unsupported(format!(
                 "this version cannot take over state the running program is holding: {}. \
-A value has nowhere to be seeded from unless the new version declares the same \
-variable at the same type.",
+A value carries forward only into the same variable, at the same type, counting \
+positions in the same place.",
                 lines.join(", "),
             ))]);
         }

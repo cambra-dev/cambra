@@ -305,33 +305,39 @@ Three pieces carry that:
   fan's own memo rather than keeping a copy beside the operator is what keeps
   this off the shared-state ledger `./ci.sh shared_state` maintains: no value
   crosses between operators outside a tile.
-- **The name.** State is keyed by `(store id, runtime key)`, and the runtime key
-  is the variable's own spelling — a writer's write set is keyed by the variable
-  written, so the name survives from the source text to the store. An induction
-  store's id is the data source its loop iterates, which tells two loops' `count`
-  apart; a commit store's id is `__txn`, since a transactional variable is not
-  tied to one source. Both store kinds seed a rebuilt store's keys from the
-  carried values, so a transactional variable survives an edit to the writer that
-  commits it exactly as an accumulator survives an edit to its loop.
+- **The name.** State is keyed by a `VarPath`: the variable's own spelling plus
+  its index among the variables of that spelling, in tree order. The spelling
+  carries the meaning — a writer's write set is keyed by the variable written, so
+  the name survives from the source text to the store — and the index only
+  disambiguates. Counted among the variables sharing the spelling rather than
+  among all of them, so a stateful loop added anywhere shifts nothing unless it
+  declares that same name.
 
-  **A store id is not an identity.** A program has one commit store per causal
-  group, so every group's variables share the `__txn` id, and a loop's id is the
-  collection it reads rather than the loop itself. The pair is enough to tell two
-  variables apart only because `Name::field_key` spellings are distinct within the
-  record that declares them and no two records in reach declare the same one.
-  Keying state by the variable's declaration would need neither half; the id is
-  what the code has today.
+  **A spelling is not unique, and nothing computed can stand in for one.** A
+  declaration can be shadowed, and a function holding a whole stateful loop
+  declares one variable per call site once inlining has cloned its body. Two such
+  instantiations can differ *only* in their writer bodies once arguments are
+  substituted, so a content-derived identity either fails to tell them apart or
+  changes under exactly the edit state has to survive. The index is what is left,
+  and it is why identity is assigned by one walk
+  (`OpConversionContext::set_var_paths`) whose answers both the guard and
+  conversion read, rather than derived twice.
 - **The position.** A rebuilt store resumes at the retired store's frontier, and
   each variable's seed is that store's value at the same position
   (`CarriedState`). The value and the position travel together because either one
   alone decides a position twice or skips it, and they hang off the *variable*
-  because the id they would otherwise hang off names no one store: two commit
-  stores at different frontiers would race to set one position and hash order
-  would settle it. A rebuilt store reads the position back off any variable it
-  declares, asserting that its variables agree. Both the store's seed tick
-  (`CommitEngine::seeded_at`) and the drive's window base come from `resume_at`,
-  and they must agree — `InductionDriver` asserts that a decision cannot precede
-  the input it decides.
+  because a variable is what has an identity: a store has none, so two commit
+  stores at different frontiers would otherwise race to set one position. A
+  rebuilt store reads the position back off any variable it declares. Both the
+  store's seed tick (`CommitEngine::seeded_at`) and the drive's window base come
+  from `resume_at`, and they must agree — `InductionDriver` asserts that a
+  decision cannot precede the input it decides.
+
+  A position only means something in the space it was counted in, which
+  `PositionSpace` names: a data source, a transaction's private clock, or a fixed
+  collection. A variable over a fixed collection carries nothing at all — its
+  replacement recomputes the fold from the collection its own version declares,
+  and seeding it would count the elements twice.
 - **What the source still owes.** A source hands a producer registering after the
   swap the release state its retired producers agreed on, which runs *below* a
   store's resume position rather than deciding it: a drive holds the input it

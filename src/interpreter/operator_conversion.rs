@@ -6,6 +6,7 @@ use crate::{
         Type, TypedExprNode, V_COMMIT, WriterSite,
         ccl_utils::{free_names, is_trivially_true_predicate},
         content_hash::{ContentHash, resolved_hash},
+        provenance::NodeId,
         symbolic::symbolic,
     },
     interpreter::{
@@ -256,17 +257,44 @@ enum StoreReadKind {
 /// expressed in the CCL, not here.
 #[derive(Clone)]
 struct KeyReadInfo {
+    /// What identifies this variable across versions, or `None` for a key that is
+    /// not a variable.
+    ///
+    /// `Some` exactly for a mutable variable, so this is also what
+    /// [`carry_forward`](Self::carry_forward) answers: a reply tap is a
+    /// per-commit event, and a key that carries no value between ticks has no
+    /// state to carry between versions either. One field rather than two that
+    /// would have to agree.
+    ///
+    /// Distinct from `runtime_key`, which labels the variable inside *this*
+    /// store's record and is the user's spelling alone: a spelling is unique per
+    /// record, and an identity has to be unique per program. Assigned by the walk
+    /// the guard also reads ([`mutable_variable_paths`]).
+    carried: Option<VarPath>,
     /// The runtime key the variable's value lives under in the commit store map
     /// (`commit` stores only; `Value::Unit` for induction stores).
     runtime_key: Value,
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
+}
+
+impl KeyReadInfo {
     /// Whether the key's value carries forward across commit ticks that don't
-    /// write it (`commit` stores): `true` for a mutable variable (persistent value),
-    /// `false` for a reply tap (a per-commit event). See
-    /// [`StoreValueStream::carry_forward`].
-    carry_forward: bool,
+    /// write it (`commit` stores). See [`StoreValueStream::carry_forward`].
+    fn carry_forward(&self) -> bool {
+        self.carried.is_some()
+    }
+}
+
+impl StoreReadInfo {
+    /// This store's keys that carry state, each with the identity it carries it
+    /// under.
+    fn carried_keys(&self) -> impl Iterator<Item = (&VarPath, &KeyReadInfo)> {
+        self.keys
+            .values()
+            .filter_map(|k| k.carried.as_ref().map(|path| (path, k)))
+    }
 }
 
 /// A built transactional store, registered under its `__hist` binder so each
@@ -286,15 +314,15 @@ struct StoreReadInfo {
     /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
     /// dense `Induction` store.
     induction_extent: Option<Extent>,
-    /// What names this store's carried variables across versions — the data
-    /// source its loop reads ([`store_id`]).
+    /// The space this store's positions are counted in ([`store_id`]), which is
+    /// what decides whether a replacement may resume at its frontier or has to
+    /// start at `0`.
     ///
-    /// Their *values* are not held here: a store's value rides its own fan as a
-    /// [`Tile::Store`], so a version replacing this one reads them off
+    /// Its variables' *values* are not held here: a store's value rides its own
+    /// fan as a [`Tile::Store`], so a version replacing this one reads them off
     /// [`FanOut::cached_tile`] rather than through a second channel out of the
-    /// operator. `None` for a loop over anything but a data source, which has no
-    /// name to resume under.
-    state_store_id: Option<String>,
+    /// operator.
+    position_space: PositionSpace,
     /// The token a term reading this store hashes to — the same role
     /// [`LetBinding::correspondent`] plays, for a binding that lives in
     /// [`transactional_stores`](OpConversionContext::transactional_stores)
@@ -338,6 +366,11 @@ pub struct OpConversionContext {
     reuse: ReuseTally,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    /// Every mutable variable's identity, by the `Transact` node that declares
+    /// it, from [`mutable_variable_paths`] over the tree about to be converted.
+    /// Installed by [`set_var_paths`](Self::set_var_paths) before conversion
+    /// begins; empty for a context converting no `Transact`.
+    var_paths: HashMap<NodeId, Vec<VarPath>>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
     /// `let __hist = Transact{…}` builds the shared store once and registers
     /// it here; each variable read `__hist.k` projects key `k` off the shared
@@ -356,18 +389,11 @@ pub struct OpConversionContext {
 pub struct Inheritance {
     operators: HashMap<ContentHash, Rc<FanOut>>,
     stores: HashMap<ContentHash, StoreReadInfo>,
-    /// What each mutable variable hands to the variable that replaces it, by store
-    /// id and then by runtime key. Read off `stores` at handover
+    /// What each mutable variable hands to the variable that replaces it, by
+    /// identity. Read off `stores` at handover
     /// ([`OpConversionContext::into_inheritance`]), so the copy a compilation is
     /// still accumulating into carries none — only the one it hands on.
-    ///
-    /// Nested rather than keyed by the pair, because the store id is not an
-    /// identity: every commit store in a program answers to `__txn`, so one
-    /// bucket holds the variables of every transaction group. That is why the
-    /// resume position hangs off each variable and not off the bucket — two
-    /// stores sharing a bucket would otherwise race to set one position, and hash
-    /// order would decide it.
-    mutable_state: HashMap<String, HashMap<Value, CarriedState>>,
+    mutable_state: HashMap<VarPath, CarriedState>,
 }
 
 /// What one mutable variable hands to the variable rebuilt in its place.
@@ -379,13 +405,17 @@ pub struct Inheritance {
 pub(crate) struct CarriedState {
     /// The value the variable held at `resume_at`.
     value: Value,
+    /// The space `resume_at` counts in. A replacement whose recurrence reads
+    /// something else seeds the value and starts at `0`.
+    space: PositionSpace,
     /// The first position of the source the replacement consumes — the retired
     /// store's frontier, which is the position it had reached and not yet
     /// decided.
     ///
-    /// A property of the store, carried per variable because a store id names no
-    /// one store. Every variable of one store carries the same position, and the
-    /// store rebuilt in its place reads it back off any variable it declares.
+    /// A property of the store, carried per variable because a variable is what
+    /// has an identity — a store has none. Every variable of one store carries
+    /// the same position, and the store rebuilt in its place reads it back off
+    /// any variable it declares.
     ///
     /// Taken from the retired store's own frontier rather than from how far its
     /// source has been released. A drive retains the input it reads one position
@@ -453,6 +483,15 @@ impl OpConversionContext {
     /// Create a new empty context with no registered sources.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the identities the tree about to be converted declares.
+    ///
+    /// Read off the tree once, before conversion, so a store is built under the
+    /// identity the guard checked it against rather than under a second
+    /// derivation of one.
+    pub fn set_var_paths(&mut self, expr: &Expr) {
+        self.var_paths = mutable_variable_paths(expr);
     }
 
     /// Register a data-source implementation under `name`.
@@ -544,6 +583,20 @@ impl OpConversionContext {
     ) -> Result<(), ConversionError> {
         let identity = resolved_hash(bound_expr, &self.binder_correspondents());
         self.reuse.bound += 1;
+        // The identities the guard checked this version against, for the store
+        // about to be built. Assigned by one walk of the planned tree
+        // ([`mutable_variable_paths`]) rather than derived here, so a variable is
+        // built under the identity it was checked under.
+        let paths = self
+            .var_paths
+            .get(&bound_expr.node_id())
+            .cloned()
+            .unwrap_or_default();
+        debug_assert_eq!(
+            paths.len(),
+            keys.len(),
+            "the identity walk and conversion disagree about how many variables this store declares"
+        );
 
         let adoptable = self
             .reads_only_adopted(bound_expr)
@@ -558,7 +611,7 @@ impl OpConversionContext {
             None => {
                 trace!("building store for binding {name}");
                 self.rebuilt.insert(name.clone());
-                build_transact_store(keys, writers, domain, self)?
+                build_transact_store(keys, writers, domain, &paths, self)?
             }
         };
         let info = StoreReadInfo {
@@ -659,49 +712,34 @@ impl OpConversionContext {
         let declared = declared_state(planned);
         let mut out = Vec::new();
         for info in self.minted.stores.values() {
-            let Some(store) = &info.state_store_id else {
+            if !info.position_space.carries() {
                 continue;
-            };
-            for key in info.keys.values().filter(|k| k.carry_forward) {
-                let id = (store.clone(), key.runtime_key.clone());
-                match declared.get(&id).map(|ty| self.extent_of(ty)) {
-                    None => {
-                        // The same name under another store is a variable that
-                        // moved between loops, which reads very differently to
-                        // one that was deleted.
-                        // `min`, not `find`: several stores may declare the
-                        // name, and a `HashMap`'s first match would make the
-                        // diagnostic depend on hash order.
-                        let now = declared
-                            .keys()
-                            .filter(|(_, k)| *k == key.runtime_key)
-                            .map(|(s, _)| s)
-                            .min()
-                            .cloned();
-                        out.push(match now {
-                            Some(now) => StateConflict::Moved {
-                                store: store.clone(),
-                                key: key.runtime_key.clone(),
-                                now,
-                            },
-                            None => StateConflict::Dropped {
-                                store: store.clone(),
-                                key: key.runtime_key.clone(),
-                            },
-                        })
-                    }
-                    Some(Ok(declared)) if declared != key.value_extent => {
-                        out.push(StateConflict::Retyped {
-                            store: store.clone(),
-                            key: key.runtime_key.clone(),
-                            held: key.value_extent.clone(),
-                            declared,
-                        })
-                    }
-                    // A declared type the conversion context cannot resolve to an
-                    // extent is a compile error the real compile will raise with
-                    // its own diagnostic; this check has nothing to add.
-                    Some(_) => {}
+            }
+            for (path, key) in info.carried_keys() {
+                let Some(decl) = declared.get(path) else {
+                    out.push(StateConflict::Dropped { path: path.clone() });
+                    continue;
+                };
+                if decl.space != info.position_space {
+                    out.push(StateConflict::Moved {
+                        path: path.clone(),
+                        held: info.position_space.clone(),
+                        declared: decl.space.clone(),
+                    });
+                    continue;
+                }
+                // A declared type the conversion context cannot resolve to an
+                // extent is a compile error the real compile will raise with its
+                // own diagnostic; this check has nothing to add.
+                let Ok(extent) = self.extent_of(&decl.ty) else {
+                    continue;
+                };
+                if extent != key.value_extent {
+                    out.push(StateConflict::Retyped {
+                        path: path.clone(),
+                        held: key.value_extent.clone(),
+                        declared: extent,
+                    });
                 }
             }
         }
@@ -722,16 +760,14 @@ impl OpConversionContext {
     /// decided no position has no frontier, and a variable no position has written
     /// has no value at the frontier. Either way its replacement reads its init,
     /// which is what it would have read anyway.
-    pub(crate) fn live_state(&self) -> HashMap<String, HashMap<Value, CarriedState>> {
-        let mut out: HashMap<String, HashMap<Value, CarriedState>> = HashMap::new();
+    pub(crate) fn live_state(&self) -> HashMap<VarPath, CarriedState> {
+        let mut out: HashMap<VarPath, CarriedState> = HashMap::new();
         for info in self.minted.stores.values() {
-            let Some(store) = &info.state_store_id else {
-                continue;
-            };
             let Some(tile) = info.fan.cached_tile() else {
                 debug_assert!(
                     false,
-                    "store `{store}` has no cached tile: a store's fan is cyclic, so it has one"
+                    "a store's fan is cyclic, so it has a cached tile: {:?}",
+                    info.keys.keys().collect::<Vec<_>>()
                 );
                 continue;
             };
@@ -741,15 +777,23 @@ impl OpConversionContext {
             let Some(frontier) = store_frontier(&tile) else {
                 continue;
             };
-            let bucket = out.entry(store.clone()).or_default();
-            for key in info.keys.values().filter(|k| k.carry_forward) {
+            if !info.position_space.carries() {
+                continue;
+            }
+            for (path, key) in info.carried_keys() {
                 if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
-                    bucket.insert(
-                        key.runtime_key.clone(),
+                    let prior = out.insert(
+                        path.clone(),
                         CarriedState {
                             value,
                             resume_at: frontier,
+                            space: info.position_space.clone(),
                         },
+                    );
+                    debug_assert!(
+                        prior.is_none(),
+                        "{path} is declared by two stores, so the walk that assigns \
+identities is not distinguishing them",
                     );
                 }
             }
@@ -1851,12 +1895,13 @@ fn build_transact_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
     domain: &Type,
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     if !matches!(domain, Type::Txn) {
-        return build_induction_store(keys, writers, ctx);
+        return build_induction_store(keys, writers, paths, ctx);
     }
-    build_commit_store(keys, writers, ctx)
+    build_commit_store(keys, writers, paths, ctx)
 }
 
 /// The reply taps on a writer body's `` {`commit{writes, to_<defer>*} | `abort} ``
@@ -1898,6 +1943,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 fn build_commit_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     // Each variable becomes a key under its `field_key`'s runtime value; the
@@ -1918,7 +1964,7 @@ fn build_commit_store(
     // homogeneous store collapses the union to its single extent (the common
     // case, unchanged).
     let mut value_extents: Vec<Extent> = Vec::new();
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let runtime_key = Value::String(field.clone().into());
         let key_value_extent = ctx.extent_of(&k.init.ty)?;
@@ -1931,11 +1977,7 @@ fn build_commit_store(
         // a transaction decides without discarding what it has committed — the
         // same rule the induction path follows, and the reason state is keyed by
         // variable rather than by store.
-        let carried = ctx
-            .inherited
-            .mutable_state
-            .get(TRANSACTION_STORE_ID)
-            .and_then(|bucket| bucket.get(&runtime_key));
+        let carried = ctx.inherited.mutable_state.get(&paths[i]);
         let init_op: Box<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming transactional {field} from the retired version's value");
@@ -1950,9 +1992,9 @@ fn build_commit_store(
         let prior = keys_map.insert(
             field,
             KeyReadInfo {
+                carried: Some(paths[i].clone()),
                 runtime_key,
                 value_extent: key_value_extent,
-                carry_forward: true, // mutable variable: value persists across commits
             },
         );
         debug_assert!(
@@ -2049,12 +2091,14 @@ fn build_commit_store(
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
-                    runtime_key: Value::String(field.clone().into()),
-                    value_extent: tap_value_extent,
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
-                    // taps to one defer don't smear across the shared clock.
-                    carry_forward: false,
+                    // taps to one defer don't smear across the shared clock. It
+                    // carries nothing between ticks and so nothing between
+                    // versions.
+                    carried: None,
+                    runtime_key: Value::String(field.clone().into()),
+                    value_extent: tap_value_extent,
                 },
             );
             // A tap shares this map with the mutable-variable keys, so its
@@ -2086,9 +2130,7 @@ fn build_commit_store(
         induction_extent: None,
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
-        // A transactional variable is not tied to one source — several endpoints
-        // commit to it — so a commit store has no source to name it by.
-        state_store_id: Some(TRANSACTION_STORE_ID.to_string()),
+        position_space: PositionSpace::Transaction,
     })
 }
 
@@ -2104,124 +2146,260 @@ fn induction_extent_is_positional(extent: &Extent) -> bool {
     matches!(extent, Extent::UIntRange(_) | Extent::DataSourceDomain(_))
 }
 
-/// The bucket every transactional variable resumes under.
+/// A mutable variable's identity across versions of a program.
 ///
-/// Shared by every commit store in a program, and a program has one per causal
-/// group rather than one in total, so this does **not** identify a store. What
-/// keeps two groups' variables apart inside the bucket is the variable's own
-/// spelling, and what keeps their resume positions apart is that the position
-/// hangs off each variable ([`CarriedState`]) rather than off the bucket —
-/// `two_transaction_groups_resume_at_their_own_positions` covers it.
+/// The spelling carries the meaning and the index only disambiguates, because a
+/// spelling is not unique on its own: a declaration can be shadowed, and a
+/// function holding a whole stateful loop declares one variable per call site
+/// once inlining has cloned its body. Neither of those has a name of its own to
+/// borrow, so the index is what tells them apart.
 ///
-/// The spelling is the remaining gap: [`Name::field_key`] is unique within the
-/// record that declares it, not across a program, so two groups that each
-/// declare a variable of the same name would share one entry. Reaching that needs
-/// two scopes declaring one name, which is why it is a gap rather than a defect
-/// today; closing it means keying state by the variable's declaration instead of
-/// by `(store, spelling)`.
-pub const TRANSACTION_STORE_ID: &str = "__txn";
+/// Counted among the variables that *share* the spelling rather than among all of
+/// them, which is what makes it stable: a stateful loop added anywhere shifts
+/// nothing unless it declares this same name. A version that does insert another
+/// `total` between two existing ones renumbers them, and the variables below the
+/// insertion read as dropped rather than as each other.
+///
+/// This is deliberately not derived from anything the program computes. Two
+/// instantiations of one function can differ *only* in their writer bodies once
+/// arguments are substituted, so any content-derived identity either fails to
+/// tell them apart or changes under exactly the edit state has to survive.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VarPath {
+    /// The variable's own spelling — [`Name::field_key`].
+    name: String,
+    /// Its position among the variables of this spelling, in tree order.
+    index: usize,
+}
 
-/// Every mutable variable `expr` declares, by the identity its state is carried
-/// under — what [`store_id`] and the key naming produce for the stores this
-/// tree will build.
+impl std::fmt::Display for VarPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The bare spelling while it is the only one, because that is what an
+        // author recognizes; the index only when it is doing work.
+        if self.index == 0 {
+            write!(f, "`{}`", self.name)
+        } else {
+            write!(f, "`{}` (#{})", self.name, self.index)
+        }
+    }
+}
+
+/// What a mutable variable's state may be carried into, beside its identity.
 ///
-/// Read off the term rather than from conversion, so a version can be asked what
-/// it would keep before anything is built from it.
-pub fn declared_state(expr: &Expr) -> HashMap<(String, Value), Type> {
-    fn go(e: &Expr, out: &mut HashMap<(String, Value), Type>) {
+/// A value can be seeded into any store that declares the variable at its type. A
+/// *position* cannot: `resume_at` counts positions of the collection the
+/// recurrence iterates, so it means nothing to a recurrence reading a different
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PositionSpace {
+    /// A commit clock, private to its store and restartable. There is no position
+    /// to carry: a replacement seeds each value and starts its clock at `0`.
+    Transaction,
+    /// Positions of a data source, which outlives the version reading it. A
+    /// replacement over the same source resumes at the retired store's frontier.
+    Source(String),
+    /// Positions of a finite collection, which is part of the program rather than
+    /// outside it. Nothing is carried: a replacement recomputes the whole fold
+    /// from the collection its own version declares, and seeding it would count
+    /// the elements twice.
+    Finite,
+}
+
+impl std::fmt::Display for PositionSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PositionSpace::Transaction => write!(f, "a transaction"),
+            PositionSpace::Source(source) => write!(f, "the loop over `{source}`"),
+            PositionSpace::Finite => write!(f, "a loop over a fixed collection"),
+        }
+    }
+}
+
+impl PositionSpace {
+    /// Whether a variable counting positions here has state to hand to its
+    /// replacement at all.
+    fn carries(&self) -> bool {
+        !matches!(self, PositionSpace::Finite)
+    }
+}
+
+/// Every mutable variable `expr` declares, by identity, with the type it is
+/// declared at and the position space its recurrence iterates.
+///
+/// One walk, shared by the guard and by conversion, so the identity a version is
+/// checked against is the identity its stores are built under. Deriving it twice
+/// would mean two computations that have to agree, and a disagreement reads as a
+/// variable that is still declared having been dropped.
+pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
+    let mut out = HashMap::new();
+    for v in mutable_variables(expr) {
+        // A variable over a fixed collection is recomputed, not carried, so it is
+        // not state a version has to be able to take over. Its identity is still
+        // numbered above, so removing one renumbers what follows exactly as
+        // removing any other would.
+        if !v.space.carries() {
+            continue;
+        }
+        out.insert(
+            v.path,
+            DeclaredVariable {
+                ty: v.key.init.ty.clone(),
+                space: v.space,
+            },
+        );
+    }
+    out
+}
+
+/// What a version declares a mutable variable as — enough to decide whether the
+/// running program's value can be seeded into it, and at what position.
+pub struct DeclaredVariable {
+    ty: Type,
+    space: PositionSpace,
+}
+
+/// Every mutable variable's identity, in key order, by the `Transact` node that
+/// declares it.
+///
+/// Handed to conversion so that a store is built under the identities the guard
+/// checked, rather than under a second derivation of them.
+pub fn mutable_variable_paths(expr: &Expr) -> HashMap<NodeId, Vec<VarPath>> {
+    let mut out: HashMap<NodeId, Vec<VarPath>> = HashMap::new();
+    for v in mutable_variables(expr) {
+        out.entry(v.declared_by).or_default().push(v.path);
+    }
+    out
+}
+
+/// One mutable variable as the identity walk sees it.
+struct MutableVariable<'e> {
+    path: VarPath,
+    key: &'e TransactKey,
+    space: PositionSpace,
+    /// The `Transact` node declaring it, so conversion can ask for the identities
+    /// of the store it is building.
+    declared_by: NodeId,
+}
+
+/// Every mutable variable in `expr`, in tree order, with its identity and the
+/// position space of the recurrence that carries it.
+///
+/// The one place identities are assigned. `Transact` is the only node that
+/// declares a mutable variable, so the walk is over those.
+fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
+    fn go<'e>(
+        e: &'e Expr,
+        counts: &mut HashMap<String, usize>,
+        out: &mut Vec<MutableVariable<'e>>,
+    ) {
         if let TypedExprNode::Transact {
             keys,
             writers,
             domain,
         } = &e.node
         {
-            // A transaction's variables resume under the one transaction id; an
-            // induction loop's under the source it reads, and a loop over
-            // anything else does not resume at all.
-            let store = if matches!(domain, Type::Txn) {
-                Some(TRANSACTION_STORE_ID.to_string())
-            } else {
-                writers.first().and_then(store_id)
-            };
-            if let Some(store) = store {
-                for k in keys {
-                    out.insert(
-                        (store.clone(), Value::String(k.name.field_key().into())),
-                        k.init.ty.clone(),
-                    );
-                }
+            let space = position_space(writers, domain);
+            for k in keys {
+                let name = k.name.field_key();
+                let index = counts.entry(name.clone()).or_insert(0);
+                out.push(MutableVariable {
+                    path: VarPath {
+                        name,
+                        index: *index,
+                    },
+                    key: k,
+                    space: space.clone(),
+                    declared_by: e.node_id(),
+                });
+                *index += 1;
             }
         }
-        e.walk_children(|c| go(c, out));
+        e.walk_children(|c| go(c, counts, out));
     }
-    let mut out = HashMap::new();
-    go(expr, &mut out);
+    let mut counts = HashMap::new();
+    let mut out = Vec::new();
+    go(expr, &mut counts, &mut out);
     out
+}
+
+/// The data source a recurrence's writer iterates, which is the space its
+/// positions are counted in.
+///
+/// `None` for a loop over anything but a data source: a finite list's positions
+/// are its own, and a replacement reading one recomputes rather than resumes.
+fn store_id(w: &WriterSite) -> Option<String> {
+    let domain = w.source.ty.domain()?;
+    match crate::ccl::ccl_utils::strip_refinements(&domain) {
+        Type::DataSource(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// The position space a `Transact`'s recurrence counts in.
+///
+/// A commit clock is private to its store and restartable, so a transaction's
+/// variables have no position to carry and every commit store answers the same
+/// way. An induction loop counts positions of the data source it iterates.
+fn position_space(writers: &[WriterSite], domain: &Type) -> PositionSpace {
+    if matches!(domain, Type::Txn) {
+        return PositionSpace::Transaction;
+    }
+    induction_position_space(writers.first())
+}
+
+/// The space an induction loop's writer counts positions in.
+fn induction_position_space(writer: Option<&WriterSite>) -> PositionSpace {
+    match writer.and_then(store_id) {
+        Some(source) => PositionSpace::Source(source),
+        None => PositionSpace::Finite,
+    }
 }
 
 /// A variable the running program is holding that a new version cannot take
 /// over.
+///
+/// Three shapes. Two are about the *value* having nowhere to go; the third is
+/// about its *position* meaning nothing where it is going, which is a policy
+/// refusal rather than a constraint — see [`StateConflict::Moved`].
 #[derive(Debug)]
 pub enum StateConflict {
     /// The new version does not declare it, so its value has nowhere to be
     /// seeded and would be discarded.
-    Dropped { store: String, key: Value },
-    /// The new version declares a variable of this name, but under a different
-    /// store — a loop's accumulator moved to another loop, or to or from a
-    /// transaction. Its history came from the inputs the old store read, so it
-    /// is not the same variable's value however the name matches.
+    Dropped { path: VarPath },
+    /// The new version's recurrence for it counts positions in a different space,
+    /// so the position the value was read at means nothing there.
+    ///
+    /// The *value* could still be seeded — a replacement whose space differs can
+    /// start at `0` and take the value forward, which is what a variable moving
+    /// between loops or into a transaction would want. Refusing rather than doing
+    /// that is a policy choice, not a constraint: a variable whose recurrence now
+    /// reads something else has a history that came from inputs the new one never
+    /// saw. `build_induction_store_single` asserts the spaces agree by the time it
+    /// seeds, so relaxing this means deleting the refusal and letting the
+    /// replacement start at `0`.
     Moved {
-        store: String,
-        key: Value,
-        now: String,
+        path: VarPath,
+        held: PositionSpace,
+        declared: PositionSpace,
     },
     /// The new version declares it at a different type. Its value cannot be the
     /// seed of a store that expects another shape: the store would be built
     /// around a constant of the wrong extent and fail on its first pull.
     Retyped {
-        store: String,
-        key: Value,
+        path: VarPath,
         held: Extent,
         declared: Extent,
     },
 }
 
 impl StateConflict {
-    /// The store the variable belongs to, for naming it in a diagnostic.
-    pub fn store(&self) -> &str {
+    /// The variable this is about, for naming it in a diagnostic.
+    pub fn path(&self) -> &VarPath {
         match self {
-            StateConflict::Dropped { store, .. }
-            | StateConflict::Moved { store, .. }
-            | StateConflict::Retyped { store, .. } => store,
+            StateConflict::Dropped { path }
+            | StateConflict::Moved { path, .. }
+            | StateConflict::Retyped { path, .. } => path,
         }
-    }
-
-    /// The variable's runtime key.
-    pub fn key(&self) -> &Value {
-        match self {
-            StateConflict::Dropped { key, .. }
-            | StateConflict::Moved { key, .. }
-            | StateConflict::Retyped { key, .. } => key,
-        }
-    }
-}
-
-/// What names a store's carried variables across versions: the data source its
-/// loop iterates.
-///
-/// The variables themselves are named — a write set is keyed by the variable
-/// written — but a name is only unique within its own loop, so two loops each
-/// carrying a `count` need telling apart. The source a loop reads is the part of
-/// it an edit to its body leaves alone, which is exactly the condition under
-/// which resuming is wanted.
-///
-/// `None` for a loop over anything but a data source: a list loop runs to
-/// completion rather than carrying state across an update.
-fn store_id(w: &WriterSite) -> Option<String> {
-    let domain = w.source.ty.domain()?;
-    match crate::ccl::ccl_utils::strip_refinements(&domain) {
-        Type::DataSource(name) => Some(name),
-        _ => None,
     }
 }
 
@@ -2232,6 +2410,7 @@ fn store_id(w: &WriterSite) -> Option<String> {
 fn build_induction_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let n_accs = keys.len();
@@ -2262,7 +2441,7 @@ fn build_induction_store(
         w.write_keys.len(),
         "the induction writer writes every accumulator key"
     );
-    build_induction_store_single(keys, w, ctx)
+    build_induction_store_single(keys, w, paths, ctx)
 }
 
 /// Build a single-writer induction store as a position-driven [`InductionStore`]
@@ -2278,11 +2457,12 @@ fn build_induction_store(
 fn build_induction_store_single(
     keys: &[TransactKey],
     w: &WriterSite,
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let key_extent = Extent::Base(BaseType::String);
     let runtime_key = |n: &Name| Value::String(n.field_key().into());
-    let store_id = store_id(w);
+    let space = induction_position_space(Some(w));
 
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
@@ -2294,7 +2474,7 @@ fn build_induction_store_single(
     // store's frontier, and `0` if none does — a store this version introduces,
     // or one that had decided no position.
     let mut resume_at: Option<usize> = None;
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = Value::String(field.clone().into());
         let value_extent = ctx.extent_of(&k.init.ty)?;
@@ -2306,11 +2486,14 @@ fn build_induction_store_single(
         // Rebuilding a store therefore changes what the loop does next without
         // discarding what it had accumulated, which is what distinguishes
         // swapping the logic from recomputing the program.
-        let carried = store_id
-            .as_ref()
-            .and_then(|s| ctx.inherited.mutable_state.get(s))
-            .and_then(|bucket| bucket.get(&rk));
+        let carried = ctx.inherited.mutable_state.get(&paths[i]);
         if let Some(carried) = carried {
+            debug_assert_eq!(
+                carried.space, space,
+                "{} resumes in a space its retired version never counted in; \
+`state_conflicts` refuses that before anything is built",
+                paths[i],
+            );
             // Every variable of one store carries that store's frontier, so any
             // of them answers for the store. They must agree: the seed tick and
             // the drive's window base both come from this, and the drive asserts
@@ -2333,15 +2516,15 @@ fn build_induction_store_single(
         keys_map.insert(
             field,
             KeyReadInfo {
+                // An accumulator persists across positions. A literal init is the
+                // leading-carry fold default; a *conditional* single-writer loop
+                // does have leading carries (positions before the first
+                // committing write), and those read the accumulator's seed,
+                // supplied by the tick-0 init in `CommitEngine::new(inits)` — not
+                // this default, which anchors a computed-init empty fold.
+                carried: Some(paths[i].clone()),
                 runtime_key: rk,
                 value_extent,
-                carry_forward: true, // an accumulator persists across positions
-                                     // A literal init is the leading-carry fold default. A
-                                     // *conditional* single-writer loop does have leading carries
-                                     // (positions before the first committing write); those read the
-                                     // accumulator's seed, supplied by the tick-0 init in
-                                     // `CommitEngine::new(inits)` — not this default, which anchors a
-                                     // computed-init empty fold.
             },
         );
     }
@@ -2399,8 +2582,8 @@ fn build_induction_store_single(
     // the same shape a commit writer carries (see `build_commit_store`). Each tap
     // becomes a write-only changelog key (appended after the accumulator keys), so
     // its per-position value rides the committing change and is read back densely.
-    // A tap is a per-position event, not a carried mutable variable (`carry_forward:
-    // false`): it appears only at the position that fired it. Under a conditional
+    // A tap is a per-position event, not a carried mutable variable (`carried:
+    // None`): it appears only at the position that fired it. Under a conditional
     // feed the decision also carries a `to_<defer>__fire` gate, which the producer
     // reads to omit a non-fired tap from the delta.
     let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
@@ -2411,9 +2594,9 @@ fn build_induction_store_single(
         keys_map.insert(
             field.clone(),
             KeyReadInfo {
+                carried: None, // a tap fires only at its own position
                 runtime_key: Value::String(field.clone().into()),
                 value_extent: tap_value_extent,
-                carry_forward: false, // a tap fires only at its own position
             },
         );
         tap_fields.push(field);
@@ -2457,7 +2640,7 @@ fn build_induction_store_single(
         keys: keys_map,
         kind: StoreReadKind::InductionChangelog,
         induction_extent: Some(induction_extent),
-        state_store_id: store_id,
+        position_space: space,
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
     })
@@ -2606,7 +2789,7 @@ fn convert_store_read(
             (
                 k.runtime_key.clone(),
                 k.value_extent.clone(),
-                k.carry_forward,
+                k.carry_forward(),
             )
         });
         (

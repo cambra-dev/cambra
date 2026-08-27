@@ -3,23 +3,26 @@
 //!
 //! # The programs
 //!
-//! Base programs with variants that differ from them by one edit. A variant is
-//! named for its edit, so `diff`ing it against its base shows what a case is
-//! about.
+//! The gallery entry is one program and the version that replaces it:
+//! `program.cambra` is a guestbook where `POST /sign` accumulates into a mutable
+//! variable and `GET /peek` holds no state, and `updated.cambra` is the same
+//! program with the accumulating loop edited. That pair is what a reader should
+//! look at to see what an update *is*.
+//!
+//! Everything else the cases drive is scaffolding, and lives inline in
+//! [`fixtures`]: variants that differ from a base by the single edit their case is
+//! about, plus the shapes with no single base — a program on two ports, and the
+//! `stdin`-sourced ones. The bases they vary:
 //!
 //! | Base | Shape |
 //! | --- | --- |
-//! | `guestbook` | `POST /sign` accumulates into a mutable variable, `GET /peek` holds no state. Both loops fall in one causal group, so one `Transact` store carries them. |
+//! | `guestbook` | The gallery program. Both its loops fall in one causal group, so one `Transact` store carries them. |
 //! | `two-loops` | `POST /a` and `POST /b` each accumulate into their own variable. Independent, so a store each — one stays adoptable while the other is rebuilt. |
 //! | `two-accumulators` | One loop carrying two variables (`left` and `right`), for the cases about telling them apart. |
 //! | `one-stateful-loop` | `POST /p` accumulates, `POST /q` does not — the pair a variable can move between. |
 //! | `latest-write` | A transactional variable (`Mut(String, Txn)`) that `POST /set` overwrites and `GET /get` reads. |
 //! | `running-log` | A transactional variable that `POST /set` *appends* to, so every commit leaves a mark a replay would show. |
 //! | `two-transactions` | Two transactional variables written and read from disjoint endpoint pairs, so they fall in different causal groups and each gets its own commit store. |
-//!
-//! Two cases build their programs inline instead: the multi-port one, because a
-//! base program's `{PORT}` is a single port, and the control-port ones, which are
-//! `stdin`-sourced.
 //!
 //! The `stdin` cases drive the binary as a subprocess
 //! ([`launch_under_control`]), because a `main` output belongs to the binary's own
@@ -236,30 +239,318 @@ fn no_main() -> Box<dyn Consumer> {
     Box::new(|| {})
 }
 
+/// The programs the cases below drive, other than the two the gallery keeps as
+/// files.
+///
+/// Inline because they are scaffolding rather than demonstrations: each is one
+/// base program's variant differing by the single edit its case is about, and a
+/// gallery directory holds a program, not a fixture set. `{PORT}` is substituted
+/// by [`source`].
+mod fixtures {
+    use indoc::indoc;
+
+    pub const GUESTBOOK_ADDS_ROUTE: &str = indoc! {r#"
+        entries := ""
+
+        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+        added_reqs, added_resps = http_serve("{PORT}", "GET", "/added")
+
+        for entry in sign_reqs:
+            entries := entries + entry + "\n"
+            sign_resps << entries
+
+        for req in peek_reqs:
+            peek_resps << "peek\n"
+
+        for req in added_reqs:
+            added_resps << "added\n"
+    "#};
+
+    pub const GUESTBOOK_DROPS_ROUTE: &str = indoc! {r#"
+        entries := ""
+
+        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+
+        for entry in sign_reqs:
+            entries := entries + entry + "\n"
+            sign_resps << entries
+    "#};
+
+    pub const GUESTBOOK_DROPS_STATE: &str = indoc! {r#"
+        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+
+        for entry in sign_reqs:
+            sign_resps << entry + "\n"
+
+        for req in peek_reqs:
+            peek_resps << "peek\n"
+    "#};
+
+    pub const GUESTBOOK_RETYPES_STATE: &str = indoc! {r#"
+        entries := 0
+
+        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+
+        for entry in sign_reqs:
+            entries := entries + 1
+            sign_resps << "signed\n"
+
+        for req in peek_reqs:
+            peek_resps << "peek\n"
+    "#};
+
+    pub const GUESTBOOK_STATELESS_EDIT: &str = indoc! {r#"
+        entries := ""
+
+        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+
+        for entry in sign_reqs:
+            entries := entries + entry + "\n"
+            sign_resps << entries
+
+        for req in peek_reqs:
+            peek_resps << "peek edited\n"
+    "#};
+
+    pub const LATEST_WRITE: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        latest: Mut(String, Txn) := "(none)"
+
+        for msg in set_reqs:
+            with begin():
+                latest := msg
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << latest
+    "#};
+
+    pub const LATEST_WRITE_WRITER_EDIT: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        latest: Mut(String, Txn) := "(none)"
+
+        for msg in set_reqs:
+            with begin():
+                latest := msg + "!"
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << latest
+    "#};
+
+    pub const ONE_STATEFUL_LOOP: &str = indoc! {r#"
+        n := ""
+        p, pr = http_serve("{PORT}", "POST", "/p")
+        q, qr = http_serve("{PORT}", "POST", "/q")
+        for x in p:
+            n := n + "a"
+            pr << n + "\n"
+        for y in q:
+            qr << "q\n"
+    "#};
+
+    pub const ONE_STATEFUL_LOOP_MOVED: &str = indoc! {r#"
+        n := ""
+        p, pr = http_serve("{PORT}", "POST", "/p")
+        q, qr = http_serve("{PORT}", "POST", "/q")
+        for x in p:
+            pr << "p\n"
+        for y in q:
+            n := n + "a"
+            qr << n + "\n"
+    "#};
+
+    pub const RUNNING_LOG: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        log: Mut(String, Txn) := ""
+
+        for msg in set_reqs:
+            with begin():
+                log := log + msg
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << log
+    "#};
+
+    pub const RUNNING_LOG_WRITER_EDIT: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        log: Mut(String, Txn) := ""
+
+        for msg in set_reqs:
+            with begin():
+                log := log + "-" + msg
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << log
+    "#};
+
+    pub const TWO_ACCUMULATORS: &str = indoc! {r#"
+        left := ""
+        right := ""
+
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+
+        for x in reqs:
+            left := left + "a"
+            right := right + "B"
+            resps << left + "|" + right + "\n"
+    "#};
+
+    pub const TWO_ACCUMULATORS_ADDED: &str = indoc! {r#"
+        left := ""
+        right := ""
+        extra := ""
+
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+
+        for x in reqs:
+            left := left + "a"
+            right := right + "B"
+            extra := extra + "c"
+            resps << left + "|" + right + "|" + extra + "\n"
+    "#};
+
+    pub const TWO_ACCUMULATORS_REORDERED: &str = indoc! {r#"
+        right := ""
+        left := ""
+
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+
+        for x in reqs:
+            right := right + "B"
+            left := left + "a"
+            resps << left + "|" + right + "\n"
+    "#};
+
+    pub const TWO_LOOPS: &str = indoc! {r#"
+        a := ""
+        b := ""
+
+        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
+        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+
+        for x in a_reqs:
+            a := a + x + "\n"
+            a_resps << a
+
+        for y in b_reqs:
+            b := b + y + "\n"
+            b_resps << b
+    "#};
+
+    pub const TWO_LOOPS_ONE_EDITED: &str = indoc! {r#"
+        a := ""
+        b := ""
+
+        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
+        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+
+        for x in a_reqs:
+            a := a + x + "\n"
+            a_resps << a
+
+        for y in b_reqs:
+            b := b + "* " + y + "\n"
+            b_resps << b
+    "#};
+
+    pub const TWO_TRANSACTIONS: &str = indoc! {r#"
+        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
+        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
+        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
+        get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+
+        x: Mut(String, Txn) := ""
+        y: Mut(String, Txn) := ""
+
+        for m in set_a:
+            with begin():
+                x := x + m
+            ok_a << "ok\n"
+
+        for r in get_a:
+            with begin():
+                out_a << x
+
+        for m in set_b:
+            with begin():
+                y := y + m
+            ok_b << "ok\n"
+
+        for r in get_b:
+            with begin():
+                out_b << y
+    "#};
+
+    pub const TWO_TRANSACTIONS_ONE_WRITER_EDITED: &str = indoc! {r#"
+        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
+        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
+        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
+        get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+
+        x: Mut(String, Txn) := ""
+        y: Mut(String, Txn) := ""
+
+        for m in set_a:
+            with begin():
+                x := x + "-" + m
+            ok_a << "ok\n"
+
+        for r in get_a:
+            with begin():
+                out_a << x
+
+        for m in set_b:
+            with begin():
+                y := y + m
+            ok_b << "ok\n"
+
+        for r in get_b:
+            with begin():
+                out_b << y
+    "#};
+}
+
 fn source(name: &str, port: u16) -> String {
     let text = match name {
-        "guestbook" => include_str!("guestbook.cambra"),
-        "guestbook-stateless-edit" => include_str!("guestbook-stateless-edit.cambra"),
-        "guestbook-stateful-edit" => include_str!("guestbook-stateful-edit.cambra"),
-        "guestbook-adds-route" => include_str!("guestbook-adds-route.cambra"),
-        "guestbook-drops-state" => include_str!("guestbook-drops-state.cambra"),
-        "guestbook-retypes-state" => include_str!("guestbook-retypes-state.cambra"),
-        "guestbook-drops-route" => include_str!("guestbook-drops-route.cambra"),
-        "two-loops" => include_str!("two-loops.cambra"),
-        "two-loops-one-edited" => include_str!("two-loops-one-edited.cambra"),
-        "two-accumulators" => include_str!("two-accumulators.cambra"),
-        "two-accumulators-reordered" => include_str!("two-accumulators-reordered.cambra"),
-        "two-accumulators-added" => include_str!("two-accumulators-added.cambra"),
-        "one-stateful-loop" => include_str!("one-stateful-loop.cambra"),
-        "one-stateful-loop-moved" => include_str!("one-stateful-loop-moved.cambra"),
-        "latest-write" => include_str!("latest-write.cambra"),
-        "running-log" => include_str!("running-log.cambra"),
-        "two-transactions" => include_str!("two-transactions.cambra"),
-        "two-transactions-one-writer-edited" => {
-            include_str!("two-transactions-one-writer-edited.cambra")
-        }
-        "running-log-writer-edit" => include_str!("running-log-writer-edit.cambra"),
-        "latest-write-writer-edit" => include_str!("latest-write-writer-edit.cambra"),
+        "guestbook" => include_str!("program.cambra"),
+        "guestbook-adds-route" => fixtures::GUESTBOOK_ADDS_ROUTE,
+        "guestbook-drops-route" => fixtures::GUESTBOOK_DROPS_ROUTE,
+        "guestbook-drops-state" => fixtures::GUESTBOOK_DROPS_STATE,
+        "guestbook-retypes-state" => fixtures::GUESTBOOK_RETYPES_STATE,
+        "guestbook-stateful-edit" => include_str!("updated.cambra"),
+        "guestbook-stateless-edit" => fixtures::GUESTBOOK_STATELESS_EDIT,
+        "latest-write" => fixtures::LATEST_WRITE,
+        "latest-write-writer-edit" => fixtures::LATEST_WRITE_WRITER_EDIT,
+        "one-stateful-loop" => fixtures::ONE_STATEFUL_LOOP,
+        "one-stateful-loop-moved" => fixtures::ONE_STATEFUL_LOOP_MOVED,
+        "running-log" => fixtures::RUNNING_LOG,
+        "running-log-writer-edit" => fixtures::RUNNING_LOG_WRITER_EDIT,
+        "two-accumulators" => fixtures::TWO_ACCUMULATORS,
+        "two-accumulators-added" => fixtures::TWO_ACCUMULATORS_ADDED,
+        "two-accumulators-reordered" => fixtures::TWO_ACCUMULATORS_REORDERED,
+        "two-loops" => fixtures::TWO_LOOPS,
+        "two-loops-one-edited" => fixtures::TWO_LOOPS_ONE_EDITED,
+        "two-transactions" => fixtures::TWO_TRANSACTIONS,
+        "two-transactions-one-writer-edited" => fixtures::TWO_TRANSACTIONS_ONE_WRITER_EDITED,
         other => panic!("no such program: {other}"),
     };
     text.replace("{PORT}", &port.to_string())
@@ -498,7 +789,7 @@ fn moving_a_variable_to_another_loop_is_refused() {
         .expect("`n` accumulates over a different source in the new version");
     let rendered = format!("{errors:?}");
     assert!(
-        rendered.contains("`n`") && rendered.contains("now belongs to"),
+        rendered.contains("`n`") && rendered.contains("now counts them in"),
         "the rejection should say where the variable went: {rendered}",
     );
 
@@ -825,7 +1116,7 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
         "b",
     );
     assert!(
-        reply.contains("`n`, of the loop over `stdin`") && reply.contains("Int"),
+        reply.contains("`n` is now Int"),
         "the rejection should name the stdin loop's variable and its new type: {reply}"
     );
 }
@@ -993,6 +1284,43 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 
     let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(still_serving, vec!["peek\n"]);
+}
+
+/// Two calls to one function, each carrying its own loop and its own accumulator,
+/// keep their state apart across an update.
+///
+/// Inlining clones the function body per call site, so both accumulators are the
+/// same source declaration — same spelling, same lexical position, no name of
+/// their own to tell them apart. Nor can anything they compute: once `step` is
+/// substituted the two stores differ *only* in their writer bodies, which is
+/// exactly what the edit changes. Their identities are the spelling plus an index
+/// among the variables of that spelling, which is why the edit carries and the
+/// two do not cross.
+#[test]
+fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
+    let v1 = concat!(
+        "def count_by(src, step) => Int:\n",
+        "    total := 0\n",
+        "    for x in src:\n",
+        "        total := total + step\n",
+        "    total\n",
+        "\n",
+        "lines = stdin()\n",
+        "a = count_by(lines, 1)\n",
+        "b = count_by(lines, 10)\n",
+        "a * 1000 + b\n",
+    );
+    let v2 = v1.replace("total + step", "total + step * 2");
+    let (reply, out) = stdin_across_update(v1, &v2, "m\nn", "o\np");
+    assert!(
+        reply.contains("updated"),
+        "the update should be accepted: {reply}"
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Ints([6060,],)"),
+        "want a = 2 + 2*2 and b = 20 + 2*20; seeding either from the other reads 6042: {out}"
+    );
 }
 
 /// Two causally independent transaction groups keep their state apart across an

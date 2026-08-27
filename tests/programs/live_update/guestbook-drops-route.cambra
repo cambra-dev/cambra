@@ -1,7 +1,0 @@
-entries := ""
-
-sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-
-for entry in sign_reqs:
-    entries := entries + entry + "\n"
-    sign_resps << entries

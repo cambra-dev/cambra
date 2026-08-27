@@ -1,8 +1,0 @@
-n := ""
-p, pr = http_serve("{PORT}", "POST", "/p")
-q, qr = http_serve("{PORT}", "POST", "/q")
-for x in p:
-    pr << "p\n"
-for y in q:
-    n := n + "a"
-    qr << n + "\n"
