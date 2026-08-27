@@ -386,9 +386,19 @@ impl Typing for InferCtx {
         // Only a requested association gets a variable for the obligation to settle;
         // a pure requirement determines nothing and mints none.
         let wanted = assoc.map(|name| (name, self.fresh()));
-        // Open a provenance recording to cover the cloning of the
-        // operand_exprs into the obligation.
-        let _f = crate::ccl::provenance::copy_frame("require_trait");
+        // The recording covers two things this rule produces: the operand
+        // expressions cloned into the obligation, and the nodes a deposit reached
+        // from here mints — an instance whose association carries a
+        // `RefinementTemplate` builds its predicate out of those operands
+        // (`Refinement::born_from_template`), and a deposit fires both at
+        // construction and from the `require_sub` narrowing below. So it names the
+        // node being typed, as the `Lit` rule's singleton recording does: a mint has
+        // nowhere to attach in a recording that names nothing.
+        let _f = crate::ccl::provenance::enter(
+            self.current_node_id,
+            "infer.require_trait",
+            crate::ccl::provenance::Nature::Machinery,
+        );
         let obligation = TraitObligation::new(
             trait_,
             wanted.clone().into_iter().collect(),
