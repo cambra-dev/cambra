@@ -40,16 +40,16 @@
 //! common. Those two are the actionable form: the first says where a version
 //! guard goes, the second says what the two versions can compute once.
 //!
-//! # Stage-agnostic
+//! # Phase-agnostic
 //!
 //! [`diff`] is a pure function of two [`TypedExpr`] trees and does not care
-//! which pipeline stage produced them, so one implementation serves every
+//! which pipeline phase produced them, so one implementation serves every
 //! [`Phase`]: the caller chooses how much of the compiler's own
 //! rewriting to diff through by choosing which trees to pass. Nothing in the
-//! matcher is stage-specific — [`content_hash`] is uid-robust (free names by
+//! matcher is phase-specific — [`content_hash`] is uid-robust (free names by
 //! spelling) and type-aware, which is what lets one core cover the lot,
 //! including the `LetRec` and `Transact` shapes that exist only below the
-//! mutability phases. Which stage answers which question is
+//! mutability phases. Which phase answers which question is
 //! `src/ccl/design/diffing.md`, "Which phase to diff".
 //!
 //! # Scope of this implementation
@@ -398,7 +398,7 @@ fn anchor_roots(s: &Indexed, d: &Indexed, m: &mut Matching) {
     recover(s, d, ROOT, ROOT, m);
 }
 
-/// Compile two source programs to `stage` and diff them — the end-to-end entry
+/// Compile two source programs to `phase` and diff them — the end-to-end entry
 /// point from source. The classified [`Diff`] borrows the two compiled trees,
 /// which live only for the duration of this call, so the result is delivered to
 /// `f`; return out of it whatever you need to keep (e.g. counts, cloned nodes).
@@ -410,11 +410,11 @@ fn anchor_roots(s: &Indexed, d: &Indexed, m: &mut Matching) {
 pub fn diff_programs<R>(
     src: &str,
     dst: &str,
-    stage: Phase,
+    phase: Phase,
     f: impl FnOnce(&Diff) -> R,
 ) -> Result<R, Vec<CompileError>> {
-    let a = compile_to(src, stage)?;
-    let b = compile_to(dst, stage)?;
+    let a = compile_to(src, phase)?;
+    let b = compile_to(dst, phase)?;
     Ok(f(&diff(&a, &b)))
 }
 
@@ -1816,21 +1816,21 @@ mod tests {
 
     /// Pre-uniquify CCL (`Raw` names, before inference), via the public API.
     fn lower(code: &str) -> TypedExpr {
-        compile_to(code, Phase::Lower).expect("compile to lowered stage should succeed")
+        compile_to(code, Phase::Lower).expect("compile to lowered phase should succeed")
     }
 
     /// Post-inference CCL (uniquified, fully typed), via the public API.
     fn lower_and_infer(code: &str) -> TypedExpr {
-        compile_to(code, Phase::Infer).expect("compile to inferred stage should succeed")
+        compile_to(code, Phase::Infer).expect("compile to inferred phase should succeed")
     }
 
     // Realistic CHL programs exercising records, list comprehensions, filters,
     // aggregates, projections, joins, def/yield generators, groupby, induction
     // accumulators, and transactional registers. Between them they cover every
-    // node kind that reaches these two stages: `Defer`/`Feed` (generators),
+    // node kind that reaches these two phases: `Defer`/`Feed` (generators),
     // `Case` (guards), `Cast` (comprehension filters), `For`/`MutWrite`
     // (accumulators), and `Begin` (transaction blocks). `LetRec` and `Transact`
-    // are born *below* the inferred stage — the mutability phases build them —
+    // are born *below* the inferred phase — the mutability phases build them —
     // so no source program can exercise them here; `content_hash` covers them
     // structurally instead.
     const FILTER_AGG: &str = indoc! {r#"
@@ -2526,14 +2526,14 @@ mod tests {
     }
 
     #[test]
-    fn every_stage_diffs_identical_source_as_identical() {
+    fn every_phase_diffs_identical_source_as_identical() {
         // The property the whole analysis rests on, over the shapes the corpus
         // reaches: compiling one source twice — independent contexts, fresh
         // binder uids — must produce trees the differ cannot tell apart. A
         // failure means some pass has let a run-varying identity leak into the
         // hash, which would make every real diff untrustworthy.
         //
-        // It covers every stage because that is exactly how the leak was found:
+        // It covers every phase because that is exactly how the leak was found:
         // `Transact` labelled its mutable variable record with
         // `Name::field_key()`, which folded the binder uid into a `String`, and
         // once a name is a record label no amount of uid-robustness in the
@@ -2555,7 +2555,7 @@ mod tests {
             ("transaction", TXN),
             ("source", "[\"> \" + line for line in stdin()]\n"),
         ];
-        for stage in [
+        for phase in [
             Phase::Lower,
             Phase::Uniquify,
             Phase::Infer,
@@ -2569,12 +2569,12 @@ mod tests {
         ] {
             for (label, src) in corpus {
                 let (a, b) = (
-                    compile_to(src, stage).expect(label),
-                    compile_to(src, stage).expect(label),
+                    compile_to(src, phase).expect(label),
+                    compile_to(src, phase).expect(label),
                 );
                 assert!(
                     diff(&a, &b).is_identical(),
-                    "{label} at {stage:?} is not stable across compilations:\n{}",
+                    "{label} at {phase:?} is not stable across compilations:\n{}",
                     diff(&a, &b)
                 );
             }
@@ -2785,15 +2785,15 @@ mod tests {
             prog("(await_final(a), await_final(b))"),
             prog("(await_final(b), await_final(a))"),
         );
-        for stage in [Phase::Channelize, Phase::Planning] {
+        for phase in [Phase::Channelize, Phase::Planning] {
             let (a, b) = (
-                compile_to(&v1, stage).expect("v1"),
-                compile_to(&v2, stage).expect("v2"),
+                compile_to(&v1, phase).expect("v1"),
+                compile_to(&v2, phase).expect("v2"),
             );
             let r = diff(&a, &b);
             assert!(
                 !r.is_identical(),
-                "a swapped pair of registers is a change at {stage:?}:\n{r}"
+                "a swapped pair of registers is a change at {phase:?}:\n{r}"
             );
             // The swap is one site — the tuple — rather than the whole
             // recurrence: the two reads pair with their counterparts and move.
@@ -2803,7 +2803,7 @@ mod tests {
                     sites.as_slice(),
                     [Divergence::Changed(m)] if matches!(m.dst.node, TypedExprNode::Tuple(_))
                 ),
-                "at {stage:?} the swap must localize to the tuple:\n{r}",
+                "at {phase:?} the swap must localize to the tuple:\n{r}",
             );
             // And the tuple itself is not offered for reuse: its two elements
             // returned swapped values.
@@ -2811,7 +2811,7 @@ mod tests {
                 !r.shared_roots()
                     .iter()
                     .any(|m| matches!(m.src.node, TypedExprNode::Tuple(_))),
-                "at {stage:?} the swapped tuple is not reusable wholesale:\n{r}",
+                "at {phase:?} the swapped tuple is not reusable wholesale:\n{r}",
             );
         }
     }
@@ -2819,7 +2819,7 @@ mod tests {
     #[test]
     fn compile_to_rejects_what_compile_program_rejects() {
         // `compile_to` is a second path through the frontend, so a program the
-        // real pipeline refuses must not yield a stage snapshot: the differ
+        // real pipeline refuses must not yield a phase snapshot: the differ
         // would otherwise be handed a tree whose illegal construct was silently
         // dropped, and two versions differing only in it would diff as
         // identical. `x := 2` writes to an immutable binding, which
@@ -2829,7 +2829,7 @@ mod tests {
             x := 2
             x
         "};
-        for stage in [
+        for phase in [
             Phase::Infer,
             Phase::Inline,
             Phase::Channelize,
@@ -2837,8 +2837,8 @@ mod tests {
             Phase::Planning,
         ] {
             assert!(
-                compile_to(src, stage).is_err(),
-                "a write to an immutable binding must be rejected at {stage:?}",
+                compile_to(src, phase).is_err(),
+                "a write to an immutable binding must be rejected at {phase:?}",
             );
         }
         // `Lowered` is below every check by construction — it is the tree as
@@ -2860,9 +2860,9 @@ mod tests {
             let mut ctx = GlobalContext::new();
             let compiled = compile_program(&mut ctx, src, Box::new(|| {}))
                 .unwrap_or_else(|e| panic!("compile_program failed on {src:?}: {e:?}"));
-            let staged = compile_to(src, Phase::Planning)
+            let planned = compile_to(src, Phase::Planning)
                 .unwrap_or_else(|e| panic!("compile_to failed on {src:?}: {e:?}"));
-            let d = diff(&compiled.ast, &staged);
+            let d = diff(&compiled.ast, &planned);
             assert!(
                 d.is_identical(),
                 "the two entry points disagree on {src:?}: {:?}",
@@ -2888,18 +2888,18 @@ mod tests {
 
     #[test]
     fn diff_programs_end_to_end_from_source() {
-        // The public single-call entry: compile both sources to a stage and
+        // The public single-call entry: compile both sources to a phase and
         // diff, results delivered through the closure.
         //
         // A filter-threshold edit (`>= 18` → `>= 21`) is reflected at the
-        // lowered stage.
+        // lowered phase.
         let changed = diff_programs(FILTER_AGG, FILTER_AGG_21, Phase::Lower, |d| {
             d.updated().count()
         })
         .expect("compile + diff should succeed");
         assert!(changed > 0, "the edit is reflected");
 
-        // Identical programs diff as identical at the inferred stage.
+        // Identical programs diff as identical at the inferred phase.
         let identical = diff_programs(FILTER_AGG, FILTER_AGG, Phase::Infer, |d| d.is_identical())
             .expect("compile + diff should succeed");
         assert!(
@@ -2915,7 +2915,7 @@ mod tests {
         // the public API handles sources, not just literal programs.
         let prog = "[\"> \" + line for line in stdin()]\n";
         let identical = diff_programs(prog, prog, Phase::Infer, |d| d.is_identical())
-            .expect("stdin program should compile to the inferred stage and diff");
+            .expect("stdin program should compile to the inferred phase and diff");
         assert!(identical);
     }
 }

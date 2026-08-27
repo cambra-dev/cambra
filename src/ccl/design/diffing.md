@@ -29,7 +29,7 @@ What holds of the output, and the test that holds it:
 
 | | Held by |
 | --- | --- |
-| Two compilations of one source diff as identical, at every phase | `every_stage_diffs_identical_source_as_identical` |
+| Two compilations of one source diff as identical, at every phase | `every_phase_diffs_identical_source_as_identical` |
 | Identical trees have no divergences, and one shared root: the program | `identical_programs_have_no_divergences` |
 | An identity that varies between compilations (a `Name` uid) never reaches the result | `diff_is_robust_to_uid_nondeterminism` |
 | Renaming a binding is not a change | `renaming_a_binding_is_not_a_change` |
@@ -279,7 +279,7 @@ Loop planning is where this bites. The mutable variable record a `Transact`
 denotes is typed with `Name::field_key()` labels, and folding the binder uid in
 would type the node `{acc#9: ([0, 2] ⇒ Int)}` in one compilation and `{acc#19:
 …}` in the next, with `.acc#9` against `.acc#19` reading it — two compilations
-of the same source diffing as different, and every stage from planning down
+of the same source diffing as different, and every phase from planning down
 unusable.
 
 The label has no need of a uid. It must be distinct only among the keys of one
@@ -523,7 +523,7 @@ a                         b = sum([i * 2 for i in [1,2,3]])
                           a + b
 ```
 
-Diffed at the lowered stage they render as:
+Diffed at the lowered phase they render as:
 
 ```text
 2 shared · 1 changed · 1 moved · 0 deleted · 16 new
@@ -572,7 +572,7 @@ shown with the reused `a` under it, because claiming `a` changed would be false.
 ### Worked example: one literal, and the duplicates around it
 
 A changed literal with the guard threshold edited to `1`, diffed at the lowered
-stage:
+phase:
 
 ```
 # v1                      # v2
@@ -660,15 +660,15 @@ are reachable at all — a caller debugging a phase wants them.
 
 ## How much to normalize
 
-Two questions want two different stages, and neither one dominates.
+Two questions want two different phases, and neither one dominates.
 
 **What runs together** is a question about the operator graph, so it is asked at
-`Planning` — the shape operator conversion consumes, and therefore the only stage
+`Planning` — the shape operator conversion consumes, and therefore the only phase
 where a claim about sharing compute is a claim about what executes. Anything a
 version guard or a shared store is derived from is read there.
 
 **Which source edit is this** is a question about the program the user wrote, so
-it is asked at the earliest stage that can see the edit at all. Every pass
+it is asked at the earliest phase that can see the edit at all. Every pass
 between the two rewrites the user's shape, and a rewrite spreads one edit over
 more of the tree: at `Planning` a comprehension's threshold change is four sites
 rather than one, and an accumulator's body change carries fourteen new nodes
@@ -678,7 +678,7 @@ source.
 
 Two programs can also be the same computation written differently. The more of
 that the diff sees through, the more the two versions share — and the less
-localized the answer becomes when they genuinely differ. Choosing a stage is
+localized the answer becomes when they genuinely differ. Choosing a phase is
 choosing where on that curve to sit; the compiler's own passes do the work, so
 there is no separate rewriting system to keep honest.
 
@@ -701,7 +701,7 @@ be reproduced and a drift in them is visible.
 Inlining is a trade, not an improvement: it makes moving code across a function
 boundary invisible, and in exchange reports an edit inside a shared helper once
 per call site, because the body it changed now appears once per call site. It is
-the stage to pick when refactoring across function boundaries is the noise to
+the phase to pick when refactoring across function boundaries is the noise to
 remove.
 
 ### `Infer` has already spent some of that locality
@@ -721,7 +721,7 @@ the helper; `g(a)` and `g(b)` for two computed `Int`s key together and do not.
 Inlining then costs one further duplication per call site on top of whatever
 monomorphization already did — 1 → 2 in the shared row, 2 → 3 in the split one.
 
-`Infer` is therefore the earliest stage this differ offers, not a stage that
+`Infer` is therefore the earliest phase this differ offers, not a phase that
 has normalized nothing: the curve starts before its column.
 
 Below `Inline` the trade continues — every pass that rewrites the user's shape
@@ -755,7 +755,7 @@ predicate is a shared `Rc` by design (`src/ccl/ty.rs`), so the mentions are
 identifiable — and it is not done here. See
 [Open threads](#open-threads).
 
-The rule this leaves: diff at the earliest stage that can see the edit, unless
+The rule this leaves: diff at the earliest phase that can see the edit, unless
 the answer is about the graph that runs, in which case diff at `Planning`.
 Reaching past `Inline` is not a better diff of the source; it is a diff of a
 different object.
@@ -788,11 +788,11 @@ equivalence class and costs locality the same way inlining does. Nothing
 observed yet asks for them; the roadmap is driven by missed sharing that shows
 up in practice, not by completeness.
 
-### The one that needs more than a stage
+### The one that needs more than a phase
 
 Reordering two independent bindings is a true no-op — CCL's `let` is
 non-recursive and pure, so the operator graph depends on the dependency DAG, not
-on the written order — and no stage fixes it, because the nesting is the order.
+on the written order — and no phase fixes it, because the nesting is the order.
 See "Open threads".
 
 ---
