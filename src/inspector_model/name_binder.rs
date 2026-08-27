@@ -10,13 +10,15 @@
 //! # Why source-level
 //!
 //! Name resolution is a *source-language* lexical question, and lowering has
-//! already destroyed some source variables by the time any IR node exists:
-//! `uncurry_params` rewrites a multi-param reference `Var(x)` to the projection
-//! `__arg_tuple_N ▷ .i` **before** uniquify runs, so a uniquify/IR-based binder
-//! table structurally cannot resolve a multi-param `def`/`lambda` parameter
-//! (there is no surviving `Var(x)` to rename, no use-span). The surface AST
-//! still has `x`/`y` with their [`Param.name_span`](crate::chl_parser::ast::Param::name_span),
-//! so resolving over it is lossless and matches the standard LSP approach.
+//! already destroyed the **name** by the time any pass could resolve it:
+//! `uncurry_params` rewrites a multi-param reference `Var(p)` to the projection
+//! `__arg_tuple_N ▷ .i` **before** uniquify runs, so nothing downstream binds or
+//! mentions `p` and a uniquify/IR-based binder table has no `Var(p)` to rename.
+//! The occurrence's *span* survives — substitution is root-carry — so what is
+//! lost is the correspondence from a use to its binder, not the position. The
+//! surface AST still has `p`/`q` with their
+//! [`Param.name_span`](crate::chl_parser::ast::Param::name_span), so resolving
+//! over it is lossless and matches the standard LSP approach.
 //!
 //! # Scoping model
 //!
@@ -202,12 +204,13 @@ impl NameBinderIndex {
     /// binders visible inside it — the data behind the `/api/snapshot` `scopes`
     /// array (the type join is the caller's, since it needs the `SpanIndex`).
     ///
-    /// A scope region is emitted for each binder-bearing span the walk surfaces
-    /// (statement sequences, function/lambda/comprehension/loop bodies) whose
-    /// visible-binder set is non-empty; regions with no binders in scope are
-    /// dropped (an empty `scopes` row carries nothing). The binders are the ones
-    /// visible at the region's start, outermost → innermost, matching
-    /// [`bindings_in_scope`](Self::bindings_in_scope)'s shape.
+    /// A region is emitted per statement and per expression, minus those whose
+    /// visible-binder set is empty (an empty `scopes` row carries nothing). The
+    /// binders are the ones visible at the region's start, outermost →
+    /// innermost, matching [`bindings_in_scope`](Self::bindings_in_scope)'s
+    /// shape. Regions therefore repeat where a statement and its expression
+    /// share a span; `src/inspector_model/design.md`, "Decided, not yet built"
+    /// carries the deduplication.
     ///
     /// Pure; re-walks the AST. Regions may nest and overlap (an inner body's
     /// region is a sub-span of its enclosing sequence's), mirroring the lexical
@@ -263,9 +266,10 @@ impl NameBinderIndex {
 
 /// An event surfaced during the AST walk: an [`Event::Use`] at every `Name`
 /// occurrence, an [`Event::Binder`] wherever a binder is introduced, and an
-/// [`Event::Scope`] over every region that carries binders (statement sequences,
-/// loop/function/lambda/comprehension bodies), the latter two carrying the
-/// binder stack live at that point.
+/// [`Event::Scope`] at every statement and every expression, carrying the binder
+/// stack live there. Scope events are that dense because a `bindings_in_scope`
+/// position may land anywhere, and the caller keeps the innermost region
+/// containing it.
 ///
 /// Both borrows are tied to the single lifetime `'s` of the in-progress walk;
 /// the visitor (a higher-ranked `FnMut`) may inspect them only for the duration

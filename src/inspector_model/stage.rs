@@ -8,12 +8,11 @@
 //! The link is a [`ProvenanceMap<NodeId, NodeId>`] folded at the pane boundary by
 //! [`collapse`](crate::ccl::provenance::collapse) — one per adjacent pane pair,
 //! materialized on [`CompiledProgram`](crate::ccl::context::CompiledProgram) via
-//! `materialize_panes`. The map is **dense**: every id that survived the phase
-//! is its own self-edge. The wire ships the map **verbatim** — self-edges
-//! included — so the frontend follows edges only (no identity special case); a
-//! surviving node's cross-pane link is the shipped `[id, id]` self-edge, and a
-//! genuine identity *change* (monomorphization / inline fan-out, channelize's
-//! cluster/fan-in copies) is a `u != d` edge.
+//! `materialize_panes`. The wire ships it verbatim, so a surviving node's
+//! cross-pane link is a `[id, id]` self-edge and a genuine identity change
+//! (monomorphization or inline fan-out, channelize's cluster and fan-in copies)
+//! is a `u != d` edge. What the density and the labels promise a consumer:
+//! `src/inspector_model/design.md`, "Pane links are dense and labelled".
 
 use crate::ccl::provenance::{EdgeLabels, NodeId, ProvenanceMap};
 

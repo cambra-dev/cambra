@@ -35,7 +35,7 @@
 //!   of an undecided shape, the field is left out until an `outline` query
 //!   exists.
 //! * `meta.tick` — `null` (the live seam); `snapshotKind` is `"post-inference"`,
-//!   `schema` is `3`.
+//!   `schema` is [`SCHEMA_VERSION`].
 
 use crate::chl_parser::ast::Span;
 
@@ -70,16 +70,15 @@ pub struct SnapshotPayload {
     pub diagnostics: Vec<Diagnostic>,
     /// Snapshot metadata + the live-protocol seams.
     pub meta: Meta,
-    /// The ordered pipeline stages (upstream → downstream), each carrying its
-    /// own IR tree + span index. The stages
-    /// `["pre-inference", "post-inference", "post-channelize", …]` — one entry per
-    /// declared pane, in pipeline order.
+    /// The pipeline stages, upstream → downstream, each carrying its own IR tree
+    /// and span index — one entry per pane
+    /// [`PANES`](crate::ccl::panes::PANES) declares, in pipeline order. Read
+    /// `PANES` for the current set rather than a list here.
     pub stages: Vec<StageEntry>,
     /// The dense node→node links between adjacent stages — each adjacent pane
-    /// pair's `ProvenanceMap` shipped verbatim, self-edges included. One entry per
-    /// adjacent pair, in order: `{ from: "pre-inference", to: "post-inference" }`
-    /// (the monomorphization boundary) and `{ from: "post-inference", to:
-    /// "post-channelize" }`.
+    /// pair's `ProvenanceMap` shipped verbatim, self-edges included. One entry
+    /// per adjacent pair, in the same order as `stages.windows(2)`, so this is
+    /// always one shorter than [`stages`](Self::stages).
     pub pane_links: Vec<PaneLinkEntry>,
 }
 
@@ -294,15 +293,10 @@ pub struct Meta {
     /// The wire-format version. A client reads this to detect an incompatible
     /// payload before parsing the rest.
     ///
-    /// **Schema 4** is the field set of [`SnapshotPayload`] documented on that
-    /// type (`source`, `definitions`, `scopes`, `diagnostics`, `meta`, `stages`,
-    /// `paneLinks`), with the live seams (`meta.tick`, value summaries) always
-    /// null. Each `stages[].ir` node carries its native attribution: the spans
-    /// channel on the `span` field plus a `rewritten` tag
-    /// (`null | { via, nature, label }`). `paneLinks` ships each adjacent pane
-    /// pair's `ProvenanceMap` **dense** (self-edges included), so the consumer
-    /// follows edges only. There is one entry per pane and one window per adjacent
-    /// pair, so this is always one shorter than `stages`.
+    /// The current version is [`SCHEMA_VERSION`], whose field set is
+    /// [`SnapshotPayload`]'s as documented on that type. Each `stages[].ir` node
+    /// carries its attribution as the spans channel on `span` plus a `rewritten`
+    /// tag (`null | { via, nature, label }`).
     ///
     /// **Bump the version** on any *breaking* wire change — a field removed,
     /// renamed, or retyped, or a value-shape change an old client would
@@ -349,7 +343,8 @@ impl Snapshot<'_> {
     /// * `scopes` — [`NameBinderIndex::scopes`](crate::inspector_model::NameBinderIndex::scopes),
     ///   each binding's `type` read off the IR node that binds it.
     /// * `diagnostics` — empty.
-    /// * `meta` — `tick: None`, `snapshotKind: "post-inference"`, `schema: 3`.
+    /// * `meta` — `tick: None`, `snapshotKind: "post-inference"`, `schema:
+    ///   `[`SCHEMA_VERSION`].
     pub fn build_payload(&self, name: impl Into<String>) -> SnapshotPayload {
         let source = SourceInfo {
             name: name.into(),
@@ -457,10 +452,12 @@ impl SnapshotPayload {
     /// still renders the editor + squiggles from this.
     ///
     /// TODO(degraded-stages): emit whatever pipeline stages *did* complete — if
-    /// channelization succeeds and only inference fails, we can still ship the
-    /// post-channelize `stages[]` entry so the inspector visualizes the channelized
-    /// IR. Today every degraded payload ships empty `stages`/`paneLinks`
-    /// regardless of where the failure occurred.
+    /// channelization succeeds and only inference fails, the post-channelize
+    /// `stages[]` entry is still displayable. Today every degraded payload ships
+    /// empty `stages`/`paneLinks` regardless of where the failure occurred. It
+    /// needs `compile_program` to hand back its partial panes rather than one
+    /// error, so the change is mostly outside this module; see
+    /// `src/inspector_model/design.md`, "Diagnostics and the degraded payload".
     pub fn degraded(
         name: impl Into<String>,
         text: impl Into<String>,

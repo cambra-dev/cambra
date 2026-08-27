@@ -83,11 +83,8 @@ pub struct SpanIndex {
 }
 
 // Containment is the integer test `start <= pos < end`, so a lookup filters and
-// sorts the entry vector. One program's tree is small enough that this is not
-// worth an interval tree, and lookups hand back node ids rather than exposing
-// the entries, so a different backing structure stays a change behind this API.
-// `intervalsets` is not used: it is built for numeric value domains and carries a
-// `contains` bug on half-bounded intervals (see `interpreter/tiling.rs`).
+// sorts the entry vector. Why a flat vector rather than an interval tree or
+// `intervalsets`: `src/inspector_model/design.md`, "Span containment is a scan".
 impl SpanIndex {
     /// Build the index from a pane's tree and its [`SourceProjection`]. Each node
     /// is indexed under every span in its attribution; a node with no spans, or

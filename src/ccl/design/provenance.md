@@ -8,12 +8,12 @@ recorder, the table, and the folds. `src/ccl/context.rs` is where the pipeline
 opens the sessions, and `src/ccl/panes.rs` is where the retained AST snapshots
 are declared and folded ([The seam](#the-seam)).
 
-**Status markers.** The provenance model, the recorder, some phases' adoption of it,
-the lowering projection, the [`NodeId`-keyed table](#the-provenance-model), and the
-fold over it are in tree. **Planned** markers introduce designed but not-yet-built
-features: the inspector's consumption of the AST snapshots (panes), and adoption in
-further phases. A reader can tell the two apart by the marker alone; unmarked prose
-describes code you can go read.
+**Status markers.** The provenance model, the recorder, every phase's adoption of
+it, the lowering projection, the [`NodeId`-keyed table](#the-provenance-model),
+the fold over it, and the inspector's consumption of the panes are in tree.
+**Planned** markers introduce designed but not-yet-built features. A reader can
+tell the two apart by the marker alone; unmarked prose describes code you can go
+read.
 
 Every phase that rewrites expression nodes records, and every recording reaches
 a table: `compile_program` opens a `PhaseScope` around each. Operator conversion
@@ -724,8 +724,9 @@ id, nothing recorded), so an id cannot be minted **unrecorded**. Minting one and
 then discarding it stays possible, and costs the stranded row named under
 "Freshen at placement, not at construction".
 
-The fold runs over each adjacent pane pair; **planned** is the inspector's
-consumption of what it produces.
+The fold runs over each adjacent pane pair, and the inspector model consumes
+what it produces
+([The inspector consumers](#the-inspector-consumers-srcinspector_model)).
 
 ### Gate and audit coverage
 
@@ -916,28 +917,35 @@ re-rooting channel was the predicate ids being outside the enumerated domain,
 which the binder-slot widening fixed;
 `both_raising_paths_attribute_the_predicate_to_the_predicate` pins it.
 
-## Planned — inspector consumers (`src/inspector_model/`)
+## The inspector consumers (`src/inspector_model/`)
 
-None of this layer exists yet. The inspector is to be the only consumer of the
-pane folds; the release compiler reads the lowering projection and nothing else.
+The inspector model is the only consumer of the folds' projections and maps; the
+leak gate reads the same folds' `leaks` under `CAMBRA_PROVENANCE_GATE`, and a
+release compile reads the lowering projection and nothing else. The model's own
+reference is
+[design.md](../../inspector_model/design.md), which owns the payload shape, the
+usage model and the wire's versioning; what follows is what that layer reads out
+of this one.
 
 - `SpanIndex::build(ir, projection)` inverts a pane's projection to span → node.
-- `build_inspect_tree` / `resolve` / `hover` read the pane projection and ship
-  each attribution as it is stored: a node's spans plus its `rewritten` tag
-  (`{ via, nature, label }`). `/api/resolve` and `/api/hover` carry the same
-  `{ spans, rewritten }` shape. The tag serializes as `null` for a direct image
-  — `Nature::Source` null-compresses at the emission sites via
-  `Nature::is_source`, and both validators guard that a `"source"` nature never
-  actually ships. The wire carries no flat `Source`/`Derived`/`Synthetic` label
-  string; the frontend formats the tag itself.
+- `build_inspect_tree` ships each attribution as it is stored: a node's spans
+  plus its `rewritten` tag (`{ via, nature, label }`). The tag serializes as
+  `null` for a direct image — `Nature::Source` null-compresses at the emission
+  site via `Nature::is_source`, and the consumer's validator guards that a
+  `"source"` nature never actually ships. The wire carries no flat
+  `Source`/`Derived`/`Synthetic` label string; the frontend formats the tag
+  itself.
 - `paneLinks` ship each pane-pair `ProvenanceMap` **dense** — self-edges included,
   no identity-edge filter — via `stage::dense_edges`; the frontend only follows
   edges, never reconstructing them, and reads each edge's label set to decide
-  whether to render the blame or prune it. Both validators check that every
-  edge endpoint is a live node id in its respective pane.
+  whether to render the blame or prune it. Every edge endpoint is a live node id
+  in the pane it points into, which
+  `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` pins at the
+  producer and the consumer's validator re-checks on the shipped payload.
+- Ids inside refinement predicates are endpoints like any other, so every walk
+  that builds the payload descends into them
+  ([Walking the ids](#walking-the-ids)).
 
-The snapshot payload carries its own version in `meta.schema`, owned by the
-inspector crate along with the fixture corpus pinned to it. Nothing under
-`ccl/` reads or depends on that number: this layer produces attributions and
-maps, and the serialization shape is the inspector's contract with its
-frontend.
+The payload carries its own version in `meta.schema`. Nothing under `ccl/` reads
+or depends on that number: this layer produces attributions and maps, and the
+serialization shape is the inspector's contract with its frontend.

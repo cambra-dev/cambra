@@ -1,23 +1,28 @@
-//! The program inspector's read-only model over the post-inference IR snapshot.
+//! The program inspector's read-only model over the retained IR panes.
+//!
+//! `src/inspector_model/design.md` is the reference for this layer: what the
+//! payload carries, when it is built, and what the wire promises. See "The usage
+//! model" there before adding an entry point, and "Decided, not yet built" for
+//! the changes this module is ratified to make and has not made.
 //!
 //! This module lives in the `cambra` core crate (not a separate inspector
 //! crate) because it is coupled to `ccl` internals — it walks the
 //! [`Expr`](crate::ccl::Expr) snapshot and reads the per-pane
 //! [`SourceProjection`](crate::ccl::provenance::SourceProjection)s materialized by
 //! [`CompiledProgram::materialize_panes`](crate::ccl::context::CompiledProgram::materialize_panes).
-//! It is deliberately **serde-free**: serialization lives in the
-//! `cambra-inspector` workspace crate behind the optional, default-off `serde`
-//! feature on `cambra`, so plain `ccl`/interpreter builds
-//! (`cargo build -p cambra`) never compile it.
+//! The wire types here derive `Serialize` under the optional, default-off
+//! `serde` feature, and nothing else about serialization lives here: no
+//! `serde_json`, no transport. A plain `ccl`/interpreter build
+//! (`cargo build -p cambra`) compiles none of it.
 //!
-//! # The anchor (post-inference snapshot)
+//! # The anchor pane
 //!
-//! Every index here is built over the **post-inference** IR retained on
-//! [`CompiledProgram::post_inference_ir`](crate::ccl::context::CompiledProgram::post_inference_ir):
-//! fully typed, but still source-shaped (lambdas intact, before
-//! inline/lambda-elim/planning). That snapshot's node ids resolve against the
-//! materialized post-inference pane
-//! [`SourceProjection`](crate::ccl::provenance::SourceProjection).
+//! Each stage carries its own tree and its own
+//! [`SourceProjection`](crate::ccl::provenance::SourceProjection), and one of
+//! them is the **anchor**: the post-inference pane, fully typed but still
+//! source-shaped (lambdas intact, before inline/lambda-elim/planning). A
+//! binder's type is read from it, so the payload's scope-binding types are
+//! post-inference types. See `src/inspector_model/design.md`, "The anchor pane".
 //!
 //! # The pane set is the compiler's, not this module's
 //!
@@ -29,13 +34,10 @@
 //! # Predicates are nodes
 //!
 //! A refinement predicate riding a type slot is an expression tree with its own
-//! [`NodeId`](crate::ccl::provenance::NodeId)s, and the pane fold explains those
-//! ids — `collect_tree_ids` enumerates them, so they appear in the pane
-//! projections and as endpoints of the pane-pair maps. Every walk here descends
-//! into them for that reason: a tree that stopped at the main expression tree
-//! would ship links pointing at nodes it had omitted. A predicate reaches the
-//! wire as a child edge labelled `where.N` rather than a positional index, which
-//! is how a consumer tells "inside a type" from "an operand".
+//! [`NodeId`](crate::ccl::provenance::NodeId)s, so every walk here descends into
+//! them and a predicate reaches the wire as a child edge labelled `where.N`
+//! rather than a positional index. Why the ids are in the walk's domain at all:
+//! `src/inspector_model/design.md`, "Predicates are nodes".
 //!
 //! # Scope
 //!
@@ -47,11 +49,13 @@
 //! * [`NameBinderIndex`] — source-level lexical name resolution
 //!   (`goto-definition`, the binder half of `scope-at`), over the parsed CHL
 //!   surface AST retained on
-//!   [`source_ast`](crate::ccl::context::CompiledProgram::source_ast). This is
-//!   done at the *source* level, not over the lowered tree: some
-//!   source variables (multi-param `def`/`lambda` parameters) are destroyed by
-//!   lowering before any IR node exists, so only the surface AST can resolve
-//!   them.
+//!   [`source_ast`](crate::ccl::context::CompiledProgram::source_ast). It resolves
+//!   at the *source* level because lowering destroys the **name** of a
+//!   multi-param `def`/`lambda` parameter: `uncurry_params` rewrites `Var(p)` to
+//!   `__arg_tuple_N ▷ .i`, so nothing downstream binds or mentions `p`. The
+//!   occurrence's span survives (substitution is root-carry), which is why a
+//!   *use* of such a parameter still resolves to a node and a type; what only the
+//!   surface AST can say is which binder that use refers to.
 //!
 //! # Query handlers
 //!
@@ -64,9 +68,9 @@
 //! module doc above). Every value-ish result carries the
 //! always-`None` live seams (`tick`, `value_summary`).
 //!
-//! The substituted-parameter span fix (so `hover`/`type_of` on a *use* of a
-//! multi-param `def`/`lambda` parameter resolves to a type rather than `None`)
-//! is still a follow-up — see [`Snapshot::type_of`].
+//! No consumer calls them, and they are removed by item 1 of
+//! `src/inspector_model/design.md`, "Decided, not yet built" — a positional
+//! question is the consumer's to answer over the shipped tables.
 
 mod index;
 mod name_binder;

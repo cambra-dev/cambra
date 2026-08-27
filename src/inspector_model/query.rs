@@ -415,12 +415,11 @@ impl<'a> Snapshot<'a> {
     /// expression is an `Int`.
     ///
     /// `None` when neither answer exists. A **substituted multi-param
-    /// parameter** is the standing case: `uncurry_params` rewrites `Var(x)` to
-    /// `__arg_tuple_N ▷ .i` before any node binds `x`, so no IR binder carries
-    /// the name and no node carries the use-span. Carrying the replaced `Var`'s
-    /// span onto the projection (with per-occurrence fresh ids) is the deferred
-    /// substituted-parameter fix; goto-def on such a param already works via the
-    /// source-level [`NameBinderIndex`].
+    /// parameter's binding site** is the standing case: `uncurry_params` rewrites
+    /// `Var(p)` to `__arg_tuple_N ▷ .i`, so no IR binder carries the name and the
+    /// parameter's name span is no node's span. A *use* of such a parameter does
+    /// answer, because substitution is root-carry and the replacement root keeps
+    /// the occurrence's id and span.
     ///
     /// Perf: the binder path walks the surface AST once and the IR once; the
     /// expression path runs the O(nodes) [`find_node`] once. `build_payload`
@@ -465,8 +464,13 @@ impl<'a> Snapshot<'a> {
     /// one, and the descendant is its value (a `def`'s `let` over its `λ`).
     ///
     /// That two probes are needed is a gap in the model rather than a fact about
-    /// binders: nothing on the wire says "this node binds that source binder", so
-    /// the correspondence is recovered from name and span instead of read.
+    /// binders: nothing says "this node binds that source binder", so the
+    /// correspondence is recovered from name and span instead of read.
+    ///
+    /// TODO(binder-site): either channel closes the gap — a source span on
+    /// `TypedBinding`, so a binder carries its own site, or a binder-site entry
+    /// in a pane's attributions, so the pane names the node that binds a site.
+    /// See `src/inspector_model/design.md`, "A binder's type is the binder's".
     pub(super) fn binder_type(&self, binder: &Binding) -> Option<Type> {
         self.binder_at_site(binder.def_span, &|b, _exact| {
             b.name.base() == binder.name.as_str()
@@ -1614,23 +1618,23 @@ max(totals)
         );
     }
 
-    /// DEFER coverage view. The mapped set includes the Part-A nodes **and** the
-    /// **`CollectionUnion` fan-in**.
+    /// DEFER coverage view. The mapped set includes the Part-A nodes and the
+    /// **copaired fan-in**.
     ///
-    /// `CollectionUnion` is the node the `defer()`/`<<`/`for`-feed plumbing fans
-    /// into, tagged `via: Channelize, nature: Expansion`. Its fan-in record stores
-    /// each feed's pre-order id list and resolves to the *first* id that has a
-    /// span — the feed-value content the user wrote, as opposed to the feed
-    /// *wrapper* roots (a `λ __unused → V` lift, a `Compose` over the source)
-    /// whose own ids carry no span — so the union blames both feed sites
-    /// (`sum(readings)` and the `x` of `totals << x`) with non-empty origins.
+    /// `Copair` is the node the `defer()`/`<<`/`for`-feed plumbing fans into,
+    /// tagged `via: Channelize, nature: Expansion`. Its fan-in record stores each
+    /// feed's pre-order id list and resolves to the first id that has a span —
+    /// the feed-value content the user wrote, as opposed to the feed *wrapper*
+    /// roots (a `λ __unused → V` lift, a `Compose` over the source) whose own ids
+    /// carry no span — so the fan-in blames both feed sites (`sum(readings)` and
+    /// the `x` of `totals << x`) with non-empty origins.
     ///
     /// Distinct from the feed plumbing (`Lambda(__unused)`, the `Compose` over
     /// the feed body), tagged `nature: Machinery`, which stays unmapped by
     /// design.
-    // See `generator_coverage_maps_wrapper_chain`: the `CollectionUnion` fan-in is
-    // a post-channelize artifact, absent from the post-inference anchor. Retarget
-    // the walk/resolve to a snapshot anchored at the post-channelize stage.
+    ///
+    /// The fan-in is a post-channelize artifact, absent from the post-inference
+    /// anchor, so the snapshot under test is anchored at `post-channelize`.
     #[test]
     fn defer_coverage_maps_the_copaired_fan_in() {
         let prog = compile(DEFER_SRC);
