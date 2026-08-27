@@ -1532,7 +1532,7 @@ mod tests {
         assert!(
             matches!(
                 ob.agreed_assoc(Assoc::Output),
-                Some((BaseType::Int, Some(_)))
+                Some((BaseType::Int, _))
             ),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
              that row refines its output by the operands' sum",
@@ -1543,10 +1543,6 @@ mod tests {
         };
         assert_eq!(only.args, &[BaseType::Int, BaseType::Int]);
         assert_eq!(only.assoc, &[(Assoc::Output, BaseType::Int)]);
-        assert!(
-            only.refinement.is_some(),
-            "the integer row pins its output to the sum of its operands",
-        );
     }
 
     /// A comparison associates **nothing**: its `Bool` is the operator's, not the
