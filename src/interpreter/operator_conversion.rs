@@ -28,8 +28,8 @@ use crate::{
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
-            MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
-            PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
+            MapFilter, MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource,
+            Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
             VariantProject, VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
@@ -918,6 +918,20 @@ fn convert_impl_inner(
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
             let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
             Ok(Box::new(Filter::new(fan.branch(), pred_op)))
+        }
+
+        // `map_filter(p)`: filter the inner collections of a partition, per outer
+        // key. The fed input is the curried collection, fanned to the value side and
+        // the predicate exactly as `filter_values` fans its element stream — the
+        // difference is the shape, `CurriedFunction` rather than `SealedFunction`,
+        // and so the domain the predicate selects on is the inner one.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::MapFilter) =>
+        {
+            let upstream = expect_input(input, "map_filter")?;
+            let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
+            let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
+            Ok(Box::new(MapFilter::new(fan.branch(), pred_op)))
         }
 
         // cast(value): pure type-level assertion — re-views `value` under

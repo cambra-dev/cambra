@@ -1588,12 +1588,19 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
 /// `provide_function` lower-bounds with `domain ⇒ codomain`, so it coalesces
 /// to the built function) and the recorded type in Check (destructured
 /// directly — no inference vars).
+///
+/// A **dependent** projection reaches here: `lambda_elim`'s pairing rule carries a
+/// refinement that reads one component into the other's type, so `.k`'s codomain
+/// mentions the projected pair. The comparison below puts that codomain beside the
+/// domain it was read off, which is the domain's coordinate, so it is opened first —
+/// the same reading [`compose_chain`] takes on a chain adjacency.
 pub(super) fn emit_proj<C: Typing>(
     key: &ProjKey,
     node_ty: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (domain, codomain) = ctx.provide_function(node_ty, &|| "Proj".to_string())?;
+    let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
     let requirement = proj_requirement(key, codomain, ctx);
     ctx.require_sub(&domain, &requirement, &|| "Proj".to_string())?;
     Ok(node_ty.clone())

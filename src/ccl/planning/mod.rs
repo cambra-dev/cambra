@@ -38,6 +38,7 @@ mod groupby;
 mod iterate;
 mod join;
 mod loops;
+mod map_filter;
 mod predicates;
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
@@ -108,6 +109,12 @@ pub fn run(mut expr: Expr) -> Expr {
     // after the recognizers (which already consumed the bare shapes they
     // match) and is idempotent on already-compiled predicates.
     compile_refinement_predicates(&mut expr, &PredMemo::new());
+    // A refinement on an inner collection's domain is materialized here rather than
+    // by the iteration walk above: `wrap_with_iterate` reads a node's own domain,
+    // and this one is a codomain in. It runs after predicate compilation because it
+    // matches the point-free predicate, and after the group-by rewrite because the
+    // site's upstream is the `converse` chain it splices into.
+    map_filter::insert_map_filters(&mut expr);
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its

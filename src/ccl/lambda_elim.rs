@@ -838,6 +838,31 @@ fn elim_lambda_impl(
             // Merge λ x → λ y into λ __pair where x = pair[0], y = pair[1].
             // The pair variable has type (param_ty, y_ty).
             let pair = ctx.fresh_pair_name();
+            // `y_ty` may mention `param` — an inner comprehension filtered over the
+            // outer binder puts `param` in the refinement on its own domain. The pair
+            // type is what the `Proj` rule checks the projections against, so it must
+            // carry the same substitution the body gets, or the two disagree on which
+            // name the predicate reads. Substituting needs a `sub_x`, and `sub_x`'s
+            // annotation needs the pair type, so the annotation inside the rewritten
+            // predicate is the pre-substitution one; refinement equality is
+            // type-blind, so that is not observable.
+            let y_ty = {
+                // The replacement is annotated at the *un-narrowed* second component:
+                // annotating it with `y_ty` would carry the predicate being rewritten
+                // into its own replacement, and the substitution would then find
+                // `param` still free in what it just wrote.
+                let unnarrowed = match &y_ty {
+                    Type::Refinement(base, _) => base.as_ref().clone(),
+                    other => other.clone(),
+                };
+                let pre_pair_ty = Type::Tuple(vec![param_ty.clone(), unnarrowed]);
+                let pre_sub_x = Expr::apply(
+                    Expr::var(&pair).with_ty(pre_pair_ty.clone()),
+                    Expr::proj_index(0).with_ty(Type::fun(pre_pair_ty, param_ty.clone())),
+                )
+                .with_ty(param_ty.clone());
+                crate::ccl::subst::Subst::discharge(param.clone(), pre_sub_x).apply_type(&y_ty)
+            };
             let pair_ty = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
@@ -869,42 +894,86 @@ fn elim_lambda_impl(
         // [`crate::ccl::ccl_utils::make_cast`]), where the cast's refinement `𝑝`
         // may reference the outer binder `param` (correlated, the groupby
         // shape) or only local binders (uncorrelated, the for-filter shape).
-        // Handled by the Pi-const path below.
+        //
+        // Both paths below give the result the Pi type `(param) ⇒ {D | p} ⇒ V`,
+        // keeping the eliminated lambda's own kind: a group-by partition denotes a
+        // collection, and `Type::pi` mints the capability kind, which would flatten
+        // it. The binder must ride the type for the refinement's `param` to stay
+        // bound once the term binder is gone, and it is what planning's pointful
+        // group-by recognizer reads the key off.
         TypedExprNode::Cast { value, target }
             if matches!(value.node, TypedExprNode::Lambda { .. }) =>
         {
-            // Pi-aware path: the outer binder `param` is dependent solely
-            // through the cast's *refinement* (the group-by shape — the binder
-            // appears in the refinement predicate, not in the cast's value).
-            // Emit `const(cast(<point-free inner>))` with the Pi type
-            // `(param) ⇒ {D | p} ⇒ V`: the param-dependence rides the
-            // refinement and is materialized as a `Restrict` at the iteration
-            // boundary (the dependent-application model), and planning's
-            // pointful group-by recognizer reads the binder off the predicate.
-            // This replaces the former correlated-refinement uncurrying.
-            //
-            // A binder referenced in the cast's *value* (a value-dependent
-            // dependent function) is not produced by any current lowering; the
-            // assertion rejects it loudly rather than silently mishandle.
             debug_assert!(
                 cast_target_refinement(&target).is_some(),
                 "cast-wrapped lambda must carry a Fun(Refinement(_, _), _) target; got {target:?}"
             );
-            assert!(
-                !is_free(param, &value),
-                "value-dependent dependent function unsupported: `{param}` occurs in the cast value of {}",
-                symbolic(&value)
-            );
+            let result_pi =
+                Type::pi_kinded(param, param_ty.clone(), body_ty.clone(), fun_kind.clone());
+            // `param` in the cast's **value** as well as its refinement: an inner
+            // comprehension over the outer binder, `[s.amount for s in g if …]`.
+            // The value varies with `param`, so there is no `const` to lift. Move
+            // the refinement onto the inner lambda's binder, since `cast(λ 𝑦 : {𝐷 | 𝑟}
+            // → body, {𝐷 | 𝑝} ⤇ 𝑉)` and `λ 𝑦 : {𝐷 | 𝑟, 𝑝} → body` are the same
+            // function, and hand the result to the nested-lambda rule, which carries
+            // the binder's type into the curried morphism. The refinement ends up on
+            // the inner collection's domain, under the Pi that binds `param`, and
+            // planning materializes it there as a `map_filter`.
+            //
+            // Re-targeting the cast onto the eliminated morphism instead does not
+            // typecheck: it narrows a data function's domain inside a codomain, and
+            // a collection's domain is its data, so no subtyping edge admits that.
+            if is_free(param, &value) {
+                let TypedExpr {
+                    node:
+                        TypedExprNode::Lambda {
+                            param: inner_binding,
+                            body: inner_body,
+                        },
+                    ..
+                } = *value
+                else {
+                    unreachable!("guarded on the value being a Lambda")
+                };
+                // The cast **adds** its refinements to the ones the binder already
+                // carries rather than replacing them: a refinement set is a
+                // conjunction, and the partition's domain refinement and the filter's
+                // both hold of the elements that survive. The cast target names only
+                // the narrowing it imposes, so the binder is the union.
+                let binder_ty = match target.domain() {
+                    Some(narrowing) => {
+                        debug_assert_eq!(
+                            narrowing.peel_refinements(),
+                            inner_binding.ty.peel_refinements(),
+                            "a cast narrows the domain the lambda already binds, so the \
+                             two refine one base",
+                        );
+                        Type::refined(
+                            inner_binding.ty.clone(),
+                            narrowing.refinements().iter().cloned().collect(),
+                        )
+                    }
+                    None => inner_binding.ty.clone(),
+                };
+                let refined = Expr::new(TypedExprNode::Lambda {
+                    param: crate::ccl::expr::TypedBinding {
+                        ty: binder_ty,
+                        ..inner_binding
+                    },
+                    body: inner_body,
+                })
+                .with_ty(body_ty.clone());
+                return elim_lambda_kinded(ctx, param, param_ty, refined, fun_kind);
+            }
+            // `param` occurs only in the refinement (the group-by shape): the value
+            // is closed, so it lifts under `const` and the dependence rides the
+            // refinement, materialized as a `Restrict` at the iteration boundary.
             let inner_pf = elim_lambdas(ctx, *value)?;
             let cast_val = Expr::new(TypedExprNode::Cast {
                 value: Box::new(inner_pf),
                 target,
             })
             .with_ty(body_ty.clone());
-            // The Pi keeps the eliminated lambda's own kind: a group-by partition
-            // function denotes a collection, so the arrow stays `⤇` rather than
-            // flattening to the capability arrow.
-            let result_pi = Type::pi_kinded(param, param_ty.clone(), body_ty.clone(), fun_kind);
             let const_fn = Expr::builtin(Builtin::Const)
                 .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
             return Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi));

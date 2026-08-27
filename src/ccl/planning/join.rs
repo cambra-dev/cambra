@@ -206,7 +206,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
 }
 
 /// Combines two optional predicates over the same flat domain with a logical AND.
-fn combine_predicates(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
+pub(super) fn combine_predicates(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     match (a, b) {
         (None, None) => None,
         (Some(p), None) | (None, Some(p)) => Some(p),
