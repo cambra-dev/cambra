@@ -598,6 +598,19 @@ pub enum Expr {
         value: Box<Spanned<Expr>>,
     },
 
+    /// A block statement in value position: an `if`/`match` on the right of an
+    /// assignment, or a one-line `match` inside a bracket.
+    ///
+    /// The block's value is its last statement's, by the same rule that gives a
+    /// function body its value (`docs/chl-spec.md`, "4.5 `if` / `elif` /
+    /// `else`"). The indented and one-line arm layouts differ in how an arm
+    /// body is parsed, so both build the same statement here and lowering
+    /// routes both through `lower_final_stmt`.
+    ///
+    /// **Invariant:** the statement is a [`Stmt::If`] or a [`Stmt::Match`].
+    /// Lowering asserts it.
+    Block(Box<Spanned<Stmt>>),
+
     /// Recovery placeholder inserted when chumsky's bracket-level
     /// `recover_with` matched. The placeholder's [`Span`] covers the
     /// bracketed region whose contents failed to parse.

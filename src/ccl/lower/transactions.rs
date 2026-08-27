@@ -211,7 +211,7 @@ fn lower_tx_block_inner(
             // `balance += value` — the compound-write shorthand, likewise a write.
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
-                let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
+                let val = lower_aug_binop(&name, *op, lower_expr(value, ctx)?, stmt.span, ctx)?;
                 write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `x = value` — a plain immutable binding: a per-transaction local

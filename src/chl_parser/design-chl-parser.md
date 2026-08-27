@@ -96,7 +96,16 @@ highest precedence:
 13. `*`, `//`
 14. unary `-`
 15. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name` / `x.0`
-16. atom: literal, name, parenthesised, list, dict/record, comprehension
+16. atom: literal, name, parenthesised, list, record, brace type, comprehension
+
+Every position a bracket encloses — a list or tuple element, a call argument, a
+subscript index, a record field, a brace item, a refinement predicate, a
+comprehension clause — goes through `bracketed_expr` rather than `expr`. That
+production is `oneline_match | expr`, which is what confines the one-line
+`match` to a position where a `)`, `]` or `}` closes its arm list. `match` is a
+keyword, so no `expr` can start with one and the choice needs no backtracking.
+See [docs/chl-spec.md](../../docs/chl-spec.md), "The one-line form" for the rule
+and why the bracket rather than the arm body carries it.
 
 Notably absent vs. Python: `/` (true division), `%` (modulo), `**`
 (power), `>>` (right shift), `~` (bitwise not), `is`, `in`, `not in`,
@@ -115,21 +124,28 @@ Key shape choices:
 - **`if`/`elif` chains flatten.** `Stmt::If` carries a `Vec<IfBranch>` (one
   per `if`/`elif`) plus an optional `else_body`, rather than nesting an
   `If` inside an `Else`. This matches the `Case` shape in CCL.
+- **A block statement in value position is `Expr::Block`.** `x = if c: … else:
+  …`, `x = match v: …`, and the one-line `match` all wrap the `Stmt::If` or
+  `Stmt::Match` they parsed to, so each construct keeps one AST shape and
+  lowering routes every spelling through `lower_final_stmt`. The two `match`
+  layouts share `match_arms`, a production over how an arm's body is spelled:
+  an indented `block` for the statement form, a single expression for the
+  one-line one. The six assignment operators likewise share `assign_tail`, a
+  production over the right-hand side, which is what gives every one of them a
+  block right-hand side rather than only `=`.
 - **Records are parens; braces are types.** A record *value* `(x=1)` parses
   as `Expr::Record`; brace literals are type syntax — `{x: T}` is
-  `Expr::BraceRecord`, `{T, U}` is `Expr::BraceGroup`, `{"name": v}` is
-  `Expr::Dict`. Lowering reads the brace forms as types and rejects them as
-  values. Because braces are always a *product* in type position and never
-  grouping, the brace parser captures the trailing comma rather than merely
-  allowing it: `{T,}` is the one-element product and a comma-free `{T}` is a
-  parse error, while the empty `{}` is the **unit type**, which lowering reads as
-  `Unit` (see [docs/chl-spec.md](../../docs/chl-spec.md),
-  "6.6 The empty product is unit"). A `where` clause after a single colon-free
-  base turns the brace into a refinement type `{T where p}` (`Expr::BraceRefinement`,
-  [docs/chl-spec.md](../../docs/chl-spec.md), "6.4 Refinement syntax"); the
-  clause gates off the one-element `{T}` diagnostic, and its predicate `p` — an
-  ordinary expression whose subject `_` lowering maps to the refinement binder —
-  is parsed with the same `expr` as everything else.
+  `Expr::BraceRecord` and `{T, U}` is `Expr::BraceGroup`. Lowering reads the brace forms as types
+  and rejects them as values. Because braces are always a *product* in type position and never
+  grouping, the brace parser captures the trailing comma rather than merely allowing it: `{T,}` is
+  the one-element product and a comma-free `{T}` is a parse error, while the empty `{}` is the
+  **unit type**, which lowering reads as `Unit` (see
+  [docs/chl-spec.md](../../docs/chl-spec.md), "6.6 The empty product is unit"). A `where` clause
+  after a single colon-free base turns the brace into a refinement type `{T where p}`
+  (`Expr::BraceRefinement`, [docs/chl-spec.md](../../docs/chl-spec.md), "6.4 Refinement syntax");
+  the clause gates off the one-element `{T}` diagnostic, and its predicate `p` — an ordinary
+  expression whose subject `_` lowering maps to the refinement binder — is parsed with the same
+  `bracketed_expr` as every other bracketed position.
 - **The function-type arrow `=>` is the loosest binary form.** `T => U` parses
   to `Expr::FunctionType`, a level below `feed` in the precedence chain. It is
   right-associative — `A => B => C` is `A => (B => C)` — because it takes the

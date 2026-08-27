@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use cambra::interpreter::{ColumnValue, Tile, Value};
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -140,6 +141,64 @@ False if c else True",
     Value::Bool(false)
 )]
 fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A block `if` on the right of an assignment binds the block's value, and that
+// value is the same `Case` the ternary in the same position builds
+// (`docs/chl-spec.md`, "4.3 Assignment forms"). What is worth pinning end to
+// end is that a *branch* is a full block: its own bindings, then its value.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {"
+        a: Int = 1
+        x = if a == 1:
+            100
+        else:
+            200
+        x"},
+    Value::Int(100)
+)]
+// The `elif` chain is one choice, and the last guard wins nothing the earlier
+// ones already took.
+#[case(
+    indoc! {"
+        a: Int = 5
+        x = if a > 10:
+            1
+        elif a > 3:
+            2
+        else:
+            3
+        x"},
+    Value::Int(2)
+)]
+// A branch binds before it yields.
+#[case(
+    indoc! {"
+        a: Int = 4
+        x = if a > 3:
+            d = a * 2
+            d + 1
+        else:
+            0
+        x"},
+    Value::Int(9)
+)]
+// The value feeds an ordinary expression after the block: the `Dedent` ends the
+// statement, and `x` is in scope from there.
+#[case(
+    indoc! {"
+        a: Int = 2
+        x = if a == 2:
+            10
+        else:
+            20
+        x + 5"},
+    Value::Int(15)
+)]
+fn test_block_if_as_an_assigned_value(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
