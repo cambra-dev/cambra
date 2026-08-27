@@ -70,6 +70,12 @@ The TCP socket is bound synchronously in `SharedHttpServer::new` (not inside the
 
 Each request is assigned a monotonically-increasing integer index by `UIntStreamBuffer`.  The CCL program iterates over that index domain.  `SinkConsumer` pulls tiles from the responses producer and calls `HttpServerSharedState::process`, which matches `(index, response-body)` pairs against the `pending` map and sends each HTTP response outside the lock.
 
+`UIntStreamBuffer` drops a request body once every registered producer has released its index, which
+bounds a long-lived server's memory to the requests still in flight. Bodies are dropped from the
+front, so a release frees memory only over an unbroken run from the lowest index still held. A
+release covering a later region is recorded and withheld from that producer; its memory is reclaimed
+when the front is released.
+
 ---
 
 ## Multi-endpoint programs
