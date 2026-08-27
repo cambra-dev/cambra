@@ -401,14 +401,18 @@ impl SourceSinkRegistry {
     }
 
     /// Fold everything a completed lowering pass opened into the registry.
-    fn absorb(&mut self, lowering: &LoweringContext) {
+    ///
+    /// The listeners are taken rather than copied, so that after this the
+    /// registry is the only long-term owner of a port and
+    /// [`release_unrouted_ports`](Self::release_unrouted_ports) dropping one
+    /// really closes it.
+    fn absorb(&mut self, lowering: &mut LoweringContext) {
         self.sources.extend(
             lowering
                 .registered_sources()
                 .map(|(n, s)| (n.to_string(), s.clone())),
         );
-        self.shared_servers
-            .extend(lowering.registered_servers().map(|(p, s)| (*p, s.clone())));
+        self.shared_servers.extend(lowering.take_servers());
         for (name, route) in lowering.registered_routes() {
             let Some(server) = self.shared_servers.get(&route.port) else {
                 continue;
@@ -443,6 +447,32 @@ impl SourceSinkRegistry {
             server.unregister(&route.method, &route.path);
             self.sources.remove(&name);
         }
+        self.release_unrouted_ports();
+    }
+
+    /// Drop the listener on every port no route is registered on any more.
+    ///
+    /// A port is held for as long as some version binds a route there, and no
+    /// longer. The listener is what makes an unrouted address answer 404, so
+    /// while any route survives on the port its siblings' addresses keep
+    /// answering; once the last one goes there is nothing left to answer for and
+    /// the address stops existing instead. Dropping the handle ends the
+    /// dispatcher thread and closes the socket
+    /// ([`SharedHttpServer`](crate::interpreter::http_server::SharedHttpServer)),
+    /// so a long-lived program that moves its endpoints between ports does not
+    /// accumulate a listener per port it ever served.
+    ///
+    /// Nothing is mid-flight on a port with no routes: a request there matched no
+    /// route, so it was answered 404 rather than buffered for a reader.
+    fn release_unrouted_ports(&mut self) {
+        let routed: HashSet<u16> = self.http_routes.values().map(|r| r.route.port).collect();
+        self.shared_servers.retain(|port, _| {
+            let keep = routed.contains(port);
+            if !keep {
+                debug!("releasing port {port}: no route is registered on it");
+            }
+            keep
+        });
     }
     /// A [`LoweringContext`] holding everything this registry does.
     ///
@@ -1506,13 +1536,7 @@ fn run_frontend(
     // Fold anything this pass opened into the source/sink registry before the
     // per-compilation registries are drained, so the next version inherits it.
     // A no-op for an `Inherited` pass, which opens nothing.
-    ctx.sources_and_sinks.absorb(&ctx.lowering);
-    // A route the registry holds and this version did not bind is one the version
-    // stopped serving. Retire it, or it keeps matching requests and buffering them
-    // for a reader that no longer exists. A no-op for a first compilation, whose
-    // pass bound every route the registry has.
-    let bound = ctx.lowering.routes_bound_this_pass().clone();
-    ctx.sources_and_sinks.retire_routes_absent_from(&bound);
+    ctx.sources_and_sinks.absorb(&mut ctx.lowering);
 
     // Drain sink bindings before taking sources.
     let sink_bindings = ctx.lowering_ctx().take_sink_bindings();
@@ -1939,6 +1963,17 @@ pub fn compile_program(
         lowering_projection,
         table_session,
     } = run_frontend(ctx, code, Phase::Planning, &PANES, true)?;
+    // A route the registry holds and this version did not bind is one the version
+    // stopped serving. Retire it, or it keeps matching requests and buffering them
+    // for a reader that no longer exists. A no-op for a first compilation, whose
+    // pass bound every route the registry has.
+    //
+    // Here rather than in `run_frontend`, because retiring is part of *installing*
+    // a version: a program's listeners are shared with every scratch compile taken
+    // against them, so a compile that only answers a question — `compile_to` for a
+    // diff — must not act on a route the running program still serves.
+    let bound = ctx.lowering.routes_bound_this_pass().clone();
+    ctx.sources_and_sinks.retire_routes_absent_from(&bound);
     // The frontend ran to , which is past every pane boundary.
     let mut pane = |phase: Phase| {
         panes

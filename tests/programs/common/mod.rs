@@ -289,6 +289,20 @@ pub fn http_post(port: u16, path: &str, body: &str) -> String {
 }
 
 pub fn raw_http(port: u16, request: &str) -> String {
+    raw_http_response(port, request)
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default()
+}
+
+/// Send `request` and return the whole response, status line and headers
+/// included.
+///
+/// [`raw_http`] answers with the body, which is what a test about a program's
+/// output wants. Use this one where the status code is the contract — the control
+/// port distinguishes an accepted request from a rejected one by status, and a
+/// body-only reading cannot tell them apart.
+pub fn raw_http_response(port: u16, request: &str) -> String {
     let mut stream =
         TcpStream::connect(format!("127.0.0.1:{port}")).expect("failed to connect to test server");
     stream
@@ -299,9 +313,7 @@ pub fn raw_http(port: u16, request: &str) -> String {
     stream
         .read_to_string(&mut raw)
         .expect("failed to read HTTP response");
-    raw.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default()
+    raw
 }
 
 /// Drive `ctx`'s scheduler on the current thread until `rx` delivers a

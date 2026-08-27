@@ -65,7 +65,7 @@ Every carrier in the program, and where its cut comes from:
 | An induction store | Its own frontier | `CarriedState`, values and position together |
 | A transaction writer's item cursor | Its source's agreed release | Absolute item positions, released on the commit-ack |
 | A commit clock | None — private and restartable | A rebuilt store seeds at `0` |
-| A route, its listener, and the requests behind it | None — registry state outlives a version | `SourceSinkRegistry` |
+| A route, its listener, and the requests behind it | None while any version still binds a route on the port | `SourceSinkRegistry` |
 
 ## Sources and sinks outlive a version
 
@@ -127,6 +127,24 @@ reply nobody computes. `SourceSinkRegistry::retire_routes_absent_from` compares
 the routes the pass bound against those the registry holds and unregisters the
 difference, so the address answers 404 — which is what "this program no longer
 serves that" should look like from outside.
+
+Retiring belongs to installing a version, not to compiling one, and it runs in
+`compile_program` rather than in `run_frontend` for that reason. A diff compiles
+the new version against the running registry, so the listeners it sees are the
+running program's; a compile that answered a question by unregistering a route
+would make `/diff` change what the program serves.
+`diffing_against_a_version_that_drops_a_route_does_not_retire_it` pins it.
+
+The port goes when its last route does. While a sibling route survives there the
+listener stays, which is what makes the retired address answer 404 rather than
+refuse a connection; once nothing is registered there is nothing left to answer
+for, so `release_unrouted_ports` drops the listener and the socket closes. That
+bounds what a long-lived program holds: a version that moves its endpoints to
+another port releases the one it left, instead of the process keeping every port
+it ever served. Dropping the handle is what closes it — `SharedHttpServer` holds
+the listener alongside the dispatcher thread and unblocks the thread on drop, so
+the thread's own shutdown path runs and its `Server` goes with it.
+`a_port_whose_last_route_goes_is_released` covers both halves.
 
 ## Operator identity is the term it computes
 
@@ -211,8 +229,14 @@ subscriber owns its side, and the registry holds a weak reference.
   guards. Skipping matters: the guards are intersected before anything is
   released upstream, so a subscriber that will never release again would
   otherwise pin the intersection where it stopped and the input would retain
-  everything from there on. Slots are never renumbered, because a producer
-  addresses its guard by index.
+  everything from there on. A producer addresses its guard by slot number, so the
+  number lives in a `Cell` the producer and the registry share: `FanOut::reopen`
+  drops the dead slots and writes each survivor its new number. Without that
+  renumbering the slot list would grow by one dead entry per replaced subscriber
+  on every update and never shrink, and both the notify walk and the release
+  intersection scan it —
+  `reopening_a_fan_out_drops_dead_slots_and_renumbers_the_rest` pins that the
+  survivor keeps the guard it released.
 - **Scheduler wake-ups.** `Scheduler::add_source_handle` records a
   `Weak<RefCell<dyn Consumer>>`, and the `IterateExtentProducer` that registered
   it owns the strong side. A source handle outlives a version; the subscriptions
@@ -228,17 +252,29 @@ subscriber owns its side, and the registry holds a weak reference.
 
 ## Order of an update
 
-1. Compile the new version to `Phase::Planning` against the endpoint
-   registry. This opens nothing and builds no operators, so a version that fails
-   here leaves the running program serving.
-2. Tear down the running graph: detach its sinks, drop its outputs.
-3. `GlobalContext::retire_version` moves the retiring conversion context's
+1. Render the difference between the running source and the new one, which
+   compiles both to `Phase::AsOfRead`.
+2. Compile the new version to `Phase::Planning` against the endpoint registry and
+   run the state guard on the planned tree. Steps 1 and 2 open nothing and build
+   no operators, so a version that fails either leaves the running program
+   serving.
+3. Tear down the running graph: detach its sinks, drop its outputs.
+4. `GlobalContext::retire_version` moves the retiring conversion context's
    operators into the next compilation's inheritance.
-4. Compile and subscribe the new version with `Endpoints::Inherited`.
+5. Compile and subscribe the new version against the same registry, which now
+   binds every endpoint the retired version left open.
 
-Steps 2 and 3 come after step 1 so that a rejection is never destructive, and
-before step 4 so that what the new version inherits is held by the inheritance
+Steps 3 and 4 come after step 2 so that a rejection is never destructive, and
+before step 5 so that what the new version inherits is held by the inheritance
 and not also by a graph still running.
+
+An accepted update therefore compiles four times: twice for the diff, once to
+`Planning` for the guard, and once for real. `run_frontend` goes from source to a
+stop phase and there is no way to continue a stopped tree into operator
+conversion, so the guard's tree cannot be the one that gets built — which is why
+`LiveProgram::update` documents a panic for the two compiles disagreeing.
+Compilation is cheap next to the state the swap preserves, and the ordering is
+what makes a rejection non-destructive, so the cost buys the guarantee.
 
 ## What an update does not do
 

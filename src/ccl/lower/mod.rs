@@ -446,9 +446,15 @@ impl LoweringContext {
         &self.http_routes_this_pass
     }
 
-    /// Every bound TCP port's listener.
-    pub fn registered_servers(&self) -> impl Iterator<Item = (&u16, &Arc<SharedHttpServer>)> {
-        self.shared_servers.iter()
+    /// Hand over every bound TCP port's listener, leaving this context with none.
+    ///
+    /// Drained rather than cloned so that the registry it is folded into becomes
+    /// the sole owner. A copy left here would keep a retired port's listener alive
+    /// until the next pass replaced this context, which is a compilation later
+    /// than the pass that stopped serving it. Lowering is finished by the time
+    /// this is called, so nothing looks a port up afterwards.
+    pub fn take_servers(&mut self) -> impl Iterator<Item = (u16, Arc<SharedHttpServer>)> + use<> {
+        std::mem::take(&mut self.shared_servers).into_iter()
     }
 
     /// Seed this context with the sources and sinks a program already holds.

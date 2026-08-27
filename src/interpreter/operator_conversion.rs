@@ -315,11 +315,10 @@ pub struct OpConversionContext {
     /// carries a [`BindingKind`] so [`TypedExprNode::Var`] lookups can
     /// dispatch on it without inspecting tile-level types.
     scopes: ScopeStack<Name, LetBinding>,
-    /// The operators a previous version of this program built, by the identity
-    /// of the term each computes. Consulted at every `Let` binding; empty for
-    /// the first version. See [`OpConversionContext::bind_let`].
     /// What the version this one replaces left behind, to be adopted where the
-    /// computation is unchanged. Empty for a program's first compilation.
+    /// computation is unchanged. Consulted at every `Let` binding
+    /// ([`bind_let`](Self::bind_let)) and every store ([`bind_store`](Self::bind_store));
+    /// empty for a program's first compilation.
     inherited: Inheritance,
     /// What this compilation binds, for the version that replaces it.
     minted: Inheritance,
@@ -521,10 +520,10 @@ impl OpConversionContext {
     /// The store-shaped counterpart of [`bind_let`](Self::bind_let), and reuse
     /// matters more here than anywhere else: the store *is* the program's
     /// mutable state, so adopting one is what carries an accumulator across an
-    /// update. Its correspondent follows the same rule — the term's identity when
-    /// adopted, a value unique to this compilation when rebuilt — so a term
-    /// reading a rebuilt store cannot be mistaken for one reading its
-    /// predecessor.
+    /// update. Its correspondent is the term's identity whether the store was
+    /// adopted or rebuilt, exactly as [`LetBinding::correspondent`] is; a term
+    /// reading a rebuilt store is kept from adoption by
+    /// [`rebuilt`](Self::rebuilt), not by its correspondent changing.
     fn bind_store(
         &mut self,
         name: &Name,
@@ -639,14 +638,6 @@ impl OpConversionContext {
         Ok(())
     }
 
-    /// Offer the operators this compilation bound to the version that replaces
-    /// it, retiring the subscriptions the replaced version made against them.
-    ///
-    /// Call after dropping the operator graph these fan-outs were wired into.
-    /// Each is reopened for the branches the next version takes
-    /// ([`FanOut::reopen`]); the subscriptions of the version being replaced
-    /// need no unwinding, since a subscription lasts exactly as long as the
-    /// producer it handed out.
     /// Every variable the running program holds that `planned` cannot take over.
     ///
     /// Checked before anything is torn down, so a version that would lose a
@@ -668,10 +659,15 @@ impl OpConversionContext {
                         // The same name under another store is a variable that
                         // moved between loops, which reads very differently to
                         // one that was deleted.
+                        // `min`, not `find`: several stores may declare the
+                        // name, and a `HashMap`'s first match would make the
+                        // diagnostic depend on hash order.
                         let now = declared
                             .keys()
-                            .find(|(_, k)| *k == key.runtime_key)
-                            .map(|(s, _)| s.clone());
+                            .filter(|(_, k)| *k == key.runtime_key)
+                            .map(|(s, _)| s)
+                            .min()
+                            .cloned();
                         out.push(match now {
                             Some(now) => StateConflict::Moved {
                                 store: store.clone(),
@@ -705,6 +701,17 @@ impl OpConversionContext {
     /// The value each mutable variable currently holds, by the identity state is
     /// carried under. Readable before the version is retired, so a replacement
     /// can be checked against what it would inherit.
+    ///
+    /// A store [`state_conflicts`](Self::state_conflicts) treated as carryable is
+    /// skipped here only when it holds nothing, because a store with a value that
+    /// this drops is the one outcome the guard exists to prevent: the replacement
+    /// reseeds from the init, the program carries on answering, and only the
+    /// history is gone. So the absent cached tile is an assertion — a store's fan
+    /// is always cyclic ([`FanOut::new_cyclic`]) and a cyclic fan always has one —
+    /// while the two ways of holding nothing are ordinary cases: a store that has
+    /// decided no position has no frontier, and a variable no position has written
+    /// has no value at the frontier. Either way its replacement reads its init,
+    /// which is what it would have read anyway.
     pub(crate) fn live_state(&self) -> HashMap<String, CarriedState> {
         let mut out: HashMap<String, CarriedState> = HashMap::new();
         // A store id names one frontier. `minted.stores` is keyed by content hash
@@ -716,8 +723,15 @@ impl OpConversionContext {
                 continue;
             };
             let Some(tile) = info.fan.cached_tile() else {
+                debug_assert!(
+                    false,
+                    "store `{store}` has no cached tile: a store's fan is cyclic, so it has one"
+                );
                 continue;
             };
+            // No frontier means no position has been decided, so there is no
+            // accumulated value to hand over and nothing is lost by starting the
+            // replacement at its init.
             let Some(frontier) = store_frontier(&tile) else {
                 continue;
             };

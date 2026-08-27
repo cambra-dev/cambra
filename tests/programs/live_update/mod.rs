@@ -16,9 +16,15 @@
 //! | `latest-write` | A transactional variable (`Mut(String, Txn)`) that `POST /set` overwrites and `GET /get` reads. |
 //! | `running-log` | A transactional variable that `POST /set` *appends* to, so every commit leaves a mark a replay would show. |
 //!
-//! The `stdin` cases build their programs inline and drive the binary as a
-//! subprocess ([`stdin_across_update`]), because a `main` output belongs to the
-//! binary's own loop rather than to a sink a test can pump.
+//! Two cases build their programs inline instead: the multi-port one, because a
+//! base program's `{PORT}` is a single port, and the control-port ones, which are
+//! `stdin`-sourced.
+//!
+//! The `stdin` cases drive the binary as a subprocess
+//! ([`launch_under_control`]), because a `main` output belongs to the binary's own
+//! loop rather than to a sink a test can pump. Those are also the only cases that
+//! reach the control port over HTTP; every other case calls `LiveProgram`
+//! directly.
 //!
 //! # What an update may do
 //!
@@ -29,7 +35,7 @@
 //! | An edit to one of two independent loops | Accepted; the other's store is adopted |
 //! | A loop gains an accumulator | Accepted; the others resume, the new one starts at its init |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
-//! | An endpoint is removed | Accepted; the route is retired and the address answers 404 |
+//! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | Repeats and reverts | Accepted; each takes effect |
 //!
 //! # What it may not
@@ -42,7 +48,8 @@
 //! | The source does not compile | Refused |
 //!
 //! In every refusal the running program keeps serving. Diffing is covered
-//! separately and must leave it untouched whichever phase it compares at.
+//! separately and must leave it untouched whichever phase it compares at, and
+//! whatever the version it is compared against would have changed.
 //!
 //! # Two properties worth stating
 //!
@@ -68,7 +75,9 @@ use cambra::{
     live_program::UpdateReport,
 };
 
-use super::common::{drive_until, http_get, http_post, raw_http, reserve_test_port, start_sink};
+use super::common::{
+    drive_until, http_get, http_post, raw_http, raw_http_response, reserve_test_port, start_sink,
+};
 
 /// Run a `stdin`-sourced program under `--control`, feeding it `before`, then
 /// swapping it for `updated` and feeding it `after`.
@@ -82,47 +91,15 @@ fn stdin_across_update(
     before: &str,
     after: &str,
 ) -> (String, String) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::{Command, Stdio};
+    use std::io::Write;
 
-    let control = reserve_test_port();
-    let dir = std::env::temp_dir().join(format!("cambra-live-{control}"));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let v1 = dir.join("v1.cambra");
-    let v2 = dir.join("v2.cambra");
-    std::fs::write(&v1, program).expect("write v1");
+    let mut launched = launch_under_control(program);
+    let control = launched.control;
+    let v2 = launched.program.dir.join("v2.cambra");
     std::fs::write(&v2, updated).expect("write v2");
-
-    let mut child = RunningProgram {
-        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
-            .arg(format!("--control={control}"))
-            .arg(&v1)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cambra"),
-        dir,
-    };
-
-    let mut input = child.child.stdin.take().expect("piped stdin");
-    let out = child.child.stdout.take().expect("piped stdout");
-    let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let sink = collected.clone();
-    let reader = thread::spawn(move || {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push_str(&line);
-            sink.lock().unwrap().push('\n');
-        }
-    });
-
-    // The program binds its control port during compilation, before it reads a
-    // line, so a write is only safe once the port answers.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::net::TcpStream::connect(("127.0.0.1", control)).is_err() {
-        assert!(Instant::now() < deadline, "control port never opened");
-        thread::sleep(Duration::from_millis(50));
-    }
+    let mut input = launched.input.take().expect("piped stdin");
+    let collected = launched.collected.clone();
+    let reader = launched.reader.take().expect("reader thread");
 
     writeln!(input, "{before}").expect("write before");
     input.flush().expect("flush");
@@ -142,10 +119,77 @@ fn stdin_across_update(
     thread::sleep(Duration::from_millis(400));
     drop(input);
 
-    child.wait_for_exit(Duration::from_secs(10));
+    launched.program.wait_for_exit(Duration::from_secs(10));
     reader.join().expect("reader thread");
     let text = collected.lock().unwrap().clone();
     (reply, text)
+}
+
+/// A program running under `--control`, with its control port already answering.
+///
+/// Split out of [`stdin_across_update`] because a test that only asks the control
+/// port a question needs the launch and none of the feeding.
+struct Launched {
+    program: RunningProgram,
+    control: u16,
+    /// The program's `stdin`, for a test that feeds it. `None` once taken.
+    input: Option<std::process::ChildStdin>,
+    /// Every line the program has written, accumulated by [`reader`](Self::reader).
+    collected: std::sync::Arc<std::sync::Mutex<String>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+/// Spawn `program` under `--control` on a reserved port and wait for that port to
+/// answer.
+///
+/// The wait is not optional: the program binds its control port during
+/// compilation, so a request sent before then is refused rather than served.
+fn launch_under_control(program: &str) -> Launched {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let control = reserve_test_port();
+    let dir = std::env::temp_dir().join(format!("cambra-live-{control}"));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let v1 = dir.join("v1.cambra");
+    std::fs::write(&v1, program).expect("write v1");
+
+    let mut program = RunningProgram {
+        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .arg(format!("--control={control}"))
+            .arg(&v1)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cambra"),
+        dir,
+    };
+
+    let input = program.child.stdin.take().expect("piped stdin");
+    let out = program.child.stdout.take().expect("piped stdout");
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = collected.clone();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push_str(&line);
+            sink.lock().unwrap().push('\n');
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", control)).is_err() {
+        assert!(Instant::now() < deadline, "control port never opened");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Launched {
+        program,
+        control,
+        input: Some(input),
+        collected,
+        reader: Some(reader),
+    }
 }
 
 /// A spawned program and its scratch directory, both cleaned up on drop.
@@ -566,6 +610,87 @@ fn reuse_does_not_depend_on_how_many_updates_came_before() {
     );
 }
 
+/// The control port answers `/diff` itself, at the phase the request names, and
+/// rejects a phase it does not offer.
+///
+/// Every other case here calls `LiveProgram::diff_against` directly, so this is
+/// what covers the wire: both ways of carrying the source, the leading `phase=`,
+/// and the main loop servicing a `Diff` between ticks.
+#[test]
+fn the_control_port_answers_a_diff_request() {
+    const V1: &str = "[\"> \" + line for line in stdin()]\n";
+    const V2: &str = "[\">> \" + line for line in stdin()]\n";
+
+    let launched = launch_under_control(V1);
+    let control = launched.control;
+
+    // The source is the body here, which is how a client sends a file. A space in
+    // a request line would end the target, so the query form has to be encoded.
+    let post = |query: &str, body: &str| {
+        raw_http(
+            control,
+            &format!(
+                "POST /diff{query} HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+
+    let same = post("", V1);
+    assert!(
+        same.contains("no difference"),
+        "the running source does not differ from itself: {same}"
+    );
+
+    let edited = post("?phase=inferred&", V2);
+    assert!(
+        edited.contains("divergence"),
+        "an edit is a divergence at the phase asked for: {edited}"
+    );
+
+    let bad = raw_http_response(
+        control,
+        &format!(
+            "POST /diff?phase=nonsense& HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{V1}",
+            V1.len()
+        ),
+    );
+    assert!(
+        bad.starts_with("HTTP/1.1 400"),
+        "an unoffered phase is a rejection, not a default: {bad}"
+    );
+    assert!(
+        bad.contains("channelized"),
+        "and the reply names the offered set: {bad}"
+    );
+
+    // The query form, which is what `percent_decode` and `split_phase_param` are
+    // for. `+` is a space and every other non-alphanumeric byte is escaped, so the
+    // program survives a request line.
+    let encoded: String = V1
+        .trim_end()
+        .bytes()
+        .map(|b| match b {
+            b' ' => "+".to_string(),
+            b if b.is_ascii_alphanumeric() => (b as char).to_string(),
+            b => format!("%{b:02X}"),
+        })
+        .collect();
+    let query_form = raw_http(
+        control,
+        &format!(
+            "GET /diff?{encoded} HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        query_form.contains("no difference"),
+        "the same source through the query string reads the same: {query_form}"
+    );
+}
+
 /// A program whose output is its `main` value rather than a sink updates too.
 ///
 /// Its source is `stdin`, which is unbounded, so the program keeps running and
@@ -863,6 +988,133 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 
     let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(still_serving, vec!["peek\n"]);
+}
+
+/// A request the retired version received but never answered is answered by the
+/// replacement, once.
+///
+/// The end-to-end half of the release carry: a source hands a newly registered
+/// producer everything it still holds, and `retire_version` records what the
+/// retired producers had released so the replacement's do not start from the
+/// oldest retained element. `UIntStreamBuffer`'s unit tests pin the buffer's side
+/// of that; this pins the promise a client sees, which is that arriving before
+/// the swap is not a way to be dropped.
+///
+/// The request is sent and left unanswered — nothing pumps the scheduler until
+/// after the update — so the version that received it is gone before it could
+/// have replied.
+#[test]
+fn a_request_that_arrived_before_the_swap_is_answered_after_it() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", port));
+
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    thread::spawn(move || tx.send(vec![http_post(port, "/sign", "alice")]).unwrap());
+    // Long enough for the dispatcher thread to have taken the request off the
+    // socket. Nothing has pumped, so no operator has seen it and no reply exists.
+    thread::sleep(Duration::from_millis(300));
+
+    live.update(
+        &mut ctx,
+        &source("guestbook-stateless-edit", port),
+        &no_main,
+    )
+    .expect("editing `/peek` leaves `/sign` alone");
+
+    let answered = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(
+        answered,
+        vec!["alice\n"],
+        "the replacement answers the request its predecessor received",
+    );
+
+    let next = exchange(&mut ctx, move || vec![http_post(port, "/sign", "bob")]);
+    assert_eq!(
+        next,
+        vec!["alice\nbob\n"],
+        "and counted it once: a replay would read `alice` twice",
+    );
+}
+
+/// Diffing against a version that stops serving a route leaves the route serving.
+///
+/// A diff answers a question; only an update changes what the program serves. The
+/// two compile against the same registry, so the compile that answers the
+/// question must not act on the difference it finds — the route it would retire
+/// belongs to the running program, and its listener is shared.
+#[test]
+fn diffing_against_a_version_that_drops_a_route_does_not_retire_it() {
+    let port = reserve_test_port();
+    let (mut ctx, live) = start_sink(&source("guestbook", port));
+
+    let changed = live
+        .diff_against(
+            &ctx,
+            &source("guestbook-drops-route", port),
+            Phase::AsOfRead,
+        )
+        .expect("the new version compiles against the running endpoints");
+    assert!(
+        changed.contains("divergence"),
+        "dropping a route is a difference: {changed}",
+    );
+
+    let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
+    assert_eq!(
+        still_serving,
+        vec!["peek\n"],
+        "`/peek` is still the running program's route; only an update retires it",
+    );
+}
+
+/// A port whose last route goes is released; one that keeps a route keeps serving.
+///
+/// A listener outlives the version that opened it, but not the program's interest
+/// in the address. While a sibling route survives on the port, a retired route's
+/// address answers 404 — there is still a server there. Once nothing is
+/// registered, the port itself goes, so a program that moves its endpoints around
+/// over a long life does not hold every port it ever served.
+#[test]
+fn a_port_whose_last_route_goes_is_released() {
+    let kept = reserve_test_port();
+    let dropped = reserve_test_port();
+    let two_ports = format!(
+        "a_reqs, a_resps = http_serve(\"{kept}\", \"GET\", \"/a\")\n\
+         b_reqs, b_resps = http_serve(\"{dropped}\", \"GET\", \"/b\")\n\
+         c_reqs, c_resps = http_serve(\"{kept}\", \"GET\", \"/c\")\n\
+         for r in a_reqs:\n    a_resps << \"a\\n\"\n\
+         for r in b_reqs:\n    b_resps << \"b\\n\"\n\
+         for r in c_reqs:\n    c_resps << \"c\\n\"\n"
+    );
+    let one_port = format!(
+        "a_reqs, a_resps = http_serve(\"{kept}\", \"GET\", \"/a\")\n\
+         for r in a_reqs:\n    a_resps << \"a\\n\"\n"
+    );
+
+    let (mut ctx, mut live) = start_sink(&two_ports);
+    assert_eq!(
+        exchange(&mut ctx, move || vec![
+            http_get(kept, "/a"),
+            http_get(dropped, "/b")
+        ]),
+        vec!["a\n", "b\n"],
+    );
+
+    live.update(&mut ctx, &one_port, &no_main)
+        .expect("dropping routes declares no state, so it is accepted");
+
+    // `/c` shared the kept port, so its address is a 404 rather than a refusal:
+    // the listener is still there for `/a`'s sake.
+    let retired = exchange(&mut ctx, move || {
+        vec![http_get(kept, "/a"), http_get(kept, "/c")]
+    });
+    assert_eq!(retired, vec!["a\n", "Not Found"]);
+
+    // The other port lost its only route, so nothing is listening there.
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", dropped)).is_err(),
+        "port {dropped} should be released once no route is registered on it",
+    );
 }
 
 /// Every phase the control port offers is a working diff point, not only the

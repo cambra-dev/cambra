@@ -51,14 +51,26 @@ type RouteMap = Arc<Mutex<HashMap<(String, String), RouteSender>>>;
 /// which returns a `Receiver` delivering matching requests.  Requests that do not match
 /// any registered route receive an immediate 404.
 ///
-/// The background dispatcher thread is spawned once on construction and runs until the
-/// server is dropped.
+/// The background dispatcher thread is spawned once on construction and runs until this
+/// handle is dropped, which is what releases the port. A program serves a port for as
+/// long as some version of it binds a route there; dropping the last handle closes the
+/// socket rather than leaving the address answering 404 forever (see
+/// [`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry)).
 pub struct SharedHttpServer {
     /// Routing table: `(method, path)` → sender half of each route's channel.
     ///
     /// Protected by a `Mutex` so that new routes can be registered after the
     /// dispatcher thread is already running.
     routes: RouteMap,
+
+    /// The listener, shared with the dispatcher thread.
+    ///
+    /// Held here as well as there so that dropping this handle can end the
+    /// thread: `unblock` makes its `recv` return an error, which is the shutdown
+    /// the loop already handles by telling every route `None`. Moving the server
+    /// into the thread alone would leave the port bound for the life of the
+    /// process, since nothing else can reach it to stop the loop.
+    server: Arc<Server>,
 }
 
 impl SharedHttpServer {
@@ -68,13 +80,15 @@ impl SharedHttpServer {
     /// returned immediately at construction rather than causing a silent hang
     /// after the program appears to start successfully.
     pub fn new(port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let server = Server::http(format!("0.0.0.0:{port}"))?;
+        let server = Arc::new(Server::http(format!("0.0.0.0:{port}"))?);
         debug!("HTTP server listening on 0.0.0.0:{port}");
 
         let routes: RouteMap = Arc::new(Mutex::new(HashMap::new()));
         let routes_bg = routes.clone();
+        let server_bg = server.clone();
 
         thread::spawn(move || {
+            let server = server_bg;
             loop {
                 match server.recv() {
                     Ok(mut request) => {
@@ -117,7 +131,7 @@ impl SharedHttpServer {
             }
         });
 
-        Ok(Self { routes })
+        Ok(Self { routes, server })
     }
 
     /// Register a new `(method, path)` route and return the `Receiver` for incoming requests.
@@ -147,6 +161,16 @@ impl SharedHttpServer {
             .lock()
             .unwrap()
             .remove(&(method.to_string(), path.to_string()));
+    }
+}
+
+impl Drop for SharedHttpServer {
+    fn drop(&mut self) {
+        // Ends the dispatcher thread, which is what drops its `Arc<Server>` and
+        // so closes the listener. `recv` returns an error, and the loop's error
+        // arm already sends `None` to every remaining route — the shutdown signal
+        // [`register`] documents.
+        self.server.unblock();
     }
 }
 
