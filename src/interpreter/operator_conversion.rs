@@ -356,26 +356,36 @@ pub struct OpConversionContext {
 pub struct Inheritance {
     operators: HashMap<ContentHash, Rc<FanOut>>,
     stores: HashMap<ContentHash, StoreReadInfo>,
-    /// What each store hands to the store that replaces it, by store id. Read
-    /// off `stores` at handover ([`OpConversionContext::into_inheritance`]), so
-    /// the copy a compilation is still accumulating into carries none — only the
-    /// one it hands on.
-    mutable_state: HashMap<String, CarriedState>,
+    /// What each mutable variable hands to the variable that replaces it, by store
+    /// id and then by runtime key. Read off `stores` at handover
+    /// ([`OpConversionContext::into_inheritance`]), so the copy a compilation is
+    /// still accumulating into carries none — only the one it hands on.
+    ///
+    /// Nested rather than keyed by the pair, because the store id is not an
+    /// identity: every commit store in a program answers to `__txn`, so one
+    /// bucket holds the variables of every transaction group. That is why the
+    /// resume position hangs off each variable and not off the bucket — two
+    /// stores sharing a bucket would otherwise race to set one position, and hash
+    /// order would decide it.
+    mutable_state: HashMap<String, HashMap<Value, CarriedState>>,
 }
 
-/// What one store hands to the store rebuilt in its place.
+/// What one mutable variable hands to the variable rebuilt in its place.
 ///
-/// The values and the position travel together because they only mean anything
+/// The value and the position travel together because they only mean anything
 /// together: a value is what the recurrence held at `resume_at`, so seeding from
 /// one position and resuming at another either decides a position twice or skips
 /// it.
-#[derive(Default)]
 pub(crate) struct CarriedState {
-    /// Each carried variable's value at the store's frontier.
-    values: HashMap<Value, Value>,
+    /// The value the variable held at `resume_at`.
+    value: Value,
     /// The first position of the source the replacement consumes — the retired
     /// store's frontier, which is the position it had reached and not yet
     /// decided.
+    ///
+    /// A property of the store, carried per variable because a store id names no
+    /// one store. Every variable of one store carries the same position, and the
+    /// store rebuilt in its place reads it back off any variable it declares.
     ///
     /// Taken from the retired store's own frontier rather than from how far its
     /// source has been released. A drive retains the input it reads one position
@@ -712,12 +722,8 @@ impl OpConversionContext {
     /// decided no position has no frontier, and a variable no position has written
     /// has no value at the frontier. Either way its replacement reads its init,
     /// which is what it would have read anyway.
-    pub(crate) fn live_state(&self) -> HashMap<String, CarriedState> {
-        let mut out: HashMap<String, CarriedState> = HashMap::new();
-        // A store id names one frontier. `minted.stores` is keyed by content hash
-        // and iterated in its order, so two stores claiming one id with different
-        // frontiers would settle the resume position by hash order.
-        let mut frontiers: HashMap<String, usize> = HashMap::new();
+    pub(crate) fn live_state(&self) -> HashMap<String, HashMap<Value, CarriedState>> {
+        let mut out: HashMap<String, HashMap<Value, CarriedState>> = HashMap::new();
         for info in self.minted.stores.values() {
             let Some(store) = &info.state_store_id else {
                 continue;
@@ -735,18 +741,16 @@ impl OpConversionContext {
             let Some(frontier) = store_frontier(&tile) else {
                 continue;
             };
-            if let Some(claimed) = frontiers.insert(store.clone(), frontier) {
-                debug_assert_eq!(
-                    claimed, frontier,
-                    "`{store}` is claimed by two stores at different frontiers, \
-so which one a replacement resumes at depends on hash order"
-                );
-            }
-            let carried = out.entry(store.clone()).or_default();
-            carried.resume_at = frontier;
+            let bucket = out.entry(store.clone()).or_default();
             for key in info.keys.values().filter(|k| k.carry_forward) {
                 if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
-                    carried.values.insert(key.runtime_key.clone(), value);
+                    bucket.insert(
+                        key.runtime_key.clone(),
+                        CarriedState {
+                            value,
+                            resume_at: frontier,
+                        },
+                    );
                 }
             }
         }
@@ -1931,11 +1935,14 @@ fn build_commit_store(
             .inherited
             .mutable_state
             .get(TRANSACTION_STORE_ID)
-            .and_then(|c| c.values.get(&runtime_key));
+            .and_then(|bucket| bucket.get(&runtime_key));
         let init_op: Box<dyn TileOperator> = match carried {
-            Some(value) => {
+            Some(carried) => {
                 trace!("resuming transactional {field} from the retired version's value");
-                Box::new(Constant::new(value.clone(), key_value_extent.clone()))
+                Box::new(Constant::new(
+                    carried.value.clone(),
+                    key_value_extent.clone(),
+                ))
             }
             None => convert_impl(&k.init, None, ctx)?,
         };
@@ -2080,9 +2087,7 @@ fn build_commit_store(
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
         // A transactional variable is not tied to one source — several endpoints
-        // commit to it — so a commit store has no source to name it by. Its keys
-        // are the variables' own spellings rather than positional labels, so one
-        // scope for the whole transaction domain distinguishes them.
+        // commit to it — so a commit store has no source to name it by.
         state_store_id: Some(TRANSACTION_STORE_ID.to_string()),
     })
 }
@@ -2099,9 +2104,21 @@ fn induction_extent_is_positional(extent: &Extent) -> bool {
     matches!(extent, Extent::UIntRange(_) | Extent::DataSourceDomain(_))
 }
 
-/// The scope every transactional variable resumes under. Unlike an induction
-/// accumulator, a transactional variable's key is its own spelling, so the
-/// commit store needs no per-source scope to keep two of them apart.
+/// The bucket every transactional variable resumes under.
+///
+/// Shared by every commit store in a program, and a program has one per causal
+/// group rather than one in total, so this does **not** identify a store. What
+/// keeps two groups' variables apart inside the bucket is the variable's own
+/// spelling, and what keeps their resume positions apart is that the position
+/// hangs off each variable ([`CarriedState`]) rather than off the bucket —
+/// `two_transaction_groups_resume_at_their_own_positions` covers it.
+///
+/// The spelling is the remaining gap: [`Name::field_key`] is unique within the
+/// record that declares it, not across a program, so two groups that each
+/// declare a variable of the same name would share one entry. Reaching that needs
+/// two scopes declaring one name, which is why it is a gap rather than a defect
+/// today; closing it means keying state by the variable's declaration instead of
+/// by `(store, spelling)`.
 pub const TRANSACTION_STORE_ID: &str = "__txn";
 
 /// Every mutable variable `expr` declares, by the identity its state is carried
@@ -2273,6 +2290,10 @@ fn build_induction_store_single(
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     let mut value_extents: Vec<Extent> = Vec::new();
+    // Where this store starts: `None` until a carried variable names the retired
+    // store's frontier, and `0` if none does — a store this version introduces,
+    // or one that had decided no position.
+    let mut resume_at: Option<usize> = None;
     for k in keys {
         let field = k.name.field_key();
         let rk = Value::String(field.clone().into());
@@ -2288,11 +2309,23 @@ fn build_induction_store_single(
         let carried = store_id
             .as_ref()
             .and_then(|s| ctx.inherited.mutable_state.get(s))
-            .and_then(|c| c.values.get(&rk));
+            .and_then(|bucket| bucket.get(&rk));
+        if let Some(carried) = carried {
+            // Every variable of one store carries that store's frontier, so any
+            // of them answers for the store. They must agree: the seed tick and
+            // the drive's window base both come from this, and the drive asserts
+            // that a decision cannot precede the input it decides.
+            let claimed = *resume_at.get_or_insert(carried.resume_at);
+            debug_assert_eq!(
+                claimed, carried.resume_at,
+                "`{field}` resumes at {} where its store's other variables resume at {claimed}",
+                carried.resume_at,
+            );
+        }
         let init_op: Box<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming {field} from the retired version's value");
-                Box::new(Constant::new(carried.clone(), value_extent.clone()))
+                Box::new(Constant::new(carried.value.clone(), value_extent.clone()))
             }
             None => convert_impl(&k.init, None, ctx)?,
         };
@@ -2392,15 +2425,11 @@ fn build_induction_store_single(
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
 
-    // Where this store starts: `0` for a program's own, and the retired store's
-    // frontier for one replacing a store in a running program. Both the store's seed tick and the drive's window base come from
-    // it, and they must agree — the drive asserts that a decision cannot precede
-    // the input it decides. The source may still owe positions below this, which
-    // the drive holds without re-deciding.
-    let resume_at = store_id
-        .as_ref()
-        .and_then(|s| ctx.inherited.mutable_state.get(s))
-        .map_or(0, |c| c.resume_at);
+    // `0` for a program's own store, and the retired store's frontier for one
+    // replacing a store in a running program. Both the store's seed tick and the
+    // drive's window base come from it. The source may still owe positions below
+    // this, which the drive holds without re-deciding.
+    let resume_at = resume_at.unwrap_or(0);
     let store = InductionStore::new(
         init_ops,
         write_keys,

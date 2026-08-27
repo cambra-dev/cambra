@@ -55,7 +55,8 @@ pub type MainConsumerFactory<'a> = &'a dyn Fn() -> Box<dyn Consumer>;
 /// always did, and an induction accumulator does now that the write set is
 /// keyed by the variable written. A loop's accumulator is qualified by the
 /// source its loop reads, which is what tells two loops' variables apart when
-/// they share a name.
+/// they share a name; a transactional one is not qualified at all, because every
+/// commit store in a program shares one bucket.
 fn describe_variable(store_id: &str, key: &Value) -> String {
     let key = match key {
         Value::String(name) => name.to_string(),

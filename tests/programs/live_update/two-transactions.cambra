@@ -1,0 +1,25 @@
+set_a, ok_a = http_serve("{PORT}", "POST", "/a")
+set_b, ok_b = http_serve("{PORT}", "POST", "/b")
+get_a, out_a = http_serve("{PORT}", "GET", "/ga")
+get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+
+x: Mut(String, Txn) := ""
+y: Mut(String, Txn) := ""
+
+for m in set_a:
+    with begin():
+        x := x + m
+    ok_a << "ok\n"
+
+for r in get_a:
+    with begin():
+        out_a << x
+
+for m in set_b:
+    with begin():
+        y := y + m
+    ok_b << "ok\n"
+
+for r in get_b:
+    with begin():
+        out_b << y

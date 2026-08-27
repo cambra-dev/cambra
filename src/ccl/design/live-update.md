@@ -62,7 +62,7 @@ Every carrier in the program, and where its cut comes from:
 | --- | --- | --- |
 | A `Let` binding or store the new version also computes | None — nothing is replaced | `resolved_hash` match, one more `FanOut` branch |
 | An element-wise map, a feed, a loop over a list | Its source's agreed release | `carry_release_to_new_producers` |
-| An induction store | Its own frontier | `CarriedState`, values and position together |
+| An induction store | Its own frontier | `CarriedState`, each variable's value and position together |
 | A transaction writer's item cursor | Its source's agreed release | Absolute item positions, released on the commit-ack |
 | A commit clock | None — private and restartable | A rebuilt store seeds at `0` |
 | A route, its listener, and the requests behind it | None while any version still binds a route on the port | `SourceSinkRegistry` |
@@ -310,16 +310,28 @@ Three pieces carry that:
   written, so the name survives from the source text to the store. An induction
   store's id is the data source its loop iterates, which tells two loops' `count`
   apart; a commit store's id is `__txn`, since a transactional variable is not
-  tied to one source. Both store kinds
-  seed a rebuilt store's keys from the carried values, so a transactional
-  variable survives an edit to the writer that commits it exactly as an
-  accumulator survives an edit to its loop.
+  tied to one source. Both store kinds seed a rebuilt store's keys from the
+  carried values, so a transactional variable survives an edit to the writer that
+  commits it exactly as an accumulator survives an edit to its loop.
+
+  **A store id is not an identity.** A program has one commit store per causal
+  group, so every group's variables share the `__txn` id, and a loop's id is the
+  collection it reads rather than the loop itself. The pair is enough to tell two
+  variables apart only because `Name::field_key` spellings are distinct within the
+  record that declares them and no two records in reach declare the same one.
+  Keying state by the variable's declaration would need neither half; the id is
+  what the code has today.
 - **The position.** A rebuilt store resumes at the retired store's frontier, and
-  its seed is that store's value at the same position (`CarriedState`). The two
-  travel together because either one alone decides a position twice or skips it.
-  Both the store's seed tick (`CommitEngine::seeded_at`) and the drive's window
-  base come from `resume_at`, and they must agree — `InductionDriver` asserts that
-  a decision cannot precede the input it decides.
+  each variable's seed is that store's value at the same position
+  (`CarriedState`). The value and the position travel together because either one
+  alone decides a position twice or skips it, and they hang off the *variable*
+  because the id they would otherwise hang off names no one store: two commit
+  stores at different frontiers would race to set one position and hash order
+  would settle it. A rebuilt store reads the position back off any variable it
+  declares, asserting that its variables agree. Both the store's seed tick
+  (`CommitEngine::seeded_at`) and the drive's window base come from `resume_at`,
+  and they must agree — `InductionDriver` asserts that a decision cannot precede
+  the input it decides.
 - **What the source still owes.** A source hands a producer registering after the
   swap the release state its retired producers agreed on, which runs *below* a
   store's resume position rather than deciding it: a drive holds the input it

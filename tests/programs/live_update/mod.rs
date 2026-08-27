@@ -15,6 +15,7 @@
 //! | `one-stateful-loop` | `POST /p` accumulates, `POST /q` does not — the pair a variable can move between. |
 //! | `latest-write` | A transactional variable (`Mut(String, Txn)`) that `POST /set` overwrites and `GET /get` reads. |
 //! | `running-log` | A transactional variable that `POST /set` *appends* to, so every commit leaves a mark a replay would show. |
+//! | `two-transactions` | Two transactional variables written and read from disjoint endpoint pairs, so they fall in different causal groups and each gets its own commit store. |
 //!
 //! Two cases build their programs inline instead: the multi-port one, because a
 //! base program's `{PORT}` is a single port, and the control-port ones, which are
@@ -253,6 +254,10 @@ fn source(name: &str, port: u16) -> String {
         "one-stateful-loop-moved" => include_str!("one-stateful-loop-moved.cambra"),
         "latest-write" => include_str!("latest-write.cambra"),
         "running-log" => include_str!("running-log.cambra"),
+        "two-transactions" => include_str!("two-transactions.cambra"),
+        "two-transactions-one-writer-edited" => {
+            include_str!("two-transactions-one-writer-edited.cambra")
+        }
         "running-log-writer-edit" => include_str!("running-log-writer-edit.cambra"),
         "latest-write-writer-edit" => include_str!("latest-write-writer-edit.cambra"),
         other => panic!("no such program: {other}"),
@@ -988,6 +993,59 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 
     let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(still_serving, vec!["peek\n"]);
+}
+
+/// Two causally independent transaction groups keep their state apart across an
+/// update that rebuilds one of them.
+///
+/// A program has one commit store per causal group, not one commit store, so
+/// `x` and `y` here live in different stores that both answer to `__txn`. Their
+/// frontiers differ — `x` has taken four commits and `y` one — and the store
+/// rebuilt for `x` has to resume at its own, which is why the resume position
+/// hangs off each variable rather than off the id they share.
+#[test]
+fn two_transaction_groups_resume_at_their_own_positions() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("two-transactions", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![
+            http_post(port, "/a", "1"),
+            http_post(port, "/a", "2"),
+            http_post(port, "/a", "3"),
+            http_post(port, "/a", "4"),
+            http_post(port, "/b", "9"),
+            http_get(port, "/ga"),
+            http_get(port, "/gb"),
+        ]
+    });
+    assert_eq!(
+        before,
+        vec!["ok\n", "ok\n", "ok\n", "ok\n", "ok\n", "1234", "9"],
+    );
+
+    live.update(
+        &mut ctx,
+        &source("two-transactions-one-writer-edited", port),
+        &no_main,
+    )
+    .expect("editing one group's writer declares the same variables at the same types");
+
+    let after = exchange(&mut ctx, move || {
+        vec![
+            http_get(port, "/ga"),
+            http_get(port, "/gb"),
+            http_post(port, "/a", "5"),
+            http_post(port, "/b", "8"),
+            http_get(port, "/ga"),
+            http_get(port, "/gb"),
+        ]
+    });
+    assert_eq!(
+        after,
+        vec!["1234", "9", "ok\n", "ok\n", "1234-5", "98"],
+        "each group stands where it stood, and the new rule governs `x` from here",
+    );
 }
 
 /// A request the retired version received but never answered is answered by the
