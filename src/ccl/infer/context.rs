@@ -392,7 +392,7 @@ impl Typing for InferCtx {
         let obligation = TraitObligation::new(
             trait_,
             wanted.clone().into_iter().collect(),
-            operand_exprs.iter().map(|e| (*e).clone()).collect()
+            operand_exprs.iter().map(|e| (*e).clone()).collect(),
         );
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);

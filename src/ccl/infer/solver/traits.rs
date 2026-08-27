@@ -74,12 +74,15 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(feature = "refinement-experimental")]
+use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Name};
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name,
-    Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr,
+    BaseType, FieldKey, InferVar, InferVarId, Refinement, RefinementSet, RefinementTemplate, Type,
+    TypedExpr,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
+#[cfg(feature = "refinement-experimental")]
 use super::prim;
 
 /// A trait: a named requirement on types, together with any types it associates
@@ -137,17 +140,20 @@ pub struct TraitInstance {
     /// arity is the trait's business — every operator trait is binary today, and an
     /// `Orderable` over one type is the obvious next one.
     pub args: &'static [BaseType],
-    /// The types this instance associates, by name. Empty for a trait that is
-    /// a pure requirement.
-    pub assoc: &'static [(Assoc, BaseType)],
-    /// An optional function producing a refinement from the input expressions.
-    pub refinement: Option<RefinementTemplate>,
+    /// The types this instance associates, by name. Empty for a trait
+    /// that is a pure requirement. Each associated type has an
+    /// optional RefinementTemplate, which builds a refinement from
+    /// operator's input argument expressions.
+    pub assoc: &'static [(Assoc, BaseType, Option<RefinementTemplate>)],
 }
 
 impl TraitInstance {
     /// The type this instance associates with `name`, if any.
-    pub fn assoc_ty(&self, name: Assoc) -> Option<&BaseType> {
-        self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+    pub fn assoc_ty(&self, name: Assoc) -> Option<(&BaseType, Option<RefinementTemplate>)> {
+        self.assoc
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, t, r)| (t, *r))
     }
 }
 
@@ -156,13 +162,11 @@ impl TraitInstance {
 const NUMERIC: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
-        assoc: &[(Assoc::Output, BaseType::Int)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::Int, None)],
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
-        assoc: &[(Assoc::Output, BaseType::UInt)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::UInt, None)],
     },
 ];
 
@@ -198,18 +202,15 @@ fn refinement_for_add(args: &Vec<TypedExpr>) -> TypedExpr {
 const NUMERIC_OR_STRING: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
-        assoc: &[(Assoc::Output, BaseType::Int)],
-        refinement: Some(refinement_for_add),
+        assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_add))],
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
-        assoc: &[(Assoc::Output, BaseType::UInt)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::UInt, None)],
     },
     TraitInstance {
         args: &[BaseType::String, BaseType::String],
-        assoc: &[(Assoc::Output, BaseType::String)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::String, None)],
     },
 ];
 
@@ -218,18 +219,15 @@ const NUMERIC_OR_STRING: &[TraitInstance] = &[
 const NUMERIC_OR_STRING: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
-        assoc: &[(Assoc::Output, BaseType::Int)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::Int, None)],
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
-        assoc: &[(Assoc::Output, BaseType::UInt)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::UInt, None)],
     },
     TraitInstance {
         args: &[BaseType::String, BaseType::String],
-        assoc: &[(Assoc::Output, BaseType::String)],
-        refinement: None,
+        assoc: &[(Assoc::Output, BaseType::String, None)],
     },
 ];
 
@@ -244,22 +242,18 @@ const COMPARABLE: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[],
-        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[],
-        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::String, BaseType::String],
         assoc: &[],
-        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::Bool, BaseType::Bool],
         assoc: &[],
-        refinement: None,
     },
 ];
 
@@ -267,8 +261,7 @@ const COMPARABLE: &[TraitInstance] = &[
 /// arity and association shape `Addable` and `Equatable` between them do not have.
 const NEGATABLE: &[TraitInstance] = &[TraitInstance {
     args: &[BaseType::Int],
-    assoc: &[(Assoc::Output, BaseType::Int)],
-    refinement: None,
+    assoc: &[(Assoc::Output, BaseType::Int, None)],
 }];
 
 /// The bases an aggregate can order, matching `max`'s merge in `ccl/mod.rs`. Unary
@@ -277,17 +270,14 @@ const ORDERED: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int],
         assoc: &[],
-        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::UInt],
         assoc: &[],
-        refinement: None,
     },
     TraitInstance {
         args: &[BaseType::String],
         assoc: &[],
-        refinement: None,
     },
 ];
 
@@ -334,7 +324,7 @@ impl Trait {
             .expect("every trait has at least one instance");
         (
             first.args.len(),
-            first.assoc.iter().map(|(n, _)| *n).collect(),
+            first.assoc.iter().map(|(n, _, _)| *n).collect(),
         )
     }
 
@@ -603,9 +593,7 @@ impl TraitObligation {
             let ty = match maybe_refinement {
                 Some(template) => Type::Refinement(
                     Box::new(ty_base),
-                    RefinementSet::one(
-                        Refinement::born_from_template(template, &self.input_exprs)
-                    ),
+                    RefinementSet::one(Refinement::born_from_template(template, &self.input_exprs)),
                 ),
                 None => ty_base,
             };
@@ -644,10 +632,10 @@ impl TraitObligation {
         let (first, rest) = candidates
             .split_first()
             .expect("a candidate set is never empty: emptying it is the error");
-        let settled = first.assoc_ty(name)?;
+        let (settled_ty, settled_rf) = first.assoc_ty(name)?;
         rest.iter()
-            .all(|i| i.assoc_ty(name) == Some(settled))
-            .then(|| (settled.clone(), first.refinement.clone()))
+            .all(|i| i.assoc_ty(name).map(|(t, _)| t) == Some(settled_ty))
+            .then(|| (settled_ty.clone(), settled_rf))
     }
 }
 
@@ -1530,10 +1518,7 @@ mod tests {
             .expect("Int is addable");
 
         assert!(
-            matches!(
-                ob.agreed_assoc(Assoc::Output),
-                Some((BaseType::Int, _))
-            ),
+            matches!(ob.agreed_assoc(Assoc::Output), Some((BaseType::Int, _))),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
              that row refines its output by the operands' sum",
         );
@@ -1542,7 +1527,7 @@ mod tests {
             panic!("(Int, Int) ⇝ Int is the only Addable row left, got {candidates:?}");
         };
         assert_eq!(only.args, &[BaseType::Int, BaseType::Int]);
-        assert_eq!(only.assoc, &[(Assoc::Output, BaseType::Int)]);
+        assert!(matches!(only.assoc, [(Assoc::Output, BaseType::Int, _)]));
     }
 
     /// A comparison associates **nothing**: its `Bool` is the operator's, not the
@@ -1624,7 +1609,7 @@ mod tests {
                     arity,
                     "{trait_} has rows of differing arity: {row:?}",
                 );
-                let names: Vec<Assoc> = row.assoc.iter().map(|(n, _)| *n).collect();
+                let names: Vec<Assoc> = row.assoc.iter().map(|(n, _, _)| *n).collect();
                 assert_eq!(
                     names, assocs,
                     "{trait_} has rows associating different names: {row:?}",

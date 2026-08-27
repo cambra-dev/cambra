@@ -180,7 +180,7 @@ impl Typing for CheckCtx {
             Some(matched) => Ok(assoc.map(|name| {
                 matched
                     .assoc_ty(name)
-                    .map(|b| Type::Base(b.clone()))
+                    .map(|(b, _)| Type::Base(b.clone()))
                     .unwrap_or_else(|| fresh_var(self.level))
             })),
             None => {
