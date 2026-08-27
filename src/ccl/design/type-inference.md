@@ -33,7 +33,39 @@ When a new constraint involves a variable, the solver records the bound and then
 
 This recursive propagation replaces the traditional "union-find" algorithm used in HM type inference.
 
-Note that propagation only sweeps the *existing* bounds on the side of the new bound — it does not eagerly transfer the other side's bounds onto the variable. For a variable-against-variable constraint `constrain(Var v, Var w)`, the LHS-variable arm fires (recording `w` as an upper bound of `v` and sweeping `v`'s lower bounds); the missing edges are recovered later by walking the bounds graph during simplification. Whether this one-sided handling is purely a redundancy-avoidance optimization or is semantically load-bearing is noted as an open question in the review thread.
+Note that propagation only sweeps the *existing* bounds on the side of the new bound — it does not
+eagerly transfer the other side's bounds onto the variable. For a variable-against-variable
+constraint `constrain(Var v, Var w)`, the LHS-variable arm fires (recording `w` as an upper bound of
+`v` and sweeping `v`'s lower bounds); the missing edges are recovered later by walking the bounds
+graph during simplification.
+
+**Bound arrival order does not change the answer.** Record-then-sweep makes that a property of the
+algorithm rather than of any one constraint, and one-sided var-var propagation is where it is least
+obvious: the edge records less than a symmetric rule would, and the difference is only recovered at
+simplification. `tests/constraint_order_fuzz.rs` states the property — the same constraint set applied in
+permuted orders coalesces every variable to the same type, or is rejected in every order — and
+checks it over 2000 generated sets, eight permutations each. Which constraint trips the rejection of
+an unsatisfiable set is order-relative and deliberately not part of the outcome: the last edge to
+arrive is the one that meets the already-recorded bounds, and emission order is fixed by the AST
+walk.
+
+**A kind pin is joined at the read, not at the edge.** `constrain_kind`'s
+variable-against-variable arm records that the two kinds are the same unknown, and `FunKindVar::pin`
+folds the join over everything that relation reaches. So a variable's kind is a function of the
+whole constraint set: a pin arriving after the edge crosses it, and so does one two edges away.
+Resolving
+at the edge instead — copying each side's pin onto the other — answers from the pins that happen to
+have arrived and drops the rest, and the two variables then coalesce to different arrows depending
+on which constraint came first. `a_shared_kind_var_resolves_the_same_way_in_every_order` checks
+all 24 orders of the shape that exhibits it. The join is the flat semilattice
+`Unpinned < {Compute, Data} < Conflict`, whose commutativity, associativity and idempotence are what
+make the fold order-blind: every reader folds the same set, and no fold step reads a value a later
+step can change.
+
+The arm is unreachable from lowered CHL — nothing in the integration corpus or the unit suite hits
+it, since a kind variable is minted only by an elimination's demand and two demands meet at
+compaction rather than at a constraint. It is reached by generated type pairs, which is what
+`tests/constraint_order_fuzz.rs` supplies.
 
 ### Positions and Polarity
 

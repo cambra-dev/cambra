@@ -427,6 +427,25 @@ pub enum KindPin {
     Conflict,
 }
 
+impl KindPin {
+    /// The join in the flat semilattice `Unpinned < {Compute, Data} < Conflict`.
+    ///
+    /// Commutative, associative, and idempotent, which is what makes a
+    /// variable's pin independent of the order the pins arrive in: every reader
+    /// folds the same set and no fold step reads a value a later step can
+    /// change.
+    pub fn join(self, other: KindPin) -> KindPin {
+        use KindPin::{Compute, Conflict, Data, Unpinned};
+        match (self, other) {
+            (Unpinned, p) | (p, Unpinned) => p,
+            (Compute, Compute) => Compute,
+            (Data, Data) => Data,
+            // Two points at once, or either point meeting the conflict.
+            _ => Conflict,
+        }
+    }
+}
+
 /// A kind-inference variable — an unknown [`FunKind`] an elimination mints
 /// and the value flowing in pins.
 ///
@@ -435,10 +454,17 @@ pub enum KindPin {
 /// alike ([`Type::pi_eliminated`], [`Type::fun_eliminated`]). Each mints one of
 /// these, and the kind edge pins it to whatever concrete kind the value carries
 /// (`constrain_kind`). Nothing else mints one — no scheme is kind-polymorphic and
-/// lowering stamps every function type it builds — so a variable is **written by the one
-/// value that reaches it**, never solved against other variables: two variables
-/// meeting record nothing, because what they resolve to is not known at that edge
-/// and no program needs it to be.
+/// lowering stamps every function type it builds — so a variable is **written by
+/// the one value that reaches it**.
+///
+/// Two variables meeting is a **relation**, not a resolution. What the pair
+/// resolves to is not known at that edge, so `constrain_kind` records the edge
+/// and [`FunKindVar::pin`] joins over it at the read. Resolving at the edge
+/// instead — copying each side's pin onto the other — loses a pin that arrives
+/// afterwards, and then which arrow the two coalesce to depends on which
+/// constraint came first. The rule is the one the domain combination follows for
+/// the same reason: a value the fold is still accumulating cannot be read
+/// pairwise (see [`crate::ccl::infer::solver::compact::KindMerge`]).
 ///
 /// Identity (`uid`) is immutable and lives outside the `RefCell`, so
 /// equality/hashing is borrow-free and never inspects the pin (mirroring
@@ -447,10 +473,19 @@ pub enum KindPin {
 pub struct FunKindVar {
     /// Stable, globally-unique identity.
     pub uid: FunKindVarId,
-    /// Which point this var has been pinned to. Private so that every write goes
-    /// through a pin, which is what makes reaching [`KindPin::Conflict`] the only
-    /// way to hold two points at once.
+    /// The point *this* variable was pinned to directly, by a concrete kind
+    /// reaching it. Private so that every write goes through a pin, and so that
+    /// no reader mistakes it for the answer: [`FunKindVar::pin`] is the answer,
+    /// and it also folds in everything [`FunKindVar::related`] reaches.
     pin: RefCell<KindPin>,
+    /// The variables this one meets at a variable-against-variable kind edge.
+    ///
+    /// Symmetric — `relate` records both directions — so the set reachable from
+    /// either end is the same component, and every member reads one join.
+    /// Empty for all but a handful of variables: nothing in lowered CHL puts two
+    /// kind variables on one edge, since a variable is minted by an
+    /// elimination's demand and two demands meet at compaction.
+    related: RefCell<Vec<Rc<FunKindVar>>>,
 }
 
 impl FunKindVar {
@@ -459,37 +494,89 @@ impl FunKindVar {
         Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             pin: RefCell::new(KindPin::Unpinned),
+            related: RefCell::new(Vec::new()),
         })
     }
 
-    /// What this variable has been pinned to.
+    /// What this variable is pinned to: the [`KindPin::join`] of its own pin and
+    /// every pin reachable through [`FunKindVar::related`].
+    ///
+    /// The join is folded here rather than at the edges, so the answer is a
+    /// function of the whole recorded relation and not of the order its pins and
+    /// edges arrived in. An unrelated variable — every variable a CHL program
+    /// produces — answers from its own slot and walks nothing.
     pub fn pin(&self) -> KindPin {
-        *self.pin.borrow()
+        let own = *self.pin.borrow();
+        if self.related.borrow().is_empty() {
+            return own;
+        }
+        // Breadth-first over the component, reading each member's *own* slot so
+        // the walk is not re-entered per member. `seen` is a `Vec` because a
+        // component holding more than a couple of variables has never been
+        // observed; it also terminates the walk on the symmetric edges.
+        let mut acc = own;
+        let mut seen = vec![self.uid];
+        let mut stack: Vec<Rc<FunKindVar>> = self.related.borrow().clone();
+        while let Some(v) = stack.pop() {
+            if seen.contains(&v.uid) {
+                continue;
+            }
+            seen.push(v.uid);
+            acc = acc.join(*v.pin.borrow());
+            stack.extend(v.related.borrow().iter().cloned());
+        }
+        acc
+    }
+
+    /// Relate two kinds, so each reads the other's pins from now on — including
+    /// the ones that arrive after this edge.
+    ///
+    /// Recorded in both directions: the edge says the two kinds are the same
+    /// unknown, which is symmetric, and a reader starting from either end has to
+    /// see the same component. Relating a variable to itself, or recording an
+    /// edge twice, changes nothing — the join is idempotent.
+    pub fn relate(a: &Rc<FunKindVar>, b: &Rc<FunKindVar>) {
+        if a.uid == b.uid {
+            return;
+        }
+        let mut a_rel = a.related.borrow_mut();
+        if !a_rel.iter().any(|v| v.uid == b.uid) {
+            a_rel.push(Rc::clone(b));
+        }
+        drop(a_rel);
+        let mut b_rel = b.related.borrow_mut();
+        if !b_rel.iter().any(|v| v.uid == a.uid) {
+            b_rel.push(Rc::clone(a));
+        }
     }
 
     /// Pin this kind to `Compute`. Pinning to the point already recorded is
-    /// idempotent; pinning to the other one is the conflict, which absorbs.
+    /// idempotent; pinning to the other one is the conflict, which absorbs
+    /// ([`KindPin::join`]).
     pub fn pin_compute(&self) {
         let pin = &mut *self.pin.borrow_mut();
-        *pin = match *pin {
-            KindPin::Unpinned | KindPin::Compute => KindPin::Compute,
-            KindPin::Data | KindPin::Conflict => KindPin::Conflict,
-        };
+        *pin = pin.join(KindPin::Compute);
     }
 
     /// Pin this kind to `Data`. The dual of [`FunKindVar::pin_compute`].
     pub fn pin_data(&self) {
         let pin = &mut *self.pin.borrow_mut();
-        *pin = match *pin {
-            KindPin::Unpinned | KindPin::Data => KindPin::Data,
-            KindPin::Compute | KindPin::Conflict => KindPin::Conflict,
-        };
+        *pin = pin.join(KindPin::Data);
     }
 
     /// Copy `other`'s pin onto this variable, for a scheme instantiation carrying
     /// the definition site's answer onto the freshened copy.
+    ///
+    /// The copy takes the definition's *answer* — `other.pin()`, the component's
+    /// join — into its own slot, and starts related to nothing. That is what
+    /// decouples the instantiation: a pin the definition site acquires later does
+    /// not reach the copy, which is the same decoupling a fresh `uid` gives.
     pub fn adopt_pin(&self, other: &FunKindVar) {
         *self.pin.borrow_mut() = other.pin();
+        debug_assert!(
+            self.related.borrow().is_empty(),
+            "a freshened kind var adopts a pin before any edge relates it",
+        );
     }
 }
 
@@ -532,6 +619,15 @@ pub fn reset_kind_var_counter() {
 /// | `History` (`kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-channelize stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
+///
+/// A type is **concrete** when none of those variants occurs anywhere in it, nor
+/// a [`FunKind::Var`]: it is what a checked program exhibits, and what every pass
+/// after inference reads. The word is not "ground", which in logic means
+/// variable-free — a concrete type may still carry a *free name*, since a
+/// refinement predicate references an enclosing binder by name until landing
+/// closes it to an index. [`crate::ccl::subst::type_contains_infer`] is the cheap
+/// per-type check for the `Infer` case, and `check_fully_typed` the
+/// whole-program one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
