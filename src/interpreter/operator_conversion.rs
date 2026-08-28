@@ -315,15 +315,15 @@ struct StoreReadInfo {
     /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
     /// dense `Induction` store.
     induction_extent: Option<Extent>,
-    /// The sequencing domain this store's positions are counted in — the index of
-    /// every key's history, which is what decides whether a replacement may resume
-    /// at this store's frontier.
+    /// The sequence this store counts its positions in, which is what decides
+    /// whether a replacement may resume at this store's frontier. `None` for a
+    /// commit store, whose clock restarts with the store that counts it.
     ///
     /// Its variables' *values* are not held here: a store's value rides its own
     /// fan as a [`Tile::Store`], so a version replacing this one reads them off
     /// [`FanOut::cached_tile`] rather than through a second channel out of the
     /// operator.
-    sequencing_domain: Type,
+    sequence: Option<Sequence>,
     /// The token a term reading this store hashes to — the same role
     /// [`LetBinding::correspondent`] plays, for a binding that lives in
     /// [`transactional_stores`](OpConversionContext::transactional_stores)
@@ -400,30 +400,38 @@ pub struct Inheritance {
 /// What one mutable variable hands to the variable rebuilt in its place.
 ///
 /// The value and the position travel together because they only mean anything
-/// together: a value is what the recurrence held at `resume_at`, so seeding from
-/// one position and resuming at another either decides a position twice or skips
-/// it.
+/// together: a value is what the recurrence held at the position it had reached,
+/// so seeding from one position and resuming at another either decides a position
+/// twice or skips it.
 pub(crate) struct CarriedState {
-    /// The value the variable held at `resume_at`.
+    /// The value the variable held where its recurrence had reached.
     value: Value,
-    /// The sequencing domain `resume_at` counts in. A position means nothing to a
-    /// recurrence indexed by anything else.
-    domain: Type,
-    /// The first position of the source the replacement consumes — the retired
-    /// store's frontier, which is the position it had reached and not yet
-    /// decided.
-    ///
-    /// A property of the store, carried per variable because a variable is what
-    /// has an identity — a store has none. Every variable of one store carries
-    /// the same position, and the store rebuilt in its place reads it back off
-    /// any variable it declares.
+    /// Where that was, or `None` for a recurrence with no position to hand on: a
+    /// transaction's commit clock restarts with the store that counts it, and the
+    /// replacement seeds tick 0 from `value`.
+    resumption: Option<Resumption>,
+}
+
+/// Where a recurrence had reached, for the recurrence rebuilt in its place.
+///
+/// A property of the store, carried per variable because a variable is what has
+/// an identity — a store has none. Every variable of one store carries the same
+/// resumption, and the store rebuilt in their place reads it back off any
+/// variable it declares.
+#[derive(Clone)]
+pub(crate) struct Resumption {
+    /// The first position the replacement decides — the retired store's frontier,
+    /// which is the position it had reached and not yet decided.
     ///
     /// Taken from the retired store's own frontier rather than from how far its
     /// source has been released. A drive retains the input it reads one position
     /// back through, so the source still owes the replacement an element the
     /// recurrence has already decided — reading the resume position off the
     /// source would decide it a second time.
-    resume_at: usize,
+    position: usize,
+    /// What `position` counts in. A replacement counting in another sequence
+    /// starts its own count.
+    sequence: Sequence,
 }
 
 /// How much of the previous version a compilation adopted.
@@ -713,20 +721,11 @@ impl OpConversionContext {
         let declared = declared_state(planned);
         let mut out = Vec::new();
         for info in self.minted.stores.values() {
-            if !carries_state(&info.sequencing_domain) {
-                continue;
-            }
             for (path, key) in info.carried_keys() {
                 let Some(decl) = declared.get(path) else {
                     out.push(StateConflict::Dropped { path: path.clone() });
                     continue;
                 };
-                // A variable the new version sequences by a fixed collection is
-                // recomputed rather than seeded, so nothing is carried into it and
-                // its type is its own business.
-                if !carries_state(&decl.domain) {
-                    continue;
-                }
                 // A declared type the conversion context cannot resolve to an
                 // extent is a compile error the real compile will raise with its
                 // own diagnostic; this check has nothing to add.
@@ -776,17 +775,16 @@ impl OpConversionContext {
             let Some(frontier) = store_frontier(&tile) else {
                 continue;
             };
-            if !carries_state(&info.sequencing_domain) {
-                continue;
-            }
             for (path, key) in info.carried_keys() {
                 if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
                     let prior = out.insert(
                         path.clone(),
                         CarriedState {
                             value,
-                            resume_at: frontier,
-                            domain: info.sequencing_domain.clone(),
+                            resumption: info.sequence.clone().map(|sequence| Resumption {
+                                position: frontier,
+                                sequence,
+                            }),
                         },
                     );
                     debug_assert!(
@@ -2138,7 +2136,7 @@ fn build_commit_store(
         induction_extent: None,
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
-        sequencing_domain: Type::Txn,
+        sequence: None,
     })
 }
 
@@ -2203,19 +2201,37 @@ fn source_start(domain: &Type, ctx: &OpConversionContext) -> usize {
     })
 }
 
-/// Whether a variable sequenced by `domain` hands state to its replacement.
+/// What a recurrence counts its positions in, named so that two versions can tell
+/// whether they are counting in the same one.
 ///
-/// A data source and a transaction's commit clock both outlive the version
-/// reading them, so a position counted in one still means something to the next
-/// version. A concrete iteration extent does not: it is part of the program, so a
-/// replacement recomputes the whole fold from the collection its own version
-/// declares, and seeding it would count the elements twice.
-fn carries_state(domain: &Type) -> bool {
-    matches!(domain, Type::Txn | Type::DataSource(_))
+/// A position means nothing on its own: `3` is the fourth request a source
+/// delivered or the fourth element of a list, so a replacement resumes at its
+/// predecessor's frontier only when the two count in the same sequence, and starts
+/// its own count otherwise.
+///
+/// A source is named by itself, since it outlives every version reading it. A
+/// collection is part of the program, so it is named by the term that computes it:
+/// `[0, 2]` is the extent of `["y", "z"]` and of `["p", "q"]` alike, and resuming
+/// the second fold at the first's frontier would skip elements nothing ever read.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Sequence {
+    /// A data source's stream, by source name.
+    Source(String),
+    /// A collection this version computes, by the identity of the term.
+    Collection(ContentHash),
+}
+
+/// The sequence a store over `domain` counts in, naming a collection by the
+/// identity of `source`, the term the loop iterates.
+fn sequence_of(domain: &Type, source: &Expr, ctx: &OpConversionContext) -> Sequence {
+    match domain {
+        Type::DataSource(name) => Sequence::Source(name.to_string()),
+        _ => Sequence::Collection(resolved_hash(source, &ctx.binder_correspondents())),
+    }
 }
 
 /// Every mutable variable `expr` declares, by identity, with the type it is
-/// declared at and the position space its recurrence iterates.
+/// declared at.
 ///
 /// One walk, shared by the guard and by conversion, so the identity a version is
 /// checked against is the identity its stores are built under. Deriving it twice
@@ -2228,7 +2244,6 @@ pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
             v.path,
             DeclaredVariable {
                 ty: v.key.init.ty.clone(),
-                domain: v.domain,
             },
         );
     }
@@ -2236,10 +2251,9 @@ pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
 }
 
 /// What a version declares a mutable variable as — enough to decide whether the
-/// running program's value can be seeded into it, and at what position.
+/// running program's value can be seeded into it.
 pub struct DeclaredVariable {
     ty: Type,
-    domain: Type,
 }
 
 /// Every mutable variable's identity, in key order, by the `Transact` node that
@@ -2259,15 +2273,12 @@ pub fn mutable_variable_paths(expr: &Expr) -> HashMap<NodeId, Vec<VarPath>> {
 struct MutableVariable<'e> {
     path: VarPath,
     key: &'e TransactKey,
-    /// The recurrence's sequencing domain — the index of the variable's history.
-    domain: Type,
     /// The `Transact` node declaring it, so conversion can ask for the identities
     /// of the store it is building.
     declared_by: NodeId,
 }
 
-/// Every mutable variable in `expr`, in tree order, with its identity and the
-/// position space of the recurrence that carries it.
+/// Every mutable variable in `expr`, in tree order, with its identity.
 ///
 /// The one place identities are assigned. `Transact` is the only node that
 /// declares a mutable variable, so the walk is over those.
@@ -2277,11 +2288,7 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
         counts: &mut HashMap<String, usize>,
         out: &mut Vec<MutableVariable<'e>>,
     ) {
-        // `writers` is not consulted: the node's own sequencing domain is what
-        // indexes every key's history, so there is nothing to re-derive from the
-        // writer that reads it.
-        if let TypedExprNode::Transact { keys, domain, .. } = &e.node {
-            let domain = strip_refinements(domain);
+        if let TypedExprNode::Transact { keys, .. } = &e.node {
             for k in keys {
                 let name = k.name.field_key();
                 let index = counts.entry(name.clone()).or_insert(0);
@@ -2291,7 +2298,6 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
                         index: *index,
                     },
                     key: k,
-                    domain: domain.clone(),
                     declared_by: e.node_id(),
                 });
                 *index += 1;
@@ -2406,9 +2412,10 @@ fn build_induction_store_single(
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     let mut value_extents: Vec<Extent> = Vec::new();
     // Where this store starts, once a carried variable names the frontier of a
-    // predecessor over this same domain. `None` for a store with no such
+    // predecessor counting in this same sequence. `None` for a store with no such
     // predecessor, which starts where its source does instead.
     let mut resume_at: Option<usize> = None;
+    let sequence = sequence_of(&domain, &w.source, ctx);
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = Value::String(field.clone().into());
@@ -2421,23 +2428,20 @@ fn build_induction_store_single(
         // Rebuilding a store therefore changes what the loop does next without
         // discarding what it had accumulated, which is what distinguishes
         // swapping the logic from recomputing the program.
-        // A store sequenced by a fixed collection recomputes its whole fold, so
-        // it seeds from nothing however much its predecessor was holding.
-        let carried = ctx
-            .inherited
-            .mutable_state
-            .get(&paths[i])
-            .filter(|_| carries_state(&domain));
-        if let Some(carried) = carried.filter(|c| c.domain == domain) {
+        let carried = ctx.inherited.mutable_state.get(&paths[i]);
+        let resumed = carried
+            .and_then(|c| c.resumption.as_ref())
+            .filter(|r| r.sequence == sequence);
+        if let Some(resumed) = resumed {
             // Every variable of one store carries that store's frontier, so any
             // of them answers for the store. They must agree: the seed tick and
             // the drive's window base both come from this, and the drive asserts
             // that a decision cannot precede the input it decides.
-            let claimed = *resume_at.get_or_insert(carried.resume_at);
+            let claimed = *resume_at.get_or_insert(resumed.position);
             debug_assert_eq!(
-                claimed, carried.resume_at,
+                claimed, resumed.position,
                 "`{field}` resumes at {} where its store's other variables resume at {claimed}",
-                carried.resume_at,
+                resumed.position,
             );
         }
         let init_op: Box<dyn TileOperator> = match carried {
@@ -2589,7 +2593,7 @@ fn build_induction_store_single(
         keys: keys_map,
         kind: StoreReadKind::InductionChangelog,
         induction_extent: Some(induction_extent),
-        sequencing_domain: domain,
+        sequence: Some(sequence),
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
     })

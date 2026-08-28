@@ -23,12 +23,15 @@ An update cuts the running program and hands whatever must survive across the cu
 program-wide. There is no instant the whole graph stops at, and two carriers' cuts need not fall at
 the same input.
 
-A cut is a position in a coordinate both versions share. A source's domain positions are such a
-coordinate: the source outlives the version and hands the same positions to whoever reads it next. A
-commit clock is not shared but is private and restartable — nothing outside the store holds a tick,
-so a rebuilt store starts its clock at `0` and loses nothing. A count of the columns a tile
-currently offers is neither: it names a position in a view whose contents depend on what has been
-released, so it means nothing to anyone who did not emit it.
+A cut is a position in a sequence both versions count in. A source's stream is such a sequence: the
+source outlives the version and hands the same positions to whoever reads it next. So is a
+collection a version computes, named by the term that computes it — `[0, 2]` is the extent of
+`["y", "z"]` and of `["p", "q"]` alike, so the extent alone does not say whether two versions are
+counting the same elements. A commit clock is neither shared nor named: it is private and
+restartable, nothing outside the store holds a tick, and a rebuilt store starts its clock at `0` and
+loses nothing. A count of the columns a tile currently offers is not a sequence at all — it names a
+position in a view whose contents depend on what has been released, so it means nothing to anyone
+who did not emit it.
 
 Carriers are of two kinds, and each takes its cut from a different place.
 
@@ -45,7 +48,9 @@ adopting it would bind a name to nothing (`FanOut::released_in_full`).
 **A carrier that holds a value takes its cut from itself.** An induction store's value at position
 𝑝 already summarizes every position below 𝑝, so the store's own frontier says where the replacement
 starts. Its source's release state does not and cannot. The value and the position travel together
-in one `CarriedState`, because either alone decides a position twice or skips it.
+in one `CarriedState`, because either alone decides a position twice or skips it. The position
+travels with the sequence it counts in (`Sequence`), because a replacement counting in another one
+has to start its own count.
 
 The two are not interchangeable in either direction. A carrier of the second kind reading its cut
 off its source re-decides positions its recurrence already decided: a drive holds the input it reads
@@ -67,8 +72,8 @@ Every carrier in the program, and where its cut comes from:
 | A `Let` binding or store the new version also computes | None — nothing is replaced | `resolved_hash` match, one more `FanOut` branch |
 | An element-wise map or a feed over a shared operator | Its input's agreed release | A new subscriber's guard starts at what the `FanOut` has released |
 | The same, over a source | Its source's agreed release | `carry_release_to_new_producers` |
-| An induction store over the domain its predecessor read | Its predecessor's frontier | `CarriedState`, each variable's value and position together |
-| Any other induction store | Where its source will next offer a producer | `first_position_for_a_new_producer` |
+| An induction store counting in the sequence its predecessor counted in | Its predecessor's frontier | `CarriedState`, each variable's value and position together |
+| Any other induction store | Where its source will next offer a producer, or `0` for a collection | `first_position_for_a_new_producer` |
 | A transaction writer's item cursor | Its source's agreed release | Absolute item positions, released on the commit-ack |
 | A commit clock | None — private and restartable | A rebuilt store seeds at `0` |
 | A route, its listener, and the requests behind it | None while any version still binds a route on the port | `SourceSinkRegistry` |
@@ -340,14 +345,21 @@ Three pieces carry that:
   from `resume_at`, and they must agree — `InductionDriver` asserts that a
   decision cannot precede the input it decides.
 
-  A position only means something in the domain it was counted in, and that is
-  the `Transact`'s own sequencing domain — the index of every key's history. So
-  the two are carried separately, and a variable whose new version is sequenced by
-  a different domain seeds its value and starts counting again. That is a variable
-  moving between loops, or into a transaction, or a program moving to another
-  port: the positions it is about to decide belong to a collection its predecessor
-  never read, so none is decided twice and none is skipped, while the value —
-  which is the variable's, not the collection's — goes on.
+  A position only means something in the sequence it was counted in, so the two
+  are carried separately and a variable whose new version counts in another
+  sequence seeds its value and starts counting again. That is a variable moving
+  between loops, or into a transaction, or a program moving to another port: the
+  positions it is about to decide belong to something its predecessor never read,
+  so none is decided twice and none is skipped, while the value — which is the
+  variable's, not the sequence's — goes on.
+
+  `Sequence` is what two versions compare. A source is named by itself, since it
+  outlives every version reading it; a collection is named by the identity of the
+  term that computes it, since the extent it iterates does not distinguish
+  `["y", "z"]` from `["p", "q"]` and resuming the second fold at the first's
+  frontier would skip elements nothing ever read. A transaction hands on no
+  position at all: its clock restarts with the store that counts it, and the
+  replacement seeds tick `0` from the carried value.
 
   **Starting again is not starting at `0`.** A source it moved to may have been
   read all along by some other loop, which released what it consumed, and the
@@ -360,10 +372,13 @@ Three pieces carry that:
   carried and still cannot start at `0`
   (`a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source`).
 
-  A concrete iteration extent carries nothing at all: it is part of the program
-  rather than outside it, so a variable sequenced by one is recomputed from the
-  collection its own version declares, and seeding it would count the elements
-  twice.
+  A collection is a sequence like any other. A fold over one resumes at the
+  position it had reached, so an edit inside the loop governs the elements that are
+  left rather than replaying the ones already folded, and a fold over a *different*
+  collection starts that collection from its first element. The positions the
+  predecessor decided are not re-decided and are not re-read: the resumed store
+  seeds tick `0` with the value handed over, so a reader enumerating the whole
+  collection reads that value for them.
 - **What the source still owes.** A source hands a producer registering after the
   swap the release state its retired producers agreed on, which runs *below* a
   store's resume position rather than deciding it: a drive holds the input it
@@ -405,7 +420,9 @@ have:
 | A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
 | A loop reads another source, a port change say | Accepted; same as above, and the port it left is released |
 | Two loops swap which source they read | Accepted; each keeps its value and continues on the source it moved to |
-| A variable moves to a loop over a fixed collection | Accepted; nothing is carried, since that fold is recomputed |
+| A variable moves to a loop over a fixed collection | Accepted; same as above — the value seeds and the collection folds on top of it |
+| The body of a loop over a fixed collection is edited | Accepted; the fold resumes at the position it had reached, so the new rule governs the elements left |
+| The collection itself is edited | Accepted; the new collection counts in its own sequence, so it is folded whole |
 
 An update is atomic with respect to requests: under concurrent load every request
 is answered by exactly one version, and the versions do not interleave.

@@ -126,20 +126,26 @@ impl CommitEngine {
         }
     }
 
-    /// Create an engine whose initial state is `init` at tick `at`, for a store
-    /// whose first iteration position is not `0`.
+    /// Create an engine seeded like [`new`](Self::new) whose clock starts at
+    /// `at + 1`, for a store whose first iteration position is `at`.
     ///
-    /// A store replacing one in a running program starts where its source has
-    /// reached. The drive maps position `p` to tick `p + 1` and reads the
-    /// previous accumulator as of tick `p`, so the seed sits at the tick the
-    /// first position reads. Re-basing the ticks instead would break the
-    /// position-to-tick correspondence the dense read shares with the drive.
+    /// A store replacing one in a running program starts where its predecessor
+    /// had reached. The drive maps position `p` to tick `p + 1` and reads the
+    /// previous accumulator as of tick `p`, so starting the clock at `at + 1`
+    /// makes `at` this store's first position while leaving the
+    /// position-to-tick correspondence the dense read shares with the drive
+    /// intact.
+    ///
+    /// The seed still sits at tick `0`, so a position the predecessor decided
+    /// folds to the value it handed over rather than to nothing. This store has
+    /// no record of what that position actually held — the value is the one the
+    /// predecessor ended on — but a reader enumerating a fixed collection asks
+    /// about every position of it, and the last value is the one such a read is
+    /// after.
     pub fn seeded_at(at: CommitTs, init: HashMap<Value, Value>) -> Self {
-        let latest_write = init.keys().map(|k| (k.clone(), at)).collect();
         Self {
-            committed: BTreeMap::from([(at, init)]),
-            latest_write,
             next_ts: at + 1,
+            ..Self::new(init)
         }
     }
 
@@ -1305,14 +1311,10 @@ impl TileOperator for InductionStore {
             // self-describing: `read_as_of`/`store_value_at` fold to the init below
             // the first *iteration* change (a leading carry) without an external
             // default. Iterations therefore occupy ticks 1.., a `+ 1` offset the
-            // driver and the dense read both apply.
-            engine: if self.resume_at == 0 {
-                CommitEngine::new(inits)
-            } else {
-                // Resuming: the seed sits at the tick the first position this
-                // store decides will read. See [`CommitEngine::seeded_at`].
-                CommitEngine::seeded_at(self.resume_at, inits)
-            },
+            // driver and the dense read both apply. A store that resumes starts
+            // its clock at the position it resumes at; a store that starts with
+            // its source resumes at `0`, which is the same seeding.
+            engine: CommitEngine::seeded_at(self.resume_at, inits),
             body_producer,
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),

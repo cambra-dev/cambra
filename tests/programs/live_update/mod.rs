@@ -41,7 +41,9 @@
 //! | A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
 //! | A loop reads another source — a port change, say | Accepted; same as above, and the port it left is released |
 //! | Two loops swap which source they read | Accepted; each keeps its value and continues where its new source has got to |
-//! | A variable moves to a loop over a fixed collection | Accepted; nothing is carried, since that fold is recomputed |
+//! | A variable moves to a loop over a fixed collection | Accepted; same as above — the value seeds and the collection folds on top of it |
+//! | The body of a loop over a fixed collection is edited | Accepted; the fold resumes at the position it had reached, so the new rule governs the elements left |
+//! | The collection itself is edited | Accepted; the new collection counts in its own sequence, so it is folded whole |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | Repeats and reverts | Accepted; each takes effect |
@@ -281,6 +283,24 @@ mod fixtures {
         n := ""
         reqs, resps = http_serve("{PORT}", "POST", "/bump")
         for x in ["y", "z"]:
+            n := n + x
+        for r in reqs:
+            resps << n + "\n"
+    "#};
+
+    pub const BUMP_OVER_A_MARKED_LIST: &str = indoc! {r#"
+        n := ""
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        for x in ["y", "z"]:
+            n := n + x + "!"
+        for r in reqs:
+            resps << n + "\n"
+    "#};
+
+    pub const BUMP_OVER_ANOTHER_FIXED_LIST: &str = indoc! {r#"
+        n := ""
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        for x in ["p", "q"]:
             n := n + x
         for r in reqs:
             resps << n + "\n"
@@ -600,6 +620,8 @@ fn source(name: &str, port: u16) -> String {
         "guestbook" => include_str!("program.cambra"),
         "bump-over-source" => fixtures::BUMP_OVER_SOURCE,
         "bump-over-a-fixed-list" => fixtures::BUMP_OVER_A_FIXED_LIST,
+        "bump-over-a-marked-list" => fixtures::BUMP_OVER_A_MARKED_LIST,
+        "bump-over-another-fixed-list" => fixtures::BUMP_OVER_ANOTHER_FIXED_LIST,
         "guestbook-adds-route" => fixtures::GUESTBOOK_ADDS_ROUTE,
         "guestbook-drops-route" => fixtures::GUESTBOOK_DROPS_ROUTE,
         "guestbook-drops-state" => fixtures::GUESTBOOK_DROPS_STATE,
@@ -1750,16 +1772,15 @@ fn a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source() {
     );
 }
 
-/// A variable that moves to a loop over a fixed collection is recomputed, not
-/// seeded.
+/// A variable that moves to a loop over a fixed collection keeps its value and
+/// folds the collection on top of it.
 ///
-/// A fixed collection is part of the program rather than outside it, so the fold
-/// over it is a pure function of what the new version declares. Carrying the value
-/// in would count the elements the old version had already seen on top of the
-/// ones this fold is about to. Accepted, and `n` reads as the new list alone
-/// however many requests the old version answered.
+/// The move is the same one a variable makes between any two loops: the value
+/// seeds, and the positions restart because they are counted in something else.
+/// Nothing about the new sequence being a list rather than a source changes that
+/// — `n` holds what the requests built, and the list's elements follow.
 #[test]
-fn a_variable_that_moves_to_a_fixed_collection_is_recomputed() {
+fn a_variable_that_moves_to_a_fixed_collection_keeps_its_value() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("bump-over-source", port));
 
@@ -1774,7 +1795,63 @@ fn a_variable_that_moves_to_a_fixed_collection_is_recomputed() {
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
     assert_eq!(
         after,
+        vec!["aayz\n"],
+        "the list folds on top of what the requests built",
+    );
+}
+
+/// A fold over a fixed collection resumes where its predecessor stopped, so an
+/// edit inside the loop governs the elements that are left rather than replaying
+/// the ones already folded.
+///
+/// The version installed here appends `"!"` to every element. None is appended,
+/// because the fold had already reached the end of the list: an element is
+/// decided once, by whichever version was running when it came up.
+#[test]
+fn a_fold_over_a_fixed_collection_resumes_where_it_stopped() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("bump-over-a-fixed-list", port));
+
+    let before = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
+    assert_eq!(before, vec!["yz\n"]);
+
+    live.update(&mut ctx, &source("bump-over-a-marked-list", port), &no_main)
+        .expect("`n` is still declared, at the same type");
+
+    let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
+    assert_eq!(
+        after,
         vec!["yz\n"],
-        "the fold is the list's, not the list's on top of what the requests built",
+        "the new rule governs the elements left, and none are",
+    );
+}
+
+/// A fold over a *different* fixed collection counts in a different sequence, so
+/// it folds that collection from its first element.
+///
+/// `[0, 2]` is the extent of `["y", "z"]` and of `["p", "q"]` alike; resuming the
+/// second fold at the first's frontier would skip both its elements. The
+/// collection is named by the term that computes it for that reason, and the
+/// value carries the way it does between any two loops.
+#[test]
+fn a_fold_over_another_fixed_collection_starts_it_from_the_beginning() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("bump-over-a-fixed-list", port));
+
+    let before = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
+    assert_eq!(before, vec!["yz\n"]);
+
+    live.update(
+        &mut ctx,
+        &source("bump-over-another-fixed-list", port),
+        &no_main,
+    )
+    .expect("`n` is still declared, at the same type");
+
+    let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
+    assert_eq!(
+        after,
+        vec!["yzpq\n"],
+        "the new list is folded whole, onto the value the old one built",
     );
 }
