@@ -1,0 +1,12 @@
+name = "CclFormal"
+defaultTargets = ["CclFormal", "subverdict"]
+
+[[lean_lib]]
+name = "CclFormal"
+
+# The differential oracle (see Main.lean). `lake build` produces
+# .lake/build/bin/subverdict, which the Rust harness
+# (tests/differential_oracle.rs) spawns.
+[[lean_exe]]
+name = "subverdict"
+root = "Main"
