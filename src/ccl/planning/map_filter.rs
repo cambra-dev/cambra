@@ -50,6 +50,21 @@ pub(super) fn insert_map_filters(expr: &mut Expr) {
     let TypedExprNode::Compose(elts) = &expr.node else {
         return;
     };
+    // The compose is what the recording names: the `map_filter` is spliced into it,
+    // and the site it narrows keeps its own id, re-typed in place. `Machinery`, for
+    // the reason `planning.iterate` is — a `map_filter` is how a refinement the site's
+    // type already carries gets materialised, and the user wrote an inner
+    // comprehension with an `if`.
+    //
+    // The recording spans the *match*: `map_filter_site` clones a candidate's value
+    // predicate out of its refinements while probing, so a scan that rewrites nothing
+    // still copies. Those copies reach no output tree and compose away as transients
+    // of this node, as `planning.hash_join`'s rejected attempts do.
+    let _g = provenance::enter(
+        expr.node_id(),
+        "planning.map_filter",
+        provenance::Nature::Machinery,
+    );
     let Some(site) = elts.iter().position(|e| map_filter_site(e).is_some()) else {
         return;
     };

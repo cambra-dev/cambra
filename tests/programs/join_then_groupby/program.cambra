@@ -1,0 +1,29 @@
+# One program, both planning recognizers. The two-source comprehension with an
+# `u.id == o.user_id` guard is what `planning/join.rs` rewrites into a keyed
+# lookup; the `groupby` is what `planning/groupby.rs` rewrites into its
+# bucketize chain. They are summed rather than chained: grouping directly over a
+# join's product domain is not supported by the engine yet.
+
+users = [
+    (id=1, region="west"),
+    (id=2, region="east"),
+    (id=3, region="west"),
+]
+
+orders = [
+    (user_id=1, amount=100),
+    (user_id=2, amount=50),
+    (user_id=1, amount=200),
+    (user_id=3, amount=75),
+]
+
+joined = sum([
+    o.amount
+    for u in users
+    for o in orders
+    if u.id == o.user_id
+])
+
+grouped = sum([sum(x) for x in groupby([2, 3, 4, 5], \x -> x // 2)])
+
+joined + grouped

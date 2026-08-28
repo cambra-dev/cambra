@@ -52,8 +52,7 @@ use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{id, zip_pair};
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Lit, ProjKey, Type, TypedExpr,
-    TypedExprNode,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, ProjKey, Type, TypedExpr, TypedExprNode,
 };
 
 // ---------------------------------------------------------------------------
@@ -212,8 +211,15 @@ fn recurse_simplify(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
 ///
 /// The caller **must** write a valid expression back to `*expr` before
 /// returning; the placeholder is never externally observable.
+///
+/// `mem::take` rather than a literal, because `Default for TypedExpr` builds at
+/// [`NodeId::PLACEHOLDER`](crate::ccl::provenance::NodeId::PLACEHOLDER) without
+/// going through `Expr::new`. Minting one here would fire `on_mint` inside
+/// whichever rule is recording and claim parentage for a node no tree ever
+/// holds — a spent id and a row no query reaches, once per rule firing, and
+/// `simplify` runs to fixpoint.
 fn take(expr: &mut Expr) -> Expr {
-    std::mem::replace(expr, Expr::lit(Lit::Int(0)))
+    std::mem::take(expr)
 }
 
 /// Whether `ty` is `String`, **ignoring refinements**. A refined string
@@ -354,7 +360,7 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
 /// keyed on the node the rule is about to rewrite.
 ///
 /// This is the whole of simplify's provenance instrumentation: **one combinator,
-/// applied uniformly to all thirteen rules**, and no rule body changes at all.
+/// applied uniformly to every rule**, and no rule body changes at all.
 /// That is possible because a recording declares nothing — it names the node in
 /// the slot and lets the construction hooks report the rest. In particular:
 ///
@@ -1231,12 +1237,11 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::FieldKey;
     use crate::ccl::ccl_utils::{
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
     use crate::ccl::lambda_elim::{curry_at, zip_pair};
-    use crate::ccl::{BaseType, Expr, Name};
+    use crate::ccl::{BaseType, Expr, FieldKey, Lit, Name};
 
     fn var(s: &str) -> Expr {
         Expr::var(s)
