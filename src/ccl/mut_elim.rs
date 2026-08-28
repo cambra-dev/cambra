@@ -209,6 +209,47 @@ fn spine_writes_mut(e: &Expr) -> bool {
 /// it. The writes are sequenced *before* binding — a mutable write reads the
 /// *previous* value, so it never observes the binder — preserving evaluation
 /// order and scope.
+/// Lift a `Case` branch's writes onto its own spine and put `cont` after them,
+/// with the branch's terminal value substituted for `name`.
+///
+/// The dual of [`hoist_writer_body`], which lifts an *unconditional* writer body
+/// out of a binding. A branch's writes cannot be lifted out — they are
+/// conditional — so the binding and the continuation come in instead.
+///
+/// The terminal is **substituted**, not bound. A `let` surviving inside a branch
+/// escapes the writer lambda `transform_chain` builds from it, which is the same
+/// reason a `MutWrite`'s value is inlined into the read-your-writes environment
+/// rather than bound. The terminal is pure by construction: every write ahead of
+/// it is lifted onto the spine here.
+fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
+    match branch.node {
+        // 1:1 reparents: the statement survives at a new spine position, so it
+        // carries its id as a self-edge rather than a fresh mint.
+        TypedExprNode::ExprStmt { expr, body } => Expr::expr_stmt_preserving(
+            branch.node_id,
+            *expr,
+            splice_branch_value(name, *body, cont),
+        ),
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => Expr::let_in_preserving(
+            branch.node_id,
+            binding,
+            *bound_expr,
+            splice_branch_value(name, *body, cont),
+        ),
+        other => {
+            let terminal = Expr {
+                node: other,
+                ..branch
+            };
+            Subst::discharge_env_in_place(cont, &HashMap::from([(name.clone(), terminal)]))
+        }
+    }
+}
+
 fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Expr {
     match writer_body.node {
         // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
@@ -296,6 +337,85 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
 /// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
 /// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
 /// `transform_chain` never meet a mutable write in value position.
+// A `Case` bound by a `Let` whose branches write. The write becomes a
+// shadowing advance over the rest of the scope it sits in, and a branch's
+// scope ends at the value the binding takes, so the update would reach
+// nothing after the `Let`. Push the binding and the continuation into every
+// branch, which puts each write on a spine whose scope *is* the
+// continuation. The per-branch splice is `hoist_writer_body`, the same one
+// an unconditional writer body in this position takes: the branch's terminal
+// becomes the bound value, and its writes sequence ahead of the binding.
+//
+// The `Case` is left in statement position with value `unit`. Inside a loop
+// body that is the shape `transform_chain`'s guard-`Case` arm merges into
+// one writer decision; outside one, each branch is an ordinary write spine.
+pub(crate) fn push_binding_into_case(e: &mut Expr) -> Option<Expr> {
+    let applies = matches!(&e.node, TypedExprNode::Let { bound_expr, .. }
+        if matches!(&bound_expr.node, TypedExprNode::Case { branches, .. }
+            if branches.iter().any(|b| spine_writes_mut(&b.body))));
+    if applies {
+        let let_id = e.node_id();
+        let e = std::mem::take(e);
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = e.node
+        else {
+            unreachable!()
+        };
+        // The rewrite duplicates the continuation once per branch, so only the
+        // `Case` itself survives 1:1 — it is mutated in place, keeping its id,
+        // type and annotation. Every copy of the binding and the continuation is
+        // a mint standing in for the `Let` being pushed down, which is what the
+        // recording names. `Machinery`, because the copies are plumbing that
+        // restores the flat-spine invariant rather than anything the user wrote.
+        let pushed = {
+            let _g = provenance::enter(
+                let_id,
+                "letrec.push_binding_into_case",
+                provenance::Nature::Machinery,
+            );
+            let mut case = *bound_expr;
+            let TypedExprNode::Case { branches, .. } = &mut case.node else {
+                unreachable!("guarded by the match above")
+            };
+            for br in branches.iter_mut() {
+                let branch_body = std::mem::take(&mut br.body);
+                br.body = splice_branch_value(&binding.name, branch_body, body.as_ref().clone());
+            }
+            // The `Case` now yields what the continuation yields, not what the
+            // binding bound. A continuation that yields nothing is a statement
+            // chain, and `transform_chain` reads a guard-`Case` as a statement:
+            // put it back in effect position, before the `unit` a chain ends in.
+            // A continuation that yields a value *is* the value, so the `Case`
+            // stands where the `Let` stood.
+            case.ty = body.ty.clone();
+            if matches!(case.ty, Type::Base(BaseType::Unit)) {
+                Expr::expr_stmt(case, unit_expr())
+            } else {
+                case
+            }
+        };
+        return Some(pushed);
+    }
+    None
+}
+
+/// Apply [`push_binding_into_case`] everywhere in `expr`.
+///
+/// `transact_phase` runs before the letrec phase and walks a `with begin():`
+/// block itself, so a write inside a `Case` bound there has to be on a spine
+/// before that walk reaches it. The letrec phase normalizes again through
+/// [`flatten_spine`], because inlining between the two can bury a fresh one.
+pub(crate) fn push_bindings_into_writing_cases(mut expr: Expr) -> Expr {
+    if let Some(pushed) = push_binding_into_case(&mut expr) {
+        return push_bindings_into_writing_cases(pushed);
+    }
+    expr.map_children(push_bindings_into_writing_cases);
+    expr
+}
+
 fn flatten_spine(mut e: Expr) -> Expr {
     // Un-nest a *mutable-write-headed* nested sequence (a spliced multi-statement
     // writer body). A Feed/Define-headed nested `ExprStmt` keeps its nesting.
@@ -385,6 +505,9 @@ fn flatten_spine(mut e: Expr) -> Expr {
             hoist_writer_body(binding, *bound_expr, *body)
         };
         return flatten_spine(hoisted);
+    }
+    if let Some(pushed) = push_binding_into_case(&mut e) {
+        return flatten_spine(pushed);
     }
     // A bare write reached in value/terminal position: it is a `Unit`-valued
     // statement, not a value to bind.

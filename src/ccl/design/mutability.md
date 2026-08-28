@@ -1057,6 +1057,30 @@ store, and its `final_or_default` reports the seed as that store's default.
 These features belong to the model above but are not yet built. Each is rejected at compile time
 today rather than silently mishandled.
 
+### A write inside a `Case` bound by a `Let`
+
+A `MutWrite` becomes a shadowing advance over the rest of the scope it sits in, so a write in a
+branch of a `Case` that a `Let` binds advances the variable only until the binding takes its value:
+the update reaches nothing after the `Let`. That is the shape `x = if c: acc += e; v else: w` lowers
+to, and the shape inlining a pass-by-reference writer into a bound expression can produce.
+
+`push_bindings_into_writing_cases` normalizes it by pushing the binding and the continuation into
+every branch. Each branch's writes lift onto its own spine, its terminal is **substituted** for the
+binder in the continuation, and the `Case` takes the continuation's place — in effect position when
+the continuation yields nothing, in value position when it yields a value. The terminal is
+substituted rather than bound because a `let` surviving inside a branch escapes the writer lambda
+`transform_chain` builds from it, the same reason a write's value is inlined into the
+read-your-writes environment.
+
+What the branches then hold is the ordinary conditional induction write below: one uniform writer
+decision whose commit selector is the disjunction of the writing branches' guards, and whose
+per-accumulator write set carries the entering value on the paths that do not write. So the block
+right-hand side and the statement `if` spelling of one conditional compile to the same recurrence.
+
+The normalization runs twice, because two phases read a statement spine: `transact_phase::run`
+walks a `with begin():` block itself and runs before the letrec phase, and `flatten_spine` runs it
+again for the writes inlining buries between them.
+
 ### Value-selecting `Case` and conditional induction writes (partially implemented)
 
 > **Status: value-selecting `Case`s and conditional induction writes both compile.**

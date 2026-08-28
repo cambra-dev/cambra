@@ -620,6 +620,32 @@ fn mutation_target_name(stmt: &Spanned<ChlStmt>) -> Option<&str> {
     }
 }
 
+/// The statement an assignment's block right-hand side wraps, when this
+/// statement has one.
+///
+/// The accumulator scans below walk statements, and a block right-hand side
+/// puts statements inside an expression, so a write in one of its branches is
+/// invisible to them without this. It is a loop-carried write like any other:
+/// `flatten_spine` pushes the binding into the branches, which puts the write on
+/// a spine `transform_chain` merges into the writer decision
+/// (`src/ccl/design/mutability.md`, "Value-selecting `Case` and conditional
+/// induction writes (partially implemented)").
+fn block_value_stmt(stmt: &Spanned<ChlStmt>) -> Option<&Spanned<ChlStmt>> {
+    let value = match &stmt.node {
+        ChlStmt::Assign { value, .. }
+        | ChlStmt::AnnAssign { value, .. }
+        | ChlStmt::AugAssign { value, .. }
+        | ChlStmt::MutAssign { value, .. }
+        | ChlStmt::Define { value, .. }
+        | ChlStmt::Expr(value) => value,
+        _ => return None,
+    };
+    match &value.node {
+        ChlExpr::Block(inner) => Some(inner),
+        _ => None,
+    }
+}
+
 /// Scan a for-loop body for assignments that mutate names already
 /// bound in `mutation_scope`.  Returns every such name in first-mention
 /// order, deduplicated, so the direct-mirror loop's `acc_names` cover
@@ -674,6 +700,9 @@ fn collect_mutation_loop_vars(
             if let Some(else_body) = else_body {
                 collect_mutation_loop_vars(else_body, scope, vars, seen);
             }
+        }
+        if let Some(inner) = block_value_stmt(stmt) {
+            collect_mutation_loop_vars(std::slice::from_ref(inner), scope, vars, seen);
         }
     }
 }
@@ -740,6 +769,11 @@ pub(super) fn find_nested_mutation_var(
                 }
             }
             _ => {}
+        }
+        if let Some(inner) = block_value_stmt(stmt)
+            && let Some(n) = find_nested_mutation_var(std::slice::from_ref(inner), mutation_scope)
+        {
+            return Some(n);
         }
     }
     None

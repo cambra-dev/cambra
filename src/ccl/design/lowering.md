@@ -165,19 +165,15 @@ Its arms are expressions
 form"), so no statement, and so no name, is bound inside it for a scope to
 disambiguate.
 
-### A block in value position may not write a variable it does not declare
+### A write in a branch leaves lowering off the statement spine
 
-A `MutWrite` becomes a shadowing advance over the rest of the scope it sits in
-([mutability.md](mutability.md), "Sequencing domains"). A block standing for a
-value ends at that value, so an advance inside it reaches nothing after the
-assignment and the update is discarded. `escaping_mut_write` walks the lowered
-block for a `MutWrite` no binder inside it covers, and `lower_block_value`
-rejects what it finds, pointing at the `:=` or `op=` that wrote.
-
-A mutable variable the block declares itself is unaffected: its `MutDecl` and
-its writes share one scope, so the advance reaches every read. Writing a
-variable from outside the block takes a statement `if` beside the assignment,
-whose write legs `letrec_phase` forks into the recurrence.
+Lowering emits a block right-hand side's `Case` where the assignment stood, so
+a `MutWrite` in one of its branches sits in a `Let`'s bound expression rather
+than on the statement spine the mutability phases read. Lowering does not move
+it: the phases own that normalization, and they own it for the writes inlining
+already buries there. `push_bindings_into_writing_cases` pushes the binding and
+the continuation into the branches — see
+[mutability.md](mutability.md), "A write inside a `Case` bound by a `Let`".
 
 ## Variants and match
 

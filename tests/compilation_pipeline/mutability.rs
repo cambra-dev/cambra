@@ -1655,12 +1655,13 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
     );
 }
 
-// A write inside a block right-hand side reaches only the rest of that block,
-// so the assignment's value is taken and the update is dropped. Lowering
-// rejects the shape rather than compiling it to a discarded write
-// (`docs/chl-spec.md`, "4.3 Assignment forms"). The four cases are the write
-// spellings and the three positions a block right-hand side can sit in: a
-// for-loop body, the top level, and a `with begin():` block.
+// A write inside a block right-hand side is a write like any other: the
+// mutability phases put it back on the statement spine by pushing the binding
+// into the branches (`src/ccl/design/mutability.md`, "A write inside a `Case`
+// bound by a `Let`"), so the block right-hand side and the statement `if`
+// spelling of the same conditional agree. The cases cover the two write
+// operators, `if` and `match`, and the three positions a block right-hand side
+// sits in: a for-loop body, the top level, and a `with begin():` block.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(indoc! {"
@@ -1672,7 +1673,32 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
             else:
                 0
         yield t
-    acc"})]
+    acc"}, Value::Int(5))]
+// The branch's value reads the write, so the two must be ordered: the write is
+// lifted onto the branch's spine ahead of the value it binds.
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                acc
+            else:
+                0
+        yield t
+    acc"}, Value::Int(5))]
+// Both arms write, so neither is the carry: the writer decision commits at
+// every position and the values differ per path.
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                0
+            else:
+                acc += 100
+                0
+        yield t
+    acc"}, Value::Int(105))]
 #[case(indoc! {"
     acc := 0
     for i in [1, 2, 3]:
@@ -1682,7 +1708,7 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
             else:
                 0
         yield t
-    acc"})]
+    acc"}, Value::Int(3))]
 #[case(indoc! {"
     acc := 0
     t = if True:
@@ -1690,31 +1716,51 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
             0
         else:
             0
-    acc"})]
-// The write sits under a `for` inside the block. Reaching this message at all
-// is what shows the enclosing scope arrives: without it the inner loop reads
-// `balance` as a name it does not know and rejects the `+=` as a write to a
-// non-mutable, naming a declaration the first line already makes.
+    acc"}, Value::Int(1))]
 #[case(indoc! {"
-    balance := 0
-    with begin():
-        balance := if True:
-                for i in [1, 2]:
-                    balance += i
-                balance
-            else:
+    acc := 0
+    t = match `some(3):
+            case `some(n):
+                acc += n
                 0
-    balance"})]
-fn test_block_right_hand_side_write_is_rejected(#[case] code: &str) {
-    check_compile_error(code, "stands for a value, so the update is discarded");
+            case `none:
+                0
+    acc"}, Value::Int(3))]
+fn test_block_right_hand_side_write_accumulates(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
-/// The statement `if` writes the accumulator; the block right-hand side that
-/// spells the same conditional as a value does not, so the two are not
-/// interchangeable where a write is involved.
+/// A transactional write inside a block right-hand side commits with the rest
+/// of its block. `transact_phase` runs before the letrec phase and walks the
+/// block itself, so the same normalization runs ahead of it.
+///
+/// `r = 10` does not pass the guard, so nothing is written that round;
+/// `r = 20` writes `80` then reads it back for the `- 1`; `r = 30` writes `49`
+/// and then `48`.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn test_transactional_write_inside_a_block_right_hand_side() {
+    check_scalar(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            for r in [10, 20, 30]:
+                with begin():
+                    step = if r > 15:
+                            pool := pool - r
+                            1
+                        else:
+                            0
+                    pool := pool - step
+            await_final(pool)"},
+        Value::Int(48),
+    );
+}
+
+/// The statement `if` spelling of the first case above, which the block
+/// right-hand side now agrees with.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn test_statement_if_accumulates_where_a_block_value_cannot() {
+fn test_statement_if_accumulates() {
     check_scalar(
         indoc! {"
             acc := 0

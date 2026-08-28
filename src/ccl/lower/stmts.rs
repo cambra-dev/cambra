@@ -5,9 +5,7 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 
 use super::*;
 use crate::{
-    ccl::{
-        BaseType, Branch, Expr, FieldKey, Lit, Name, Pattern, Type, TypedBinding, TypedExprNode,
-    },
+    ccl::{BaseType, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
         Spanned, Stmt as ChlStmt, TypeAnnotation,
@@ -447,8 +445,9 @@ pub(super) fn lower_assigned_value(
 /// ([`find_mutation_loop_vars`]). `preceding` and `outer_bindings` are that
 /// scope.
 ///
-/// A write to a variable the block does not declare is rejected rather than
-/// lowered: see [`escaping_mut_write`].
+/// A write inside one of the block's branches is off the statement spine the
+/// mutability phases read, and is put back on it by
+/// [`push_bindings_into_writing_cases`](crate::ccl::mut_elim::push_bindings_into_writing_cases).
 pub(super) fn lower_block_value(
     stmt: &Spanned<ChlStmt>,
     preceding: &[Spanned<ChlStmt>],
@@ -459,141 +458,7 @@ pub(super) fn lower_block_value(
         matches!(stmt.node, ChlStmt::If { .. } | ChlStmt::Match { .. }),
         "Expr::Block wraps an `if` or a `match`; the parser builds no other block value"
     );
-    let lowered = lower_final_stmt(stmt, preceding, outer_bindings, ctx)?;
-    match escaping_mut_write(&lowered) {
-        Some(name) => {
-            let name = name.to_string();
-            Err(block_value_write_error(
-                first_write_span(stmt, &name).unwrap_or(stmt.span),
-                &stmt.node,
-                &name,
-            ))
-        }
-        None => Ok(lowered),
-    }
-}
-
-/// The first mutable variable a `MutWrite` in `block` targets without `block`
-/// binding the name.
-///
-/// A `MutWrite` becomes a shadowing advance over the rest of the scope it sits
-/// in ([`crate::ccl::mut_elim`]), so a write inside a block that stands for a
-/// value advances the variable only until that value is taken, and the update
-/// reaches nothing after the assignment. A write whose name the block binds is
-/// unaffected: the binder and the advance share a scope, so the advance reaches
-/// every read. That is the condition checked here, over every binder lowering
-/// builds — `Let`, `MutDecl`, `Lambda` and `For`.
-fn escaping_mut_write(block: &Expr) -> Option<Name> {
-    fn rec(e: &Expr, bound: &mut Vec<Name>) -> Option<Name> {
-        match &e.node {
-            TypedExprNode::MutWrite { name, value } => {
-                if !bound.contains(name) {
-                    return Some(name.clone());
-                }
-                rec(value, bound)
-            }
-            TypedExprNode::Let {
-                binding,
-                bound_expr,
-                body,
-            }
-            | TypedExprNode::MutDecl {
-                binding,
-                init: bound_expr,
-                body,
-            } => {
-                if let Some(found) = rec(bound_expr, bound) {
-                    return Some(found);
-                }
-                bound.push(binding.name.clone());
-                let found = rec(body, bound);
-                bound.pop();
-                found
-            }
-            TypedExprNode::Lambda { param, body } => {
-                bound.push(param.name.clone());
-                let found = rec(body, bound);
-                bound.pop();
-                found
-            }
-            TypedExprNode::For { target, iter, body } => {
-                if let Some(found) = rec(iter, bound) {
-                    return Some(found);
-                }
-                bound.push(target.name.clone());
-                let found = rec(body, bound);
-                bound.pop();
-                found
-            }
-            _ => {
-                let mut found = None;
-                e.walk_children(|c| {
-                    if found.is_none() {
-                        found = rec(c, bound);
-                    }
-                });
-                found
-            }
-        }
-    }
-    rec(block, &mut Vec::new())
-}
-
-/// The span of the first statement in `stmt` that writes `name` — the `:=` or
-/// `op=` an [`escaping_mut_write`] diagnostic points at.
-fn first_write_span(stmt: &Spanned<ChlStmt>, name: &str) -> Option<Span> {
-    fn in_stmts(stmts: &[Spanned<ChlStmt>], name: &str) -> Option<Span> {
-        stmts.iter().find_map(|s| in_stmt(s, name))
-    }
-    fn in_stmt(stmt: &Spanned<ChlStmt>, name: &str) -> Option<Span> {
-        match &stmt.node {
-            ChlStmt::AugAssign { target, value, .. } | ChlStmt::MutAssign { target, value, .. } => {
-                if name_target_as_name(target) == Some(name) {
-                    return Some(stmt.span);
-                }
-                in_value(value, name)
-            }
-            ChlStmt::Assign { value, .. }
-            | ChlStmt::AnnAssign { value, .. }
-            | ChlStmt::Define { value, .. }
-            | ChlStmt::Expr(value) => in_value(value, name),
-            ChlStmt::If {
-                branches,
-                else_body,
-            } => branches
-                .iter()
-                .find_map(|b| in_stmts(&b.body, name))
-                .or_else(|| else_body.as_deref().and_then(|e| in_stmts(e, name))),
-            ChlStmt::Match { arms, .. } => arms.iter().find_map(|a| in_stmts(&a.body, name)),
-            ChlStmt::For { body, .. } | ChlStmt::With { body, .. } => in_stmts(body, name),
-            _ => None,
-        }
-    }
-    fn in_value(value: &Spanned<ChlExpr>, name: &str) -> Option<Span> {
-        match &value.node {
-            ChlExpr::Block(inner) => in_stmt(inner, name),
-            _ => None,
-        }
-    }
-    in_stmt(stmt, name)
-}
-
-/// Rejection for a write inside a block standing in value position, whose
-/// update the block's value would discard.
-fn block_value_write_error(span: Span, block: &ChlStmt, name: &str) -> LoweringError {
-    let keyword = match block {
-        ChlStmt::Match { .. } => "match",
-        _ => "if",
-    };
-    LoweringError::unsupported(
-        span,
-        format!(
-            "`{name}` is written inside an `{keyword}` that stands for a value, so the \
-             update is discarded when that value is taken: a write reaches only the rest \
-             of the block it sits in. Write `{name}` from a statement `{keyword}` beside \
-             the assignment, or bind the block's value and write `{name}` after it"
-        ),
-    )
+    lower_final_stmt(stmt, preceding, outer_bindings, ctx)
 }
 
 /// Lower a single statement in the middle of a block.
@@ -2169,9 +2034,8 @@ x";
 
     /// A `for` inside a branch of a block right-hand side sees the names bound
     /// above the assignment, so `acc += i` reads as a write to the accumulator
-    /// rather than as a `+=` to a non-mutable. The write is then rejected for
-    /// standing in value position, and that rejection is what shows the scope
-    /// arrived: without it the loop rejects `acc` as not a mutable variable.
+    /// rather than as a `+=` to a non-mutable. Without the scope the loop
+    /// rejects `acc` as not a mutable variable.
     #[test]
     fn test_block_right_hand_side_sees_the_enclosing_scope() {
         let stmts = parse_module(indoc! {"
@@ -2183,11 +2047,13 @@ x";
                 else:
                     0
             x"});
-        let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message, .. } = &err;
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
+        let rendered = symbolic(&ccl);
         assert!(
-            message.contains("`acc` is written inside an `if` that stands for a value"),
-            "expected the block-value write rejection, got: {message}"
+            rendered.contains("acc :="),
+            "the loop writes the outer accumulator, got: {rendered}"
         );
     }
 

@@ -645,6 +645,11 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return Ok(expr);
     }
+    // A write inside a `Case` bound by a `Let` is off the statement spine this
+    // walk reads, so its advance would be scoped to the branch and dropped.
+    // Push the binding into the branches first, the same normalization the
+    // letrec phase applies through `flatten_spine`.
+    let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
