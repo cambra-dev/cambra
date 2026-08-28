@@ -10,7 +10,8 @@ projections and maps — the leak gate reads the same folds' `leaks` under
 `CAMBRA_PROVENANCE_GATE`, see [provenance.md](../ccl/design/provenance.md#the-seam) — and a release
 compile reads the lowering projection alone.
 
-**Status.** The payload, the two indices, the per-pane stages and the pane-pair links are in tree.
+**Status.** The payload, the two indices, the per-pane node tables and the pane-pair links are in
+tree.
 Prose marked **planned** describes what is designed and not built: the live-value path. Every
 disagreement between this document and the code is listed under
 [Decided, not yet built](#decided-not-yet-built).
@@ -20,11 +21,10 @@ disagreement between this document and the code is listed under
 | | |
 |---|---|
 | Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `SnapshotPayload`: `source` (the program text), `stages` (per pane: a node table, its root, and its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
+| Output | one `SnapshotPayload`: `source` (the program text), `panes` (per pane: a node table, its root, and its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | the `cambra-inspector` crate, which serves the payload, and that crate's frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
-| Vocabulary | a **pane** in the compiler is a **stage** on the wire — one concept, two names, each the name its own side already uses; the pane vocabulary change consolidates them |
 | `span` | throughout: a byte range in the **CHL source text**, never an offset into a rendered pane. Nothing in the payload addresses a pane's text |
 
 ## The usage model
@@ -67,15 +67,16 @@ It does not reuse the static lookups. A live read is `(node, tick) → value` an
 
 ## The data model
 
-### A pane reaches the wire as a stage
+### A pane on the wire
 
-`PANES` (`src/ccl/panes.rs`) is the topology and the payload is derived from it: one `stages[]`
-entry per pane in pipeline order, one `paneLinks[]` entry per adjacent pair. A stage's `id` is the
+`PANES` (`src/ccl/panes.rs`) is the topology and the payload is derived from it: one `panes[]`
+entry per pane in pipeline order, one `paneLinks[]` entry per adjacent pair. A pane's `id` is the
 pane's declared name, its `label` is that name rendered as `IR (POST-INFERENCE)`, and its `kind` is
 `"holes"` before inference has run and `"typed"` at or after it, read off the phases the pane
 declares rather than off its position. Adding a pane is an entry in `PANES` and no edit here.
 
-`the_payload_ships_one_stage_per_declared_pane_and_one_link_per_pair` (`snapshot.rs`) pins the ids,
+`the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair` (`snapshot.rs`) pins the
+ids,
 the order, the arity and the kind split.
 
 ### The anchor pane
@@ -85,10 +86,10 @@ decides which pane a binder's type is read from, so `scopes[].bindings[].type` i
 type. The pane is named rather than positional, and `Snapshot::new` panics if `PANES` does not
 declare it, so inserting a pane ahead of it cannot silently move the anchor.
 
-### Each stage resolves against its own pane
+### A pane resolves against itself
 
-A stage carries its own node table and its own `(span, node)` rows, both resolved against that
-pane's own attributions rather than the anchor's. A node id means the same thing in every pane that
+A pane carries its own node table and its own `(span, node)` rows, both resolved against its own
+attributions rather than the anchor's. A node id means the same thing in every pane that
 holds it; what each pane says about that node is that pane's own answer.
 
 ### A node on the wire
@@ -121,7 +122,7 @@ text carries `Machinery` with the label `"lower.image"` instead — see
 
 A node the pane's projection does not cover ships the same `null`, for both `rewritten` and `span`,
 so the wire cannot tell an unexplained node from a lowering root.
-`every_node_of_every_stage_carries_an_attribution` (`snapshot.rs`) is what keeps the first case from
+`every_node_of_every_pane_carries_an_attribution` (`snapshot.rs`) is what keeps the first case from
 arising, over the same corpus the other payload tests use.
 
 The wire carries no flat `Source`/`Derived`/`Synthetic` string; a consumer formats the triple
@@ -277,7 +278,7 @@ so the walk reaches one region twice. The regions that remain are dense and nest
 `diagnostics` is empty on a successful payload: it describes a program that compiled, and there are
 no warnings. A failed compile ships `SnapshotPayload::degraded` instead — same type, so the two
 shapes cannot drift — carrying the source text, the diagnostics, `meta.snapshotKind: "failed"`, and
-empty `stages`, `paneLinks`, `definitions` and `scopes`.
+empty `panes`, `paneLinks`, `definitions` and `scopes`.
 
 A failed compile ships no panes even where the pipeline reached some: inference can fail after
 channelization succeeded, and that channelized IR is displayable. Shipping what a failed compile did
@@ -285,11 +286,11 @@ reach is follow-up work beyond this document's ratified changes, since it needs 
 back its partial panes rather than one error; it is carried as `TODO(degraded-stages)` on
 `SnapshotPayload::degraded`.
 
-A `Diagnostic` is a `CompileError` with a stage name, a message and a span. The message is the
-error's `Display` rendering — the same single line the terminal's ariadne label carries — so the two
-renderers say the same thing rather than one of them shipping a struct dump. Two variants have no
-`Display` and use `Debug`: `InferError`, whose `Debug` is its message by convention, and
-`ConversionError`.
+A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span. The
+message is the error's `Display` rendering — the same single line the terminal's ariadne label
+carries — so the two renderers say the same thing rather than one of them shipping a struct dump.
+Two variants have no `Display` and use `Debug`: `InferError`, whose `Debug` is its message by
+convention, and `ConversionError`.
 
 The span is the error's own wherever it has one. `Parse` and `Lower` read theirs off the error,
 `Infer`'s is resolved at the `compile_program` boundary; `ChannelizeDefers`, `LambdaElim`,
@@ -307,7 +308,7 @@ still to land ride that bump rather than adding their own, since 5 has not shipp
 
 The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
 every node id included, so any change re-blesses all of them; its wire validator pins the schema
-number, the stage list and the edge-label vocabulary as literal lists. Both live in the
+number, the pane list and the edge-label vocabulary as literal lists. Both live in the
 `cambra-inspector` crate, which owns the fixture corpus.
 
 ## Cost
@@ -348,13 +349,13 @@ shared term.
 | item | what it is for |
 |---|---|
 | `Snapshot::new` | bundle every pane of a `CompiledProgram` with the two indices |
-| `Snapshot::from_parts` | bundle one named pane; the payload then carries a single stage and no pane links |
+| `Snapshot::from_parts` | bundle one named pane; the payload then carries that pane alone and no pane links |
 | `Snapshot::build_payload` | assemble the `SnapshotPayload` — the whole read model |
 | `SpanIndex::build` / `entries` | build the `(span, node)` table over one pane and enumerate it for the wire |
 | `NameBinderIndex::build` / `definitions` / `scopes` | resolve names over the surface AST and enumerate the results |
 | `dense_edges` | project a pane pair's `ProvenanceMap` onto the wire |
 | `diagnostics_from_compile_errors` / `SnapshotPayload::degraded` | the compile-failure path |
-| the wire types | `SnapshotPayload`, `StageEntry`, `PaneLinkEntry`, `SpanEntry`, `DefinitionEntry`, `ScopeEntry`, `ScopeBindingEntry`, `Diagnostic`, `DiagnosticLabel`, `Meta`, `SCHEMA_VERSION` |
+| the wire types | `SnapshotPayload`, `PaneEntry`, `PaneLinkEntry`, `SpanEntry`, `DefinitionEntry`, `ScopeEntry`, `ScopeBindingEntry`, `Diagnostic`, `DiagnosticLabel`, `Meta`, `SCHEMA_VERSION` |
 
 `Snapshot::binder_type` is internal.
 
@@ -401,10 +402,6 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
 Each change is ratified here and lands on its own. They are named rather than numbered: a numbered
 list renumbers as entries land, and a reference to "item 4" would then point at the wrong change.
 
-- **Pane vocabulary.** Consolidate pane/stage on "pane", the name the compiler already defines and
-  the one `paneLinks` already uses: `stages` becomes `panes` on the wire, `StageEntry` becomes
-  `PaneEntry`, `StageProjection` becomes `PaneProjection`. It also frees "stage", which `stage.rs`
-  currently uses for the pane-link projection.
 - **The type renames.** `Snapshot` becomes `InspectedProgram` and `SnapshotPayload` becomes
   `InspectorPayload`. "Snapshot" reads as one retained AST snapshot, which is what `provenance.md`
   calls a pane, where the type is the whole read model over every pane. `InspectedProgram` parallels
@@ -425,5 +422,5 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
   Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
   of one, and the **payload** is what ships.
 
-The pane vocabulary above is a wire-shape change and rides schema 5, which the node table bumped and
+The type renames above touch the wire at `meta`, and ride schema 5, which the node table bumped and
 which has not shipped.

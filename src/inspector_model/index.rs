@@ -3,7 +3,7 @@
 //! A pane's [`SourceProjection`](crate::ccl::provenance::SourceProjection) maps
 //! each [`NodeId`] to the source spans it traces to (node → span). [`SpanIndex`]
 //! is the inverse, span → node, which is the table the payload ships as a
-//! stage's `spanIndex` and the consumer answers "what is at this source
+//! pane's `spanIndex` and the consumer answers "what is at this source
 //! position" over. The two are complementary projections of one
 //! `(tree, projection)` pair; `span_index_round_trips_with_projection` pins that
 //! they agree.

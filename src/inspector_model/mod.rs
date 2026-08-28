@@ -17,7 +17,7 @@
 //!
 //! # The anchor pane
 //!
-//! Each stage carries its own tree and its own
+//! Each pane carries its own tree and its own
 //! [`SourceProjection`](crate::ccl::provenance::SourceProjection), and one of
 //! them is the **anchor**: the post-inference pane, fully typed but still
 //! source-shaped (lambdas intact, before inline/lambda-elim/planning). A
@@ -26,10 +26,10 @@
 //!
 //! # The pane set is the compiler's, not this module's
 //!
-//! [`Snapshot::new`] derives one wire stage per entry of
+//! [`Snapshot::new`] derives one wire pane per entry of
 //! [`PANES`](crate::ccl::panes::PANES) and one pane link per adjacent pair, so
 //! the topology is declared in the compiler and read here. Adding a pane there
-//! adds a stage here with no edit in this module.
+//! adds a pane here with no edit in this module.
 //!
 //! # Predicates are nodes
 //!
@@ -46,7 +46,7 @@
 //!
 //! * [`SpanIndex`] — the `(span, node)` table over one pane's tree and its
 //!   [`SourceProjection`](crate::ccl::provenance::SourceProjection), shipped as
-//!   a stage's `spanIndex`.
+//!   a pane's `spanIndex`.
 //! * [`NameBinderIndex`] — source-level lexical name resolution, over the parsed
 //!   CHL surface AST retained on
 //!   [`source_ast`](crate::ccl::context::CompiledProgram::source_ast), shipped as
@@ -68,17 +68,17 @@
 //! which is the copy that runs. See `src/inspector_model/design.md`, "The usage model".
 
 mod index;
+mod links;
 mod name_binder;
 mod query;
 mod snapshot;
-mod stage;
 
 pub use index::SpanIndex;
+pub use links::dense_edges;
 pub use name_binder::{Binding, Definition, NameBinderIndex, ScopeRegion};
 pub use query::Snapshot;
 pub use snapshot::{
-    DefinitionEntry, Diagnostic, DiagnosticLabel, IrChild, IrNode, Meta, PaneLinkEntry,
+    DefinitionEntry, Diagnostic, DiagnosticLabel, IrChild, IrNode, Meta, PaneEntry, PaneLinkEntry,
     RewriteInfo, SCHEMA_VERSION, ScopeBindingEntry, ScopeEntry, SnapshotPayload, SourceInfo,
-    SpanEntry, StageEntry, diagnostics_from_compile_errors,
+    SpanEntry, diagnostics_from_compile_errors,
 };
-pub use stage::dense_edges;

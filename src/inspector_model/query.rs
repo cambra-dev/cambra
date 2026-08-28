@@ -1,7 +1,7 @@
 //! The [`Snapshot`] bundle — one compiled program's panes, indices and shared
 //! IR walk, assembled for the payload.
 //!
-//! [`Snapshot`] holds one [`StageProjection`] per declared pane (that pane's IR
+//! [`Snapshot`] holds one [`PaneProjection`] per declared pane (that pane's IR
 //! tree, its `SourceProjection`, and the [`SpanIndex`] built over the pair), the
 //! pane-pair provenance maps, and the source-level [`NameBinderIndex`].
 //! [`build_payload`](Snapshot::build_payload) in `snapshot.rs` is its consumer.
@@ -12,7 +12,7 @@
 //! usage model".
 //!
 //! The shared IR walk lives here as well — [`predicate_children`],
-//! [`build_node_table`] and [`node_label`] — because the payload's per-stage
+//! [`build_node_table`] and [`node_label`] — because the payload's per-pane
 //! node tables are built from it. No serde and no I/O: the wire
 //! types are `snapshot.rs`'s and the serialization is the `cambra-inspector`
 //! crate's.
@@ -33,25 +33,25 @@ use super::{Binding, NameBinderIndex, SpanIndex};
 /// Must be one of [`PANES`]' names; [`Snapshot::new`] panics if it is not.
 pub(super) const ANCHOR_PANE: &str = "post-inference";
 
-/// One pipeline stage's read-only projection: its IR tree, its
+/// One pipeline pane's read-only projection: its IR tree, its
 /// `SourceProjection`, and the span→node index built over that pair.
 ///
-/// Each stage is self-contained: its tree and its span rows are resolved
-/// against its own `(Expr, SourceProjection)` pair, never a sibling stage's
-/// projection. The `id`/`label`/`kind` are the wire identifiers a [`StageEntry`]
+/// Each pane is self-contained: its tree and its span rows are resolved
+/// against its own `(Expr, SourceProjection)` pair, never a sibling pane's
+/// projection. The `id`/`label`/`kind` are the wire identifiers a [`PaneEntry`]
 /// emits.
 ///
-/// [`StageEntry`]: crate::inspector_model::StageEntry
-pub(super) struct StageProjection<'a> {
+/// [`PaneEntry`]: crate::inspector_model::PaneEntry
+pub(super) struct PaneProjection<'a> {
     /// Stable machine id — the pane's declared [`PaneSpec::name`], e.g.
     /// `"pre-inference"`, `"post-inference"`, `"post-channelize"`.
     pub(super) id: &'static str,
     /// Human-readable label for the pane header, derived from `id`.
     pub(super) label: String,
-    /// Discriminant for the stage kind: `"holes"` for a tree inference has not
+    /// Discriminant for the pane kind: `"holes"` for a tree inference has not
     /// run on yet, `"typed"` for one it has.
     pub(super) kind: &'static str,
-    /// This stage's IR tree.
+    /// This pane's IR tree.
     pub(super) ir: &'a Expr,
     /// Node → attribution for this pane, materialized by folding this pane's
     /// rows.
@@ -60,11 +60,11 @@ pub(super) struct StageProjection<'a> {
     pub(super) span_index: SpanIndex,
 }
 
-/// The read-only inspector model bundle: every pipeline stage plus the
+/// The read-only inspector model bundle: every pipeline pane plus the
 /// source-level name index.
 ///
 /// Built once via [`new`](Self::new) from a [`CompiledProgram`], and read by
-/// [`build_payload`] alone. The bundle holds every stage so `build_payload`
+/// [`build_payload`] alone. The bundle holds every pane so `build_payload`
 /// needs only `&self` — no second borrow of the [`CompiledProgram`].
 ///
 /// [`build_payload`]: Self::build_payload
@@ -72,20 +72,20 @@ pub struct Snapshot<'a> {
     /// The original program source text (the payload's `source.text`).
     source: &'a str,
     /// Source-level lexical name resolution — the payload's `definitions` and
-    /// the name half of its `scopes`. Stage-independent (built over the surface
-    /// AST), so it is not per-stage.
+    /// the name half of its `scopes`. Pane-independent (built over the surface
+    /// AST), so it is not per-pane.
     name_binder: NameBinderIndex,
-    /// The pipeline stages in order (upstream → downstream): pre-inference,
+    /// The panes in order (upstream → downstream): pre-inference,
     /// post-inference, post-channelize, ….
-    stages: Vec<StageProjection<'a>>,
-    /// Index into [`stages`](Self::stages) of the anchor — the post-inference
-    /// stage a binder's type is read from ([`ANCHOR_PANE`]).
+    panes: Vec<PaneProjection<'a>>,
+    /// Index into [`panes`](Self::panes) of the anchor — the post-inference
+    /// pane a binder's type is read from ([`ANCHOR_PANE`]).
     anchor: usize,
-    /// The pane-pair provenance maps, aligned with `stages.windows(2)` — one per
-    /// adjacent stage pair, folded from the rows the intervening phases wrote
+    /// The pane-pair provenance maps, aligned with `panes.windows(2)` — one per
+    /// adjacent pane pair, folded from the rows the intervening phases wrote
     /// ([`CompiledProgram::materialize_panes`]). Drives the `paneLinks` payload
-    /// (shipped dense, self-edges included). Empty for a single-stage snapshot.
-    stage_maps: Vec<ProvenanceMap<NodeId, NodeId>>,
+    /// (shipped dense, self-edges included). Empty for a single-pane snapshot.
+    pane_maps: Vec<ProvenanceMap<NodeId, NodeId>>,
 }
 
 /// A pane's display label — its declared name, rendered for a pane header.
@@ -111,8 +111,8 @@ fn pane_kind(pane: &str) -> &'static str {
     panic!("no pane named {pane}");
 }
 
-impl<'a> StageProjection<'a> {
-    /// Build a stage projection: keep the IR borrow, take ownership of the
+impl<'a> PaneProjection<'a> {
+    /// Build a pane projection: keep the IR borrow, take ownership of the
     /// materialized pane projection, and build the span→node index over the pair.
     fn build(
         id: &'static str,
@@ -122,7 +122,7 @@ impl<'a> StageProjection<'a> {
         projection: SourceProjection,
     ) -> Self {
         let span_index = SpanIndex::build(ir, &projection);
-        StageProjection {
+        PaneProjection {
             id,
             label,
             kind,
@@ -136,13 +136,13 @@ impl<'a> StageProjection<'a> {
 impl<'a> Snapshot<'a> {
     /// Build the bundle from a compiled program: materialize one projection per
     /// pane and one map per adjacent pair
-    /// ([`CompiledProgram::materialize_panes`]), build each stage's span index,
+    /// ([`CompiledProgram::materialize_panes`]), build each pane's span index,
     /// build the source-level name index.
     ///
-    /// The stage list is **derived from [`PANES`]**, not spelled here: the pane
+    /// The pane list is **derived from [`PANES`]**, not spelled here: the pane
     /// id is the pane's declared name, the label is that name rendered for
     /// display, and the kind says whether inference has run at or before the
-    /// pane. Adding a pane to `PANES` therefore adds a wire stage with no edit
+    /// pane. Adding a pane to `PANES` therefore adds a wire pane with no edit
     /// in this module — which is the whole reason the compiler declares the
     /// topology once.
     ///
@@ -150,16 +150,16 @@ impl<'a> Snapshot<'a> {
     /// It is named, not positional: a pane inserted ahead of it must not silently
     /// move the anchor.
     pub fn new(compiled: &'a CompiledProgram) -> Self {
-        let panes = compiled.materialize_panes();
+        let materialized = compiled.materialize_panes();
         let trees = compiled.pane_trees();
-        // `PANES`, `pane_trees()` and `panes.projections` are the same length by
-        // construction (`PANE_COUNT`), so this zip drops nothing.
-        let stages: Vec<_> = PANES
+        // `PANES`, `pane_trees()` and the materialized projections are the same
+        // length by construction (`PANE_COUNT`), so this zip drops nothing.
+        let panes: Vec<_> = PANES
             .iter()
             .zip(trees)
-            .zip(panes.projections)
+            .zip(materialized.projections)
             .map(|((spec, tree), projection)| {
-                StageProjection::build(
+                PaneProjection::build(
                     spec.name,
                     pane_label(spec.name),
                     pane_kind(spec.name),
@@ -169,7 +169,7 @@ impl<'a> Snapshot<'a> {
             })
             .collect();
         let name_binder = NameBinderIndex::build(&compiled.source_ast);
-        let anchor = stages
+        let anchor = panes
             .iter()
             .position(|s| s.id == ANCHOR_PANE)
             .expect("the post-inference anchor pane is declared in `PANES`");
@@ -177,19 +177,19 @@ impl<'a> Snapshot<'a> {
             source: &compiled.source,
             name_binder,
             anchor,
-            stages,
-            // Aligned with `stages.windows(2)` — `MaterializedPanes::pairs` is
+            panes,
+            // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
             // already one shorter than its projections, in the same order.
-            stage_maps: panes.pairs.into_iter().map(|p| p.map).collect(),
+            pane_maps: materialized.pairs.into_iter().map(|p| p.map).collect(),
         }
     }
 
     /// Build from a single materialized pane, named by `pane`, which becomes the
     /// anchor. Equivalent to [`new`](Self::new) for one pane: there is no
     /// adjacent pair, so [`build_payload`](Self::build_payload) ships a single
-    /// stage with no pane links.
+    /// pane with no pane links.
     ///
-    /// `pane` must be one of [`PANES`]' names — a stage's wire id is the pane's
+    /// `pane` must be one of [`PANES`]' names — a pane's wire id is the pane's
     /// declared name, so a snapshot built over the post-channelize tree must say
     /// so rather than inherit the anchor's label.
     pub fn from_parts(
@@ -199,7 +199,7 @@ impl<'a> Snapshot<'a> {
         projection: SourceProjection,
         source_ast: &Module,
     ) -> Self {
-        let stages = vec![StageProjection::build(
+        let panes = vec![PaneProjection::build(
             pane,
             pane_label(pane),
             pane_kind(pane),
@@ -210,27 +210,27 @@ impl<'a> Snapshot<'a> {
         Snapshot {
             source,
             name_binder,
-            anchor: stages.len() - 1,
-            stages,
-            stage_maps: Vec::new(),
+            anchor: panes.len() - 1,
+            panes,
+            pane_maps: Vec::new(),
         }
     }
 
-    /// The anchor stage (post-inference) — the one a binder's type is read
+    /// The anchor pane (post-inference) — the one a binder's type is read
     /// from.
-    pub(super) fn anchor(&self) -> &StageProjection<'a> {
-        &self.stages[self.anchor]
+    pub(super) fn anchor(&self) -> &PaneProjection<'a> {
+        &self.panes[self.anchor]
     }
 
-    /// The pipeline stages in order (for the payload's `stages` enumeration).
-    pub(super) fn stages(&self) -> &[StageProjection<'a>] {
-        &self.stages
+    /// The panes in order (for the payload's `panes` enumeration).
+    pub(super) fn panes(&self) -> &[PaneProjection<'a>] {
+        &self.panes
     }
 
-    /// The pane-pair provenance maps, aligned with `stages.windows(2)` — for the
+    /// The pane-pair provenance maps, aligned with `panes.windows(2)` — for the
     /// payload's `paneLinks` (see [`build_payload`](Self::build_payload)).
-    pub(super) fn stage_maps(&self) -> &[ProvenanceMap<NodeId, NodeId>] {
-        &self.stage_maps
+    pub(super) fn pane_maps(&self) -> &[ProvenanceMap<NodeId, NodeId>] {
+        &self.pane_maps
     }
 
     /// The program's source text (the snapshot payload's `source.text`).
@@ -453,7 +453,7 @@ pub(super) fn predicate_children(expr: &Expr) -> Vec<(String, &Expr)> {
 /// node's id and every node reachable from `expr` exactly once, in first-visit
 /// pre-order.
 ///
-/// The single source-linking node builder: every stage's payload nodes go
+/// The single source-linking node builder: every pane's payload nodes go
 /// through this one shape, parameterized only by its `(Expr, SourceProjection)`
 /// pair.
 ///
@@ -845,26 +845,24 @@ for x in readings:
 max(totals)
 ";
 
-    /// The labels of the nodes `stage_id` indexes at `span`: every `(span,
-    /// nodeId)` row of that stage whose span covers the query, resolved to the
-    /// node carrying that id in that stage's node table. This is the consumer's
+    /// The labels of the nodes `pane_id` indexes at `span`: every `(span,
+    /// nodeId)` row of that pane whose span covers the query, resolved to the
+    /// node carrying that id in that pane's node table. This is the consumer's
     /// lookup, over the two shipped tables and nothing else.
     ///
     /// Panics if a row names a node the table does not hold — the invariant
     /// `span_index_round_trips_with_projection` (`index.rs`) pins.
-    fn labels_at(payload: &SnapshotPayload, stage_id: &str, span: Span) -> Vec<String> {
-        let stage = payload
-            .stages
+    fn labels_at(payload: &SnapshotPayload, pane_id: &str, span: Span) -> Vec<String> {
+        let pane = payload
+            .panes
             .iter()
-            .find(|s| s.id == stage_id)
-            .unwrap_or_else(|| panic!("the payload ships a {stage_id} stage"));
-        stage
-            .span_index
+            .find(|s| s.id == pane_id)
+            .unwrap_or_else(|| panic!("the payload ships a {pane_id} pane"));
+        pane.span_index
             .iter()
             .filter(|row| row.span.start <= span.start && span.end <= row.span.end)
             .map(|row| {
-                stage
-                    .nodes
+                pane.nodes
                     .iter()
                     .find(|n| n.node_id == row.node_id.as_u64())
                     .unwrap_or_else(|| panic!("row node {:?} is in the table", row.node_id))
@@ -1040,12 +1038,12 @@ max(totals)
         // fully-folded rows leave no node absent from the projection, and a node
         // the projection does not cover would ship neither a span nor a rewrite
         // tag.
-        let stage = payload
-            .stages
+        let pane = payload
+            .panes
             .iter()
             .find(|s| s.id == "post-channelize")
-            .expect("the payload ships the post-channelize stage");
-        let absent: Vec<&str> = stage
+            .expect("the payload ships the post-channelize pane");
+        let absent: Vec<&str> = pane
             .nodes
             .iter()
             .filter(|n| n.span.is_none() && n.rewritten.is_none())

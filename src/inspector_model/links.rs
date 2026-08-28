@@ -1,6 +1,6 @@
 //! Pane-pair node→node links (the provenance map).
 //!
-//! The multi-pane inspector shows several pipeline stages side by side (CHL
+//! The multi-pane inspector shows several panes side by side (CHL
 //! source, pre-inference IR, post-inference IR, post-channelize IR, …) and links a
 //! node in one pane to the node(s) it came from / became in the adjacent panes.
 //! That link is the node's provenance across the phase.
@@ -149,7 +149,7 @@ a + b
         let edges = dense_edges(&panes.pair("post-inference → post-channelize").map);
         assert!(
             !edges.is_empty(),
-            "a two-site inline fan-out must produce non-identity stage edges"
+            "a two-site inline fan-out must produce non-identity pane edges"
         );
         assert_endpoints_live(
             &edges,

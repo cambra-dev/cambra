@@ -2,14 +2,14 @@
 //! struct, assembled by enumerating the snapshot's two indices.
 //!
 //! `/api/snapshot` is the primary read-only endpoint:
-//! source + the pipeline stages (each a node table + span→node index) + use→def
+//! source + the panes (each a node table + span→node index) + use→def
 //! definitions + per-scope bindings + diagnostics + meta. This module mirrors
 //! that JSON exactly as a serde-gated [`SnapshotPayload`]; the actual
 //! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
 //! Building the payload is pure: it enumerates
 //! [`SpanIndex`](crate::inspector_model::SpanIndex) and
 //! [`NameBinderIndex`](crate::inspector_model::NameBinderIndex) and builds each
-//! stage's node table via the shared `build_node_table`.
+//! pane's node table via the shared `build_node_table`.
 //!
 //! # Wire-type isolation
 //!
@@ -21,7 +21,7 @@
 //!
 //! # Populated vs. stubbed
 //!
-//! * `source`, `stages` (each with its own node table + span index),
+//! * `source`, `panes` (each with its own node table + span index),
 //!   `definitions`, `scopes`, `meta` — fully populated.
 //! * `diagnostics` — **always empty `[]`** in this payload: a `/api/snapshot`
 //!   describes a *successfully compiled* program, and there are no warnings. The
@@ -38,9 +38,9 @@
 
 use crate::chl_parser::ast::Span;
 
+use super::links::dense_edges;
 use super::name_binder::{Definition, ScopeRegion};
-use super::query::{Snapshot, StageProjection};
-use super::stage::dense_edges;
+use super::query::{PaneProjection, Snapshot};
 use crate::ccl::Type;
 
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
@@ -68,47 +68,47 @@ pub struct SnapshotPayload {
     pub diagnostics: Vec<Diagnostic>,
     /// Snapshot metadata + the live-protocol seams.
     pub meta: Meta,
-    /// The pipeline stages, upstream → downstream, each carrying its own node
+    /// The panes, upstream → downstream, each carrying its own node
     /// table and span index — one entry per pane
     /// [`PANES`](crate::ccl::panes::PANES) declares, in pipeline order. Read
     /// `PANES` for the current set rather than a list here.
-    pub stages: Vec<StageEntry>,
-    /// The dense node→node links between adjacent stages — each adjacent pane
+    pub panes: Vec<PaneEntry>,
+    /// The dense node→node links between adjacent panes — each adjacent pane
     /// pair's `ProvenanceMap` shipped verbatim, self-edges included. One entry
-    /// per adjacent pair, in the same order as `stages.windows(2)`, so this is
-    /// always one shorter than [`stages`](Self::stages).
+    /// per adjacent pair, in the same order as `panes.windows(2)`, so this is
+    /// always one shorter than [`panes`](Self::panes).
     pub pane_links: Vec<PaneLinkEntry>,
 }
 
-/// One IR pipeline stage in the multi-pane snapshot.
+/// One IR pipeline pane in the multi-pane snapshot.
 ///
-/// Carries its own self-contained node table and span index — each stage
+/// Carries its own self-contained node table and span index — each pane
 /// resolves against its own (`Expr`, `SourceProjection`) pair.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct StageEntry {
+pub struct PaneEntry {
     /// Stable machine id — the pane's declared name, e.g. `"pre-inference"`,
     /// `"post-inference"`, `"post-channelize"`.
     pub id: &'static str,
     /// Human-readable label for the pane header, derived from `id`.
     pub label: String,
-    /// Discriminant for the stage kind: `"holes"` for a tree inference has not
+    /// Discriminant for the pane kind: `"holes"` for a tree inference has not
     /// run on yet, `"typed"` for one it has.
     pub kind: &'static str,
-    /// The id of the stage's root node — where a consumer starts walking
+    /// The id of the pane's root node — where a consumer starts walking
     /// [`nodes`](Self::nodes).
     pub root: u64,
-    /// Every node of this stage exactly once, in first-visit pre-order. A node
+    /// Every node of this pane exactly once, in first-visit pre-order. A node
     /// reached from several places — a refinement predicate shared by several
     /// type slots, most of all — is one entry here that each of those places
     /// names by id.
     pub nodes: Vec<IrNode>,
-    /// Every `(span → nodeId)` entry of this stage's span index.
+    /// Every `(span → nodeId)` entry of this pane's span index.
     pub span_index: Vec<SpanEntry>,
 }
 
-/// One node of a stage's shipped node table.
+/// One node of a pane's shipped node table.
 ///
 /// The wire's own node type, owned here rather than borrowed from the terminal
 /// renderer: the fields are this payload's and nothing else sets them. See
@@ -125,7 +125,7 @@ pub struct IrNode {
     pub node_id: u64,
     /// The **narrowest** source span this node traces to, absent when it traces
     /// to none. A node several source spans fan into carries one of them here
-    /// and all of them in [`StageEntry::span_index`], so it stays reachable from
+    /// and all of them in [`PaneEntry::span_index`], so it stays reachable from
     /// each.
     pub span: Option<Span>,
     /// The node's rewrite tag, `None` for a
@@ -156,7 +156,7 @@ pub struct IrNode {
 }
 
 /// One `{ edge, id, predicate }` child of an [`IrNode`] — an edge into the
-/// stage's node table.
+/// pane's node table.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct IrChild {
@@ -164,8 +164,8 @@ pub struct IrChild {
     /// `"1"`, …), or `where.N` for a refinement predicate riding one of the
     /// parent's type slots.
     pub edge: String,
-    /// The child node's id — an entry of the same stage's
-    /// [`nodes`](StageEntry::nodes).
+    /// The child node's id — an entry of the same pane's
+    /// [`nodes`](PaneEntry::nodes).
     pub id: u64,
     /// Whether the child is a type-interior subtree: `true` for a refinement
     /// predicate, `false` for a value child. This is what a consumer branches
@@ -193,7 +193,7 @@ pub struct RewriteInfo {
     pub label: String,
 }
 
-/// The dense node→node links between two adjacent pipeline stages — the
+/// The dense node→node links between two adjacent panes — the
 /// pane-pair [`ProvenanceMap`](crate::ccl::provenance::ProvenanceMap) shipped verbatim.
 ///
 /// **Dense**: an id preserved unchanged across the phase appears as its own
@@ -204,9 +204,9 @@ pub struct RewriteInfo {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct PaneLinkEntry {
-    /// The upstream stage id, e.g. `"pre-inference"`.
+    /// The upstream pane id, e.g. `"pre-inference"`.
     pub from: &'static str,
-    /// The downstream stage id, e.g. `"post-inference"`.
+    /// The downstream pane id, e.g. `"post-inference"`.
     pub to: &'static str,
     /// Every edge as `(upstream_node_id, downstream_node_id, labels)`,
     /// self-edges included, sorted deterministically. `labels` is a non-empty
@@ -298,9 +298,9 @@ pub struct ScopeBindingEntry {
 pub struct Diagnostic {
     /// Severity discriminant — `"error"` (no warnings).
     pub severity: String,
-    /// The compile stage that produced it — `"parse"`, `"lower"`, `"infer"`, …
-    /// (the `CompileError` variant's stage).
-    pub stage: String,
+    /// The compile pane that produced it — `"parse"`, `"lower"`, `"infer"`, …
+    /// (the `CompileError` variant's pane).
+    pub pane: String,
     /// The human-readable message (reuses the variant's rendered text).
     pub message: String,
     /// The primary source span, when one is known.
@@ -339,7 +339,7 @@ impl Diagnostic {
     /// [`CompileError`]: crate::ccl::context::CompileError
     pub fn from_compile_error(error: &crate::ccl::context::CompileError) -> Self {
         use crate::ccl::context::CompileError;
-        let (stage, message, span) = match error {
+        let (pane, message, span) = match error {
             CompileError::Parse(e) => ("parse", e.to_string(), Some(e.span())),
             CompileError::Lower(e) => ("lower", e.to_string(), Some(e.span())),
             CompileError::ChannelizeDefers(e) => ("channelizeDefers", e.to_string(), None),
@@ -358,7 +358,7 @@ impl Diagnostic {
             .unwrap_or_default();
         Diagnostic {
             severity: "error".to_string(),
-            stage: stage.to_string(),
+            pane: pane.to_string(),
             message,
             span,
             labels,
@@ -391,7 +391,7 @@ pub struct Meta {
     ///
     /// The current version is [`SCHEMA_VERSION`], whose field set is
     /// [`SnapshotPayload`]'s as documented on that type. Each
-    /// `stages[].nodes[]` entry carries its attribution as the spans channel on
+    /// `panes[].nodes[]` entry carries its attribution as the spans channel on
     /// `span` plus a `rewritten` tag (`null | { via, nature, label }`).
     ///
     /// **Bump the version** on any *breaking* wire change — a field removed,
@@ -402,20 +402,20 @@ pub struct Meta {
     pub schema: u32,
 }
 
-/// Build one stage's node table — its root id and its nodes — and its span rows.
+/// Build one pane's node table — its root id and its nodes — and its span rows.
 ///
-/// The rows are enumerated from the index the stage already carries; building a
+/// The rows are enumerated from the index the pane already carries; building a
 /// second one over the same pair would duplicate the walk. The nodes go through
 /// [`build_node_table`](super::query::build_node_table), the single
 /// source-linking node builder.
-fn build_stage_nodes_and_index(stage: &StageProjection<'_>) -> (u64, Vec<IrNode>, Vec<SpanEntry>) {
-    let span_entries = stage
+fn build_pane_nodes_and_index(pane: &PaneProjection<'_>) -> (u64, Vec<IrNode>, Vec<SpanEntry>) {
+    let span_entries = pane
         .span_index
         .entries()
         .map(|(span, node_id)| SpanEntry { span, node_id })
         .collect();
 
-    let (root, nodes) = super::query::build_node_table(stage.ir, &stage.projection);
+    let (root, nodes) = super::query::build_node_table(pane.ir, &pane.projection);
 
     (root, nodes, span_entries)
 }
@@ -426,12 +426,12 @@ impl Snapshot<'_> {
     /// `name` is the program name for `source.name` (a placeholder; the server
     /// picks it). Every other field is derived purely from the snapshot:
     ///
-    /// * `stages` — the pipeline stages in upstream → downstream order:
+    /// * `panes` — the panes in upstream → downstream order:
     ///   one per declared pane in pipeline order, each with its
     ///   own node table + span index.
-    /// * `paneLinks` — per consecutive stage pair, the dense edges of the
+    /// * `paneLinks` — per consecutive pane pair, the dense edges of the
     ///   pane-pair `ProvenanceMap` folded at that boundary, self-edges included (see
-    ///   [`dense_edges`](super::stage::dense_edges)).
+    ///   [`dense_edges`](super::links::dense_edges)).
     /// * `definitions` — [`NameBinderIndex::definitions`](crate::inspector_model::NameBinderIndex::definitions).
     /// * `scopes` — [`NameBinderIndex::scopes`](crate::inspector_model::NameBinderIndex::scopes),
     ///   each binding's `type` read off the IR node that binds it.
@@ -481,17 +481,17 @@ impl Snapshot<'_> {
             })
             .collect();
 
-        // Build the pipeline stages (upstream → downstream) from the bundled
-        // stage projections — each ships its own node table + span index.
-        let stages = self
-            .stages()
+        // Build the panes (upstream → downstream) from the bundled
+        // pane projections — each ships its own node table + span index.
+        let panes = self
+            .panes()
             .iter()
-            .map(|stage| {
-                let (root, nodes, span_index) = build_stage_nodes_and_index(stage);
-                StageEntry {
-                    id: stage.id,
-                    label: stage.label.clone(),
-                    kind: stage.kind,
+            .map(|pane| {
+                let (root, nodes, span_index) = build_pane_nodes_and_index(pane);
+                PaneEntry {
+                    id: pane.id,
+                    label: pane.label.clone(),
+                    kind: pane.kind,
                     root,
                     nodes,
                     span_index,
@@ -499,16 +499,16 @@ impl Snapshot<'_> {
             })
             .collect();
 
-        // Dense edges between each consecutive stage pair, read off the pane-pair
+        // Dense edges between each consecutive pane pair, read off the pane-pair
         // `ProvenanceMap` folded at that boundary (aligned with the same
         // `windows(2)`). `dense_edges` ships every edge — self-edges included —
         // already sorted for a byte-reproducible payload; the frontend follows
         // edges only, with no identity special case.
-        let stage_maps = self.stage_maps();
+        let pane_maps = self.pane_maps();
         let pane_links = self
-            .stages()
+            .panes()
             .windows(2)
-            .zip(stage_maps)
+            .zip(pane_maps)
             .map(|(pair, map)| {
                 let (upstream, downstream) = (&pair[0], &pair[1]);
                 PaneLinkEntry {
@@ -529,7 +529,7 @@ impl Snapshot<'_> {
                 snapshot_kind: "post-inference".to_string(),
                 schema: SCHEMA_VERSION,
             },
-            stages,
+            panes,
             pane_links,
         }
     }
@@ -541,14 +541,14 @@ impl SnapshotPayload {
     ///
     /// Built from the **same** [`SnapshotPayload`] type as the success path
     /// (rather than a separately hand-rolled JSON object), so the two shapes
-    /// cannot silently diverge as the schema evolves — the `stages`/scope
+    /// cannot silently diverge as the schema evolves — the `panes`/scope
     /// collections are empty and `meta.snapshotKind` is `"failed"`. The frontend
     /// still renders the editor + squiggles from this.
     ///
-    /// TODO(degraded-stages): emit whatever pipeline stages *did* complete — if
+    /// TODO(degraded-panes): emit whatever panes *did* complete — if
     /// channelization succeeds and only inference fails, the post-channelize
-    /// `stages[]` entry is still displayable. Today every degraded payload ships
-    /// empty `stages`/`paneLinks` regardless of where the failure occurred. It
+    /// `panes[]` entry is still displayable. Today every degraded payload ships
+    /// empty `panes`/`paneLinks` regardless of where the failure occurred. It
     /// needs `compile_program` to hand back its partial panes rather than one
     /// error, so the change is mostly outside this module; see
     /// `src/inspector_model/design.md`, "Diagnostics and the degraded payload".
@@ -570,7 +570,7 @@ impl SnapshotPayload {
                 snapshot_kind: "failed".to_string(),
                 schema: SCHEMA_VERSION,
             },
-            stages: Vec::new(),
+            panes: Vec::new(),
             pane_links: Vec::new(),
         }
     }
@@ -615,33 +615,31 @@ mod tests {
         ]
     }
 
-    /// Every `nodeId` in one stage's shipped node table.
-    fn stage_ids(stage: &StageEntry) -> HashSet<u64> {
-        stage.nodes.iter().map(|n| n.node_id).collect()
+    /// Every `nodeId` in one pane's shipped node table.
+    fn pane_ids(pane: &PaneEntry) -> HashSet<u64> {
+        pane.nodes.iter().map(|n| n.node_id).collect()
     }
 
-    /// The stage's node carrying `id`. Panics when no node does, which is the
+    /// The pane's node carrying `id`. Panics when no node does, which is the
     /// dangling-child-id failure `every_child_id_resolves_in_its_own_table`
     /// rules out over the whole corpus.
-    fn node_with_id(stage: &StageEntry, id: u64) -> &IrNode {
-        stage
-            .nodes
+    fn node_with_id(pane: &PaneEntry, id: u64) -> &IrNode {
+        pane.nodes
             .iter()
             .find(|n| n.node_id == id)
-            .unwrap_or_else(|| panic!("node {id} is absent from the {} table", stage.id))
+            .unwrap_or_else(|| panic!("node {id} is absent from the {} table", pane.id))
     }
 
-    /// The stage's first node labelled `label`.
-    fn node_named<'a>(stage: &'a StageEntry, label: &str) -> &'a IrNode {
-        stage
-            .nodes
+    /// The pane's first node labelled `label`.
+    fn node_named<'a>(pane: &'a PaneEntry, label: &str) -> &'a IrNode {
+        pane.nodes
             .iter()
             .find(|n| n.label == label)
-            .unwrap_or_else(|| panic!("no {label} node in the {} table", stage.id))
+            .unwrap_or_else(|| panic!("no {label} node in the {} table", pane.id))
     }
 
     /// Every node reachable from `id` by following child edges, `id` included.
-    fn reachable(stage: &StageEntry, id: u64) -> Vec<&IrNode> {
+    fn reachable(pane: &PaneEntry, id: u64) -> Vec<&IrNode> {
         let mut seen = HashSet::new();
         let mut queue = vec![id];
         let mut out = Vec::new();
@@ -649,14 +647,14 @@ mod tests {
             if !seen.insert(id) {
                 continue;
             }
-            let node = node_with_id(stage, id);
+            let node = node_with_id(pane, id);
             out.push(node);
             queue.extend(node.children.iter().map(|c| c.id));
         }
         out
     }
 
-    /// The payload's stage list is [`PANES`]: one stage per declared pane, in
+    /// The payload's pane list is [`PANES`]: one pane per declared pane, in
     /// pipeline order, under the pane's own name, and one link per adjacent pair
     /// naming the panes it joins.
     ///
@@ -665,21 +663,21 @@ mod tests {
     /// list, so that a pane added upstream fails a test rather than appearing
     /// unannounced; this asserts the two agree at the producer.
     #[test]
-    fn the_payload_ships_one_stage_per_declared_pane_and_one_link_per_pair() {
+    fn the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair() {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
 
-            let ids: Vec<&str> = payload.stages.iter().map(|s| s.id).collect();
+            let ids: Vec<&str> = payload.panes.iter().map(|s| s.id).collect();
             let declared: Vec<&str> = PANES.iter().map(|p| p.name).collect();
-            assert_eq!(ids, declared, "stages are `PANES`, in order");
+            assert_eq!(ids, declared, "panes are `PANES`, in order");
 
             assert_eq!(
                 payload.pane_links.len(),
-                payload.stages.len() - 1,
-                "one link per adjacent stage pair"
+                payload.panes.len() - 1,
+                "one link per adjacent pane pair"
             );
-            for (link, pair) in payload.pane_links.iter().zip(payload.stages.windows(2)) {
+            for (link, pair) in payload.pane_links.iter().zip(payload.panes.windows(2)) {
                 assert_eq!(link.from, pair[0].id);
                 assert_eq!(link.to, pair[1].id);
             }
@@ -687,11 +685,11 @@ mod tests {
             // The kind is read off the phases, so exactly the panes at or after
             // inference are typed.
             assert_eq!(
-                payload.stages[0].kind, "holes",
+                payload.panes[0].kind, "holes",
                 "the anchor precedes inference"
             );
             assert!(
-                payload.stages[1..].iter().all(|s| s.kind == "typed"),
+                payload.panes[1..].iter().all(|s| s.kind == "typed"),
                 "every pane at or after inference is typed"
             );
             assert_eq!(payload.meta.schema, SCHEMA_VERSION);
@@ -710,11 +708,8 @@ mod tests {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            let ids: HashMap<&str, HashSet<u64>> = payload
-                .stages
-                .iter()
-                .map(|s| (s.id, stage_ids(s)))
-                .collect();
+            let ids: HashMap<&str, HashSet<u64>> =
+                payload.panes.iter().map(|s| (s.id, pane_ids(s))).collect();
 
             for link in &payload.pane_links {
                 assert!(
@@ -743,21 +738,21 @@ mod tests {
         }
     }
 
-    /// Every `spanIndex` row points at a node the same stage's tree carries, so a
+    /// Every `spanIndex` row points at a node the same pane's tree carries, so a
     /// span lookup cannot resolve to an id the consumer has no node for.
     #[test]
-    fn every_span_index_row_points_at_a_node_of_its_own_stage() {
+    fn every_span_index_row_points_at_a_node_of_its_own_pane() {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            for stage in &payload.stages {
-                let ids = stage_ids(stage);
-                for row in &stage.span_index {
+            for pane in &payload.panes {
+                let ids = pane_ids(pane);
+                for row in &pane.span_index {
                     assert!(
                         ids.contains(&row.node_id.as_u64()),
                         "spanIndex row {:?} names an id absent from the {} table",
                         row.node_id,
-                        stage.id
+                        pane.id
                     );
                 }
             }
@@ -778,21 +773,21 @@ mod tests {
         "#};
         let prog = compile(code);
         let payload = Snapshot::new(&prog).build_payload("test");
-        let stage = payload
-            .stages
+        let pane = payload
+            .panes
             .iter()
             .find(|s| s.id == "post-inference")
-            .expect("the payload ships the post-inference stage");
+            .expect("the payload ships the post-inference pane");
 
         let mut spans: HashMap<u64, Vec<Span>> = HashMap::new();
-        for row in &stage.span_index {
+        for row in &pane.span_index {
             spans
                 .entry(row.node_id.as_u64())
                 .or_default()
                 .push(row.span);
         }
 
-        for node in &stage.nodes {
+        for node in &pane.nodes {
             // The node ships one span and the rows ship all of them, so the one
             // it ships is the narrowest.
             let narrowest = spans
@@ -824,7 +819,7 @@ mod tests {
 
         // `x * 2` is the root of a lowered source expression, so its rewrite tag
         // null-compresses; it carries its own span and its inferred type.
-        let mul = node_named(stage, "BinOp(Arithmetic(Mul))");
+        let mul = node_named(pane, "BinOp(Arithmetic(Mul))");
         assert_eq!(mul.span, Some(Span::new(24, 29)), "the span of `x * 2`");
         assert_eq!(mul.ty, "Int");
         assert!(
@@ -835,19 +830,19 @@ mod tests {
 
         // The comprehension's filter rides the `Cast`'s refined domain, so it
         // hangs off a marked `where.N` edge rather than a positional one.
-        let cast = node_named(stage, "Cast");
+        let cast = node_named(pane, "Cast");
         let edges: Vec<(&str, bool)> = cast
             .children
             .iter()
             .map(|c| (c.edge.as_str(), c.predicate))
             .collect();
         assert_eq!(edges, [("0", false), ("where.0", true), ("where.1", true)]);
-        let predicate = node_with_id(stage, cast.children[1].id);
+        let predicate = node_with_id(pane, cast.children[1].id);
         assert_ne!(
             predicate.node_id, cast.node_id,
             "a predicate is a node in its own right"
         );
-        let labels: Vec<&str> = reachable(stage, predicate.node_id)
+        let labels: Vec<&str> = reachable(pane, predicate.node_id)
             .iter()
             .map(|n| n.label.as_str())
             .collect();
@@ -857,7 +852,7 @@ mod tests {
         );
     }
 
-    /// Every child id, and every stage's `root`, names a node of that stage's own
+    /// Every child id, and every pane's `root`, names a node of that pane's own
     /// table. A dangling child id is the failure the node table makes possible
     /// and a nested tree could not express.
     #[test]
@@ -865,15 +860,15 @@ mod tests {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            for stage in &payload.stages {
-                let ids = stage_ids(stage);
+            for pane in &payload.panes {
+                let ids = pane_ids(pane);
                 assert!(
-                    ids.contains(&stage.root),
+                    ids.contains(&pane.root),
                     "the {} root {} is absent from its own table",
-                    stage.id,
-                    stage.root
+                    pane.id,
+                    pane.root
                 );
-                for node in &stage.nodes {
+                for node in &pane.nodes {
                     for child in &node.children {
                         assert!(
                             ids.contains(&child.id),
@@ -882,7 +877,7 @@ mod tests {
                             child.edge,
                             node.node_id,
                             child.id,
-                            stage.id
+                            pane.id
                         );
                     }
                 }
@@ -890,7 +885,7 @@ mod tests {
         }
     }
 
-    /// A stage's table holds each node exactly once, and holds exactly the ids
+    /// A pane's table holds each node exactly once, and holds exactly the ids
     /// `collect_tree_ids` enumerates for that pane's tree — the main tree plus
     /// everything reachable through its type slots.
     ///
@@ -899,29 +894,29 @@ mod tests {
     /// is the same enumeration the pane folds explain, so a table disagreeing
     /// with it would ship pane links whose endpoints have no node.
     #[test]
-    fn a_stage_table_holds_each_pane_node_exactly_once() {
+    fn a_pane_table_holds_each_node_exactly_once() {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            for (stage, tree) in payload.stages.iter().zip(prog.pane_trees()) {
+            for (pane, tree) in payload.panes.iter().zip(prog.pane_trees()) {
                 let mut seen = HashSet::new();
-                for node in &stage.nodes {
+                for node in &pane.nodes {
                     assert!(
                         seen.insert(node.node_id),
                         "{} appears twice in the {} table",
                         node.node_id,
-                        stage.id
+                        pane.id
                     );
                 }
 
-                let pane: HashSet<u64> =
+                let held: HashSet<u64> =
                     collect_tree_ids(tree).iter().map(|i| i.as_u64()).collect();
-                let dropped: Vec<u64> = pane.difference(&seen).copied().collect();
-                let invented: Vec<u64> = seen.difference(&pane).copied().collect();
+                let dropped: Vec<u64> = held.difference(&seen).copied().collect();
+                let invented: Vec<u64> = seen.difference(&held).copied().collect();
                 assert!(
                     dropped.is_empty() && invented.is_empty(),
                     "the {} table drops {dropped:?} and invents {invented:?}",
-                    stage.id
+                    pane.id
                 );
             }
         }
@@ -936,13 +931,13 @@ mod tests {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            for stage in &payload.stages {
+            for pane in &payload.panes {
                 let mut seen = HashSet::new();
-                for row in &stage.span_index {
+                for row in &pane.span_index {
                     assert!(
                         seen.insert((row.span.start, row.span.end, row.node_id)),
                         "the {} span index repeats ({:?}, {:?})",
-                        stage.id,
+                        pane.id,
                         row.span,
                         row.node_id
                     );
@@ -962,14 +957,14 @@ mod tests {
         let code = corpus()[0];
         let prog = compile(code);
         let payload = Snapshot::new(&prog).build_payload("test");
-        let stage = payload
-            .stages
+        let pane = payload
+            .panes
             .iter()
             .find(|s| s.id == "post-inference")
-            .expect("the payload ships the post-inference stage");
+            .expect("the payload ships the post-inference pane");
 
         let mut edges: HashMap<u64, usize> = HashMap::new();
-        for node in &stage.nodes {
+        for node in &pane.nodes {
             for child in node.children.iter().filter(|c| c.predicate) {
                 *edges.entry(child.id).or_default() += 1;
             }
@@ -980,7 +975,7 @@ mod tests {
             .expect("a predicate this pane reaches from more than one type slot");
         assert!(count > 1, "{shared} is named by {count} predicate edges");
         assert_eq!(
-            stage.nodes.iter().filter(|n| n.node_id == shared).count(),
+            pane.nodes.iter().filter(|n| n.node_id == shared).count(),
             1,
             "the shared predicate {shared} is one entry in the table"
         );
@@ -1007,7 +1002,7 @@ mod tests {
         let diagnostics = diagnostics_from_compile_errors(&errors);
         let parse = diagnostics
             .iter()
-            .find(|d| d.stage == "parse")
+            .find(|d| d.pane == "parse")
             .unwrap_or_else(|| panic!("a parse diagnostic; got {diagnostics:?}"));
 
         assert!(
@@ -1049,7 +1044,7 @@ mod tests {
             "generators are not supported here",
         ));
         let diagnostic = Diagnostic::from_compile_error(&error);
-        assert_eq!(diagnostic.stage, "lower");
+        assert_eq!(diagnostic.pane, "lower");
         assert_eq!(diagnostic.message, "generators are not supported here");
         assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
     }
@@ -1063,23 +1058,20 @@ mod tests {
     /// This is what keeps the second case from arising, and it is the payload-wide
     /// form of the leak gate's promise that every node of a pane is explained.
     #[test]
-    fn every_node_of_every_stage_carries_an_attribution() {
+    fn every_node_of_every_pane_carries_an_attribution() {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            for stage in &payload.stages {
-                let ids = stage_ids(stage);
-                let attributed: HashSet<u64> = stage
-                    .span_index
-                    .iter()
-                    .map(|r| r.node_id.as_u64())
-                    .collect();
+            for pane in &payload.panes {
+                let ids = pane_ids(pane);
+                let attributed: HashSet<u64> =
+                    pane.span_index.iter().map(|r| r.node_id.as_u64()).collect();
                 let missing: Vec<u64> = ids.difference(&attributed).copied().collect();
                 assert!(
                     missing.is_empty(),
                     "{} nodes of the {} pane carry no span row: {missing:?}",
                     missing.len(),
-                    stage.id
+                    pane.id
                 );
             }
         }
@@ -1099,10 +1091,10 @@ mod tests {
         for code in corpus() {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
-            for stage in &payload.stages {
-                let ids = stage_ids(stage);
+            for pane in &payload.panes {
+                let ids = pane_ids(pane);
                 let mut refined = 0;
-                for node in &stage.nodes {
+                for node in &pane.nodes {
                     assert!(
                         !node.type_kind.is_empty(),
                         "node {} has no type discriminant",
@@ -1120,7 +1112,7 @@ mod tests {
                         assert!(
                             ids.contains(id),
                             "predicate ref {id} resolves in the {} table",
-                            stage.id
+                            pane.id
                         );
                     }
                     // The node's own type is walked first, so its predicates are
@@ -1141,11 +1133,11 @@ mod tests {
                 // Inference types a literal by which literal it is, so a pane it
                 // has run on carries refined nodes; before it, the types are
                 // holes and this says nothing.
-                if stage.kind == "typed" {
+                if pane.kind == "typed" {
                     assert!(
                         refined > 0,
                         "the {} pane is typed, so a literal's singleton refines some node",
-                        stage.id
+                        pane.id
                     );
                 }
             }
@@ -1155,7 +1147,7 @@ mod tests {
     /// A degraded payload carries the diagnostics and no IR: same type as the
     /// success path, so the two shapes cannot drift apart.
     #[test]
-    fn a_degraded_payload_carries_diagnostics_and_no_stages() {
+    fn a_degraded_payload_carries_diagnostics_and_no_panes() {
         let compiled = compile_program(
             &mut GlobalContext::default(),
             "z + 1\n",
@@ -1170,7 +1162,7 @@ mod tests {
         let payload = SnapshotPayload::degraded("test", "z + 1\n", diagnostics);
         assert_eq!(payload.meta.snapshot_kind, "failed");
         assert_eq!(payload.meta.schema, SCHEMA_VERSION);
-        assert!(payload.stages.is_empty());
+        assert!(payload.panes.is_empty());
         assert!(payload.pane_links.is_empty());
         assert!(!payload.diagnostics.is_empty());
     }
