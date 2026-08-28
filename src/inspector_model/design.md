@@ -20,7 +20,7 @@ disagreement between this document and the code is listed under
 | | |
 |---|---|
 | Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `SnapshotPayload`: `source` (the program text), `stages` (one IR tree per pane, with its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
+| Output | one `SnapshotPayload`: `source` (the program text), `stages` (per pane: a node table, its root, and its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | the `cambra-inspector` crate, which serves the payload, and that crate's frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
@@ -87,13 +87,17 @@ declare it, so inserting a pane ahead of it cannot silently move the anchor.
 
 ### Each stage resolves against its own pane
 
-A stage carries its own IR tree and its own `(span, node)` rows, both resolved against that pane's
-own attributions rather than the anchor's. A node id means the same thing in every pane that holds
-it; what each pane says about that node is that pane's own answer.
+A stage carries its own node table and its own `(span, node)` rows, both resolved against that
+pane's own attributions rather than the anchor's. A node id means the same thing in every pane that
+holds it; what each pane says about that node is that pane's own answer.
 
 ### A node on the wire
 
-Each tree node carries:
+A pane ships `nodes`, every node of that pane exactly once, and `root`, the id its walk starts from.
+A node reached from several places — a shared refinement predicate, most often — is one entry that
+several children name. The order is first-visit pre-order, so the payload is byte-reproducible.
+
+Each node carries:
 
 | field | what it holds |
 |---|---|
@@ -102,7 +106,7 @@ Each tree node carries:
 | `span` | the **narrowest** source span it traces to, or absent when it traces to none |
 | `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
-| `children` | `{ edge, node }` pairs, where `node` is the child node itself; the node table replaces this nesting with ids |
+| `children` | `{ edge, id, predicate }` — the child's id in this same table, its display label, and whether it is a type-interior subtree |
 
 A node's `span` is one span even where it traces to several; the `(span, node)` rows carry all of
 them, so a node several source spans fan into is reachable from each.
@@ -123,8 +127,9 @@ itself.
 
 **A refinement predicate is a child node.** A predicate is an expression tree in its own right
 ([Predicates are nodes](#predicates-are-nodes)), and it reaches the consumer as a child of the node
-whose type carries it, distinguished only by its edge label. So a node's children are of two kinds:
-a value child's `edge` is its positional index (`"0"`, `"1"`), and a predicate's is `where.N`.
+whose type carries it. `predicate` on the edge is what a consumer branches on. The `edge` label is
+for display and follows the same split: a value child's is its positional index (`"0"`, `"1"`), a
+predicate's is `where.N`.
 
 `N` counts predicates in `walk_type_slots` order — the node's own type, its annotation, a `Cast`
 target, then each binder's type and annotation — flattened across nested type children. The order is
@@ -154,18 +159,18 @@ they carry attributions and they appear as endpoints of the pane links (see
 expression tree would therefore ship links pointing at nodes it had left out, which is why every
 walk here descends into predicates.
 
-**A predicate should ship once, and today it ships once per type slot that carries it.** One
-predicate term is shared — the same term is reachable from a node's own type, from a binder's type,
-and from the types of other nodes — so a tree that hangs each occurrence off the slot that reached
-it repeats the whole subtree, and the span rows repeat with it. Until the predicate table lands
-a consumer sees a `where.N` subtree more than once under one node, and one node id at
-several tree positions, so a consumer keying nodes by id alone keeps whichever position it walked
-last.
+**A predicate ships once.** One predicate term is shared — the same term is reachable from a node's
+own type, from a binder's type, and from the types of other nodes — so it is one entry in the node
+table that several child edges name. That is what the table is for. A tree had to repeat the whole
+subtree once per slot that reached it, and the span rows repeated with it: on the program measured
+under [Cost](#cost), 2,443 node positions for 465 nodes, and 1,978 of 2,443 span rows repeating a
+pair already present.
 
 ### Types on the wire
 
 A node's `type` is rendered by `Display for Type`, and `Type`'s `Serialize` impl delegates to that
-same `Display`, so every type on the wire is one rendered string.
+same `Display`, so every type on the wire is one rendered string. Every node has a type, so the
+field is never absent.
 
 The choice is provisional. A structural type would carry a refinement's predicate, which is an
 expression tree with node ids, re-creating inside every `type` field the repetition the predicate
@@ -284,9 +289,10 @@ The span is the error's own wherever it has one. `Parse` and `Lower` read theirs
 
 ### The schema version
 
-`SCHEMA_VERSION` is the payload's wire version, carried as `meta.schema`. A breaking change — a
-field removed, renamed or retyped, or a value shape an old consumer would misread — bumps it; purely
-additive optional fields do not.
+`SCHEMA_VERSION` is the payload's wire version, carried as `meta.schema`, and is **5**. A breaking
+change — a field removed, renamed or retyped, or a value shape an old consumer would misread — bumps
+it; purely additive optional fields do not. The node table bumped it to 5, and the wire changes
+still to land ride that bump rather than adding their own, since 5 has not shipped.
 
 The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
 every node id included, so any change re-blesses all of them; its wire validator pins the schema
@@ -314,16 +320,17 @@ max(ys) + f(1, 2)
 
 | | |
 |---|---|
-| tree positions, six stages | 2,443, carrying 465 distinct node ids |
-| `post-planning` alone | 1,755 positions for 184 distinct ids |
-| span rows | 2,443 — one per position, since every node here carries exactly one span — of which 1,571 repeat a `(span, node)` pair already present |
-| `where.N` edges | 153, of which 29 duplicate within one node |
+| nodes, six panes | 465, one entry per node |
+| `post-planning` alone | 184 |
+| span rows | 465 — one per node here, since every node of this program traces to exactly one span — with no pair repeated |
+| predicate edges | 198, naming 465 nodes between them |
 | pane-link edges | 419 |
 | scope regions | 25, over 76 bindings |
-| build time | about 11 ms for the bundle and the payload together |
+| build time | about 10 ms, of which the payload is 2 ms |
 
-Size is the cost that binds, not time, and predicate repetition dominates it
-([Predicates are nodes](#predicates-are-nodes)).
+Size is the cost that binds rather than time. The node table is what bounds it: a pane ships one
+entry per node, so the payload grows with the program and not with how many type slots reach a
+shared term.
 
 ## API shape
 
@@ -383,15 +390,6 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
 Each change is ratified here and lands on its own. They are named rather than numbered: a numbered
 list renumbers as entries land, and a reference to "item 4" would then point at the wrong change.
 
-- **The node table.** Ship a pane's nodes as an array keyed by `NodeId`, with a `root` id, and make
-  a node's children `(edge, id)` pairs instead of nested nodes. Nothing then repeats: a shared
-  predicate is one entry that several slots name, a node reached from several places is one entry,
-  and the duplicate span rows go with them. It also matches how a consumer already works — keying
-  nodes by id — so the reconciliation described under
-  [Predicates are nodes](#predicates-are-nodes) stops being necessary. `spanIndex` stays: a node
-  carries its narrowest span, and those rows carry every span it traces to.
-- **Marked predicate edges.** Say on the edge itself that a child is a type-interior subtree,
-  rather than leaving a consumer to read the `where.` prefix off a display label.
 - **Type metadata.** Carry two narrow facts beside the rendered string — a `typeKind` discriminant,
   and a refinement's predicate as a reference into the node table — so a consumer can filter by type
   and reach a predicate without a structural type.
@@ -410,7 +408,7 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
 
   | module | owns |
   |---|---|
-  | walk | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, tree height, node labels |
+  | walk | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, node labels |
   | span index | the `(span, node)` table over one pane |
   | name binder | source-level name resolution over the surface AST |
   | snapshot | the bundle and its per-pane projections |
@@ -419,5 +417,5 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
   Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
   of one, and the **payload** is what ships.
 
-The four wire-shape changes above — the node table, marked predicate edges, type metadata and the
-pane vocabulary — ride one schema bump together.
+The wire-shape changes above — type metadata, and the pane vocabulary — ride schema 5, which the
+node table bumped and which has not shipped.

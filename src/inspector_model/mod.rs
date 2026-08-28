@@ -64,8 +64,8 @@
 //! text, one IR tree and one `SourceProjection` per pane, surface AST), and
 //! [`Snapshot::build_payload`] assembles the payload from them. That is the
 //! module's whole entry surface: a positional question is answered by the
-//! consumer over the shipped `(span, node)` rows and the shipped tree, which is
-//! the copy that runs. See `src/inspector_model/design.md`, "The usage model".
+//! consumer over the shipped `(span, node)` rows and the shipped node table,
+//! which is the copy that runs. See `src/inspector_model/design.md`, "The usage model".
 
 mod index;
 mod name_binder;

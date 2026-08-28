@@ -11,6 +11,7 @@
 use crate::ccl::Expr;
 use crate::ccl::provenance::{NodeId, SourceProjection};
 use crate::chl_parser::ast::Span;
+use std::collections::HashSet;
 
 /// One node's entry in a [`SpanIndex`]: its id and one source span it is
 /// indexed under.
@@ -30,7 +31,8 @@ struct Entry {
 /// # What the entries are
 ///
 /// One `(span, node)` row per node per span its attribution records, in build
-/// order (tree pre-order × each node's spans). One source position sits inside
+/// order (tree pre-order × each node's spans), and no `(span, node)` pair
+/// twice. One source position sits inside
 /// many nodes at once — in `x = 1 + 2` the position of the `1` is inside the
 /// literal, inside the `+`, and inside the whole `let` — so a position matches
 /// several rows.
@@ -53,32 +55,46 @@ impl SpanIndex {
     /// Build the index from a pane's tree and its [`SourceProjection`]. Each node
     /// is indexed under every span in its attribution; a node with no spans, or
     /// one the projection does not cover, contributes nothing.
+    ///
+    /// Each node is visited once. One refinement predicate is shared across
+    /// every type slot that carries it, so a walk visiting it per slot would
+    /// push its rows once per slot; a node indexed under several *distinct*
+    /// spans still contributes one row per span.
     pub fn build(snapshot: &Expr, projection: &SourceProjection) -> Self {
         let mut entries = Vec::new();
-        Self::collect(snapshot, projection, &mut entries);
+        let mut visited = HashSet::new();
+        Self::collect(snapshot, projection, &mut visited, &mut entries);
         SpanIndex { entries }
     }
 
-    fn collect(expr: &Expr, projection: &SourceProjection, out: &mut Vec<Entry>) {
+    fn collect(
+        expr: &Expr,
+        projection: &SourceProjection,
+        visited: &mut HashSet<NodeId>,
+        out: &mut Vec<Entry>,
+    ) {
         let node = expr.node_id();
+        if !visited.insert(node) {
+            return;
+        }
         if let Some(attr) = projection.get(&node) {
             for &span in &attr.spans {
                 out.push(Entry { node, span });
             }
         }
-        expr.walk_children(|c| Self::collect(c, projection, out));
+        expr.walk_children(|c| Self::collect(c, projection, visited, out));
         // Predicate interiors carry their own attributions, so a position inside
         // one has to reach it — see
         // [`predicate_children`](crate::inspector_model::query::predicate_children).
         for (_, predicate) in crate::inspector_model::query::predicate_children(expr) {
-            Self::collect(predicate, projection, out);
+            Self::collect(predicate, projection, visited, out);
         }
     }
 
     /// Every `(span, node)` entry, one per (node × span) — the data behind the
     /// `spanIndex` array of the snapshot payload. Order is build order (tree
     /// pre-order × each node's spans), and a node indexed under several spans
-    /// appears once per span.
+    /// appears once per span — never twice under one span.
     pub fn entries(&self) -> impl Iterator<Item = (Span, NodeId)> + '_ {
         self.entries.iter().map(|e| (e.span, e.node))
     }

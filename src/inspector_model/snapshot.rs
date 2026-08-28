@@ -2,14 +2,14 @@
 //! struct, assembled by enumerating the snapshot's two indices.
 //!
 //! `/api/snapshot` is the primary read-only endpoint:
-//! source + the pipeline stages (each an IR tree + span→node index) + use→def
+//! source + the pipeline stages (each a node table + span→node index) + use→def
 //! definitions + per-scope bindings + diagnostics + meta. This module mirrors
 //! that JSON exactly as a serde-gated [`SnapshotPayload`]; the actual
 //! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
 //! Building the payload is pure: it enumerates
 //! [`SpanIndex`](crate::inspector_model::SpanIndex) and
 //! [`NameBinderIndex`](crate::inspector_model::NameBinderIndex) and builds each
-//! stage's IR tree via the shared `build_inspect_tree`.
+//! stage's node table via the shared `build_node_table`.
 //!
 //! # Wire-type isolation
 //!
@@ -21,7 +21,7 @@
 //!
 //! # Populated vs. stubbed
 //!
-//! * `source`, `stages` (each with its own IR tree + span index),
+//! * `source`, `stages` (each with its own node table + span index),
 //!   `definitions`, `scopes`, `meta` — fully populated.
 //! * `diagnostics` — **always empty `[]`** in this payload: a `/api/snapshot`
 //!   describes a *successfully compiled* program, and there are no warnings. The
@@ -46,7 +46,7 @@ use crate::ccl::Type;
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
 /// both the success and degraded payloads. See [`Meta::schema`] for the
 /// versioning contract and the current version's field set.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The `GET /api/snapshot` bulk payload — the whole static read-only model.
 ///
@@ -68,8 +68,8 @@ pub struct SnapshotPayload {
     pub diagnostics: Vec<Diagnostic>,
     /// Snapshot metadata + the live-protocol seams.
     pub meta: Meta,
-    /// The pipeline stages, upstream → downstream, each carrying its own IR tree
-    /// and span index — one entry per pane
+    /// The pipeline stages, upstream → downstream, each carrying its own node
+    /// table and span index — one entry per pane
     /// [`PANES`](crate::ccl::panes::PANES) declares, in pipeline order. Read
     /// `PANES` for the current set rather than a list here.
     pub stages: Vec<StageEntry>,
@@ -82,8 +82,8 @@ pub struct SnapshotPayload {
 
 /// One IR pipeline stage in the multi-pane snapshot.
 ///
-/// Carries its own self-contained IR tree and span index — each stage resolves
-/// against its own (`Expr`, `SourceProjection`) pair.
+/// Carries its own self-contained node table and span index — each stage
+/// resolves against its own (`Expr`, `SourceProjection`) pair.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
@@ -96,13 +96,19 @@ pub struct StageEntry {
     /// Discriminant for the stage kind: `"holes"` for a tree inference has not
     /// run on yet, `"typed"` for one it has.
     pub kind: &'static str,
-    /// The full IR tree for this stage.
-    pub ir: IrNode,
+    /// The id of the stage's root node — where a consumer starts walking
+    /// [`nodes`](Self::nodes).
+    pub root: u64,
+    /// Every node of this stage exactly once, in first-visit pre-order. A node
+    /// reached from several places — a refinement predicate shared by several
+    /// type slots, most of all — is one entry here that each of those places
+    /// names by id.
+    pub nodes: Vec<IrNode>,
     /// Every `(span → nodeId)` entry of this stage's span index.
     pub span_index: Vec<SpanEntry>,
 }
 
-/// One node of a stage's shipped IR tree.
+/// One node of a stage's shipped node table.
 ///
 /// The wire's own node type, owned here rather than borrowed from the terminal
 /// renderer: the fields are this payload's and nothing else sets them. See
@@ -132,22 +138,29 @@ pub struct IrNode {
     /// rendering changes this verbatim. See
     /// `src/inspector_model/design.md`, "Types on the wire".
     #[cfg_attr(feature = "serde", serde(rename = "type"))]
-    pub ty: Option<String>,
-    /// The node's children, each under the edge that reaches it.
+    pub ty: String,
+    /// The node's children, each named by id under the edge that reaches it.
     pub children: Vec<IrChild>,
 }
 
-/// One `{ edge, node }` child of an [`IrNode`].
+/// One `{ edge, id, predicate }` child of an [`IrNode`] — an edge into the
+/// stage's node table.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct IrChild {
-    /// A value child's positional index (`"0"`, `"1"`, …), or `where.N` for a
-    /// refinement predicate riding one of the parent's type slots. The label is
-    /// what tells a subtree living inside a type from one that is an operand;
-    /// see `src/inspector_model/design.md`, "Predicates are nodes".
+    /// The edge's display label: a value child's positional index (`"0"`,
+    /// `"1"`, …), or `where.N` for a refinement predicate riding one of the
+    /// parent's type slots.
     pub edge: String,
-    /// The child node itself.
-    pub node: IrNode,
+    /// The child node's id — an entry of the same stage's
+    /// [`nodes`](StageEntry::nodes).
+    pub id: u64,
+    /// Whether the child is a type-interior subtree: `true` for a refinement
+    /// predicate, `false` for a value child. This is what a consumer branches
+    /// on, rather than reading a `where.` prefix off
+    /// [`edge`](Self::edge); see `src/inspector_model/design.md`, "Predicates
+    /// are nodes".
+    pub predicate: bool,
 }
 
 /// A node's rewrite tag — the
@@ -365,9 +378,9 @@ pub struct Meta {
     /// payload before parsing the rest.
     ///
     /// The current version is [`SCHEMA_VERSION`], whose field set is
-    /// [`SnapshotPayload`]'s as documented on that type. Each `stages[].ir` node
-    /// carries its attribution as the spans channel on `span` plus a `rewritten`
-    /// tag (`null | { via, nature, label }`).
+    /// [`SnapshotPayload`]'s as documented on that type. Each
+    /// `stages[].nodes[]` entry carries its attribution as the spans channel on
+    /// `span` plus a `rewritten` tag (`null | { via, nature, label }`).
     ///
     /// **Bump the version** on any *breaking* wire change — a field removed,
     /// renamed, or retyped, or a value-shape change an old client would
@@ -377,24 +390,22 @@ pub struct Meta {
     pub schema: u32,
 }
 
-/// Build one stage's IR tree and its span rows.
+/// Build one stage's node table — its root id and its nodes — and its span rows.
 ///
 /// The rows are enumerated from the index the stage already carries; building a
-/// second one over the same pair would duplicate the walk. The tree goes through
-/// [`build_inspect_tree`], the single source-linking tree-builder.
-fn build_stage_ir_and_index(stage: &StageProjection<'_>) -> (IrNode, Vec<SpanEntry>) {
-    use super::query::{build_inspect_tree, tree_height};
-
+/// second one over the same pair would duplicate the walk. The nodes go through
+/// [`build_node_table`](super::query::build_node_table), the single
+/// source-linking node builder.
+fn build_stage_nodes_and_index(stage: &StageProjection<'_>) -> (u64, Vec<IrNode>, Vec<SpanEntry>) {
     let span_entries = stage
         .span_index
         .entries()
         .map(|(span, node_id)| SpanEntry { span, node_id })
         .collect();
 
-    // Expand the full IR tree (ship-everything: descend to max depth).
-    let ir_node = build_inspect_tree(stage.ir, &stage.projection, tree_height(stage.ir));
+    let (root, nodes) = super::query::build_node_table(stage.ir, &stage.projection);
 
-    (ir_node, span_entries)
+    (root, nodes, span_entries)
 }
 
 impl Snapshot<'_> {
@@ -405,7 +416,7 @@ impl Snapshot<'_> {
     ///
     /// * `stages` — the pipeline stages in upstream → downstream order:
     ///   one per declared pane in pipeline order, each with its
-    ///   own IR tree + span index.
+    ///   own node table + span index.
     /// * `paneLinks` — per consecutive stage pair, the dense edges of the
     ///   pane-pair `ProvenanceMap` folded at that boundary, self-edges included (see
     ///   [`dense_edges`](super::stage::dense_edges)).
@@ -459,17 +470,18 @@ impl Snapshot<'_> {
             .collect();
 
         // Build the pipeline stages (upstream → downstream) from the bundled
-        // stage projections — each ships its own IR tree + span index.
+        // stage projections — each ships its own node table + span index.
         let stages = self
             .stages()
             .iter()
             .map(|stage| {
-                let (ir, span_index) = build_stage_ir_and_index(stage);
+                let (root, nodes, span_index) = build_stage_nodes_and_index(stage);
                 StageEntry {
                     id: stage.id,
                     label: stage.label.clone(),
                     kind: stage.kind,
-                    ir,
+                    root,
+                    nodes,
                     span_index,
                 }
             })
@@ -555,7 +567,7 @@ impl SnapshotPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
+    use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
     use crate::ccl::panes::PANES;
     use crate::interpreter::Consumer;
     use indoc::indoc;
@@ -591,16 +603,44 @@ mod tests {
         ]
     }
 
-    /// Every `nodeId` in one stage's shipped IR tree.
-    fn tree_ids(node: &IrNode) -> HashSet<u64> {
-        fn go(node: &IrNode, out: &mut HashSet<u64>) {
-            out.insert(node.node_id);
-            for child in &node.children {
-                go(&child.node, out);
+    /// Every `nodeId` in one stage's shipped node table.
+    fn stage_ids(stage: &StageEntry) -> HashSet<u64> {
+        stage.nodes.iter().map(|n| n.node_id).collect()
+    }
+
+    /// The stage's node carrying `id`. Panics when no node does, which is the
+    /// dangling-child-id failure `every_child_id_resolves_in_its_own_table`
+    /// rules out over the whole corpus.
+    fn node_with_id(stage: &StageEntry, id: u64) -> &IrNode {
+        stage
+            .nodes
+            .iter()
+            .find(|n| n.node_id == id)
+            .unwrap_or_else(|| panic!("node {id} is absent from the {} table", stage.id))
+    }
+
+    /// The stage's first node labelled `label`.
+    fn node_named<'a>(stage: &'a StageEntry, label: &str) -> &'a IrNode {
+        stage
+            .nodes
+            .iter()
+            .find(|n| n.label == label)
+            .unwrap_or_else(|| panic!("no {label} node in the {} table", stage.id))
+    }
+
+    /// Every node reachable from `id` by following child edges, `id` included.
+    fn reachable(stage: &StageEntry, id: u64) -> Vec<&IrNode> {
+        let mut seen = HashSet::new();
+        let mut queue = vec![id];
+        let mut out = Vec::new();
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
             }
+            let node = node_with_id(stage, id);
+            out.push(node);
+            queue.extend(node.children.iter().map(|c| c.id));
         }
-        let mut out = HashSet::new();
-        go(node, &mut out);
         out
     }
 
@@ -661,7 +701,7 @@ mod tests {
             let ids: HashMap<&str, HashSet<u64>> = payload
                 .stages
                 .iter()
-                .map(|s| (s.id, tree_ids(&s.ir)))
+                .map(|s| (s.id, stage_ids(s)))
                 .collect();
 
             for link in &payload.pane_links {
@@ -699,11 +739,11 @@ mod tests {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
             for stage in &payload.stages {
-                let ids = tree_ids(&stage.ir);
+                let ids = stage_ids(stage);
                 for row in &stage.span_index {
                     assert!(
                         ids.contains(&row.node_id.as_u64()),
-                        "spanIndex row {:?} names an id absent from the {} tree",
+                        "spanIndex row {:?} names an id absent from the {} table",
                         row.node_id,
                         stage.id
                     );
@@ -715,17 +755,10 @@ mod tests {
     /// A shipped node carries the row `src/inspector_model/design.md`, "A node on
     /// the wire" describes: an id, the narrowest span it traces to, a rendered
     /// type, no rewrite tag when its tag is `Nature::Source`, positional edges
-    /// for its value children and `where.N` for a predicate riding one of its
-    /// type slots.
+    /// for its value children and `where.N`, marked `predicate`, for a predicate
+    /// riding one of its type slots.
     #[test]
     fn a_wire_node_carries_its_id_span_type_and_edges() {
-        fn nodes_of<'a>(node: &'a IrNode, out: &mut Vec<&'a IrNode>) {
-            out.push(node);
-            for child in &node.children {
-                nodes_of(&child.node, out);
-            }
-        }
-
         let code = indoc! {r#"
             xs = [1, 2, 3, 4]
             ys = [x * 2 for x in xs if x > 2]
@@ -747,9 +780,7 @@ mod tests {
                 .push(row.span);
         }
 
-        let mut nodes = Vec::new();
-        nodes_of(&stage.ir, &mut nodes);
-        for node in &nodes {
+        for node in &stage.nodes {
             // The node ships one span and the rows ship all of them, so the one
             // it ships is the narrowest.
             let narrowest = spans
@@ -760,31 +791,30 @@ mod tests {
                 "{} ships the narrowest of {:?}",
                 node.label, spans[&node.node_id]
             );
-            assert!(node.ty.is_some(), "{} ships a type", node.label);
+            assert!(!node.ty.is_empty(), "{} ships a type", node.label);
 
             // Value children come first under their positional index; every
-            // predicate follows, under `where.N`.
-            let positional = node
-                .children
-                .iter()
-                .take_while(|c| !c.edge.starts_with("where."))
-                .count();
+            // predicate follows, under `where.N`, and the flag says which is
+            // which without reading the label.
+            let positional = node.children.iter().take_while(|c| !c.predicate).count();
             let edges: Vec<&str> = node.children.iter().map(|c| c.edge.as_str()).collect();
             let expected: Vec<String> = (0..positional)
                 .map(|i| i.to_string())
                 .chain((0..edges.len() - positional).map(|i| format!("where.{i}")))
                 .collect();
             assert_eq!(edges, expected, "{}'s edges", node.label);
+            assert!(
+                node.children[positional..].iter().all(|c| c.predicate),
+                "{}'s `where.N` edges are the marked ones",
+                node.label
+            );
         }
 
         // `x * 2` is the root of a lowered source expression, so its rewrite tag
         // null-compresses; it carries its own span and its inferred type.
-        let mul = nodes
-            .iter()
-            .find(|n| n.label == "BinOp(Arithmetic(Mul))")
-            .expect("the comprehension's `x * 2` reaches the tree");
+        let mul = node_named(stage, "BinOp(Arithmetic(Mul))");
         assert_eq!(mul.span, Some(Span::new(24, 29)), "the span of `x * 2`");
-        assert_eq!(mul.ty.as_deref(), Some("Int"));
+        assert_eq!(mul.ty, "Int");
         assert!(
             mul.rewritten.is_none(),
             "a `Nature::Source` tag null-compresses; got {:?}",
@@ -792,26 +822,155 @@ mod tests {
         );
 
         // The comprehension's filter rides the `Cast`'s refined domain, so it
-        // hangs off a `where.N` edge rather than a positional one.
-        let cast = nodes
+        // hangs off a marked `where.N` edge rather than a positional one.
+        let cast = node_named(stage, "Cast");
+        let edges: Vec<(&str, bool)> = cast
+            .children
             .iter()
-            .find(|n| n.label == "Cast")
-            .expect("the comprehension lowers through a Cast");
-        let edges: Vec<&str> = cast.children.iter().map(|c| c.edge.as_str()).collect();
-        assert_eq!(edges, ["0", "where.0", "where.1"]);
-        let predicate = &cast.children[1].node;
+            .map(|c| (c.edge.as_str(), c.predicate))
+            .collect();
+        assert_eq!(edges, [("0", false), ("where.0", true), ("where.1", true)]);
+        let predicate = node_with_id(stage, cast.children[1].id);
         assert_ne!(
             predicate.node_id, cast.node_id,
             "a predicate is a node in its own right"
         );
-        let mut predicate_nodes = Vec::new();
-        nodes_of(predicate, &mut predicate_nodes);
+        let labels: Vec<&str> = reachable(stage, predicate.node_id)
+            .iter()
+            .map(|n| n.label.as_str())
+            .collect();
         assert!(
-            predicate_nodes
-                .iter()
-                .any(|n| n.label == "BinOp(Compare(Greater))"),
-            "the `x > 2` filter is the predicate subtree; got {:?}",
-            predicate_nodes.iter().map(|n| &n.label).collect::<Vec<_>>()
+            labels.contains(&"BinOp(Compare(Greater))"),
+            "the `x > 2` filter is the predicate subtree; got {labels:?}"
+        );
+    }
+
+    /// Every child id, and every stage's `root`, names a node of that stage's own
+    /// table. A dangling child id is the failure the node table makes possible
+    /// and a nested tree could not express.
+    #[test]
+    fn every_child_id_resolves_in_its_own_table() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = Snapshot::new(&prog).build_payload("test");
+            for stage in &payload.stages {
+                let ids = stage_ids(stage);
+                assert!(
+                    ids.contains(&stage.root),
+                    "the {} root {} is absent from its own table",
+                    stage.id,
+                    stage.root
+                );
+                for node in &stage.nodes {
+                    for child in &node.children {
+                        assert!(
+                            ids.contains(&child.id),
+                            "{}'s child edge {} of {} names {}, absent from the {} table",
+                            node.label,
+                            child.edge,
+                            node.node_id,
+                            child.id,
+                            stage.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A stage's table holds each node exactly once, and holds exactly the ids
+    /// `collect_tree_ids` enumerates for that pane's tree — the main tree plus
+    /// everything reachable through its type slots.
+    ///
+    /// The two halves are one claim from opposite sides: no id repeats, and the
+    /// id set is neither short of nor beyond what the pane holds. `collect_tree_ids`
+    /// is the same enumeration the pane folds explain, so a table disagreeing
+    /// with it would ship pane links whose endpoints have no node.
+    #[test]
+    fn a_stage_table_holds_each_pane_node_exactly_once() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = Snapshot::new(&prog).build_payload("test");
+            for (stage, tree) in payload.stages.iter().zip(prog.pane_trees()) {
+                let mut seen = HashSet::new();
+                for node in &stage.nodes {
+                    assert!(
+                        seen.insert(node.node_id),
+                        "{} appears twice in the {} table",
+                        node.node_id,
+                        stage.id
+                    );
+                }
+
+                let pane: HashSet<u64> =
+                    collect_tree_ids(tree).iter().map(|i| i.as_u64()).collect();
+                let dropped: Vec<u64> = pane.difference(&seen).copied().collect();
+                let invented: Vec<u64> = seen.difference(&pane).copied().collect();
+                assert!(
+                    dropped.is_empty() && invented.is_empty(),
+                    "the {} table drops {dropped:?} and invents {invented:?}",
+                    stage.id
+                );
+            }
+        }
+    }
+
+    /// No `(span, nodeId)` row repeats. The rows come from one visit per node,
+    /// so a node reached from several type slots contributes its rows once; a
+    /// node indexed under several *distinct* spans still contributes one row per
+    /// span.
+    #[test]
+    fn no_span_index_row_repeats() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = Snapshot::new(&prog).build_payload("test");
+            for stage in &payload.stages {
+                let mut seen = HashSet::new();
+                for row in &stage.span_index {
+                    assert!(
+                        seen.insert((row.span.start, row.span.end, row.node_id)),
+                        "the {} span index repeats ({:?}, {:?})",
+                        stage.id,
+                        row.span,
+                        row.node_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// A predicate reached from more than one type slot is one entry in the
+    /// table, named by each edge that reaches it. This is the repetition the
+    /// node table removes: the nested tree emitted the whole subtree once per
+    /// slot.
+    #[test]
+    fn a_shared_predicate_is_one_entry_named_by_several_edges() {
+        // The comprehension's filter rides both the `Cast`'s own refined type
+        // and its target, so the same predicate term is reached twice.
+        let code = corpus()[0];
+        let prog = compile(code);
+        let payload = Snapshot::new(&prog).build_payload("test");
+        let stage = payload
+            .stages
+            .iter()
+            .find(|s| s.id == "post-inference")
+            .expect("the payload ships the post-inference stage");
+
+        let mut edges: HashMap<u64, usize> = HashMap::new();
+        for node in &stage.nodes {
+            for child in node.children.iter().filter(|c| c.predicate) {
+                *edges.entry(child.id).or_default() += 1;
+            }
+        }
+        let (&shared, &count) = edges
+            .iter()
+            .find(|&(_, &count)| count > 1)
+            .expect("a predicate this pane reaches from more than one type slot");
+        assert!(count > 1, "{shared} is named by {count} predicate edges");
+        assert_eq!(
+            stage.nodes.iter().filter(|n| n.node_id == shared).count(),
+            1,
+            "the shared predicate {shared} is one entry in the table"
         );
     }
 
@@ -897,7 +1056,7 @@ mod tests {
             let prog = compile(code);
             let payload = Snapshot::new(&prog).build_payload("test");
             for stage in &payload.stages {
-                let ids = tree_ids(&stage.ir);
+                let ids = stage_ids(stage);
                 let attributed: HashSet<u64> = stage
                     .span_index
                     .iter()

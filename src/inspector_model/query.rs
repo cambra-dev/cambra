@@ -12,8 +12,8 @@
 //! usage model".
 //!
 //! The shared IR walk lives here as well — [`predicate_children`],
-//! [`build_inspect_tree`], [`tree_height`] and [`node_label`] — because the
-//! payload's per-stage trees are built from it. No serde and no I/O: the wire
+//! [`build_node_table`] and [`node_label`] — because the payload's per-stage
+//! node tables are built from it. No serde and no I/O: the wire
 //! types are `snapshot.rs`'s and the serialization is the `cambra-inspector`
 //! crate's.
 
@@ -350,28 +350,28 @@ impl<'a> Snapshot<'a> {
 /// A predicate is a real expression tree with its own [`NodeId`]s, and the pane
 /// fold explains those ids: `collect_tree_ids`
 /// ([`crate::ccl::context`]) enumerates them, so they appear in every pane
-/// projection and as endpoints of every pane-pair map. A tree walk that stopped
-/// at `walk_children` would therefore ship links whose endpoints are absent from
-/// the tree they point into, which is what the wire validators call a dead
-/// endpoint. This is the descent that keeps the shipped tree and the shipped
-/// links over the same id domain.
+/// projection and as endpoints of every pane-pair map. A walk that stopped at
+/// `walk_children` would therefore ship links whose endpoints are absent from
+/// the pane they point into, which is what the wire validators call a dead
+/// endpoint. This is the descent that keeps the shipped node table and the
+/// shipped links over the same id domain.
 ///
-/// The label is **not** a child index, and that is the signal: a value child's
-/// label is its positional index, so a `where.N` label is how a consumer tells
-/// "this subtree lives inside a type" from "this subtree is an operand". Order is
-/// [`TypedExpr::walk_type_slots`] order, which is stable, so the labels are
-/// stable too.
+/// The label is for display; the edge's `predicate` flag is what a consumer
+/// branches on to tell "this subtree lives inside a type" from "this subtree is
+/// an operand". Order is [`TypedExpr::walk_type_slots`] order, which is stable,
+/// so the labels are stable too, and a consumer can compare one node's predicate
+/// edges across panes.
 ///
 /// Mirrors `collect_tree_ids`' type-slot descent, and must: a predicate that walk
-/// enumerates and this one does not is a node the fold explains and the tree
+/// enumerates and this one does not is a node the fold explains and the table
 /// omits.
 pub(super) fn predicate_children(expr: &Expr) -> Vec<(String, &Expr)> {
     fn from_ty<'t>(t: &'t Type, out: &mut Vec<&'t Expr>) {
         if let Type::Refinement(_, refinements) = t {
             // Every refinement's predicate rides the slot, so each is its own
             // `where.N` child — the same per-member descent `collect_tree_ids`
-            // makes, which is what keeps the shipped tree and the shipped links
-            // over one id domain.
+            // makes, which is what keeps the shipped node table and the shipped
+            // links over one id domain.
             for r in refinements.iter() {
                 out.push(&r.predicate);
             }
@@ -388,80 +388,97 @@ pub(super) fn predicate_children(expr: &Expr) -> Vec<(String, &Expr)> {
         .collect()
 }
 
-/// Build the [`IrNode`] tree for `expr` against its pane `projection`,
-/// descending `depth` child levels (`0` = the node alone, no children). The
-/// single source-linking tree-builder: every stage's payload tree goes through
-/// this one shape, parameterized only by its `(Expr, SourceProjection)` pair.
-pub(super) fn build_inspect_tree(
-    expr: &Expr,
-    projection: &SourceProjection,
-    depth: usize,
-) -> IrNode {
-    let id = expr.node_id();
-    let mut node = IrNode {
-        label: node_label(&expr.node),
-        node_id: id.as_u64(),
-        span: None,
-        rewritten: None,
-        ty: Some(expr.ty.to_string()),
-        children: Vec::new(),
-    };
-    if let Some(attr) = projection.get(&id) {
-        // The rewrite channel: a `Nature::Source` tag — the root of a lowered
-        // source expression — null-compresses and carries no wire tag; every
-        // other node carries `{via, nature, label}`. The validators guard that
-        // `"source"` never ships.
-        let tag = &attr.rewritten;
-        if !tag.nature.is_source() {
-            node.rewritten = Some(RewriteInfo {
-                via: format!("{:?}", tag.via),
-                nature: tag.nature.wire_str().to_string(),
-                label: tag.label.to_string(),
-            });
+/// Build one pane's node table against its `projection`, returning the root
+/// node's id and every node reachable from `expr` exactly once, in first-visit
+/// pre-order.
+///
+/// The single source-linking node builder: every stage's payload nodes go
+/// through this one shape, parameterized only by its `(Expr, SourceProjection)`
+/// pair.
+///
+/// A node reached from several places — a refinement predicate shared by
+/// several type slots — is emitted once and named by id from each place that
+/// reaches it, so nothing repeats and the walk terminates on a shared term. The
+/// pre-order is what makes the emitted array byte-reproducible.
+pub(super) fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrNode>) {
+    fn visit(
+        expr: &Expr,
+        projection: &SourceProjection,
+        visited: &mut std::collections::HashSet<NodeId>,
+        out: &mut Vec<IrNode>,
+    ) -> u64 {
+        let id = expr.node_id();
+        if !visited.insert(id) {
+            return id.as_u64();
         }
-        // The spans channel: the node's primary (narrowest) source span, if any.
-        node.span = attr
-            .spans
-            .iter()
-            .min_by_key(|s| s.end.saturating_sub(s.start))
-            .copied();
-    }
-    if depth > 0 {
+
+        let mut node = IrNode {
+            label: node_label(&expr.node),
+            node_id: id.as_u64(),
+            span: None,
+            rewritten: None,
+            ty: expr.ty.to_string(),
+            children: Vec::new(),
+        };
+        if let Some(attr) = projection.get(&id) {
+            // The rewrite channel: a `Nature::Source` tag — the root of a
+            // lowered source expression — null-compresses and carries no wire
+            // tag; every other node carries `{via, nature, label}`. The
+            // validators guard that `"source"` never ships.
+            let tag = &attr.rewritten;
+            if !tag.nature.is_source() {
+                node.rewritten = Some(RewriteInfo {
+                    via: format!("{:?}", tag.via),
+                    nature: tag.nature.wire_str().to_string(),
+                    label: tag.label.to_string(),
+                });
+            }
+            // The spans channel: the node's primary (narrowest) source span, if
+            // any.
+            node.span = attr
+                .spans
+                .iter()
+                .min_by_key(|s| s.end.saturating_sub(s.start))
+                .copied();
+        }
+
+        // The entry claims its pre-order slot before its children are walked, so
+        // the array is ordered by first visit rather than by completion.
+        let slot = out.len();
+        out.push(node);
+
+        let mut children = Vec::new();
         for (idx, child) in expr.child_exprs().into_iter().enumerate() {
-            node.children.push(IrChild {
+            children.push(IrChild {
                 edge: idx.to_string(),
-                node: build_inspect_tree(child, projection, depth - 1),
+                id: visit(child, projection, visited, out),
+                predicate: false,
             });
         }
         // Predicate subtrees come after the value children so a consumer that
-        // reads children positionally is unaffected; the `where.N` label is what
-        // marks them (see [`predicate_children`]).
+        // reads children positionally is unaffected; `predicate` is what marks
+        // them (see [`predicate_children`]).
         for (edge, predicate) in predicate_children(expr) {
-            node.children.push(IrChild {
+            children.push(IrChild {
                 edge,
-                node: build_inspect_tree(predicate, projection, depth - 1),
+                id: visit(predicate, projection, visited, out),
+                predicate: true,
             });
         }
-    }
-    node
-}
+        out[slot].children = children;
 
-/// The height of `expr`'s tree (a leaf is height 0). It is the child-level
-/// count [`build_inspect_tree`] needs to reach every leaf of the payload's
-/// per-stage `ir`.
-pub(super) fn tree_height(expr: &Expr) -> usize {
-    expr.child_exprs()
-        .into_iter()
-        .map(|c| 1 + tree_height(c))
-        // A predicate subtree is a child edge in the shipped tree, so it counts
-        // toward the height that reaches every leaf.
-        .chain(
-            predicate_children(expr)
-                .into_iter()
-                .map(|(_, p)| 1 + tree_height(p)),
-        )
-        .max()
-        .unwrap_or(0)
+        id.as_u64()
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+    let root = visit(expr, projection, &mut visited, &mut nodes);
+    debug_assert_eq!(
+        nodes.len(),
+        visited.len(),
+        "the node table holds one entry per visited id"
+    );
+    (root, nodes)
 }
 
 /// A short kind label for a node, mirroring the symbolic vocabulary at a glance
@@ -767,19 +784,12 @@ max(totals)
 
     /// The labels of the nodes `stage_id` indexes at `span`: every `(span,
     /// nodeId)` row of that stage whose span covers the query, resolved to the
-    /// node carrying that id in that stage's tree. This is the consumer's
+    /// node carrying that id in that stage's node table. This is the consumer's
     /// lookup, over the two shipped tables and nothing else.
     ///
-    /// Panics if a row names a node the tree does not hold — the invariant
+    /// Panics if a row names a node the table does not hold — the invariant
     /// `span_index_round_trips_with_projection` (`index.rs`) pins.
     fn labels_at(payload: &SnapshotPayload, stage_id: &str, span: Span) -> Vec<String> {
-        fn label_of(node: &IrNode, id: u64) -> Option<&str> {
-            if node.node_id == id {
-                return Some(&node.label);
-            }
-            node.children.iter().find_map(|c| label_of(&c.node, id))
-        }
-
         let stage = payload
             .stages
             .iter()
@@ -790,9 +800,13 @@ max(totals)
             .iter()
             .filter(|row| row.span.start <= span.start && span.end <= row.span.end)
             .map(|row| {
-                label_of(&stage.ir, row.node_id.as_u64())
-                    .unwrap_or_else(|| panic!("row node {:?} is in the tree", row.node_id))
-                    .to_string()
+                stage
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_id == row.node_id.as_u64())
+                    .unwrap_or_else(|| panic!("row node {:?} is in the table", row.node_id))
+                    .label
+                    .clone()
             })
             .collect()
     }
@@ -959,24 +973,21 @@ max(totals)
             );
         }
 
-        // Every node of the shipped tree carries an attribution: the fully-folded
-        // rows leave no node absent from the projection, and a node the
-        // projection does not cover would ship neither a span nor a rewrite tag.
-        fn untagged(node: &IrNode, out: &mut Vec<String>) {
-            if node.span.is_none() && node.rewritten.is_none() {
-                out.push(node.label.clone());
-            }
-            for child in &node.children {
-                untagged(&child.node, out);
-            }
-        }
+        // Every node of the shipped table carries an attribution: the
+        // fully-folded rows leave no node absent from the projection, and a node
+        // the projection does not cover would ship neither a span nor a rewrite
+        // tag.
         let stage = payload
             .stages
             .iter()
             .find(|s| s.id == "post-channelize")
             .expect("the payload ships the post-channelize stage");
-        let mut absent = Vec::new();
-        untagged(&stage.ir, &mut absent);
+        let absent: Vec<&str> = stage
+            .nodes
+            .iter()
+            .filter(|n| n.span.is_none() && n.rewritten.is_none())
+            .map(|n| n.label.as_str())
+            .collect();
         assert!(
             absent.is_empty(),
             "no defer node is left untagged (absent from projection); got {absent:?}"

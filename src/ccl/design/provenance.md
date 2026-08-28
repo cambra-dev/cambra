@@ -928,7 +928,7 @@ usage model and the wire's versioning; what follows is what that layer reads out
 of this one.
 
 - `SpanIndex::build(ir, projection)` inverts a pane's projection to span → node.
-- `build_inspect_tree` ships each attribution as it is stored: a node's spans
+- `build_node_table` ships each attribution as it is stored: a node's spans
   plus its `rewritten` tag (`{ via, nature, label }`). The tag serializes as
   `null` for a direct image — `Nature::Source` null-compresses at the emission
   site via `Nature::is_source`, and the consumer's validator guards that a
