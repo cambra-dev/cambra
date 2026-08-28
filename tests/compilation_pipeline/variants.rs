@@ -1384,3 +1384,62 @@ q = unwrap(`a("s"))
 p"#;
     check_scalar(code, Value::Int(1));
 }
+
+// A `match` arm that does not mention its payload binder is a constant function
+// of it, and `elim_lambda`'s constant rule lifts it with `const`. The rule
+// eliminates the body it lifts, which the `match`-arm rule depends on: unlike
+// the `Lambda` arm of `elim_lambdas`, it does not re-enter on the result, so an
+// arm computing over a name bound outside the `match` would otherwise reach
+// operator conversion as the `BinOp` it was written as
+// (`src/ccl/design/optimization.md`, "The constant rule reaches through its
+// body"). All three `match` spellings route through that rule.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// On the right of an assignment.
+#[case(indoc! {"
+    base = 3
+    t = match `some(3):
+            case `some(n):
+                base + n
+            case `none:
+                base + 0
+    t"}, Value::Int(6))]
+// As the program's final expression.
+#[case(indoc! {"
+    base = 3
+    match `some(3):
+        case `some(n):
+            base + n
+        case `none:
+            base + 0"}, Value::Int(6))]
+// The one-line form.
+#[case(indoc! {"
+    base = 3
+    t = (match `none: case `some(n): base + n case `none: base * 2)
+    t"}, Value::Int(6))]
+// The arm the scrutinee does not take is the computing one.
+#[case(indoc! {"
+    base = 10
+    t = match `none:
+            case `some(n):
+                base + n
+            case `none:
+                base * 2
+    t"}, Value::Int(20))]
+// Nested: the outer arm is binder-free, and the `match` inside it is what the
+// lift has to reach.
+#[case(indoc! {"
+    base = 4
+    t = match `some(1):
+            case `some(n):
+                match `none:
+                    case `some(m):
+                        m
+                    case `none:
+                        base + 1
+            case `none:
+                0
+    t"}, Value::Int(5))]
+fn test_const_lifted_arm_is_point_free(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}

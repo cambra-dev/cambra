@@ -789,7 +789,17 @@ fn elim_lambda_impl(
     // Constant: λ x → e  ⟹  const(e)  when x ∉ fv(e)
     // Checked before pattern-matching because a nested lambda that does not
     // reference param should also be treated as a constant.
+    //
+    // `e` is eliminated first. `const` lifts a *value*, and the value operator
+    // conversion accepts is point-free, so a `BinOp` or a nested `Lambda` left
+    // inside a lifted body reaches conversion as written and is refused there.
+    //
+    // The `Lambda` arm of `elim_lambdas` re-enters on whatever this returns, so
+    // it covered for the omission; the `match`-arm rule calls here directly and
+    // does not. That is what left every `match` arm not mentioning its payload
+    // binder unconverted, in all three `match` spellings.
     if !is_free(param, &body) {
+        let body = elim_lambdas(ctx, body)?;
         // const: T → (A → T) where T = body.ty and result_ty = A → T
         let const_fn_ty = Type::compute_fun_or_hole(&body.ty, &result_ty);
         let const_var = Expr::builtin(Builtin::Const).with_ty(const_fn_ty);

@@ -124,6 +124,19 @@ where `src_refined` is `src_elim` with its domain wrapped in `Type::Refinement` 
 
 The filter check happens at the `Compose` level (rather than inside the `Lambda` arm) because the refinement must be attached to the source, which is only visible alongside the lambda at the compose level.
 
+### The constant rule reaches through its body
+
+`λ 𝑥 → 𝑒` with `𝑥 ∉ fv(𝑒)` becomes `𝑒 ▷ const`, and `𝑒` is eliminated first. `const` lifts a
+*value*, and the value operator conversion accepts is point-free — a `BinOp` or a nested `Lambda`
+left inside a lifted body reaches conversion as written and is refused there.
+
+The `Lambda` arm of `elim_lambdas` re-enters on the rule's result, so it covers for a body the rule
+leaves alone. The `match`-arm rule calls `elim_lambda` directly and does not, which is the caller
+the descent is load-bearing for: an arm reaches the constant rule whenever it does not mention its
+payload binder, so an arm computing over a name bound outside the `match` needs it. So does every
+write in a `match` arm — the mutability phases lift the write onto the arm's spine and leave the arm
+computing ([mutability.md](mutability.md), "A write inside a `Case` bound by a `Let`").
+
 ### `Let` nodes after rule 7
 
 When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bound variable changes type from `T` to `ParamTy ⇒ T`. The rewritten `Let` node has `bound_ty: None` because the old annotation is stale and would be incorrect.

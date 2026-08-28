@@ -1940,24 +1940,40 @@ fn test_a_branch_value_reads_what_the_branch_wrote(#[case] code: &str, #[case] e
     check_scalar(code, expected);
 }
 
-/// A `match` arm that computes over a name bound outside the `match` reaches
-/// operator conversion as a bare `BinOp`. The program below writes nothing, so
-/// the bound is below the mutability layer rather than in it: every `match`
-/// shape a write reaches ends up with a computed arm, which is why the writing
-/// cases above are `if` only.
-#[test]
-#[ignore = "a `match` arm computing over an outer name is not point-free by \
-            operator conversion; no write is involved"]
-fn test_match_arm_computing_over_an_outer_name() {
-    check_scalar(
-        indoc! {"
-            base = 3
-            t = match `some(3):
-                    case `some(n):
-                        base + n
-                    case `none:
-                        base + 0
-            t"},
-        Value::Int(6),
-    );
+// A write in a `match` arm reaches the same normalization an `if` branch's
+// does. Lifting the write onto the arm's spine leaves the arm computing over a
+// name bound outside the `match`, which is point-free by the `const` lift in
+// `elim_lambda` — see `test_const_lifted_arm_is_point_free` in `variants.rs`
+// for the write-free shape that bounds it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    match `some(3):
+        case `some(n):
+            acc += n
+        case `none:
+            acc += 0
+    acc"}, Value::Int(3))]
+#[case(indoc! {"
+    acc := 0
+    t = match `some(3):
+            case `some(n):
+                acc += n
+                0
+            case `none:
+                acc += 0
+                0
+    acc"}, Value::Int(3))]
+// The arm the scrutinee does not take is the one that writes.
+#[case(indoc! {"
+    acc := 1
+    match `none:
+        case `some(n):
+            acc += n
+        case `none:
+            acc += 6
+    acc"}, Value::Int(7))]
+fn test_match_arm_write_carries(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
