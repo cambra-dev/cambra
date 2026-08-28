@@ -1077,9 +1077,21 @@ decision whose commit selector is the disjunction of the writing branches' guard
 per-accumulator write set carries the entering value on the paths that do not write. So the block
 right-hand side and the statement `if` spelling of one conditional compile to the same recurrence.
 
-The normalization runs twice, because two phases read a statement spine: `transact_phase::run`
-walks a `with begin():` block itself and runs before the letrec phase, and `flatten_spine` runs it
-again for the writes inlining buries between them.
+`push_continuation_into_case` is the statement-position sibling. `if p: acc += e else: acc += f`
+lowers to `Case[…]; rest`, and a write in a branch likewise advances the variable only to the end of
+that branch, so `rest` reads the entering value. Splicing `rest` onto each branch's terminal makes
+the `Case` yield what `rest` yields and puts every write ahead of it. It is **not applied inside a
+for-loop body**, where that shape is the recurrence's and `transform_chain` reads it; it is for the
+positions with no recurrence to carry the write — the top level, a function body, a `with begin():`
+block.
+
+Both run before `transact_phase::run`, which walks a `with begin():` block itself, and again at the
+letrec phase for the writes inlining buries between the two.
+
+A `match` reaches neither: an arm computing over a name bound outside it is not point-free by
+operator conversion, and lifting a write onto an arm's spine leaves exactly that. The bound is below
+this layer and holds with no write involved — see
+`tests/compilation_pipeline/mutability.rs`, `test_match_arm_computing_over_an_outer_name`.
 
 ### Value-selecting `Case` and conditional induction writes (partially implemented)
 

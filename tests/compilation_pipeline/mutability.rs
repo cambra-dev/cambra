@@ -1802,3 +1802,70 @@ fn test_statement_if_accumulates() {
 fn test_block_right_hand_side_writes_its_own_mutable(#[case] code: &str) {
     check_scalar(code, Value::Int(3));
 }
+
+// A write inside a statement `if` outside a for-loop body carries past the
+// conditional. There is no recurrence to hold it there, so the continuation is
+// pushed into the branches instead and each write's advance scopes over it
+// (`src/ccl/design/mutability.md`, "A write inside a `Case` bound by a `Let`").
+// Inside a loop body the same shape is the recurrence's, and is left alone —
+// the last case is that one, unchanged.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    if True:
+        acc += 1
+    else:
+        acc += 0
+    acc"}, Value::Int(1))]
+#[case(indoc! {"
+    acc := 0
+    if False:
+        acc += 1
+    else:
+        acc += 7
+    acc"}, Value::Int(7))]
+#[case(indoc! {"
+    def f(c: Bool) => Int:
+        acc := 0
+        if c:
+            acc += 4
+        else:
+            acc += 9
+        acc
+    f(True)"}, Value::Int(4))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        if i > 1:
+            acc += i
+        yield 0
+    acc"}, Value::Int(5))]
+fn test_statement_if_write_carries_past_the_conditional(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// A `match` arm that computes over a name bound outside the `match` reaches
+/// operator conversion as a bare `BinOp`. The program below writes nothing and
+/// fails identically on `main`, so it bounds `match` support below the
+/// mutability layer rather than in it: every `match` shape a write reaches ends
+/// up with a computed arm, which is why the writing cases above are `if` only.
+#[test]
+#[ignore = "a `match` arm computing over an outer name is not point-free by \
+            operator conversion; pre-existing, and unrelated to writes"]
+fn test_match_arm_computing_over_an_outer_name() {
+    check_scalar(
+        indoc! {"
+            base = 3
+            t = match `some(3):
+                    case `some(n):
+                        base + n
+                    case `none:
+                        base + 0
+            t"},
+        Value::Int(6),
+    );
+}

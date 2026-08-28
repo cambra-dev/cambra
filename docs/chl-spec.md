@@ -1359,7 +1359,8 @@ acc                     # 5
 
 A branch's value may read what that branch wrote (`acc += i` then `acc` yields
 the updated value), and a write inside a `with begin():` block commits with the
-rest of its block.
+rest of its block. The statement `if` carries its writes the same way, in a
+for-loop body and outside one alike.
 
 Annotated assignment **requires** a value (`x: T` alone is a parse error,
 unlike Python's bare type-only declarations).
