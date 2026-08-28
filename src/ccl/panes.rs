@@ -460,75 +460,23 @@ mod tests {
         }
     }
 
-    /// The `program / pane pair` names at which the provenance map is **not**
-    /// vacuous — where some node's origin is another node, so the fold had to
-    /// read a row. See
-    /// [`the_pane_folds_derive_a_non_vacuous_provenance_map`].
-    ///
-    /// Pinned rather than counted: a recording that opens after the clone that
-    /// produced its nodes captures nothing, and the fold still succeeds — it
-    /// reads the pane pair as pure identity. The pin is what makes that
-    /// difference visible, so it lists names and not a total.
-    const EXERCISED_BOUNDARIES: &[&str] = &[
-        "arithmetic / post-as-of-read → post-lambda-elim",
-        "arithmetic / post-lambda-elim → post-planning",
-        "arithmetic / pre-inference → post-inference",
-        "feed_loop / post-as-of-read → post-lambda-elim",
-        "feed_loop / post-inference → post-channelize",
-        "feed_loop / post-lambda-elim → post-planning",
-        "feed_loop / pre-inference → post-inference",
-        "filter_and_aggregate / post-as-of-read → post-lambda-elim",
-        "filter_and_aggregate / post-lambda-elim → post-planning",
-        "filter_and_aggregate / pre-inference → post-inference",
-        "for_accumulator / post-as-of-read → post-lambda-elim",
-        "for_accumulator / post-inference → post-channelize",
-        "for_accumulator / post-lambda-elim → post-planning",
-        "for_accumulator / pre-inference → post-inference",
-        "generator_pipeline / post-as-of-read → post-lambda-elim",
-        "generator_pipeline / post-inference → post-channelize",
-        "generator_pipeline / post-lambda-elim → post-planning",
-        "generator_pipeline / pre-inference → post-inference",
-        "group_by / post-as-of-read → post-lambda-elim",
-        "group_by / post-lambda-elim → post-planning",
-        "group_by / pre-inference → post-inference",
-        "inner_join / post-as-of-read → post-lambda-elim",
-        "inner_join / post-lambda-elim → post-planning",
-        "inner_join / pre-inference → post-inference",
-        "join_then_groupby / post-as-of-read → post-lambda-elim",
-        "join_then_groupby / post-lambda-elim → post-planning",
-        "join_then_groupby / pre-inference → post-inference",
-        "prefix_lines / post-as-of-read → post-lambda-elim",
-        "prefix_lines / post-lambda-elim → post-planning",
-        "prefix_lines / pre-inference → post-inference",
-        "streaming_echo / post-as-of-read → post-lambda-elim",
-        "streaming_echo / post-lambda-elim → post-planning",
-        "streaming_echo / pre-inference → post-inference",
-        "transaction / post-as-of-read → post-lambda-elim",
-        "transaction / post-channelize → post-as-of-read",
-        "transaction / post-inference → post-channelize",
-        "transaction / post-lambda-elim → post-planning",
-        "transaction / pre-inference → post-inference",
-        "udf_chain / post-as-of-read → post-lambda-elim",
-        "udf_chain / post-inference → post-channelize",
-        "udf_chain / post-lambda-elim → post-planning",
-        "udf_chain / pre-inference → post-inference",
-    ];
-
     /// **The provenance map is well-formed and non-vacuous** on every corpus
     /// program: every edge runs from an input-pane id to an output-pane id,
-    /// every id present in both panes is its own dense self-edge, and the
-    /// pane pairs where the fold had to read a *row* are exactly the ones
-    /// pinned above.
+    /// every id present in both panes is its own dense self-edge, and every
+    /// gated pane pair reads a *row* on at least one program.
     ///
-    /// The non-vacuity half is what this test is for. Six of the twenty-two
-    /// corpus pane pairs are pure identity: no phase inside them minted, so the
-    /// map is the input pane's self-edges and holds for reasons that have
-    /// nothing to do with the recording. A corpus edit that
-    /// silently dropped the rewriting programs would otherwise leave a green
-    /// tautology behind.
+    /// The non-vacuity half is what this test is for. A pane pair whose phases
+    /// minted nothing on a given program derives its whole map from the two
+    /// pane id sets, so the well-formedness assertions above hold there for
+    /// reasons that have nothing to do with the recording. Requiring one
+    /// witness per pair is what keeps a pair whose instrumentation stopped
+    /// firing — or a corpus that lost the only program exercising it — from
+    /// leaving a green tautology behind. Which programs supply the witness is
+    /// not pinned: a program rewrites where its own shape makes it rewrite, and
+    /// pinning that turns every corpus edit into a list edit.
     #[test]
     fn the_pane_folds_derive_a_non_vacuous_provenance_map() {
-        let mut exercised: Vec<String> = Vec::new();
+        let mut exercised: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let panes = program.materialize_panes();
@@ -575,15 +523,19 @@ mod tests {
                 // pane pair whose phases rewrote nothing derives its whole
                 // map from the two pane id sets.
                 if edges.iter().any(|(u, d)| *u != d.id) {
-                    exercised.push(format!("{name} / {pair}"));
+                    exercised.insert(i);
                 }
             }
         }
-        exercised.sort();
-        assert_eq!(
-            exercised, EXERCISED_BOUNDARIES,
-            "the pane pairs at which the fold actually reads a row have changed",
-        );
+        for (i, spec) in PANES.iter().enumerate().skip(1).filter(|(_, s)| s.gated) {
+            assert!(
+                exercised.contains(&(i - 1)),
+                "no corpus program's fold reads a row at {} → {}: either the phases inside the \
+                 pair record nothing, or the corpus lost the program that exercised them",
+                PANES[i - 1].name,
+                spec.name,
+            );
+        }
     }
 
     /// The `program / pane pair` names at which a **blame** edge reaches the
@@ -592,6 +544,8 @@ mod tests {
     /// [`blame_reaches_the_provenance_map_labelled`].
     const RELATING_BOUNDARIES: &[&str] = &[
         "for_accumulator / post-inference → post-channelize",
+        "inner_join / post-lambda-elim → post-planning",
+        "join_then_groupby / post-lambda-elim → post-planning",
         "transaction / post-inference → post-channelize",
     ];
 
@@ -599,11 +553,13 @@ mod tests {
     /// closed transitively alongside `parents`, so a consumer receives the
     /// blame edges and can render or prune them.
     ///
-    /// Pinned as the set of pane pairs where such an edge exists, for the same
-    /// reason [`EXERCISED_BOUNDARIES`] is pinned: blame is named at a handful of
-    /// sites, all in the mutability phases and so all inside the second pane
-    /// pair, and a corpus or recording edit that stopped exercising them
-    /// would otherwise leave the labelled half of the map untested.
+    /// Pinned by name, unlike the per-pair witness
+    /// [`the_pane_folds_derive_a_non_vacuous_provenance_map`] asks for: blame is
+    /// named at a handful of sites — the mutability phases' effect and begin
+    /// nodes, and the refinement predicate `planning.hash_join` reads its plan
+    /// out of — so the pin is short, and a corpus or recording edit that stopped
+    /// exercising them would otherwise leave the labelled half of the map
+    /// untested.
     ///
     /// A blame edge is *only* blame here: no corpus rewrite both
     /// consumes a node and blames it, so nothing in the corpus pins the
@@ -630,6 +586,51 @@ mod tests {
             relating, RELATING_BOUNDARIES,
             "the pane pairs at which blame contributes an edge have changed",
         );
+    }
+
+    /// **Both of a nested join's conditions reach the map**, as blame edges from
+    /// `planning.hash_join`.
+    ///
+    /// The site's recording blames what the *domain type* carries rather than the
+    /// refinement the recogniser accepted, because `join_plan_to_expr` re-enters
+    /// `convert_refinement_to_join` on an arm's own refined type — three frames
+    /// below the recording, with no access to its guard. A one-condition join
+    /// cannot tell the two apart, which is what the flat control fixes: the
+    /// nested program must blame two distinct predicates where the flat one
+    /// blames one.
+    #[test]
+    fn a_nested_join_blames_both_join_conditions() {
+        let flat = "[x + y for x in [2] for y in [1, 2, 3] if x == y]";
+        let nested = "[x + y for x in [2] \
+                      for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]";
+        for (name, code, want) in [("flat", flat, 1), ("nested", nested, 2)] {
+            let program = compile_ok(code);
+            let panes = program.materialize_panes();
+            let pair = panes
+                .pairs
+                .iter()
+                .find(|p| p.name == "post-lambda-elim → post-planning")
+                .expect("the planning pane pair");
+            let blamed: std::collections::HashSet<NodeId> = pair
+                .map
+                .edges()
+                .into_iter()
+                .filter(|(u, d)| {
+                    *u != d.id
+                        && d.labels.has_blame()
+                        && program
+                            .provenance_table
+                            .tag(d.id)
+                            .is_some_and(|t| t.label == "planning.hash_join")
+                })
+                .map(|(u, _)| u)
+                .collect();
+            assert_eq!(
+                blamed.len(),
+                want,
+                "{name}: distinct predicates blamed by planning.hash_join",
+            );
+        }
     }
 
     /// The corpus programs whose definitions inference **generalizes and then

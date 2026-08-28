@@ -357,9 +357,9 @@ even so, which is why a surviving node carries an ancestry self-edge
 Attribution resolves through **`parents` ∪ `blame`** — parentage first, then
 blame's distinct additions, so the span order is deterministic and blame is never
 dropped when it names a node the parents do not. Blame is named at a handful of
-sites, all in the mutability phases, so for almost every node this is simply the
-spans of what it was made from, which is why walking the parent edges recovers a
-source location at all.
+sites, in the mutability phases and at the hash-join recognizer, so for almost
+every node this is simply the spans of what it was made from, which is why
+walking the parent edges recovers a source location at all.
 
 **Two labels on one relation, which is why they stay separate columns.** Both
 relate a node to other nodes; what differs is what the relation *asserts* — a
@@ -453,9 +453,10 @@ a loud failure rather than a silent misattribution):
   second parent on a row and the only place any id is named at record time.
 - `blame(ids)` — nodes this rewrite is **related to but did not consume to
   produce** its outputs. Attribution unions them with the parents; the pane
-  relation carries them as *blame* edges. Blame is named at a handful of sites,
-  all in the mutability phases, so `parents` alone is what recovers a source
-  location for almost every node.
+  relation carries them as *blame* edges. Blame is named at a handful of sites —
+  the mutability phases' effect and begin nodes, and the refinement predicate
+  `planning.hash_join` reads its plan out of — so `parents` alone is what
+  recovers a source location for almost every node.
 
 `enter` is the constructor a phase uses to record a rewrite. `copy_frame` is the
 one recording that names **no** node, for a duplication with nothing being
