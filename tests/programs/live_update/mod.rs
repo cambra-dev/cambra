@@ -40,6 +40,7 @@
 //! | A loop gains an accumulator | Accepted; the others resume, the new one starts at its init |
 //! | A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
 //! | A loop reads another source — a port change, say | Accepted; same as above, and the port it left is released |
+//! | Two loops swap which source they read | Accepted; each keeps its value and continues where its new source has got to |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | Repeats and reverts | Accepted; each takes effect |
@@ -235,6 +236,23 @@ impl Drop for RunningProgram {
     }
 }
 
+/// Wait for `port` to stop accepting connections.
+///
+/// Releasing a port is not synchronous with the update that stopped serving it:
+/// dropping the last handle unblocks the dispatcher thread, and the socket closes
+/// when that thread notices. The contract is that the port *is* released, not that
+/// it is released before `update` returns.
+fn assert_port_released(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "port {port} is still accepting connections after its last route went",
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The main-output consumer a sink-only program never uses.
 fn no_main() -> Box<dyn Consumer> {
     Box::new(|| {})
@@ -360,6 +378,19 @@ mod fixtures {
             qr << "q\n"
     "#};
 
+    pub const ONE_STATEFUL_LOOP_BOTH: &str = indoc! {r#"
+        n := ""
+        m := ""
+        p, pr = http_serve("{PORT}", "POST", "/p")
+        q, qr = http_serve("{PORT}", "POST", "/q")
+        for x in p:
+            n := n + "a"
+            pr << n + "\n"
+        for y in q:
+            m := m + "b"
+            qr << m + "\n"
+    "#};
+
     pub const ONE_STATEFUL_LOOP_MOVED: &str = indoc! {r#"
         n := ""
         p, pr = http_serve("{PORT}", "POST", "/p")
@@ -439,6 +470,22 @@ mod fixtures {
             right := right + "B"
             left := left + "a"
             resps << left + "|" + right + "\n"
+    "#};
+
+    pub const TWO_LOOPS_SWAPPED: &str = indoc! {r#"
+        a := ""
+        b := ""
+
+        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
+        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+
+        for y in b_reqs:
+            a := a + y + "\n"
+            b_resps << a
+
+        for x in a_reqs:
+            b := b + x + "\n"
+            a_resps << b
     "#};
 
     pub const TWO_LOOPS: &str = indoc! {r#"
@@ -542,6 +589,7 @@ fn source(name: &str, port: u16) -> String {
         "latest-write" => fixtures::LATEST_WRITE,
         "latest-write-writer-edit" => fixtures::LATEST_WRITE_WRITER_EDIT,
         "one-stateful-loop" => fixtures::ONE_STATEFUL_LOOP,
+        "one-stateful-loop-both" => fixtures::ONE_STATEFUL_LOOP_BOTH,
         "one-stateful-loop-moved" => fixtures::ONE_STATEFUL_LOOP_MOVED,
         "running-log" => fixtures::RUNNING_LOG,
         "running-log-writer-edit" => fixtures::RUNNING_LOG_WRITER_EDIT,
@@ -549,6 +597,7 @@ fn source(name: &str, port: u16) -> String {
         "two-accumulators-added" => fixtures::TWO_ACCUMULATORS_ADDED,
         "two-accumulators-reordered" => fixtures::TWO_ACCUMULATORS_REORDERED,
         "two-loops" => fixtures::TWO_LOOPS,
+        "two-loops-swapped" => fixtures::TWO_LOOPS_SWAPPED,
         "two-loops-one-edited" => fixtures::TWO_LOOPS_ONE_EDITED,
         "two-transactions" => fixtures::TWO_TRANSACTIONS,
         "two-transactions-one-writer-edited" => fixtures::TWO_TRANSACTIONS_ONE_WRITER_EDITED,
@@ -834,10 +883,7 @@ fn moving_a_program_to_another_port_keeps_its_state() {
 
     // The old port served nothing after the swap, so it was released with its
     // last route.
-    assert!(
-        std::net::TcpStream::connect(("127.0.0.1", old_port)).is_err(),
-        "port {old_port} should be released once the program stopped serving it",
-    );
+    assert_port_released(old_port);
 }
 
 /// A transactional variable survives an edit to the writer that commits it.
@@ -1540,10 +1586,7 @@ fn a_port_whose_last_route_goes_is_released() {
     assert_eq!(retired, vec!["a\n", "Not Found"]);
 
     // The other port lost its only route, so nothing is listening there.
-    assert!(
-        std::net::TcpStream::connect(("127.0.0.1", dropped)).is_err(),
-        "port {dropped} should be released once no route is registered on it",
-    );
+    assert_port_released(dropped);
 }
 
 /// Every phase the control port offers is a working diff point, not only the
@@ -1620,4 +1663,69 @@ fn a_transaction_writer_does_not_replay_what_it_committed() {
     // Six as they were committed, and the seventh under the new rule — not
     // `123456-1-2-3-4-5-6-7`.
     assert_eq!(after, vec!["ok\n", "123456-7"]);
+}
+
+/// Two loops swapping which source they read keep their values and pick up where
+/// each source has got to.
+///
+/// Both variables change domain at once, so neither can resume at its
+/// predecessor's frontier — and neither can start at `0` either, because both
+/// sources have already delivered and released. Each starts where the source it
+/// moved to will next offer a producer.
+#[test]
+fn two_loops_may_swap_which_source_they_read() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("two-loops", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![
+            http_post(port, "/a", "1"),
+            http_post(port, "/a", "2"),
+            http_post(port, "/b", "9"),
+        ]
+    });
+    assert_eq!(before, vec!["1\n", "1\n2\n", "9\n"]);
+
+    live.update(&mut ctx, &source("two-loops-swapped", port), &no_main)
+        .expect("both variables are still declared, at the same types");
+
+    // `/a` now writes `b` and answers on `a_resps`; `/b` now writes `a`.
+    let after = exchange(&mut ctx, move || {
+        vec![http_post(port, "/a", "3"), http_post(port, "/b", "8")]
+    });
+    assert_eq!(
+        after,
+        vec!["9\n3\n", "1\n2\n8\n"],
+        "each variable kept its value and continued on the source it moved to",
+    );
+}
+
+/// A loop that gains an accumulator over a source the program was already reading
+/// starts where that source has got to.
+///
+/// There is no predecessor to resume from — the variable is new — so this is the
+/// case that has nothing carried at all and still cannot start at `0`. `/q` has
+/// delivered and released a request, and a store based below that waits for an
+/// element the source will not offer again.
+#[test]
+fn a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("one-stateful-loop", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![http_post(port, "/p", "x"), http_post(port, "/q", "x")]
+    });
+    assert_eq!(before, vec!["a\n", "q\n"]);
+
+    live.update(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
+        .expect("`n` is unchanged and `m` is new");
+
+    let after = exchange(&mut ctx, move || {
+        vec![http_post(port, "/q", "x"), http_post(port, "/p", "x")]
+    });
+    assert_eq!(
+        after,
+        vec!["b\n", "aa\n"],
+        "`m` starts empty at `/q`'s current position, and `n` carries",
+    );
 }

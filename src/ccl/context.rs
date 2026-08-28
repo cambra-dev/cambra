@@ -494,7 +494,11 @@ impl SourceSinkRegistry {
     /// touching the running program — see [`compile_to_in`] for why that is safe
     /// to do while it is serving.
     pub fn compile_to(&self, code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
-        compile_to_in(self.seed_lowering_context(), code, phase)
+        let mut lowering = self.seed_lowering_context();
+        // Answering a question must not change what the program serves, so a route
+        // this registry does not hold is named rather than opened.
+        lowering.inherit_endpoints_only();
+        compile_to_in(lowering, code, phase)
     }
 }
 

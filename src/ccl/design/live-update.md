@@ -62,7 +62,8 @@ Every carrier in the program, and where its cut comes from:
 | --- | --- | --- |
 | A `Let` binding or store the new version also computes | None — nothing is replaced | `resolved_hash` match, one more `FanOut` branch |
 | An element-wise map, a feed, a loop over a list | Its source's agreed release | `carry_release_to_new_producers` |
-| An induction store | Its own frontier | `CarriedState`, each variable's value and position together |
+| An induction store over the domain its predecessor read | Its predecessor's frontier | `CarriedState`, each variable's value and position together |
+| Any other induction store | Where its source will next offer a producer | `first_position_for_a_new_producer` |
 | A transaction writer's item cursor | Its source's agreed release | Absolute item positions, released on the commit-ack |
 | A commit clock | None — private and restartable | A rebuilt store seeds at `0` |
 | A route, its listener, and the requests behind it | None while any version still binds a route on the port | `SourceSinkRegistry` |
@@ -258,7 +259,12 @@ subscriber owns its side, and the registry holds a weak reference.
 4. `GlobalContext::retire_version` moves the retiring conversion context's
    operators into the next compilation's inheritance.
 5. Compile and subscribe the new version against the same registry, which now
-   binds every endpoint the retired version left open.
+   binds every endpoint the retired version left open, and opens the ones it adds.
+
+Only step 5 opens anything. Steps 1 and 2 run with `Endpoints::Inherited`, so a
+route the registry does not hold is named rather than opened: their contexts are
+thrown away but a socket is not, and opening one would make asking a question
+change what the program serves and leave step 5 unable to bind the port.
 
 Steps 3 and 4 come after step 2 so that a rejection is never destructive, and
 before step 5 so that what the new version inherits is held by the inheritance
@@ -332,11 +338,22 @@ Three pieces carry that:
   A position only means something in the domain it was counted in, and that is
   the `Transact`'s own sequencing domain — the index of every key's history. So
   the two are carried separately, and a variable whose new version is sequenced by
-  a different domain seeds its value and decides from `0`. That is a variable
+  a different domain seeds its value and starts counting again. That is a variable
   moving between loops, or into a transaction, or a program moving to another
   port: the positions it is about to decide belong to a collection its predecessor
   never read, so none is decided twice and none is skipped, while the value —
   which is the variable's, not the collection's — goes on.
+
+  **Starting again is not starting at `0`.** A source it moved to may have been
+  read all along by some other loop, which released what it consumed, and the
+  source will not offer those positions again. So a store with no predecessor over
+  its own domain starts at `first_position_for_a_new_producer` — `0` for a source
+  nothing has read, and the released frontier otherwise. Basing a drive below that
+  makes it wait for an element that is not coming, which is a silent stall rather
+  than a wrong answer. The same holds for a store the update *adds*: a loop that
+  gains an accumulator over a source the program was already reading has nothing
+  carried and still cannot start at `0`
+  (`a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source`).
 
   A concrete iteration extent carries nothing at all: it is part of the program
   rather than outside it, so a variable sequenced by one is recomputed from the
@@ -375,13 +392,14 @@ have:
 | Logic of a loop or a transaction writer | Accepted; the variable resumes |
 | A loop gains an accumulator | Accepted; the others resume, the new one starts at its init |
 | A variable's declared init changes, type unchanged | Accepted; the carried value wins, the init is only for a fresh start |
-| A whole stateful loop is added | Accepted; existing state untouched |
+| A whole stateful loop is added | Accepted; existing state untouched, and the new store starts where its source has got to |
 | A route is added | Accepted; it serves as soon as the swap completes |
 | A route is removed | Accepted; the route is retired and answers 404 |
 | A loop loses an accumulator | Refused, naming it |
 | A variable's type changes, records included | Refused, naming both types |
 | A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
 | A loop reads another source, a port change say | Accepted; same as above, and the port it left is released |
+| Two loops swap which source they read | Accepted; each keeps its value and continues on the source it moved to |
 | A variable moves to a loop over a fixed collection | Accepted; nothing is carried, since that fold is recomputed |
 
 An update is atomic with respect to requests: under concurrent load every request

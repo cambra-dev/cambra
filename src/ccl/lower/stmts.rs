@@ -524,6 +524,11 @@ pub(super) fn lower_middle_stmt(
             // endpoint serves it as soon as the swap completes.
             let sink: Arc<dyn DataSink> = match ctx.http_routes.get(&source_name) {
                 Some(existing) => existing.sink.clone(),
+                None if ctx.endpoints == Endpoints::Inherited => {
+                    let source_obj = Rc::new(RefCell::new(UnopenedRoute::new(source_name.clone())));
+                    ctx.sources.insert(source_name.clone(), source_obj);
+                    Arc::new(UnopenedRouteSink)
+                }
                 None => {
                     // Share one tiny_http::Server per port across all http_serve routes.
                     if let std::collections::hash_map::Entry::Vacant(e) =

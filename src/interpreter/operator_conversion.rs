@@ -2183,6 +2183,17 @@ impl std::fmt::Display for VarPath {
     }
 }
 
+/// The first position the source `domain` names will offer a producer registering
+/// now, or `0` for a domain that is not a source.
+fn source_start(domain: &Type, ctx: &OpConversionContext) -> usize {
+    let Type::DataSource(name) = domain else {
+        return 0;
+    };
+    ctx.sources.get(name).map_or(0, |source| {
+        source.borrow().first_position_for_a_new_producer()
+    })
+}
+
 /// Whether a variable sequenced by `domain` hands state to its replacement.
 ///
 /// A data source and a transaction's commit clock both outlive the version
@@ -2385,9 +2396,9 @@ fn build_induction_store_single(
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     let mut value_extents: Vec<Extent> = Vec::new();
-    // Where this store starts: `None` until a carried variable names the retired
-    // store's frontier, and `0` if none does — a store this version introduces,
-    // or one that had decided no position.
+    // Where this store starts, once a carried variable names the frontier of a
+    // predecessor over this same domain. `None` for a store with no such
+    // predecessor, which starts where its source does instead.
     let mut resume_at: Option<usize> = None;
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
@@ -2523,14 +2534,25 @@ fn build_induction_store_single(
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
 
-    // `0` for a program's own store, and the retired store's frontier for one
-    // replacing a store over the same domain. A replacement sequenced by a
-    // *different* domain starts at `0` while still seeding its values: the
-    // positions it is about to decide are positions of a collection its
-    // predecessor never read, so none is decided twice and none is skipped. Both
-    // the store's seed tick and the drive's window base come from this. The source
-    // may still owe positions below it, which the drive holds without re-deciding.
-    let resume_at = resume_at.unwrap_or(0);
+    // A store replacing one over the same domain resumes at that store's
+    // frontier, which is deliberately behind its source: a drive reads one
+    // position back through its input, so the source still owes it an element the
+    // recurrence has already decided.
+    //
+    // Every other store starts where its source will next offer a producer. That
+    // is `0` for a source nothing has read — every source of a program's first
+    // version — and the released frontier for one a retired version advanced,
+    // which is the case for a variable that moved to another loop, a program that
+    // moved to another port, and a stateful loop a version adds over a source it
+    // was already reading. Starting such a store at `0` would base its drive below
+    // every position the source will offer, and it would wait for an element that
+    // is not coming.
+    //
+    // Both the store's seed tick and the drive's window base come from this.
+    let resume_at = match resume_at {
+        Some(frontier) => frontier,
+        None => source_start(&domain, ctx),
+    };
     let store = InductionStore::new(
         init_ops,
         write_keys,

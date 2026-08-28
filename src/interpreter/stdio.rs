@@ -132,6 +132,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     fn carry_release_to_new_producers(&mut self) {
         self.buf.carry_release_to_new_producers();
     }
+
+    fn first_position_for_a_new_producer(&self) -> usize {
+        self.buf.first_index_for_a_new_producer()
+    }
 }
 
 #[cfg(test)]

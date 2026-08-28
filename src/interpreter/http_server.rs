@@ -164,6 +164,81 @@ impl SharedHttpServer {
     }
 }
 
+/// An `http_serve` route a compilation named but did not open.
+///
+/// A compile that only answers a question — `/diff`, and the planned tree the
+/// state guard reads — runs against the endpoints the program already holds. A
+/// version it is asked about may name a route the program does not serve, and
+/// opening one would make asking change what the program does: it binds a socket
+/// and registers a route that outlive the throwaway context, so the address
+/// starts answering for a version nobody installed and the real compile then
+/// fails to bind the port it just took.
+///
+/// So such a route lowers to this instead. It answers the type questions lowering
+/// and inference put to a source and nothing else, which is all a compile that
+/// stops above operator conversion asks. Reaching a runtime method means one
+/// escaped into an operator graph, so each is [`unreachable`].
+pub struct UnopenedRoute {
+    id: String,
+}
+
+impl UnopenedRoute {
+    pub fn new(id: String) -> Self {
+        Self { id }
+    }
+}
+
+impl DataSourceDomainExtentImpl for UnopenedRoute {
+    fn get_id(&self) -> &str {
+        &self.id
+    }
+
+    fn element_extent(&self) -> Extent {
+        Extent::Base(BaseType::UInt)
+    }
+
+    fn output_value_extent(&self) -> Extent {
+        Extent::Base(BaseType::String)
+    }
+
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
+    }
+
+    fn check_for_new_data(&mut self) -> bool {
+        unreachable!("`{}` was never opened, so nothing drives it", self.id)
+    }
+
+    fn get_yield_predicate(&self) -> Predicate {
+        unreachable!("`{}` was never opened, so it yields nothing", self.id)
+    }
+
+    fn get_elements(&self, _producer: &str) -> ColumnValue {
+        unreachable!("`{}` was never opened, so it holds no elements", self.id)
+    }
+
+    fn get(&self, _keys: ColumnValue) -> ColumnValue {
+        unreachable!("`{}` was never opened, so it answers no key", self.id)
+    }
+
+    fn release(&mut self, _producer: &str, _obsolete: Predicate) {
+        unreachable!(
+            "`{}` was never opened, so nothing subscribed to it",
+            self.id
+        )
+    }
+}
+
+/// The reply sink of an [`UnopenedRoute`]. Dispatching to it would mean a version
+/// nobody installed answering a request.
+pub struct UnopenedRouteSink;
+
+impl DataSink for UnopenedRouteSink {
+    fn process(&self, _tile: &Tile) {
+        unreachable!("a route that was never opened has no client to answer");
+    }
+}
+
 impl Drop for SharedHttpServer {
     fn drop(&mut self) {
         // Ends the dispatcher thread, which is what drops its `Arc<Server>` and
@@ -474,5 +549,9 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn carry_release_to_new_producers(&mut self) {
         self.buf.carry_release_to_new_producers();
+    }
+
+    fn first_position_for_a_new_producer(&self) -> usize {
+        self.buf.first_index_for_a_new_producer()
     }
 }

@@ -198,6 +198,19 @@ impl UIntStreamBuffer {
         ColumnValue::from_uints(indices)
     }
 
+    /// The first index a producer registering now will be offered.
+    ///
+    /// The buffer has already dropped everything every producer agreed on, so
+    /// this is `start_idx` unless the carried release runs past it. A store built
+    /// over this source starts here: the source will never offer the positions
+    /// below it, and a drive based lower waits for an element that is not coming.
+    pub(crate) fn first_index_for_a_new_producer(&self) -> usize {
+        match self.released_prefix(&Self::index_set(&self.new_producer_obsolete)) {
+            Some(last) => last + 1,
+            None => self.start_idx,
+        }
+    }
+
     /// Record what every current producer has released, so that a producer
     /// registering from now on starts there.
     ///

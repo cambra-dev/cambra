@@ -112,10 +112,12 @@ impl LiveProgram {
 
     /// Render how `code` differs from this version, comparing at `phase`.
     ///
-    /// Compiles both sides against the running sources and sinks, which opens nothing
-    /// and leaves the running program untouched. Compiling the new version in a
-    /// fresh [`GlobalContext`] instead would try to bind a port this program
-    /// already holds.
+    /// Compiles both sides against the running sources and sinks, which opens
+    /// nothing and leaves the running program untouched: a route the registry does
+    /// not hold is named rather than opened
+    /// ([`Endpoints::Inherited`](crate::ccl::lower::Endpoints::Inherited)).
+    /// Compiling the new version in a fresh [`GlobalContext`] instead would try to
+    /// bind a port this program already holds.
     pub fn diff_against(
         &self,
         ctx: &GlobalContext,

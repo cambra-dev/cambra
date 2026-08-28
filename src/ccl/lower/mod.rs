@@ -88,7 +88,10 @@ use crate::{
         Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt,
         VariantPayload as ChlVariantPayload,
     },
-    interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},
+    interpreter::{
+        DataSink, DataSourceDomainExtentImpl,
+        http_server::{SharedHttpServer, UnopenedRoute, UnopenedRouteSink},
+    },
 };
 
 mod comprehension;
@@ -248,6 +251,25 @@ impl LoweringResult {
 // Lowering context
 // ---------------------------------------------------------------------------
 
+/// What a pass may do with an `http_serve` route the source/sink registry does not
+/// already hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Endpoints {
+    /// Open it. The pass is compiling the version that will serve it, and serving
+    /// an address the previous version did not is what adding an endpoint means.
+    #[default]
+    Open,
+    /// Leave it unopened, and lower it to an
+    /// [`UnopenedRoute`](crate::interpreter::http_server::UnopenedRoute).
+    ///
+    /// For a pass that answers a question rather than installing a version — a
+    /// `/diff`, or the planned tree the state guard reads. Its context is thrown
+    /// away, but a socket and a routing-table entry are not: opening one would
+    /// make *asking* change what the program serves, and would leave the port
+    /// taken when the pass that installs the version comes to bind it.
+    Inherited,
+}
+
 /// One `http_serve` route as lowering knows it: its reply sink and the address
 /// it serves.
 #[derive(Clone)]
@@ -320,6 +342,10 @@ pub struct LoweringContext {
     /// `http_serve` calls on one route within a single program remain an error;
     /// re-lowering the same route in a later version is the reuse path.
     pub(super) http_routes_this_pass: HashSet<String>,
+
+    /// What this pass may do with an `http_serve` naming a route the registry does
+    /// not already hold.
+    pub(super) endpoints: Endpoints,
 
     /// Monotonic counter for minting unique synthetic names during lowering.
     /// Globally unique across nested scopes so inner binders cannot capture
@@ -455,6 +481,11 @@ impl LoweringContext {
     /// this is called, so nothing looks a port up afterwards.
     pub fn take_servers(&mut self) -> impl Iterator<Item = (u16, Arc<SharedHttpServer>)> + use<> {
         std::mem::take(&mut self.shared_servers).into_iter()
+    }
+
+    /// Answer against the endpoints this context already holds, opening none.
+    pub fn inherit_endpoints_only(&mut self) {
+        self.endpoints = Endpoints::Inherited;
     }
 
     /// Seed this context with the sources and sinks a program already holds.

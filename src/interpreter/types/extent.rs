@@ -301,6 +301,23 @@ pub trait DataSourceDomainExtentImpl {
     ///
     /// The default does nothing, for a source with nothing retained to hand over.
     fn carry_release_to_new_producers(&mut self) {}
+
+    /// The first position a producer registering with this source from now on
+    /// will be offered.
+    ///
+    /// A store built over this source starts here rather than at `0`: the source
+    /// will never offer the positions below it, and a drive based lower waits for
+    /// an element that is not coming. `0` for a source that has released nothing,
+    /// which is every source of a program's first version, so this is `0`
+    /// wherever there is no predecessor to have advanced it.
+    ///
+    /// The exception is a store resuming a predecessor over this same source,
+    /// which starts at *its* frontier instead — deliberately behind this, because
+    /// a drive reads one position back through its input and the source still owes
+    /// the replacement an element the recurrence has already decided.
+    fn first_position_for_a_new_producer(&self) -> usize {
+        0
+    }
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {
