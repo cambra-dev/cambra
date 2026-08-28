@@ -343,3 +343,44 @@ fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] nam
 fn refined_add() {
     check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
 }
+
+#[test]
+fn refined_add_let() {
+    check_scalar(
+        "
+def foo(t: Int) => {Int where _ == 1 ^+ 3}:
+    x = 1 ^+ 3
+    y = x ^+ 2
+    y
+()
+",
+        Value::Unit
+    )
+}
+
+#[test]
+fn refined_add_let2() {
+    check_scalar(
+        "
+def foo(t: Int):
+    x = t ^+ 3
+    y = x ^+ 2
+    y
+foo(1)
+",
+        Value::Int(6)
+    )
+}
+
+#[test]
+fn refined_add_let3() {
+    check_scalar(
+        "
+def foo(t: Int):
+    x = 1 ^+ 3
+    x
+foo(1)
+",
+        Value::Int(4)
+    )
+}
