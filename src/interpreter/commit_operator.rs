@@ -2617,16 +2617,11 @@ struct DriverWindow {
 }
 
 impl DriverWindow {
-    /// `base` is the first absolute position this window will hold — `0` for a
-    /// driver that starts with its source, and the resume position for one
-    /// replacing a driver in a running program. Rows are addressed absolutely, so
-    /// starting a resuming window at `0` would offer the body a decision at a
-    /// position the store never decides.
-    fn new(read_extents: Vec<Extent>, item_extent: Extent, base: usize) -> Self {
+    fn new(read_extents: Vec<Extent>, item_extent: Extent) -> Self {
         Self {
             read_extents,
             item_extent,
-            next_position: base,
+            next_position: 0,
             rows: Vec::new(),
             release_cursor: PrefixReleaseCursor::default(),
         }
@@ -2840,13 +2835,21 @@ impl TileOperator for InductionDriver {
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
-            window: DriverWindow::new(
-                self.read_extents.clone(),
-                self.item_extent.clone(),
-                self.resume_at,
-            ),
-            emitted_through: None,
-            source_released_through: None,
+            window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone()),
+            // A resuming driver has already emitted every position below the one
+            // its store resumes at — by its predecessor, whose rows are gone. The
+            // item cursor is where that is said: it is what the next position to
+            // iterate is taken from, and what the store's frontier is checked
+            // against. `None` for a driver starting at `0`, which has emitted
+            // nothing.
+            emitted_through: self.resume_at.checked_sub(1),
+            // And inherits the release cursor with it. A resuming driver has no
+            // interest in the prefix below the position it starts at, which is
+            // what this cursor records; leaving it empty would have this driver
+            // re-release a prefix its predecessor already released, and would
+            // read a position the source re-offers there as an out-of-order
+            // arrival.
+            source_released_through: self.resume_at.checked_sub(1),
             source_fully_released: false,
         })
     }
@@ -3138,7 +3141,7 @@ impl TileOperator for TransactDriver {
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
-            window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone(), 0),
+            window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone()),
             current: 0,
             latest_emit: None,
         })

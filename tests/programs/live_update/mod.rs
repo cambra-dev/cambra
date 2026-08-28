@@ -51,6 +51,7 @@
 //! | The body of a loop over a fixed collection is edited | Accepted; the fold resumes at the position it had reached, so the new rule governs the elements left |
 //! | The same, with the fold caught partway | Accepted; every element is folded once, and the cut falls at the position the retired version had reached |
 //! | The collection itself is edited | Accepted; the new collection counts in its own sequence, so it is folded whole |
+//! | The same, over a collection a filter narrows | Accepted; the cut falls on a position the filter kept, which is a position of the collection it filters |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | Repeats and reverts | Accepted; each takes effect |
@@ -2011,6 +2012,61 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
     assert!(
         decided[resumed_at..].iter().all(|marked| *marked),
         "the new rule governs every element from the frontier on: {value}",
+    );
+}
+
+/// A fold of [`TWENTY`]'s later half into `n`, the elements reaching the loop
+/// through a filter. `step` is the loop body, as in [`fold_to_main`].
+fn filtered_fold_to_main(step: &str) -> String {
+    format!(
+        indoc! {r#"
+            n := ""
+            kept = [x for x in {items} if x > "q"]
+            for x in kept:
+                {step}
+            n
+        "#},
+        items = TWENTY,
+        step = step,
+    )
+}
+
+/// A fold whose source is filtered resumes at the position it had reached, which
+/// is a position of the *unfiltered* extent.
+///
+/// The elements the filter drops occupy no position in the recurrence, so the
+/// positions it does decide are a subset of the collection's and are not
+/// contiguous. The resume position is one of those, and the cut has to fall on it:
+/// resuming at the position after the last one *decided* would skip an element
+/// nothing has folded, and resuming by counting decided elements would land in the
+/// wrong place entirely.
+#[test]
+fn a_filtered_fold_resumes_at_a_position_of_the_collection_it_filters() {
+    const PULLS: usize = 2;
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &filtered_fold_to_main("n := n + x"), &no_main)
+        .expect("compiles");
+    for _ in 0..PULLS {
+        let producer = live
+            .main_producer_mut()
+            .expect("the program's value is `n`");
+        let guard = producer.tiling().universal_guard();
+        let _ = producer.get(guard);
+        ctx.scheduler().check_for_notifications();
+    }
+
+    live.update(
+        &mut ctx,
+        &filtered_fold_to_main(r#"n := n + x + "!""#),
+        &no_main,
+    )
+    .expect("`n` is still declared, at the same type");
+
+    let value = drive_main_to_terminal(&mut ctx, &mut live);
+    assert_eq!(
+        value, "rs!t!",
+        "the filter keeps `r`, `s` and `t`; the first is the retired version's and \
+         the rest are the new one's",
     );
 }
 
