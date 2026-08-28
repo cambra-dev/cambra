@@ -1191,8 +1191,8 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
 
 /// The state guard covers a `stdin`-sourced loop, not just an `http_serve` one.
 ///
-/// A loop's accumulators are identified by the source the loop reads, and
-/// nothing about that is HTTP-specific — the store id here is plainly `stdin`.
+/// Nothing about the guard is HTTP-specific: it reads the variables a version
+/// declares off its planned tree, and `stdin` declares them the same way.
 /// The value never reaches the program's output (a scalar read of an
 /// accumulator over an unbounded source never finalizes), which is exactly why
 /// the guard has to catch the change rather than leaving it to be noticed.
@@ -1415,11 +1415,11 @@ fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
 /// Two causally independent transaction groups keep their state apart across an
 /// update that rebuilds one of them.
 ///
-/// A program has one commit store per causal group, not one commit store, so
-/// `x` and `y` here live in different stores that both answer to `__txn`. Their
-/// frontiers differ — `x` has taken four commits and `y` one — and the store
-/// rebuilt for `x` has to resume at its own, which is why the resume position
-/// hangs off each variable rather than off the id they share.
+/// A program has one commit store per causal group, not one commit store, so `x`
+/// and `y` here live in different stores sequenced by the same `Txn` domain.
+/// Their frontiers differ — `x` has taken four commits and `y` one — and the
+/// store rebuilt for `x` has to resume at its own, which is why the resume
+/// position hangs off each variable rather than off the recurrence.
 #[test]
 fn two_transaction_groups_resume_at_their_own_positions() {
     let port = reserve_test_port();
