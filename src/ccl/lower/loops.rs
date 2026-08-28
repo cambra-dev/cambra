@@ -345,9 +345,6 @@ fn lower_for_body_stmts(
     // Each binding carries its statement's span so the `Let` folded around the
     // terminal below can be tagged as that statement's direct image.
     let mut bindings: Vec<(String, Expr, Option<Type>, Span)> = Vec::new();
-    // Every name a statement here sits under, grown with `frame_introduced`.
-    // A block right-hand side is lowered in it.
-    let mut scope = body_scope(mutation_scope, &frame_introduced);
 
     for stmt in rest {
         match &stmt.node {
@@ -356,9 +353,9 @@ fn lower_for_body_stmts(
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
+                let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
-                scope.insert(name.clone());
                 bindings.push((name, val, None, stmt.span));
             }
             ChlStmt::AnnAssign {
@@ -374,9 +371,9 @@ fn lower_for_body_stmts(
                     return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
                 let ann = lower_type_annotation(annotation, ctx)?;
+                let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
-                scope.insert(name.clone());
                 bindings.push((name, val, Some(ann), stmt.span));
             }
             ChlStmt::AugAssign { target, .. } => {
@@ -414,7 +411,6 @@ fn lower_for_body_stmts(
                 let func_expr =
                     lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
                 frame_introduced.insert(name_str.clone());
-                scope.insert(name_str.clone());
                 bindings.push((name_str, func_expr, None, stmt.span));
             }
             // A `with begin():` transaction inside a *generator* loop body is a
@@ -626,10 +622,10 @@ fn mutation_target_name(stmt: &Spanned<ChlStmt>) -> Option<&str> {
 /// The accumulator scans below walk statements, and a block right-hand side
 /// puts statements inside an expression, so a write in one of its branches is
 /// invisible to them without this. It is a loop-carried write like any other:
-/// `flatten_spine` pushes the binding into the branches, which puts the write on
-/// a spine `transform_chain` merges into the writer decision
-/// (`src/ccl/design/mutability.md`, "Value-selecting `Case` and conditional
-/// induction writes (partially implemented)").
+/// `push_bindings_into_writing_cases` pushes the binding into the branches,
+/// which puts the write on a spine `transform_chain` merges into the writer
+/// decision (`src/ccl/design/mutability.md`, "A write inside a `Case` bound by
+/// a `Let`").
 fn block_value_stmt(stmt: &Spanned<ChlStmt>) -> Option<&Spanned<ChlStmt>> {
     let value = match &stmt.node {
         ChlStmt::Assign { value, .. }

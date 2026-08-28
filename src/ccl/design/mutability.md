@@ -631,6 +631,50 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    init)`; a `Txn` read fed out of a read-only block → a broadcast of the history over the
    enclosing loop, which planning latches through the as-of read.
 
+### A write inside a `Case` bound by a `Let`
+
+A `MutWrite` becomes a shadowing advance over the rest of the scope it sits in, so a write in a
+branch of a `Case` that a `Let` binds advances the variable only until the binding takes its value:
+the update reaches nothing after the `Let`. That is the shape `x = if c: acc += e; v else: w` lowers
+to, and the shape inlining a pass-by-reference writer into a bound expression can produce.
+
+`push_bindings_into_writing_cases` normalizes it by pushing the binding and the continuation into
+every branch. Each branch's writes lift onto its own spine, its terminal is **substituted** for the
+binder in the continuation, and the `Case` takes the continuation's place — in effect position when
+the continuation yields nothing, in value position when it yields a value. The terminal is
+substituted rather than bound because a `let` surviving inside a branch escapes the writer lambda
+`transform_chain` builds from it, the same reason a write's value is inlined into the
+read-your-writes environment.
+
+What the branches then hold is the ordinary conditional induction write below: one uniform writer
+decision whose commit selector is the disjunction of the writing branches' guards, and whose
+per-accumulator write set carries the entering value on the paths that do not write. So the block
+right-hand side and the statement `if` spelling of one conditional compile to the same recurrence.
+
+`push_continuation_into_case` is the statement-position sibling. `if p: acc += e else: acc += f`
+lowers to `Case[…]; rest`, and a write in a branch likewise advances the variable only to the end of
+that branch, so `rest` reads the entering value. Splicing `rest` onto each branch's terminal makes
+the `Case` yield what `rest` yields and puts every write ahead of it. It is **not applied inside a
+for-loop body**, where that shape is the recurrence's and `transform_chain` reads it; it is for the
+positions with no recurrence to carry the write — the top level, a function body, a `with begin():`
+block.
+
+Both run before `transact_phase::run`, which walks a `with begin():` block itself, and again at the
+letrec phase for the writes inlining buries between the two.
+
+Both walk children first. Pushing a nested conditional leaves a `Case` standing where a statement
+stood, and its writes are then on that `Case`'s branches rather than on the enclosing branch's
+spine — so `spine_writes_mut` follows a `Case`'s branches as well as a spine, and a terminal `Case`
+that still writes is descended into rather than substituted whole. Substituting it would put the
+write inside the continuation's own expression. What the two rules together guarantee is that every
+path carries its writes ahead of the continuation, at any nesting depth
+(`test_nested_conditional_write_carries_out_of_a_block_right_hand_side`).
+
+A `match` reaches neither: an arm computing over a name bound outside it is not point-free by
+operator conversion, and lifting a write onto an arm's spine leaves exactly that. The bound is below
+this layer and holds with no write involved — see
+`tests/compilation_pipeline/mutability.rs`, `test_match_arm_computing_over_an_outer_name`.
+
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
 ## Worked example
@@ -1056,42 +1100,6 @@ store, and its `final_or_default` reports the seed as that store's default.
 
 These features belong to the model above but are not yet built. Each is rejected at compile time
 today rather than silently mishandled.
-
-### A write inside a `Case` bound by a `Let`
-
-A `MutWrite` becomes a shadowing advance over the rest of the scope it sits in, so a write in a
-branch of a `Case` that a `Let` binds advances the variable only until the binding takes its value:
-the update reaches nothing after the `Let`. That is the shape `x = if c: acc += e; v else: w` lowers
-to, and the shape inlining a pass-by-reference writer into a bound expression can produce.
-
-`push_bindings_into_writing_cases` normalizes it by pushing the binding and the continuation into
-every branch. Each branch's writes lift onto its own spine, its terminal is **substituted** for the
-binder in the continuation, and the `Case` takes the continuation's place — in effect position when
-the continuation yields nothing, in value position when it yields a value. The terminal is
-substituted rather than bound because a `let` surviving inside a branch escapes the writer lambda
-`transform_chain` builds from it, the same reason a write's value is inlined into the
-read-your-writes environment.
-
-What the branches then hold is the ordinary conditional induction write below: one uniform writer
-decision whose commit selector is the disjunction of the writing branches' guards, and whose
-per-accumulator write set carries the entering value on the paths that do not write. So the block
-right-hand side and the statement `if` spelling of one conditional compile to the same recurrence.
-
-`push_continuation_into_case` is the statement-position sibling. `if p: acc += e else: acc += f`
-lowers to `Case[…]; rest`, and a write in a branch likewise advances the variable only to the end of
-that branch, so `rest` reads the entering value. Splicing `rest` onto each branch's terminal makes
-the `Case` yield what `rest` yields and puts every write ahead of it. It is **not applied inside a
-for-loop body**, where that shape is the recurrence's and `transform_chain` reads it; it is for the
-positions with no recurrence to carry the write — the top level, a function body, a `with begin():`
-block.
-
-Both run before `transact_phase::run`, which walks a `with begin():` block itself, and again at the
-letrec phase for the writes inlining buries between the two.
-
-A `match` reaches neither: an arm computing over a name bound outside it is not point-free by
-operator conversion, and lifting a write onto an arm's spine leaves exactly that. The bound is below
-this layer and holds with no write involved — see
-`tests/compilation_pipeline/mutability.rs`, `test_match_arm_computing_over_an_outer_name`.
 
 ### Value-selecting `Case` and conditional induction writes (partially implemented)
 
