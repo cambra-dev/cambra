@@ -506,9 +506,9 @@ fn push_writing_cases(mut expr: Expr, in_loop_body: bool) -> Expr {
 ///   intermediate bindings onto the outer spine. This subsumes the direct
 ///   cases `Let(𝑥, ExprStmt(𝑤, 𝑢), 𝑘)` and `Let(𝑥, MutWrite(..), 𝑘)` and the
 ///   *intermediate-first* case `Let(𝑥, Let(tmp, 𝑒, 𝑤), 𝑘)`
-///   (`def f(c): tmp = c + 1; c := tmp`), which the earlier head-only hoist
-///   missed — leaving the write trapped in the bound expression and silently
-///   mis-normalized (or surviving the phase as a marker).
+///   (`def f(c): tmp = c + 1; c := tmp`). Hoisting only the body's head reaches
+///   the first two and leaves the third's write trapped in the bound
+///   expression, silently mis-normalized or surviving the phase as a marker.
 ///
 /// and terminalizes a value-position write (a trailing `cnt += 1` with no
 /// read, whose final state is unobserved):

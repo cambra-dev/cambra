@@ -1757,7 +1757,7 @@ fn test_transactional_write_inside_a_block_right_hand_side() {
 }
 
 /// The statement `if` spelling of the first case above, which the block
-/// right-hand side now agrees with.
+/// right-hand side agrees with.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_statement_if_accumulates() {
@@ -1943,13 +1943,13 @@ fn test_a_branch_value_reads_what_the_branch_wrote(#[case] code: &str, #[case] e
 }
 
 /// A `match` arm that computes over a name bound outside the `match` reaches
-/// operator conversion as a bare `BinOp`. The program below writes nothing and
-/// fails identically on `main`, so it bounds `match` support below the
-/// mutability layer rather than in it: every `match` shape a write reaches ends
-/// up with a computed arm, which is why the writing cases above are `if` only.
+/// operator conversion as a bare `BinOp`. The program below writes nothing, so
+/// the bound is below the mutability layer rather than in it: every `match`
+/// shape a write reaches ends up with a computed arm, which is why the writing
+/// cases above are `if` only.
 #[test]
 #[ignore = "a `match` arm computing over an outer name is not point-free by \
-            operator conversion; pre-existing, and unrelated to writes"]
+            operator conversion; no write is involved"]
 fn test_match_arm_computing_over_an_outer_name() {
     check_scalar(
         indoc! {"
