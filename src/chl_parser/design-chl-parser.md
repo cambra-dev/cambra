@@ -78,11 +78,13 @@ to dedent into it fixes the column for the rest of the chain. That is the rule
 [chl-spec.md](../../docs/chl-spec.md#43-assignment-forms), "4.3 Assignment
 forms" states as one indent in for the chain and one further for the bodies.
 
-The layout pass tells the two apart by whether the line that ended in `:` began
-with the keyword that opened the block. This is the one place layout depends on
-what a line says rather than only on where it starts, and it is intrinsic:
-where a block may open mid-line, where the block began is what decides where it
-continues.
+The layout pass tells the two apart by the first token of the statement whose
+line ends in `:`. It reads the logical line: a bracketed header wraps onto
+further physical lines, and both the keyword test and the floor belong to the
+statement that opened the block, not to the line the `:` lands on. This is the
+one place layout depends on what a line says rather than only on where it
+starts, and it is intrinsic: where a block may open mid-line, where the block
+began is what decides where it continues.
 
 A level opened this way emits no `Indent` — no line indented onto it — but its
 `Dedent` closes it like any other, so a block right-hand side ends with one

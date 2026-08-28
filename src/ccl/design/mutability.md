@@ -631,6 +631,8 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    init)`; a `Txn` read fed out of a read-only block → a broadcast of the history over the
    enclosing loop, which planning latches through the as-of read.
 
+Stateless programs never build a letrec — the phase degenerates to plain feed routing.
+
 ### A write inside a `Case` bound by a `Let`
 
 A `MutWrite` becomes a shadowing advance over the rest of the scope it sits in, so a write in a
@@ -674,8 +676,6 @@ A `match` reaches neither: an arm computing over a name bound outside it is not 
 operator conversion, and lifting a write onto an arm's spine leaves exactly that. The bound is below
 this layer and holds with no write involved — see
 `tests/compilation_pipeline/mutability.rs`, `test_match_arm_computing_over_an_outer_name`.
-
-Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
 ## Worked example
 
