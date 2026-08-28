@@ -41,6 +41,7 @@
 //! | A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
 //! | A loop reads another source — a port change, say | Accepted; same as above, and the port it left is released |
 //! | Two loops swap which source they read | Accepted; each keeps its value and continues where its new source has got to |
+//! | A variable moves to a loop over a fixed collection | Accepted; nothing is carried, since that fold is recomputed |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | Repeats and reverts | Accepted; each takes effect |
@@ -267,6 +268,23 @@ fn no_main() -> Box<dyn Consumer> {
 /// by [`source`].
 mod fixtures {
     use indoc::indoc;
+
+    pub const BUMP_OVER_SOURCE: &str = indoc! {r#"
+        n := ""
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        for r in reqs:
+            n := n + "a"
+            resps << n + "\n"
+    "#};
+
+    pub const BUMP_OVER_A_FIXED_LIST: &str = indoc! {r#"
+        n := ""
+        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        for x in ["y", "z"]:
+            n := n + x
+        for r in reqs:
+            resps << n + "\n"
+    "#};
 
     pub const GUESTBOOK_ADDS_ROUTE: &str = indoc! {r#"
         entries := ""
@@ -580,6 +598,8 @@ mod fixtures {
 fn source(name: &str, port: u16) -> String {
     let text = match name {
         "guestbook" => include_str!("program.cambra"),
+        "bump-over-source" => fixtures::BUMP_OVER_SOURCE,
+        "bump-over-a-fixed-list" => fixtures::BUMP_OVER_A_FIXED_LIST,
         "guestbook-adds-route" => fixtures::GUESTBOOK_ADDS_ROUTE,
         "guestbook-drops-route" => fixtures::GUESTBOOK_DROPS_ROUTE,
         "guestbook-drops-state" => fixtures::GUESTBOOK_DROPS_STATE,
@@ -1727,5 +1747,34 @@ fn a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source() {
         after,
         vec!["b\n", "aa\n"],
         "`m` starts empty at `/q`'s current position, and `n` carries",
+    );
+}
+
+/// A variable that moves to a loop over a fixed collection is recomputed, not
+/// seeded.
+///
+/// A fixed collection is part of the program rather than outside it, so the fold
+/// over it is a pure function of what the new version declares. Carrying the value
+/// in would count the elements the old version had already seen on top of the
+/// ones this fold is about to. Accepted, and `n` reads as the new list alone
+/// however many requests the old version answered.
+#[test]
+fn a_variable_that_moves_to_a_fixed_collection_is_recomputed() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("bump-over-source", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![http_post(port, "/bump", "x"), http_post(port, "/bump", "x")]
+    });
+    assert_eq!(before, vec!["a\n", "aa\n"]);
+
+    live.update(&mut ctx, &source("bump-over-a-fixed-list", port), &no_main)
+        .expect("`n` is still declared, at the same type");
+
+    let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
+    assert_eq!(
+        after,
+        vec!["yz\n"],
+        "the fold is the list's, not the list's on top of what the requests built",
     );
 }
