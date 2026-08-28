@@ -8,9 +8,8 @@
 //! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
 //! Building the payload is pure: it enumerates
 //! [`SpanIndex`](crate::inspector_model::SpanIndex) and
-//! [`NameBinderIndex`](crate::inspector_model::NameBinderIndex) (the enumeration
-//! methods added alongside their point queries) and builds each stage's IR tree
-//! via the shared `build_inspect_tree`.
+//! [`NameBinderIndex`](crate::inspector_model::NameBinderIndex) and builds each
+//! stage's IR tree via the shared `build_inspect_tree`.
 //!
 //! # Wire-type isolation
 //!
@@ -98,7 +97,7 @@ pub struct StageEntry {
     /// Discriminant for the stage kind: `"holes"` for a tree inference has not
     /// run on yet, `"typed"` for one it has.
     pub kind: &'static str,
-    /// The full IR expand-tree for this stage.
+    /// The full IR tree for this stage.
     pub ir: InspectNode,
     /// Every `(span → nodeId)` entry of this stage's span index.
     pub span_index: Vec<SpanEntry>,
@@ -310,8 +309,7 @@ pub struct Meta {
 ///
 /// The rows are enumerated from the index the stage already carries; building a
 /// second one over the same pair would duplicate the walk. The tree goes through
-/// [`build_inspect_tree`], the single source-linking tree-builder, so the
-/// payload's trees and the `expand` query cannot diverge.
+/// [`build_inspect_tree`], the single source-linking tree-builder.
 fn build_stage_ir_and_index(stage: &StageProjection<'_>) -> (InspectNode, Vec<SpanEntry>) {
     use super::query::{build_inspect_tree, tree_height};
 

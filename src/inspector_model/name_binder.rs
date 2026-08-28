@@ -1,9 +1,10 @@
 //! The source-level name-resolution index over the parsed CHL AST.
 //!
-//! This is the [`NameBinderIndex`] — the answer to *lexical* name questions
-//! (`goto-definition`, the binder half of `scope-at`). Unlike [`SpanIndex`],
-//! which projects the *typed IR* back onto source spans, this index resolves
-//! purely over the **surface AST** ([`Module`]).
+//! This is the [`NameBinderIndex`] — the source-level answer to lexical name
+//! questions, enumerated onto the wire as the payload's `definitions` (use →
+//! binder) and the name half of its `scopes` (the binders visible in a region).
+//! Unlike [`SpanIndex`], which projects the *typed IR* back onto source spans,
+//! this index resolves purely over the **surface AST** ([`Module`]).
 //!
 //! [`SpanIndex`]: crate::inspector_model::SpanIndex
 //!
@@ -47,8 +48,8 @@ use smol_str::SmolStr;
 pub struct Binding {
     /// The bound name.
     pub name: SmolStr,
-    /// The source span of the binder — what `goto-definition` returns. For a
-    /// parameter this is its [`Param.name_span`](crate::chl_parser::ast::Param::name_span);
+    /// The source span of the binder — the `defSpan` a payload row carries. For
+    /// a parameter this is its [`Param.name_span`](crate::chl_parser::ast::Param::name_span);
     /// for an assignment it is the target's span; for a `def` it is the name's
     /// span.
     pub def_span: Span,
@@ -61,7 +62,7 @@ pub struct Binding {
 pub struct Definition {
     /// The use-site span.
     pub use_span: Span,
-    /// The binder's source span (goto-definition target).
+    /// The binder's source span — where the use is defined.
     pub def_span: Span,
     /// The bound name.
     pub name: SmolStr,
@@ -81,21 +82,19 @@ pub struct ScopeRegion {
 
 /// Source-level lexical name resolution over the parsed CHL [`Module`].
 ///
-/// Built once over the surface AST ([`build`](Self::build)); answers
-/// [`definition_of`](Self::definition_of) (use→binder, goto-definition) and
-/// [`bindings_in_scope`](Self::bindings_in_scope) (visible binders at a
-/// position, the name half of `scope-at`).
+/// Built once over the surface AST ([`build`](Self::build)); enumerated by
+/// [`definitions`](Self::definitions) (every resolved use→binder pair) and
+/// [`scopes`](Self::scopes) (every binder-bearing region with the names visible
+/// inside it).
 ///
 /// # Resolution by span
 ///
-/// The canonical handle is the source [`Span`] (what you click). Both queries
-/// take a span and answer by re-walking the AST with the same scope bookkeeping
-/// the build pass used; an unbound or unknown span resolves gracefully to
-/// `None`/empty, never a panic. The index keeps a reference-free owned copy of
-/// the resolution inputs — the `Module` is borrowed only during a query, so the
-/// index is built eagerly but the walks are re-run per query (a program's AST is
-/// small; this trades a tiny amount of recomputation for a far simpler, clearly
-/// correct implementation than caching a span→binder map with shadowing).
+/// Every handle the enumerations carry is a source [`Span`]: a use span, a
+/// binder's def-span, a region's span. Both enumerations walk the AST with the
+/// same scope bookkeeping, resolving each use against the binder stack live at
+/// it; an unbound use contributes no row. The index owns its copy of the
+/// `Module`, and each enumeration re-runs the walk rather than caching a
+/// span→binder map with shadowing.
 #[derive(Clone, Debug)]
 pub struct NameBinderIndex {
     module: Module,
@@ -124,65 +123,15 @@ impl NameBinderIndex {
         }
     }
 
-    /// Resolve a `Name` use at `use_span` to the source span of its binder
-    /// (goto-definition). `None` if `use_span` is not a `Name` use, or the name
-    /// is unbound at that position.
-    ///
-    /// The innermost binder visible at `use_span` wins (shadowing); a binder is
-    /// only visible if its binding site precedes the use in lexical scope
-    /// (sequential let-style).
-    pub fn definition_of(&self, use_span: Span) -> Option<Span> {
-        let mut found: Option<Span> = None;
-        let mut scopes: Vec<Scoped> = Vec::new();
-        walk_module(&self.module, &mut scopes, &mut |ev| {
-            // Only the `Name` use exactly at `use_span` is a query hit.
-            if let Event::Use { name, span, scopes } = ev
-                && span == use_span
-            {
-                found = resolve(name, use_span, scopes);
-            }
-        });
-        found
-    }
-
-    /// The binder whose binding site is exactly `def_span`, or `None` if no
-    /// binder is written there.
-    ///
-    /// The inverse question to [`definition_of`](Self::definition_of): that one
-    /// asks what a *use* refers to, this one asks whether a span *is* a binding
-    /// site and what it binds. The inspector needs it to type a binder: a
-    /// binder's name and type live on the IR node that binds it, and no IR node
-    /// carries the binder's own span, so the name from here is what selects that
-    /// node (see `Snapshot::binder_type`).
-    ///
-    /// Spans are compared exactly, as [`definition_of`](Self::definition_of)
-    /// compares use spans. Two binders never share a binding site, so the first
-    /// match in source order is the only one.
-    pub fn binder_at(&self, def_span: Span) -> Option<Binding> {
-        let mut found: Option<Binding> = None;
-        let mut scopes: Vec<Scoped> = Vec::new();
-        walk_module(&self.module, &mut scopes, &mut |ev| {
-            if let Event::Binder { name, def_span: at } = ev
-                && at == def_span
-                && found.is_none()
-            {
-                found = Some(Binding {
-                    name: name.clone(),
-                    def_span,
-                });
-            }
-        });
-        found
-    }
-
     /// Enumerate every resolved use→binder pair in the module — the data behind
     /// the `/api/snapshot` `definitions` array. Each entry is a `Name` use that
     /// resolves to a visible binder, paired with that binder's def-span and the
     /// bound name; unbound uses (which would resolve to `None`) are skipped.
     ///
-    /// Pure: re-walks the AST with the same scope bookkeeping the point queries
-    /// use, resolving each use against the binder stack live at it. Order is the
-    /// source pre-order of the uses.
+    /// Pure: re-walks the AST, resolving each use against the binder stack live
+    /// at it — the innermost binder of that name whose binding site precedes the
+    /// use (sequential let-style shadowing). Order is the source pre-order of
+    /// the uses.
     pub fn definitions(&self) -> Vec<Definition> {
         let mut out: Vec<Definition> = Vec::new();
         let mut scopes: Vec<Scoped> = Vec::new();
@@ -207,8 +156,7 @@ impl NameBinderIndex {
     /// A region is emitted per statement and per expression, minus those whose
     /// visible-binder set is empty (an empty `scopes` row carries nothing). The
     /// binders are the ones visible at the region's start, outermost →
-    /// innermost, matching [`bindings_in_scope`](Self::bindings_in_scope)'s
-    /// shape. Regions therefore repeat where a statement and its expression
+    /// innermost. Regions therefore repeat where a statement and its expression
     /// share a span; `src/inspector_model/design.md`, "Decided, not yet built"
     /// carries the deduplication.
     ///
@@ -229,47 +177,12 @@ impl NameBinderIndex {
         });
         out
     }
-
-    /// The binders visible at `at` (the name half of `scope-at`): every binder
-    /// in lexical scope whose binding site precedes `at`, innermost shadowing
-    /// outermost. Ordered outermost → innermost.
-    ///
-    /// Resolution is by the position `at.start`: the index walks into the
-    /// tightest AST scope containing it, capturing the binder stack there. A
-    /// position outside every scope (or inside no binding-introducing context)
-    /// returns just the top-level binders visible at that point.
-    pub fn bindings_in_scope(&self, at: Span) -> Vec<Binding> {
-        let pos = at.start;
-        let mut scopes: Vec<Scoped> = Vec::new();
-        // Capture the binder stack at the deepest scope-boundary that still
-        // contains `pos`. The use-visitor reports the *stack as of each scope's
-        // body*; we record the last (deepest) one covering `pos`.
-        let mut captured: Vec<Binding> = Vec::new();
-        let mut best_extent = usize::MAX;
-        walk_module(&self.module, &mut scopes, &mut |ev| {
-            if let Event::Scope { span, scopes } = ev
-                && span.start <= pos
-                && pos < span.end
-            {
-                let extent = span.end - span.start;
-                // `<=` so a tie (coincident span) keeps the later, deeper
-                // capture — its binder stack is a superset.
-                if extent <= best_extent {
-                    best_extent = extent;
-                    captured = visible_bindings(scopes, pos);
-                }
-            }
-        });
-        captured
-    }
 }
 
 /// An event surfaced during the AST walk: an [`Event::Use`] at every `Name`
-/// occurrence, an [`Event::Binder`] wherever a binder is introduced, and an
-/// [`Event::Scope`] at every statement and every expression, carrying the binder
-/// stack live there. Scope events are that dense because a `bindings_in_scope`
-/// position may land anywhere, and the caller keeps the innermost region
-/// containing it.
+/// occurrence and an [`Event::Scope`] at every statement and every expression,
+/// carrying the binder stack live there. Scope events are that dense because
+/// every region a name is visible in ships as a `scopes` row.
 ///
 /// Both borrows are tied to the single lifetime `'s` of the in-progress walk;
 /// the visitor (a higher-ranked `FnMut`) may inspect them only for the duration
@@ -281,11 +194,6 @@ enum Event<'s> {
         span: Span,
         scopes: &'s [Scoped<'s>],
     },
-    /// A binder introduction, fired where the binder is pushed rather than where
-    /// it becomes visible. A binder nothing follows into — the last statement of
-    /// a sequence — is surfaced like any other, which a scan of the
-    /// [`Scope`](Self::Scope) stacks would miss.
-    Binder { name: &'s SmolStr, def_span: Span },
     /// A binder-bearing region and the binder stack visible inside it.
     Scope {
         span: Span,
@@ -370,7 +278,7 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
         // nested-`let` shape and shadowing semantics).
         Stmt::Assign { target, value } => {
             walk_expr(value, scopes, visit);
-            bind_target(target, stmt_end, scopes, visit);
+            bind_target(target, stmt_end, scopes);
         }
         Stmt::AnnAssign {
             target,
@@ -379,16 +287,16 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
         } => {
             walk_expr(&annotation.ty, scopes, visit);
             walk_expr(value, scopes, visit);
-            bind_target(target, stmt_end, scopes, visit);
+            bind_target(target, stmt_end, scopes);
         }
         Stmt::AugAssign { target, value, .. } => {
             // `x += v` reads the prior `x` in the RHS and rebinds it after.
             walk_expr(value, scopes, visit);
-            bind_target(target, stmt_end, scopes, visit);
+            bind_target(target, stmt_end, scopes);
         }
         Stmt::Define { target, value } => {
             walk_expr(value, scopes, visit);
-            bind_target(target, stmt_end, scopes, visit);
+            bind_target(target, stmt_end, scopes);
         }
 
         Stmt::If {
@@ -421,10 +329,6 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
                     ..
                 }) = pattern
                 {
-                    visit(Event::Binder {
-                        name,
-                        def_span: *name_span,
-                    });
                     scopes.push(Scoped {
                         name,
                         def_span: *name_span,
@@ -442,7 +346,7 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
             walk_expr(iter, scopes, visit);
             let base = scopes.len();
             let body_start = body.first().map(|s| s.span.start).unwrap_or(stmt_end);
-            bind_target(target, body_start, scopes, visit);
+            bind_target(target, body_start, scopes);
             walk_stmt_seq(body, scopes, visit);
             scopes.truncate(base);
         }
@@ -465,10 +369,6 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
             }
             // The def's name is bound in the enclosing scope from the statement
             // end onward, and its def-span is the name's own.
-            visit(Event::Binder {
-                name,
-                def_span: *name_span,
-            });
             scopes.push(Scoped {
                 name,
                 def_span: *name_span,
@@ -476,7 +376,7 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
             });
             let base = scopes.len();
             let body_start = body.first().map(|s| s.span.start).unwrap_or(stmt_end);
-            bind_params(params, body_start, scopes, visit);
+            bind_params(params, body_start, scopes);
             walk_stmt_seq(body, scopes, visit);
             scopes.truncate(base);
         }
@@ -494,7 +394,7 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
                 walk_expr(&annotation.ty, scopes, visit);
             }
             walk_expr(value, scopes, visit);
-            bind_target(target, stmt_end, scopes, visit);
+            bind_target(target, stmt_end, scopes);
         }
 
         // `with [binding =] begin(): body` — a transaction block. The context
@@ -593,7 +493,7 @@ fn walk_expr<'a>(expr: &'a Spanned<Expr>, scopes: &mut Vec<Scoped<'a>>, visit: &
         // `\params -> body` — params visible only inside the body.
         Expr::Lambda { params, body } => {
             let base = scopes.len();
-            bind_params(params, body.span.start, scopes, visit);
+            bind_params(params, body.span.start, scopes);
             walk_expr(body, scopes, visit);
             scopes.truncate(base);
         }
@@ -666,7 +566,7 @@ fn walk_comprehension<'a>(
                 // target; the target then binds across subsequent clauses + the
                 // element, visible from the iter's end.
                 walk_expr(iter, scopes, visit);
-                bind_target(target, iter.span.end, scopes, visit);
+                bind_target(target, iter.span.end, scopes);
             }
             CompClause::If(guard) => walk_expr(guard, scopes, visit),
         }
@@ -681,14 +581,9 @@ fn bind_target<'a>(
     target: &'a Spanned<AssignTarget>,
     visible_from: usize,
     scopes: &mut Vec<Scoped<'a>>,
-    visit: &mut Visitor<'_>,
 ) {
     match &target.node {
         AssignTarget::Name(name) => {
-            visit(Event::Binder {
-                name,
-                def_span: target.span,
-            });
             scopes.push(Scoped {
                 name,
                 def_span: target.span,
@@ -697,24 +592,15 @@ fn bind_target<'a>(
         }
         AssignTarget::Tuple(elts) => {
             for elt in elts {
-                bind_target(elt, visible_from, scopes, visit);
+                bind_target(elt, visible_from, scopes);
             }
         }
     }
 }
 
 /// Push each parameter binder, visible from `visible_from` (the body start).
-fn bind_params<'a>(
-    params: &'a [Param],
-    visible_from: usize,
-    scopes: &mut Vec<Scoped<'a>>,
-    visit: &mut Visitor<'_>,
-) {
+fn bind_params<'a>(params: &'a [Param], visible_from: usize, scopes: &mut Vec<Scoped<'a>>) {
     for p in params {
-        visit(Event::Binder {
-            name: &p.name,
-            def_span: p.name_span,
-        });
         scopes.push(Scoped {
             name: &p.name,
             def_span: p.name_span,
@@ -747,10 +633,19 @@ mod tests {
         Span::new(start, start + needle.len())
     }
 
-    /// goto-definition on an assignment variable's use resolves to the
-    /// binding-site span (the assignment target).
+    /// The def-span `definitions()` pairs with the use at `use_span`.
+    fn def_of(index: &NameBinderIndex, use_span: Span) -> Option<Span> {
+        index
+            .definitions()
+            .into_iter()
+            .find(|d| d.use_span == use_span)
+            .map(|d| d.def_span)
+    }
+
+    /// An assignment variable's use pairs with the binding-site span (the
+    /// assignment target) in `definitions()`.
     #[test]
-    fn goto_def_on_assignment_use_resolves_to_binding_site() {
+    fn a_use_pairs_with_its_assignment_target() {
         let code = "\
 x = 1 + 2
 y = x + 3
@@ -765,15 +660,14 @@ y
         let def_x = nth_span(code, "x", 0);
 
         assert_eq!(
-            index.definition_of(use_x),
+            def_of(&index, use_x),
             Some(def_x),
-            "use of x resolves to its assignment target span"
+            "use of x pairs with its assignment target span"
         );
     }
 
-    /// The motivating case for source-level resolution: goto-definition on a
-    /// **multi-param `def` parameter** use resolves to that param's `name_span`.
-    /// A lowered/uniquify
+    /// The motivating case for source-level resolution: a use of a **multi-param
+    /// `def` parameter** pairs with that param's `name_span`. A lowered/uniquify
     /// index structurally cannot do this — `uncurry_params` rewrites the
     /// multi-param reference `Var(a)` to `__arg_tuple_N ▷ .0` before uniquify,
     /// so `a` never survives as a renamable `Var`. Source-level resolution does.
@@ -798,19 +692,19 @@ combine(1, 2)
         let use_q = nth_span(code, "q", 1);
 
         assert_eq!(
-            index.definition_of(use_p),
+            def_of(&index, use_p),
             Some(param_p),
-            "multi-param `p` use resolves to its Param.name_span"
+            "multi-param `p` use pairs with its Param.name_span"
         );
         assert_eq!(
-            index.definition_of(use_q),
+            def_of(&index, use_q),
             Some(param_q),
-            "multi-param `q` use resolves to its Param.name_span"
+            "multi-param `q` use pairs with its Param.name_span"
         );
     }
 
-    /// Shadowing: a re-bound name resolves to the innermost (most recent)
-    /// binder visible at the use, per CHL's sequential let-style scoping.
+    /// Shadowing: a re-bound name pairs with the innermost (most recent) binder
+    /// visible at the use, per CHL's sequential let-style scoping.
     #[test]
     fn shadowing_resolves_to_innermost_binder() {
         let code = "\
@@ -831,22 +725,22 @@ x
         // The RHS use on line 2 sees only the *outer* `x` (the line-2 binder is
         // not visible to its own RHS — sequential let-style).
         assert_eq!(
-            index.definition_of(rhs_use),
+            def_of(&index, rhs_use),
             Some(def0),
-            "x in `x = x + 1` RHS resolves to the prior (outer) binding"
+            "x in `x = x + 1` RHS pairs with the prior (outer) binding"
         );
         // The trailing `x` sees the innermost (line-2) binder.
         assert_eq!(
-            index.definition_of(trailing_use),
+            def_of(&index, trailing_use),
             Some(def1),
-            "trailing x resolves to the innermost (shadowing) binder"
+            "trailing x pairs with the innermost (shadowing) binder"
         );
     }
 
-    /// `bindings_in_scope` at a nested position (inside a `def` body) returns
-    /// the expected visible names: the params + the enclosing-scope binders.
+    /// The scope region at a nested position (inside a `def` body) lists the
+    /// expected visible names: the params + the enclosing-scope binders.
     #[test]
-    fn bindings_in_scope_at_nested_position_lists_visible_names() {
+    fn scope_region_in_a_def_body_lists_the_visible_names() {
         let code = "\
 g = 10
 def f(p, q):
@@ -856,10 +750,16 @@ f(1, 2)
         let module = compile_source_ast(code);
         let index = NameBinderIndex::build(&module);
 
-        // A position on the body use of `p` (inside the def body).
+        // The region emitted for the body use of `p` — a region is emitted per
+        // expression, so this one's span is exactly that occurrence's.
         let body_use_p = nth_span(code, "p", 1);
-        let names: std::collections::HashSet<String> = index
-            .bindings_in_scope(body_use_p)
+        let region = index
+            .scopes()
+            .into_iter()
+            .find(|r| r.span == body_use_p)
+            .expect("a region is emitted at the body use of p");
+        let names: std::collections::HashSet<String> = region
+            .bindings
             .into_iter()
             .map(|b| b.name.to_string())
             .collect();
@@ -877,12 +777,13 @@ f(1, 2)
         );
     }
 
-    /// An unbound name resolves to `None` — graceful, no panic. Uses a raw
-    /// parse (an unbound reference fails type inference, so it can't go through
-    /// `compile_program`); name resolution is a pure function over the parsed
-    /// `Module`, exactly the point of source-level resolution.
+    /// An unbound use contributes no `definitions()` row — the enumeration skips
+    /// it rather than pairing it with anything. Uses a raw parse (an unbound
+    /// reference fails type inference, so it can't go through `compile_program`);
+    /// name resolution is a pure function over the parsed `Module`, exactly the
+    /// point of source-level resolution.
     #[test]
-    fn unbound_name_resolves_to_none() {
+    fn an_unbound_use_contributes_no_definition() {
         let code = "\
 x = 1
 z + x
@@ -890,28 +791,17 @@ z + x
         let module = crate::chl_parser::parse_module(code).value.expect("parses");
         let index = NameBinderIndex::build(&module);
 
-        // `z` is never bound → no definition.
+        // `z` is never bound → no row names it.
         let use_z = nth_span(code, "z", 0);
-        assert_eq!(
-            index.definition_of(use_z),
-            None,
-            "unbound z resolves to None"
-        );
-
-        // A span that is not a `Name` use at all (the literal `1`) → None.
-        let lit = nth_span(code, "1", 0);
-        assert_eq!(index.definition_of(lit), None);
-
-        // An out-of-tree span matches no use → None.
-        assert_eq!(
-            index.definition_of(Span::new(code.len() + 10, code.len() + 11)),
-            None,
-            "a span matching no use resolves to None"
+        assert_eq!(def_of(&index, use_z), None, "unbound z pairs with nothing");
+        assert!(
+            index.definitions().iter().all(|d| d.name != "z"),
+            "no definitions row carries the unbound name z"
         );
 
         // But `x` *is* bound, even in this parse-only module.
         let use_x = nth_span(code, "x", 1);
         let def_x = nth_span(code, "x", 0);
-        assert_eq!(index.definition_of(use_x), Some(def_x));
+        assert_eq!(def_of(&index, use_x), Some(def_x));
     }
 }

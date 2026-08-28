@@ -41,15 +41,16 @@
 //!
 //! # Scope
 //!
-//! Two source-side indices live here:
+//! Two source-side indices live here, both enumerated onto the wire rather than
+//! queried:
 //!
-//! * [`SpanIndex`] — span → typed-IR-node containment, over
-//!   [`post_inference_ir`](crate::ccl::context::CompiledProgram::post_inference_ir)
-//!   + the pane [`SourceProjection`](crate::ccl::provenance::SourceProjection).
-//! * [`NameBinderIndex`] — source-level lexical name resolution
-//!   (`goto-definition`, the binder half of `scope-at`), over the parsed CHL
-//!   surface AST retained on
-//!   [`source_ast`](crate::ccl::context::CompiledProgram::source_ast). It resolves
+//! * [`SpanIndex`] — the `(span, node)` table over one pane's tree and its
+//!   [`SourceProjection`](crate::ccl::provenance::SourceProjection), shipped as
+//!   a stage's `spanIndex`.
+//! * [`NameBinderIndex`] — source-level lexical name resolution, over the parsed
+//!   CHL surface AST retained on
+//!   [`source_ast`](crate::ccl::context::CompiledProgram::source_ast), shipped as
+//!   the payload's `definitions` and the name half of its `scopes`. It resolves
 //!   at the *source* level because lowering destroys the **name** of a
 //!   multi-param `def`/`lambda` parameter: `uncurry_params` rewrites `Var(p)` to
 //!   `__arg_tuple_N ▷ .i`, so nothing downstream binds or mentions `p`. The
@@ -57,20 +58,14 @@
 //!   *use* of such a parameter still resolves to a node and a type; what only the
 //!   surface AST can say is which binder that use refers to.
 //!
-//! # Query handlers
+//! # One payload, no point queries
 //!
-//! [`Snapshot`] bundles the two indices + the snapshot projections
-//! (source text, IR, per-pane [`SourceProjection`](crate::ccl::provenance::SourceProjection), surface AST) and exposes the
-//! transport-agnostic query handlers as methods: [`Snapshot::resolve`],
-//! [`Snapshot::hover`]/[`Snapshot::type_of`], [`Snapshot::goto_definition`],
-//! [`Snapshot::scope_at`], [`Snapshot::expand`]. These are pure reads — no
-//! serde, no I/O (serialization lives in the `cambra-inspector` crate, per the
-//! module doc above). Every value-ish result carries the
-//! always-`None` live seams (`tick`, `value_summary`).
-//!
-//! No consumer calls them, and they are removed by item 1 of
-//! `src/inspector_model/design.md`, "Decided, not yet built" — a positional
-//! question is the consumer's to answer over the shipped tables.
+//! [`Snapshot`] bundles the two indices with the per-pane projections (source
+//! text, one IR tree and one `SourceProjection` per pane, surface AST), and
+//! [`Snapshot::build_payload`] assembles the payload from them. That is the
+//! module's whole entry surface: a positional question is answered by the
+//! consumer over the shipped `(span, node)` rows and the shipped tree, which is
+//! the copy that runs. See `src/inspector_model/design.md`, "The usage model".
 
 mod index;
 mod name_binder;
@@ -80,9 +75,7 @@ mod stage;
 
 pub use index::SpanIndex;
 pub use name_binder::{Binding, Definition, NameBinderIndex, ScopeRegion};
-pub use query::{
-    GotoDefinition, Hover, Resolve, ScopeAt, ScopeBinding, Snapshot, Tick, ValueSummary,
-};
+pub use query::Snapshot;
 pub use snapshot::{
     DefinitionEntry, Diagnostic, DiagnosticLabel, Meta, PaneLinkEntry, SCHEMA_VERSION,
     ScopeBindingEntry, ScopeEntry, SnapshotPayload, SourceInfo, SpanEntry, StageEntry,

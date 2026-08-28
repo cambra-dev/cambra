@@ -24,7 +24,7 @@ disagreement between this document and the code is listed under
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | the `cambra-inspector` crate, which serves the payload, and that crate's frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
-| Vocabulary | a **pane** in the compiler is a **stage** on the wire — one concept, two names, each the name its own side already uses; item 9 consolidates them |
+| Vocabulary | a **pane** in the compiler is a **stage** on the wire — one concept, two names, each the name its own side already uses; the pane vocabulary change consolidates them |
 | `span` | throughout: a byte range in the **CHL source text**, never an offset into a rendered pane. Nothing in the payload addresses a pane's text |
 
 ## The usage model
@@ -45,15 +45,12 @@ Two rules follow.
   shipped. Answering it here as well would be a second implementation of one semantics, and the
   consumer's is the copy that runs.
 
-The point-query handlers this module currently exposes — `resolve`, `hover`, `type_of`,
-`goto_definition`, `scope_at`, `expand`, and the `SpanIndex` and `NameBinderIndex` lookups under
-them — predate that rule and are removed by item 1 of
-[Decided, not yet built](#decided-not-yet-built). No consumer calls them.
+So this module offers no positional query. `SpanIndex` and `NameBinderIndex` build their tables and
+enumerate them onto the wire; neither answers "what is at this position".
 
 The consumer's own lookup combines two shipped things: the `(span, node)` rows for containment, and
-the stage's tree for structure. Depth, which breaks a tie between byte-identical spans, comes from
-the tree it already walks, which is why the wire row carries no depth and why removing the Rust
-lookups changes no payload field.
+the pane's tree for structure. Depth, which breaks a tie between byte-identical spans, comes from
+the tree it already walks, which is why a span row carries no depth.
 
 ### The live model is a separate path
 
@@ -105,7 +102,7 @@ Each tree node carries:
 | `span` | the **narrowest** source span it traces to, or absent when it traces to none |
 | `rewritten` | `null` for a direct image, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
-| `children` | `{ edge, node }` pairs, where `node` is the child node itself; the node table (item 2) replaces this nesting with ids |
+| `children` | `{ edge, node }` pairs, where `node` is the child node itself; the node table replaces this nesting with ids |
 
 A node's `span` is one span even where it traces to several; the `(span, node)` rows carry all of
 them, so a node several source spans fan into is reachable from each.
@@ -151,7 +148,7 @@ walk here descends into predicates.
 predicate term is shared — the same term is reachable from a node's own type, from a binder's type,
 and from the types of other nodes — so a tree that hangs each occurrence off the slot that reached
 it repeats the whole subtree, and the span rows repeat with it. Until the predicate table lands
-(item 2), a consumer sees a `where.N` subtree more than once under one node, and one node id at
+a consumer sees a `where.N` subtree more than once under one node, and one node id at
 several tree positions, so a consumer keying nodes by id alone keeps whichever position it walked
 last.
 
@@ -162,14 +159,14 @@ same `Display`, so every type on the wire is one rendered string.
 
 The choice is provisional. A structural type would carry a refinement's predicate, which is an
 expression tree with node ids, re-creating inside every `type` field the repetition the predicate
-table removes (item 2);
+table removes;
 and the compact spelling — `⇒` against `⤇`, `T@lit` singletons, `{T | p}`, `Σ`, `?N` — would have to
 be reimplemented by the consumer.
 
 What it forecloses: a consumer cannot filter or colour by type structure, cannot link a refinement
 to the predicate subtree shipped beside it, cannot diff a node's type across panes except by string
 comparison, and cannot elide a long type by structure. The narrow facts that unlock those without a
-structural type are item 4.
+structural type are the type metadata below.
 
 ### A binder's type is the binder's
 
@@ -263,7 +260,7 @@ back its partial panes rather than one error; it is carried as `TODO(degraded-st
 
 A `Diagnostic` is a `CompileError` with a stage name, a message and a span. Today the message is the
 variant's `Debug` form for every variant but `Unsupported`, and only `Lower` and `Infer` carry a
-span; rendering each error through its `Display` and carrying its span (item 5) is what makes the
+span; rendering each error through its `Display` and carrying its span is what makes the
 JSON a second renderer of the same error rather than a dump of it.
 
 `meta` carries `snapshotKind`, the always-null live seam `tick`, and `schema`. The schema's
@@ -287,7 +284,7 @@ O(tree) for the tree and the span rows; per scope binding it is one or two full 
 tree, since `binder_type`'s probes run in sequence and a parameter's site misses both. So the scope
 join is O(bindings × tree).
 
-Measured at the time of writing, before the predicate table (item 2), which is what the size
+Measured at the time of writing, before the node table, which is what the size
 figures below are dominated by:
 
 ```chl
@@ -325,9 +322,7 @@ Size is the cost that binds, not time, and predicate repetition dominates it
 | `diagnostics_from_compile_errors` / `SnapshotPayload::degraded` | the compile-failure path |
 | the wire types | `SnapshotPayload`, `StageEntry`, `PaneLinkEntry`, `SpanEntry`, `DefinitionEntry`, `ScopeEntry`, `ScopeBindingEntry`, `Diagnostic`, `DiagnosticLabel`, `Meta`, `SCHEMA_VERSION` |
 
-`Snapshot::binder_type` is internal, and so is every item under
-[One payload per program](#one-payload-per-program-every-lookup-is-the-consumers) that item 1
-removes.
+`Snapshot::binder_type` is internal.
 
 Unit tests live in the module they exercise. `snapshot.rs`'s run over a three-program `corpus()`
 chosen for the shapes that reach the payload's moving parts: a comprehension for refinement
@@ -369,53 +364,51 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
 
 ## Decided, not yet built
 
-Each item is ratified here and lands in its own change.
+Each change is ratified here and lands on its own. They are named rather than numbered: a numbered
+list renumbers as entries land, and a reference to "item 4" would then point at the wrong change.
 
-1. **Remove the static query layer.** The point-query handlers, their result types, the
-   always-`None` fields on those results (`operator_id`, `value_summary`, the per-result `tick` —
-   not `meta.tick`, which stays), the `SpanIndex` lookups, the `NameBinderIndex` lookups, and
-   `SourceAttribution`'s `Serialize` impl, which only those results reached. Payload-invariant: no
-   fixture and no consumer change.
-2. **Ship a stage's nodes as a table keyed by `NodeId`**, with a `root` id, and make a node's
-   children `(edge, id)` pairs instead of nested nodes. Nothing then repeats: a shared predicate is
-   one entry that several slots name, a node reached from several places is one entry, and the
-   duplicate span rows go with them. It also matches how a consumer already works — keying nodes by
-   id — so the reconciliation described under
-   [Predicates are nodes](#predicates-are-nodes) stops being necessary. `spanIndex` stays: a node
-   carries its narrowest span, and those rows carry every span it traces to. A wire-shape change:
-   consumer, validator and fixtures move with it.
-3. **Mark a predicate child edge explicitly** rather than leaving a consumer to read the `where.`
-   prefix off a display label.
-4. **Carry two narrow type facts** beside the rendered string — a `typeKind` discriminant, and a
-   refinement's predicate as a reference into the predicate table — so a consumer can filter by type
-   and reach a predicate without a structural type.
-5. **Render a `CompileError` through `Display` where it has one, and carry its span.** A parse error
-   ships a struct dump and no span today, so the most common failure underlines nothing.
-6. **Deduplicate the scope regions** by span and binding set.
-7. **Move the wire node into this module**, carrying neither `annotations` nor `tiling`, and leave
-   `pretty_tree` a renderer with no serde and no domain types, per
-   [The wire belongs to this module](#the-wire-belongs-to-this-module).
-8. **Reorganize the modules** so each owns one concept, its inherent impl and its unit tests, with
-   no module depending on one above it. The target, which the current file names do not yet match —
-   today `snapshot.rs` holds the wire and `query.rs` holds the bundle:
+- **The node table.** Ship a pane's nodes as an array keyed by `NodeId`, with a `root` id, and make
+  a node's children `(edge, id)` pairs instead of nested nodes. Nothing then repeats: a shared
+  predicate is one entry that several slots name, a node reached from several places is one entry,
+  and the duplicate span rows go with them. It also matches how a consumer already works — keying
+  nodes by id — so the reconciliation described under
+  [Predicates are nodes](#predicates-are-nodes) stops being necessary. `spanIndex` stays: a node
+  carries its narrowest span, and those rows carry every span it traces to.
+- **Marked predicate edges.** Say on the edge itself that a child is a type-interior subtree,
+  rather than leaving a consumer to read the `where.` prefix off a display label.
+- **Type metadata.** Carry two narrow facts beside the rendered string — a `typeKind` discriminant,
+  and a refinement's predicate as a reference into the node table — so a consumer can filter by type
+  and reach a predicate without a structural type.
+- **Diagnostic rendering.** Render a `CompileError` through `Display` where it has one, and carry
+  its span. A parse error ships a struct dump and no span today, so the most common failure
+  underlines nothing.
+- **Scope-region deduplication.** Drop regions repeating a span and binding set already emitted.
+- **An inspector-owned wire node.** Move the wire node into this module, carrying neither
+  `annotations` nor `tiling`, and leave `pretty_tree` a renderer with no serde and no domain types,
+  per [The wire belongs to this module](#the-wire-belongs-to-this-module).
+- **Pane vocabulary.** Consolidate pane/stage on "pane", the name the compiler already defines and
+  the one `paneLinks` already uses: `stages` becomes `panes` on the wire, `StageEntry` becomes
+  `PaneEntry`, `StageProjection` becomes `PaneProjection`. It also frees "stage", which `stage.rs`
+  currently uses for the pane-link projection.
+- **The type renames.** `Snapshot` becomes `InspectedProgram` and `SnapshotPayload` becomes
+  `InspectorPayload`. "Snapshot" reads as one retained AST snapshot, which is what `provenance.md`
+  calls a pane, where the type is the whole read model over every pane. `InspectedProgram` parallels
+  the `CompiledProgram` it is built from. `meta.snapshotKind` becomes `payloadKind` — its values say
+  which payload this is, not which pane.
+- **Module reorganization.** One concept per module, each owning its type, its inherent impl and its
+  unit tests, with no module depending on one above it. The target, which the current file names do
+  not yet match — today `snapshot.rs` holds the wire and `query.rs` holds the bundle:
 
-   | module | owns |
-   |---|---|
-   | walk | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, tree height, node labels |
-   | span index | the `(span, node)` table over one pane |
-   | name binder | source-level name resolution over the surface AST |
-   | snapshot | the `Snapshot` bundle and its per-pane stage projections |
-   | wire | the payload types, the schema version, the payload assembly, and the pane-link projection |
+  | module | owns |
+  |---|---|
+  | walk | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, tree height, node labels |
+  | span index | the `(span, node)` table over one pane |
+  | name binder | source-level name resolution over the surface AST |
+  | snapshot | the bundle and its per-pane projections |
+  | wire | the payload types, the schema version, the payload assembly, and the pane-link projection |
 
-   Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
-   of one, and the **payload** is what ships.
-9. **Consolidate the pane/stage vocabulary on "pane"**, the name the compiler already defines and
-   the one `paneLinks` already uses: `stages` becomes `panes` on the wire, `StageEntry` becomes
-   `PaneEntry`, `StageProjection` becomes `PaneProjection`. A wire-shape change, so it rides with
-   items 2-4 and one schema bump. It also frees "stage", which `stage.rs` currently uses for the
-   pane-link projection.
-10. **Rename `Snapshot` to `InspectedProgram` and `SnapshotPayload` to `InspectorPayload`.**
-    "Snapshot" reads as one retained AST snapshot, which is what `provenance.md` calls a pane, where
-    the type is the whole read model over every pane. `InspectedProgram` parallels the
-    `CompiledProgram` it is built from. `meta.snapshotKind` becomes `payloadKind` — its values say
-    which payload this is, not which pane — and rides the same schema bump as items 2-4 and 9.
+  Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
+  of one, and the **payload** is what ships.
+
+The four wire-shape changes above — the node table, marked predicate edges, type metadata and the
+pane vocabulary — ride one schema bump together.

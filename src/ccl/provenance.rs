@@ -226,8 +226,7 @@ pub enum Nature {
 
 impl Nature {
     /// The lowercase wire discriminant (`"source"` / `"expansion"` /
-    /// `"machinery"`), shared by the per-node `ir` tree tag and the
-    /// `SourceAttribution` query wire so the two encodings never diverge.
+    /// `"machinery"`) a payload tree node's `rewritten` tag carries.
     ///
     /// `"source"` never reaches the wire: the sole emission path branches on
     /// [`is_source`](Self::is_source) first and writes `null` instead. The arm
@@ -241,8 +240,8 @@ impl Nature {
     }
 
     /// Whether this is the [`Source`](Self::Source) direct-image nature — the
-    /// wire null-compression predicate. A `SourceAttribution` whose tag
-    /// `is_source()` serializes its `rewritten` as `null`.
+    /// wire null-compression predicate. A node whose attribution tag
+    /// `is_source()` ships `rewritten: null`.
     pub(crate) fn is_source(self) -> bool {
         matches!(self, Nature::Source)
     }
@@ -489,46 +488,6 @@ pub struct SourceAttribution {
     /// that produced the node. Null-compressed on the wire when the tag
     /// [`is_source`](Nature::is_source).
     pub rewritten: RewriteTag,
-}
-
-// Wire shape (inspector, feature `serde`): the attribution ships natively. The
-// query endpoints (`/api/resolve`, `/api/hover`) carry a `SourceAttribution` as
-// `{ spans, rewritten: null | { via, nature, label } }` — the same two-channel
-// shape the per-node `ir` tree carries (spans + rewrite tag), letting the
-// frontend format the tag itself rather than consuming a pre-flattened string.
-//
-// Null-compression: a `Source`-nature tag (a direct image) serializes its
-// `rewritten` as `null`. This is the sole emission path, so a `"source"` nature
-// cannot reach the wire.
-#[cfg(feature = "serde")]
-impl serde::Serialize for SourceAttribution {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
-        /// The wire form of a [`RewriteTag`]: `via` as the `Phase` debug name,
-        /// `nature` as the lowercase discriminant, `label` verbatim.
-        #[derive(serde::Serialize)]
-        struct WireTag {
-            via: String,
-            nature: &'static str,
-            label: &'static str,
-        }
-
-        // Direct images null-compress: a Source-nature tag ships as `null`.
-        let rewritten = if self.rewritten.nature.is_source() {
-            None
-        } else {
-            Some(WireTag {
-                via: format!("{:?}", self.rewritten.via),
-                nature: self.rewritten.nature.wire_str(),
-                label: self.rewritten.label,
-            })
-        };
-        let mut s = serializer.serialize_struct("SourceAttribution", 2)?;
-        s.serialize_field("spans", &self.spans)?;
-        s.serialize_field("rewritten", &rewritten)?;
-        s.end()
-    }
 }
 
 /// How a rewritten node came to exist, for tooltips and display policy.
