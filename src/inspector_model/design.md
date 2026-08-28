@@ -242,8 +242,9 @@ downstream binds or mentions `p`. The occurrence keeps its own id and span, so a
 resolves to a node and a type; what no IR pass can recover is which binder that use refers to, and
 that is what `NameBinderIndex` answers.
 
-A scope region is emitted per statement and per expression, minus those where no name is visible, so
-the regions are dense and nest.
+A scope region is emitted per statement and per expression, minus those where no name is visible and
+those repeating a span and binder set already emitted — a statement and its expression share a span,
+so the walk reaches one region twice. The regions that remain are dense and nest.
 
 ### Diagnostics and the degraded payload
 
@@ -308,7 +309,7 @@ max(ys) + f(1, 2)
 | span rows | 2,443 — one per position, since every node here carries exactly one span — of which 1,571 repeat a `(span, node)` pair already present |
 | `where.N` edges | 153, of which 29 duplicate within one node |
 | pane-link edges | 419 |
-| scope regions | 27, over 85 bindings, 2 of the regions repeating a row already present |
+| scope regions | 25, over 76 bindings |
 | build time | about 11 ms for the bundle and the payload together |
 
 Size is the cost that binds, not time, and predicate repetition dominates it
@@ -384,7 +385,6 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
 - **Type metadata.** Carry two narrow facts beside the rendered string — a `typeKind` discriminant,
   and a refinement's predicate as a reference into the node table — so a consumer can filter by type
   and reach a predicate without a structural type.
-- **Scope-region deduplication.** Drop regions repeating a span and binding set already emitted.
 - **An inspector-owned wire node.** Move the wire node into this module, carrying neither
   `annotations` nor `tiling`, and leave `pretty_tree` a renderer with no serde and no domain types,
   per [The wire belongs to this module](#the-wire-belongs-to-this-module).

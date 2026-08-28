@@ -153,8 +153,10 @@ impl NameBinderIndex {
     /// binders visible inside it — the data behind the `/api/snapshot` `scopes`
     /// array (the type join is the caller's, since it needs the `SpanIndex`).
     ///
-    /// A region is emitted per statement and per expression, minus those whose
-    /// visible-binder set is empty (an empty `scopes` row carries nothing). The
+    /// A region is emitted per statement and per expression, minus those where
+    /// no name is visible and those repeating a span and binder set already
+    /// emitted — a statement and its expression share a span, so the walk reaches
+    /// one region twice. The
     /// binders are the ones visible at the region's start, outermost →
     /// innermost. Regions therefore repeat where a statement and its expression
     /// share a span; `src/inspector_model/design.md`, "Decided, not yet built"
@@ -166,17 +168,37 @@ impl NameBinderIndex {
     /// tree.
     pub fn scopes(&self) -> Vec<ScopeRegion> {
         let mut out: Vec<ScopeRegion> = Vec::new();
+        let mut seen: std::collections::HashSet<RegionKey> = std::collections::HashSet::new();
         let mut scopes: Vec<Scoped> = Vec::new();
         walk_module(&self.module, &mut scopes, &mut |ev| {
             if let Event::Scope { span, scopes } = ev {
                 let bindings = visible_bindings(scopes, span.start);
-                if !bindings.is_empty() {
+                // A statement and its expression share a span and see the same
+                // names, so the walk reaches one region twice. A repeat carries
+                // nothing a consumer can act on, so the first one stands.
+                if !bindings.is_empty() && seen.insert(region_key(span, &bindings)) {
                     out.push(ScopeRegion { span, bindings });
                 }
             }
         });
         out
     }
+}
+
+/// What makes two [`ScopeRegion`]s the same row: one span over one set of
+/// visible binders. [`Span`] is not `Hash`, so the offsets stand in for it.
+type RegionKey = (usize, usize, Vec<(SmolStr, usize, usize)>);
+
+/// The deduplication key of a region — see [`RegionKey`].
+fn region_key(span: Span, bindings: &[Binding]) -> RegionKey {
+    (
+        span.start,
+        span.end,
+        bindings
+            .iter()
+            .map(|b| (b.name.clone(), b.def_span.start, b.def_span.end))
+            .collect(),
+    )
 }
 
 /// An event surfaced during the AST walk: an [`Event::Use`] at every `Name`
@@ -735,6 +757,40 @@ x
             Some(def1),
             "trailing x pairs with the innermost (shadowing) binder"
         );
+    }
+
+    /// No two scope regions carry one span and one binder set: a statement and
+    /// its expression are reached separately by the walk and would otherwise
+    /// ship the same row twice.
+    #[test]
+    fn no_scope_region_repeats_a_span_and_binder_set() {
+        let code = "\
+g = 10
+def f(p, q):
+  p + q + g
+f(1, 2)
+";
+        let module = compile_source_ast(code);
+        let regions = NameBinderIndex::build(&module).scopes();
+        assert!(!regions.is_empty(), "the program has visible binders");
+
+        let mut seen = std::collections::HashSet::new();
+        for region in &regions {
+            let key = (
+                region.span.start,
+                region.span.end,
+                region
+                    .bindings
+                    .iter()
+                    .map(|b| b.name.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            assert!(
+                seen.insert(key.clone()),
+                "region {key:?} repeats a row already emitted; {} regions",
+                regions.len()
+            );
+        }
     }
 
     /// The scope region at a nested position (inside a `def` body) lists the
