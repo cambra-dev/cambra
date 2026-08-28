@@ -1848,6 +1848,100 @@ fn test_statement_if_write_carries_past_the_conditional(
     check_scalar(code, expected);
 }
 
+// A conditional nested inside a block right-hand side's branch. The inner one
+// normalizes first, which leaves its writes on the branches of a `Case` standing
+// where a statement stood, so the enclosing binding pushes only if
+// `spine_writes_mut` follows a `Case`'s branches as well as a spine. Every path
+// through the outer branch writes, and the continuation lands on each of them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// A statement `if` inside the branch.
+#[case(indoc! {"
+    acc := 0
+    x = if True:
+            if True:
+                acc += 2
+            else:
+                acc += 0
+            1
+        else:
+            0
+    acc + x"}, Value::Int(3))]
+// A block right-hand side inside the branch.
+#[case(indoc! {"
+    acc := 0
+    x = if True:
+            y = if True:
+                    acc += 2
+                    1
+                else:
+                    0
+            y
+        else:
+            0
+    acc + x"}, Value::Int(3))]
+// The nested block right-hand side's value is computed with, so its terminal is
+// not the branch's.
+#[case(indoc! {"
+    acc := 0
+    x = if True:
+            y = if True:
+                    acc += 2
+                    1
+                else:
+                    0
+            y + 10
+        else:
+            0
+    acc + x"}, Value::Int(13))]
+// The branch the scrutinee does not take is the nesting one.
+#[case(indoc! {"
+    acc := 1
+    x = if False:
+            0
+        else:
+            y = if True:
+                    acc += 5
+                    2
+                else:
+                    0
+            y
+    acc + x"}, Value::Int(8))]
+fn test_nested_conditional_write_carries_out_of_a_block_right_hand_side(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+// A branch's value reads what that branch wrote — the write is sequenced ahead
+// of the terminal on the branch's own spine, so the read-your-writes
+// environment `transform_chain` threads already carries it
+// (`docs/chl-spec.md`, "4.3 Assignment forms").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                acc
+            else:
+                0
+        yield t
+    acc"}, Value::Int(5))]
+#[case(indoc! {"
+    acc := 10
+    t = if True:
+            acc += 5
+            acc
+        else:
+            0
+    t"}, Value::Int(15))]
+fn test_a_branch_value_reads_what_the_branch_wrote(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// A `match` arm that computes over a name bound outside the `match` reaches
 /// operator conversion as a bare `BinOp`. The program below writes nothing and
 /// fails identically on `main`, so it bounds `match` support below the

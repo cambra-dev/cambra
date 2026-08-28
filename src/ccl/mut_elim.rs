@@ -184,35 +184,26 @@ fn is_mut_write(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::MutWrite { .. })
 }
 
-/// Whether `e`'s statement spine performs a mutable write, following `ExprStmt`
-/// effects/bodies and `Let` continuations. Broader than "heads a write": a
-/// pass-by-reference writer that computes an intermediate first
-/// (`tmp = c + 1; c := tmp`) splices as a `Let`-headed body whose write sits
-/// *past* the leading binding. Used to gate `flatten_spine`'s `Let`-hoist — it
-/// fires only for genuine writer bodies, never for a pure `Let` (a join subplan
-/// spine holds no `MutWrite`, so its reassociation is left undisturbed).
+/// Whether some path through `e` performs a mutable write, following `ExprStmt`
+/// effects/bodies, `Let` continuations, and a `Case`'s branches. Broader than
+/// "heads a write": a pass-by-reference writer that computes an intermediate
+/// first (`tmp = c + 1; c := tmp`) splices as a `Let`-headed body whose write
+/// sits *past* the leading binding, and a conditional nested inside a block
+/// right-hand side normalizes to a `Case` standing where a statement did
+/// (`push_binding_into_case`), which puts its writes on the branches rather
+/// than on the spine. Used to gate `flatten_spine`'s `Let`-hoist — it fires
+/// only for genuine writer bodies, never for a pure `Let` (a join subplan spine
+/// holds no `MutWrite`, so its reassociation is left undisturbed).
 fn spine_writes_mut(e: &Expr) -> bool {
     match &e.node {
         TypedExprNode::MutWrite { .. } => true,
         TypedExprNode::ExprStmt { expr, body } => is_mut_write(expr) || spine_writes_mut(body),
         TypedExprNode::Let { body, .. } => spine_writes_mut(body),
+        TypedExprNode::Case { branches, .. } => branches.iter().any(|b| spine_writes_mut(&b.body)),
         _ => false,
     }
 }
 
-/// Splice `let binding = ⟨terminal⟩ in body` into the *terminal* position of a
-/// spliced pass-by-reference writer body, lifting every leading statement
-/// (`ExprStmt` effect) and intermediate binding (`Let`) onto the outer
-/// statement spine in order. The writer body's terminal value becomes
-/// `binding`'s bound value; a body ending in a bare `MutWrite` has value `unit`
-/// (its mutable variable's final state is unobserved through the binding).
-///
-/// This is the general form of the flat-spine hoist. Widening an intermediate
-/// binding's scope over `body` is sound post-uniquify: the intermediate is a
-/// fresh callee-local, and `body` (the caller's continuation) never references
-/// it. The writes are sequenced *before* binding — a mutable write reads the
-/// *previous* value, so it never observes the binder — preserving evaluation
-/// order and scope.
 /// Lift a `Case` branch's writes onto its own spine and put `cont` after them,
 /// with the branch's terminal value substituted for `name`.
 ///
@@ -223,8 +214,9 @@ fn spine_writes_mut(e: &Expr) -> bool {
 /// The terminal is **substituted**, not bound. A `let` surviving inside a branch
 /// escapes the writer lambda `transform_chain` builds from it, which is the same
 /// reason a `MutWrite`'s value is inlined into the read-your-writes environment
-/// rather than bound. The terminal is pure by construction: every write ahead of
-/// it is lifted onto the spine here.
+/// rather than bound. What is substituted is pure: a terminal `Case` that still
+/// writes is descended into instead, so every write ends up ahead of the
+/// continuation on its own path.
 fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
     match branch.node {
         // 1:1 reparents: the statement survives at a new spine position, so it
@@ -244,6 +236,29 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
             *bound_expr,
             splice_branch_value(name, *body, cont),
         ),
+        // A terminal `Case` that writes: the paths continue into its branches, so
+        // the continuation goes to each of them. Substituting the `Case` whole
+        // would put a write inside the continuation's own expression.
+        TypedExprNode::Case {
+            scrutinee,
+            mut branches,
+        } if branches.iter().any(|b| spine_writes_mut(&b.body)) => {
+            for br in branches.iter_mut() {
+                let body = std::mem::take(&mut br.body);
+                br.body = splice_branch_value(name, body, cont.clone());
+            }
+            let ty = branches
+                .first()
+                .map_or_else(|| branch.ty.clone(), |b| b.body.ty.clone());
+            Expr {
+                node: TypedExprNode::Case {
+                    scrutinee,
+                    branches,
+                },
+                ty,
+                ..branch
+            }
+        }
         other => {
             let terminal = Expr {
                 node: other,
@@ -254,6 +269,19 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
     }
 }
 
+/// Splice `let binding = ⟨terminal⟩ in body` into the *terminal* position of a
+/// spliced pass-by-reference writer body, lifting every leading statement
+/// (`ExprStmt` effect) and intermediate binding (`Let`) onto the outer
+/// statement spine in order. The writer body's terminal value becomes
+/// `binding`'s bound value; a body ending in a bare `MutWrite` has value `unit`
+/// (its mutable variable's final state is unobserved through the binding).
+///
+/// This is the general form of the flat-spine hoist. Widening an intermediate
+/// binding's scope over `body` is sound post-uniquify: the intermediate is a
+/// fresh callee-local, and `body` (the caller's continuation) never references
+/// it. The writes are sequenced *before* binding — a mutable write reads the
+/// *previous* value, so it never observes the binder — preserving evaluation
+/// order and scope.
 fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Expr {
     match writer_body.node {
         // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
@@ -305,55 +333,19 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
     }
 }
 
-/// **Flat-spine invariant (load-bearing).** On every statement spine, each
-/// mutable write (`MutWrite`) must appear as the *direct* `expr` child of an
-/// `ExprStmt` — never buried under another `ExprStmt`, nor as a `Let`/terminal
-/// bound-expression.
+/// Push the binding and the continuation of a `Let`-bound `Case` whose branches
+/// write into those branches, so each write's advance scopes over them.
 ///
-/// Lowering emits a *bare* `MutWrite` (no continuation) for a pass-by-reference
-/// writer's final statement so inlining can splice the writer's body into its
-/// call site (see `lower_final_stmt`). Post-inline, that splice can land the
-/// write off the spine in several shapes; `flatten_spine` commutes each back on
-/// via conversions applied to a fixpoint:
+/// A write is a shadowing advance over the rest of the scope it sits in, and a
+/// branch's scope ends at the value the binding takes, so the update would reach
+/// nothing after the `Let`. [`splice_branch_value`] does the per-branch splice:
+/// the branch's writes lift onto its own spine and its terminal is substituted
+/// into the continuation.
 ///
-/// - `ExprStmt(ExprStmt(𝑤, 𝑏), 𝑐)  →  ExprStmt(𝑤, ExprStmt(𝑏, 𝑐))` — a
-///   multi-statement writer body (`def f(c): c += 1; c += 2`) spliced as one
-///   effect.
-/// - A `Let` bound to a *value-position* writer body (`y = f(c)`) whose spine
-///   performs a mutable write: `hoist_writer_body` splices `let y = ⟨terminal⟩ in
-///   k` into the body's terminal position, lifting its leading statements and
-///   intermediate bindings onto the outer spine. This subsumes the direct
-///   cases `Let(𝑥, ExprStmt(𝑤, 𝑢), 𝑘)` and `Let(𝑥, MutWrite(..), 𝑘)` and the
-///   *intermediate-first* case `Let(𝑥, Let(tmp, 𝑒, 𝑤), 𝑘)`
-///   (`def f(c): tmp = c + 1; c := tmp`), which the earlier head-only hoist
-///   missed — leaving the write trapped in the bound expression and silently
-///   mis-normalized (or surviving the phase as a marker).
-///
-/// and terminalizes a value-position write (a trailing `cnt += 1` with no
-/// read, whose final state is unobserved):
-///
-/// - `MutWrite(..)                  →  ExprStmt(MutWrite(..), unit)`.
-///
-/// The `Let`-hoist is gated on `spine_writes_mut`: only a genuine writer body
-/// is reassociated. `Feed`/`Define`-headed `ExprStmt` chains keep their nesting
-/// — channelize collects feeds outermost-first, so reassociating them would
-/// reorder channel contributions — and a pure `Let` (e.g. a join subplan) holds
-/// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
-/// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
-/// `transform_chain` never meet a mutable write in value position.
-// A `Case` bound by a `Let` whose branches write. The write becomes a
-// shadowing advance over the rest of the scope it sits in, and a branch's
-// scope ends at the value the binding takes, so the update would reach
-// nothing after the `Let`. Push the binding and the continuation into every
-// branch, which puts each write on a spine whose scope *is* the
-// continuation. The per-branch splice is `hoist_writer_body`, the same one
-// an unconditional writer body in this position takes: the branch's terminal
-// becomes the bound value, and its writes sequence ahead of the binding.
-//
-// The `Case` is left in statement position with value `unit`. Inside a loop
-// body that is the shape `transform_chain`'s guard-`Case` arm merges into
-// one writer decision; outside one, each branch is an ordinary write spine.
-pub(crate) fn push_binding_into_case(e: &mut Expr) -> Option<Expr> {
+/// The `Case` then takes the continuation's type. A continuation yielding
+/// nothing leaves it in effect position, which is where `transform_chain` reads
+/// a guard-`Case`; one yielding a value leaves it where the `Let` stood.
+fn push_binding_into_case(e: &mut Expr) -> Option<Expr> {
     let applies = matches!(&e.node, TypedExprNode::Let { bound_expr, .. }
         if matches!(&bound_expr.node, TypedExprNode::Case { branches, .. }
             if branches.iter().any(|b| spine_writes_mut(&b.body))));
@@ -470,14 +462,9 @@ pub(crate) fn push_bindings_into_writing_cases(expr: Expr) -> Expr {
 /// `in_loop_body` gates the statement-position rewrite: a for-loop body's own
 /// guard-`Case` is the recurrence's, and `transform_chain` reads it there.
 fn push_writing_cases(mut expr: Expr, in_loop_body: bool) -> Expr {
-    if let Some(pushed) = push_binding_into_case(&mut expr) {
-        return push_writing_cases(pushed, in_loop_body);
-    }
-    if !in_loop_body && let Some(pushed) = push_continuation_into_case(&mut expr) {
-        return push_writing_cases(pushed, in_loop_body);
-    }
     // A loop's source is evaluated outside its body, so only the body crosses
-    // into the recurrence's scope.
+    // into the recurrence's scope. Neither rewrite matches a `For`, so this
+    // arm is done once its two children are.
     if let TypedExprNode::For { iter, body, .. } = &mut expr.node {
         let taken_iter = std::mem::take(&mut **iter);
         **iter = push_writing_cases(taken_iter, in_loop_body);
@@ -485,10 +472,56 @@ fn push_writing_cases(mut expr: Expr, in_loop_body: bool) -> Expr {
         **body = push_writing_cases(taken_body, true);
         return expr;
     }
+    // Children before this node. Pushing a nested `Case` lifts its writes onto
+    // the branch spine of the `Case` enclosing it, and `spine_writes_mut` reads
+    // exactly that spine — so a binding whose branches write only through a
+    // block right-hand side of their own qualifies only after the inner push.
     expr.map_children(|c| push_writing_cases(c, in_loop_body));
+    if let Some(pushed) = push_binding_into_case(&mut expr) {
+        return push_writing_cases(pushed, in_loop_body);
+    }
+    if !in_loop_body && let Some(pushed) = push_continuation_into_case(&mut expr) {
+        return push_writing_cases(pushed, in_loop_body);
+    }
     expr
 }
 
+/// **Flat-spine invariant (load-bearing).** On every statement spine, each
+/// mutable write (`MutWrite`) must appear as the *direct* `expr` child of an
+/// `ExprStmt` — never buried under another `ExprStmt`, nor as a `Let`/terminal
+/// bound-expression.
+///
+/// Lowering emits a *bare* `MutWrite` (no continuation) for a pass-by-reference
+/// writer's final statement so inlining can splice the writer's body into its
+/// call site (see `lower_final_stmt`). Post-inline, that splice can land the
+/// write off the spine in several shapes; `flatten_spine` commutes each back on
+/// via conversions applied to a fixpoint:
+///
+/// - `ExprStmt(ExprStmt(𝑤, 𝑏), 𝑐)  →  ExprStmt(𝑤, ExprStmt(𝑏, 𝑐))` — a
+///   multi-statement writer body (`def f(c): c += 1; c += 2`) spliced as one
+///   effect.
+/// - A `Let` bound to a *value-position* writer body (`y = f(c)`) whose spine
+///   performs a mutable write: `hoist_writer_body` splices `let y = ⟨terminal⟩ in
+///   k` into the body's terminal position, lifting its leading statements and
+///   intermediate bindings onto the outer spine. This subsumes the direct
+///   cases `Let(𝑥, ExprStmt(𝑤, 𝑢), 𝑘)` and `Let(𝑥, MutWrite(..), 𝑘)` and the
+///   *intermediate-first* case `Let(𝑥, Let(tmp, 𝑒, 𝑤), 𝑘)`
+///   (`def f(c): tmp = c + 1; c := tmp`), which the earlier head-only hoist
+///   missed — leaving the write trapped in the bound expression and silently
+///   mis-normalized (or surviving the phase as a marker).
+///
+/// and terminalizes a value-position write (a trailing `cnt += 1` with no
+/// read, whose final state is unobserved):
+///
+/// - `MutWrite(..)                  →  ExprStmt(MutWrite(..), unit)`.
+///
+/// The `Let`-hoist is gated on `spine_writes_mut`: only a genuine writer body
+/// is reassociated. `Feed`/`Define`-headed `ExprStmt` chains keep their nesting
+/// — channelize collects feeds outermost-first, so reassociating them would
+/// reorder channel contributions — and a pure `Let` (e.g. a join subplan) holds
+/// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
+/// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
+/// `transform_chain` never meet a mutable write in value position.
 fn flatten_spine(mut e: Expr) -> Expr {
     // Un-nest a *mutable-write-headed* nested sequence (a spliced multi-statement
     // writer body). A Feed/Define-headed nested `ExprStmt` keeps its nesting.
