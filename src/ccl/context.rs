@@ -698,6 +698,12 @@ pub enum Phase {
 /// cannot tell the sharing apart from the collision — which is why the main-tree
 /// walk stays `Rc`-blind and this one does not.
 ///
+/// Coverage is [`TypedExpr::walk_type_slots`]', which is what reaches a predicate
+/// riding a binder's **annotation** and nothing else. `f: (Int => {Int where _ ==
+/// 9}) = …` is that shape, and it is live at the `post-lowering` boundary: the
+/// annotation holds the only occurrence until inference consumes it, so a walk
+/// over node types alone enumerates none of the predicate's ids there.
+///
 /// Both walks run at every boundary, from [`assert_unique_node_ids`].
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     use crate::ccl::ty::Type;
@@ -724,13 +730,7 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         });
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        from_ty(&e.ty, acc);
-        if let Some(a) = &e.user_annotation {
-            from_ty(a, acc);
-        }
-        if let crate::ccl::TypedExprNode::Cast { target, .. } = &e.node {
-            from_ty(target, acc);
-        }
+        e.walk_type_slots(|t| from_ty(t, acc));
         e.walk_children(|c| from_expr_ty(c, acc));
     }
     let mut terms: HashMap<usize, HashSet<NodeId>> = HashMap::new();
