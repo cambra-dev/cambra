@@ -315,9 +315,12 @@ pub struct ScopeBindingEntry {
 pub struct Diagnostic {
     /// Severity discriminant — `"error"` (no warnings).
     pub severity: String,
-    /// The compile pane that produced it — `"parse"`, `"lower"`, `"infer"`, …
-    /// (the `CompileError` variant's pane).
-    pub pane: String,
+    /// The compiler stage that produced it — `"parse"`, `"lower"`, `"infer"`, …
+    ///
+    /// A `CompileError` variant, not a pane: no value of it appears in
+    /// [`PANES`](crate::ccl::panes::PANES). This is the one place the word
+    /// "stage" is the right one.
+    pub stage: String,
     /// The human-readable message (reuses the variant's rendered text).
     pub message: String,
     /// The primary source span, when one is known.
@@ -356,7 +359,7 @@ impl Diagnostic {
     /// [`CompileError`]: crate::ccl::context::CompileError
     pub fn from_compile_error(error: &crate::ccl::context::CompileError) -> Self {
         use crate::ccl::context::CompileError;
-        let (pane, message, span) = match error {
+        let (stage, message, span) = match error {
             CompileError::Parse(e) => ("parse", e.to_string(), Some(e.span())),
             CompileError::Lower(e) => ("lower", e.to_string(), Some(e.span())),
             CompileError::ChannelizeDefers(e) => ("channelizeDefers", e.to_string(), None),
@@ -375,7 +378,7 @@ impl Diagnostic {
             .unwrap_or_default();
         Diagnostic {
             severity: "error".to_string(),
-            pane: pane.to_string(),
+            stage: stage.to_string(),
             message,
             span,
             labels,
@@ -1217,7 +1220,7 @@ mod tests {
         let diagnostics = diagnostics_from_compile_errors(&errors);
         let parse = diagnostics
             .iter()
-            .find(|d| d.pane == "parse")
+            .find(|d| d.stage == "parse")
             .unwrap_or_else(|| panic!("a parse diagnostic; got {diagnostics:?}"));
 
         assert!(
@@ -1259,7 +1262,7 @@ mod tests {
             "generators are not supported here",
         ));
         let diagnostic = Diagnostic::from_compile_error(&error);
-        assert_eq!(diagnostic.pane, "lower");
+        assert_eq!(diagnostic.stage, "lower");
         assert_eq!(diagnostic.message, "generators are not supported here");
         assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
     }
