@@ -85,8 +85,8 @@ impl SpanIndex {
         expr.walk_children(|c| Self::collect(c, projection, visited, out));
         // Predicate interiors carry their own attributions, so a position inside
         // one has to reach it — see
-        // [`predicate_children`](crate::inspector_model::query::predicate_children).
-        for (_, predicate) in crate::inspector_model::query::predicate_children(expr) {
+        // [`predicate_children`](super::walk::predicate_children).
+        for (_, predicate) in super::walk::predicate_children(expr) {
             Self::collect(predicate, projection, visited, out);
         }
     }
@@ -140,7 +140,7 @@ x
         fn holds(expr: &Expr, target: NodeId) -> bool {
             expr.node_id() == target
                 || expr.child_exprs().iter().any(|c| holds(c, target))
-                || crate::inspector_model::query::predicate_children(expr)
+                || crate::inspector_model::walk::predicate_children(expr)
                     .iter()
                     .any(|(_, p)| holds(p, target))
         }

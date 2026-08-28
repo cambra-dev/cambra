@@ -1,4 +1,4 @@
-# The inspector model — the snapshot the inspector serves
+# The inspector model — the payload the inspector serves
 
 `src/inspector_model/` turns a `CompiledProgram` into one read-only payload describing that program:
 its source, its IR at every retained pane, the links between adjacent panes, and its source-level
@@ -10,11 +10,8 @@ projections and maps — the leak gate reads the same folds' `leaks` under
 `CAMBRA_PROVENANCE_GATE`, see [provenance.md](../ccl/design/provenance.md#the-seam) — and a release
 compile reads the lowering projection alone.
 
-**Status.** The payload, the two indices, the per-pane node tables and the pane-pair links are in
-tree.
-Prose marked **planned** describes what is designed and not built: the live-value path. Every
-disagreement between this document and the code is listed under
-[Decided, not yet built](#decided-not-yet-built).
+**Status.** This document describes code you can go read. Prose marked **planned** is the one
+exception, and describes what is designed and not built: the live-value path.
 
 ## At a glance
 
@@ -33,8 +30,8 @@ disagreement between this document and the code is listed under
 
 `cambra-inspector` compiles a program once at startup and serves the rendered payload from memory.
 Its frontend fetches that payload once and answers every interaction from it — clicking a node,
-hovering a span, following a link from one pane to the next. No snapshot interaction reaches the
-compiler or a running program; reading a running program is the separate path below.
+hovering a span, following a link from one pane to the next. None of that reaches the compiler or a
+running program; reading a running program is the separate path below.
 
 Two rules follow.
 
@@ -75,7 +72,7 @@ pane's declared name, its `label` is that name rendered as `IR (POST-INFERENCE)`
 `"holes"` before inference has run and `"typed"` at or after it, read off the phases the pane
 declares rather than off its position. Adding a pane is an entry in `PANES` and no edit here.
 
-`the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair` (`snapshot.rs`) pins the
+`the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair` (`wire.rs`) pins the
 ids,
 the order, the arity and the kind split.
 
@@ -122,7 +119,7 @@ text carries `Machinery` with the label `"lower.image"` instead — see
 
 A node the pane's projection does not cover ships the same `null`, for both `rewritten` and `span`,
 so the wire cannot tell an unexplained node from a lowering root.
-`every_node_of_every_pane_carries_an_attribution` (`snapshot.rs`) is what keeps the first case from
+`every_node_of_every_pane_carries_an_attribution` (`wire.rs`) is what keeps the first case from
 arising, over the same corpus the other payload tests use.
 
 The wire carries no flat `Source`/`Derived`/`Synthetic` string; a consumer formats the triple
@@ -149,7 +146,7 @@ made from it — as a set, since an edge reachable both ways carries both. The l
 empty.
 
 Every endpoint of every edge is a node of the tree it points into: an edge a consumer follows always
-lands somewhere. `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` (`snapshot.rs`)
+lands somewhere. `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` (`wire.rs`)
 asserts it at the producer, and the consumer's wire validator re-checks it on the shipped payload —
 that branch of the validator has no test of its own.
 
@@ -249,7 +246,7 @@ span covers the binding site, for the node that holds the binder — by two test
 A parameter's name span is no node's span and no binder carries the name, so both tests miss and the
 answer is `None`. `a_binder_joins_its_own_type_not_the_continuations`,
 `a_def_binder_joins_its_function_type` and `a_substituted_multi_param_binder_joins_no_type`
-(`query.rs`) pin the three outcomes.
+(`program.rs`) pin the three outcomes.
 
 **A better design exists and is not built.** The two tests reconstruct a fact the compiler had and
 dropped. Either of two channels would replace them with a read, and both are follow-up work beyond
@@ -303,8 +300,7 @@ The span is the error's own wherever it has one. `Parse` and `Lower` read theirs
 
 `SCHEMA_VERSION` is the payload's wire version, carried as `meta.schema`, and is **5**. A breaking
 change — a field removed, renamed or retyped, or a value shape an old consumer would misread — bumps
-it; purely additive optional fields do not. The node table bumped it to 5, and the wire changes
-still to land ride that bump rather than adding their own, since 5 has not shipped.
+it; purely additive optional fields do not.
 
 The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
 every node id included, so any change re-blesses all of them; its wire validator pins the schema
@@ -318,8 +314,7 @@ O(tree) for the tree and the span rows; per scope binding it is one or two full 
 tree, since `binder_type`'s probes run in sequence and a parameter's site misses both. So the scope
 join is O(bindings × tree).
 
-Measured at the time of writing, before the node table, which is what the size
-figures below are dominated by:
+Measured at the time of writing on this program:
 
 ```chl
 xs = [1, 2, 3, 4]
@@ -359,7 +354,21 @@ shared term.
 
 `InspectedProgram::binder_type` is internal.
 
-Unit tests live in the module they exercise. `snapshot.rs`'s run over a three-program `corpus()`
+**Module layout.** One concept per module, each owning its type, its inherent impl and its unit
+tests, and no module depending on one below it:
+
+| module | owns |
+|---|---|
+| `walk` | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, node labels |
+| `span_index` | the `(span, node)` table over one pane |
+| `name_binder` | source-level name resolution over the surface AST |
+| `program` | `InspectedProgram` and its per-pane projections |
+| `wire` | the payload types, the schema version, the payload assembly, and the pane-link projection |
+
+The words the layout settles: an **index** is a built structure, a **lookup** is a read of one, and
+the **payload** is what ships.
+
+Unit tests live in the module they exercise. `wire.rs`'s run over a three-program `corpus()`
 chosen for the shapes that reach the payload's moving parts: a comprehension for refinement
 predicates, a monomorphized definition for one source span over several nodes, and a mutable loop
 for a recurrence.
@@ -396,26 +405,3 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
   may be issued at any point in the pipeline; that one has nothing to resolve against.
 - **No channel names a binder site**, which is what
   [A binder's type is the binder's](#a-binders-type-is-the-binders) works around.
-
-## Decided, not yet built
-
-Each change is ratified here and lands on its own. They are named rather than numbered: a numbered
-list renumbers as entries land, and a reference to "item 4" would then point at the wrong change.
-
-- **Module reorganization.** One concept per module, each owning its type, its inherent impl and its
-  unit tests, with no module depending on one above it. The target, which the current file names do
-  not yet match — today `snapshot.rs` holds the wire and `query.rs` holds the bundle:
-
-  | module | owns |
-  |---|---|
-  | walk | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, node labels |
-  | span index | the `(span, node)` table over one pane |
-  | name binder | source-level name resolution over the surface AST |
-  | snapshot | the bundle and its per-pane projections |
-  | wire | the payload types, the schema version, the payload assembly, and the pane-link projection |
-
-  Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
-  of one, and the **payload** is what ships.
-
-The module reorganization above touches no wire field. Schema 5, which the node table bumped, has
-not shipped.

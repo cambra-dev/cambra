@@ -156,11 +156,9 @@ impl NameBinderIndex {
     /// A region is emitted per statement and per expression, minus those where
     /// no name is visible and those repeating a span and binder set already
     /// emitted — a statement and its expression share a span, so the walk reaches
-    /// one region twice. The
-    /// binders are the ones visible at the region's start, outermost →
-    /// innermost. Regions therefore repeat where a statement and its expression
-    /// share a span; `src/inspector_model/design.md`, "Decided, not yet built"
-    /// carries the deduplication.
+    /// one region twice. The binders are the ones visible at the region's start,
+    /// outermost → innermost. See `src/inspector_model/design.md`, "Definitions
+    /// and scopes are source-level".
     ///
     /// Pure; re-walks the AST. Regions may nest and overlap (an inner body's
     /// region is a sub-span of its enclosing sequence's), mirroring the lexical

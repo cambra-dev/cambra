@@ -1,5 +1,5 @@
 //! The `/api/snapshot` bulk payload — the whole read-only model in one
-//! struct, assembled by enumerating the snapshot's two indices.
+//! struct, assembled by enumerating the model's two indices.
 //!
 //! `/api/snapshot` is the primary read-only endpoint:
 //! source + the panes (each a node table + span→node index) + use→def
@@ -9,7 +9,23 @@
 //! Building the payload is pure: it enumerates
 //! [`SpanIndex`](crate::inspector_model::SpanIndex) and
 //! [`NameBinderIndex`](crate::inspector_model::NameBinderIndex) and builds each
-//! pane's node table via the shared `build_node_table`.
+//! pane's node table via [`build_node_table`], over the IR walk `walk.rs` owns.
+//!
+//! # Pane links
+//!
+//! The multi-pane inspector shows several panes side by side (CHL
+//! source, pre-inference IR, post-inference IR, post-channelize IR, …) and links a
+//! node in one pane to the node(s) it came from / became in the adjacent panes.
+//! That link is the node's provenance across the phase.
+//!
+//! The link is a [`ProvenanceMap<NodeId, NodeId>`] folded at the pane boundary by
+//! [`collapse`](crate::ccl::provenance::collapse) — one per adjacent pane pair,
+//! materialized on [`CompiledProgram`](crate::ccl::context::CompiledProgram) via
+//! `materialize_panes`. The wire ships it verbatim, so a surviving node's
+//! cross-pane link is a `[id, id]` self-edge and a genuine identity change
+//! (monomorphization or inline fan-out, channelize's cluster and fan-in copies)
+//! is a `u != d` edge. What the density and the labels promise a consumer:
+//! `src/inspector_model/design.md`, "Pane links are dense and labelled".
 //!
 //! # Wire-type isolation
 //!
@@ -36,12 +52,13 @@
 //! * `meta.tick` — `null` (the live seam); `payloadKind` is `"post-inference"`,
 //!   `schema` is [`SCHEMA_VERSION`].
 
+use crate::ccl::provenance::{EdgeLabels, NodeId, ProvenanceMap, SourceProjection};
+use crate::ccl::{Expr, FunKind, HistoryKind, Type};
 use crate::chl_parser::ast::Span;
 
-use super::links::dense_edges;
 use super::name_binder::{Definition, ScopeRegion};
-use super::query::{InspectedProgram, PaneProjection};
-use crate::ccl::Type;
+use super::program::{InspectedProgram, PaneProjection};
+use super::walk::{node_label, predicate_children};
 
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
 /// both the success and degraded payloads. See [`Meta::schema`] for the
@@ -234,7 +251,7 @@ pub struct SpanEntry {
     /// The origin span.
     pub span: Span,
     /// The node indexed under it.
-    pub node_id: crate::ccl::provenance::NodeId,
+    pub node_id: NodeId,
 }
 
 /// One `{ useSpan, defSpan, name }` row of `definitions`. The schema's optional
@@ -402,12 +419,200 @@ pub struct Meta {
     pub schema: u32,
 }
 
+/// Every edge of a pane-pair [`ProvenanceMap`], as `(upstream, downstream, labels)`
+/// — **dense**: self-edges (`u == d`, a node preserved across the phase) are
+/// kept, so the frontend needs no identity special case.
+///
+/// The labels say what the edge *asserts*, which a consumer needs in order to
+/// render or prune the two apart: `"descends"` for an edge the downstream node
+/// was made from, `"relates"` for one it is about but was not made from. They
+/// are a **set** — an edge reachable both ways carries both — so this is an
+/// array rather than one discriminant, and an edge always carries at least one.
+///
+/// [`ProvenanceMap::edges`] already yields sorted, deduplicated edges, one entry
+/// per pair; this only projects to the wire's `u64` and label strings.
+pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64, Vec<&'static str>)> {
+    map.edges()
+        .into_iter()
+        .map(|(u, d)| (u.as_u64(), d.id.as_u64(), wire_labels(d.labels)))
+        .collect()
+}
+
+/// The wire spelling of an edge's label set, in a fixed order so the payload is
+/// deterministic.
+fn wire_labels(labels: EdgeLabels) -> Vec<&'static str> {
+    let mut out = Vec::with_capacity(2);
+    if labels.has_ancestry() {
+        out.push("descends");
+    }
+    if labels.has_blame() {
+        out.push("relates");
+    }
+    debug_assert!(!out.is_empty(), "an edge carries at least one label");
+    out
+}
+
+/// The wire's discriminant for a type: which constructor it is, without its
+/// contents.
+///
+/// A rendered type is one string ([`crate::inspector_model`]'s design doc,
+/// "Types on the wire"), so a consumer that wants to branch — colour the
+/// function-typed nodes, filter to the refined ones — has nothing to branch on.
+/// This is that datum, and nothing more: it says which constructor sits at the
+/// top of the type, never what is inside it.
+///
+/// A function's kind is part of the discriminant, since the two render
+/// differently (`⇒` against `⤇`) and mean different things. An unpinned kind
+/// variable reads as a compute function, matching how `Display` renders it.
+fn type_kind(ty: &Type) -> &'static str {
+    match ty {
+        Type::Base(_) => "base",
+        Type::UIntRange(_) => "range",
+        Type::Fun {
+            kind: FunKind::Data,
+            ..
+        } => "dataFun",
+        Type::Fun { .. } => "fun",
+        Type::Tuple(_) => "tuple",
+        Type::Record(_) => "record",
+        Type::Variant(..) => "variant",
+        Type::Refinement(..) => "refinement",
+        Type::Hole | Type::SharedHole(_) | Type::BoundedHole(_) => "hole",
+        Type::Infer(_) => "infer",
+        Type::DataSource(_) => "source",
+        Type::ChanDom(..) => "channel",
+        Type::Txn => "txn",
+        // A history is a mutable variable or a feed channel, and the two read
+        // differently enough that one discriminant would hide the distinction.
+        Type::History { kind, .. } => match kind {
+            HistoryKind::Overwrite => "mut",
+            HistoryKind::Append => "feed",
+        },
+    }
+}
+
+/// The predicates riding `ty` itself, as node ids, in the order
+/// [`predicate_children`] reaches them.
+///
+/// A node's `where.N` children cover every type slot it carries — its own type,
+/// an annotation, a `Cast` target, each binder's type — so a consumer holding
+/// them cannot tell which predicate refines *this node's* type. These are that
+/// subset, and because `predicate_children` walks the node's own type first,
+/// they are its leading children.
+fn own_type_predicates(ty: &Type) -> Vec<u64> {
+    fn walk(t: &Type, out: &mut Vec<u64>) {
+        if let Type::Refinement(_, refinements) = t {
+            for r in refinements.iter() {
+                out.push(r.predicate.node_id().as_u64());
+            }
+        }
+        t.walk_children(|c| walk(c, out));
+    }
+    let mut out = Vec::new();
+    walk(ty, &mut out);
+    out
+}
+
+/// Build one pane's node table against its `projection`, returning the root
+/// node's id and every node reachable from `expr` exactly once, in first-visit
+/// pre-order.
+///
+/// The single source-linking node builder: every pane's payload nodes go
+/// through this one shape, parameterized only by its `(Expr, SourceProjection)`
+/// pair.
+///
+/// A node reached from several places — a refinement predicate shared by
+/// several type slots — is emitted once and named by id from each place that
+/// reaches it, so nothing repeats and the walk terminates on a shared term. The
+/// pre-order is what makes the emitted array byte-reproducible.
+fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrNode>) {
+    fn visit(
+        expr: &Expr,
+        projection: &SourceProjection,
+        visited: &mut std::collections::HashSet<NodeId>,
+        out: &mut Vec<IrNode>,
+    ) -> u64 {
+        let id = expr.node_id();
+        if !visited.insert(id) {
+            return id.as_u64();
+        }
+
+        let mut node = IrNode {
+            label: node_label(&expr.node),
+            node_id: id.as_u64(),
+            span: None,
+            rewritten: None,
+            ty: expr.ty.to_string(),
+            type_kind: type_kind(&expr.ty),
+            predicate_refs: own_type_predicates(&expr.ty),
+            children: Vec::new(),
+        };
+        if let Some(attr) = projection.get(&id) {
+            // The rewrite channel: a `Nature::Source` tag — the root of a
+            // lowered source expression — null-compresses and carries no wire
+            // tag; every other node carries `{via, nature, label}`. The
+            // validators guard that `"source"` never ships.
+            let tag = &attr.rewritten;
+            if !tag.nature.is_source() {
+                node.rewritten = Some(RewriteInfo {
+                    via: format!("{:?}", tag.via),
+                    nature: tag.nature.wire_str().to_string(),
+                    label: tag.label.to_string(),
+                });
+            }
+            // The spans channel: the node's primary (narrowest) source span, if
+            // any.
+            node.span = attr
+                .spans
+                .iter()
+                .min_by_key(|s| s.end.saturating_sub(s.start))
+                .copied();
+        }
+
+        // The entry claims its pre-order slot before its children are walked, so
+        // the array is ordered by first visit rather than by completion.
+        let slot = out.len();
+        out.push(node);
+
+        let mut children = Vec::new();
+        for (idx, child) in expr.child_exprs().into_iter().enumerate() {
+            children.push(IrChild {
+                edge: idx.to_string(),
+                id: visit(child, projection, visited, out),
+                predicate: false,
+            });
+        }
+        // Predicate subtrees come after the value children so a consumer that
+        // reads children positionally is unaffected; `predicate` is what marks
+        // them (see [`predicate_children`]).
+        for (edge, predicate) in predicate_children(expr) {
+            children.push(IrChild {
+                edge,
+                id: visit(predicate, projection, visited, out),
+                predicate: true,
+            });
+        }
+        out[slot].children = children;
+
+        id.as_u64()
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+    let root = visit(expr, projection, &mut visited, &mut nodes);
+    debug_assert_eq!(
+        nodes.len(),
+        visited.len(),
+        "the node table holds one entry per visited id"
+    );
+    (root, nodes)
+}
+
 /// Build one pane's node table — its root id and its nodes — and its span rows.
 ///
 /// The rows are enumerated from the index the pane already carries; building a
 /// second one over the same pair would duplicate the walk. The nodes go through
-/// [`build_node_table`](super::query::build_node_table), the single
-/// source-linking node builder.
+/// [`build_node_table`], the single source-linking node builder.
 fn build_pane_nodes_and_index(pane: &PaneProjection<'_>) -> (u64, Vec<IrNode>, Vec<SpanEntry>) {
     let span_entries = pane
         .span_index
@@ -415,7 +620,7 @@ fn build_pane_nodes_and_index(pane: &PaneProjection<'_>) -> (u64, Vec<IrNode>, V
         .map(|(span, node_id)| SpanEntry { span, node_id })
         .collect();
 
-    let (root, nodes) = super::query::build_node_table(pane.ir, &pane.projection);
+    let (root, nodes) = build_node_table(pane.ir, &pane.projection);
 
     (root, nodes, span_entries)
 }
@@ -431,7 +636,7 @@ impl InspectedProgram<'_> {
     ///   own node table + span index.
     /// * `paneLinks` — per consecutive pane pair, the dense edges of the
     ///   pane-pair `ProvenanceMap` folded at that boundary, self-edges included (see
-    ///   [`dense_edges`](super::links::dense_edges)).
+    ///   [`dense_edges`]).
     /// * `definitions` — [`NameBinderIndex::definitions`](crate::inspector_model::NameBinderIndex::definitions).
     /// * `scopes` — [`NameBinderIndex::scopes`](crate::inspector_model::NameBinderIndex::scopes),
     ///   each binding's `type` read off the IR node that binds it.
@@ -589,6 +794,16 @@ mod tests {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         compile_program(&mut ctx, code, consumer).expect("program compiles")
+    }
+
+    /// The span of the `n`-th (0-based) byte occurrence of `needle` in `code`.
+    fn nth_span(code: &str, needle: &str, n: usize) -> Span {
+        let start = code
+            .match_indices(needle)
+            .nth(n)
+            .unwrap_or_else(|| panic!("occurrence {n} of {needle:?} not found"))
+            .0;
+        Span::new(start, start + needle.len())
     }
 
     /// Programs whose shapes reach the payload's moving parts: a comprehension
@@ -1165,5 +1380,389 @@ mod tests {
         assert!(payload.panes.is_empty());
         assert!(payload.pane_links.is_empty());
         assert!(!payload.diagnostics.is_empty());
+    }
+
+    /// A let-polymorphic def used at two types fans out: the pre-inference →
+    /// post-inference map (folded from the rows `Phase::Infer` wrote) is dense —
+    /// surviving nodes carry `[id, id]` self-edges — and at least one upstream
+    /// node fans out to ≥2 distinct downstream nodes (the specialization
+    /// clones), a genuine `u != d` identity change.
+    #[test]
+    fn mono_fanout_links_upstream_def_to_downstream_clones() {
+        let code = "\
+dup = \\x -> (x, x)
+a = dup(1)
+b = dup(2 == 2)
+a
+";
+        let prog = compile(code);
+        let panes = prog.materialize_panes();
+        let edges = dense_edges(&panes.pair("pre-inference → post-inference").map);
+
+        assert!(!edges.is_empty(), "the pane-pair map has edges");
+        assert!(
+            edges.iter().any(|(u, d, _)| u == d),
+            "the dense map ships self-edges for nodes preserved across the phase"
+        );
+
+        // At least one upstream node fans out to ≥2 distinct downstream nodes
+        // (dup used at Int and Bool) — counting only the genuine identity
+        // changes, not the self-edges.
+        let mut fanout: HashMap<u64, usize> = HashMap::new();
+        for (u, d, _) in &edges {
+            if u != d {
+                *fanout.entry(*u).or_default() += 1;
+            }
+        }
+        assert!(
+            fanout.values().any(|&n| n >= 2),
+            "dup used at two types should fan out to ≥2 downstream nodes; edges={edges:?}"
+        );
+    }
+
+    /// Every edge endpoint of a pane pair is a node of the pane it points into.
+    ///
+    /// The id set is `collect_tree_ids`', not `walk_children`': predicate
+    /// interiors are rows the fold explains, so they are edge endpoints, and a
+    /// tree walk that stopped at the main tree would call a live endpoint dead.
+    /// This is the invariant the wire validators enforce on the shipped payload,
+    /// asserted here against the source of truth.
+    fn assert_endpoints_live(
+        edges: &[(u64, u64, Vec<&'static str>)],
+        upstream: &Expr,
+        downstream: &Expr,
+        up_name: &str,
+        down_name: &str,
+    ) {
+        let ids = |e: &Expr| -> HashSet<u64> {
+            collect_tree_ids(e).iter().map(|id| id.as_u64()).collect()
+        };
+        let up_ids = ids(upstream);
+        let down_ids = ids(downstream);
+        for (u, d, _) in edges {
+            assert!(
+                up_ids.contains(u),
+                "edge upstream id {u} must be a node in the {up_name} tree"
+            );
+            assert!(
+                down_ids.contains(d),
+                "edge downstream id {d} must be a node in the {down_name} tree"
+            );
+        }
+    }
+
+    /// A two-site inline fan-out surfaces as non-identity edges on the
+    /// post-inference → post-channelize map, each edge's upstream a
+    /// post-inference node and downstream a post-channelize node.
+    #[test]
+    fn inline_fanout_links_post_inference_to_post_channelize_copies() {
+        let code = "\
+add1 = \\x -> x + 1
+a = add1(10)
+b = add1(20)
+a + b
+";
+        let prog = compile(code);
+        let panes = prog.materialize_panes();
+        let edges = dense_edges(&panes.pair("post-inference → post-channelize").map);
+        assert!(
+            !edges.is_empty(),
+            "a two-site inline fan-out must produce non-identity pane edges"
+        );
+        assert_endpoints_live(
+            &edges,
+            &prog.post_inference_ir,
+            &prog.post_channelize_ir,
+            "post-inference",
+            "post-channelize",
+        );
+    }
+
+    /// A monomorphic program changes no **main-tree** identity across inference:
+    /// every main-tree edge is a self-edge. Its predicates are a different story
+    /// — inference rebuilds a refinement predicate rather than preserving it, so
+    /// each rebuild is a genuine `u != d` edge — and this pins that the whole of
+    /// the difference is predicate interiors and nothing else.
+    #[test]
+    fn a_monomorphic_program_changes_no_main_tree_identity_across_inference() {
+        let code = "\
+x = 1 + 2
+x
+";
+        let prog = compile(code);
+        let panes = prog.materialize_panes();
+        let edges = dense_edges(&panes.pair("pre-inference → post-inference").map);
+        assert!(
+            !edges.is_empty(),
+            "a compiled program has surviving nodes, hence dense self-edges"
+        );
+        assert_endpoints_live(
+            &edges,
+            &prog.pre_inference_ir,
+            &prog.post_inference_ir,
+            "pre-inference",
+            "post-inference",
+        );
+
+        // The main tree: `walk_children` only, which is exactly the domain the
+        // identity claim covers.
+        fn main_tree_ids(e: &Expr) -> HashSet<u64> {
+            let mut s = HashSet::new();
+            fn go(e: &Expr, s: &mut HashSet<u64>) {
+                s.insert(e.node_id().as_u64());
+                e.walk_children(|c| go(c, s));
+            }
+            go(e, &mut s);
+            s
+        }
+        let up_main = main_tree_ids(&prog.pre_inference_ir);
+        let down_main = main_tree_ids(&prog.post_inference_ir);
+
+        let mut changed_main = Vec::new();
+        let mut changed_predicate = 0usize;
+        for (u, d, _) in &edges {
+            if u == d {
+                continue;
+            }
+            if up_main.contains(u) && down_main.contains(d) {
+                changed_main.push((*u, *d));
+            } else {
+                changed_predicate += 1;
+            }
+        }
+        assert!(
+            changed_main.is_empty(),
+            "a monomorphic program preserves every main-tree identity across \
+             inference; these changed: {changed_main:?}"
+        );
+        assert!(
+            changed_predicate > 0,
+            "inference rebuilds this program's literal-singleton predicates, so \
+             the pair must carry predicate-interior identity changes"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Span↔CCL (source↔IR) mapping over the payload.
+    //
+    // These pin which source construct maps to which IR node, over two programs
+    // whose lowering produces synthetic wrapper chains: a `yield` generator and
+    // a `defer()`/`<<` feed pipeline. They mirror the manual web-validation
+    // examples (`cambra-inspector/examples/{generator_min,defer_min}.chl`) but
+    // inline the source so the flow is exercised without the front end.
+    //
+    // The question they ask is the consumer's — "what is at this span" — and it
+    // is asked the way a consumer asks it: over the shipped `(span, nodeId)`
+    // rows and the shipped tree.
+    // ------------------------------------------------------------------------
+
+    const GENERATOR_SRC: &str = "\
+def squared(xs):
+    for x in xs:
+        yield x * x
+
+max(squared([1, 2, 3, 4]))
+";
+
+    const DEFER_SRC: &str = "\
+readings = [1, 2, 3, 4]
+totals = defer()
+totals << sum(readings)
+for x in readings:
+    totals << x
+max(totals)
+";
+
+    /// The labels of the nodes `pane_id` indexes at `span`: every `(span,
+    /// nodeId)` row of that pane whose span covers the query, resolved to the
+    /// node carrying that id in that pane's node table. This is the consumer's
+    /// lookup, over the two shipped tables and nothing else.
+    ///
+    /// Panics if a row names a node the table does not hold — the invariant
+    /// `span_index_round_trips_with_projection` (`span_index.rs`) pins.
+    fn labels_at(payload: &InspectorPayload, pane_id: &str, span: Span) -> Vec<String> {
+        let pane = payload
+            .panes
+            .iter()
+            .find(|s| s.id == pane_id)
+            .unwrap_or_else(|| panic!("the payload ships a {pane_id} pane"));
+        pane.span_index
+            .iter()
+            .filter(|row| row.span.start <= span.start && span.end <= row.span.end)
+            .map(|row| {
+                pane.nodes
+                    .iter()
+                    .find(|n| n.node_id == row.node_id.as_u64())
+                    .unwrap_or_else(|| panic!("row node {:?} is in the table", row.node_id))
+                    .label
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// GENERATOR: the source constructs that map name the expected IR node.
+    /// `x * x` → the `Mul` BinOp; `max(...)` → `Aggregate(Max)`; the list
+    /// literals → their `Lit` nodes.
+    #[test]
+    fn generator_mapped_spans_resolve_to_expected_nodes() {
+        let prog = compile(GENERATOR_SRC);
+        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let at = |span| labels_at(&payload, "post-inference", span);
+
+        // The `x * x` body → the arithmetic-mul BinOp (a mono clone of the
+        // generator body, which *does* carry the body span).
+        let mul = at(nth_span(GENERATOR_SRC, "x * x", 0));
+        assert!(
+            mul.iter().any(|l| l.contains("BinOp(Arithmetic(Mul))")),
+            "`x * x` → Mul BinOp; got {mul:?}"
+        );
+
+        // `max(squared(...))` → the Max aggregate.
+        let max = at(nth_span(GENERATOR_SRC, "max", 0));
+        assert!(
+            max.iter().any(|l| l.contains("Aggregate(Max)")),
+            "`max` → Max; got {max:?}"
+        );
+
+        // The list literals `1` and `2` map to their Lit nodes.
+        let lit1 = at(nth_span(GENERATOR_SRC, "1", 0));
+        assert!(
+            lit1.iter().any(|l| l.contains("Lit(Int(1))")),
+            "`1` → Lit; got {lit1:?}"
+        );
+        let lit2 = at(nth_span(GENERATOR_SRC, "2", 0));
+        assert!(
+            lit2.iter().any(|l| l.contains("Lit(Int(2))")),
+            "`2` → Lit; got {lit2:?}"
+        );
+
+        // The whole `[1, 2, 3, 4]` list literal (the argument of the
+        // monomorphized `squared(...)` call) maps to the `List` node. Span the
+        // elements, not the whole `[...]`: the `[` sits outside the lowered list
+        // span, so the elements' extent is what a row covers.
+        let list = at(nth_span(GENERATOR_SRC, "1, 2, 3, 4", 0));
+        assert!(
+            list.iter().any(|l| l.contains("List")),
+            "`[1, 2, 3, 4]` → List; got {list:?}"
+        );
+    }
+
+    /// DEFER: the source constructs that map name the expected IR node.
+    /// `sum(readings)` → `Aggregate(Sum)`; `max(totals)` → `Aggregate(Max)`; the
+    /// `totals` use in `max(totals)` → `Var(totals)`; the readings list literals
+    /// map.
+    #[test]
+    fn defer_mapped_spans_resolve_to_expected_nodes() {
+        let prog = compile(DEFER_SRC);
+        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let at = |span| labels_at(&payload, "post-inference", span);
+
+        let sum = at(nth_span(DEFER_SRC, "sum", 0));
+        assert!(
+            sum.iter().any(|l| l.contains("Aggregate(Sum)")),
+            "`sum` → Sum; got {sum:?}"
+        );
+
+        let max = at(nth_span(DEFER_SRC, "max", 0));
+        assert!(
+            max.iter().any(|l| l.contains("Aggregate(Max)")),
+            "`max` → Max; got {max:?}"
+        );
+
+        // `totals` occurs 4×: the def (0), the two `<<` feeds (1, 2), and the
+        // `max(totals)` use (3). The last is the read whose span maps to Var.
+        let totals_use = at(nth_span(DEFER_SRC, "totals", 3));
+        assert!(
+            totals_use.iter().any(|l| l.contains("Var(totals)")),
+            "`totals` in `max(totals)` → Var(totals); got {totals_use:?}"
+        );
+
+        // The readings list literals map to Lit nodes.
+        let lit1 = at(nth_span(DEFER_SRC, "1", 0));
+        assert!(
+            lit1.iter().any(|l| l.contains("Lit(Int(1))")),
+            "`1` → Lit; got {lit1:?}"
+        );
+    }
+
+    /// DEFER: the **copaired fan-in** carries a source span.
+    ///
+    /// `Copair` is the node the `defer()`/`<<`/`for`-feed plumbing fans into,
+    /// tagged `via: Channelize, nature: Expansion`. It is indexed at the
+    /// `totals = defer()` statement — the declaration the feeds fan into — so a
+    /// consumer clicking the `defer()` site reaches it. Distinct from the feed
+    /// plumbing (`Lambda(__unused)`, the `Compose` over the feed body), tagged
+    /// `nature: Machinery`, which carries no span by design.
+    ///
+    /// The fan-in is a post-channelize artifact, absent from the post-inference
+    /// anchor, so the payload under test carries the post-channelize pane
+    /// alone.
+    #[test]
+    fn defer_coverage_maps_the_copaired_fan_in() {
+        let prog = compile(DEFER_SRC);
+        let panes = prog.materialize_panes();
+        let payload = InspectedProgram::from_parts(
+            "post-channelize",
+            &prog.source,
+            &prog.post_channelize_ir,
+            panes.projection("post-channelize").clone(),
+            &prog.source_ast,
+        )
+        .build_payload("test");
+        let at = |span| labels_at(&payload, "post-channelize", span);
+
+        // Copairing, not a disjoint join: the arms land on their coproduct, and
+        // nothing asserts the two feeds cover disjoint parts of one domain.
+        let defer_site = at(nth_span(DEFER_SRC, "defer()", 0));
+        assert!(
+            defer_site.iter().any(|l| l.contains("Copair")),
+            "the `defer()` declaration reaches the copaired fan-in; got {defer_site:?}"
+        );
+
+        // The fed value the user wrote still maps to its own aggregate, and the
+        // rest of the Part-A set maps at this pane too.
+        let feed = at(nth_span(DEFER_SRC, "sum", 0));
+        assert!(
+            feed.iter().any(|l| l.contains("Aggregate(Sum)")),
+            "`sum` → Sum; got {feed:?}"
+        );
+        let max = at(nth_span(DEFER_SRC, "max", 0));
+        assert!(
+            max.iter().any(|l| l.contains("Aggregate(Max)")),
+            "`max` → Max; got {max:?}"
+        );
+        let totals_use = at(nth_span(DEFER_SRC, "totals", 3));
+        assert!(
+            totals_use.iter().any(|l| l.contains("Var(totals)")),
+            "`totals` in `max(totals)` → Var(totals); got {totals_use:?}"
+        );
+        for digit in ["1", "2", "3", "4"] {
+            let lit = at(nth_span(DEFER_SRC, digit, 0));
+            assert!(
+                lit.iter()
+                    .any(|l| l.contains(&format!("Lit(Int({digit}))"))),
+                "the readings literal `{digit}` → Lit; got {lit:?}"
+            );
+        }
+
+        // Every node of the shipped table carries an attribution: the
+        // fully-folded rows leave no node absent from the projection, and a node
+        // the projection does not cover would ship neither a span nor a rewrite
+        // tag.
+        let pane = payload
+            .panes
+            .iter()
+            .find(|s| s.id == "post-channelize")
+            .expect("the payload ships the post-channelize pane");
+        let absent: Vec<&str> = pane
+            .nodes
+            .iter()
+            .filter(|n| n.span.is_none() && n.rewritten.is_none())
+            .map(|n| n.label.as_str())
+            .collect();
+        assert!(
+            absent.is_empty(),
+            "no defer node is left untagged (absent from projection); got {absent:?}"
+        );
     }
 }

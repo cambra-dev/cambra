@@ -936,7 +936,7 @@ of this one.
   `Source`/`Derived`/`Synthetic` label string; the frontend formats the tag
   itself.
 - `paneLinks` ship each pane-pair `ProvenanceMap` **dense** — self-edges included,
-  no identity-edge filter — via `stage::dense_edges`; the frontend only follows
+  no identity-edge filter — via `wire::dense_edges`; the frontend only follows
   edges, never reconstructing them, and reads each edge's label set to decide
   whether to render the blame or prune it. Every edge endpoint is a live node id
   in the pane it points into, which

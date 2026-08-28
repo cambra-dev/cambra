@@ -67,18 +67,17 @@
 //! consumer over the shipped `(span, node)` rows and the shipped node table,
 //! which is the copy that runs. See `src/inspector_model/design.md`, "The usage model".
 
-mod index;
-mod links;
 mod name_binder;
-mod query;
-mod snapshot;
+mod program;
+mod span_index;
+mod walk;
+mod wire;
 
-pub use index::SpanIndex;
-pub use links::dense_edges;
 pub use name_binder::{Binding, Definition, NameBinderIndex, ScopeRegion};
-pub use query::InspectedProgram;
-pub use snapshot::{
+pub use program::InspectedProgram;
+pub use span_index::SpanIndex;
+pub use wire::{
     DefinitionEntry, Diagnostic, DiagnosticLabel, InspectorPayload, IrChild, IrNode, Meta,
     PaneEntry, PaneLinkEntry, RewriteInfo, SCHEMA_VERSION, ScopeBindingEntry, ScopeEntry,
-    SourceInfo, SpanEntry, diagnostics_from_compile_errors,
+    SourceInfo, SpanEntry, dense_edges, diagnostics_from_compile_errors,
 };
