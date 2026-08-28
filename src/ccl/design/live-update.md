@@ -32,11 +32,15 @@ released, so it means nothing to anyone who did not emit it.
 
 Carriers are of two kinds, and each takes its cut from a different place.
 
-**A carrier that holds nothing takes its cut from its source.** An element-wise map, a feed, a loop
-over a literal list: the replacement recomputes from wherever its input still has work, and the
-release state the retired producers agreed on is what says where that is
-(`UIntStreamBuffer::carry_release_to_new_producers`). This asks one thing of every producer — that
-it release what it has finished, and only that.
+**A carrier that holds nothing takes its cut from its input.** An element-wise map, a feed: the
+replacement recomputes from wherever its input still has work, and the release the retired
+subscribers agreed on is what says where that is. This asks one thing of every producer — that it
+release what it has finished, and only that. The agreement is what an input hands a subscriber that
+registers after it: a `FanOut` seeds a new subscriber's guard from what it has already released
+upstream, and a source seeds a newly-registered producer the same way
+(`DataSourceDomainExtentImpl::carry_release_to_new_producers`). An operator whose subscribers
+released it in full is withheld from the next version altogether — it can only answer empty, so
+adopting it would bind a name to nothing (`FanOut::released_in_full`).
 
 **A carrier that holds a value takes its cut from itself.** An induction store's value at position
 𝑝 already summarizes every position below 𝑝, so the store's own frontier says where the replacement
@@ -61,7 +65,8 @@ Every carrier in the program, and where its cut comes from:
 | Carrier | Cut | Mechanism |
 | --- | --- | --- |
 | A `Let` binding or store the new version also computes | None — nothing is replaced | `resolved_hash` match, one more `FanOut` branch |
-| An element-wise map, a feed, a loop over a list | Its source's agreed release | `carry_release_to_new_producers` |
+| An element-wise map or a feed over a shared operator | Its input's agreed release | A new subscriber's guard starts at what the `FanOut` has released |
+| The same, over a source | Its source's agreed release | `carry_release_to_new_producers` |
 | An induction store over the domain its predecessor read | Its predecessor's frontier | `CarriedState`, each variable's value and position together |
 | Any other induction store | Where its source will next offer a producer | `first_position_for_a_new_producer` |
 | A transaction writer's item cursor | Its source's agreed release | Absolute item positions, released on the commit-ack |

@@ -66,6 +66,18 @@ struct FanOutShared {
     consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
+    /// What every subscriber had agreed to release the last time one released,
+    /// and so what this fan-out has already passed upstream.
+    ///
+    /// A subscriber registering from now on starts here rather than at nothing.
+    /// The region is gone: the fan-out told its input it would not be read again,
+    /// so the input is free to have dropped it and a late subscriber that claimed
+    /// to still want it would hold the intersection back at a frontier no one is
+    /// waiting on. Within one version every subscription is made before any data
+    /// flows, so this is the empty guard and seeding from it changes nothing;
+    /// across a version handover it is what a rebuilt subscriber inherits from the
+    /// one it replaces.
+    released: TileGuard,
     /// Each subscriber's slot number, parallel to [`release_guards`] and
     /// [`consumers`].
     ///
@@ -242,6 +254,7 @@ impl FanOut {
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
+            released: tiling.empty_guard(),
             subscribers: Vec::new(),
             reentrancy,
         }));
@@ -285,6 +298,17 @@ impl FanOut {
             .reentrancy
             .as_ref()
             .map(|r| r.cached_tile.clone())
+    }
+
+    /// Whether every subscriber has released everything this fan-out could
+    /// offer.
+    ///
+    /// Such a fan-out answers empty from here on: it has told its input that
+    /// nothing will be read again, and a `Memo` input drops what it holds in
+    /// response. A version handing its operators on offers only the ones that can
+    /// still produce, since adopting this one binds a name to nothing.
+    pub fn released_in_full(&self) -> bool {
+        self.shared.borrow().released.is_universal()
     }
 
     /// Reopen this fan-out for a fresh set of branches, keeping the inner
@@ -345,7 +369,8 @@ impl TileOperator for FanOutBranch {
             let mut shared = self.shared.borrow_mut();
             slot.set(shared.consumers.len());
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
-            shared.release_guards.push(self.tiling.empty_guard());
+            let carried = shared.released.clone();
+            shared.release_guards.push(carried);
             shared.subscribers.push(Rc::downgrade(&slot));
         } // borrow released here before we might call input.subscribe
 
@@ -553,6 +578,7 @@ impl TileProducer for FanOutProducer {
                 acc.intersect(&shared.release_guards[i])
             });
         trace!("{} releasing: {intersection:?}", self.name());
+        shared.released = intersection.clone();
         // In cyclic mode the inner producer can be temporarily taken out
         // by a sibling-branch `get_impl`; skip the inner release in that
         // case (the next non-reentrant release will recompute and
@@ -730,6 +756,47 @@ mod tests {
             mine,
             "the survivor's guard moved with it, and it reads its new slot"
         );
+    }
+
+    /// A subscriber that registers after the fan-out has released starts having
+    /// released the same, because that data is gone: the fan-out told its input
+    /// it would not be read again.
+    ///
+    /// Within one version every subscription is made before any data flows, so
+    /// this only bites across a version handover — which is exactly when it has
+    /// to, since the subscriber registering is the one replacing the subscriber
+    /// that released.
+    #[test]
+    fn a_late_subscriber_starts_at_what_the_fan_out_has_released() {
+        let extent = Extent::Base(BaseType::Int);
+        let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
+        let mut sched = Scheduler::new();
+        let tiling = Tiling::Scalar(extent);
+
+        let mut first = fan
+            .branch()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+        assert!(
+            !fan.released_in_full(),
+            "nothing has released, so the fan-out still has its value to give"
+        );
+        first.release(TileGuard::Scalar(true));
+        drop(first);
+        fan.reopen();
+
+        assert!(
+            fan.released_in_full(),
+            "the one subscriber released everything, so the fan-out can only answer empty"
+        );
+        let late = fan
+            .branch()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+        assert_eq!(
+            fan.shared.borrow().release_guards[0],
+            TileGuard::Scalar(true),
+            "the late subscriber inherits the release rather than starting at nothing"
+        );
+        drop(late);
     }
 
     /// A `Memo` releases its input universally as soon as the input hands over a

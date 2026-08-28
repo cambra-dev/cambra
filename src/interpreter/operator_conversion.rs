@@ -814,6 +814,15 @@ identities is not distinguishing them",
             info.fan.reopen();
         }
         self.minted.mutable_state = self.live_state();
+        // Read after `live_state`, which is what takes a store's value off its
+        // fan; a store released in full still hands its variables on, and it is
+        // only the operator that is withdrawn.
+        self.minted
+            .operators
+            .retain(|_, fan| !fan.released_in_full());
+        self.minted
+            .stores
+            .retain(|_, info| !info.fan.released_in_full());
         self.minted
     }
 
