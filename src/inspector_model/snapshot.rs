@@ -139,6 +139,18 @@ pub struct IrNode {
     /// `src/inspector_model/design.md`, "Types on the wire".
     #[cfg_attr(feature = "serde", serde(rename = "type"))]
     pub ty: String,
+    /// Which constructor sits at the top of [`ty`](Self::ty) — `"base"`,
+    /// `"fun"`, `"dataFun"`, `"refinement"`, `"hole"`, … — so a consumer can
+    /// branch on the type without parsing the rendering. Says nothing about what
+    /// is inside the type.
+    pub type_kind: &'static str,
+    /// The predicates riding [`ty`](Self::ty), as ids into this pane's table.
+    ///
+    /// A node's `where.N` children cover every type slot it carries, so they do
+    /// not say which predicate refines *this node's* type; these do. They are the
+    /// node's leading predicate children, since the walk reaches the node's own
+    /// type first.
+    pub predicate_refs: Vec<u64>,
     /// The node's children, each named by id under the edge that reaches it.
     pub children: Vec<IrChild>,
 }
@@ -1069,6 +1081,73 @@ mod tests {
                     missing.len(),
                     stage.id
                 );
+            }
+        }
+    }
+
+    /// Every node carries a type discriminant, and a refined node's
+    /// `predicateRefs` name predicate nodes of its own pane — the two facts a
+    /// consumer needs to branch on a type it only receives rendered.
+    ///
+    /// `predicateRefs` is the leading part of a node's predicate children,
+    /// because the walk reaches the node's own type before its annotation, its
+    /// `Cast` target and its binders. That is what lets a consumer tell "the
+    /// predicate refining this node's type" from "a predicate riding some other
+    /// slot of it".
+    #[test]
+    fn a_node_carries_its_type_kind_and_its_own_predicates() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = Snapshot::new(&prog).build_payload("test");
+            for stage in &payload.stages {
+                let ids = stage_ids(stage);
+                let mut refined = 0;
+                for node in &stage.nodes {
+                    assert!(
+                        !node.type_kind.is_empty(),
+                        "node {} has no type discriminant",
+                        node.node_id
+                    );
+                    if node.type_kind == "refinement" {
+                        refined += 1;
+                        assert!(
+                            !node.predicate_refs.is_empty(),
+                            "a refined node names the predicates refining it; node {}",
+                            node.node_id
+                        );
+                    }
+                    for id in &node.predicate_refs {
+                        assert!(
+                            ids.contains(id),
+                            "predicate ref {id} resolves in the {} table",
+                            stage.id
+                        );
+                    }
+                    // The node's own type is walked first, so its predicates are
+                    // the leading predicate children.
+                    let predicate_children: Vec<u64> = node
+                        .children
+                        .iter()
+                        .filter(|c| c.predicate)
+                        .map(|c| c.id)
+                        .collect();
+                    assert_eq!(
+                        predicate_children[..node.predicate_refs.len()],
+                        node.predicate_refs[..],
+                        "node {}'s own-type predicates lead its predicate children",
+                        node.node_id
+                    );
+                }
+                // Inference types a literal by which literal it is, so a pane it
+                // has run on carries refined nodes; before it, the types are
+                // holes and this says nothing.
+                if stage.kind == "typed" {
+                    assert!(
+                        refined > 0,
+                        "the {} pane is typed, so a literal's singleton refines some node",
+                        stage.id
+                    );
+                }
             }
         }
     }

@@ -20,7 +20,7 @@
 use crate::ccl::context::{CompiledProgram, Phase};
 use crate::ccl::panes::PANES;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
-use crate::ccl::{Expr, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{Expr, FunKind, HistoryKind, Type, TypedBinding, TypedExprNode};
 use crate::chl_parser::ast::{Module, Span};
 
 use super::snapshot::{IrChild, IrNode, RewriteInfo};
@@ -344,6 +344,67 @@ impl<'a> Snapshot<'a> {
     }
 }
 
+/// The wire's discriminant for a type: which constructor it is, without its
+/// contents.
+///
+/// A rendered type is one string ([`crate::inspector_model`]'s design doc,
+/// "Types on the wire"), so a consumer that wants to branch — colour the
+/// function-typed nodes, filter to the refined ones — has nothing to branch on.
+/// This is that datum, and nothing more: it says which constructor sits at the
+/// top of the type, never what is inside it.
+///
+/// A function's kind is part of the discriminant, since the two render
+/// differently (`⇒` against `⤇`) and mean different things. An unpinned kind
+/// variable reads as a compute function, matching how `Display` renders it.
+pub(super) fn type_kind(ty: &Type) -> &'static str {
+    match ty {
+        Type::Base(_) => "base",
+        Type::UIntRange(_) => "range",
+        Type::Fun {
+            kind: FunKind::Data,
+            ..
+        } => "dataFun",
+        Type::Fun { .. } => "fun",
+        Type::Tuple(_) => "tuple",
+        Type::Record(_) => "record",
+        Type::Variant(..) => "variant",
+        Type::Refinement(..) => "refinement",
+        Type::Hole | Type::SharedHole(_) | Type::BoundedHole(_) => "hole",
+        Type::Infer(_) => "infer",
+        Type::DataSource(_) => "source",
+        Type::ChanDom(..) => "channel",
+        Type::Txn => "txn",
+        // A history is a mutable variable or a feed channel, and the two read
+        // differently enough that one discriminant would hide the distinction.
+        Type::History { kind, .. } => match kind {
+            HistoryKind::Overwrite => "mut",
+            HistoryKind::Append => "feed",
+        },
+    }
+}
+
+/// The predicates riding `ty` itself, as node ids, in the order
+/// [`predicate_children`] reaches them.
+///
+/// A node's `where.N` children cover every type slot it carries — its own type,
+/// an annotation, a `Cast` target, each binder's type — so a consumer holding
+/// them cannot tell which predicate refines *this node's* type. These are that
+/// subset, and because `predicate_children` walks the node's own type first,
+/// they are its leading children.
+pub(super) fn own_type_predicates(ty: &Type) -> Vec<u64> {
+    fn walk(t: &Type, out: &mut Vec<u64>) {
+        if let Type::Refinement(_, refinements) = t {
+            for r in refinements.iter() {
+                out.push(r.predicate.node_id().as_u64());
+            }
+        }
+        t.walk_children(|c| walk(c, out));
+    }
+    let mut out = Vec::new();
+    walk(ty, &mut out);
+    out
+}
+
 /// Every refinement predicate riding one of `expr`'s own type slots, paired with
 /// the wire label its child edge carries.
 ///
@@ -418,6 +479,8 @@ pub(super) fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u
             span: None,
             rewritten: None,
             ty: expr.ty.to_string(),
+            type_kind: type_kind(&expr.ty),
+            predicate_refs: own_type_predicates(&expr.ty),
             children: Vec::new(),
         };
         if let Some(attr) = projection.get(&id) {

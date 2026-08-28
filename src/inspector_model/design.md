@@ -106,6 +106,8 @@ Each node carries:
 | `span` | the **narrowest** source span it traces to, or absent when it traces to none |
 | `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
+| `typeKind` | which constructor sits at the top of that type — `"base"`, `"fun"`, `"dataFun"`, `"refinement"`, `"hole"`, … |
+| `predicateRefs` | the predicates riding this node's own type, as ids into the same table |
 | `children` | `{ edge, id, predicate }` — the child's id in this same table, its display label, and whether it is a type-interior subtree |
 
 A node's `span` is one span even where it traces to several; the `(span, node)` rows carry all of
@@ -178,10 +180,19 @@ table removes;
 and the compact spelling — `⇒` against `⤇`, `T@lit` singletons, `{T | p}`, `Σ`, `?N` — would have to
 be reimplemented by the consumer.
 
-What it forecloses: a consumer cannot filter or colour by type structure, cannot link a refinement
-to the predicate subtree shipped beside it, cannot diff a node's type across panes except by string
-comparison, and cannot elide a long type by structure. The narrow facts that unlock those without a
-structural type are the type metadata below.
+Two narrow facts ride beside the string so a consumer is not left parsing it. `typeKind` is the
+type's top constructor, which is what a consumer branches on to filter or colour by type.
+`predicateRefs` names the predicates riding the node's own type, as ids into the pane's table, which
+is what turns "this type is refined" into the predicate's own node. Both say something the rendering
+cannot be asked for reliably, and neither describes what is inside the type.
+
+What the rendering still forecloses: a consumer cannot diff a node's type across panes except by
+string comparison, and cannot elide a long type by structure.
+
+A node's `where.N` children cover every type slot it carries — its own type, an annotation, a `Cast`
+target, each binder's — so they cannot say which predicate refines the node's *own* type.
+`predicateRefs` is that subset, and it is the leading part of those children, since the walk reaches
+the node's own type first.
 
 ### A binder's type is the binder's
 
@@ -390,9 +401,6 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
 Each change is ratified here and lands on its own. They are named rather than numbered: a numbered
 list renumbers as entries land, and a reference to "item 4" would then point at the wrong change.
 
-- **Type metadata.** Carry two narrow facts beside the rendered string — a `typeKind` discriminant,
-  and a refinement's predicate as a reference into the node table — so a consumer can filter by type
-  and reach a predicate without a structural type.
 - **Pane vocabulary.** Consolidate pane/stage on "pane", the name the compiler already defines and
   the one `paneLinks` already uses: `stages` becomes `panes` on the wire, `StageEntry` becomes
   `PaneEntry`, `StageProjection` becomes `PaneProjection`. It also frees "stage", which `stage.rs`
@@ -417,5 +425,5 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
   Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
   of one, and the **payload** is what ships.
 
-The wire-shape changes above — type metadata, and the pane vocabulary — ride schema 5, which the
-node table bumped and which has not shipped.
+The pane vocabulary above is a wire-shape change and rides schema 5, which the node table bumped and
+which has not shipped.
