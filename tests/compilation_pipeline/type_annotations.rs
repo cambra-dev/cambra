@@ -364,8 +364,7 @@ fn refined_add_let2() {
         "
 def foo(t: Int):
     x = t ^+ 3
-    y = x ^+ 2
-    y
+    x ^+ 2
 foo(1)
 ",
         Value::Int(6)
@@ -382,5 +381,21 @@ def foo(t: Int):
 foo(1)
 ",
         Value::Int(4)
+    )
+}
+
+#[test]
+fn refined_add_let4() {
+    check_scalar(
+        "
+def bar(i: Int):
+    i // 2
+
+def foo(t: Int):
+    x = bar(t)
+    x ^+ 2
+foo(2)
+",
+        Value::Int(3)
     )
 }
