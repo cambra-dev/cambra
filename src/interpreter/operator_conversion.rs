@@ -4,6 +4,7 @@ use crate::{
     ccl::{
         AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
         Type, TypedExprNode, V_COMMIT, WriterSite,
+        ccl_utils::strip_refinements,
         ccl_utils::{free_names, is_trivially_true_predicate},
         content_hash::{ContentHash, resolved_hash},
         provenance::NodeId,
@@ -314,15 +315,15 @@ struct StoreReadInfo {
     /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
     /// dense `Induction` store.
     induction_extent: Option<Extent>,
-    /// The space this store's positions are counted in ([`store_id`]), which is
-    /// what decides whether a replacement may resume at its frontier or has to
-    /// start at `0`.
+    /// The sequencing domain this store's positions are counted in — the index of
+    /// every key's history, which is what decides whether a replacement may resume
+    /// at this store's frontier.
     ///
     /// Its variables' *values* are not held here: a store's value rides its own
     /// fan as a [`Tile::Store`], so a version replacing this one reads them off
     /// [`FanOut::cached_tile`] rather than through a second channel out of the
     /// operator.
-    position_space: PositionSpace,
+    sequencing_domain: Type,
     /// The token a term reading this store hashes to — the same role
     /// [`LetBinding::correspondent`] plays, for a binding that lives in
     /// [`transactional_stores`](OpConversionContext::transactional_stores)
@@ -405,9 +406,9 @@ pub struct Inheritance {
 pub(crate) struct CarriedState {
     /// The value the variable held at `resume_at`.
     value: Value,
-    /// The space `resume_at` counts in. A replacement whose recurrence reads
-    /// something else seeds the value and starts at `0`.
-    space: PositionSpace,
+    /// The sequencing domain `resume_at` counts in. A position means nothing to a
+    /// recurrence indexed by anything else.
+    domain: Type,
     /// The first position of the source the replacement consumes — the retired
     /// store's frontier, which is the position it had reached and not yet
     /// decided.
@@ -712,7 +713,7 @@ impl OpConversionContext {
         let declared = declared_state(planned);
         let mut out = Vec::new();
         for info in self.minted.stores.values() {
-            if !info.position_space.carries() {
+            if !carries_state(&info.sequencing_domain) {
                 continue;
             }
             for (path, key) in info.carried_keys() {
@@ -720,11 +721,11 @@ impl OpConversionContext {
                     out.push(StateConflict::Dropped { path: path.clone() });
                     continue;
                 };
-                if decl.space != info.position_space {
+                if decl.domain != info.sequencing_domain {
                     out.push(StateConflict::Moved {
                         path: path.clone(),
-                        held: info.position_space.clone(),
-                        declared: decl.space.clone(),
+                        held: info.sequencing_domain.clone(),
+                        declared: decl.domain.clone(),
                     });
                     continue;
                 }
@@ -777,7 +778,7 @@ impl OpConversionContext {
             let Some(frontier) = store_frontier(&tile) else {
                 continue;
             };
-            if !info.position_space.carries() {
+            if !carries_state(&info.sequencing_domain) {
                 continue;
             }
             for (path, key) in info.carried_keys() {
@@ -787,7 +788,7 @@ impl OpConversionContext {
                         CarriedState {
                             value,
                             resume_at: frontier,
-                            space: info.position_space.clone(),
+                            domain: info.sequencing_domain.clone(),
                         },
                     );
                     debug_assert!(
@@ -1899,7 +1900,7 @@ fn build_transact_store(
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     if !matches!(domain, Type::Txn) {
-        return build_induction_store(keys, writers, paths, ctx);
+        return build_induction_store(keys, writers, domain, paths, ctx);
     }
     build_commit_store(keys, writers, paths, ctx)
 }
@@ -2130,7 +2131,7 @@ fn build_commit_store(
         induction_extent: None,
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
-        position_space: PositionSpace::Transaction,
+        sequencing_domain: Type::Txn,
     })
 }
 
@@ -2184,43 +2185,15 @@ impl std::fmt::Display for VarPath {
     }
 }
 
-/// What a mutable variable's state may be carried into, beside its identity.
+/// Whether a variable sequenced by `domain` hands state to its replacement.
 ///
-/// A value can be seeded into any store that declares the variable at its type. A
-/// *position* cannot: `resume_at` counts positions of the collection the
-/// recurrence iterates, so it means nothing to a recurrence reading a different
-/// one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PositionSpace {
-    /// A commit clock, private to its store and restartable. There is no position
-    /// to carry: a replacement seeds each value and starts its clock at `0`.
-    Transaction,
-    /// Positions of a data source, which outlives the version reading it. A
-    /// replacement over the same source resumes at the retired store's frontier.
-    Source(String),
-    /// Positions of a finite collection, which is part of the program rather than
-    /// outside it. Nothing is carried: a replacement recomputes the whole fold
-    /// from the collection its own version declares, and seeding it would count
-    /// the elements twice.
-    Finite,
-}
-
-impl std::fmt::Display for PositionSpace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PositionSpace::Transaction => write!(f, "a transaction"),
-            PositionSpace::Source(source) => write!(f, "the loop over `{source}`"),
-            PositionSpace::Finite => write!(f, "a loop over a fixed collection"),
-        }
-    }
-}
-
-impl PositionSpace {
-    /// Whether a variable counting positions here has state to hand to its
-    /// replacement at all.
-    fn carries(&self) -> bool {
-        !matches!(self, PositionSpace::Finite)
-    }
+/// A data source and a transaction's commit clock both outlive the version
+/// reading them, so a position counted in one still means something to the next
+/// version. A concrete iteration extent does not: it is part of the program, so a
+/// replacement recomputes the whole fold from the collection its own version
+/// declares, and seeding it would count the elements twice.
+fn carries_state(domain: &Type) -> bool {
+    matches!(domain, Type::Txn | Type::DataSource(_))
 }
 
 /// Every mutable variable `expr` declares, by identity, with the type it is
@@ -2237,14 +2210,14 @@ pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
         // not state a version has to be able to take over. Its identity is still
         // numbered above, so removing one renumbers what follows exactly as
         // removing any other would.
-        if !v.space.carries() {
+        if !carries_state(&v.domain) {
             continue;
         }
         out.insert(
             v.path,
             DeclaredVariable {
                 ty: v.key.init.ty.clone(),
-                space: v.space,
+                domain: v.domain,
             },
         );
     }
@@ -2255,7 +2228,7 @@ pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
 /// running program's value can be seeded into it, and at what position.
 pub struct DeclaredVariable {
     ty: Type,
-    space: PositionSpace,
+    domain: Type,
 }
 
 /// Every mutable variable's identity, in key order, by the `Transact` node that
@@ -2275,7 +2248,8 @@ pub fn mutable_variable_paths(expr: &Expr) -> HashMap<NodeId, Vec<VarPath>> {
 struct MutableVariable<'e> {
     path: VarPath,
     key: &'e TransactKey,
-    space: PositionSpace,
+    /// The recurrence's sequencing domain — the index of the variable's history.
+    domain: Type,
     /// The `Transact` node declaring it, so conversion can ask for the identities
     /// of the store it is building.
     declared_by: NodeId,
@@ -2292,13 +2266,11 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
         counts: &mut HashMap<String, usize>,
         out: &mut Vec<MutableVariable<'e>>,
     ) {
-        if let TypedExprNode::Transact {
-            keys,
-            writers,
-            domain,
-        } = &e.node
-        {
-            let space = position_space(writers, domain);
+        // `writers` is not consulted: the node's own sequencing domain is what
+        // indexes every key's history, so there is nothing to re-derive from the
+        // writer that reads it.
+        if let TypedExprNode::Transact { keys, domain, .. } = &e.node {
+            let domain = strip_refinements(domain);
             for k in keys {
                 let name = k.name.field_key();
                 let index = counts.entry(name.clone()).or_insert(0);
@@ -2308,7 +2280,7 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
                         index: *index,
                     },
                     key: k,
-                    space: space.clone(),
+                    domain: domain.clone(),
                     declared_by: e.node_id(),
                 });
                 *index += 1;
@@ -2322,39 +2294,6 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
     out
 }
 
-/// The data source a recurrence's writer iterates, which is the space its
-/// positions are counted in.
-///
-/// `None` for a loop over anything but a data source: a finite list's positions
-/// are its own, and a replacement reading one recomputes rather than resumes.
-fn store_id(w: &WriterSite) -> Option<String> {
-    let domain = w.source.ty.domain()?;
-    match crate::ccl::ccl_utils::strip_refinements(&domain) {
-        Type::DataSource(name) => Some(name),
-        _ => None,
-    }
-}
-
-/// The position space a `Transact`'s recurrence counts in.
-///
-/// A commit clock is private to its store and restartable, so a transaction's
-/// variables have no position to carry and every commit store answers the same
-/// way. An induction loop counts positions of the data source it iterates.
-fn position_space(writers: &[WriterSite], domain: &Type) -> PositionSpace {
-    if matches!(domain, Type::Txn) {
-        return PositionSpace::Transaction;
-    }
-    induction_position_space(writers.first())
-}
-
-/// The space an induction loop's writer counts positions in.
-fn induction_position_space(writer: Option<&WriterSite>) -> PositionSpace {
-    match writer.and_then(store_id) {
-        Some(source) => PositionSpace::Source(source),
-        None => PositionSpace::Finite,
-    }
-}
-
 /// A variable the running program is holding that a new version cannot take
 /// over.
 ///
@@ -2366,21 +2305,21 @@ pub enum StateConflict {
     /// The new version does not declare it, so its value has nowhere to be
     /// seeded and would be discarded.
     Dropped { path: VarPath },
-    /// The new version's recurrence for it counts positions in a different space,
-    /// so the position the value was read at means nothing there.
+    /// The new version sequences it by a different domain, so the position the
+    /// value was read at means nothing there.
     ///
     /// The *value* could still be seeded — a replacement whose space differs can
     /// start at `0` and take the value forward, which is what a variable moving
     /// between loops or into a transaction would want. Refusing rather than doing
     /// that is a policy choice, not a constraint: a variable whose recurrence now
     /// reads something else has a history that came from inputs the new one never
-    /// saw. `build_induction_store_single` asserts the spaces agree by the time it
-    /// seeds, so relaxing this means deleting the refusal and letting the
+    /// saw. `build_induction_store_single` asserts the domains agree by the time
+    /// it seeds, so relaxing this means deleting the refusal and letting the
     /// replacement start at `0`.
     Moved {
         path: VarPath,
-        held: PositionSpace,
-        declared: PositionSpace,
+        held: Type,
+        declared: Type,
     },
     /// The new version declares it at a different type. Its value cannot be the
     /// seed of a store that expects another shape: the store would be built
@@ -2410,6 +2349,7 @@ impl StateConflict {
 fn build_induction_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
+    domain: &Type,
     paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
@@ -2441,7 +2381,7 @@ fn build_induction_store(
         w.write_keys.len(),
         "the induction writer writes every accumulator key"
     );
-    build_induction_store_single(keys, w, paths, ctx)
+    build_induction_store_single(keys, w, domain, paths, ctx)
 }
 
 /// Build a single-writer induction store as a position-driven [`InductionStore`]
@@ -2457,12 +2397,13 @@ fn build_induction_store(
 fn build_induction_store_single(
     keys: &[TransactKey],
     w: &WriterSite,
+    domain: &Type,
     paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let key_extent = Extent::Base(BaseType::String);
     let runtime_key = |n: &Name| Value::String(n.field_key().into());
-    let space = induction_position_space(Some(w));
+    let domain = strip_refinements(domain);
 
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
@@ -2489,7 +2430,7 @@ fn build_induction_store_single(
         let carried = ctx.inherited.mutable_state.get(&paths[i]);
         if let Some(carried) = carried {
             debug_assert_eq!(
-                carried.space, space,
+                carried.domain, domain,
                 "{} resumes in a space its retired version never counted in; \
 `state_conflicts` refuses that before anything is built",
                 paths[i],
@@ -2545,7 +2486,7 @@ fn build_induction_store_single(
             w.source.ty
         ))
     })?;
-    let induction_extent = ctx.extent_of(&crate::ccl::ccl_utils::strip_refinements(&raw_domain))?;
+    let induction_extent = ctx.extent_of(&strip_refinements(&raw_domain))?;
     // The recurrence is sequenced by `UInt` position end to end: the driver pairs
     // items with `UInt` domain keys, `CommitEngine` ticks are positions, and
     // `StoreDenseRead` folds tick `p + 1` at each. A product domain (a
@@ -2640,7 +2581,7 @@ fn build_induction_store_single(
         keys: keys_map,
         kind: StoreReadKind::InductionChangelog,
         induction_extent: Some(induction_extent),
-        position_space: space,
+        sequencing_domain: domain,
         // Set by `bind_store`, which is what knows the store's identity.
         correspondent: 0,
     })

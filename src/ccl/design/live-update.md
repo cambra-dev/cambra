@@ -333,11 +333,13 @@ Three pieces carry that:
   from `resume_at`, and they must agree — `InductionDriver` asserts that a
   decision cannot precede the input it decides.
 
-  A position only means something in the space it was counted in, which
-  `PositionSpace` names: a data source, a transaction's private clock, or a fixed
-  collection. A variable over a fixed collection carries nothing at all — its
-  replacement recomputes the fold from the collection its own version declares,
-  and seeding it would count the elements twice.
+  A position only means something in the domain it was counted in, and that is
+  the `Transact`'s own sequencing domain — the index of every key's history. A
+  data source and a transaction's commit clock outlive the version reading them,
+  so a position counted in one still means something to the next version. A
+  concrete iteration extent does not: it is part of the program, so a variable
+  sequenced by one carries nothing at all and its replacement recomputes the fold
+  from the collection its own version declares.
 - **What the source still owes.** A source hands a producer registering after the
   swap the release state its retired producers agreed on, which runs *below* a
   store's resume position rather than deciding it: a drive holds the input it
