@@ -6,7 +6,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fun, type_level};
+use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
+use crate::ccl::infer::solver::{
+    ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
+};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
 use std::rc::Rc;
 
@@ -17,6 +20,7 @@ use crate::util::ScopeStack;
 
 use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
+use super::solve::value_type;
 use super::typing::Typing;
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
@@ -34,6 +38,28 @@ pub(super) struct Binding {
     /// code) happens during the coalesce walk
     /// ([`specialize_use`](super::solve::specialize_use)).
     pub(super) scheme: PolyScheme,
+}
+
+/// Inference's lexical scope, read as the environment a solver query runs in.
+///
+/// A binder's slot mid-emission is an inference variable, so the scheme body is
+/// resolved before it can be read as a fact —
+/// [`value_type`](super::solve::value_type), which reports what a value has made
+/// of the slot and never what a use demanded of it. `x = 2 ^+ 1` is the case: the
+/// literal's own singleton is on the node, but the sum's is on the variable's
+/// bounds, and unresolved it has no SMT sort at all.
+///
+/// The quantified variables of a generalized binder's scheme stay
+/// uninstantiated — there is no use site here to instantiate them at. A polytype
+/// has no SMT sort, so [`smt_sub`](super::solver::smt::smt_sub) drops it rather
+/// than assuming anything wrong about it.
+impl ScopeEnv for ScopeStack<Name, Binding> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        value_type(&self.lookup(name)?.scheme.body)
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
 }
 
 /// Whether a `let` bound to `def` at `level` should be **generalized** —
@@ -84,7 +110,7 @@ pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
 /// The solver works directly on [`Type`]: each node's inferred type is written
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
-pub(super) struct InferCtx {
+pub struct InferCtx {
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -169,6 +195,10 @@ impl InferCtx {
         }
     }
 
+    pub fn empty() -> Self {
+        Self::new(HashMap::new(), NodeId::fresh())
+    }
+
     /// Enter `node`'s rule, returning the previous node for the caller to
     /// restore. Only [`emit_node`](super::emit::emit_node) calls this.
     pub(super) fn enter_node(&mut self, node: NodeId) -> NodeId {
@@ -247,7 +277,7 @@ impl InferCtx {
                 // The result is discarded because a fresh variable cannot conflict
                 // with its first upper bound; a genuine mismatch surfaces later,
                 // when a value flows in and fails against this bound.
-                let _ = constrain_subtype(&v, &bound, &mut ConstrainCache::new());
+                let _ = constrain_subtype_in(&v, &bound, &mut ConstrainCache::new(), &NoScope);
                 v
             }
             // Refinements ride the lattice: keep the wrapper, normalize the
@@ -447,7 +477,7 @@ impl Typing for InferCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        constrain_subtype(sub, sup, &mut self.cache)
+        constrain_subtype_in(sub, sup, &mut self.cache, &self.scopes)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
     }
 
@@ -519,10 +549,53 @@ impl Typing for InferCtx {
         r
     }
 
-    fn close_let_type(&self, _name: &Name, _bound_expr: &Expr, body_ty: Type) -> Type {
-        // No-op: the closing discharge runs on the resolved type in
-        // `coalesce_node`'s Let arm (see the trait doc).
-        body_ty
+    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
+        // Lifting the body's type past the binder is an application: a `let`
+        // telescope entry carries its definiens, so the lift discharges
+        // `[name ↦ bound_expr]` (`src/ccl/design/type-inference.md`, "`let`
+        // binders and scope exit"). The body type is an inference variable here,
+        // whose refinements accumulate as bounds rather than sitting in the
+        // type, so the substitution cannot be applied to it directly. It rides
+        // the lifted variable's lower edge instead, and β fires at coalesce.
+        // `Typing::apply` suspends a dependent codomain's discharge the same way
+        // ("Discharge is application").
+        //
+        // `scoped_let` restored the telescope before this runs, so the lifted
+        // variable stands outside the binder and a bound naming `name` reaches
+        // it only across this edge. Returning `body_ty` verbatim instead lets a
+        // refinement over `name` flow into the enclosing lambda's codomain,
+        // which is minted outside the binder and holds no discharge for it.
+        //
+        // A `:=` definiens is the exception, and for the reason `emit_mut_decl`
+        // gives for holding a mutable variable's own body back from this
+        // method: the discharge substitutes the definiens *into a type*, which
+        // needs the definiens to denote a value. A mutable variable is a
+        // history — its value is the join over the seed and every write — so a
+        // `MutDecl` denotes no value to substitute, and a `MutWrite` denotes a
+        // write rather than the written value. Both are erased before any
+        // consumer of the discharged type runs. Lift `body_ty` unchanged.
+        if matches!(
+            bound_expr.node,
+            TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
+        ) {
+            return body_ty;
+        }
+        let lifted = self.fresh();
+        let Type::Infer(v) = &lifted else {
+            unreachable!("fresh() yields a Type::Infer var");
+        };
+        let bound = crate::ccl::Bound::with_subst(
+            body_ty,
+            crate::ccl::subst::Subst::discharge(name.clone(), bound_expr.clone_preserving_ids()),
+        );
+        crate::ccl::infer_var::observe_bound_scope(
+            v,
+            "lower",
+            &bound,
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
+        v.bounds.borrow_mut().lower_mut().push(bound);
+        lifted
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
@@ -605,12 +678,14 @@ impl Typing for InferCtx {
         // below read this one snapshot, so each shows what was inferred rather than the
         // partially modified state a failed `constrain_subtype` leaves behind.
         let inferred_ty = coalesce_for_error(inferred);
-        constrain_subtype(inferred, &ann_simple, &mut self.cache).map_err(|_| {
-            self.raise(InferError::AnnotationMismatch {
-                annotation: ann.clone(),
-                inferred: inferred_ty.clone(),
-            })
-        })?;
+        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &self.scopes).map_err(
+            |_| {
+                self.raise(InferError::AnnotationMismatch {
+                    annotation: ann.clone(),
+                    inferred: inferred_ty.clone(),
+                })
+            },
+        )?;
         // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
         // above is contravariant in the domain, so it leaves the shared variable *below*
         // every domain annotated with it: a common lower bound, which orders each domain
@@ -639,12 +714,14 @@ impl Typing for InferCtx {
             } = inferred.peel_refinements()
             && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
         {
-            constrain_subtype(inferred_dom, shared, &mut self.cache).map_err(|_| {
-                self.raise(InferError::AnnotationMismatch {
-                    annotation: ann.clone(),
-                    inferred: inferred_ty,
-                })
-            })?;
+            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &self.scopes).map_err(
+                |_| {
+                    self.raise(InferError::AnnotationMismatch {
+                        annotation: ann.clone(),
+                        inferred: inferred_ty,
+                    })
+                },
+            )?;
         }
         Ok(ann_simple)
     }

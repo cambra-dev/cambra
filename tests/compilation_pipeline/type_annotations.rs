@@ -10,6 +10,9 @@ fn refinement() {
         include_str!("type_annotations/refined_div_zero.cambra"),
         "expected {Int | __elem != 0}",
     );
+    // The demanded predicate reads a field of the record it refines, and the
+    // argument's own type pins that field to `0`, so the rejection is a
+    // refutation rather than a comparison nothing decided.
     check_compile_error(
         include_str!("type_annotations/complex_refinement.cambra"),
         "expected {{x: Int, y: Int} | __elem.y != 0}, found {x: Int@1, y: Int@0}",
@@ -342,4 +345,286 @@ fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] nam
 #[test]
 fn refined_add() {
     check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
+}
+
+#[test]
+fn refined_add_let() {
+    check_scalar(
+        "
+def foo(t: Int) => {Int where _ == 1 ^+ 5}:
+    x = 1 ^+ 3
+    y = x ^+ 2
+    y
+()
+",
+        Value::Unit,
+    )
+}
+
+#[test]
+fn refined_add_let2() {
+    check_scalar(
+        "
+def foo(t: Int):
+    x = t ^+ 3
+    x ^+ 2
+foo(1)
+",
+        Value::Int(6),
+    )
+}
+
+#[test]
+fn refined_add_let22() {
+    check_scalar(
+        "
+def foo(t: Int):
+    (t ^+ 3) ^+ 2
+foo(1)
+",
+        Value::Int(6),
+    )
+}
+
+/// A parameter refinement the argument entails semantically but not structurally:
+/// `1 ^+ 3 ^+ 2` and `1 ^+ 5` are unequal terms denoting one value. Inference accepts
+/// the call through `smt_sub`, and `inline`'s beta-reduction discharges the same
+/// precondition the same way (see `src/ccl/design/type-inference.md`, "Semantic
+/// entailment as a fallback").
+#[test]
+fn refined_arg_entailed_only_semantically() {
+    check_scalar(
+        "
+def foo(t: {Int where _ == 1 ^+ 5}):
+    t
+foo((1 ^+ 3) ^+ 2)
+",
+        Value::Int(6),
+    )
+}
+
+#[test]
+fn refined_add_let3() {
+    check_scalar(
+        "
+def foo(t: Int):
+    x = 1 ^+ 3
+    x
+foo(1)
+",
+        Value::Int(4),
+    )
+}
+
+#[test]
+fn refined_add_let4() {
+    check_scalar(
+        "
+def bar(i: Int):
+    i // 2
+
+def foo(t: Int):
+    x = bar(t)
+    x ^+ 2
+foo(2)
+",
+        Value::Int(3),
+    )
+}
+
+#[test]
+fn external_scope1() {
+    check_scalar(
+        "
+x = 2
+
+def foo(t: Int) => {Int where _ == t + 2}:
+    t ^+ x
+
+foo(2)
+",
+        Value::Int(4),
+    )
+}
+
+#[test]
+fn external_scope2() {
+    check_scalar(
+        "
+x = 2 ^+ 1
+
+def foo(t: Int) => {Int where _ == t + 3}:
+    t ^+ x
+
+foo(2)
+",
+        Value::Int(5),
+    )
+}
+
+#[test]
+fn external_scope3() {
+    check_scalar(
+        "
+x = 2
+
+y = x ^+ 1
+
+def foo(t: Int) => {Int where _ == t + 3}:
+    t ^+ y
+
+foo(2)
+",
+        Value::Int(5),
+    )
+}
+
+#[test]
+fn external_scope4() {
+    // TODO: inline `bar` to type-check successfully.
+    check_compile_error(
+        "
+x = 2
+
+y = x ^+ 1
+
+def bar(x: Int):
+    y ^+ x ^+ x
+
+def foo(t: Int) => {Int where _ == t + 3 + t + 5}:
+    t ^+ y ^+ bar(t)
+
+foo(2)
+",
+        "inferred as {Int | __elem == t ^+ y ^+ t ▷ bar}",
+    )
+}
+
+#[test]
+fn collection_product1() {
+    check_compile_error(
+        "
+def f(u: Int) => {Int where _ <= 15}:
+    products = [
+        (name=\"foo\", quant=10),
+        (name=\"bar\", quant=20),
+    ]
+    max([p.quant for p in products if p.quant <= 15])
+
+f(0)
+",
+        "but inferred as Int",
+    )
+}
+
+#[test]
+fn collection_int2() {
+    // TODO: handle aggregate operators (max)
+    check_compile_error(
+        "
+def f(u: Int) => {Int where _ <= 15}:
+    products = [ 10, 20 ]
+    max([p for p in products if p <= 15])
+
+f(0)
+",
+        "Annotation mismatch: annotated as {Int | __elem <= 15}, but inferred as Int",
+    )
+}
+
+#[test]
+fn collection_int3() {
+    check_compile_error(
+        "
+def f(u: Int) => {Int where _ <= 10}:
+    products = [ 10, 20 ]
+    max([p for p in products if p <= 15])
+
+f(0)
+",
+        ", but inferred as Int",
+    )
+}
+
+#[test]
+fn collection_int4() {
+    check_compile_error(
+        "
+def f(u: Int) => {Int where _ <= 5}:
+    products = [ 10, 20 ]
+    max([p for p in products if p <= 15])
+
+f(0)
+",
+        ", but inferred as Int",
+    )
+}
+
+#[test]
+fn records1() {
+    check_scalar(
+        "
+x = ( a = 10, b = 2 ^+ 1 )
+
+def foo(t: Int) => {Int where _ == t + 3}:
+    t ^+ x.b
+
+foo(2)
+",
+        Value::Int(5),
+    )
+}
+
+#[test]
+fn records2() {
+    check_scalar(
+        "
+x = ( a = 10, b = 2 ^+ 1 )
+
+def foo(t: {a:Int, b:Int}) => {Int where _ == t.a + 3}:
+    t.a ^+ x.b
+
+foo((a=2, b=3))
+",
+        Value::Int(5),
+    )
+}
+
+#[test]
+fn records3() {
+    check_compile_error(
+        "
+def foo(t: {a:Int, b:Int}) => {Bool where _ == true}:
+    t == t
+
+foo((a=2, b=3))
+",
+        "No Equatable instance for BinOp",
+    )
+}
+
+#[test]
+fn records4() {
+    check_compile_error(
+        "
+x = (a=2, b=3)
+
+x == x
+",
+        "No Equatable instance for BinOp",
+    )
+}
+
+// TODO: enable == for arbitrary types in refinements.
+#[test]
+fn records5() {
+    check_compile_error(
+        "
+def foo(t: {a:Int, b:Int}) => {{a:Int, b:Int} where _ == t}:
+    t
+
+foo((a=1, b=2)).a
+",
+        "No Equatable instance for BinOp",
+    )
 }

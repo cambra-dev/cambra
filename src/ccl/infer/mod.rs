@@ -80,6 +80,7 @@ mod emit;
 mod schemes;
 pub(crate) mod solve;
 pub mod solver;
+mod strip;
 mod typing;
 
 // Public surface (consumed by `crate::ccl::infer`): the entry points, the check
@@ -100,9 +101,10 @@ use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
 use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedExpr};
 
-use context::InferCtx;
+pub use context::InferCtx;
 use emit::emit_node;
 use solve::{coalesce_pass, resolve_var_type};
+use solver::smt::SmtError;
 
 // `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
 // refinement binder in every build.
@@ -332,6 +334,31 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         ConstrainError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
             domains: domains.iter().map(coalesce_for_error).collect(),
             origin: ctx_label.to_string(),
+        },
+        ConstrainError::SmtError { lhs, rhs, error } => match error.as_ref() {
+            // Only the Encoding error is passed upward as an
+            // api-level error. All other errors panic here.
+            SmtError::Encoding { body, message } => InferError::Unsupported(format!(
+                "could not compare {} <: {}: the refinement predicate {} is outside the \
+                 supported SMT encoding ({message})",
+                coalesce_for_error(&lhs),
+                coalesce_for_error(&rhs),
+                crate::ccl::symbolic::symbolic(&body.predicate),
+            )),
+            SmtError::Process { message } => {
+                // This should be independent of the types that are
+                // being compared, so don't report them.
+                panic!("Failed to spawn or communicate with solver process: {message}")
+            }
+            SmtError::SolverReportedUnknown => {
+                // For now, treat UNKNOWN as a bug. We may later need
+                // to accept UNKNOWN as simply a type mismatch,
+                // depending on the logic fragment we target.
+                panic!("Solver returned UNKNOWN for {lhs} <: {rhs}")
+            }
+            SmtError::SolverError { message } => {
+                panic!("Could not compare {lhs} <: {rhs}. Solver process reported error: {message}")
+            }
         },
     }
 }
@@ -582,6 +609,14 @@ pub(crate) fn run(
     if !errors.is_empty() {
         return Err(errors);
     }
+
+    // Pass 3: drop the refinements riding type slots *inside* a refinement
+    // predicate. Coalesce discharges the predicate a type carries as that type
+    // crosses a binder; an interior copy of the same claim, one level down in the
+    // predicate's own type slots, restates it and is the copy a discharge can
+    // leave naming a binder it has left. Runs before the scope check below, which
+    // is what reports such a leftover. See `strip`.
+    strip::strip_predicate_interiors(expr);
     #[cfg(debug_assertions)]
     // Scope-validity check (design §6.2): every coalesced node's type is
     // well-formed in the lexical scope at that node — every free term-variable

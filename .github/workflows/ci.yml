@@ -107,6 +107,24 @@ jobs:
         with:
           node-version: 20
 
+      # The refinement-entailment fallback shells out to a `z3` subprocess
+      # (`easy_smt::ContextBuilder::with_z3_defaults` in
+      # `src/ccl/infer/solver/smt.rs`), so without the binary on PATH every
+      # query fails and the solver slot poisons. Pinned by release and verified
+      # by hash, the same discipline as the elan install above, and for a
+      # sharper reason: z3's answers decide refinement subtyping, so a version
+      # floating with the runner image would move what the type checker accepts
+      # without a commit saying so.
+      - name: Setup Z3
+        if: steps.filter.outputs.code == 'true'
+        run: |
+          curl -sSfL -o /tmp/z3.zip \
+            https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip
+          echo "7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e  /tmp/z3.zip" \
+            | sha256sum -c -
+          unzip -q /tmp/z3.zip -d /tmp
+          echo "/tmp/z3-4.16.0-x64-glibc-2.39/bin" >> "$GITHUB_PATH"
+
       # 3. Run Checks (Only if code changed)
       - name: Shellcheck
         if: steps.filter.outputs.code == 'true'

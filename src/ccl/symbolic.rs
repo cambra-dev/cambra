@@ -11,7 +11,7 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Type, TypedExprNode,
+    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, Type, TypedExprNode,
     UnaryOpKind,
 };
 
@@ -593,13 +593,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::And, format!("{first} ⊎ {rest}"))
         }
 
-        TypedExprNode::Proj(key) => (
-            Precedence::Atom,
-            match key {
-                ProjKey::Index(n) => format!(".{n}"),
-                ProjKey::Field(s) => format!(".{s}"),
-            },
-        ),
+        TypedExprNode::Proj(key) => (Precedence::Atom, format!(".{key}")),
 
         TypedExprNode::ExprStmt { expr, body } => {
             let expr_str = fmt(expr, Precedence::Lowest, opts);

@@ -85,6 +85,29 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     40
 )]
+// // Refined transaction bodies
+// #[case::counter_refined_1(
+//     indoc! {r#"
+//         pool: Mut({Int where _ >= 0}, Txn) := 100
+//         for r in [10, 20, 30]:
+//             with begin():
+//                 pool := pool ^+ 1
+//         await_final(pool)
+//     "#},
+//     40
+// )]
+// #[case::counter_refined_2(
+//     indoc! {r#"
+//         pool: Mut({Int where _ >= 0}, Txn) := 100
+//         for r in [10, 20, 30]:
+//             with begin():
+//                 if pool - r >= 0:
+//                     pool := pool - r
+//         await_final(pool)
+//     "#},
+//     40
+// )]
+
 // Two writers over one mutable variable: the operator serializes + retries, conserving the
 // total: 100 − 30 − 40 = 30.
 #[case::two_writers(

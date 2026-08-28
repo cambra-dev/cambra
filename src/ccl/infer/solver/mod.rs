@@ -13,8 +13,9 @@
 //! Refinements ride the lattice natively, as a **set** per position. A
 //! refined type `{T | S}` carries a set `S` of [`Refinement`](crate::ccl::Refinement)
 //! refinements (matched by structural predicate equality — see
-//! [`Refinement`](crate::ccl::Refinement)'s
-//! `PartialEq` — but never by predicate implication). Subtyping is
+//! [`Refinement`](crate::ccl::Refinement)'s `PartialEq`). Where structural
+//! matching leaves a deficit, [`smt`] decides the entailment semantically over
+//! the linear-integer-arithmetic fragment. Subtyping is
 //! superset-on-refinements, structurally identical to record width-subtyping
 //! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a refinement set therefore
 //! merges with the same polarity rule as `rec` (positive ⇒ intersect,
@@ -45,6 +46,7 @@ pub mod compact;
 pub mod constrain;
 pub mod scheme;
 pub mod simplify_type;
+pub mod smt;
 pub mod spec_key;
 pub mod traits;
 
@@ -55,7 +57,7 @@ pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type, compact_type_polarity_only};
 pub use constrain::{
     ConstrainCache, ConstrainError, Derivation, ExtrudeCache, constrain_subtype,
-    constrain_subtype_under, extrude,
+    constrain_subtype_in, constrain_subtype_under, extrude,
 };
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
@@ -188,14 +190,23 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// Build `{base | marker}` — a `Type::Refinement` whose refinement's predicate
-    /// encodes `marker` (an `Int(marker)` literal). Refinements compare by
-    /// structural predicate equality (see [`Refinement`]'s `PartialEq`), so
-    /// equal markers match and distinct markers stay distinct.
+    /// Build `{base | __elem == marker}`. Refinements compare by structural
+    /// predicate equality (see [`Refinement`]'s `PartialEq`), so equal markers
+    /// match and distinct markers stay distinct.
+    ///
+    /// The marker rides a predicate rather than sitting in the slot bare because
+    /// the semantic fallback for a deficit reads a predicate as a formula
+    /// (`super::smt::smt_sub`), where a term that is not a proposition is a
+    /// misencoding. Distinct markers denote disjoint singletons, so a deficit
+    /// between two of them is a mismatch semantically as well as structurally.
     pub(crate) fn refined(base: Type, marker: i64) -> Type {
-        use crate::ccl::{Lit, TypedExpr};
-        let r = Refinement::born(Rc::new(TypedExpr::lit(Lit::Int(marker))));
-        Type::refined_one(base, r)
+        use crate::ccl::{BinOpKind, CompareKind, Lit, Name, TypedExpr};
+        let predicate = TypedExpr::binop(
+            TypedExpr::var(Name::elem()),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::lit(Lit::Int(marker)),
+        );
+        Type::refined_one(base, Refinement::born(Rc::new(predicate)))
     }
 
     /// Helper: build a `Type::Variant({tag: payload, ...})` with named
