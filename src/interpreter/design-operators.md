@@ -450,6 +450,10 @@ engine: a `` `commit `` position appends a change (tick `pos + 1`), an `` `abort
 guard) is a **carry** (no change; the value inherits). It closes its frontier when the
 decision stream goes terminal.
 
+Positions are `UInt` throughout — the engine's ticks are them, and `build_induction_store` refuses
+a source whose extent is not position-indexed rather than letting a product domain reach the driver,
+which drops a non-`UInt` key silently.
+
 Ascending rather than contiguous, because the positions are the *source's*. A restricted loop
 source (`for l in [x for x in xs if p(x)]`) delivers a subset of its extent's positions and
 the recurrence runs over exactly those, so the watermark is a lower bound on the next position

@@ -1597,6 +1597,69 @@ fn nested_for_loops_stay_rejected() {
     );
 }
 
+/// A `mut` loop over a **product** domain is rejected at op-conversion, at every
+/// spelling: let-bound, inline, joined, and over a source. A comprehension across
+/// two sources is keyed by `(i, j)`, and the induction recurrence is sequenced by
+/// `UInt` position end to end — the driver pairs items with `UInt` domain keys,
+/// `CommitEngine` ticks are positions, and `StoreDenseRead` folds tick `p + 1`.
+///
+/// Pinned because the failure is otherwise silent-adjacent. The driver's decode
+/// (`decode_source_positioned`) drops a non-`UInt` key rather than failing on it,
+/// so an unguarded product domain is an empty position set, which the driver reads
+/// as an exhausted source: a loop that runs zero times. What stopped that before
+/// this check was a tile-shape panic and an `unreachable!` further downstream —
+/// loud, but neither names the construct and neither is guaranteed to be reached
+/// first.
+#[rstest]
+#[case(
+    indoc! {r#"
+        xs = [1, 2]
+        ys = [10, 20]
+        prod = [x + y for x in xs for y in ys]
+        n := 0
+        for l in prod:
+            n := n + 1
+        n
+    "#}
+)]
+#[case(
+    indoc! {r#"
+        xs = [1, 2]
+        ys = [10, 20]
+        n := 0
+        for l in [x + y for x in xs for y in ys]:
+            n := n + 1
+        n
+    "#}
+)]
+// The join spelling. Its domain is *refined* as well as a product, and it is the
+// case that reaches this check only because the filtered-source fix lets it past
+// the post-planning `typecheck`.
+#[case(
+    indoc! {r#"
+        xs = [1, 2, 3]
+        ys = [2, 3, 4]
+        n := 0
+        for l in [x for x in xs for y in ys if x == y]:
+            n := n + 1
+        n
+    "#}
+)]
+// One side a live source: the product is `([0, 1], source(stdin))`, so neither
+// factor being a `UIntRange` is what decides it.
+#[case(
+    indoc! {r#"
+        xs = ["a", "b"]
+        n := 0
+        for l in [x + y for x in xs for y in stdin()]:
+            n := n + 1
+        n
+    "#}
+)]
+fn a_mut_loop_over_a_product_domain_is_rejected(#[case] code: &str) {
+    expect_compile_error(code, "must be indexed by iteration position");
+}
+
 /// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where
 /// the mutable variable genuinely crosses a function boundary. Pinned because `emit_let`
 /// now reads through an initializer that is a mutable variable, and widening that to argument

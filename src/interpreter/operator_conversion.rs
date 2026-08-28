@@ -1694,6 +1694,18 @@ fn build_commit_store(
     })
 }
 
+/// Whether `extent` enumerates `UInt` positions, the only shape the induction
+/// recurrence can sequence.
+///
+/// A filtered source needs no case of its own: [`OpConversionContext::extent_of`]
+/// strips refinements at every level, so a restricted loop source arrives here as
+/// the extent it restricts. [`Extent::Restricted`] cannot arrive at all — nothing
+/// outside `extent.rs` constructs one, and iterating one panics
+/// ([`crate::interpreter::tile_operators::IterateExtent`]).
+fn induction_extent_is_positional(extent: &Extent) -> bool {
+    matches!(extent, Extent::UIntRange(_) | Extent::DataSourceDomain(_))
+}
+
 /// Build an induction-domain store (a `mut` loop). Every induction store — plain,
 /// conditional, or feed-carrying, over a finite or async extent — is single-writer
 /// (recognition folds a conditional write to one carry-complete writer), so this
@@ -1800,6 +1812,23 @@ fn build_induction_store_single(
         ))
     })?;
     let induction_extent = ctx.extent_of(&crate::ccl::ccl_utils::strip_refinements(&raw_domain))?;
+    // The recurrence is sequenced by `UInt` position end to end: the driver pairs
+    // items with `UInt` domain keys, `CommitEngine` ticks are positions, and
+    // `StoreDenseRead` folds tick `p + 1` at each. A product domain (a
+    // comprehension over two sources, whose keys are `(i, j)` records) satisfies
+    // none of that. Rejected here rather than deeper, because the deeper failures
+    // are a tile-shape panic and an `unreachable!` in the dense read, and because
+    // the driver's own decode drops a non-`UInt` key silently — an empty position
+    // set reads to it as an exhausted source, so an unguarded product domain is a
+    // loop that runs zero times rather than one that fails.
+    if !induction_extent_is_positional(&induction_extent) {
+        return Err(ConversionError::Unsupported(format!(
+            "a `mut` loop's source must be indexed by iteration position, but this \
+             one is indexed by `{raw_domain}` — a comprehension over two sources \
+             (`[e for x in xs for y in ys]`) has a product domain, which the \
+             induction recurrence cannot sequence"
+        )));
+    }
     let source_op = convert_impl(&w.source, None, ctx)?;
     let read_extents: Vec<Extent> = w
         .read_keys
