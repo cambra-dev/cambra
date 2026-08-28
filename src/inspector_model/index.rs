@@ -60,10 +60,10 @@ impl SpanIndex {
     /// every type slot that carries it, so a walk visiting it per slot would
     /// push its rows once per slot; a node indexed under several *distinct*
     /// spans still contributes one row per span.
-    pub fn build(snapshot: &Expr, projection: &SourceProjection) -> Self {
+    pub fn build(tree: &Expr, projection: &SourceProjection) -> Self {
         let mut entries = Vec::new();
         let mut visited = HashSet::new();
-        Self::collect(snapshot, projection, &mut visited, &mut entries);
+        Self::collect(tree, projection, &mut visited, &mut entries);
         SpanIndex { entries }
     }
 
@@ -92,7 +92,7 @@ impl SpanIndex {
     }
 
     /// Every `(span, node)` entry, one per (node × span) — the data behind the
-    /// `spanIndex` array of the snapshot payload. Order is build order (tree
+    /// `spanIndex` array of the payload. Order is build order (tree
     /// pre-order × each node's spans), and a node indexed under several spans
     /// appears once per span — never twice under one span.
     pub fn entries(&self) -> impl Iterator<Item = (Span, NodeId)> + '_ {

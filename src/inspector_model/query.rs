@@ -1,10 +1,10 @@
-//! The [`Snapshot`] bundle — one compiled program's panes, indices and shared
+//! The [`InspectedProgram`] bundle — one compiled program's panes, indices and shared
 //! IR walk, assembled for the payload.
 //!
-//! [`Snapshot`] holds one [`PaneProjection`] per declared pane (that pane's IR
+//! [`InspectedProgram`] holds one [`PaneProjection`] per declared pane (that pane's IR
 //! tree, its `SourceProjection`, and the [`SpanIndex`] built over the pair), the
 //! pane-pair provenance maps, and the source-level [`NameBinderIndex`].
-//! [`build_payload`](Snapshot::build_payload) in `snapshot.rs` is its consumer.
+//! [`build_payload`](InspectedProgram::build_payload) in `snapshot.rs` is its consumer.
 //!
 //! There is no point-query layer: every static fact ships in the payload, and a
 //! positional question ("which node is at this position") is answered by the
@@ -30,7 +30,7 @@ use super::{Binding, NameBinderIndex, SpanIndex};
 /// still source-shaped. Named rather than positional, so a pane inserted ahead
 /// of it does not silently move the anchor.
 ///
-/// Must be one of [`PANES`]' names; [`Snapshot::new`] panics if it is not.
+/// Must be one of [`PANES`]' names; [`InspectedProgram::new`] panics if it is not.
 pub(super) const ANCHOR_PANE: &str = "post-inference";
 
 /// One pipeline pane's read-only projection: its IR tree, its
@@ -68,7 +68,7 @@ pub(super) struct PaneProjection<'a> {
 /// needs only `&self` — no second borrow of the [`CompiledProgram`].
 ///
 /// [`build_payload`]: Self::build_payload
-pub struct Snapshot<'a> {
+pub struct InspectedProgram<'a> {
     /// The original program source text (the payload's `source.text`).
     source: &'a str,
     /// Source-level lexical name resolution — the payload's `definitions` and
@@ -84,7 +84,7 @@ pub struct Snapshot<'a> {
     /// The pane-pair provenance maps, aligned with `panes.windows(2)` — one per
     /// adjacent pane pair, folded from the rows the intervening phases wrote
     /// ([`CompiledProgram::materialize_panes`]). Drives the `paneLinks` payload
-    /// (shipped dense, self-edges included). Empty for a single-pane snapshot.
+    /// (shipped dense, self-edges included). Empty for a single-pane model.
     pane_maps: Vec<ProvenanceMap<NodeId, NodeId>>,
 }
 
@@ -133,7 +133,7 @@ impl<'a> PaneProjection<'a> {
     }
 }
 
-impl<'a> Snapshot<'a> {
+impl<'a> InspectedProgram<'a> {
     /// Build the bundle from a compiled program: materialize one projection per
     /// pane and one map per adjacent pair
     /// ([`CompiledProgram::materialize_panes`]), build each pane's span index,
@@ -173,7 +173,7 @@ impl<'a> Snapshot<'a> {
             .iter()
             .position(|s| s.id == ANCHOR_PANE)
             .expect("the post-inference anchor pane is declared in `PANES`");
-        Snapshot {
+        InspectedProgram {
             source: &compiled.source,
             name_binder,
             anchor,
@@ -190,7 +190,7 @@ impl<'a> Snapshot<'a> {
     /// pane with no pane links.
     ///
     /// `pane` must be one of [`PANES`]' names — a pane's wire id is the pane's
-    /// declared name, so a snapshot built over the post-channelize tree must say
+    /// declared name, so a model built over the post-channelize tree must say
     /// so rather than inherit the anchor's label.
     pub fn from_parts(
         pane: &'static str,
@@ -207,7 +207,7 @@ impl<'a> Snapshot<'a> {
             projection,
         )];
         let name_binder = NameBinderIndex::build(source_ast);
-        Snapshot {
+        InspectedProgram {
             source,
             name_binder,
             anchor: panes.len() - 1,
@@ -233,7 +233,7 @@ impl<'a> Snapshot<'a> {
         &self.pane_maps
     }
 
-    /// The program's source text (the snapshot payload's `source.text`).
+    /// The program's source text (the payload's `source.text`).
     pub(super) fn source_text(&self) -> &str {
         self.source
     }
@@ -594,12 +594,12 @@ mod tests {
     use crate::ccl::context::Phase;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::provenance::Nature;
-    use crate::inspector_model::SnapshotPayload;
+    use crate::inspector_model::InspectorPayload;
     use crate::interpreter::Consumer;
     use indoc::indoc;
 
     /// Compile a CHL program for inspection. Returns the whole
-    /// [`CompiledProgram`] so a [`Snapshot`] can borrow all its projections.
+    /// [`CompiledProgram`] so a [`InspectedProgram`] can borrow all its projections.
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -734,7 +734,7 @@ a
             k
         "#};
         let prog = compile(code);
-        let payload = Snapshot::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test");
 
         let ty = |name: &str| -> String {
             let mut types = binder_types(&payload, name);
@@ -771,7 +771,7 @@ a
             f(1, 2)
         "#};
         let prog = compile(code);
-        let snap = Snapshot::new(&prog);
+        let snap = InspectedProgram::new(&prog);
 
         let call = code.find("f(1, 2)").expect("call present");
         let call_span = Span::new(call, call + 1);
@@ -801,7 +801,7 @@ a
             f(1, 2)
         "#};
         let prog = compile(code);
-        let payload = Snapshot::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test");
 
         for name in ["p", "q"] {
             let types = binder_types(&payload, name);
@@ -852,7 +852,7 @@ max(totals)
     ///
     /// Panics if a row names a node the table does not hold — the invariant
     /// `span_index_round_trips_with_projection` (`index.rs`) pins.
-    fn labels_at(payload: &SnapshotPayload, pane_id: &str, span: Span) -> Vec<String> {
+    fn labels_at(payload: &InspectorPayload, pane_id: &str, span: Span) -> Vec<String> {
         let pane = payload
             .panes
             .iter()
@@ -875,7 +875,7 @@ max(totals)
     /// The distinct types the payload's scope rows join to the binder named
     /// `name`. A binder joins one type wherever it is visible, so a well-formed
     /// payload answers with a single entry.
-    fn binder_types(payload: &SnapshotPayload, name: &str) -> Vec<Option<String>> {
+    fn binder_types(payload: &InspectorPayload, name: &str) -> Vec<Option<String>> {
         let mut out: Vec<Option<String>> = Vec::new();
         for binding in payload.scopes.iter().flat_map(|scope| &scope.bindings) {
             if binding.name != name {
@@ -895,7 +895,7 @@ max(totals)
     #[test]
     fn generator_mapped_spans_resolve_to_expected_nodes() {
         let prog = compile(GENERATOR_SRC);
-        let payload = Snapshot::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test");
         let at = |span| labels_at(&payload, "post-inference", span);
 
         // The `x * x` body → the arithmetic-mul BinOp (a mono clone of the
@@ -943,7 +943,7 @@ max(totals)
     #[test]
     fn defer_mapped_spans_resolve_to_expected_nodes() {
         let prog = compile(DEFER_SRC);
-        let payload = Snapshot::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test");
         let at = |span| labels_at(&payload, "post-inference", span);
 
         let sum = at(nth_span(DEFER_SRC, "sum", 0));
@@ -990,7 +990,7 @@ max(totals)
     fn defer_coverage_maps_the_copaired_fan_in() {
         let prog = compile(DEFER_SRC);
         let panes = prog.materialize_panes();
-        let payload = Snapshot::from_parts(
+        let payload = InspectedProgram::from_parts(
             "post-channelize",
             &prog.source,
             &prog.post_channelize_ir,

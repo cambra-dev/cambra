@@ -4,7 +4,7 @@
 //! `/api/snapshot` is the primary read-only endpoint:
 //! source + the panes (each a node table + span→node index) + use→def
 //! definitions + per-scope bindings + diagnostics + meta. This module mirrors
-//! that JSON exactly as a serde-gated [`SnapshotPayload`]; the actual
+//! that JSON exactly as a serde-gated [`InspectorPayload`]; the actual
 //! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
 //! Building the payload is pure: it enumerates
 //! [`SpanIndex`](crate::inspector_model::SpanIndex) and
@@ -15,7 +15,7 @@
 //!
 //! Every type here carries `#[cfg_attr(feature = "serde", derive(Serialize))]`
 //! with camelCase field names (`spanIndex`, `useSpan`, `defSpan`,
-//! `snapshotKind`, …) to match the schema. `cambra` itself never compiles serde
+//! `payloadKind`, …) to match the schema. `cambra` itself never compiles serde
 //! unless the feature is on — see the module-level note on
 //! [`inspector_model`](crate::inspector_model).
 //!
@@ -27,20 +27,20 @@
 //!   describes a *successfully compiled* program, and there are no warnings. The
 //!   wire type ([`Diagnostic`]) drives the standalone compile-failure path
 //!   (`cambra-inspector::diagnose_json`); a failed compile instead flows
-//!   through [`SnapshotPayload::degraded`], which carries the same
+//!   through [`InspectorPayload::degraded`], which carries the same
 //!   diagnostics in place of a real snapshot (see `cambra-inspector::server`'s
 //!   "Transport decision" note).
 //! * `outline` — **omitted** from the payload. Rather than ship an empty stub
 //!   of an undecided shape, the field is left out until an `outline` query
 //!   exists.
-//! * `meta.tick` — `null` (the live seam); `snapshotKind` is `"post-inference"`,
+//! * `meta.tick` — `null` (the live seam); `payloadKind` is `"post-inference"`,
 //!   `schema` is [`SCHEMA_VERSION`].
 
 use crate::chl_parser::ast::Span;
 
 use super::links::dense_edges;
 use super::name_binder::{Definition, ScopeRegion};
-use super::query::{PaneProjection, Snapshot};
+use super::query::{InspectedProgram, PaneProjection};
 use crate::ccl::Type;
 
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
@@ -55,7 +55,7 @@ pub const SCHEMA_VERSION: u32 = 5;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct SnapshotPayload {
+pub struct InspectorPayload {
     /// The program's name + full source text.
     pub source: SourceInfo,
     /// Every resolved use→definition pair.
@@ -64,9 +64,9 @@ pub struct SnapshotPayload {
     pub scopes: Vec<ScopeEntry>,
     /// Always empty on the success path (see the module doc's "Populated vs.
     /// stubbed" section) — a failed compile carries real diagnostics through
-    /// [`SnapshotPayload::degraded`] instead.
+    /// [`InspectorPayload::degraded`] instead.
     pub diagnostics: Vec<Diagnostic>,
-    /// Snapshot metadata + the live-protocol seams.
+    /// InspectedProgram metadata + the live-protocol seams.
     pub meta: Meta,
     /// The panes, upstream → downstream, each carrying its own node
     /// table and span index — one entry per pane
@@ -287,7 +287,7 @@ pub struct ScopeBindingEntry {
 /// structured JSON, the same error the terminal renders via ariadne. Built by
 /// [`Diagnostic::from_compile_error`] / [`diagnostics_from_compile_errors`].
 ///
-/// `diagnostics` on [`SnapshotPayload`] stays `[]` for *successful* compiles
+/// `diagnostics` on [`InspectorPayload`] stays `[]` for *successful* compiles
 /// (no warnings); these are produced on the compile-failure path by the
 /// standalone `diagnose_json` entry, not by `build_payload`.
 ///
@@ -385,12 +385,12 @@ pub struct Meta {
     pub tick: Option<u64>,
     /// The snapshot kind discriminant — `"post-inference"` for a successful
     /// compile, `"failed"` for a degraded (compile-error) payload.
-    pub snapshot_kind: String,
+    pub payload_kind: String,
     /// The wire-format version. A client reads this to detect an incompatible
     /// payload before parsing the rest.
     ///
     /// The current version is [`SCHEMA_VERSION`], whose field set is
-    /// [`SnapshotPayload`]'s as documented on that type. Each
+    /// [`InspectorPayload`]'s as documented on that type. Each
     /// `panes[].nodes[]` entry carries its attribution as the spans channel on
     /// `span` plus a `rewritten` tag (`null | { via, nature, label }`).
     ///
@@ -420,7 +420,7 @@ fn build_pane_nodes_and_index(pane: &PaneProjection<'_>) -> (u64, Vec<IrNode>, V
     (root, nodes, span_entries)
 }
 
-impl Snapshot<'_> {
+impl InspectedProgram<'_> {
     /// Assemble the `/api/snapshot` bulk payload by enumerating the indices.
     ///
     /// `name` is the program name for `source.name` (a placeholder; the server
@@ -436,9 +436,9 @@ impl Snapshot<'_> {
     /// * `scopes` — [`NameBinderIndex::scopes`](crate::inspector_model::NameBinderIndex::scopes),
     ///   each binding's `type` read off the IR node that binds it.
     /// * `diagnostics` — empty.
-    /// * `meta` — `tick: None`, `snapshotKind: "post-inference"`, `schema:
+    /// * `meta` — `tick: None`, `payloadKind: "post-inference"`, `schema:
     ///   `[`SCHEMA_VERSION`].
-    pub fn build_payload(&self, name: impl Into<String>) -> SnapshotPayload {
+    pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
         let source = SourceInfo {
             name: name.into(),
             text: self.source_text().to_string(),
@@ -519,14 +519,14 @@ impl Snapshot<'_> {
             })
             .collect();
 
-        SnapshotPayload {
+        InspectorPayload {
             source,
             definitions,
             scopes,
             diagnostics: Vec::new(),
             meta: Meta {
                 tick: None,
-                snapshot_kind: "post-inference".to_string(),
+                payload_kind: "post-inference".to_string(),
                 schema: SCHEMA_VERSION,
             },
             panes,
@@ -535,14 +535,14 @@ impl Snapshot<'_> {
     }
 }
 
-impl SnapshotPayload {
+impl InspectorPayload {
     /// The degraded `/api/snapshot` payload for a program that failed to
     /// compile: the source text + the structured diagnostics, with no typed IR.
     ///
-    /// Built from the **same** [`SnapshotPayload`] type as the success path
+    /// Built from the **same** [`InspectorPayload`] type as the success path
     /// (rather than a separately hand-rolled JSON object), so the two shapes
     /// cannot silently diverge as the schema evolves — the `panes`/scope
-    /// collections are empty and `meta.snapshotKind` is `"failed"`. The frontend
+    /// collections are empty and `meta.payloadKind` is `"failed"`. The frontend
     /// still renders the editor + squiggles from this.
     ///
     /// TODO(degraded-panes): emit whatever panes *did* complete — if
@@ -556,8 +556,8 @@ impl SnapshotPayload {
         name: impl Into<String>,
         text: impl Into<String>,
         diagnostics: Vec<Diagnostic>,
-    ) -> SnapshotPayload {
-        SnapshotPayload {
+    ) -> InspectorPayload {
+        InspectorPayload {
             source: SourceInfo {
                 name: name.into(),
                 text: text.into(),
@@ -567,7 +567,7 @@ impl SnapshotPayload {
             diagnostics,
             meta: Meta {
                 tick: None,
-                snapshot_kind: "failed".to_string(),
+                payload_kind: "failed".to_string(),
                 schema: SCHEMA_VERSION,
             },
             panes: Vec::new(),
@@ -666,7 +666,7 @@ mod tests {
     fn the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
 
             let ids: Vec<&str> = payload.panes.iter().map(|s| s.id).collect();
             let declared: Vec<&str> = PANES.iter().map(|p| p.name).collect();
@@ -707,7 +707,7 @@ mod tests {
     fn every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             let ids: HashMap<&str, HashSet<u64>> =
                 payload.panes.iter().map(|s| (s.id, pane_ids(s))).collect();
 
@@ -744,7 +744,7 @@ mod tests {
     fn every_span_index_row_points_at_a_node_of_its_own_pane() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
                 for row in &pane.span_index {
@@ -772,7 +772,7 @@ mod tests {
             max(ys)
         "#};
         let prog = compile(code);
-        let payload = Snapshot::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test");
         let pane = payload
             .panes
             .iter()
@@ -859,7 +859,7 @@ mod tests {
     fn every_child_id_resolves_in_its_own_table() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
                 assert!(
@@ -897,7 +897,7 @@ mod tests {
     fn a_pane_table_holds_each_node_exactly_once() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             for (pane, tree) in payload.panes.iter().zip(prog.pane_trees()) {
                 let mut seen = HashSet::new();
                 for node in &pane.nodes {
@@ -930,7 +930,7 @@ mod tests {
     fn no_span_index_row_repeats() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let mut seen = HashSet::new();
                 for row in &pane.span_index {
@@ -956,7 +956,7 @@ mod tests {
         // and its target, so the same predicate term is reached twice.
         let code = corpus()[0];
         let prog = compile(code);
-        let payload = Snapshot::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test");
         let pane = payload
             .panes
             .iter()
@@ -1061,7 +1061,7 @@ mod tests {
     fn every_node_of_every_pane_carries_an_attribution() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
                 let attributed: HashSet<u64> =
@@ -1090,7 +1090,7 @@ mod tests {
     fn a_node_carries_its_type_kind_and_its_own_predicates() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = Snapshot::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
                 let mut refined = 0;
@@ -1159,8 +1159,8 @@ mod tests {
         let diagnostics = diagnostics_from_compile_errors(&errors);
         assert!(!diagnostics.is_empty(), "the failure produces diagnostics");
 
-        let payload = SnapshotPayload::degraded("test", "z + 1\n", diagnostics);
-        assert_eq!(payload.meta.snapshot_kind, "failed");
+        let payload = InspectorPayload::degraded("test", "z + 1\n", diagnostics);
+        assert_eq!(payload.meta.payload_kind, "failed");
         assert_eq!(payload.meta.schema, SCHEMA_VERSION);
         assert!(payload.panes.is_empty());
         assert!(payload.pane_links.is_empty());

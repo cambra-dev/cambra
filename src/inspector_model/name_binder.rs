@@ -70,7 +70,7 @@ pub struct Definition {
 
 /// One scope region, the enumeration unit behind the `/api/snapshot` `scopes`
 /// array: a binder-bearing span plus the binders visible inside it. The type
-/// join (each binding's `type`) is added by the snapshot assembler, which has
+/// join (each binding's `type`) is added by the payload assembler, which has
 /// the [`SpanIndex`](crate::inspector_model::SpanIndex).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeRegion {

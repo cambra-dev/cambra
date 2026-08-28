@@ -26,7 +26,7 @@
 //!
 //! # The pane set is the compiler's, not this module's
 //!
-//! [`Snapshot::new`] derives one wire pane per entry of
+//! [`InspectedProgram::new`] derives one wire pane per entry of
 //! [`PANES`](crate::ccl::panes::PANES) and one pane link per adjacent pair, so
 //! the topology is declared in the compiler and read here. Adding a pane there
 //! adds a pane here with no edit in this module.
@@ -60,9 +60,9 @@
 //!
 //! # One payload, no point queries
 //!
-//! [`Snapshot`] bundles the two indices with the per-pane projections (source
+//! [`InspectedProgram`] bundles the two indices with the per-pane projections (source
 //! text, one IR tree and one `SourceProjection` per pane, surface AST), and
-//! [`Snapshot::build_payload`] assembles the payload from them. That is the
+//! [`InspectedProgram::build_payload`] assembles the payload from them. That is the
 //! module's whole entry surface: a positional question is answered by the
 //! consumer over the shipped `(span, node)` rows and the shipped node table,
 //! which is the copy that runs. See `src/inspector_model/design.md`, "The usage model".
@@ -76,9 +76,9 @@ mod snapshot;
 pub use index::SpanIndex;
 pub use links::dense_edges;
 pub use name_binder::{Binding, Definition, NameBinderIndex, ScopeRegion};
-pub use query::Snapshot;
+pub use query::InspectedProgram;
 pub use snapshot::{
-    DefinitionEntry, Diagnostic, DiagnosticLabel, IrChild, IrNode, Meta, PaneEntry, PaneLinkEntry,
-    RewriteInfo, SCHEMA_VERSION, ScopeBindingEntry, ScopeEntry, SnapshotPayload, SourceInfo,
-    SpanEntry, diagnostics_from_compile_errors,
+    DefinitionEntry, Diagnostic, DiagnosticLabel, InspectorPayload, IrChild, IrNode, Meta,
+    PaneEntry, PaneLinkEntry, RewriteInfo, SCHEMA_VERSION, ScopeBindingEntry, ScopeEntry,
+    SourceInfo, SpanEntry, diagnostics_from_compile_errors,
 };

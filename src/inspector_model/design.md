@@ -21,7 +21,7 @@ disagreement between this document and the code is listed under
 | | |
 |---|---|
 | Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `SnapshotPayload`: `source` (the program text), `panes` (per pane: a node table, its root, and its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
+| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table, its root, and its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | the `cambra-inspector` crate, which serves the payload, and that crate's frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
@@ -83,8 +83,8 @@ the order, the arity and the kind split.
 
 `ANCHOR_PANE` is `"post-inference"` — the first fully-typed tree that is still source-shaped. It
 decides which pane a binder's type is read from, so `scopes[].bindings[].type` is a post-inference
-type. The pane is named rather than positional, and `Snapshot::new` panics if `PANES` does not
-declare it, so inserting a pane ahead of it cannot silently move the anchor.
+type. The pane is named rather than positional, and `InspectedProgram::new` panics if `PANES` does
+not declare it, so inserting a pane ahead of it cannot silently move the anchor.
 
 ### A pane resolves against itself
 
@@ -231,8 +231,8 @@ that happens to be well-formed.
 from. A binder is not a node, so nothing attributes it, and the `Let` holding it carries one span
 covering the whole statement. No field says "the binder written at 0…1 is this node's".
 
-`Snapshot::binder_type` recovers that correspondence by searching, among the nodes whose span covers
-the binding site, for the node that holds the binder — by two tests, in order.
+`InspectedProgram::binder_type` recovers that correspondence by searching, among the nodes whose
+span covers the binding site, for the node that holds the binder — by two tests, in order.
 
 1. **The binder's name.** `g` is still a binder named `g` on the covering `Let`. Shadowed binders
    separate on span, since each statement's `Let` covers only its own binding site:
@@ -276,15 +276,15 @@ so the walk reaches one region twice. The regions that remain are dense and nest
 ### Diagnostics and the degraded payload
 
 `diagnostics` is empty on a successful payload: it describes a program that compiled, and there are
-no warnings. A failed compile ships `SnapshotPayload::degraded` instead — same type, so the two
-shapes cannot drift — carrying the source text, the diagnostics, `meta.snapshotKind: "failed"`, and
+no warnings. A failed compile ships `InspectorPayload::degraded` instead — same type, so the two
+shapes cannot drift — carrying the source text, the diagnostics, `meta.payloadKind: "failed"`, and
 empty `panes`, `paneLinks`, `definitions` and `scopes`.
 
 A failed compile ships no panes even where the pipeline reached some: inference can fail after
 channelization succeeded, and that channelized IR is displayable. Shipping what a failed compile did
 reach is follow-up work beyond this document's ratified changes, since it needs the pipeline to hand
 back its partial panes rather than one error; it is carried as `TODO(degraded-stages)` on
-`SnapshotPayload::degraded`.
+`InspectorPayload::degraded`.
 
 A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span. The
 message is the error's `Display` rendering — the same single line the terminal's ariadne label
@@ -296,7 +296,7 @@ The span is the error's own wherever it has one. `Parse` and `Lower` read theirs
 `Infer`'s is resolved at the `compile_program` boundary; `ChannelizeDefers`, `LambdaElim`,
 `Conversion` and `Unsupported` carry none, so a consumer has nothing to underline for them.
 
-`meta` carries `snapshotKind`, the always-null live seam `tick`, and `schema`. The schema's
+`meta` carries `payloadKind`, the always-null live seam `tick`, and `schema`. The schema's
 `outline` field is omitted rather than stubbed, until an outline query exists.
 
 ### The schema version
@@ -348,16 +348,16 @@ shared term.
 
 | item | what it is for |
 |---|---|
-| `Snapshot::new` | bundle every pane of a `CompiledProgram` with the two indices |
-| `Snapshot::from_parts` | bundle one named pane; the payload then carries that pane alone and no pane links |
-| `Snapshot::build_payload` | assemble the `SnapshotPayload` — the whole read model |
+| `InspectedProgram::new` | bundle every pane of a `CompiledProgram` with the two indices — the whole read model over one compiled program |
+| `InspectedProgram::from_parts` | bundle one named pane; the payload then carries that pane alone and no pane links |
+| `InspectedProgram::build_payload` | assemble the `InspectorPayload` — the whole read model |
 | `SpanIndex::build` / `entries` | build the `(span, node)` table over one pane and enumerate it for the wire |
 | `NameBinderIndex::build` / `definitions` / `scopes` | resolve names over the surface AST and enumerate the results |
 | `dense_edges` | project a pane pair's `ProvenanceMap` onto the wire |
-| `diagnostics_from_compile_errors` / `SnapshotPayload::degraded` | the compile-failure path |
-| the wire types | `SnapshotPayload`, `PaneEntry`, `PaneLinkEntry`, `SpanEntry`, `DefinitionEntry`, `ScopeEntry`, `ScopeBindingEntry`, `Diagnostic`, `DiagnosticLabel`, `Meta`, `SCHEMA_VERSION` |
+| `diagnostics_from_compile_errors` / `InspectorPayload::degraded` | the compile-failure path |
+| the wire types | `InspectorPayload`, `PaneEntry`, `PaneLinkEntry`, `SpanEntry`, `DefinitionEntry`, `ScopeEntry`, `ScopeBindingEntry`, `Diagnostic`, `DiagnosticLabel`, `Meta`, `SCHEMA_VERSION` |
 
-`Snapshot::binder_type` is internal.
+`InspectedProgram::binder_type` is internal.
 
 Unit tests live in the module they exercise. `snapshot.rs`'s run over a three-program `corpus()`
 chosen for the shapes that reach the payload's moving parts: a comprehension for refinement
@@ -402,11 +402,6 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
 Each change is ratified here and lands on its own. They are named rather than numbered: a numbered
 list renumbers as entries land, and a reference to "item 4" would then point at the wrong change.
 
-- **The type renames.** `Snapshot` becomes `InspectedProgram` and `SnapshotPayload` becomes
-  `InspectorPayload`. "Snapshot" reads as one retained AST snapshot, which is what `provenance.md`
-  calls a pane, where the type is the whole read model over every pane. `InspectedProgram` parallels
-  the `CompiledProgram` it is built from. `meta.snapshotKind` becomes `payloadKind` — its values say
-  which payload this is, not which pane.
 - **Module reorganization.** One concept per module, each owning its type, its inherent impl and its
   unit tests, with no module depending on one above it. The target, which the current file names do
   not yet match — today `snapshot.rs` holds the wire and `query.rs` holds the bundle:
@@ -422,5 +417,5 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
   Vocabulary the reorganization settles: an **index** is a built structure, a **lookup** is a read
   of one, and the **payload** is what ships.
 
-The type renames above touch the wire at `meta`, and ride schema 5, which the node table bumped and
-which has not shipped.
+The module reorganization above touches no wire field. Schema 5, which the node table bumped, has
+not shipped.
