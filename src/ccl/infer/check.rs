@@ -8,6 +8,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
+use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
@@ -143,7 +144,7 @@ impl Typing for CheckCtx {
     fn require_trait(
         &mut self,
         trait_: Trait,
-        _operator_node_id: NodeId,
+        operator_node_id: NodeId,
         operand_types: &[&Type],
         operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
@@ -187,6 +188,11 @@ impl Typing for CheckCtx {
                         let base = Type::Base(b.clone());
                         match template {
                             Some(template) => {
+                                let _f = provenance::enter(
+                                    operator_node_id,
+                                    "check.require_trait",
+                                    provenance::Nature::Machinery,
+                                );
                                 let args: Vec<TypedExpr> =
                                     operand_exprs.iter().map(|e| (*e).clone()).collect();
                                 Type::Refinement(
