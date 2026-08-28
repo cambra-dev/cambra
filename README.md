@@ -112,7 +112,7 @@ curl --data-binary @v2.cambra localhost:8081/update
 
 `/diff` reports how the two versions differ and changes nothing. `/update` replaces the program in place: sockets stay open, every binding whose computation is unchanged keeps running, and a variable whose logic you did edit resumes from the value it was holding. Add `phase=<name>&` before the source to diff somewhere other than the default (`lowered`, `inferred`, `inlined`, `channelized`, `lambda-elim`, `planned`).
 
-An update may change the program's logic freely, add endpoints, and stop serving ones it no longer wants (their addresses then answer 404). The one thing it may not do is break continuity of state: a variable the running program is holding a value for must be one the new version declares, at the same type and in the same loop, or the update is refused and the running program is left serving. See [live-update.md](src/ccl/design/live-update.md).
+An update may change the program's logic freely, add endpoints, and stop serving ones it no longer wants (their addresses then answer 404). A variable may even move to another loop or into a transaction: it keeps its value and starts counting positions in whatever it now iterates. The one thing an update may not do is break continuity of state: a variable the running program is holding a value for must be one the new version declares, at the same type, or the update is refused and the running program is left serving. See [live-update.md](src/ccl/design/live-update.md).
 
 The control port defaults to 8081 (`--control=9090` to change it).
 
