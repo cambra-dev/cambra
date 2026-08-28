@@ -755,7 +755,7 @@ What differs is only what *decides* a position:
 
 | | `InductionStore` | commit operator |
 |---|---|---|
-| what decides a position | the next contiguous iteration position | a proposal that survives validation |
+| what decides a position | the next iteration position the source delivers | a proposal that survives validation |
 | ordering | strict predecessor dependence | any serialization the model admits |
 | conflicts | impossible: single writer | validated read sets, skip and retry |
 | what advances the cursor | the store's decided frontier, which is in the tile | the commit-ack, which is not — a commit is what *moves* the frontier |

@@ -495,6 +495,76 @@ o"#,
         deleted: BitSet::new(),
     }
 )]
+// A `mut` accumulator over a **filtered** source. `restrict` keeps an element at
+// its original position, so `kept`'s domain is the subset `{1, 2}` of the
+// extent `[0, 2]` — the recurrence runs over exactly those two positions and
+// never over the filtered-out 0. The iteration ticks are the positions' (a
+// position `p` decides tick `p + 1`), so the changelog skips tick 1 the way the
+// domain skips position 0.
+#[case(
+    indoc! {r#"
+        kept = [x for x in [1, 2, 3] if x > 1]
+        n := 0
+        for l in kept:
+            n := n + 1
+        n"#},
+    Tile::Scalar(ColumnValue::Ints(vec![2]))
+)]
+// The same source un-bound, so planning materializes the filter at the loop's own
+// iteration site rather than at a `let`.
+#[case(
+    indoc! {r#"
+        n := 0
+        for l in [x for x in [1, 2, 3] if x > 1]:
+            n := n + 1
+        n"#},
+    Tile::Scalar(ColumnValue::Ints(vec![2]))
+)]
+// A filter with an **interior** gap that keeps position 0: the domain is
+// `{0, 2, 4}`, so the driver's next position is neither its predecessor's
+// successor nor the store's tick cursor. 1 + 3 + 5.
+#[case(
+    indoc! {r#"
+        kept = [x for x in [1, 2, 3, 4, 5] if x != 2 if x != 4]
+        n := 0
+        for l in kept:
+            n := n + l
+        n"#},
+    Tile::Scalar(ColumnValue::Ints(vec![9]))
+)]
+// A filter that keeps nothing: the loop runs zero iterations over a non-empty
+// extent and the read falls back to the seed. Distinct from an empty extent —
+// the source is complete with no position above the cursor from the first pull,
+// which is the shape a driver that read "position 0 absent" as "source ended"
+// could not tell apart from a filtered-out leading position.
+#[case(
+    indoc! {r#"
+        kept = [x for x in [1, 2, 3] if x > 10]
+        n := 0
+        for l in kept:
+            n := n + 1
+        n"#},
+    Tile::Scalar(ColumnValue::Ints(vec![0]))
+)]
+// A feed inside a filtered loop: the tap fires once per *iterated* position, so
+// its stream is keyed by the source's positions (2, 3, 4) rather than by a count
+// of iterations. Running sums 3, 3+4, 3+4+5.
+#[case(
+    indoc! {r#"
+        kept = [x for x in [1, 2, 3, 4, 5] if x > 2]
+        n := 0
+        o = defer()
+        for l in kept:
+            n := n + l
+            o << n
+        o"#},
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![2, 3, 4]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 7, 12]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
 #[ignore] // TODO support nested loops with mutations.
 #[case(
     r#"

@@ -445,10 +445,18 @@ of one loop, wired as a cycle: store → body → driver → `FanOut::new_cyclic
 The **store** owns a `CommitEngine` seeded at tick 0 with the accumulators' inits (so the
 changelog is self-describing — a read below the first *iteration* change folds to the seed).
 It consumes the body's `` {`commit{writes} | `abort} `` decisions (`body_decision_at` decodes
-the union tag) contiguously from its decided watermark (which counts the positions already
-stepped — the store keeps no separate cursor for them) and `step`s the engine: a `` `commit `` position
-appends a change (tick `pos + 1`), an `` `abort `` (a failed guard) is a **carry** (no change;
-the value inherits). It closes its frontier when the decision stream goes terminal.
+the union tag) in **ascending position order** from its decided watermark, and `step`s the
+engine: a `` `commit `` position appends a change (tick `pos + 1`), an `` `abort `` (a failed
+guard) is a **carry** (no change; the value inherits). It closes its frontier when the
+decision stream goes terminal.
+
+Ascending rather than contiguous, because the positions are the *source's*. A restricted loop
+source (`for l in [x for x in xs if p(x)]`) delivers a subset of its extent's positions and
+the recurrence runs over exactly those, so the watermark is a lower bound on the next position
+rather than the position itself, and the ticks a filtered-out position would have occupied are
+never occupied. The alternative — iterating the extent densely and gating the write — was not
+taken: the domain the pipeline hands the store is the refined extent, and a store that
+disagreed with it would have to recover the filter the type already carries.
 
 That last clause is an **obligation on the body chain**, and worth stating because it is
 easy to violate without noticing. The driver owns the source and closes its body-input tile,
@@ -456,18 +464,22 @@ so the store learns the loop is over only if every operator between the two forw
 `domain_predicate`. An operator that
 renders a decision column but hardcodes a non-terminal predicate leaves the loop running
 forever with the right values in it — a hang, not a wrong answer. The store asserts the
-matching gaplessness property (a terminal decision stream with a hole in it) but cannot
-assert this one, since "the body never went terminal" is indistinguishable from "the body
-is not done yet".
+matching property (a terminal decision stream it has not fully consumed) but cannot assert
+this one, since "the body never went terminal" is indistinguishable from "the body is not
+done yet".
 
 The **driver** owns the iteration source and produces the body's `(prev…, item)` input. It
-holds no part of the recurrence: the store's decided frontier already names the next position to
-iterate (`step` advances the watermark unconditionally, so a carry decides its position
-without appending a change), and the previous accumulator is that key's value *at* the
-frontier (`store_value_at`, one fold per read key — folding *at* the position being fed,
-which is what the recurrence means, rather than taking the key's latest write). So an
-emitted row is a pure function of the store tile and the source tile, with nothing cached
-that could drift. It decodes the source
+holds no part of the recurrence, and reads the store on two axes. The frontier is a **tick**
+cursor: `step` advances the watermark unconditionally (so a carry decides its position without
+appending a change), and a frontier equal to `emitted_through + 1` says every emitted position
+has been decided and the next may go. The previous accumulator is that key's value *at* the
+frontier (`store_value_at`, one fold per read key — folding *at* the tick the predecessor's
+decision occupies, which is what the recurrence means, rather than taking the key's latest
+write). What the driver does keep is the **item** cursor `emitted_through`, because a
+restricted source's positions are sparser than its extent's and the frontier therefore does
+not name one; the next position to iterate is the smallest delivered position above it. An
+emitted row is otherwise a pure function of the store tile and the source tile, with nothing
+cached that could drift. It decodes the source
 into `(absolute position, item)` pairs (`decode_source_positioned`), since an async source's
 domain arrives *unordered* and *compacts* as its consumed prefix is released; it reclaims
 that prefix incrementally and releases the whole source (`True`) once the loop is done. It
@@ -510,6 +522,13 @@ an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with b
 sorting is correct for both.) One reader serves both shapes, and a downstream release of loop
 positions is forwarded to the trigger so the source is reclaimed. Reading by fold rather
 than by indexed projection is what unifies induction reads with transactional-variable reads.
+
+The trigger enumerates the loop **extent**, which for a restricted source is wider than the
+set of positions the recurrence ran at. That needs no special case: a position the filter
+excluded occupies no tick, so `store_value_at` folds it to the latest write below it — the
+accumulator's value as of that position, which is what a history over the extent means. A
+scalar-final read still lands on the last iterated write, and a tap (`carry_forward: false`)
+still appears only at the positions that fired.
 
 Folding by position keeps the read independent of the store's own length — the positions
 come from the trigger, the values from the fold. And the trailing-carry undercount that

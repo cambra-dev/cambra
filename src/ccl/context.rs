@@ -780,7 +780,6 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 /// Explanation and uniqueness are two questions with two answers; see
 /// `design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
-    use crate::ccl::TypedExprNode;
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut HashSet<NodeId>) {
@@ -791,29 +790,14 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
         acc.insert(e.node_id());
-        from_ty(&e.ty, acc);
-        if let Some(ann) = &e.user_annotation {
-            from_ty(ann, acc);
-        }
-        // A `Cast`'s target is a type slot `walk_children` skips, and it is where
-        // lowering parks the predicate it just built.
-        if let TypedExprNode::Cast { target, .. } = &e.node {
-            from_ty(target, acc);
-        }
-        // A binder's declared type and its annotation are type slots too. This
-        // walk and `TypedExpr::walk_type_slots` enumerate the same domain, and
-        // must: the rewriting passes reach predicates through `walk_type_slots`,
-        // so anything it covers and this does not is a predicate a pass may
-        // rebuild while the fold has never enumerated the original — which reads
-        // as `DanglingParent` against an id the input pane demonstrably holds.
+        // Delegating to `walk_type_slots` is what keeps the two in step, and they
+        // must be: the rewriting passes reach predicates through that walk, so a
+        // slot it covers and this does not is a predicate a pass may rebuild while
+        // the fold has never enumerated the original — which reads as
+        // `DanglingParent` against an id the input pane demonstrably holds.
         // `f: (Int => {Int where _ == 9}) = …` is the shape: the predicate rides
         // the `let` binder's annotation and nothing else.
-        e.walk_binders(|b| {
-            from_ty(&b.ty, acc);
-            if let Some(ann) = &b.user_annotation {
-                from_ty(ann, acc);
-            }
-        });
+        e.walk_type_slots(|t| from_ty(t, acc));
         e.walk_children(|c| from_expr(c, acc));
     }
 
