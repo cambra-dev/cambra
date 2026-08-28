@@ -368,6 +368,11 @@ impl TileProducer for VariantWrapProducer {
 /// step. There is no separate boolean `Restrict` and no tag-discriminating
 /// `Predicate`.
 ///
+/// The projection **narrows** the domain but preserves keys — output key `d` is
+/// scrutinee key `d` — so a domain release, which names keys rather than a
+/// count, forwards to the scrutinee verbatim. That is what lets it sit inside an
+/// induction writer body, whose driver reclaims the prefix it has consumed.
+///
 /// A domain-level `Restrict` could not express this anyway: the tag lives in the
 /// scrutinee's *codomain* (the union value), not its domain, and `Restrict`
 /// consumes a boolean-producing operator over the domain.
@@ -559,11 +564,165 @@ impl TileProducer for VariantProjectProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // The scrutinee is always read in full, so there is no sub-region of it
-        // this producer could stop requesting.
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.input.release(self.input.tiling().universal_guard());
+        self.input.release(obsolete_guard);
+    }
+}
+
+/// ``variant_is(c) : Union({cᵢ: Pᵢ}) ⇒ Bool`` — whether each position of a union
+/// stream carries the arm named `c`.
+///
+/// The **total** counterpart of [`VariantProject`]: same scrutinee, same domain
+/// out as in, `true` on the rows the arm holds and `false` on the rest. Reading
+/// an arm is the tag restriction, so dispatching a `match` needs no test at all
+/// where an arm may narrow its domain — a fan-out of projections re-totalled by
+/// a flat [`UnionOperator`]. This exists for the position that takes a boolean
+/// instead.
+///
+/// An induction writer decision selects on a predicate over its whole driver
+/// domain: the commit selector is a disjunction of the arms' guards, and each
+/// guard is complemented against the ones before it into a first-match
+/// predicate. A projection restricts that domain rather than answering over it,
+/// so it cannot stand there. A total test answers every position, which is what
+/// lets a `match` in a for-loop body ride the same first-match `Case` an `if`
+/// chain does.
+///
+/// **An absent arm is not an error** — it answers `false` everywhere, matching
+/// [`VariantProject`]'s empty projection on a width-subtype scrutinee.
+pub struct VariantIs {
+    /// The scrutinee operator, producing a `Scalar(Union)` tile or a
+    /// `SealedFunction { D ⇒ Scalar(Union) }` tile.
+    input: Box<dyn TileOperator>,
+    /// The tag to test for.
+    tag: FieldKey,
+    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ Bool }`.
+    tiling: Tiling,
+}
+
+impl VariantIs {
+    /// Construct a `VariantIs` testing arm `tag` of the scrutinee's union. The
+    /// domain is the scrutinee's own, as [`VariantProject::new`] derives it; the
+    /// codomain is `Bool` rather than the arm's payload, and unlike a projection
+    /// every key of the domain is answered.
+    pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
+        let domain_extent = match input.tiling() {
+            Tiling::Scalar(Extent::Union(_)) => Extent::Base(BaseType::UInt),
+            Tiling::SealedFunction { domain, codomain } => match codomain.as_ref() {
+                Tiling::Scalar(Extent::Union(_)) => domain.clone(),
+                other => panic!(
+                    "VariantIs: SealedFunction scrutinee must have a Scalar(Union) codomain, \
+                     got {other:?}"
+                ),
+            },
+            other => panic!("VariantIs: scrutinee must be a (Sealed)Union, got {other:?}"),
+        };
+        let tiling = Tiling::SealedFunction {
+            domain: domain_extent,
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Bool))),
+        };
+        Self { input, tag, tiling }
+    }
+}
+
+impl TileOperator for VariantIs {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("scrutinee", self.input.inspect(opts))
+            .annotate(format!("is arm {}", self.tag))
+    }
+
+    fn subscribe(
+        &mut self,
+        intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input = self.input.subscribe(intent_guard, consumer, scheduler);
+        Box::new(VariantIsProducer {
+            base: ProducerBase::new(VariantIsProducer::alloc_id(), &self.tiling),
+            input,
+            tag: self.tag.clone(),
+        })
+    }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        // The codomain is a tag test, unrelated to the domain key, so there is no
+        // domain↔codomain correlation to advertise — as for `VariantProject`.
+        None
+    }
+}
+
+struct VariantIsProducer {
+    base: ProducerBase,
+    /// The subscribed scrutinee producer.
+    input: Box<dyn TileProducer>,
+    tag: FieldKey,
+}
+
+impl TileProducer for VariantIsProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("scrutinee", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let tile = self.input.get(projection_guard);
+        let (domain_col, domain_predicate, deleted, cv) = match tile {
+            Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
+            Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                deleted,
+            } => (
+                Some(domain),
+                domain_predicate,
+                deleted,
+                scalar_tile_to_column_value(*codomain),
+            ),
+            other => panic!("VariantIs expects a (Sealed)Union input, got {other:?}"),
+        };
+        let ColumnValue::Union(arms) = cv else {
+            panic!("VariantIs expects a Union codomain, got {cv:?}");
+        };
+        // The arm records which rows carry the tag, so the test is a membership
+        // check per surviving position rather than a walk over the payloads.
+        let carried: BitSet = arms
+            .get(&self.tag)
+            .map(|arm| arm.row_slots().map(|(pos, _)| pos).collect())
+            .unwrap_or_default();
+        let positions: Vec<usize> = match &domain_col {
+            Some(d) => (0..d.len()).filter(|p| !deleted.contains(*p)).collect(),
+            None => (0..arms
+                .values()
+                .flat_map(|a| a.rows())
+                .max()
+                .map_or(0, |m| m + 1))
+                .filter(|p| !deleted.contains(*p))
+                .collect(),
+        };
+        let answers: bit_vec::BitVec = positions.iter().map(|p| carried.contains(*p)).collect();
+        let out_domain = match domain_col {
+            Some(d) => d.select_indices(positions.iter().copied(), positions.len()),
+            None => ColumnValue::from_uints(positions),
+        };
+        Tile::SealedFunction {
+            domain: out_domain,
+            codomain: Box::new(Tile::Scalar(ColumnValue::Bools(answers))),
+            domain_predicate,
+            deleted: BitSet::new(),
         }
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // Every key in is a key out, so a released region of the output names
+        // exactly the region of the scrutinee that produced it. `VariantProject`
+        // forwards a release on the same key-preserving argument, over the
+        // narrower domain it emits.
+        self.input.release(obsolete_guard);
     }
 }
 
@@ -886,20 +1045,58 @@ mod tests {
         );
     }
 
-    /// A partial domain release is **rejected, not ignored**. `VariantProject`
-    /// reads its scrutinee in full on every pull, so it cannot stop requesting
-    /// the released rows; dropping the guard silently would leave it re-emitting
-    /// them, against the promise the producer has already recorded.
+    /// A partial domain release forwards to the scrutinee. The projection is
+    /// **key-preserving** — output key `d` is scrutinee key `d`, and no output
+    /// key past `d` reads a scrutinee key at or below it — so "never asked for
+    /// keys ≤ w again" says the same thing on both sides. It narrows the domain
+    /// rather than preserving it, unlike
+    /// [`variant_wrap_forwards_a_partial_domain_release_to_its_payload`], and
+    /// that is what a *count*-based guard would turn on; a domain guard is over
+    /// keys, so it forwards verbatim.
+    ///
+    /// This is what lets a projection sit inside an induction writer body, whose
+    /// driver reclaims the prefix it has consumed.
     #[test]
-    #[should_panic(expected = "cannot honor the partial release guard")]
-    fn variant_project_rejects_a_partial_domain_release() {
-        let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, FieldKey::Index(0), Extent::Base(BaseType::Int));
-        let mut sched = Scheduler::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(0)),
-        )));
+    fn variant_project_forwards_a_partial_domain_release_to_its_scrutinee() {
+        let scrut_tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
+                FieldKey::Index(0),
+                Extent::Base(BaseType::Int),
+            )])))),
+        };
+        let (spy, released) = ReleaseSpy::new(
+            Tile::SealedFunction {
+                domain: ColumnValue::from_uints(vec![0, 1]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![(
+                    FieldKey::Index(0),
+                    UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![10, 20])),
+                )])))),
+                domain_predicate: Predicate::False,
+                deleted: BitSet::new(),
+            },
+            scrut_tiling.clone(),
+        );
+        let out_tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let mut producer = VariantProjectProducer {
+            base: ProducerBase::new(VariantProjectProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            tag: FieldKey::Index(0),
+            payload_extent: Extent::Base(BaseType::Int),
+        };
+
+        let prefix =
+            TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(0))));
+        producer.release(prefix.clone());
+
+        assert_eq!(
+            released.borrow().as_slice(),
+            &[prefix],
+            "a domain release must reach the scrutinee unchanged"
+        );
     }
 
     /// `VariantWrap` is domain-preserving, so output position `d` is payload

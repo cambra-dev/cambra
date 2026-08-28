@@ -1717,11 +1717,27 @@ type-checked as one.
 Patterns are **shallow**: an arm matches one tag and binds the whole
 payload, with no nesting, no literal patterns, and no per-arm guard.
 
-A `match` is not yet accepted **inside a `for`-loop body**, which admits
-only assignments, `<<` feeds, `yield`, `if` guards, `with begin():` blocks
-and bare calls. Dispatching per element is written as a `def` that matches
-on its parameter and is called from the loop or a comprehension, which is
-the same first-match rule reached through a call.
+**Inside a `for`-loop body a `match` dispatches a write**, as an `if` guard
+does: each arm is a write path, and an arm may read its payload. An arm that
+writes nothing carries the entering value, exactly as an `if` with no `else`
+does.
+
+```python
+acc := 0
+for m in msgs:
+    match m:
+        case `ping(seq):
+            acc += seq
+        case `close:
+            acc += 1
+acc
+```
+
+An arm may not `yield` or `<<`. A conditional feed fires on its path's
+predicate, and an arm is selected by its tag; dispatching a *feed* per element
+is still written as a `def` that matches on its parameter and is called from
+the loop or a comprehension, which is the same first-match rule reached through
+a call.
 
 #### The one-line form
 

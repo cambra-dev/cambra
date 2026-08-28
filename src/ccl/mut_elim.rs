@@ -46,8 +46,8 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BaseType, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type, TypedBinding,
-    TypedExprNode,
+    BaseType, Branch, Builtin, Expr, F_WRITES, FieldKey, HistoryKind, Lit, Name, Type,
+    TypedBinding, TypedExprNode,
     ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
     provenance,
@@ -1516,6 +1516,32 @@ fn transform_chain(
             let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
             Expr::let_in(b, bound, rest)
         }
+        // A statement-position tag-`Case` (``match m: case `t(w): acc += e``,
+        // lowered by `lower_loop_body_chain`). Rewrite it into the guard-`Case`
+        // the arm below already merges into a writer decision, and re-enter.
+        //
+        // Selecting an arm by reading it — the fan-out of `variant_project`s a
+        // `match` compiles to everywhere else — cannot drive a writer body: the
+        // decision selects on a predicate over its whole driver domain, and a
+        // projection restricts that domain rather than answering over it.
+        // `variant_is` answers every position, so the arms become ordinary
+        // boolean guards and `synthesize_arm_predicate` gives each its
+        // first-match predicate, exactly as for an `elif` chain.
+        // The payload stays a projection, bound at the head of its arm where
+        // `decision_writes` inlines it. See `src/ccl/design/mutability.md`,
+        // "A `match` in a for-loop body".
+        TypedExprNode::ExprStmt { expr: effect, body }
+            if matches!(
+                &effect.node,
+                TypedExprNode::Case {
+                    scrutinee: Some(_),
+                    ..
+                }
+            ) =>
+        {
+            let rewritten = Expr::expr_stmt(tag_case_to_guard_case(*effect), *body);
+            transform_chain(rewritten, env, accs, writes_ty, entering, path, feeds)
+        }
         // A statement-position guard-`Case` (`if p: acc += e`, lowered by
         // `lower_loop_body_chain` to `{gᵢ → branch; true → carry}`): merge its
         // branches into a single always-commit decision whose write set is a
@@ -1813,6 +1839,82 @@ fn conditional_decision(
         })
         .collect();
     decision_record(commit, write_elts, writes_ty)
+}
+
+/// Rewrite a tag-dispatching `Case` into the boolean-guard `Case` a writer
+/// decision is built from.
+///
+/// Each arm's `Pattern` becomes a `variant_is(tag)` guard over the scrutinee and
+/// a `let` binding its payload to the same arm's `variant_project(tag)`, so the
+/// arm reads as `if` does. A `match` without a `case _:` arm gains the trailing
+/// `true → unit` carry every lowered guard-`Case` ends in — the position where
+/// the accumulators keep their previous value.
+///
+/// The scrutinee is duplicated once per arm rather than bound: a `let` around
+/// the `Case` would put its name in the write set, where it escapes the writer
+/// lambda. A loop's `match` scrutinee is the iteration variable or a projection
+/// of it, so the copies are reads.
+fn tag_case_to_guard_case(case: Expr) -> Expr {
+    let case_ty = case.ty.clone();
+    let TypedExprNode::Case {
+        scrutinee,
+        branches,
+    } = case.node
+    else {
+        unreachable!("caller guarantees a Case")
+    };
+    let scrut = *scrutinee.expect("caller guarantees a tag-dispatching Case");
+    let scrut_ty = scrut.ty.clone();
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut has_default = false;
+    let mut out: Vec<Branch> = Vec::with_capacity(branches.len() + 1);
+    for br in branches {
+        let Some(pat) = br.pattern else {
+            // A `case _:` arm is already the fallback the trailing `true` guard
+            // names, and lowering has placed it last.
+            has_default = true;
+            out.push(Branch {
+                pattern: None,
+                guard: br.guard,
+                body: br.body,
+            });
+            continue;
+        };
+        let tag = FieldKey::Name(pat.tag.clone().into());
+        let payload_ty = pat.binding.ty.clone();
+        let mut guard = Expr::apply(
+            scrut.clone(),
+            Expr::builtin(Builtin::VariantIs(tag.clone()))
+                .with_ty(Type::fun(scrut_ty.clone(), bool_ty.clone())),
+        );
+        guard.ty = bool_ty.clone();
+        let mut payload = Expr::apply(
+            scrut.clone(),
+            Expr::builtin(Builtin::VariantProject(tag))
+                .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone())),
+        );
+        payload.ty = payload_ty;
+        out.push(Branch {
+            pattern: None,
+            guard,
+            body: Expr::let_in(pat.binding, payload, br.body),
+        });
+    }
+    if !has_default {
+        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+        t.ty = bool_ty;
+        out.push(Branch {
+            pattern: None,
+            guard: t,
+            body: unit_expr(),
+        });
+    }
+    let mut rebuilt = Expr::new(TypedExprNode::Case {
+        scrutinee: None,
+        branches: out,
+    });
+    rebuilt.ty = case_ty;
+    rebuilt
 }
 
 /// Assemble a writer decision record `{commit, writes: (write_elts…)}`.

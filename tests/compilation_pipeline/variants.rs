@@ -1441,3 +1441,105 @@ p"#;
 fn test_const_lifted_arm_is_point_free(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
+
+// A `match` in a for-loop body dispatches on `variant_is` guards, so its arms
+// are the boolean-guard `Case` an `if` chain builds and the writer decision
+// merges them the same way (`src/ccl/design/mutability.md`, "A `match` in a
+// for-loop body").
+//
+// Selecting an arm by *reading* it — the fan-out of `variant_project`s a `match`
+// compiles to everywhere else — cannot drive a writer body: the decision selects
+// on a predicate over its whole driver domain, and a projection restricts that
+// domain rather than answering over it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case `b:
+                acc += 10
+    acc"}, Value::Int(12))]
+// `case _:` is already the fallback the trailing `true` guard names.
+#[case(indoc! {"
+    acc := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case _:
+                acc += 10
+    acc"}, Value::Int(12))]
+// An arm that writes nothing is the carry position, as an `if` without an
+// `else` is.
+#[case(indoc! {"
+    acc := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case `b:
+                acc += 0
+    acc"}, Value::Int(2))]
+fn test_match_in_a_for_loop_body(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// An arm reading its payload projects it out of the scrutinee, inside a writer
+// body whose driver reclaims the prefix it has consumed. The projection narrows
+// the domain but preserves keys, so it forwards that release to the scrutinee
+// rather than refusing it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for m in [`a(2), `b(3), `a(5)]:
+        match m:
+            case `a(n):
+                acc += n
+            case `b(k):
+                acc += k
+    acc"}, Value::Int(10))]
+fn test_match_arm_reading_its_payload_in_a_loop(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A `yield` or `<<` inside a `match` arm in a for-loop body is rejected: a
+/// conditional feed rides its path's predicate as a fire gate, and a `match`
+/// arm is selected by its tag rather than by a predicate.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_feed_inside_a_match_arm_in_a_loop_is_rejected() {
+    check_compile_error(
+        indoc! {"
+            acc := 0
+            for m in [`a(2), `b(3)]:
+                match m:
+                    case `a(n):
+                        yield n
+                    case `b(k):
+                        acc += k
+            acc"},
+        "inside a `match` arm in a for-loop body is not",
+    );
+}
+
+// The program `docs/chl-spec.md`, "4.10 `match` — tag dispatch" states: a
+// payload-binding arm and a payload-less one, both writing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    msgs = [`ping(3), `close, `ping(4)]
+    acc := 0
+    for m in msgs:
+        match m:
+            case `ping(seq):
+                acc += seq
+            case `close:
+                acc += 1
+    acc"}, Value::Int(8))]
+fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
