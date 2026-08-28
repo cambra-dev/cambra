@@ -233,21 +233,28 @@ pub struct DiagnosticLabel {
 impl Diagnostic {
     /// Build a [`Diagnostic`] from a single [`CompileError`].
     ///
-    /// Maps the variant to its stage string and reuses the variant's existing
-    /// rendered message. The infer path carries the span resolved at the
-    /// `compile_program` boundary (the dual-use payload); other variants
-    /// extract their span where it is cheaply reachable and otherwise degrade
-    /// to `span: None` — still a valid, renderable diagnostic.
+    /// The message is the variant's `Display` rendering, which is the same
+    /// single-line text the terminal path puts in its ariadne label, so the two
+    /// renderers say the same thing. Two variants have no `Display` and use
+    /// `Debug` instead: [`InferError`](crate::ccl::infer::InferError), whose
+    /// `Debug` *is* its message by convention (`infer_report` renders it that
+    /// way), and `ConversionError`.
+    ///
+    /// The span is the error's own wherever it carries one. `Infer`'s is
+    /// resolved at the `compile_program` boundary and arrives on the variant;
+    /// the rest read theirs off the error. A variant with no span degrades to
+    /// `span: None` — still renderable, but the consumer has nothing to
+    /// underline, which is why the ones that can carry a span do.
     ///
     /// [`CompileError`]: crate::ccl::context::CompileError
     pub fn from_compile_error(error: &crate::ccl::context::CompileError) -> Self {
         use crate::ccl::context::CompileError;
         let (stage, message, span) = match error {
-            CompileError::Parse(e) => ("parse", format!("{e:?}"), None),
-            CompileError::Lower(e) => ("lower", format!("{e:?}"), Some(e.span())),
-            CompileError::ChannelizeDefers(e) => ("channelizeDefers", format!("{e:?}"), None),
+            CompileError::Parse(e) => ("parse", e.to_string(), Some(e.span())),
+            CompileError::Lower(e) => ("lower", e.to_string(), Some(e.span())),
+            CompileError::ChannelizeDefers(e) => ("channelizeDefers", e.to_string(), None),
             CompileError::Infer { error, span } => ("infer", format!("{error:?}"), *span),
-            CompileError::LambdaElim(e) => ("lambdaElim", format!("{e:?}"), None),
+            CompileError::LambdaElim(e) => ("lambdaElim", e.to_string(), None),
             CompileError::Conversion(e) => ("conversion", format!("{e:?}"), None),
             CompileError::Unsupported(msg) => ("unsupported", msg.clone(), None),
         };
@@ -640,6 +647,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A parse failure — the most common one — ships a message a person can read
+    /// and a span the consumer can underline.
+    ///
+    /// The `Debug` rendering of a `ParseError` is a struct dump naming the
+    /// variant and its fields, so a consumer showing the message verbatim shows
+    /// that dump; the `Display` rendering is the single line the terminal's
+    /// ariadne label carries.
+    #[test]
+    fn a_parse_failure_ships_a_readable_message_and_a_span() {
+        let code = "x = (1 + \n";
+        let compiled = compile_program(
+            &mut GlobalContext::default(),
+            code,
+            Box::new(|| {}) as Box<dyn Consumer>,
+        );
+        let Err(errors) = compiled else {
+            panic!("an unclosed paren must fail to compile")
+        };
+        let diagnostics = diagnostics_from_compile_errors(&errors);
+        let parse = diagnostics
+            .iter()
+            .find(|d| d.stage == "parse")
+            .unwrap_or_else(|| panic!("a parse diagnostic; got {diagnostics:?}"));
+
+        assert!(
+            !parse.message.contains("ParseErrorInfo") && !parse.message.contains("Span {"),
+            "the message is the rendering, not the struct dump; got {:?}",
+            parse.message
+        );
+        assert!(
+            !parse.message.is_empty() && !parse.message.contains('\n'),
+            "the message is one line; got {:?}",
+            parse.message
+        );
+
+        let span = parse
+            .span
+            .unwrap_or_else(|| panic!("a parse error carries its span; got {parse:?}"));
+        assert!(
+            span.end <= code.len(),
+            "the span is a range in this source; got {span:?} over {} bytes",
+            code.len()
+        );
+        assert_eq!(
+            parse.labels.len(),
+            1,
+            "the span is also a label, so a consumer can underline it"
+        );
+        assert_eq!(parse.labels[0].span, span);
+    }
+
+    /// A lowering failure ships its own message rather than the enum's `Debug`
+    /// form, which would repeat the span and the variant name inside the text.
+    #[test]
+    fn a_lowering_failure_ships_its_message() {
+        use crate::ccl::lower::LoweringError;
+        use crate::chl_parser::ast::Span;
+
+        let error = crate::ccl::context::CompileError::Lower(LoweringError::unsupported(
+            Span::new(3, 7),
+            "generators are not supported here",
+        ));
+        let diagnostic = Diagnostic::from_compile_error(&error);
+        assert_eq!(diagnostic.stage, "lower");
+        assert_eq!(diagnostic.message, "generators are not supported here");
+        assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
     }
 
     /// A degraded payload carries the diagnostics and no IR: same type as the

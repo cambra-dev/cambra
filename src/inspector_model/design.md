@@ -258,10 +258,15 @@ reach is follow-up work beyond this document's ratified changes, since it needs 
 back its partial panes rather than one error; it is carried as `TODO(degraded-stages)` on
 `SnapshotPayload::degraded`.
 
-A `Diagnostic` is a `CompileError` with a stage name, a message and a span. Today the message is the
-variant's `Debug` form for every variant but `Unsupported`, and only `Lower` and `Infer` carry a
-span; rendering each error through its `Display` and carrying its span is what makes the
-JSON a second renderer of the same error rather than a dump of it.
+A `Diagnostic` is a `CompileError` with a stage name, a message and a span. The message is the
+error's `Display` rendering — the same single line the terminal's ariadne label carries — so the two
+renderers say the same thing rather than one of them shipping a struct dump. Two variants have no
+`Display` and use `Debug`: `InferError`, whose `Debug` is its message by convention, and
+`ConversionError`.
+
+The span is the error's own wherever it has one. `Parse` and `Lower` read theirs off the error,
+`Infer`'s is resolved at the `compile_program` boundary; `ChannelizeDefers`, `LambdaElim`,
+`Conversion` and `Unsupported` carry none, so a consumer has nothing to underline for them.
 
 `meta` carries `snapshotKind`, the always-null live seam `tick`, and `schema`. The schema's
 `outline` field is omitted rather than stubbed, until an outline query exists.
@@ -379,9 +384,6 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
 - **Type metadata.** Carry two narrow facts beside the rendered string — a `typeKind` discriminant,
   and a refinement's predicate as a reference into the node table — so a consumer can filter by type
   and reach a predicate without a structural type.
-- **Diagnostic rendering.** Render a `CompileError` through `Display` where it has one, and carry
-  its span. A parse error ships a struct dump and no span today, so the most common failure
-  underlines nothing.
 - **Scope-region deduplication.** Drop regions repeating a span and binding set already emitted.
 - **An inspector-owned wire node.** Move the wire node into this module, carrying neither
   `annotations` nor `tiling`, and leave `pretty_tree` a renderer with no serde and no domain types,

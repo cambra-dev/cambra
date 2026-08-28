@@ -348,6 +348,34 @@ pub enum LexError {
     InconsistentIndent { span: Span },
 }
 
+impl fmt::Display for LexError {
+    /// What went wrong, in one line and with no span — a caller renders the span
+    /// itself. Without this, a caller showing the error text shows the struct
+    /// dump `Debug` produces.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            LexError::InvalidToken { .. } => "unrecognized token",
+            LexError::UnmatchedClose { .. } => "closing bracket with no opening bracket",
+            LexError::UnclosedBracket { .. } => "unclosed bracket at end of input",
+            LexError::InconsistentIndent { .. } => "indentation does not match any enclosing level",
+        };
+        f.write_str(message)
+    }
+}
+
+impl LexError {
+    /// The source span this error points at. Every variant carries one, so a
+    /// caller rendering a diagnostic always has a range to underline.
+    pub fn span(&self) -> Span {
+        match self {
+            LexError::InvalidToken { span }
+            | LexError::UnmatchedClose { span }
+            | LexError::UnclosedBracket { span }
+            | LexError::InconsistentIndent { span } => *span,
+        }
+    }
+}
+
 /// Tokenise `source` into a layout-resolved token stream.
 ///
 /// Caller-visible invariants of the returned stream:

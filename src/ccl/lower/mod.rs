@@ -135,6 +135,17 @@ pub enum LoweringError {
     },
 }
 
+impl std::fmt::Display for LoweringError {
+    /// The error's own message, with no span or variant name — a single line, for
+    /// a caller that renders the span itself (an ariadne report, a JSON
+    /// diagnostic).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoweringError::Unsupported { message, .. } => f.write_str(message),
+        }
+    }
+}
+
 impl LoweringError {
     /// Construct an `Unsupported` lowering error at the given span.
     ///
