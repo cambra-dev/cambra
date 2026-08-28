@@ -42,7 +42,6 @@ use super::name_binder::{Definition, ScopeRegion};
 use super::query::{Snapshot, StageProjection};
 use super::stage::dense_edges;
 use crate::ccl::Type;
-use crate::pretty_tree::InspectNode;
 
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
 /// both the success and degraded payloads. See [`Meta::schema`] for the
@@ -98,9 +97,75 @@ pub struct StageEntry {
     /// run on yet, `"typed"` for one it has.
     pub kind: &'static str,
     /// The full IR tree for this stage.
-    pub ir: InspectNode,
+    pub ir: IrNode,
     /// Every `(span → nodeId)` entry of this stage's span index.
     pub span_index: Vec<SpanEntry>,
+}
+
+/// One node of a stage's shipped IR tree.
+///
+/// The wire's own node type, owned here rather than borrowed from the terminal
+/// renderer: the fields are this payload's and nothing else sets them. See
+/// `src/inspector_model/design.md`, "A node on the wire".
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct IrNode {
+    /// The node's kind, rendered — `BinOp(Arithmetic(Mul))`, `Lit(Int(1))`,
+    /// `Let(x)`. Built by `node_label`.
+    pub label: String,
+    /// The node's [`NodeId`](crate::ccl::provenance::NodeId) as a number — the
+    /// handle every pane link and span row names.
+    pub node_id: u64,
+    /// The **narrowest** source span this node traces to, absent when it traces
+    /// to none. A node several source spans fan into carries one of them here
+    /// and all of them in [`StageEntry::span_index`], so it stays reachable from
+    /// each.
+    pub span: Option<Span>,
+    /// The node's rewrite tag, `None` for a
+    /// [`Nature::Source`](crate::ccl::provenance::Nature::Source) tag — the root
+    /// of a lowered source expression — and for a node the pane's projection
+    /// does not cover. The spans channel of the same attribution rides
+    /// [`span`](Self::span).
+    pub rewritten: Option<RewriteInfo>,
+    /// The node's type, rendered by `Display for Type`, so a change to that
+    /// rendering changes this verbatim. See
+    /// `src/inspector_model/design.md`, "Types on the wire".
+    #[cfg_attr(feature = "serde", serde(rename = "type"))]
+    pub ty: Option<String>,
+    /// The node's children, each under the edge that reaches it.
+    pub children: Vec<IrChild>,
+}
+
+/// One `{ edge, node }` child of an [`IrNode`].
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct IrChild {
+    /// A value child's positional index (`"0"`, `"1"`, …), or `where.N` for a
+    /// refinement predicate riding one of the parent's type slots. The label is
+    /// what tells a subtree living inside a type from one that is an operand;
+    /// see `src/inspector_model/design.md`, "Predicates are nodes".
+    pub edge: String,
+    /// The child node itself.
+    pub node: IrNode,
+}
+
+/// A node's rewrite tag — the
+/// [`RewriteTag`](crate::ccl::provenance::RewriteTag) of its attribution,
+/// rendered for the wire.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RewriteInfo {
+    /// The phase that performed the rewrite — the
+    /// [`Phase`](crate::ccl::context::Phase) debug name, e.g. `"Infer"`.
+    pub via: String,
+    /// The `Nature` discriminant as its wire string: `"expansion"` for a
+    /// faithful expansion of a user construct, `"machinery"` for pure plumbing.
+    /// `"source"` never ships — that tag null-compresses to
+    /// [`IrNode::rewritten`] `= None`.
+    pub nature: String,
+    /// The rewrite's stable label, e.g. `"channelize.feed_union"`.
+    pub label: String,
 }
 
 /// The dense node→node links between two adjacent pipeline stages — the
@@ -317,7 +382,7 @@ pub struct Meta {
 /// The rows are enumerated from the index the stage already carries; building a
 /// second one over the same pair would duplicate the walk. The tree goes through
 /// [`build_inspect_tree`], the single source-linking tree-builder.
-fn build_stage_ir_and_index(stage: &StageProjection<'_>) -> (InspectNode, Vec<SpanEntry>) {
+fn build_stage_ir_and_index(stage: &StageProjection<'_>) -> (IrNode, Vec<SpanEntry>) {
     use super::query::{build_inspect_tree, tree_height};
 
     let span_entries = stage
@@ -527,13 +592,11 @@ mod tests {
     }
 
     /// Every `nodeId` in one stage's shipped IR tree.
-    fn tree_ids(node: &InspectNode) -> HashSet<u64> {
-        fn go(node: &InspectNode, out: &mut HashSet<u64>) {
-            if let Some(id) = node.node_id {
-                out.insert(id);
-            }
-            for (_edge, child) in &node.children {
-                go(child, out);
+    fn tree_ids(node: &IrNode) -> HashSet<u64> {
+        fn go(node: &IrNode, out: &mut HashSet<u64>) {
+            out.insert(node.node_id);
+            for child in &node.children {
+                go(&child.node, out);
             }
         }
         let mut out = HashSet::new();
@@ -649,6 +712,109 @@ mod tests {
         }
     }
 
+    /// A shipped node carries the row `src/inspector_model/design.md`, "A node on
+    /// the wire" describes: an id, the narrowest span it traces to, a rendered
+    /// type, no rewrite tag when its tag is `Nature::Source`, positional edges
+    /// for its value children and `where.N` for a predicate riding one of its
+    /// type slots.
+    #[test]
+    fn a_wire_node_carries_its_id_span_type_and_edges() {
+        fn nodes_of<'a>(node: &'a IrNode, out: &mut Vec<&'a IrNode>) {
+            out.push(node);
+            for child in &node.children {
+                nodes_of(&child.node, out);
+            }
+        }
+
+        let code = indoc! {r#"
+            xs = [1, 2, 3, 4]
+            ys = [x * 2 for x in xs if x > 2]
+            max(ys)
+        "#};
+        let prog = compile(code);
+        let payload = Snapshot::new(&prog).build_payload("test");
+        let stage = payload
+            .stages
+            .iter()
+            .find(|s| s.id == "post-inference")
+            .expect("the payload ships the post-inference stage");
+
+        let mut spans: HashMap<u64, Vec<Span>> = HashMap::new();
+        for row in &stage.span_index {
+            spans
+                .entry(row.node_id.as_u64())
+                .or_default()
+                .push(row.span);
+        }
+
+        let mut nodes = Vec::new();
+        nodes_of(&stage.ir, &mut nodes);
+        for node in &nodes {
+            // The node ships one span and the rows ship all of them, so the one
+            // it ships is the narrowest.
+            let narrowest = spans
+                .get(&node.node_id)
+                .and_then(|s| s.iter().copied().min_by_key(|s| s.end - s.start));
+            assert_eq!(
+                node.span, narrowest,
+                "{} ships the narrowest of {:?}",
+                node.label, spans[&node.node_id]
+            );
+            assert!(node.ty.is_some(), "{} ships a type", node.label);
+
+            // Value children come first under their positional index; every
+            // predicate follows, under `where.N`.
+            let positional = node
+                .children
+                .iter()
+                .take_while(|c| !c.edge.starts_with("where."))
+                .count();
+            let edges: Vec<&str> = node.children.iter().map(|c| c.edge.as_str()).collect();
+            let expected: Vec<String> = (0..positional)
+                .map(|i| i.to_string())
+                .chain((0..edges.len() - positional).map(|i| format!("where.{i}")))
+                .collect();
+            assert_eq!(edges, expected, "{}'s edges", node.label);
+        }
+
+        // `x * 2` is the root of a lowered source expression, so its rewrite tag
+        // null-compresses; it carries its own span and its inferred type.
+        let mul = nodes
+            .iter()
+            .find(|n| n.label == "BinOp(Arithmetic(Mul))")
+            .expect("the comprehension's `x * 2` reaches the tree");
+        assert_eq!(mul.span, Some(Span::new(24, 29)), "the span of `x * 2`");
+        assert_eq!(mul.ty.as_deref(), Some("Int"));
+        assert!(
+            mul.rewritten.is_none(),
+            "a `Nature::Source` tag null-compresses; got {:?}",
+            mul.rewritten
+        );
+
+        // The comprehension's filter rides the `Cast`'s refined domain, so it
+        // hangs off a `where.N` edge rather than a positional one.
+        let cast = nodes
+            .iter()
+            .find(|n| n.label == "Cast")
+            .expect("the comprehension lowers through a Cast");
+        let edges: Vec<&str> = cast.children.iter().map(|c| c.edge.as_str()).collect();
+        assert_eq!(edges, ["0", "where.0", "where.1"]);
+        let predicate = &cast.children[1].node;
+        assert_ne!(
+            predicate.node_id, cast.node_id,
+            "a predicate is a node in its own right"
+        );
+        let mut predicate_nodes = Vec::new();
+        nodes_of(predicate, &mut predicate_nodes);
+        assert!(
+            predicate_nodes
+                .iter()
+                .any(|n| n.label == "BinOp(Compare(Greater))"),
+            "the `x > 2` filter is the predicate subtree; got {:?}",
+            predicate_nodes.iter().map(|n| &n.label).collect::<Vec<_>>()
+        );
+    }
+
     /// A parse failure — the most common one — ships a message a person can read
     /// and a span the consumer can underline.
     ///
@@ -715,6 +881,37 @@ mod tests {
         assert_eq!(diagnostic.stage, "lower");
         assert_eq!(diagnostic.message, "generators are not supported here");
         assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
+    }
+
+    /// Every node of every pane carries an attribution, so `span` and `rewritten`
+    /// are absent only where the node is a lowering root — never because the pane
+    /// failed to explain the node.
+    ///
+    /// The wire cannot tell those apart: a node the projection does not cover
+    /// ships the same `span: null, rewritten: null` as a `Nature::Source` root.
+    /// This is what keeps the second case from arising, and it is the payload-wide
+    /// form of the leak gate's promise that every node of a pane is explained.
+    #[test]
+    fn every_node_of_every_stage_carries_an_attribution() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = Snapshot::new(&prog).build_payload("test");
+            for stage in &payload.stages {
+                let ids = tree_ids(&stage.ir);
+                let attributed: HashSet<u64> = stage
+                    .span_index
+                    .iter()
+                    .map(|r| r.node_id.as_u64())
+                    .collect();
+                let missing: Vec<u64> = ids.difference(&attributed).copied().collect();
+                assert!(
+                    missing.is_empty(),
+                    "{} nodes of the {} pane carry no span row: {missing:?}",
+                    missing.len(),
+                    stage.id
+                );
+            }
+        }
     }
 
     /// A degraded payload carries the diagnostics and no IR: same type as the

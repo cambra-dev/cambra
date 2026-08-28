@@ -100,16 +100,26 @@ Each tree node carries:
 | `label` | the node's kind, rendered — `BinOp(Arithmetic(Mul))`, `Lit(Int(1))`, `Let(x)` |
 | `nodeId` | its `NodeId` as a number, the handle every link and span row names |
 | `span` | the **narrowest** source span it traces to, or absent when it traces to none |
-| `rewritten` | `null` for a direct image, else `{ via, nature, label }` |
+| `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
 | `children` | `{ edge, node }` pairs, where `node` is the child node itself; the node table replaces this nesting with ids |
 
 A node's `span` is one span even where it traces to several; the `(span, node)` rows carry all of
 them, so a node several source spans fan into is reachable from each.
 
-`rewritten` is `null` exactly for a `Nature::Source` tag, which null-compresses at the one emission
-site via `Nature::is_source`. The wire carries no flat `Source`/`Derived`/`Synthetic` string; a
-consumer formats the triple itself.
+`rewritten` is `null` for a `Nature::Source` tag, which null-compresses at the one emission site via
+`Nature::is_source`. `Source` is positional rather than a judgment about faithfulness: a node is
+`Source` exactly when it is the root of a lowered source expression, so an interior image of source
+text carries `Machinery` with the label `"lower.image"` instead — see
+[provenance.md](../ccl/design/provenance.md#the-seam).
+
+A node the pane's projection does not cover ships the same `null`, for both `rewritten` and `span`,
+so the wire cannot tell an unexplained node from a lowering root.
+`every_node_of_every_stage_carries_an_attribution` (`snapshot.rs`) is what keeps the first case from
+arising, over the same corpus the other payload tests use.
+
+The wire carries no flat `Source`/`Derived`/`Synthetic` string; a consumer formats the triple
+itself.
 
 **A refinement predicate is a child node.** A predicate is an expression tree in its own right
 ([Predicates are nodes](#predicates-are-nodes)), and it reaches the consumer as a child of the node
@@ -339,15 +349,15 @@ for a recurrence.
 
 ### The wire belongs to this module
 
-The payload's IR node is `pretty_tree::InspectNode`, whose charter is rendering — the terminal tree
-and a second hand-rolled JSON for `web_inspector.rs` — and which holds the tile-producer fields
-`annotations` and `tiling` that this payload never sets, plus a hand-written `Serialize` spelling
-this module's schema. So a change to this wire is a diff in a renderer, and the node ships two
-fields no consumer reads. Item 7 moves the wire node here.
+The payload's node type is this module's own, and `pretty_tree` is a renderer again: it carries no
+serde and no `ccl` types, which is its standing invariant. Before, the payload rode
+`pretty_tree::InspectNode` — a rendering type holding the tile-producer fields `annotations` and
+`tiling`, which the payload never set and no consumer read, plus a hand-written `Serialize`
+spelling this module's schema. A wire change was then a diff in a renderer.
 
-A `RewriteTag` is separately encoded twice for the wire, by `SourceAttribution`'s `Serialize` and by
-`build_inspect_tree`'s `RewriteInfo`, each carrying its own copy of the null-compression rule. Item
-1 removes the first, which is reachable only from the query results.
+One encoder now writes a `RewriteTag` to the wire. There were two, the second on
+`SourceAttribution`, each with its own copy of the null-compression rule; it went with the query
+results that were its only reader.
 
 ### Span containment is a scan
 
@@ -385,9 +395,6 @@ list renumbers as entries land, and a reference to "item 4" would then point at 
 - **Type metadata.** Carry two narrow facts beside the rendered string — a `typeKind` discriminant,
   and a refinement's predicate as a reference into the node table — so a consumer can filter by type
   and reach a predicate without a structural type.
-- **An inspector-owned wire node.** Move the wire node into this module, carrying neither
-  `annotations` nor `tiling`, and leave `pretty_tree` a renderer with no serde and no domain types,
-  per [The wire belongs to this module](#the-wire-belongs-to-this-module).
 - **Pane vocabulary.** Consolidate pane/stage on "pane", the name the compiler already defines and
   the one `paneLinks` already uses: `stages` becomes `panes` on the wire, `StageEntry` becomes
   `PaneEntry`, `StageProjection` becomes `PaneProjection`. It also frees "stage", which `stage.rs`

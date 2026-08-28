@@ -77,8 +77,8 @@ pub use index::SpanIndex;
 pub use name_binder::{Binding, Definition, NameBinderIndex, ScopeRegion};
 pub use query::Snapshot;
 pub use snapshot::{
-    DefinitionEntry, Diagnostic, DiagnosticLabel, Meta, PaneLinkEntry, SCHEMA_VERSION,
-    ScopeBindingEntry, ScopeEntry, SnapshotPayload, SourceInfo, SpanEntry, StageEntry,
-    diagnostics_from_compile_errors,
+    DefinitionEntry, Diagnostic, DiagnosticLabel, IrChild, IrNode, Meta, PaneLinkEntry,
+    RewriteInfo, SCHEMA_VERSION, ScopeBindingEntry, ScopeEntry, SnapshotPayload, SourceInfo,
+    SpanEntry, StageEntry, diagnostics_from_compile_errors,
 };
 pub use stage::dense_edges;

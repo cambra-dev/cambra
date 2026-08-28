@@ -23,8 +23,8 @@ use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 use crate::ccl::{Expr, Type, TypedBinding, TypedExprNode};
 use crate::chl_parser::ast::{Module, Span};
 
+use super::snapshot::{IrChild, IrNode, RewriteInfo};
 use super::{Binding, NameBinderIndex, SpanIndex};
-use crate::pretty_tree::{InspectNode, RewriteInfo};
 
 /// The pane a binder's type is read from: the first fully-typed tree that is
 /// still source-shaped. Named rather than positional, so a pane inserted ahead
@@ -388,7 +388,7 @@ pub(super) fn predicate_children(expr: &Expr) -> Vec<(String, &Expr)> {
         .collect()
 }
 
-/// Build the [`InspectNode`] tree for `expr` against its pane `projection`,
+/// Build the [`IrNode`] tree for `expr` against its pane `projection`,
 /// descending `depth` child levels (`0` = the node alone, no children). The
 /// single source-linking tree-builder: every stage's payload tree goes through
 /// this one shape, parameterized only by its `(Expr, SourceProjection)` pair.
@@ -396,44 +396,51 @@ pub(super) fn build_inspect_tree(
     expr: &Expr,
     projection: &SourceProjection,
     depth: usize,
-) -> InspectNode {
+) -> IrNode {
     let id = expr.node_id();
-    let mut node = InspectNode::leaf(node_label(&expr.node))
-        .with_type(expr.ty.to_string())
-        .with_node_id(id.as_u64());
+    let mut node = IrNode {
+        label: node_label(&expr.node),
+        node_id: id.as_u64(),
+        span: None,
+        rewritten: None,
+        ty: Some(expr.ty.to_string()),
+        children: Vec::new(),
+    };
     if let Some(attr) = projection.get(&id) {
-        // The rewrite channel: a direct image (`Nature::Source`)
-        // null-compresses — it carries no wire tag, byte-identical to the retired
-        // `rewritten: None` encoding; a rewritten node carries `{via, nature,
-        // label}` natively. The validators guard that `"source"` never ships.
+        // The rewrite channel: a `Nature::Source` tag — the root of a lowered
+        // source expression — null-compresses and carries no wire tag; every
+        // other node carries `{via, nature, label}`. The validators guard that
+        // `"source"` never ships.
         let tag = &attr.rewritten;
         if !tag.nature.is_source() {
-            node = node.with_rewritten(RewriteInfo {
+            node.rewritten = Some(RewriteInfo {
                 via: format!("{:?}", tag.via),
                 nature: tag.nature.wire_str().to_string(),
                 label: tag.label.to_string(),
             });
         }
         // The spans channel: the node's primary (narrowest) source span, if any.
-        if let Some(span) = attr
+        node.span = attr
             .spans
             .iter()
             .min_by_key(|s| s.end.saturating_sub(s.start))
-        {
-            node = node.with_node_span((span.start, span.end));
-        }
+            .copied();
     }
     if depth > 0 {
         for (idx, child) in expr.child_exprs().into_iter().enumerate() {
-            let child_node = build_inspect_tree(child, projection, depth - 1);
-            node.children.push((idx.to_string(), child_node));
+            node.children.push(IrChild {
+                edge: idx.to_string(),
+                node: build_inspect_tree(child, projection, depth - 1),
+            });
         }
         // Predicate subtrees come after the value children so a consumer that
         // reads children positionally is unaffected; the `where.N` label is what
         // marks them (see [`predicate_children`]).
-        for (label, predicate) in predicate_children(expr) {
-            let child_node = build_inspect_tree(predicate, projection, depth - 1);
-            node.children.push((label, child_node));
+        for (edge, predicate) in predicate_children(expr) {
+            node.children.push(IrChild {
+                edge,
+                node: build_inspect_tree(predicate, projection, depth - 1),
+            });
         }
     }
     node
@@ -766,11 +773,11 @@ max(totals)
     /// Panics if a row names a node the tree does not hold — the invariant
     /// `span_index_round_trips_with_projection` (`index.rs`) pins.
     fn labels_at(payload: &SnapshotPayload, stage_id: &str, span: Span) -> Vec<String> {
-        fn label_of(node: &InspectNode, id: u64) -> Option<&str> {
-            if node.node_id == Some(id) {
+        fn label_of(node: &IrNode, id: u64) -> Option<&str> {
+            if node.node_id == id {
                 return Some(&node.label);
             }
-            node.children.iter().find_map(|(_, c)| label_of(c, id))
+            node.children.iter().find_map(|c| label_of(&c.node, id))
         }
 
         let stage = payload
@@ -955,12 +962,12 @@ max(totals)
         // Every node of the shipped tree carries an attribution: the fully-folded
         // rows leave no node absent from the projection, and a node the
         // projection does not cover would ship neither a span nor a rewrite tag.
-        fn untagged(node: &InspectNode, out: &mut Vec<String>) {
+        fn untagged(node: &IrNode, out: &mut Vec<String>) {
             if node.span.is_none() && node.rewritten.is_none() {
                 out.push(node.label.clone());
             }
-            for (_edge, child) in &node.children {
-                untagged(child, out);
+            for child in &node.children {
+                untagged(&child.node, out);
             }
         }
         let stage = payload
