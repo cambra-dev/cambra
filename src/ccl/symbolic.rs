@@ -236,6 +236,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("variant_wrap(`{tag})"))
         }
 
+        TypedExprNode::Builtin(Builtin::VariantIs(tag)) => {
+            (Precedence::Atom, format!("variant_is(`{tag})"))
+        }
+
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
 
         TypedExprNode::BinOp { left, op, right } => {
