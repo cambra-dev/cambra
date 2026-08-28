@@ -552,7 +552,13 @@ fn build_scrutinee_case_cform(
         )))
         .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
+        // `elim_lambda` abstracts the binder and leaves the walk to its caller
+        // (`src/ccl/design/optimization.md`, "`elim_lambda`'s caller walks its
+        // result"). An arm not mentioning its payload binder takes a `const`
+        // rule, which lifts the body whole, and operator conversion refuses a
+        // `BinOp` or a nested `Lambda` inside a lifted value.
         let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
+        let arm_fn = elim_lambdas(ctx, arm_fn)?;
         arms.push(arm_compose(
             vec![scrut_stream.clone(), vp, arm_fn],
             driver_dom.clone(),
@@ -789,17 +795,7 @@ fn elim_lambda_impl(
     // Constant: λ x → e  ⟹  const(e)  when x ∉ fv(e)
     // Checked before pattern-matching because a nested lambda that does not
     // reference param should also be treated as a constant.
-    //
-    // `e` is eliminated first. `const` lifts a *value*, and the value operator
-    // conversion accepts is point-free, so a `BinOp` or a nested `Lambda` left
-    // inside a lifted body reaches conversion as written and is refused there.
-    //
-    // The `Lambda` arm of `elim_lambdas` re-enters on whatever this returns, so
-    // it covered for the omission; the `match`-arm rule calls here directly and
-    // does not. That is what left every `match` arm not mentioning its payload
-    // binder unconverted, in all three `match` spellings.
     if !is_free(param, &body) {
-        let body = elim_lambdas(ctx, body)?;
         // const: T → (A → T) where T = body.ty and result_ty = A → T
         let const_fn_ty = Type::compute_fun_or_hole(&body.ty, &result_ty);
         let const_var = Expr::builtin(Builtin::Const).with_ty(const_fn_ty);
@@ -978,12 +974,8 @@ fn elim_lambda_impl(
             // `param` occurs only in the refinement (the group-by shape): the value
             // is closed, so it lifts under `const` and the dependence rides the
             // refinement, materialized as a `Restrict` at the iteration boundary.
-            let inner_pf = elim_lambdas(ctx, *value)?;
-            let cast_val = Expr::new(TypedExprNode::Cast {
-                value: Box::new(inner_pf),
-                target,
-            })
-            .with_ty(body_ty.clone());
+            let cast_val =
+                Expr::new(TypedExprNode::Cast { value, target }).with_ty(body_ty.clone());
             let const_fn = Expr::builtin(Builtin::Const)
                 .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
             return Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi));
