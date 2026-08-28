@@ -501,10 +501,38 @@ impl Typing for InferCtx {
         r
     }
 
-    fn close_let_type(&self, _name: &Name, _bound_expr: &Expr, body_ty: Type) -> Type {
-        // No-op: the closing discharge runs on the resolved type in
-        // `coalesce_node`'s Let arm (see the trait doc).
-        body_ty
+    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
+        // Lifting the body's type past the binder is an application: a `let`
+        // telescope entry carries its definiens, so the lift discharges
+        // `[name ↦ bound_expr]` (`src/ccl/design/type-inference.md`, "`let`
+        // binders and scope exit"). The body type is an inference variable here,
+        // whose refinements accumulate as bounds rather than sitting in the
+        // type, so the substitution cannot be applied to it directly. It rides
+        // the lifted variable's lower edge instead, and β fires at coalesce.
+        // `Typing::apply` suspends a dependent codomain's discharge the same way
+        // ("Discharge is application").
+        //
+        // `scoped_let` restored the telescope before this runs, so the lifted
+        // variable stands outside the binder and a bound naming `name` reaches
+        // it only across this edge. Returning `body_ty` verbatim instead lets a
+        // refinement over `name` flow into the enclosing lambda's codomain,
+        // which is minted outside the binder and holds no discharge for it.
+        let lifted = self.fresh();
+        let Type::Infer(v) = &lifted else {
+            unreachable!("fresh() yields a Type::Infer var");
+        };
+        let bound = crate::ccl::Bound::with_subst(
+            body_ty,
+            crate::ccl::subst::Subst::discharge(name.clone(), bound_expr.clone_preserving_ids()),
+        );
+        crate::ccl::infer_var::observe_bound_scope(
+            v,
+            "lower",
+            &bound,
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
+        v.bounds.borrow_mut().lower_mut().push(bound);
+        lifted
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {

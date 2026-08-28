@@ -354,7 +354,7 @@ def foo(t: Int) => {Int where _ == 1 ^+ 3}:
     y
 ()
 ",
-        Value::Unit
+        Value::Unit,
     )
 }
 
@@ -367,7 +367,7 @@ def foo(t: Int):
     x ^+ 2
 foo(1)
 ",
-        Value::Int(6)
+        Value::Int(6),
     )
 }
 
@@ -380,7 +380,7 @@ def foo(t: Int):
     x
 foo(1)
 ",
-        Value::Int(4)
+        Value::Int(4),
     )
 }
 
@@ -396,6 +396,6 @@ def foo(t: Int):
     x ^+ 2
 foo(2)
 ",
-        Value::Int(3)
+        Value::Int(3),
     )
 }

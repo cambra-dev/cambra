@@ -989,7 +989,7 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 
 **Discharged-argument slot resolution.** A predicate's interior is typed **by construction**, and the invariant that makes that hold is that *substitution never discards a type*. A `Discharge` carries a typed argument term and clones it; a `Rename` materializes as a fresh `Var` node and takes the type of the occurrence it replaces, because α-renaming cannot change a term's type — the type belongs to the position, not to the name. Nothing re-derives a predicate's types afterwards, and nothing may: a predicate's interior is outside the walk that resolves node types (its terms ride a *type*), so a slot left untyped here would survive to the post-inference wall as an unresolved variable with no way to recover it except lexical scope — which is a *name* lookup standing in for a type that was thrown away. (`freshen_above` separately copy-and-freshens a specialization clone's predicate type slots.)
 
-**`let`-closing (codomain extraction).** A `let 𝑥 = 𝑣 in body` node's type is the body's type, which may close over `𝑥`. As that type is lifted out of the `let`'s scope, `coalesce_node` discharges `[𝑥 ↦ 𝑣]` into it (derived from the body's already-closed type, so chained `let`s close to fixpoint) — the design's `let`-closing refinement-move site. Together with the contravariant discharge above, every coalesced node's type is **well-formed in its lexical scope**, checked at the end of inference by `check_scope_valid` (§6.2) in debug builds: a free predicate variable must be bound by an enclosing Pi binder or AST binder, or be a source. A violation is a compiler bug (a substitution-descent miss leaving a dangling predicate binder), reported as an internal `InferError::ScopeViolation`. This is a debug-build regression net: because substitution rewrites type-borne occurrences in the same pass as the term, a dangling predicate binder is structurally unrepresentable; the per-substitution `debug_assert`s in `ccl::subst` remain as fast-path guards.
+**`let`-closing (codomain extraction).** A `let 𝑥 = 𝑣 in body` node's type is the body's type, which may close over `𝑥`. Emission records the lift as a suspended discharge on the `let` node's own variable (see [`let` binders and scope exit](#let-binders-and-scope-exit)), and `coalesce_node` discharges `[𝑥 ↦ 𝑣]` into the resolved type (derived from the body's already-closed type, so chained `let`s close to fixpoint) — the design's `let`-closing refinement-move site. The discharge quotes `𝑣`, so a pass that rewrites `𝑣` re-runs it: `lambda_elim`'s two `Let` arms rebuild the node's type from the eliminated body and definition, and the post-pass check reconstructs it from the tree it is handed, which holds the eliminated `𝑣` alone. Only a dependent binding is rebuilt, so elimination changes a node's type exactly where the term it quotes changed. Together with the contravariant discharge above, every coalesced node's type is **well-formed in its lexical scope**, checked at the end of inference by `check_scope_valid` (§6.2) in debug builds: a free predicate variable must be bound by an enclosing Pi binder or AST binder, or be a source. A violation is a compiler bug (a substitution-descent miss leaving a dangling predicate binder), reported as an internal `InferError::ScopeViolation`. This is a debug-build regression net: because substitution rewrites type-borne occurrences in the same pass as the term, a dangling predicate binder is structurally unrepresentable; the per-substitution `debug_assert`s in `ccl::subst` remain as fast-path guards.
 
 **Lambda elimination.** A `λ 𝑥 → e` whose binder is free only in `e`'s *type* (a refinement closes over it) — not its value — eliminates to the **Pi-const** form `const(e) : (𝑥) ⇒ e.ty` (`is_free_in_value` distinguishes the two). It also fires after the currying/pairing rule rewrites a captured partition predicate onto a pair domain: the residual `λ __pair → <point-free value>` has its binder free only in that refinement.
 
@@ -1104,10 +1104,17 @@ that should dedup, and a `Data` domain admits no join across the split: with ind
 
 A `let` telescope entry carries its definiens. A refinement may reference it while in scope, which a
 user-written refinement type needs (`{Int | __elem > n}` with `n` let-bound). Lifting a type past
-the binding discharges the reference to the definiens, through the existing `let`-closing discharge
-in `coalesce_node`. No re-addressing is needed: a uniquified name is its telescope entry's
-address, so the name-keyed discharge already speaks in entries. A Pi entry has no definiens, and
-lifting past one abstracts instead of discharging.
+the binding discharges the reference to the definiens. No re-addressing is needed: a uniquified name
+is its telescope entry's address, so the name-keyed discharge already speaks in entries. A Pi entry
+has no definiens, and lifting past one abstracts instead of discharging.
+
+Emission records the lift, and cannot perform it: the body's type is an inference variable there,
+whose refinements sit in its bounds rather than in the type. `InferCtx::close_let_type` mints the
+`let` node's type outside the binder and records the body's type on its lower edge under `[𝑥 ↦ 𝑣]`,
+a suspended discharge read as an application. Every bound naming `𝑥` then crosses an edge that
+discharges the name, and β fires at coalesce. Returning the body's variable verbatim instead lets a
+refinement over `𝑥` reach the enclosing lambda's codomain, which is minted outside the binder and
+so trips the record-time closure check at the first call site that reads the codomain.
 
 #### Discharge is application
 
@@ -1152,7 +1159,10 @@ identity there, and the `Fun` literal says so.
 
 **A refinement closes against the enclosing functions of the walk carrying it.** `compact_go` and
 the `SpecKey` walk both do so in the same two arms that force the edge substitutions into it
-(`force_refinement`). Nothing earlier can: `CompactType::merge` dedups refinements while bounds
+(`force_refinement`), and `coalesce_type_predicates` does so again on what it rebuilds. That third
+site is a re-entry: a predicate's sub-expression type slots hold inference variables `compact_go`
+steps over, and resolving them afterwards reads name-spelled references out of the live graph and
+puts them back into a type the walk already closed. Nothing earlier can: `CompactType::merge` dedups refinements while bounds
 fold, before any function is assembled, so a closed cast and a live emitted function meeting at one
 variable would otherwise put an index-spelled refinement and a name-spelled one at a single
 position. `subst::RefinementScope` is the state both walks thread — the enclosing-binder stack and

@@ -1611,6 +1611,31 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// parameterized by a domain minted per occurrence, so it must run at each one and
 /// uses `TermMemo` instead (`emit_bare_predicate`).
 fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
+    coalesce_type_predicates_go(
+        ty,
+        level,
+        ctx,
+        &mut crate::ccl::subst::RefinementScope::default(),
+    );
+}
+
+/// [`coalesce_type_predicates`] carrying the functions it has descended
+/// through, so a predicate it rebuilds leaves closed against them.
+///
+/// A predicate's sub-expression type slots hold inference variables that
+/// `compact_go` steps over, and resolving them here reads their content out of
+/// the live constraint graph, where every reference is name-spelled. That runs
+/// once `compact_go` has already closed the refinement, so a resolved slot
+/// naming an enclosing Pi binder puts a name back into a stored type, which
+/// `check_scope_valid`'s tripwire rejects. This walk closes what it rebuilt, at
+/// the crossings `compact_go` counts (see `src/ccl/design/type-inference.md`,
+/// "Where the conversions run").
+fn coalesce_type_predicates_go(
+    ty: &mut Type,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+    scope: &mut crate::ccl::subst::RefinementScope,
+) {
     match ty {
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
@@ -1630,29 +1655,37 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
                     coalesce_node(pred, level, ctx);
                     true
                 });
+                *r = scope.close(r);
             });
-            coalesce_type_predicates(inner, level, ctx);
+            coalesce_type_predicates_go(inner, level, ctx, scope);
         }
         Type::Fun {
+            name,
             domain: d,
             codomain: c,
             ..
         } => {
-            coalesce_type_predicates(d, level, ctx);
-            coalesce_type_predicates(c, level, ctx);
+            // A binder scopes over its codomain only. An unnamed function still
+            // counts as a crossing: the index a reference below carries counts
+            // every function between it and its binder.
+            let binder = name.clone();
+            coalesce_type_predicates_go(d, level, ctx, scope);
+            scope.enter(binder);
+            coalesce_type_predicates_go(c, level, ctx, scope);
+            scope.exit();
         }
         Type::Tuple(ts) => ts
             .iter_mut()
-            .for_each(|t| coalesce_type_predicates(t, level, ctx)),
+            .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::Record(fs) => fs
             .iter_mut()
-            .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
+            .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::Variant(tags, _) => tags
             .iter_mut()
-            .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
+            .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::History { value, domain, .. } => {
-            coalesce_type_predicates(value, level, ctx);
-            coalesce_type_predicates(domain, level, ctx);
+            coalesce_type_predicates_go(value, level, ctx, scope);
+            coalesce_type_predicates_go(domain, level, ctx, scope);
         }
         Type::Base(_)
         | Type::UIntRange(_)

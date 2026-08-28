@@ -284,7 +284,7 @@ impl Typing for CheckCtx {
         self.under_binder(name, f)
     }
 
-    fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
         // Mirror the let-closing in `coalesce_node`'s Let arm (design §6.2):
         // the recorded node type has the binding discharged, so the
         // reconstruction must re-run the same substitution to reconcile under

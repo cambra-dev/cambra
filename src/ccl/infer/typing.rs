@@ -146,14 +146,16 @@ pub(super) trait Typing {
     /// (design §6.2 move-site rule), so the lifted type stays well-formed
     /// outside the binder's scope.
     ///
-    /// Emit returns `body_ty` unchanged: the body type is an unresolved var
-    /// there, and the closing runs on the *resolved* type in `coalesce_node`'s
-    /// Let arm — discharging here would rebuild refinement predicates out of
-    /// any already-concrete body type (e.g. a lambda's `Fun`), and the rebuilt
-    /// terms would escape coalesce unresolved. Check re-runs the discharge so its
-    /// reconstruction matches the recorded (closed) node type under structural
-    /// predicate equality.
-    fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
+    /// Emit records the discharge rather than performing it. The body type is
+    /// an unresolved var there, so Emit mints the `let` node's type outside the
+    /// binder and suspends the discharge on its lower edge; the substitution
+    /// fires on the *resolved* content at coalesce, alongside `coalesce_node`'s
+    /// Let arm. Applying it at emission would rebuild refinement predicates out
+    /// of any already-concrete body type (e.g. a lambda's `Fun`), and the
+    /// rebuilt terms would escape coalesce unresolved. Check re-runs the
+    /// discharge so its reconstruction matches the recorded (closed) node type
+    /// under structural predicate equality.
+    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
 
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this records the **one-way** obligation `inferred <: ann` —
