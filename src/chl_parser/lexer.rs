@@ -451,6 +451,10 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
     // Whether the current line's first token is a block keyword, which is what
     // separates a block that starts its line from one that does not.
     let mut line_opens_at_first_token = false;
+    // The indent of the line the current *logical* line started on. A bracketed
+    // header spans several physical lines, and the floor a block right-hand side
+    // opens belongs to the statement, not to the physical line its `:` lands on.
+    let mut line_indent = 0usize;
 
     for (tok, span) in &raw {
         // Blank lines and comment-only lines: their only token is `Newline`,
@@ -462,6 +466,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
         if at_line_start && bracket_depth == 0 {
             let line_start = source[..span.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let indent = span.start - line_start;
+            line_indent = indent;
             if let Some(min) = block_value_open.take() {
                 indent_stack.push(Level::Pending { min });
             }
@@ -521,9 +526,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
                     // an assignment's right-hand side and continues at a column
                     // of its own rather than at the statement's.
                     if matches!(out.last(), Some((Token::Colon, _))) && !line_opens_at_first_token {
-                        let ls = source[..span.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                        let line = &source[ls..span.start];
-                        block_value_open = Some(line.len() - line.trim_start().len());
+                        block_value_open = Some(line_indent);
                     }
                     out.push((tok.clone(), *span));
                     at_line_start = true;
@@ -746,6 +749,31 @@ mod tests {
         let indents = toks.iter().filter(|t| **t == Token::Indent).count();
         let dedents = toks.iter().filter(|t| **t == Token::Dedent).count();
         assert_eq!((indents, dedents), (2, 2));
+    }
+
+    /// A bracketed header wraps onto further physical lines, and the level the
+    /// block opens is floored at the *statement's* column, not at the column of
+    /// the line the `:` lands on. Reading the latter would put the floor above
+    /// the branch bodies and reject the chain.
+    #[test]
+    fn a_wrapped_header_floors_the_level_at_the_statement() {
+        assert_eq!(
+            tokens(indoc! {"
+                x = if f(c,
+                         d):
+                        1
+                    else:
+                        2
+                y
+            "}),
+            tokens(indoc! {"
+                x = if f(c, d):
+                        1
+                    else:
+                        2
+                y
+            "})
+        );
     }
 
     /// The chain's column is the writer's, like every other indentation here:
