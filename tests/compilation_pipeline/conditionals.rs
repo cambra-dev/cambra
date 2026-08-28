@@ -202,6 +202,28 @@ fn test_block_if_as_an_assigned_value(#[case] code: &str, #[case] expected: Valu
     check_scalar(code, expected);
 }
 
+// The block belongs to the statement, so `elif` and `else` return to the
+// statement's column. The `if` keyword sits further right, after the target and
+// the `=`, and that column is not an indentation level — aligning the chain to
+// it is a lex error. `docs/chl-spec.md`, "4.3 Assignment forms" spells the
+// accepted form, and this pins it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_block_if_chain_aligns_with_the_statement() {
+    check_scalar(
+        indoc! {r#"
+            score = 95
+            label = if score > 90:
+                "high"
+            elif score > 50:
+                "mid"
+            else:
+                "low"
+            label"#},
+        Value::String("high".into()),
+    );
+}
+
 // The off-path arm is **not evaluated**: a guard-protected partial expression
 // (`//` by a value the guard proves non-zero) must not fault on the path its
 // guard excludes. The scalar C-form lifts each arm over a gated `Units(1)`

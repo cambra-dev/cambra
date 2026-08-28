@@ -1313,11 +1313,11 @@ that block's value — its last statement's, by the rule in §4.5:
 
 ```python
 label = if score > 90:
-      "high"
-  elif score > 50:
-      "mid"
-  else:
-      "low"
+    "high"
+elif score > 50:
+    "mid"
+else:
+    "low"
 
 n = match msg:
     case `ping(seq):
@@ -1326,10 +1326,31 @@ n = match msg:
         0
 ```
 
+The block belongs to the statement, so `elif` and `else` return to the
+statement's own column; the `if` keyword's column, further right, is not an
+indentation level.
+
 The block's DEDENT ends the statement, so nothing follows it on the line. Every
 branch must produce a value, and an `if` with no `else` is rejected (§4.5); a
 one-line spelling of the same thing is the ternary (§3.6) or, for `match`, the
 bracketed form in §4.10.
+
+A block on the right may not write a variable declared outside it. A write
+reaches the rest of the block it sits in, and the block ends at the value the
+assignment takes, so the update would reach nothing:
+
+```python
+acc := 0
+t = if c:
+    acc += 1        # rejected: the update is discarded
+    0
+else:
+    0
+```
+
+Write `acc` from a statement `if` beside the assignment, or bind the block's
+value and write `acc` after it. A mutable variable the block itself declares is
+written normally — its declaration and its writes share one scope.
 
 Annotated assignment **requires** a value (`x: T` alone is a parse error,
 unlike Python's bare type-only declarations).

@@ -161,7 +161,7 @@ type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 /// 13. `*`, `//`
 /// 14. unary `-`
 /// 15. postfix: call `f(...)`, subscript `x[...]`, attribute `x.name` / `x.0`
-/// 16. atom: literal, name, parenthesised, list, dict/record, comprehension
+/// 16. atom: literal, name, parenthesised, list, record, brace type, comprehension
 fn expression<'src, I>() -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
@@ -1267,9 +1267,15 @@ where
         // right of an assignment, whose value is the block's own
         // (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`"). The block's
         // `Dedent` ends the statement, so this form takes no `stmt_terminator`
-        // and cannot ride `simple_stmt`. It is tried before `simple_stmt`, which
-        // reparses the target when the right-hand side turns out to be an
-        // ordinary expression.
+        // and cannot ride `simple_stmt`, which is why the two are separate
+        // alternatives rather than one production over both right-hand sides.
+        //
+        // Ordering costs a second parse of the target. `block_assign` is tried
+        // first and `.clone()` on a chumsky combinator copies the parser without
+        // memoizing, so every statement whose right-hand side is not a block —
+        // each ordinary assignment, and each expression statement — parses its
+        // leading `bare_tuple` twice, once here and once in `simple_stmt`. Error
+        // quality is unaffected: the furthest-progress alternative wins.
         let block_value =
             choice((if_stmt.clone(), match_stmt.clone())).map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
@@ -1364,8 +1370,6 @@ enum AssignTail {
     None,
 }
 
-/// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
-///
 /// What follows an assignment target, over parsers for the right-hand side and
 /// for an annotation's type.
 ///
@@ -1556,6 +1560,8 @@ where
         .collect::<Vec<_>>()
 }
 
+/// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
+///
 /// CHL binding patterns are bare names and (possibly-nested) tuples of
 /// patterns. We parse the LHS as a full expression so the regular grammar
 /// (with its error recovery) handles it, then narrow to the binding-pattern
@@ -1680,7 +1686,7 @@ mod tests {
     #[test]
     fn brace_group_is_colon_free() {
         // A colon-free brace list is a `BraceGroup` (tuple-type syntax `{T, U}`),
-        // distinct from a record (`{x: 1}`) and a dict (`{"k": v}`).
+        // distinct from a record (`{x: 1}`).
         let Expr::BraceGroup(elts) = parse_e("{Int, Bool}").node else {
             panic!(
                 "expected a BraceGroup, got {:?}",
@@ -1839,7 +1845,7 @@ mod tests {
     #[test]
     fn mixed_brace_entries_are_an_error() {
         // A brace literal mixing `key: value` entries with bare expressions is
-        // neither a record/dict nor a tuple type.
+        // neither a record nor a tuple type.
         let result = parse_expression("{a: 1, b}");
         assert!(
             !result.errors.is_empty(),

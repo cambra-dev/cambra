@@ -1654,3 +1654,105 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
         "`Feed` takes one type argument: `Feed(T)`",
     );
 }
+
+// A write inside a block right-hand side reaches only the rest of that block,
+// so the assignment's value is taken and the update is dropped. Lowering
+// rejects the shape rather than compiling it to a discarded write
+// (`docs/chl-spec.md`, "4.3 Assignment forms"). The four cases are the write
+// spellings and the three positions a block right-hand side can sit in: a
+// for-loop body, the top level, and a `with begin():` block.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+            acc += i
+            0
+        else:
+            0
+        yield t
+    acc"})]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+            acc := i
+            0
+        else:
+            0
+        yield t
+    acc"})]
+#[case(indoc! {"
+    acc := 0
+    t = if True:
+        acc += 1
+        0
+    else:
+        0
+    acc"})]
+// The write sits under a `for` inside the block. Reaching this message at all
+// is what shows the enclosing scope arrives: without it the inner loop reads
+// `balance` as a name it does not know and rejects the `+=` as a write to a
+// non-mutable, naming a declaration the first line already makes.
+#[case(indoc! {"
+    balance := 0
+    with begin():
+        balance := if True:
+            for i in [1, 2]:
+                balance += i
+            balance
+        else:
+            0
+    balance"})]
+fn test_block_right_hand_side_write_is_rejected(#[case] code: &str) {
+    check_compile_error(code, "stands for a value, so the update is discarded");
+}
+
+/// The statement `if` writes the accumulator; the block right-hand side that
+/// spells the same conditional as a value does not, so the two are not
+/// interchangeable where a write is involved.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_statement_if_accumulates_where_a_block_value_cannot() {
+    check_scalar(
+        indoc! {"
+            acc := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    acc += i
+                yield 0
+            acc"},
+        Value::Int(5),
+    );
+}
+
+/// A mutable variable the block itself declares is written normally: the
+/// declaration and every write share the block's scope, so the advance reaches
+/// every read of it. The block's value is the accumulator's.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    t = if True:
+        s := 0
+        for i in [1, 2]:
+            s += i
+        s
+    else:
+        0
+    t"})]
+#[case(indoc! {"
+    acc := 0
+    for j in [1]:
+        t = if True:
+            s := 0
+            for i in [1, 2]:
+                s += i
+            s
+        else:
+            0
+        yield t
+    3"})]
+fn test_block_right_hand_side_writes_its_own_mutable(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
+}

@@ -944,23 +944,16 @@ fn lower_expr_inner(
         }
         // `target << value` — feed into a deferred output.
         ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
-        // A block in value position, reached with no enclosing scope to pass:
-        // a one-line `match`, and a block right-hand side in a loop body or a
-        // `with begin():` block, whose own statement handlers lower an
-        // assignment's value with `lower_expr`. The scope is what tells a `for`
-        // inside a branch that a write targets a loop-carried accumulator
-        // rather than a branch-local, and none of these positions admits such a
-        // `for`: a one-line arm body is a single expression, and a `for` nested
-        // in either enclosing block is rejected already. The statement path
-        // through `lower_assigned_value` carries the scope where a `for` can
-        // appear.
-        ChlExpr::Block(stmt) => {
-            debug_assert!(
-                matches!(stmt.node, ChlStmt::If { .. } | ChlStmt::Match { .. }),
-                "Expr::Block wraps an `if` or a `match`; the parser builds no other block value"
-            );
-            lower_final_stmt(stmt, &[], &HashSet::new(), ctx)
-        }
+        // The one-line `match` (`match v { case `a: … }`), the only block value
+        // that reaches an expression position. Every block *statement* value is
+        // an assignment's right-hand side and routes through
+        // `lower_assigned_value`, which carries the scope its position binds.
+        //
+        // The empty scope passed here is the one-line form's own: its arms are
+        // expressions (`docs/chl-spec.md`, "The one-line form"), so no
+        // statement — and so no name — can be bound inside it for the scope to
+        // disambiguate.
+        ChlExpr::Block(stmt) => lower_block_value(stmt, &[], &HashSet::new(), ctx),
         // `yield e` is only valid in a generator-for body; reject elsewhere.
         ChlExpr::Yield(_) => Err(LoweringError::unsupported(
             expr.span,
