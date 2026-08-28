@@ -753,6 +753,7 @@ where
             .foldl_with(
                 choice((
                     just(Token::Plus).to(BinOp::Add),
+                    just(Token::CaretPlus).to(BinOp::AddRefined),
                     just(Token::Minus).to(BinOp::Sub),
                 ))
                 .then(product.clone())

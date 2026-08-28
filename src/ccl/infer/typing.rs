@@ -84,7 +84,9 @@ pub(super) trait Typing {
     fn require_trait(
         &mut self,
         trait_: Trait,
-        operands: &[&Type],
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError>;

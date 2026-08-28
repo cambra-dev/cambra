@@ -8,9 +8,12 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
+use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
+use crate::ccl::{
+    BaseType, Expr, Level, Name, Refinement, RefinementSet, Type, TypedExpr, TypedExprNode,
+};
 
 use super::emit::{
     emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast, emit_compose,
@@ -141,7 +144,9 @@ impl Typing for CheckCtx {
     fn require_trait(
         &mut self,
         trait_: Trait,
-        operands: &[&Type],
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
@@ -163,7 +168,7 @@ impl Typing for CheckCtx {
         // [`Typing::require_sub`] reuses `TypeMismatch` here: the error vocabulary
         // describes the inconsistency, the wall supplies the interpretation. Measured
         // across the suite: it never fires.
-        let bases: Option<Vec<&BaseType>> = operands.iter().map(|t| offered_base(t)).collect();
+        let bases: Option<Vec<&BaseType>> = operand_types.iter().map(|t| offered_base(t)).collect();
         let Some(bases) = bases else {
             // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
             // still-`Infer` position under `Strictness::PreChannelize`) is not something
@@ -179,7 +184,27 @@ impl Typing for CheckCtx {
             Some(matched) => Ok(assoc.map(|name| {
                 matched
                     .assoc_ty(name)
-                    .map(|b| Type::Base(b.clone()))
+                    .map(|(b, template)| {
+                        let base = Type::Base(b.clone());
+                        match template {
+                            Some(template) => {
+                                let _f = provenance::enter(
+                                    operator_node_id,
+                                    "check.require_trait",
+                                    provenance::Nature::Machinery,
+                                );
+                                let args: Vec<TypedExpr> =
+                                    operand_exprs.iter().map(|e| (*e).clone()).collect();
+                                Type::Refinement(
+                                    Box::new(base),
+                                    RefinementSet::one(Refinement::born_from_template(
+                                        template, &args,
+                                    )),
+                                )
+                            }
+                            None => base,
+                        }
+                    })
                     .unwrap_or_else(|| fresh_var(self.level))
             })),
             None => {
@@ -418,6 +443,7 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
 /// recorded `Type`.
 fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
     let label = symbolic(expr);
+    let node_id = expr.node_id();
     // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
@@ -459,17 +485,17 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(left, right, &sig, ctx)?
+            emit_binop(node_id, left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(inner, &sig, ctx)?
+            emit_unary(inner, node_id, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {
             let scheme = ctx.schemes.aggregate(*kind).clone();
-            emit_aggregate(input, &scheme, *kind, ctx)?
+            emit_aggregate(input, node_id, &scheme, *kind, ctx)?
         }
 
         // Check never generalizes (`is_generalizable` is `false`), so every

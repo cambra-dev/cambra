@@ -338,3 +338,8 @@ def test(a: String, b: Int):
 fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] name: &str) {
     check_compile_error(code, &format!("type inference: Unbound variable: '{name}'"));
 }
+
+#[test]
+fn refined_add() {
+    check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
+}

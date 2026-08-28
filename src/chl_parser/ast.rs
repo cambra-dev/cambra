@@ -708,6 +708,9 @@ pub enum CompClause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
+    /// `^+` — addition whose result type records the sum. Same arithmetic as
+    /// [`Add`](Self::Add), a different trait (`src/ccl/ops.rs`, `ArithmeticKind`).
+    AddRefined,
     Sub,
     Mul,
     FloorDiv,

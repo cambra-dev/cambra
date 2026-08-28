@@ -74,9 +74,13 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::ccl::{BaseType, FieldKey, InferVar, InferVarId, Type};
+use crate::ccl::{
+    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name,
+    Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr, provenance,
+};
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
+use super::prim;
 
 /// A trait: a named requirement on types, together with any types it associates
 /// with them.
@@ -92,6 +96,11 @@ pub enum Trait {
     /// why surface `+` on strings types through arithmetic; `simplify` rewrites it to
     /// `Concat` later.
     Addable,
+    /// `^+` over `(𝐴, 𝐵)`, associating `Output`.
+    ///
+    /// This is an experimental version of Addable that gives the
+    /// output type an input-dependent refinement.
+    AddableRefined,
     /// `-` over `(𝐴, 𝐵)`, associating `Output`.
     Subtractable,
     /// `*` over `(𝐴, 𝐵)`, associating `Output`.
@@ -127,21 +136,26 @@ pub enum Assoc {
 }
 
 /// One instance: the types it accepts, and what it associates with them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TraitInstance {
     /// The accepted types, positionally. A slice rather than a fixed array because
     /// arity is the trait's business — every operator trait is binary today, and an
     /// `Orderable` over one type is the obvious next one.
     pub args: &'static [BaseType],
-    /// The types this instance associates, by name. Empty for a trait that is
-    /// a pure requirement.
-    pub assoc: &'static [(Assoc, BaseType)],
+    /// The types this instance associates, by name. Empty for a trait
+    /// that is a pure requirement. Each associated type has an
+    /// optional RefinementTemplate, which builds a refinement from
+    /// operator's input argument expressions.
+    pub assoc: &'static [(Assoc, BaseType, Option<RefinementTemplate>)],
 }
 
 impl TraitInstance {
     /// The type this instance associates with `name`, if any.
-    pub fn assoc_ty(&self, name: Assoc) -> Option<&BaseType> {
-        self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+    pub fn assoc_ty(&self, name: Assoc) -> Option<(&BaseType, Option<RefinementTemplate>)> {
+        self.assoc
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, t, r)| (t, *r))
     }
 }
 
@@ -150,27 +164,59 @@ impl TraitInstance {
 const NUMERIC: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
-        assoc: &[(Assoc::Output, BaseType::Int)],
+        assoc: &[(Assoc::Output, BaseType::Int, None)],
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
-        assoc: &[(Assoc::Output, BaseType::UInt)],
+        assoc: &[(Assoc::Output, BaseType::UInt, None)],
     },
 ];
+
+/// The bare predicate `__elem == a1 ^+ a2` for the `AddableRefined(Int, Int ⇝ Int)`
+/// row: the result is the sum of the operands the instance accepted.
+///
+/// Bare in the sense of [`crate::ccl::ccl_utils::refine_with_bare`] — [`Name::elem`] is
+/// free, and the refinement it lands in is what binds it. Every node is typed at
+/// construction because the row fixes both operand bases and the associated base at
+/// `Int`, leaving nothing for inference to resolve, the same reason
+/// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
+fn refinement_for_add(args: &[TypedExpr]) -> TypedExpr {
+    let [a1, a2] = args else {
+        panic!("AddableRefined is binary, so its instance's refinement receives two operands");
+    };
+    let int = prim(BaseType::Int);
+    TypedExpr::binop(
+        TypedExpr::var(Name::elem()).with_ty(int.clone()),
+        BinOpKind::Compare(CompareKind::Equals),
+        TypedExpr::binop(
+            a1.clone(),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+            a2.clone(),
+        )
+        .with_ty(int),
+    )
+    .with_ty(prim(BaseType::Bool))
+}
+
+/// `(Int, Int) ⇝ {Int | __elem == 𝑎₁ ^+ 𝑎₂}` — the one row of `^+`.
+const ADDITION_REFINED: &[TraitInstance] = &[TraitInstance {
+    args: &[BaseType::Int, BaseType::Int],
+    assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_add))],
+}];
 
 /// The numeric rows plus `(String, String) ⇝ String`.
 const NUMERIC_OR_STRING: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
-        assoc: &[(Assoc::Output, BaseType::Int)],
+        assoc: &[(Assoc::Output, BaseType::Int, None)],
     },
     TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
-        assoc: &[(Assoc::Output, BaseType::UInt)],
+        assoc: &[(Assoc::Output, BaseType::UInt, None)],
     },
     TraitInstance {
         args: &[BaseType::String, BaseType::String],
-        assoc: &[(Assoc::Output, BaseType::String)],
+        assoc: &[(Assoc::Output, BaseType::String, None)],
     },
 ];
 
@@ -204,7 +250,7 @@ const COMPARABLE: &[TraitInstance] = &[
 /// arity and association shape `Addable` and `Equatable` between them do not have.
 const NEGATABLE: &[TraitInstance] = &[TraitInstance {
     args: &[BaseType::Int],
-    assoc: &[(Assoc::Output, BaseType::Int)],
+    assoc: &[(Assoc::Output, BaseType::Int, None)],
 }];
 
 /// The bases an aggregate can order, matching `max`'s merge in `ccl/mod.rs`. Unary
@@ -238,6 +284,7 @@ impl Trait {
     pub fn instances(self) -> &'static [TraitInstance] {
         match self {
             Trait::Addable => NUMERIC_OR_STRING,
+            Trait::AddableRefined => ADDITION_REFINED,
             Trait::Subtractable | Trait::Multipliable | Trait::Divisible => NUMERIC,
             Trait::Equatable | Trait::Orderable => COMPARABLE,
             Trait::Negatable => NEGATABLE,
@@ -267,7 +314,7 @@ impl Trait {
             .expect("every trait has at least one instance");
         (
             first.args.len(),
-            first.assoc.iter().map(|(n, _)| *n).collect(),
+            first.assoc.iter().map(|(n, _, _)| *n).collect(),
         )
     }
 
@@ -275,6 +322,7 @@ impl Trait {
     pub fn name(self) -> &'static str {
         match self {
             Trait::Addable => "Addable",
+            Trait::AddableRefined => "AddableRefined",
             Trait::Subtractable => "Subtractable",
             Trait::Multipliable => "Multipliable",
             Trait::Divisible => "Divisible",
@@ -326,6 +374,12 @@ pub struct TraitObligation {
     /// declares. Empty for a trait that is a pure requirement — the mechanism then
     /// still narrows and still rejects, it simply determines nothing.
     assoc: Vec<AssocPosition>,
+    /// The input arguments' actual expressions, to be substituted
+    /// into the output type if it has a refinement template.
+    input_exprs: Vec<TypedExpr>,
+    /// The ID of the operator node that spawned this obligation, to
+    /// be used as provenance for any resulting refinement body.
+    operator_node_id: provenance::NodeId,
 }
 
 /// One associated position of an obligation: the name, the type standing in for it,
@@ -344,7 +398,12 @@ struct AssocPosition {
 impl TraitObligation {
     /// Record an instance of `trait_` whose associated names stand at the given type
     /// positions, with every instance still a candidate.
-    pub fn new(trait_: Trait, assoc: Vec<(Assoc, Type)>) -> Rc<TraitObligation> {
+    pub fn new(
+        trait_: Trait,
+        assoc: Vec<(Assoc, Type)>,
+        operator_node_id: provenance::NodeId,
+        input_exprs: Vec<TypedExpr>,
+    ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_,
@@ -357,6 +416,8 @@ impl TraitObligation {
                     deposited: Cell::new(false),
                 })
                 .collect(),
+            input_exprs,
+            operator_node_id,
         })
     }
 
@@ -374,6 +435,9 @@ impl TraitObligation {
     /// deposit already made rides the freshened bound onto the copy, so redoing it
     /// would record the same fact twice.
     pub(super) fn new_from(original: &Rc<TraitObligation>) -> Rc<TraitObligation> {
+        // We need a provenance recording here for the cloning of
+        // input_exprs into the new obligation.
+        let _f = provenance::copy_frame("infer.freshen_obligation");
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_: original.trait_,
@@ -387,6 +451,8 @@ impl TraitObligation {
                     deposited: Cell::new(p.deposited.get()),
                 })
                 .collect(),
+            input_exprs: original.input_exprs.clone(),
+            operator_node_id: original.operator_node_id,
         })
     }
 
@@ -515,12 +581,25 @@ impl TraitObligation {
             if position.deposited.get() {
                 continue;
             }
-            let Some(settled) = self.agreed_assoc(position.name) else {
+            let Some((settled, maybe_refinement)) = self.agreed_assoc(position.name) else {
                 continue;
             };
             position.deposited.set(true);
+            let _f = provenance::enter(
+                self.operator_node_id,
+                "infer.try_deposit",
+                provenance::Nature::Machinery,
+            );
             let target = position.ty.borrow().clone();
-            constrain_subtype(&Type::Base(settled), &target, cache)?;
+            let ty_base = Type::Base(settled);
+            let ty = match maybe_refinement {
+                Some(template) => Type::Refinement(
+                    Box::new(ty_base),
+                    RefinementSet::one(Refinement::born_from_template(template, &self.input_exprs)),
+                ),
+                None => ty_base,
+            };
+            constrain_subtype(&ty, &target, cache)?;
         }
         Ok(())
     }
@@ -550,15 +629,15 @@ impl TraitObligation {
 
     /// The type every surviving instance associates with `name`, or `None` if
     /// they disagree — the condition a deposit waits on.
-    fn agreed_assoc(&self, name: Assoc) -> Option<BaseType> {
+    fn agreed_assoc(&self, name: Assoc) -> Option<(BaseType, Option<RefinementTemplate>)> {
         let candidates = self.candidates.borrow();
         let (first, rest) = candidates
             .split_first()
             .expect("a candidate set is never empty: emptying it is the error");
-        let settled = first.assoc_ty(name)?;
+        let (settled_ty, settled_rf) = first.assoc_ty(name)?;
         rest.iter()
-            .all(|i| i.assoc_ty(name) == Some(settled))
-            .then(|| settled.clone())
+            .all(|i| i.assoc_ty(name).map(|(t, _)| t) == Some(settled_ty))
+            .then(|| (settled_ty.clone(), settled_rf))
     }
 }
 
@@ -1386,14 +1465,29 @@ mod tests {
     use super::*;
     use crate::ccl::infer::solver::fresh_var;
 
+    /// The operand expressions an obligation substitutes into an instance's
+    /// refinement template.
+    fn operands() -> Vec<TypedExpr> {
+        vec![
+            TypedExpr::lit(crate::ccl::Lit::Int(1)),
+            TypedExpr::lit(crate::ccl::Lit::Int(2)),
+        ]
+    }
+
     /// Both narrowing orders reach the same answer — the property that lets the
     /// obligation be resolved incrementally instead of by a final sweep.
     #[rstest::rstest]
     #[case(&[(0, BaseType::Int), (1, BaseType::Int)])]
     #[case(&[(1, BaseType::Int), (0, BaseType::Int)])]
     fn narrowing_is_order_independent(#[case] steps: &[(u8, BaseType)]) {
+        let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Addable, vec![(Assoc::Output, out.clone())]);
+        let ob = TraitObligation::new(
+            Trait::Addable,
+            vec![(Assoc::Output, out.clone())],
+            node_id,
+            operands(),
+        );
         let mut cache = ConstrainCache::new();
 
         for (pos, base) in steps {
@@ -1408,7 +1502,7 @@ mod tests {
                 .borrow()
                 .lower()
                 .iter()
-                .any(|b| b.ty == Type::Base(BaseType::Int)),
+                .any(|b| b.ty.peel_refinements() == &Type::Base(BaseType::Int)),
             "the settled output type is deposited as a lower bound on O",
         );
     }
@@ -1418,24 +1512,60 @@ mod tests {
     /// operand, which stays open for a future heterogeneous instance.
     #[test]
     fn one_known_operand_settles_an_agreed_output() {
+        let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Addable, vec![(Assoc::Output, out.clone())]);
+        let ob = TraitObligation::new(
+            Trait::Addable,
+            vec![(Assoc::Output, out.clone())],
+            node_id,
+            operands(),
+        );
         let mut cache = ConstrainCache::new();
 
         ob.narrow(1, &BaseType::Int, &mut cache)
             .expect("Int is addable");
 
-        assert_eq!(
-            ob.agreed_assoc(Assoc::Output),
-            Some(BaseType::Int),
-            "(Int, Int) ⇝ Int is the only row left, so its Output is settled",
+        assert!(
+            matches!(ob.agreed_assoc(Assoc::Output), Some((BaseType::Int, None))),
+            "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
+             `+` leaves that output unrefined",
         );
+        let candidates = ob.candidates();
+        let [only] = candidates.as_slice() else {
+            panic!("(Int, Int) ⇝ Int is the only Addable row left, got {candidates:?}");
+        };
+        assert_eq!(only.args, &[BaseType::Int, BaseType::Int]);
+        assert!(matches!(only.assoc, [(Assoc::Output, BaseType::Int, None)]));
+    }
+
+    /// `^+` deposits the sum on its output; `+` deposits a bare `Int`. The two
+    /// traits differ in exactly this, so one obligation of each pins it.
+    #[test]
+    fn only_the_refining_addition_carries_a_predicate() {
+        let deposited = |trait_| {
+            let node_id = provenance::NodeId::fresh();
+            let out = fresh_var(0);
+            let ob = TraitObligation::new(
+                trait_,
+                vec![(Assoc::Output, out.clone())],
+                node_id,
+                operands(),
+            );
+            ob.narrow(0, &BaseType::Int, &mut ConstrainCache::new())
+                .expect("Int adds to Int under either trait");
+            let Type::Infer(v) = &out else { unreachable!() };
+            let bounds = v.bounds.borrow();
+            bounds
+                .lower()
+                .iter()
+                .map(|b| b.ty.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(deposited(Trait::Addable), vec!["Int"]);
         assert_eq!(
-            ob.candidates(),
-            vec![TraitInstance {
-                args: &[BaseType::Int, BaseType::Int],
-                assoc: &[(Assoc::Output, BaseType::Int)],
-            }]
+            deposited(Trait::AddableRefined),
+            vec!["{Int | __elem == 1 ^+ 2}"],
         );
     }
 
@@ -1448,7 +1578,8 @@ mod tests {
     /// not just here.
     #[test]
     fn a_comparison_associates_nothing() {
-        let ob = TraitObligation::new(Trait::Equatable, Vec::new());
+        let node_id = provenance::NodeId::fresh();
+        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
         let mut cache = ConstrainCache::new();
 
         ob.try_deposit(&mut cache).expect("nothing to deposit");
@@ -1467,8 +1598,14 @@ mod tests {
     /// says what the position could still have taken.
     #[test]
     fn incompatible_operands_have_no_instance() {
+        let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Orderable, vec![(Assoc::Output, out)]);
+        let ob = TraitObligation::new(
+            Trait::Orderable,
+            vec![(Assoc::Output, out)],
+            node_id,
+            operands(),
+        );
         let mut cache = ConstrainCache::new();
 
         ob.narrow(0, &BaseType::Int, &mut cache)
@@ -1503,6 +1640,7 @@ mod tests {
     fn every_trait_has_a_consistent_shape() {
         for trait_ in [
             Trait::Addable,
+            Trait::AddableRefined,
             Trait::Subtractable,
             Trait::Multipliable,
             Trait::Divisible,
@@ -1518,7 +1656,7 @@ mod tests {
                     arity,
                     "{trait_} has rows of differing arity: {row:?}",
                 );
-                let names: Vec<Assoc> = row.assoc.iter().map(|(n, _)| *n).collect();
+                let names: Vec<Assoc> = row.assoc.iter().map(|(n, _, _)| *n).collect();
                 assert_eq!(
                     names, assocs,
                     "{trait_} has rows associating different names: {row:?}",
@@ -1534,9 +1672,7 @@ mod tests {
     fn a_refinement_narrows_as_its_base() {
         let refined = Type::refined_one(
             Type::Base(BaseType::String),
-            crate::ccl::Refinement::born(Rc::new(crate::ccl::TypedExpr::lit(
-                crate::ccl::Lit::Bool(true),
-            ))),
+            Refinement::born(Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(true)))),
         );
         assert_eq!(offered_base(&refined), Some(&BaseType::String));
     }

@@ -1779,6 +1779,12 @@ pub type PredicateId = *const TypedExpr;
 /// it); nested refinements share it and shadow positionally.
 pub const REFINEMENT_BINDER: &str = "__elem";
 
+/// A predicate over an operator's result, as a function of the operand terms of
+/// one use. A trait instance's associated type may carry one, and depositing that
+/// type applies it to the operands the obligation recorded
+/// ([`TraitInstance`](crate::ccl::infer::solver::traits::TraitInstance)).
+pub type RefinementTemplate = fn(&[TypedExpr]) -> TypedExpr;
+
 impl Refinement {
     /// Construct a refinement over a **genuinely new** predicate term — one this
     /// call site is *creating*, with no prior refinement identity to preserve
@@ -1790,6 +1796,12 @@ impl Refinement {
     /// `Rc` sharing one `Rc` (see the note on [`Refinement::predicate`]).
     pub fn born(predicate: Rc<TypedExpr>) -> Self {
         Refinement { predicate }
+    }
+
+    /// Construct a refinement by applying a template function to a
+    /// list of argument expressions.
+    pub fn born_from_template(template: RefinementTemplate, args: &[TypedExpr]) -> Self {
+        Self::born(Rc::new(template(args)))
     }
 
     /// Construct a refinement **deliberately sharing** an existing predicate

@@ -209,6 +209,39 @@ fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
     assert_eq!(infer_program(code), int());
 }
 
+/// `^+` records the sum in its result type. The refinement names the operand
+/// *terms* rather than their types, so it says what `+` cannot: the operands
+/// carry no refinement into it (the case above), and the equation is the
+/// instance's, from `AddableRefined`'s one row.
+#[rstest]
+#[case::literals("2 ^+ 3", "{Int | __elem == 2 ^+ 3}")]
+#[case::parameters(
+    indoc! {r#"
+        def f(a: Int, b: Int):
+            a ^+ b
+
+        f
+    "#},
+    "((__arg_tuple_0: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_0.0 ^+ __arg_tuple_0.1})"
+)]
+fn refining_addition_records_the_sum(#[case] code: &str, #[case] expected: &str) {
+    assert_eq!(format!("{}", infer_program(code)), expected);
+}
+
+/// `^+` accepts `Int` and nothing else: `AddableRefined` has one row, where
+/// `Addable` has three. A `String` operand `+` accepts is a missing instance here,
+/// not a silently unrefined result.
+#[test]
+fn refining_addition_is_int_only() {
+    let errs = infer_program_err(r#""a" ^+ "b""#);
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|m| m.contains("No AddableRefined instance")),
+        "expected a missing-instance diagnostic for AddableRefined, got {errs:?}",
+    );
+}
+
 /// The three shapes a trait can take are each exercised by a real program, which is
 /// what keeps the machinery from being fitted to one of them.
 ///

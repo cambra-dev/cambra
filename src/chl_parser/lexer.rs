@@ -109,6 +109,14 @@ pub enum Token {
     PlusPlus,
     #[token("+=")]
     PlusEq,
+    /// Refining addition `^+` — addition whose result type records the sum
+    /// (`ArithmeticKind::AddRefined`, in `src/ccl/ops.rs`). Two chars, so maximal
+    /// munch takes it over `Caret` then `Plus`; CHL has no unary `+`, so `a ^ +b`
+    /// is not a competing parse.
+    ///
+    /// Experimental, and so absent from `docs/chl-spec.md`.
+    #[token("^+")]
+    CaretPlus,
     #[token("-=")]
     MinusEq,
     /// Lambda body arrow `->`. Also the planned pair / map-entry arrow — `a -> b`
@@ -248,6 +256,7 @@ impl fmt::Display for Token {
             Token::GtE => ">=",
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",
+            Token::CaretPlus => "^+",
             Token::MinusEq => "-=",
             Token::Arrow => "->",
             Token::DoubleArrow => "=>",
@@ -519,7 +528,7 @@ mod tests {
     #[test]
     fn multi_char_operators() {
         assert_eq!(
-            tokens("<< <<= == != <= >= // //= += -= *="),
+            tokens("<< <<= == != <= >= // //= += -= *= ^+"),
             vec![
                 Token::LShift,
                 Token::LShiftEq,
@@ -532,6 +541,26 @@ mod tests {
                 Token::PlusEq,
                 Token::MinusEq,
                 Token::StarEq,
+                Token::CaretPlus,
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// `^+` is one token and `^` is another; the two operators share a first
+    /// character, and maximal munch is what separates them.
+    #[test]
+    fn caret_plus_wins_over_caret_then_plus() {
+        assert_eq!(
+            tokens("a ^+ b ^ c + d"),
+            vec![
+                Token::Ident("a".into()),
+                Token::CaretPlus,
+                Token::Ident("b".into()),
+                Token::Caret,
+                Token::Ident("c".into()),
+                Token::Plus,
+                Token::Ident("d".into()),
                 Token::Newline,
             ]
         );
