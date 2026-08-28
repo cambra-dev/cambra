@@ -38,6 +38,8 @@
 //! | Logic inside one | Accepted; the store is rebuilt and each variable resumes from the value it held, so what was recorded stands and the new rule governs from here |
 //! | An edit to one of two independent loops | Accepted; the other's store is adopted |
 //! | A loop gains an accumulator | Accepted; the others resume, the new one starts at its init |
+//! | A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
+//! | A loop reads another source — a port change, say | Accepted; same as above, and the port it left is released |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | Repeats and reverts | Accepted; each takes effect |
@@ -48,7 +50,6 @@
 //! | --- | --- |
 //! | A variable is no longer declared | Refused, naming it |
 //! | A variable's type changes | Refused, naming both types |
-//! | A variable moves to another loop, or to or from a transaction | Refused, naming where it went |
 //! | The source does not compile | Refused |
 //!
 //! In every refusal the running program keeps serving. Diffing is covered
@@ -769,32 +770,74 @@ fn a_loop_may_gain_an_accumulator() {
     );
 }
 
-/// Moving a variable to a different loop is refused, and says where it went.
+/// A variable that moves to another loop takes its value and starts counting
+/// again.
 ///
-/// A name matching is not the same variable: an accumulator's history came from
-/// the inputs its loop read, so the value the old loop built is not a seed for a
-/// loop over another source. Reported apart from a deletion because the two read
-/// very differently to whoever wrote the edit.
+/// The value is the variable's; the position belongs to the collection it was
+/// counted in. `n` accumulated over `/p` and now accumulates over `/q`, so it
+/// seeds with what it held and decides `/q`'s positions from `0` — none of which
+/// its predecessor ever read, so none is decided twice and none is skipped.
 #[test]
-fn moving_a_variable_to_another_loop_is_refused() {
+fn a_variable_that_moves_to_another_loop_takes_its_value_and_restarts() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("one-stateful-loop", port));
 
-    let before = exchange(&mut ctx, move || vec![http_post(port, "/p", "x")]);
-    assert_eq!(before, vec!["a\n"]);
+    let before = exchange(&mut ctx, move || {
+        vec![http_post(port, "/p", "x"), http_post(port, "/p", "x")]
+    });
+    assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    let errors = live
-        .update(&mut ctx, &source("one-stateful-loop-moved", port), &no_main)
-        .err()
-        .expect("`n` accumulates over a different source in the new version");
-    let rendered = format!("{errors:?}");
-    assert!(
-        rendered.contains("`n`") && rendered.contains("now counts them in"),
-        "the rejection should say where the variable went: {rendered}",
+    live.update(&mut ctx, &source("one-stateful-loop-moved", port), &no_main)
+        .expect("`n` is still declared, at the same type");
+
+    let after = exchange(&mut ctx, move || {
+        vec![http_post(port, "/q", "x"), http_post(port, "/p", "x")]
+    });
+    assert_eq!(
+        after,
+        vec!["aaa\n", "p\n"],
+        "`n` carried its `aa` into the loop it moved to",
+    );
+}
+
+/// A program that moves to another port keeps what it has accumulated.
+///
+/// The whole reason a value and its position are carried separately: the new
+/// source shares nothing with the old one — different route, different buffer,
+/// positions from `0` — so the position cannot follow. The value can, and an
+/// author moving a service to another port means to keep the guestbook.
+#[test]
+fn moving_a_program_to_another_port_keeps_its_state() {
+    let old_port = reserve_test_port();
+    let new_port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", old_port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![
+            http_post(old_port, "/sign", "alice"),
+            http_post(old_port, "/sign", "bob"),
+        ]
+    });
+    assert_eq!(before, vec!["alice\n", "alice\nbob\n"]);
+
+    live.update(&mut ctx, &source("guestbook", new_port), &no_main)
+        .expect("`entries` is still declared, at the same type");
+
+    let after = exchange(&mut ctx, move || {
+        vec![http_post(new_port, "/sign", "carol")]
+    });
+    assert_eq!(
+        after,
+        vec!["alice\nbob\ncarol\n"],
+        "the guestbook moved with the program",
     );
 
-    let still_serving = exchange(&mut ctx, move || vec![http_post(port, "/p", "x")]);
-    assert_eq!(still_serving, vec!["aa\n"], "state intact");
+    // The old port served nothing after the swap, so it was released with its
+    // last route.
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", old_port)).is_err(),
+        "port {old_port} should be released once the program stopped serving it",
+    );
 }
 
 /// A transactional variable survives an edit to the writer that commits it.

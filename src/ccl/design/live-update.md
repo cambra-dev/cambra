@@ -93,11 +93,7 @@ those the new version declares, read off its planned tree
 (`OpConversionContext::state_conflicts`). Two things are refused:
 
 - **A variable the new version no longer declares.** Its value has nowhere to be
-  seeded and would be discarded. Reported apart from the case where a variable of
-  that name turns up under a *different* store — a loop's accumulator moved to
-  another loop, or to or from a transaction — since an accumulator's history came
-  from the inputs its own loop read and is not a seed for one over another
-  source.
+  seeded and would be discarded.
 - **A variable it declares at a different type.** Its value cannot seed a store
   built for another shape. Allowed through, the store is constructed around a
   constant of the wrong extent and the *process* dies on the next pull
@@ -334,12 +330,18 @@ Three pieces carry that:
   decision cannot precede the input it decides.
 
   A position only means something in the domain it was counted in, and that is
-  the `Transact`'s own sequencing domain — the index of every key's history. A
-  data source and a transaction's commit clock outlive the version reading them,
-  so a position counted in one still means something to the next version. A
-  concrete iteration extent does not: it is part of the program, so a variable
-  sequenced by one carries nothing at all and its replacement recomputes the fold
-  from the collection its own version declares.
+  the `Transact`'s own sequencing domain — the index of every key's history. So
+  the two are carried separately, and a variable whose new version is sequenced by
+  a different domain seeds its value and decides from `0`. That is a variable
+  moving between loops, or into a transaction, or a program moving to another
+  port: the positions it is about to decide belong to a collection its predecessor
+  never read, so none is decided twice and none is skipped, while the value —
+  which is the variable's, not the collection's — goes on.
+
+  A concrete iteration extent carries nothing at all: it is part of the program
+  rather than outside it, so a variable sequenced by one is recomputed from the
+  collection its own version declares, and seeding it would count the elements
+  twice.
 - **What the source still owes.** A source hands a producer registering after the
   swap the release state its retired producers agreed on, which runs *below* a
   store's resume position rather than deciding it: a drive holds the input it
@@ -378,7 +380,9 @@ have:
 | A route is removed | Accepted; the route is retired and answers 404 |
 | A loop loses an accumulator | Refused, naming it |
 | A variable's type changes, records included | Refused, naming both types |
-| A variable moves to another loop, or to or from a transaction | Refused, naming where it went |
+| A variable moves to another loop, or to or from a transaction | Accepted; it seeds with the value it held and decides its new loop's positions from `0` |
+| A loop reads another source, a port change say | Accepted; same as above, and the port it left is released |
+| A variable moves to a loop over a fixed collection | Accepted; nothing is carried, since that fold is recomputed |
 
 An update is atomic with respect to requests: under concurrent load every request
 is answered by exactly one version, and the versions do not interleave.

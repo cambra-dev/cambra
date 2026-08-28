@@ -721,12 +721,10 @@ impl OpConversionContext {
                     out.push(StateConflict::Dropped { path: path.clone() });
                     continue;
                 };
-                if decl.domain != info.sequencing_domain {
-                    out.push(StateConflict::Moved {
-                        path: path.clone(),
-                        held: info.sequencing_domain.clone(),
-                        declared: decl.domain.clone(),
-                    });
+                // A variable the new version sequences by a fixed collection is
+                // recomputed rather than seeded, so nothing is carried into it and
+                // its type is its own business.
+                if !carries_state(&decl.domain) {
                     continue;
                 }
                 // A declared type the conversion context cannot resolve to an
@@ -2206,13 +2204,6 @@ fn carries_state(domain: &Type) -> bool {
 pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
     let mut out = HashMap::new();
     for v in mutable_variables(expr) {
-        // A variable over a fixed collection is recomputed, not carried, so it is
-        // not state a version has to be able to take over. Its identity is still
-        // numbered above, so removing one renumbers what follows exactly as
-        // removing any other would.
-        if !carries_state(&v.domain) {
-            continue;
-        }
         out.insert(
             v.path,
             DeclaredVariable {
@@ -2297,30 +2288,15 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
 /// A variable the running program is holding that a new version cannot take
 /// over.
 ///
-/// Three shapes. Two are about the *value* having nowhere to go; the third is
-/// about its *position* meaning nothing where it is going, which is a policy
-/// refusal rather than a constraint — see [`StateConflict::Moved`].
+/// Both shapes are about the *value* having nowhere to go. A variable whose
+/// recurrence now reads something else is not one of them: the value seeds and
+/// the position restarts, since a position only means something in the domain it
+/// was counted in.
 #[derive(Debug)]
 pub enum StateConflict {
     /// The new version does not declare it, so its value has nowhere to be
     /// seeded and would be discarded.
     Dropped { path: VarPath },
-    /// The new version sequences it by a different domain, so the position the
-    /// value was read at means nothing there.
-    ///
-    /// The *value* could still be seeded — a replacement whose space differs can
-    /// start at `0` and take the value forward, which is what a variable moving
-    /// between loops or into a transaction would want. Refusing rather than doing
-    /// that is a policy choice, not a constraint: a variable whose recurrence now
-    /// reads something else has a history that came from inputs the new one never
-    /// saw. `build_induction_store_single` asserts the domains agree by the time
-    /// it seeds, so relaxing this means deleting the refusal and letting the
-    /// replacement start at `0`.
-    Moved {
-        path: VarPath,
-        held: Type,
-        declared: Type,
-    },
     /// The new version declares it at a different type. Its value cannot be the
     /// seed of a store that expects another shape: the store would be built
     /// around a constant of the wrong extent and fail on its first pull.
@@ -2335,9 +2311,7 @@ impl StateConflict {
     /// The variable this is about, for naming it in a diagnostic.
     pub fn path(&self) -> &VarPath {
         match self {
-            StateConflict::Dropped { path }
-            | StateConflict::Moved { path, .. }
-            | StateConflict::Retyped { path, .. } => path,
+            StateConflict::Dropped { path } | StateConflict::Retyped { path, .. } => path,
         }
     }
 }
@@ -2427,14 +2401,14 @@ fn build_induction_store_single(
         // Rebuilding a store therefore changes what the loop does next without
         // discarding what it had accumulated, which is what distinguishes
         // swapping the logic from recomputing the program.
-        let carried = ctx.inherited.mutable_state.get(&paths[i]);
-        if let Some(carried) = carried {
-            debug_assert_eq!(
-                carried.domain, domain,
-                "{} resumes in a space its retired version never counted in; \
-`state_conflicts` refuses that before anything is built",
-                paths[i],
-            );
+        // A store sequenced by a fixed collection recomputes its whole fold, so
+        // it seeds from nothing however much its predecessor was holding.
+        let carried = ctx
+            .inherited
+            .mutable_state
+            .get(&paths[i])
+            .filter(|_| carries_state(&domain));
+        if let Some(carried) = carried.filter(|c| c.domain == domain) {
             // Every variable of one store carries that store's frontier, so any
             // of them answers for the store. They must agree: the seed tick and
             // the drive's window base both come from this, and the drive asserts
@@ -2550,9 +2524,12 @@ fn build_induction_store_single(
     };
 
     // `0` for a program's own store, and the retired store's frontier for one
-    // replacing a store in a running program. Both the store's seed tick and the
-    // drive's window base come from it. The source may still owe positions below
-    // this, which the drive holds without re-deciding.
+    // replacing a store over the same domain. A replacement sequenced by a
+    // *different* domain starts at `0` while still seeding its values: the
+    // positions it is about to decide are positions of a collection its
+    // predecessor never read, so none is decided twice and none is skipped. Both
+    // the store's seed tick and the drive's window base come from this. The source
+    // may still owe positions below it, which the drive holds without re-deciding.
     let resume_at = resume_at.unwrap_or(0);
     let store = InductionStore::new(
         init_ops,

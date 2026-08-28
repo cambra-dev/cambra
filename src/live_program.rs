@@ -190,11 +190,6 @@ impl LiveProgram {
                         StateConflict::Dropped { .. } => {
                             format!("{what} is no longer declared")
                         }
-                        StateConflict::Moved { held, declared, .. } => {
-                            format!(
-                                "{what} counted positions in {held} and now counts them in {declared}"
-                            )
-                        }
                         StateConflict::Retyped { held, declared, .. } => {
                             format!("{what} is now {declared} rather than {held}")
                         }
@@ -204,8 +199,7 @@ impl LiveProgram {
             lines.sort();
             return Err(vec![CompileError::Unsupported(format!(
                 "this version cannot take over state the running program is holding: {}. \
-A value carries forward only into the same variable, at the same type, counting \
-positions in the same place.",
+A value carries forward only into the same variable, at the same type.",
                 lines.join(", "),
             ))]);
         }
