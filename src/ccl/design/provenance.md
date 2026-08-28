@@ -199,9 +199,11 @@ one id, which surfaces at a boundary assert far from the site, if at all.
 Freshening removes the decision rather than answering it.
 
 `assert_unique_node_ids` enforces it at every phase boundary in `compile_program`
-— post-lowering, -inference, -inline, -transact, -letrec-run, -channelize,
+— post-lowering, -inference, -inline, -transact, -letrec, -channelize,
 -as-of-read, -lambda-elim, -planning — gated on `cfg!(any(debug_assertions,
-test))`. The two walks are `O(nodes)` per phase boundary, and a release compile
+test))`. Every boundary but post-lowering reaches it through `settle`, which
+carries the boundary's three post-conditions: unique ids, the debug dumps, and
+the consistency check the stage answers to. The two walks are `O(nodes)` per phase boundary, and a release compile
 runs neither them nor the fold's leak classes: `gate_leaks` carries the same
 `cfg`. The check is a tree invariant and encodes no phase order, so a reordered
 phase carries its check with it. It also means a phase is implicated only at a

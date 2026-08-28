@@ -1145,8 +1145,8 @@ impl ProvenanceAudit {
 /// definition the program never exercises at a concrete type (see
 /// `Type::Infer`'s invariant). That residue is an *ambiguous program* — a user
 /// error — so it is rendered as a diagnostic; anything else panics, naming
-/// `produced_by`.
-fn pre_channelize_wall(expr: &Expr, produced_by: &str) -> Result<(), Vec<CompileError>> {
+/// `boundary`.
+fn pre_channelize_wall(expr: &Expr, boundary: &str) -> Result<(), Vec<CompileError>> {
     check_pre_channelize(expr).map_err(|errs| {
         if errs
             .iter()
@@ -1154,9 +1154,48 @@ fn pre_channelize_wall(expr: &Expr, produced_by: &str) -> Result<(), Vec<Compile
         {
             errs.into_compile_errors()
         } else {
-            panic!("{produced_by} created invalid expr: {errs:?}")
+            panic!("{boundary} produced an invalid tree: {errs:?}")
         }
     })
+}
+
+/// Which consistency check a phase's output answers to.
+///
+/// The three differ in what they tolerate, not in how they run. The mutability
+/// phases still carry `Defer`/`Feed` nodes and the transient `Feed` /
+/// channel-domain types only channelization erases, so they answer to
+/// `check_pre_channelize`; everything from channelization on answers to the
+/// strict [`typecheck`].
+enum Check {
+    /// [`pre_channelize_wall`]: the relaxed check, with a residual `Type::Infer`
+    /// reported as an ambiguous program. The two boundaries that can still carry
+    /// one are inference's own output and the inlining that copies it.
+    PreChannelizeReportingAmbiguity,
+    /// `check_pre_channelize`. A failure is a compiler bug.
+    PreChannelize,
+    /// [`typecheck`]. A failure is a compiler bug.
+    Typed,
+}
+
+/// A phase boundary's post-conditions: ids unique, output dumped, tree valid for
+/// the stage.
+///
+/// None of the three is type-enforced, and each fails silently in its own way. A
+/// duplicated id collapses two nodes' provenance into one entry; a tree that
+/// misses its check reaches the next phase to be mis-read there rather than
+/// rejected here. `boundary` names the phase in whichever message fires, and is
+/// the name the panes and the `assert_unique_node_ids` messages already use.
+fn settle(ir: &Expr, boundary: &str, check: Check) -> Result<(), Vec<CompileError>> {
+    assert_unique_node_ids(ir, boundary);
+    debug!("{boundary} CCL:\n{}", symbolic(ir));
+    debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
+    let outcome = match check {
+        Check::PreChannelizeReportingAmbiguity => return pre_channelize_wall(ir, boundary),
+        Check::PreChannelize => check_pre_channelize(ir),
+        Check::Typed => typecheck(ir),
+    };
+    outcome.unwrap_or_else(|errs| panic!("{boundary} produced an invalid tree: {errs:?}"));
+    Ok(())
 }
 
 /// The two user-facing mutability rules, checked on the fully-typed,
@@ -1459,17 +1498,14 @@ fn run_passes(
             })
             .collect());
     }
-    debug!("Inferred:\n{}", symbolic(&expr));
-    debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
-    // Consistency wall between `infer` and `channelize`. It is the relaxed
-    // *pre-channelize* check (`check_pre_channelize`), which permits the transient
-    // `Feed` / `Infer`-channel-domain types only channelize can erase. A failure
-    // here is a compiler bug — with one exception: residual `Type::Infer`
-    // variables, which inference deliberately tolerates for a generalized
-    // definition the program never exercises at a concrete type (see
-    // `Type::Infer`'s invariant). That residue is an *ambiguous program* — a
-    // user error — so it is rendered as a diagnostic; anything else panics.
-    pre_channelize_wall(&expr, "Inference")?;
+    // Inference mints predicates (`lit_singleton`) and clones a definition per
+    // instantiation (`specialize_use`), so its output is checked before the pane
+    // below is taken off it.
+    settle(
+        &expr,
+        "post-inference",
+        Check::PreChannelizeReportingAmbiguity,
+    )?;
 
     // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
     // "No aliasing: `Mut` values are second-class (downward-only)") on the
@@ -1499,11 +1535,6 @@ fn run_passes(
     // beta-reduction) and preserves defer-returning generators, so the
     // post-inline wall is the relaxed `check_pre_channelize`, not strict
     // `typecheck`.
-    // Inference mints predicates (`lit_singleton`) and clones a definition per
-    // instantiation (`specialize_use`), so its output is checked before the pane
-    // is taken off it.
-    assert_unique_node_ids(&expr, "post-inference");
-
     // Retain the post-inference IR for the inspector before `inline` consumes
     // `expr`. This is the source-shaped, fully-typed anchor (lambdas intact, not
     // yet point-free; inline/transact/letrec/channelize/lambda_elim/planning have
@@ -1536,9 +1567,7 @@ fn run_passes(
     expr = recorded(capture_provenance, Phase::Inline, || {
         inline::inline_capability_lambdas(expr)
     });
-    assert_unique_node_ids(&expr, "post-inline");
-    debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
-    pre_channelize_wall(&expr, "UDF inlining")?;
+    settle(&expr, "post-inline", Check::PreChannelizeReportingAmbiguity)?;
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -1569,9 +1598,7 @@ fn run_passes(
         transact_phase::run(expr, &txn_mut_vars)
     })
     .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    assert_unique_node_ids(&expr, "post-transact");
-    debug!("Transact phase CCL:\n{}", symbolic(&expr));
-    check_pre_channelize(&expr).expect("transact phase produced an inconsistent tree");
+    settle(&expr, "post-transact", Check::PreChannelize)?;
     if at_phase_output(Phase::Transact, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -1589,10 +1616,8 @@ fn run_passes(
     let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);
     let phase_out = recorded(capture_provenance, Phase::Letrec, || mut_elim::run(expr));
     audit_mutelim.finish(&phase_out);
-    assert_unique_node_ids(&phase_out, "post-letrec-run");
+    settle(&phase_out, "post-letrec", Check::PreChannelize)?;
     audit_letrec.finish(&phase_out);
-    debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
-    check_pre_channelize(&phase_out).expect("letrec phase produced an inconsistent tree");
     if at_phase_output(Phase::Letrec, &phase_out, stop, capture, panes) {
         return Ok(phase_out);
     }
@@ -1611,9 +1636,7 @@ fn run_passes(
         channelize::run(phase_out)
     })
     .errs()?;
-    assert_unique_node_ids(&channelized, "post-channelize");
-    debug!("Channelized:\n{}", symbolic(&channelized));
-    typecheck(&channelized).expect("channelize produced an ill-typed tree");
+    settle(&channelized, "post-channelize", Check::Typed)?;
 
     // Retain the post-channelize tree for the inspector's downstream pane. On the
     // post-inference channelize order this snapshot is *downstream* of
@@ -1635,8 +1658,7 @@ fn run_passes(
         transact_phase::rewrite_as_of_reads(&mut channelized)
     })
     .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    assert_unique_node_ids(&channelized, "post-as-of-read");
-    typecheck(&channelized).expect("as-of-read rewrite produced an ill-typed tree");
+    settle(&channelized, "post-as-of-read", Check::Typed)?;
     if at_phase_output(Phase::AsOfRead, &channelized, stop, capture, panes) {
         return Ok(channelized);
     }
@@ -1645,13 +1667,9 @@ fn run_passes(
         lambda_elim::run(channelized)
     })
     .errs()?;
-    assert_unique_node_ids(&lambda_elim, "post-lambda-elim");
-    debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
-    debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
-
-    // `typecheck` enforces hole-freeness as its first phase, so this call
-    // alone covers both checks.
-    typecheck(&lambda_elim).expect("type error after lambda elimination");
+    // `typecheck` enforces hole-freeness as its first phase, so the check here
+    // covers both.
+    settle(&lambda_elim, "post-lambda-elim", Check::Typed)?;
     if at_phase_output(Phase::LambdaElim, &lambda_elim, stop, capture, panes) {
         return Ok(lambda_elim);
     }
@@ -1675,14 +1693,6 @@ fn run_passes(
     });
     // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
     audit.finish(&join_planned);
-    assert_unique_node_ids(&join_planned, "post-planning");
-    debug!(
-        "Join-planned CCL:\n{} : {}",
-        symbolic(&join_planned),
-        join_planned.ty
-    );
-    debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
-
     // Planning is the one phase that introduces `iterate` / `restrict` /
     // `Compose` staging, so re-checking its output catches a malformed tile
     // graph an adjacency that doesn't chain would otherwise hide. Planning
@@ -1691,7 +1701,7 @@ fn run_passes(
     // matches the fresh refinements it mints by structural predicate
     // equality, so the staging shapes now validate without re-blinding the
     // check or peeling cast refinements.
-    typecheck(&join_planned).expect("type error after join planning");
+    settle(&join_planned, "post-planning", Check::Typed)?;
 
     // Invariant (debug): planning's `iterate`/`restrict` markers live in the
     // term tree, never inside a type's refinement predicates — the substitution
