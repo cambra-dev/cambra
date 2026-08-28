@@ -1276,8 +1276,14 @@ where
         // each ordinary assignment, and each expression statement — parses its
         // leading `bare_tuple` twice, once here and once in `simple_stmt`. Error
         // quality is unaffected: the furthest-progress alternative wins.
-        let block_value =
-            choice((if_stmt.clone(), match_stmt.clone())).map(|stmt: Spanned<Stmt>| {
+        // The block opened a layout level of its own for its `elif`/`else`
+        // chain (`lexer.rs`, `Level::Pending`), and that level closes with a
+        // `Dedent` no block inside the chain claims. Consuming it here ends the
+        // statement, and it is what a chain written at the statement's own
+        // column fails on: that spelling leaves the `Dedent` unmatched.
+        let block_value = choice((if_stmt.clone(), match_stmt.clone()))
+            .then_ignore(just(Token::Dedent))
+            .map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
                 Spanned::new(span, Expr::Block(Box::new(stmt)))
             });
@@ -2326,6 +2332,25 @@ mod tests {
         }
     }
 
+    /// A chain at the statement's own column ends the assignment rather than
+    /// continuing its block, so the `else` is left with no `if` to attach to.
+    /// The block right-hand side's own level is what makes the two spellings
+    /// different token streams (`lexer.rs`, `Level::Pending`).
+    #[test]
+    fn a_chain_at_the_statement_column_is_rejected() {
+        let result = parse_module(indoc! {"
+            x = if c:
+                1
+            else:
+                2
+            x
+        "});
+        assert!(
+            !result.errors.is_empty(),
+            "expected the statement-column chain to be rejected"
+        );
+    }
+
     /// `x = if c: … else: …` and `x = match v: …` — a block statement on the
     /// right of an assignment, wrapped in the same [`Expr::Block`] the one-line
     /// form uses.
@@ -2333,9 +2358,9 @@ mod tests {
     fn block_statement_on_the_right_of_an_assignment() {
         let m = parse_m(indoc! {"
             x = if c:
-                1
-            else:
-                2
+                    1
+                else:
+                    2
             x
         "});
         let Stmt::Assign { value, .. } = &m.body[0].node else {
@@ -2362,9 +2387,9 @@ mod tests {
         for op in ["=", ": Int =", ":=", ": Int :=", "+=", "<<="] {
             let src = formatdoc! {"
                 x {op} if c:
-                    1
-                else:
-                    2
+                        1
+                    else:
+                        2
                 x"};
             let result = parse_module(&src);
             assert!(

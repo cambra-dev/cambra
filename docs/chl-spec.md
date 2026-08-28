@@ -1313,11 +1313,11 @@ that block's value — its last statement's, by the rule in §4.5:
 
 ```python
 label = if score > 90:
-    "high"
-elif score > 50:
-    "mid"
-else:
-    "low"
+        "high"
+    elif score > 50:
+        "mid"
+    else:
+        "low"
 
 n = match msg:
     case `ping(seq):
@@ -1326,9 +1326,15 @@ n = match msg:
         0
 ```
 
-The block belongs to the statement, so `elif` and `else` return to the
-statement's own column; the `if` keyword's column, further right, is not an
-indentation level.
+**A block on the right indents one level in from its statement**, and its
+branch bodies one level further. `elif` and `else` return to that first level,
+never to the statement's own column — a chain written there ends the assignment
+instead of continuing it, and is rejected. A `match` needs no rule of its own:
+its `case` arms already sit one level in and their bodies one level further.
+
+Which columns those are is the writer's choice, as everywhere else in the
+layout: the requirement is that the chain indent past the statement and the
+bodies past the chain.
 
 The block's DEDENT ends the statement, so nothing follows it on the line. Every
 branch must produce a value, and an `if` with no `else` is rejected (§4.5); a
@@ -1342,10 +1348,10 @@ assignment takes, so the update would reach nothing:
 ```python
 acc := 0
 t = if c:
-    acc += 1        # rejected: the update is discarded
-    0
-else:
-    0
+        acc += 1        # rejected: the update is discarded
+        0
+    else:
+        0
 ```
 
 Write `acc` from a statement `if` beside the assignment, or bind the block's

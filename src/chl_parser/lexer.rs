@@ -376,13 +376,55 @@ impl LexError {
     }
 }
 
+/// One entry of the layout stack: a column a line returns to in order to
+/// continue the block that opened it.
+///
+/// A block whose header starts its own line takes that line's column, known
+/// when the block opens — `elif` returns to the `if`'s column, already on the
+/// stack as the enclosing level. A block standing on the right of an assignment
+/// has no column of its own, because its header sits mid-line, so it opens a
+/// level whose column the first continuation line supplies: any column past
+/// `min` pins it. That is what makes `elif` and `else` indent one level in from
+/// the statement and the branch bodies one level further
+/// (`docs/chl-spec.md`, "4.3 Assignment forms").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Level {
+    /// A line must match this column exactly to continue the block.
+    Fixed(usize),
+    /// A block right-hand side's level, before a continuation line has fixed
+    /// its column. `min` is the column of the statement that opened it.
+    Pending { min: usize },
+}
+
+impl Level {
+    /// The column a line must exceed to open a block under this level.
+    fn floor(self) -> usize {
+        match self {
+            Level::Fixed(c) => c,
+            Level::Pending { min } => min,
+        }
+    }
+
+    /// Whether a line at `indent` closes this level. An unpinned level closes
+    /// only at or below the statement that opened it: every column above that
+    /// is a continuation it can still take.
+    fn closes_at(self, indent: usize) -> bool {
+        match self {
+            Level::Fixed(c) => c > indent,
+            Level::Pending { min } => min >= indent,
+        }
+    }
+}
+
 /// Tokenise `source` into a layout-resolved token stream.
 ///
 /// Caller-visible invariants of the returned stream:
 /// - Always ends with a `Newline` followed by zero or more `Dedent`s back to
 ///   indent zero, so block-closing rules in the parser have a uniform exit.
-/// - `Indent` and `Dedent` are balanced (every `Indent` has a matching
-///   `Dedent` later in the stream).
+/// - `Indent` and `Dedent` are balanced, except that a block standing on the
+///   right of an assignment closes with one `Dedent` more — the level it opened
+///   for its `elif`/`else` chain, which never had a line of its own to indent
+///   on. `block_value` in the parser consumes that one.
 /// - No `Newline` appears between a `LParen`/`LBracket`/`LBrace` and its
 ///   matching closer.
 pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
@@ -399,9 +441,16 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
 
     // Phase 2: apply the off-side rule.
     let mut out: Vec<(Token, Span)> = Vec::new();
-    let mut indent_stack: Vec<usize> = vec![0];
+    let mut indent_stack: Vec<Level> = vec![Level::Fixed(0)];
     let mut bracket_depth: usize = 0;
     let mut at_line_start = true;
+    // Set when the line just closed opened a block from somewhere other than
+    // its first token — an assignment's block right-hand side. Carries the
+    // statement's own column, the floor for the level that block opens.
+    let mut block_value_open: Option<usize> = None;
+    // Whether the current line's first token is a block keyword, which is what
+    // separates a block that starts its line from one that does not.
+    let mut line_opens_at_first_token = false;
 
     for (tok, span) in &raw {
         // Blank lines and comment-only lines: their only token is `Newline`,
@@ -413,19 +462,44 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
         if at_line_start && bracket_depth == 0 {
             let line_start = source[..span.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let indent = span.start - line_start;
-            let current = *indent_stack.last().expect("stack invariant: non-empty");
+            if let Some(min) = block_value_open.take() {
+                indent_stack.push(Level::Pending { min });
+            }
+            let current = indent_stack
+                .last()
+                .expect("stack invariant: non-empty")
+                .floor();
             if indent > current {
-                indent_stack.push(indent);
+                indent_stack.push(Level::Fixed(indent));
                 out.push((Token::Indent, Span::new(line_start, span.start)));
             } else {
-                while *indent_stack.last().expect("stack invariant: non-empty") > indent {
+                while indent_stack
+                    .last()
+                    .expect("stack invariant: non-empty")
+                    .closes_at(indent)
+                {
                     indent_stack.pop();
                     out.push((Token::Dedent, Span::new(span.start, span.start)));
                 }
-                if *indent_stack.last().expect("stack invariant: non-empty") != indent {
-                    return Err(LexError::InconsistentIndent { span: *span });
+                match indent_stack.last_mut().expect("stack invariant: non-empty") {
+                    Level::Fixed(c) if *c == indent => {}
+                    // The first line to land in a block right-hand side's level
+                    // fixes its column for the rest of the chain.
+                    slot @ Level::Pending { .. } => *slot = Level::Fixed(indent),
+                    Level::Fixed(_) => return Err(LexError::InconsistentIndent { span: *span }),
                 }
             }
+            line_opens_at_first_token = matches!(
+                tok,
+                Token::If
+                    | Token::Elif
+                    | Token::Else
+                    | Token::For
+                    | Token::Def
+                    | Token::With
+                    | Token::Match
+                    | Token::Case
+            );
         }
         at_line_start = false;
 
@@ -442,6 +516,15 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
             }
             Token::Newline => {
                 if bracket_depth == 0 {
+                    // A `:` last on the line opens a block. Where the line did
+                    // not start with the keyword that opened it, the block is
+                    // an assignment's right-hand side and continues at a column
+                    // of its own rather than at the statement's.
+                    if matches!(out.last(), Some((Token::Colon, _))) && !line_opens_at_first_token {
+                        let ls = source[..span.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let line = &source[ls..span.start];
+                        block_value_open = Some(line.len() - line.trim_start().len());
+                    }
                     out.push((tok.clone(), *span));
                     at_line_start = true;
                 }
@@ -475,6 +558,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
 
     /// Strip spans for assertion brevity; spans are exercised separately.
     fn tokens(src: &str) -> Vec<Token> {
@@ -626,6 +710,99 @@ mod tests {
                 Token::Dedent,
             ]
         );
+    }
+
+    /// A block on the right of an assignment opens a level of its own, which
+    /// the `elif` line fixes. The chain's `Dedent`s therefore outnumber its
+    /// `Indent`s by one — the level no line indented onto.
+    #[test]
+    fn block_right_hand_side_opens_a_level_of_its_own() {
+        let src = indoc! {"
+            x = if c:
+                    1
+                elif d:
+                    2
+                else:
+                    3
+            y
+        "};
+        let toks = tokens(src);
+        let indents = toks.iter().filter(|t| **t == Token::Indent).count();
+        let dedents = toks.iter().filter(|t| **t == Token::Dedent).count();
+        assert_eq!((indents, dedents), (3, 4));
+    }
+
+    /// A block whose header starts its own line takes that line's column, so a
+    /// statement `if` is unaffected: its `Indent`s and `Dedent`s stay balanced.
+    #[test]
+    fn a_statement_if_opens_no_extra_level() {
+        let src = indoc! {"
+            if c:
+                1
+            else:
+                2
+        "};
+        let toks = tokens(src);
+        let indents = toks.iter().filter(|t| **t == Token::Indent).count();
+        let dedents = toks.iter().filter(|t| **t == Token::Dedent).count();
+        assert_eq!((indents, dedents), (2, 2));
+    }
+
+    /// The chain's column is the writer's, like every other indentation here:
+    /// any column past the statement's works, and the first continuation line
+    /// fixes it for the rest of the chain.
+    #[test]
+    fn the_chain_column_is_fixed_by_its_first_line() {
+        let wide = indoc! {"
+            x = if c:
+                          1
+              else:
+                          2
+            y
+        "};
+        assert_eq!(
+            tokens(wide),
+            tokens(indoc! {"
+                x = if c:
+                        1
+                    else:
+                        2
+                y
+            "})
+        );
+        // A later continuation at a different column no longer fits.
+        assert!(matches!(
+            tokenize(indoc! {"
+                x = if c:
+                        1
+                    elif d:
+                        2
+                  else:
+                        3
+                y
+            "}),
+            Err(LexError::InconsistentIndent { .. })
+        ));
+    }
+
+    /// A `match` on the right needs no level of its own to be pinned: its arms
+    /// are the block's body, so nothing dedents between the statement and them.
+    /// The level it opens still closes, which is what keeps the extra `Dedent`
+    /// uniform across the two block right-hand sides.
+    #[test]
+    fn a_match_right_hand_side_closes_its_level_unpinned() {
+        let src = indoc! {"
+            n = match m:
+                case `a(v):
+                    v
+                case `b:
+                    0
+            y
+        "};
+        let toks = tokens(src);
+        let indents = toks.iter().filter(|t| **t == Token::Indent).count();
+        let dedents = toks.iter().filter(|t| **t == Token::Dedent).count();
+        assert_eq!((indents, dedents), (3, 4));
     }
 
     #[test]

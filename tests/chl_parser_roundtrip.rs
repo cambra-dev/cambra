@@ -491,6 +491,24 @@ fn nested_block_recovery_reports_one_error_per_mistake() {
                 z = 2
             "},
         ),
+        // A block right-hand side closes with one `Dedent` more than the
+        // blocks inside it opened (`lexer.rs`, `Level::Pending`), which the
+        // statement-level recovery's `nested_delimiters` skip has to survive:
+        // it pairs `Indent` with `Dedent` to swallow a broken header's body.
+        (
+            "block right-hand side beside a broken header",
+            indoc! {"
+                def f():
+                    x = if c:
+                            1
+                        else:
+                            2
+                    def 1(y):
+                        body
+                    after
+                z = 2
+            "},
+        ),
     ];
     for (name, src) in cases {
         let r = parse_module(src);

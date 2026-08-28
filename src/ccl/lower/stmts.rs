@@ -2066,9 +2066,9 @@ x";
     #[case(
         indoc! {"
             x = if c:
-                1
-            else:
-                2
+                    1
+                else:
+                    2
             x"},
         indoc! {"
             let x = { c → 1; true → 2 }
@@ -2078,11 +2078,11 @@ x";
     #[case(
         indoc! {"
             x = if a:
-                1
-            elif b:
-                2
-            else:
-                3
+                    1
+                elif b:
+                    2
+                else:
+                    3
             x"},
         indoc! {"
             let x = { a → 1; b → 2; true → 3 }
@@ -2092,10 +2092,10 @@ x";
     #[case(
         indoc! {"
             x = if c:
-                a = 1
-                a + 1
-            else:
-                2
+                    a = 1
+                    a + 1
+                else:
+                    2
             x"},
         indoc! {"
             let x = { c → let a = 1
@@ -2157,9 +2157,9 @@ x";
         assert_eq!(
             lower(indoc! {"
                 x = if c:
-                    1
-                else:
-                    2
+                        1
+                    else:
+                        2
                 x"}),
             lower(indoc! {"
                 x = 1 if c else 2
@@ -2177,11 +2177,11 @@ x";
         let stmts = parse_module(indoc! {"
             acc := 0
             x = if c:
-                for i in [1, 2]:
-                    acc += i
-                acc
-            else:
-                0
+                    for i in [1, 2]:
+                        acc += i
+                    acc
+                else:
+                    0
             x"});
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message, .. } = &err;
@@ -2198,12 +2198,12 @@ x";
     fn test_block_right_hand_side_writes_its_own_mutable() {
         let stmts = parse_module(indoc! {"
             x = if c:
-                s := 0
-                for i in [1, 2]:
-                    s += i
-                s
-            else:
-                0
+                    s := 0
+                    for i in [1, 2]:
+                        s += i
+                    s
+                else:
+                    0
             x"});
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2221,7 +2221,7 @@ x";
     fn test_block_right_hand_side_without_else_rejected() {
         let stmts = parse_module(indoc! {"
             x = if c:
-                1
+                    1
             x"});
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message, .. } = &err;

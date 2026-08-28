@@ -154,9 +154,9 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 1
         x = if a == 1:
-            100
-        else:
-            200
+                100
+            else:
+                200
         x"},
     Value::Int(100)
 )]
@@ -166,11 +166,11 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 5
         x = if a > 10:
-            1
-        elif a > 3:
-            2
-        else:
-            3
+                1
+            elif a > 3:
+                2
+            else:
+                3
         x"},
     Value::Int(2)
 )]
@@ -179,10 +179,10 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 4
         x = if a > 3:
-            d = a * 2
-            d + 1
-        else:
-            0
+                d = a * 2
+                d + 1
+            else:
+                0
         x"},
     Value::Int(9)
 )]
@@ -192,9 +192,9 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 2
         x = if a == 2:
-            10
-        else:
-            20
+                10
+            else:
+                20
         x + 5"},
     Value::Int(15)
 )]
@@ -214,11 +214,11 @@ fn test_block_if_chain_aligns_with_the_statement() {
         indoc! {r#"
             score = 95
             label = if score > 90:
-                "high"
-            elif score > 50:
-                "mid"
-            else:
-                "low"
+                    "high"
+                elif score > 50:
+                    "mid"
+                else:
+                    "low"
             label"#},
         Value::String("high".into()),
     );
