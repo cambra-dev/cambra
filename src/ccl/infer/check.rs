@@ -143,6 +143,7 @@ impl Typing for CheckCtx {
     fn require_trait(
         &mut self,
         trait_: Trait,
+        _operator_node_id: NodeId,
         operand_types: &[&Type],
         operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
@@ -436,6 +437,7 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
 /// recorded `Type`.
 fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
     let label = symbolic(expr);
+    let node_id = expr.node_id();
     // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
@@ -477,17 +479,17 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(left, right, &sig, ctx)?
+            emit_binop(node_id, left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(inner, &sig, ctx)?
+            emit_unary(inner, node_id, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {
             let scheme = ctx.schemes.aggregate(*kind).clone();
-            emit_aggregate(input, &scheme, *kind, ctx)?
+            emit_aggregate(input, node_id, &scheme, *kind, ctx)?
         }
 
         // Check never generalizes (`is_generalizable` is `false`), so every

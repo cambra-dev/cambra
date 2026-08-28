@@ -76,7 +76,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name,
-    Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr,
+    Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr, provenance,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -377,6 +377,9 @@ pub struct TraitObligation {
     /// The input arguments' actual expressions, to be substituted
     /// into the output type if it has a refinement template.
     input_exprs: Vec<TypedExpr>,
+    /// The ID of the operator node that spawned this obligation, to
+    /// be used as provenance for any resulting refinement body.
+    operator_node_id: provenance::NodeId,
 }
 
 /// One associated position of an obligation: the name, the type standing in for it,
@@ -398,6 +401,7 @@ impl TraitObligation {
     pub fn new(
         trait_: Trait,
         assoc: Vec<(Assoc, Type)>,
+        operator_node_id: provenance::NodeId,
         input_exprs: Vec<TypedExpr>,
     ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
@@ -413,6 +417,7 @@ impl TraitObligation {
                 })
                 .collect(),
             input_exprs,
+            operator_node_id,
         })
     }
 
@@ -432,7 +437,7 @@ impl TraitObligation {
     pub(super) fn new_from(original: &Rc<TraitObligation>) -> Rc<TraitObligation> {
         // We need a provenance recording here for the cloning of
         // input_exprs into the new obligation.
-        let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation");
+        let _f = provenance::copy_frame("infer.freshen_obligation");
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_: original.trait_,
@@ -447,6 +452,7 @@ impl TraitObligation {
                 })
                 .collect(),
             input_exprs: original.input_exprs.clone(),
+            operator_node_id: original.operator_node_id,
         })
     }
 
@@ -579,6 +585,11 @@ impl TraitObligation {
                 continue;
             };
             position.deposited.set(true);
+            let _f = provenance::enter(
+                self.operator_node_id,
+                "infer.try_deposit",
+                provenance::Nature::Machinery,
+            );
             let target = position.ty.borrow().clone();
             let ty_base = Type::Base(settled);
             let ty = match maybe_refinement {
@@ -1469,10 +1480,12 @@ mod tests {
     #[case(&[(0, BaseType::Int), (1, BaseType::Int)])]
     #[case(&[(1, BaseType::Int), (0, BaseType::Int)])]
     fn narrowing_is_order_independent(#[case] steps: &[(u8, BaseType)]) {
+        let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
         let ob = TraitObligation::new(
             Trait::Addable,
             vec![(Assoc::Output, out.clone())],
+            node_id,
             operands(),
         );
         let mut cache = ConstrainCache::new();
@@ -1499,10 +1512,12 @@ mod tests {
     /// operand, which stays open for a future heterogeneous instance.
     #[test]
     fn one_known_operand_settles_an_agreed_output() {
+        let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
         let ob = TraitObligation::new(
             Trait::Addable,
             vec![(Assoc::Output, out.clone())],
+            node_id,
             operands(),
         );
         let mut cache = ConstrainCache::new();
@@ -1528,8 +1543,14 @@ mod tests {
     #[test]
     fn only_the_refining_addition_carries_a_predicate() {
         let deposited = |trait_| {
+            let node_id = provenance::NodeId::fresh();
             let out = fresh_var(0);
-            let ob = TraitObligation::new(trait_, vec![(Assoc::Output, out.clone())], operands());
+            let ob = TraitObligation::new(
+                trait_,
+                vec![(Assoc::Output, out.clone())],
+                node_id,
+                operands(),
+            );
             ob.narrow(0, &BaseType::Int, &mut ConstrainCache::new())
                 .expect("Int adds to Int under either trait");
             let Type::Infer(v) = &out else { unreachable!() };
@@ -1557,7 +1578,8 @@ mod tests {
     /// not just here.
     #[test]
     fn a_comparison_associates_nothing() {
-        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), operands());
+        let node_id = provenance::NodeId::fresh();
+        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
         let mut cache = ConstrainCache::new();
 
         ob.try_deposit(&mut cache).expect("nothing to deposit");
@@ -1576,8 +1598,14 @@ mod tests {
     /// says what the position could still have taken.
     #[test]
     fn incompatible_operands_have_no_instance() {
+        let node_id = provenance::NodeId::fresh();
         let out = fresh_var(0);
-        let ob = TraitObligation::new(Trait::Orderable, vec![(Assoc::Output, out)], operands());
+        let ob = TraitObligation::new(
+            Trait::Orderable,
+            vec![(Assoc::Output, out)],
+            node_id,
+            operands(),
+        );
         let mut cache = ConstrainCache::new();
 
         ob.narrow(0, &BaseType::Int, &mut cache)

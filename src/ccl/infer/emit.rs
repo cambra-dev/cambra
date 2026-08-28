@@ -10,6 +10,7 @@ use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
@@ -128,17 +129,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // are `Rc`-shaped, so the clone is cheap.
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(left, right, &sig, ctx)?
+            emit_binop(node_id, left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(inner, &sig, ctx)?
+            emit_unary(inner, node_id, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {
             let scheme = ctx.schemes.aggregate(*kind).clone();
-            emit_aggregate(input, &scheme, *kind, ctx)?
+            emit_aggregate(input, node_id, &scheme, *kind, ctx)?
         }
 
         TypedExprNode::Let {
@@ -853,6 +854,7 @@ pub(super) fn emit_apply<C: Typing>(
 fn require_single_obligation<C: Typing>(
     ctx: &mut C,
     trait_: Trait,
+    operator_node_id: NodeId,
     operand_types: &[&Type],
     operand_exprs: &[&Expr],
     result: &OperatorResult,
@@ -860,11 +862,25 @@ fn require_single_obligation<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     match result {
         OperatorResult::Associated(name) => {
-            let ty = ctx.require_trait(trait_, operand_types, operand_exprs, Some(*name), at)?;
+            let ty = ctx.require_trait(
+                trait_,
+                operator_node_id,
+                operand_types,
+                operand_exprs,
+                Some(*name),
+                at,
+            )?;
             Ok(ty.expect("an operator asking for an association gets its position back"))
         }
         OperatorResult::Fixed(base) => {
-            ctx.require_trait(trait_, operand_types, operand_exprs, None, at)?;
+            ctx.require_trait(
+                trait_,
+                operator_node_id,
+                operand_types,
+                operand_exprs,
+                None,
+                at,
+            )?;
             Ok(Type::Base(base.clone()))
         }
     }
@@ -906,6 +922,7 @@ fn parameter_type<'t>(function: &'t Expr, fn_ty: &'t Type) -> Option<&'t Type> {
 }
 
 pub(super) fn emit_binop<C: Typing>(
+    operator_node_id: NodeId,
     left: &mut Expr,
     right: &mut Expr,
     sig: &OpSignature,
@@ -919,6 +936,7 @@ pub(super) fn emit_binop<C: Typing>(
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
             *trait_,
+            operator_node_id,
             &[&left_ty, &right_ty],
             &[left, right],
             result,
@@ -929,6 +947,7 @@ pub(super) fn emit_binop<C: Typing>(
 
 pub(super) fn emit_unary<C: Typing>(
     inner: &mut Expr,
+    operator_node_id: NodeId,
     sig: &OpSignature,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
@@ -936,9 +955,15 @@ pub(super) fn emit_unary<C: Typing>(
     let at = || "UnaryOp".to_string();
     match sig {
         OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
-        OpSignature::SingleObligation { trait_, result } => {
-            require_single_obligation(ctx, *trait_, &[&inner_ty], &[inner], result, &at)
-        }
+        OpSignature::SingleObligation { trait_, result } => require_single_obligation(
+            ctx,
+            *trait_,
+            operator_node_id,
+            &[&inner_ty],
+            &[inner],
+            result,
+            &at,
+        ),
     }
 }
 
@@ -1257,6 +1282,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
 /// its codomain.
 pub(super) fn emit_aggregate<C: Typing>(
     input: &mut Expr,
+    operator_node_id: NodeId,
     scheme: &PolyScheme,
     kind: AggregateKind,
     ctx: &mut C,
@@ -1269,7 +1295,14 @@ pub(super) fn emit_aggregate<C: Typing>(
     // is a pure requirement — `Comparable` associates nothing, and the result type
     // stays the scheme's.
     if kind == AggregateKind::Max {
-        ctx.require_trait(Trait::Comparable, &[&result], &[input], None, &at)?;
+        ctx.require_trait(
+            Trait::Comparable,
+            operator_node_id,
+            &[&result],
+            &[input],
+            None,
+            &at,
+        )?;
     }
     Ok(result)
 }

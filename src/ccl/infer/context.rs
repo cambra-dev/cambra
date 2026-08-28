@@ -371,6 +371,7 @@ impl Typing for InferCtx {
     fn require_trait(
         &mut self,
         trait_: Trait,
+        operator_node_id: NodeId,
         operand_types: &[&Type],
         operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
@@ -402,6 +403,7 @@ impl Typing for InferCtx {
         let obligation = TraitObligation::new(
             trait_,
             wanted.clone().into_iter().collect(),
+            operator_node_id,
             operand_exprs.iter().map(|e| (*e).clone()).collect(),
         );
         for (i, position) in positions.iter().enumerate() {
