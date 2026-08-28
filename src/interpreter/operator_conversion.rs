@@ -640,8 +640,14 @@ impl OpConversionContext {
     /// the fan-out and [`Memo`] a binding compiles to are what let several uses
     /// draw on one operator, and a new version's use is just one more. A late
     /// branch does not re-subscribe upstream — it pulls the same `MemoProducer`,
-    /// whose cache is cumulative — so a reused operator hands the new version
-    /// everything it has accumulated.
+    /// so a reused operator hands the new version whatever it still holds.
+    ///
+    /// *Whatever it still holds*, not everything it ever produced: a `Memo` drops
+    /// what its consumers release, so what a new version inherits is bounded by
+    /// what the retired one had finished with. The new subscriber is told as much
+    /// — its release guard starts at what the fan-out has already released — and a
+    /// binding released in full is not offered at all
+    /// ([`FanOut::released_in_full`]).
     ///
     /// Reuse is declined for a binding compiled under an iteration
     /// ([`BindingKind::Aligned`]). Such an operator is parameterized by the

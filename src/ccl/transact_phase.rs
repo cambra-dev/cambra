@@ -2177,7 +2177,7 @@ fn proj_item(item: &Expr, item_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 }
 
 /// The writer source extended to carry each cross-read accumulator at its request
-/// position: `λ x → (source(x), acc0-view(x), …) : dom ⇒ (item, v0, …)`.
+/// position: `λ x → (source(x), acc-view(x), …) : dom ⇒ (item, v0, …)`.
 /// `lambda_elim` point-frees it to a `zip`; recognition lifts it verbatim as the
 /// writer source, and op-conversion (`build_commit_store`) destructures the `zip`
 /// to co-iterate the accumulator streams alongside the loop source.

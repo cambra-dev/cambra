@@ -231,8 +231,8 @@ Replacing a graph while sharing operators with it requires knowing which
 subscriptions are still real. Three registrations answer that the same way: the
 subscriber owns its side, and the registry holds a weak reference.
 
-- **Fan-out branches.** `FanOutShared::subscribers` holds a `Weak<()>` per slot
-  whose strong side lives in the `FanOutProducer` that slot handed out. A slot
+- **Fan-out branches.** `FanOutShared::subscribers` holds a weak reference per
+  slot whose strong side lives in the `FanOutProducer` that slot handed out. A slot
   whose producer is gone is skipped when notifying and when intersecting release
   guards. Skipping matters: the guards are intersected before anything is
   released upstream, so a subscriber that will never release again would

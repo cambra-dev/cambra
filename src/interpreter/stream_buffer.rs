@@ -1,8 +1,10 @@
 //! Shared buffer for uint-indexed string stream sources.
 //!
-//! [`UIntStreamBuffer`] captures the buffer, sliding-window indexing, and
-//! per-producer obsolete-predicate bookkeeping that is common to every
-//! streaming `UInt → String` data source (stdin, HTTP server, etc.).
+//! [`UIntStreamBuffer`] captures the buffer and the sliding-window indexing
+//! common to every streaming `UInt → String` data source (stdin, HTTP server,
+//! etc.). Which producer has released what is
+//! [`ProducerReleases`](crate::interpreter::producer_releases::ProducerReleases),
+//! which every source keeps rather than only these.
 
 use intervalsets::{
     Bounding, Interval, IntervalSet,

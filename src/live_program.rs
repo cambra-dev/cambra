@@ -141,10 +141,11 @@ impl LiveProgram {
     ///
     /// Rejected when the new version cannot **take over the state**: every
     /// mutable variable the running program holds a value for must be one the
-    /// new version still declares, at the same type and under the same store, so
-    /// that its value is seeded rather than discarded. Those are the three
-    /// refusals [`StateConflict`] names. Everything else is allowed: logic
-    /// freely, and sources and sinks by addition.
+    /// new version still declares, at the same type, so that its value is seeded
+    /// rather than discarded. Those are the two refusals [`StateConflict`] names.
+    /// Everything else is allowed: logic freely, sources and sinks by addition,
+    /// and a variable moving to another loop or into a transaction — it seeds with
+    /// the value it held and counts positions in whatever it now iterates.
     ///
     /// That is the whole guard, and it is narrower than it first looks. A
     /// version that adds an `http_serve` route serves it as soon as the swap

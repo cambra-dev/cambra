@@ -72,6 +72,12 @@ impl DoneNotifier {
 /// filled after [`crate::interpreter::tile_operators::TileOperator::subscribe`] returns (solving the chicken-and-egg:
 /// the consumer must exist before subscribe is called, but subscribe is what
 /// creates the producer).
+///
+/// So a notification raised *during* `subscribe` — an induction store raises one
+/// to start its loop — arrives with the slot still empty and is dropped. Whoever
+/// fills the slot notifies once afterwards for that reason
+/// ([`crate::ccl::context::compile_program`]); a version installed while work was
+/// outstanding is otherwise never pulled.
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
@@ -84,9 +90,11 @@ pub struct SinkConsumer {
 impl SinkConsumer {
     /// Create a new consumer paired with `sink` and `done`.
     ///
-    /// The returned consumer holds a shared handle to the `producer` slot; the
-    /// caller should fill that slot with the `TileProducer` returned by
-    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] before the first notification fires.
+    /// The returned consumer holds a shared handle to the `producer` slot. The
+    /// caller fills it with the `TileProducer` returned by
+    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] and then
+    /// notifies once, which is the only way this consumer sees the notifications
+    /// `subscribe` itself raised.
     pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
         (
