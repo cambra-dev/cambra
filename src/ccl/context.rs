@@ -2070,6 +2070,15 @@ pub fn compile_program(
                 )
             );
             *producer_slot.borrow_mut() = Some(sink_producer);
+            // Kick the sink now it has something to pull. Operators notify from
+            // inside `subscribe` (an induction store does, to start its loop), and
+            // a `SinkConsumer` whose slot is still empty drops those — so the work
+            // already available when a version is installed needs a notification
+            // of its own. A first compile is carried by the source reporting its
+            // data as new; a *replacement* is not, because the version it replaces
+            // has already taken that report, so without this an update lands with
+            // unfinished work and nothing pulls it until the next arrival.
+            consumer_rc.borrow_mut().notify();
             outputs.push(CompiledOutput {
                 name,
                 op,

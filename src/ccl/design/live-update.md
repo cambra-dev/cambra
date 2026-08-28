@@ -271,6 +271,18 @@ subscriber owns its side, and the registry holds a weak reference.
    operators into the next compilation's inheritance.
 5. Compile and subscribe the new version against the same registry, which now
    binds every endpoint the retired version left open, and opens the ones it adds.
+6. Notify each sink, so whatever is already available is pulled.
+
+Step 6 is not redundant with the notifications `subscribe` raises. An operator
+notifies from inside `subscribe` — an induction store does, to start its loop —
+and a sink consumer's producer does not exist until `subscribe` returns, so those
+notifications reach a consumer with nothing to pull and are dropped. A first
+compile does not notice: a source holding data reports it as new on the next poll,
+which drives everything. A replacement is not covered by that, because the version
+it replaces already took the report. Without step 6 an update installed while work
+is outstanding — a fold caught partway, a request accepted and not yet answered —
+sits until the next arrival
+(`a_version_installed_mid_fold_is_pulled_without_a_new_arrival`).
 
 Only step 5 opens anything. Steps 1 and 2 run with `Endpoints::Inherited`, so a
 route the registry does not hold is named rather than opened: their contexts are
@@ -379,7 +391,10 @@ Three pieces carry that:
   collection starts that collection from its first element. The positions the
   predecessor decided are not re-decided and are not re-read: the resumed store
   seeds tick `0` with the value handed over, so a reader enumerating the whole
-  collection reads that value for them.
+  collection reads that value for them. A fold caught partway is where this is
+  visible — the elements below the cut keep what the retired version decided and
+  the rest are the new one's
+  (`a_fold_interrupted_partway_resumes_at_the_position_it_reached`).
 - **What the source still owes.** A source hands a producer registering after the
   swap the release state its retired producers agreed on, which runs *below* a
   store's resume position rather than deciding it: a drive holds the input it

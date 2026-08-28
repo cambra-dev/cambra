@@ -25,10 +25,16 @@
 //! | `two-transactions` | Two transactional variables written and read from disjoint endpoint pairs, so they fall in different causal groups and each gets its own commit store. |
 //!
 //! The `stdin` cases drive the binary as a subprocess
-//! ([`launch_under_control`]), because a `main` output belongs to the binary's own
-//! loop rather than to a sink a test can pump. Those are also the only cases that
-//! reach the control port over HTTP; every other case calls `LiveProgram`
-//! directly.
+//! ([`launch_under_control`]), because a `main` output fed by `stdin` belongs to
+//! the binary's own loop rather than to a sink a test can pump. Those are also the
+//! only cases that reach the control port over HTTP; every other case calls
+//! `LiveProgram` directly.
+//!
+//! One case — `a_fold_interrupted_partway_resumes_at_the_position_it_reached` —
+//! pulls a program's value itself instead. A fold over a fixed collection needs no
+//! source, so pulling it is what makes the position an update lands on nameable:
+//! one pull decides one position, where a socket lands wherever the notification
+//! round it arrives in reaches.
 //!
 //! # What an update may do
 //!
@@ -43,6 +49,7 @@
 //! | Two loops swap which source they read | Accepted; each keeps its value and continues where its new source has got to |
 //! | A variable moves to a loop over a fixed collection | Accepted; same as above — the value seeds and the collection folds on top of it |
 //! | The body of a loop over a fixed collection is edited | Accepted; the fold resumes at the position it had reached, so the new rule governs the elements left |
+//! | The same, with the fold caught partway | Accepted; every element is folded once, and the cut falls at the position the retired version had reached |
 //! | The collection itself is edited | Accepted; the new collection counts in its own sequence, so it is folded whole |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
@@ -78,10 +85,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indoc::indoc;
+
 use cambra::{
-    ccl::context::{Phase, ReuseTally},
-    interpreter::Consumer,
-    live_program::UpdateReport,
+    ccl::context::{GlobalContext, Phase, ReuseTally},
+    interpreter::{Consumer, Tile, Value},
+    live_program::{LiveProgram, UpdateReport},
 };
 
 use super::common::{
@@ -1823,6 +1832,185 @@ fn a_fold_over_a_fixed_collection_resumes_where_it_stopped() {
         after,
         vec!["yz\n"],
         "the new rule governs the elements left, and none are",
+    );
+}
+
+/// Pull the program's value until it settles, and return it.
+///
+/// A fold's value is final once the tile is terminal, which for an induction
+/// store means every position of its extent is decided.
+fn drive_main_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
+    for _ in 0..500 {
+        ctx.scheduler().check_for_notifications();
+        let producer = live
+            .main_producer_mut()
+            .expect("the program's value is `n`");
+        let guard = producer.tiling().universal_guard();
+        let tile = producer.get(guard);
+        if tile.is_terminal() {
+            let Tile::Scalar(column) = tile else {
+                panic!("a string fold's value is a scalar, got {tile:?}");
+            };
+            let Value::String(s) = column.index_at(0) else {
+                panic!("a string fold's value is a string");
+            };
+            return s.to_string();
+        }
+    }
+    panic!("the fold never settled");
+}
+
+/// The elements the two mid-fold cases fold. Twenty because the point is a fold
+/// caught partway, and a shorter list finishes inside the notification round that
+/// starts it.
+const TWENTY: &str = r#"["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t"]"#;
+
+/// A fold of [`TWENTY`] into `n` whose `step` is the loop body, ending in `n` as
+/// the program's value. Built rather than inline because the two mid-fold cases
+/// and their two edits are one program with one line varying.
+fn fold_to_main(step: &str) -> String {
+    format!(
+        indoc! {r#"
+            n := ""
+            for x in {items}:
+                {step}
+            n
+        "#},
+        items = TWENTY,
+        step = step,
+    )
+}
+
+/// The same fold behind `POST /read`, which replies with `n`.
+fn fold_behind_a_route(step: &str, port: u16) -> String {
+    format!(
+        indoc! {r#"
+            n := ""
+            reqs, resps = http_serve("{port}", "POST", "/read")
+            for x in {items}:
+                {step}
+            for r in reqs:
+                resps << n + "\n"
+        "#},
+        port = port,
+        items = TWENTY,
+        step = step,
+    )
+}
+
+/// Every element of `reply`, with the ones the marking version decided flagged.
+///
+/// The reply is the fold's whole value, so it says which version decided which
+/// element: an element the marking version folded is followed by `!`.
+fn decided_by_the_new_version(reply: &str) -> Vec<bool> {
+    let mut out = Vec::new();
+    for c in reply.trim().chars() {
+        if c == '!' {
+            *out.last_mut().expect("a marker follows an element") = true;
+        } else {
+            out.push(false);
+        }
+    }
+    out
+}
+
+/// A fold caught partway resumes at the position it had reached: the elements
+/// below it keep what the retired version decided, and the new rule governs the
+/// rest.
+///
+/// The only case that drives a program's value directly rather than through a
+/// sink, because that is what makes the position the update lands on nameable: one
+/// pull decides one position, so pulling `k` times and then swapping puts the cut
+/// at `k - 1` rather than wherever a socket happened to be serviced.
+#[test]
+fn a_fold_interrupted_partway_resumes_at_the_position_it_reached() {
+    const PULLS: usize = 8;
+    let mut ctx = GlobalContext::default();
+    let mut live =
+        LiveProgram::start(&mut ctx, &fold_to_main("n := n + x"), &no_main).expect("compiles");
+    for _ in 0..PULLS {
+        let producer = live
+            .main_producer_mut()
+            .expect("the program's value is `n`");
+        let guard = producer.tiling().universal_guard();
+        let _ = producer.get(guard);
+        ctx.scheduler().check_for_notifications();
+    }
+
+    live.update(&mut ctx, &fold_to_main(r#"n := n + x + "!""#), &no_main)
+        .expect("`n` is still declared, at the same type");
+
+    let value = drive_main_to_terminal(&mut ctx, &mut live);
+    let decided = decided_by_the_new_version(&value);
+    assert_eq!(
+        decided.len(),
+        20,
+        "every element is folded exactly once: {value}"
+    );
+    let resumed_at = decided.iter().position(|marked| *marked);
+    assert_eq!(
+        resumed_at,
+        Some(PULLS - 1),
+        "the elements below the frontier are the retired version's, and the rest are the new one's: {value}",
+    );
+    assert!(
+        decided[PULLS - 1..].iter().all(|marked| *marked),
+        "the new rule governs every element from the frontier on: {value}",
+    );
+}
+
+/// A version installed while a fold is partway through is pulled without waiting
+/// for a source to report new data.
+///
+/// An operator notifies from inside `subscribe` — an induction store does, to
+/// start its loop — and a sink consumer whose producer slot is not filled yet
+/// drops that notification. A first compile does not notice, because the source
+/// that has data reports it as new on the next poll. A replacement does: the
+/// version it replaces already took that report, so the request in flight here
+/// went unanswered until another arrived.
+///
+/// Where the fold is cut is a property of one notification round rather than
+/// anything the language promises, so this pins the invariant — every element
+/// folded once, the new rule governing a suffix — and leaves the position to
+/// `a_fold_interrupted_partway_resumes_at_the_position_it_reached`.
+#[test]
+fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&fold_behind_a_route("n := n + x", port));
+
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    thread::spawn(move || tx.send(vec![http_post(port, "/read", "x")]).unwrap());
+    // Let the request arrive, then advance the fold with one poll — which both
+    // takes the source's report of new data and leaves the fold unfinished.
+    thread::sleep(Duration::from_millis(400));
+    ctx.scheduler().check_for_notifications();
+    assert!(
+        rx.try_recv().is_err(),
+        "twenty elements outlast the round that starts them, so the reply is still pending",
+    );
+
+    live.update(
+        &mut ctx,
+        &fold_behind_a_route(r#"n := n + x + "!""#, port),
+        &no_main,
+    )
+    .expect("`n` is still declared, at the same type");
+
+    let reply = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    let value = reply.first().expect("one request, one reply").clone();
+    let decided = decided_by_the_new_version(&value);
+    assert_eq!(
+        decided.len(),
+        20,
+        "every element is folded exactly once: {value}"
+    );
+    let resumed_at = decided
+        .iter()
+        .position(|marked| *marked)
+        .expect("the swap lands before the last element");
+    assert!(
+        decided[resumed_at..].iter().all(|marked| *marked),
+        "the new rule governs every element from the frontier on: {value}",
     );
 }
 
