@@ -5,7 +5,10 @@ use log::trace;
 
 use crate::{
     ccl::Type,
-    interpreter::{ColumnValue, DataSourceDomainExtentImpl, Extent, Value, tiling::Predicate},
+    interpreter::{
+        ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
+        producer_releases::ProducerReleases, tiling::Predicate,
+    },
 };
 
 /// Handle for simulating an arbitrary source in a program.
@@ -21,7 +24,7 @@ pub struct TestDataSource {
     yield_predicate: Predicate,
     has_data: bool,
     data: HashMap<Value, Value>,
-    obsolete_predicates: HashMap<String, Predicate>,
+    releases: ProducerReleases,
 }
 
 impl TestDataSource {
@@ -35,7 +38,7 @@ impl TestDataSource {
             yield_predicate: Predicate::False,
             has_data: false,
             data: HashMap::new(),
-            obsolete_predicates: HashMap::new(),
+            releases: ProducerReleases::default(),
         }
     }
 
@@ -64,11 +67,7 @@ impl TestDataSource {
 
     /// Returns a predicate corresponding to the data that has been entirely released from the source.
     pub fn get_released_predicate(&self) -> Predicate {
-        let mut result = Predicate::True;
-        for pred in self.obsolete_predicates.values() {
-            result = result.intersect(pred);
-        }
-        result
+        self.releases.agreed()
     }
 }
 
@@ -85,8 +84,8 @@ impl DataSourceDomainExtentImpl for TestDataSource {
 
     fn get_elements(&self, producer: &str) -> ColumnValue {
         let filter = self
-            .obsolete_predicates
-            .get(producer)
+            .releases
+            .of(producer)
             .unwrap_or_else(|| panic!("Unknown producer: {}", producer));
         trace!("Iterating test source elements with filter {filter:?}");
         ColumnValue::from_values(
@@ -129,22 +128,27 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.yield_predicate.clone()
     }
 
-    fn release(&mut self, producer: &str, mut obsolete: Predicate) {
+    fn release(&mut self, producer: &str, obsolete: Predicate) {
         trace!(
-            "TestDataSource::release: {obsolete:?} with obsolete predicates: {:?}",
-            self.obsolete_predicates
+            "TestDataSource::release: {obsolete:?} with {:?}",
+            self.releases
         );
-        let pred = self
-            .obsolete_predicates
-            .entry(producer.to_string())
-            .or_insert(Predicate::False);
-        *pred = pred.union(&obsolete);
-        for pred in self.obsolete_predicates.values() {
-            obsolete = obsolete.intersect(pred);
-        }
-        trace!("TestDataSource::release: intersected to {obsolete:?}");
-        self.data
-            .retain(|k, _| !key_matches_predicate(k, &obsolete));
+        self.releases.record(producer, &obsolete);
+        let agreed = self.releases.agreed();
+        trace!("TestDataSource::release: intersected to {agreed:?}");
+        self.data.retain(|k, _| !key_matches_predicate(k, &agreed));
+    }
+
+    fn carry_release_to_new_producers(&mut self) {
+        self.releases.carry_to_new_producers();
+    }
+
+    fn first_position_for_a_new_producer(&self) -> usize {
+        // A test source's keys are arbitrary values rather than stream positions,
+        // so it names no position for a store to start at. A store over one starts
+        // at `0` and reads whatever the source still offers a new producer, which
+        // the carry above bounds.
+        0
     }
 }
 
@@ -239,7 +243,7 @@ mod tests {
 
         // Verify producer_a's predicate is stored
         assert!(
-            source.obsolete_predicates.contains_key("producer_a"),
+            source.releases.of("producer_a").is_some(),
             "producer_a predicate should be recorded"
         );
 
@@ -248,11 +252,11 @@ mod tests {
 
         // Verify both predicates are stored
         assert!(
-            source.obsolete_predicates.contains_key("producer_a"),
+            source.releases.of("producer_a").is_some(),
             "producer_a should still be recorded"
         );
         assert!(
-            source.obsolete_predicates.contains_key("producer_b"),
+            source.releases.of("producer_b").is_some(),
             "producer_b should be recorded"
         );
 
@@ -281,9 +285,9 @@ mod tests {
         // First release from producer A
         source.release("producer_a", Predicate::LessThanEq(Value::UInt(0)));
 
-        // Verify producer_a is in the obsolete_predicates
+        // Verify producer_a has a record
         assert!(
-            source.obsolete_predicates.contains_key("producer_a"),
+            source.releases.of("producer_a").is_some(),
             "producer_a should be recorded"
         );
 
@@ -294,11 +298,11 @@ mod tests {
 
         // Verify both are recorded
         assert!(
-            source.obsolete_predicates.contains_key("producer_a"),
+            source.releases.of("producer_a").is_some(),
             "producer_a should still be recorded"
         );
         assert!(
-            source.obsolete_predicates.contains_key("producer_b"),
+            source.releases.of("producer_b").is_some(),
             "producer_b should be recorded"
         );
 

@@ -299,8 +299,10 @@ pub trait DataSourceDomainExtentImpl {
     /// finished with — so an element that arrived but went unhandled is still
     /// delivered to whoever takes over.
     ///
-    /// The default does nothing, for a source with nothing retained to hand over.
-    fn carry_release_to_new_producers(&mut self) {}
+    /// There is no default: a source that silently did not carry would replay its
+    /// history into the replacement, which reads as the program answering every
+    /// request it had already answered.
+    fn carry_release_to_new_producers(&mut self);
 
     /// The first position a producer registering with this source from now on
     /// will be offered.
@@ -315,9 +317,13 @@ pub trait DataSourceDomainExtentImpl {
     /// which starts at *its* frontier instead — deliberately behind this, because
     /// a drive reads one position back through its input and the source still owes
     /// the replacement an element the recurrence has already decided.
-    fn first_position_for_a_new_producer(&self) -> usize {
-        0
-    }
+    ///
+    /// There is no default, for the same reason
+    /// [`carry_release_to_new_producers`](Self::carry_release_to_new_producers)
+    /// has none: a source that answered `0` when it had advanced would base a
+    /// drive below every position it will offer, and the drive would wait for an
+    /// element that is not coming.
+    fn first_position_for_a_new_producer(&self) -> usize;
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {

@@ -7,6 +7,7 @@ mod binop;
 pub mod commit_operator;
 pub mod http_server;
 pub mod operator_conversion;
+mod producer_releases;
 mod scheduler;
 pub mod sinks;
 mod stdio;

@@ -130,7 +130,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     }
 
     fn carry_release_to_new_producers(&mut self) {
-        self.buf.carry_release_to_new_producers();
+        self.buf.releases.carry_to_new_producers();
     }
 
     fn first_position_for_a_new_producer(&self) -> usize {
@@ -152,10 +152,7 @@ mod tests {
         source.add("a".into());
         source.add("b".into());
         source.add("c".into());
-        source
-            .buf
-            .obsolete_predicates
-            .insert("p".to_string(), Predicate::False);
+        source.buf.releases.record("p", &Predicate::False);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![0, 1, 2]));
@@ -172,8 +169,8 @@ mod tests {
         source.add("d".into());
         source
             .buf
-            .obsolete_predicates
-            .insert("p".to_string(), Predicate::LessThanEq(Value::UInt(1)));
+            .releases
+            .record("p", &Predicate::LessThanEq(Value::UInt(1)));
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![2, 3]));
@@ -185,10 +182,7 @@ mod tests {
         let mut source = StdinDataSource::new();
         source.add("a".into());
         source.add("b".into());
-        source
-            .buf
-            .obsolete_predicates
-            .insert("p".to_string(), Predicate::True);
+        source.buf.releases.record("p", &Predicate::True);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![]));
@@ -204,10 +198,7 @@ mod tests {
         }
         // Mark indices 1 and 2 as obsolete; live window [0,4] minus {1,2} = {0,3,4}.
         let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
-        source
-            .buf
-            .obsolete_predicates
-            .insert("p".to_string(), filter);
+        source.buf.releases.record("p", &filter);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![0, 3, 4]));
@@ -226,10 +217,7 @@ mod tests {
 
         // Mark index 3 as obsolete; live window [2,4] minus {3} = {2,4}.
         let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![3]));
-        source
-            .buf
-            .obsolete_predicates
-            .insert("p".to_string(), filter);
+        source.buf.releases.record("p", &filter);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![2, 4]));
@@ -242,10 +230,7 @@ mod tests {
         let mut source = StdinDataSource::new();
         // No lines added; start_idx == ready_size == 0.
         let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
-        source
-            .buf
-            .obsolete_predicates
-            .insert("p".to_string(), filter);
+        source.buf.releases.record("p", &filter);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![]));
@@ -320,7 +305,7 @@ mod tests {
 
         // Verify producer_a's predicate is recorded
         assert!(
-            source.buf.obsolete_predicates.contains_key("producer_a"),
+            source.buf.releases.of("producer_a").is_some(),
             "producer_a predicate should be stored"
         );
 
@@ -330,11 +315,11 @@ mod tests {
 
         // Verify both predicates are recorded
         assert!(
-            source.buf.obsolete_predicates.contains_key("producer_a"),
+            source.buf.releases.of("producer_a").is_some(),
             "producer_a predicate should still be stored"
         );
         assert!(
-            source.buf.obsolete_predicates.contains_key("producer_b"),
+            source.buf.releases.of("producer_b").is_some(),
             "producer_b predicate should be stored"
         );
 
@@ -360,24 +345,14 @@ mod tests {
         source.release("producer_a", Predicate::LessThanEq(Value::UInt(0)));
 
         // Store the first predicate
-        let pred_after_first = source
-            .buf
-            .obsolete_predicates
-            .get("producer_a")
-            .cloned()
-            .unwrap();
+        let pred_after_first = source.buf.releases.of("producer_a").cloned().unwrap();
 
         // Second release from producer A: index 1
         // This should use union with the existing predicate
         source.release("producer_a", Predicate::LessThanEq(Value::UInt(1)));
 
         // The predicate should now be an OR of the two
-        let pred_after_second = source
-            .buf
-            .obsolete_predicates
-            .get("producer_a")
-            .cloned()
-            .unwrap();
+        let pred_after_second = source.buf.releases.of("producer_a").cloned().unwrap();
 
         // The second predicate should be different from the first (should be OR'd)
         assert_ne!(

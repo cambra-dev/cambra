@@ -227,6 +227,17 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
             self.id
         )
     }
+
+    fn carry_release_to_new_producers(&mut self) {
+        unreachable!(
+            "`{}` was never opened, so it has no release to carry",
+            self.id
+        )
+    }
+
+    fn first_position_for_a_new_producer(&self) -> usize {
+        unreachable!("`{}` was never opened, so it offers no position", self.id)
+    }
 }
 
 /// The reply sink of an [`UnopenedRoute`]. Dispatching to it would mean a version
@@ -548,7 +559,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     }
 
     fn carry_release_to_new_producers(&mut self) {
-        self.buf.carry_release_to_new_producers();
+        self.buf.releases.carry_to_new_producers();
     }
 
     fn first_position_for_a_new_producer(&self) -> usize {

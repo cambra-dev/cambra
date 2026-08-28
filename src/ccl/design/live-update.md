@@ -40,8 +40,9 @@ replacement recomputes from wherever its input still has work, and the release t
 subscribers agreed on is what says where that is. This asks one thing of every producer — that it
 release what it has finished, and only that. The agreement is what an input hands a subscriber that
 registers after it: a `FanOut` seeds a new subscriber's guard from what it has already released
-upstream, and a source seeds a newly-registered producer the same way
-(`DataSourceDomainExtentImpl::carry_release_to_new_producers`). An operator whose subscribers
+upstream, and every source seeds a newly-registered producer the same way — the trait method has no
+default, and `ProducerReleases` is the per-producer bookkeeping each source keeps for it. An
+operator whose subscribers
 released it in full is withheld from the next version altogether — it can only answer empty, so
 adopting it would bind a name to nothing (`FanOut::released_in_full`).
 
