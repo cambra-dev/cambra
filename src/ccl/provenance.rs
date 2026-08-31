@@ -59,10 +59,13 @@
 //!
 //! # Domains, not phases
 //!
-//! [`ProvenanceMap`] is generic over its two id domains so the same relation can
-//! serve a pane pair's `NodeId → NodeId` and a future `NodeId → OperatorId`
-//! edge; both domains are `NodeId` today. Phases live in the *data* (each row's
-//! [`RewriteTag`]), never in the type.
+//! [`ProvenanceMap`] is generic over its two id domains so a relation may run
+//! between distinct ones. Every instantiation is `NodeId → NodeId`, and operator
+//! identity does not change that: an operator carries a `NodeId` drawn from the
+//! same counter, so a pane pair spanning operator conversion is homogeneous like
+//! every other. The genericity buys the output container alone — the table, the
+//! fold, the projection and the leak classes are all monomorphically `NodeId`.
+//! Phases live in the *data* (each row's [`RewriteTag`]), never in the type.
 //!
 //! # What this module does not own
 //!

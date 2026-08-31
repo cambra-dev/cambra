@@ -901,12 +901,25 @@ bit is what says so until every phase in the pair records.
 
 A pane may be issued at **any** point during compilation — the current adoption
 point is an artifact of what has been built, not a statement about the design.
-Every pair that exists is gated. One thing stands between the panes and the rest
-of the pipeline:
+Every pair that exists is gated. Four things stand between the panes and the rest
+of the pipeline, and the first is the one usually named:
 
-- **Operator conversion has no identity**, which is what stops a pane after
-  `post-planning`. `TileOperator` carries none and there is no `OperatorId`, so a
-  pane there has nothing to resolve against.
+- **Operator conversion has no identity.** `TileOperator` carries none, so a pane
+  there has nothing to resolve against.
+- **`CompiledProgram::pane_trees` returns `[&Expr; PANES.len()]`.** Every pane is
+  an expression tree by type, so a pane whose content is an operator graph cannot
+  be declared. Only `InspectedProgram` needs the content; `materialize_panes`
+  uses the trees to build id sets and nothing else, so the two wants separate.
+- **Nothing enumerates the operator graph.** `fold` needs an output id set, and
+  `collect_tree_ids` is the only enumeration there is. `TileOperator::inspect`
+  renders a display tree rather than identities, so it cannot supply one.
+- **`CycleSlot` cannot be read without consuming it.** Its only accessor is
+  `take`, which `subscribe` calls, so `CommitOperator`'s writers and
+  `InductionStore`'s body are invisible to any traversal. Both edges have to be
+  recorded when the slot is filled rather than walked afterwards.
+
+The three below the first are why "give operators an id" is not the whole of the
+work; each is independent of the others.
 
 Planning's raising crossing was a second entry here and is resolved. The three
 sites that lift a term out of a type — `planning/iterate`'s `fn_of_bare_predicate`
