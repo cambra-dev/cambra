@@ -168,7 +168,7 @@ pub(super) fn lower_generator_for(
                 ctx,
             )
         })?;
-        let for_node = tagged_for_loop(iter_var, source, for_body, for_span, ctx);
+        let for_node = tagged_for_loop(iter_var, target.span, source, for_body, for_span, ctx);
         let handle = ctx.tag_machinery(
             Expr::var(defer_name.clone()),
             for_span,
@@ -187,7 +187,14 @@ pub(super) fn lower_generator_for(
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
             lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
         })?;
-        Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx))
+        Ok(tagged_for_loop(
+            iter_var,
+            target.span,
+            source,
+            for_body,
+            for_span,
+            ctx,
+        ))
     }
 }
 
@@ -201,12 +208,16 @@ pub(super) fn lower_generator_for(
 /// as a capability.
 fn tagged_for_loop(
     iter_var: String,
+    target_span: Span,
     source: Expr,
     body: Expr,
     for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let lambda = ctx.tag_image(Expr::lambda(iter_var, Type::Hole, body), for_span);
+    let lambda = ctx.tag_image(
+        with_binder_site(Expr::lambda(iter_var, Type::Hole, body), target_span),
+        for_span,
+    );
     ctx.tag_image(
         Expr::compose(vec![source, lambda])
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
@@ -330,8 +341,9 @@ fn lower_for_body_stmts(
     let (last, rest) = stmts.split_last().unwrap();
 
     // Each binding carries its statement's span so the `Let` folded around the
-    // terminal below can be tagged as that statement's direct image.
-    let mut bindings: Vec<(String, Expr, Option<Type>, Span)> = Vec::new();
+    // terminal below can be tagged as that statement's direct image, and the
+    // span of the *name* it binds, which the binder keeps as its source site.
+    let mut bindings: Vec<(String, Expr, Option<Type>, Span, Span)> = Vec::new();
 
     for stmt in rest {
         match &stmt.node {
@@ -342,7 +354,7 @@ fn lower_for_body_stmts(
                 }
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
-                bindings.push((name, val, None, stmt.span));
+                bindings.push((name, val, None, stmt.span, target.span));
             }
             ChlStmt::AnnAssign {
                 target,
@@ -359,7 +371,7 @@ fn lower_for_body_stmts(
                 let ann = lower_type_annotation(annotation, ctx)?;
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
-                bindings.push((name, val, Some(ann), stmt.span));
+                bindings.push((name, val, Some(ann), stmt.span, target.span));
             }
             ChlStmt::AugAssign { target, .. } => {
                 let name = extract_name_target(target, "augmented assignment")?;
@@ -385,6 +397,7 @@ fn lower_for_body_stmts(
             }
             ChlStmt::FunctionDef {
                 name,
+                name_span,
                 params,
                 output,
                 body: fn_body,
@@ -396,7 +409,7 @@ fn lower_for_body_stmts(
                 let func_expr =
                     lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
                 frame_introduced.insert(name_str.clone());
-                bindings.push((name_str, func_expr, None, stmt.span));
+                bindings.push((name_str, func_expr, None, stmt.span, *name_span));
             }
             // A `with begin():` transaction inside a *generator* loop body is a
             // later increment; top-level and simple `for … with begin():` loops
@@ -426,12 +439,12 @@ fn lower_for_body_stmts(
     Ok(bindings
         .into_iter()
         .rev()
-        .fold(terminal, |body, (name, val, ann, span)| {
+        .fold(terminal, |body, (name, val, ann, span, name_span)| {
             let let_expr = match ann {
                 Some(a) => Expr::let_bind_annotated(name, val, body, a),
                 None => Expr::let_bind(name, val, body),
             };
-            ctx.tag_image(let_expr, span)
+            ctx.tag_image(with_binder_site(let_expr, name_span), span)
         }))
 }
 
@@ -557,6 +570,7 @@ fn lower_for_body_terminal(
             })?;
             Ok(tagged_for_loop(
                 inner_var,
+                target.span,
                 inner_source,
                 inner_body,
                 stmt.span,
@@ -777,7 +791,7 @@ pub(super) fn lower_direct_mirror_loop(
                 name: iter_var.into(),
                 ty: Type::Hole,
                 user_annotation: None,
-                name_span: None,
+                name_span: Some(target.span),
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -825,7 +839,10 @@ fn lower_loop_body_chain(
                 let name = extract_name_target(target, "assignment")?;
                 check_mut_write_context(&name, stmt.span, ctx)?;
                 let val = lower_expr(value, ctx)?;
-                ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
+                ctx.tag_image(
+                    with_binder_site(Expr::let_bind(name, val, chain), target.span),
+                    stmt.span,
+                )
             }
             // `x op= value` — a mutable write, always. A write to an accumulator
             // declared before the loop is the `MutWrite` the phase threads as the
@@ -881,7 +898,10 @@ fn lower_loop_body_chain(
                 }
                 let ann = lower_type_annotation(annotation, ctx)?;
                 let val = lower_expr(value, ctx)?;
-                ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
+                ctx.tag_image(
+                    with_binder_site(Expr::let_bind_annotated(name, val, chain, ann), target.span),
+                    stmt.span,
+                )
             }
             // `o << value` — an in-loop feed. Emitted as a raw `Feed` marker
             // (reads stay bare); the phase resolves its value in the

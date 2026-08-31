@@ -95,11 +95,20 @@ carries no span, so comparing spans would make a term unequal to its own image. 
 equality is safe for the opposite reason: its `base` is minted with the `uid` and copies preserve
 both, so the two can never disagree.
 
-**Populated for the binders lowering names directly.** A `def`/`lambda` parameter carries its
-[`Param::name_span`], single and curried alike. The forms whose lowering site does not yet hold the
-target span — assignment targets, a `def`'s own name, loop and comprehension targets, match-arm
-payload binders — carry `None` for now, so a missing site reads as "unknown" and never as a wrong
-one.
+**Every source binder form carries its site.** Assignment targets (`=`, `x: T = e`, and the `:=`
+introduction), a `def`'s own name, `def`/`lambda` parameters single and curried, `for` targets in
+both loop encodings, comprehension targets, and a match arm's named payload binder.
+`every_source_binder_form_carries_its_site` (`uniquify.rs`) checks each one by reading the source
+back at the span it reports.
+
+`lower::with_binder_site` is the one place that sets the field, because the alternative is the same
+assignment at every lowering arm that builds a binding and a form added later shipping `None`
+silently. A binder with no source name never goes through it, so lowering's own plumbing keeps
+`None` by construction: the tuple binder `uncurry_params` mints, a comprehension's correlation
+record, the reserved spelling standing in for a payload an arm declined to name.
+
+Two AST nodes gained a span to make this possible, both mirroring [`Param::name_span`]:
+`Stmt::FunctionDef::name_span` and `PayloadPattern::Named`'s second field.
 
 **A substituted multi-param parameter has no binder to carry a site.** `uncurry_params` rewrites
 `Var(p)` to `__arg_tuple_N ▷ .i` and binds only the tuple, so nothing downstream binds `p` and no

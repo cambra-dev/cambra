@@ -80,6 +80,9 @@ pub(super) fn lower_list_comp(
     let mut gen_sources: Vec<Expr> = Vec::new();
     let mut gen_iter_vars: Vec<String> = Vec::new();
     let mut gen_spans: Vec<Span> = Vec::new();
+    // The comprehension target's own span, per generator: every lambda binding
+    // that generator's variable was written there.
+    let mut gen_target_spans: Vec<Span> = Vec::new();
 
     for (target, iter, _) in generators.iter() {
         // Mint binder uids inside the source *now*, before Phase 5/6 clone it
@@ -93,6 +96,7 @@ pub(super) fn lower_list_comp(
         gen_iter_vars.push(var_name);
         gen_sources.push(source);
         gen_spans.push(iter.span);
+        gen_target_spans.push(target.span);
     }
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
@@ -182,6 +186,7 @@ pub(super) fn lower_list_comp(
         return Ok(float_comp_source_case(
             source,
             &gen_iter_vars[0],
+            gen_target_spans[0],
             &body,
             comp.element.span,
             ctx,
@@ -212,6 +217,7 @@ pub(super) fn lower_list_comp(
         return Ok(fan_out_element_case(
             source,
             &gen_iter_vars[0],
+            gen_target_spans[0],
             outer_var,
             body,
             comp.element.span,
@@ -275,7 +281,14 @@ pub(super) fn lower_list_comp(
             _ => source,
         };
         let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
-        let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
+        let per_elem = ctx.tag_machinery(
+            with_binder_site(
+                Expr::lambda(iter_var, Type::Hole, body_expr),
+                gen_target_spans[i],
+            ),
+            gspan,
+            lc,
+        );
         body_expr = ctx.tag_machinery(Expr::apply(indexed_source, per_elem), gspan, lc);
     }
 
@@ -294,7 +307,10 @@ pub(super) fn lower_list_comp(
         {
             pred_expr = Expr::apply(
                 Expr::apply(make_idx_arg(Name::elem(), i), pred_source),
-                Expr::lambda(iter_var, Type::Hole, pred_expr),
+                with_binder_site(
+                    Expr::lambda(iter_var, Type::Hole, pred_expr),
+                    gen_target_spans[i],
+                ),
             );
         }
         // A refined parameter lowers to a `cast(refined_data_fun, λ outer_var →
@@ -361,6 +377,7 @@ fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
 fn float_comp_source_case(
     source: Expr,
     iter_var: &str,
+    target_span: Span,
     body: &Expr,
     span: Span,
     ctx: &mut LoweringContext,
@@ -380,7 +397,7 @@ fn float_comp_source_case(
                 pattern: b.pattern,
                 guard: b.guard,
                 // The arm body *is* this arm's source collection; float into it.
-                body: float_comp_source_case(b.body, iter_var, body, span, ctx),
+                body: float_comp_source_case(b.body, iter_var, target_span, body, span, ctx),
             })
             .collect();
         // The rebuilt `Case` is the floated encoding of the rule, not an image of
@@ -405,7 +422,11 @@ fn float_comp_source_case(
     // lowering mints is what keeps it from being decided by whoever consumes it.
     let body = fan_out_copy(body, "lower.comp_source_case_body");
     let cs = "lower.comp_source_case";
-    let elem_map = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body), span, cs);
+    let elem_map = ctx.tag_machinery(
+        with_binder_site(Expr::lambda(iter_var, Type::Hole, body), target_span),
+        span,
+        cs,
+    );
     ctx.tag_machinery(
         Expr::compose(vec![source, elem_map])
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
@@ -425,6 +446,7 @@ fn float_comp_source_case(
 fn fan_out_element_case(
     source: Expr,
     iter_var: &str,
+    target_span: Span,
     outer_var: &str,
     body: Expr,
     span: Span,
@@ -451,7 +473,11 @@ fn fan_out_element_case(
             let idx_var = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), span, ec);
             let arm_src = fan_out_copy(&source, "lower.comp_elem_case_source");
             let read = ctx.tag_machinery(Expr::apply(idx_var, arm_src), span, ec);
-            let arm_body = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, b.body), span, ec);
+            let arm_body = ctx.tag_machinery(
+                with_binder_site(Expr::lambda(iter_var, Type::Hole, b.body), target_span),
+                span,
+                ec,
+            );
             let applied = ctx.tag_machinery(Expr::apply(read, arm_body), span, ec);
             // The arm *is* a filtered comprehension — a collection — so it carries
             // the `Data` stamp, like every other comprehension lambda. The cast
@@ -470,7 +496,7 @@ fn fan_out_element_case(
                     Expr::var(Name::elem()),
                     fan_out_copy(&source, "lower.comp_elem_case_source"),
                 ),
-                Expr::lambda(iter_var, Type::Hole, gate),
+                with_binder_site(Expr::lambda(iter_var, Type::Hole, gate), target_span),
             );
             // `gate_on_source` rides the cast target's refinement predicate — a
             // type slot outside the `walk_children` walk — so nothing else will

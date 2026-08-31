@@ -536,7 +536,10 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
-            Ok(ctx.tag_image(Expr::let_bind(name, val, body), stmt.span))
+            Ok(ctx.tag_image(
+                with_binder_site(Expr::let_bind(name, val, body), target.span),
+                stmt.span,
+            ))
         }
         ChlStmt::AnnAssign {
             target,
@@ -565,7 +568,10 @@ pub(super) fn lower_middle_stmt(
             let annotation_ty = lower_type_annotation(annotation, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(
-                Expr::let_bind_annotated(name, val, body, annotation_ty),
+                with_binder_site(
+                    Expr::let_bind_annotated(name, val, body, annotation_ty),
+                    target.span,
+                ),
                 stmt.span,
             ))
         }
@@ -650,7 +656,10 @@ pub(super) fn lower_middle_stmt(
                 domain: Box::new(domain),
                 kind: crate::ccl::HistoryKind::Overwrite,
             };
-            Ok(ctx.tag_image(Expr::mut_decl(name, mut_ty, val, body), stmt.span))
+            Ok(ctx.tag_image(
+                with_binder_site(Expr::mut_decl(name, mut_ty, val, body), target.span),
+                stmt.span,
+            ))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the
         // check requires `x` to be a mutable variable (never a shadowing rebind of
@@ -679,13 +688,17 @@ pub(super) fn lower_middle_stmt(
         // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
             name,
+            name_span,
             params,
             output,
             body: fn_body,
         } => {
             let func_expr = lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
             Ok(ctx.tag_image(
-                Expr::let_bind(name.as_str().to_string(), func_expr, body),
+                with_binder_site(
+                    Expr::let_bind(name.as_str().to_string(), func_expr, body),
+                    *name_span,
+                ),
                 stmt.span,
             ))
         }
@@ -1498,9 +1511,11 @@ pub(super) fn lower_match(
         // a reserved spelling so the body cannot read what it declined to name — for
         // `_` because that is what `_` means, and for the payload-less form because
         // there is nothing there to read.
-        let binder = match &pat.payload {
-            PayloadPattern::Named(name) => name.as_str().to_string(),
-            PayloadPattern::Ignored | PayloadPattern::Absent => ctx.fresh_ignored_payload(),
+        let (binder, binder_span) = match &pat.payload {
+            PayloadPattern::Named(name, span) => (name.as_str().to_string(), Some(*span)),
+            // A reserved spelling standing in for a payload the arm declined to
+            // name, so there is no source name and no site.
+            PayloadPattern::Ignored | PayloadPattern::Absent => (ctx.fresh_ignored_payload(), None),
         };
         // Whether the arm *claims the tag carries nothing*. `` case `tag: `` is a
         // statement about the type, not an elision of the binder: it matches a
@@ -1520,7 +1535,7 @@ pub(super) fn lower_match(
                     name: binder.into(),
                     ty: Type::Hole,
                     user_annotation: None,
-                    name_span: None,
+                    name_span: binder_span,
                 },
                 empty_payload,
             }),

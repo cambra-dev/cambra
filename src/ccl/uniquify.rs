@@ -872,6 +872,70 @@ f(2)
         );
     }
 
+    /// Every source binder form carries the site of the name written at it: an
+    /// assignment target, a `def`'s own name, a parameter, a loop target, a
+    /// comprehension target, a `:=` introduction, and a match arm's payload
+    /// binder.
+    ///
+    /// The check is over binder *spellings*, because the point is that a reader
+    /// clicking any of these names gets an answer. A form whose lowering site
+    /// loses the span shows up here as a `None`.
+    #[test]
+    fn every_source_binder_form_carries_its_site() {
+        use crate::ccl::Name;
+
+        let code = "\
+xs = [1, 2, 3]
+g = 10
+def f(p):
+  p + g
+ys = [x * 2 for x in xs]
+acc := 0
+for i in xs:
+  acc += i
+total = acc + f(1)
+match total:
+  case `some(v):
+    v
+  case _:
+    0
+";
+        let tree = pipeline_front(code);
+
+        fn sites(e: &Expr, out: &mut Vec<(String, Option<crate::chl_parser::ast::Span>)>) {
+            e.walk_binders(|b| {
+                if let Name::Unique { base, .. } = &b.name {
+                    out.push((base.clone(), b.name_span));
+                }
+            });
+            e.walk_children(|c| sites(c, out));
+        }
+
+        let mut found = Vec::new();
+        sites(&tree, &mut found);
+
+        // Each of these is written exactly once in the program above, so its
+        // binder's site is the span of that spelling.
+        for name in ["xs", "g", "f", "p", "ys", "x", "acc", "i", "total", "v"] {
+            let entries: Vec<_> = found.iter().filter(|(b, _)| b == name).collect();
+            assert!(
+                !entries.is_empty(),
+                "`{name}` has no binder in the lowered tree; binders are {:?}",
+                found.iter().map(|(b, _)| b).collect::<Vec<_>>()
+            );
+            for (_, span) in &entries {
+                let span = span
+                    .unwrap_or_else(|| panic!("the binder for `{name}` carries no source site"));
+                assert_eq!(
+                    &code[span.start..span.end],
+                    name,
+                    "`{name}`'s site spans {span:?}, which reads {:?}",
+                    &code[span.start..span.end]
+                );
+            }
+        }
+    }
+
     /// A compiler-minted binder carries no site, because it was written nowhere.
     #[test]
     fn a_minted_binder_carries_no_source_site() {

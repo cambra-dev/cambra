@@ -1202,7 +1202,11 @@ where
                 annotation,
             });
         let def_stmt = just(Token::Def)
-            .ignore_then(select! { Token::Ident(s) => s }.labelled("function name"))
+            .ignore_then(
+                select! { Token::Ident(s) => s }
+                    .map_with(|s, e| (s, e.span()))
+                    .labelled("function name"),
+            )
             .then(
                 param
                     .separated_by(just(Token::Comma))
@@ -1213,11 +1217,12 @@ where
             .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
             .then_ignore(just(Token::Colon))
             .then(block.clone())
-            .map_with(|(((name, params), output), body), e| {
+            .map_with(|((((name, name_span), params), output), body), e| {
                 Spanned::new(
                     e.span(),
                     Stmt::FunctionDef {
                         name,
+                        name_span,
                         params,
                         output,
                         body,
@@ -1512,7 +1517,7 @@ where
     ));
     let case_binder = choice((
         select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
-        match_ident.map(|(name, _)| Some(name)),
+        match_ident.map(|(name, span)| Some((name, span))),
     ));
     just(Token::Case)
         .ignore_then(case_pattern)
@@ -1538,7 +1543,7 @@ where
                 };
             }
             let payload = match binder {
-                Some(Some(name)) => PayloadPattern::Named(name),
+                Some(Some((name, span))) => PayloadPattern::Named(name, span),
                 Some(None) => PayloadPattern::Ignored,
                 None => PayloadPattern::Absent,
             };
@@ -2061,11 +2066,17 @@ mod tests {
         match &m.body[0].node {
             Stmt::FunctionDef {
                 name,
+                name_span,
                 params,
                 output,
                 body,
             } => {
                 assert_eq!(name.as_str(), "f");
+                // The name's own span, not the statement's.
+                assert_eq!(
+                    &"def f(x, y):\n    x + y\n"[name_span.start..name_span.end],
+                    "f"
+                );
                 assert_eq!(params.len(), 2);
                 assert!(output.is_none());
                 assert_eq!(body.len(), 1);
@@ -2201,7 +2212,7 @@ mod tests {
                 assert_eq!(arms.len(), 2);
                 let p0 = arms[0].pattern.as_ref().expect("tagged arm");
                 assert_eq!(p0.tag.as_str(), "some");
-                assert_eq!(p0.payload, PayloadPattern::Named("v".into()));
+                assert!(matches!(&p0.payload, PayloadPattern::Named(n, _) if n.as_str() == "v"));
                 let p1 = arms[1].pattern.as_ref().expect("tagged arm");
                 assert_eq!(p1.tag.as_str(), "none");
                 assert_eq!(p1.payload, PayloadPattern::Absent);
@@ -2237,10 +2248,10 @@ mod tests {
         };
         assert!(matches!(scrutinee.node, Expr::Name(_)));
         assert_eq!(arms.len(), 2);
-        assert_eq!(
-            arms[0].pattern.as_ref().expect("tagged arm").payload,
-            PayloadPattern::Named("n".into())
-        );
+        assert!(matches!(
+            &arms[0].pattern.as_ref().expect("tagged arm").payload,
+            PayloadPattern::Named(n, _) if n.as_str() == "n"
+        ));
         assert_eq!(
             arms[1].pattern.as_ref().expect("tagged arm").payload,
             PayloadPattern::Absent
