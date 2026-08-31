@@ -2505,6 +2505,7 @@ fn binding(name: Name, ty: Type) -> TypedBinding {
         name,
         ty,
         user_annotation: None,
+        name_span: None,
     }
 }
 

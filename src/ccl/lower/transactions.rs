@@ -119,6 +119,7 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
             name: iter_var.into(),
             ty: Type::Hole,
             user_annotation: None,
+            name_span: None,
         },
         iter: Box::new(source),
         body: Box::new(block),

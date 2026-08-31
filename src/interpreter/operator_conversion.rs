@@ -2643,6 +2643,7 @@ mod variant_ctor_tests {
             name: name.into(),
             ty,
             user_annotation: None,
+            name_span: None,
         }
     }
 

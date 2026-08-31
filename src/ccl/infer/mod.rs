@@ -682,6 +682,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
@@ -725,6 +726,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                name_span: None,
             },
             bound_expr: Box::new(lit_int(42)),
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),

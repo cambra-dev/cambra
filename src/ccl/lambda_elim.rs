@@ -2361,6 +2361,7 @@ mod tests {
                     name: binder.into(),
                     ty: binder_ty,
                     user_annotation: None,
+                    name_span: None,
                 },
                 empty_payload: false,
             }),

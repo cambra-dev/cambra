@@ -1980,6 +1980,7 @@ mod tests {
                 name: "p".into(),
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(body),
         });
@@ -2182,6 +2183,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::String)),
+                name_span: None,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
             body: Box::new(Expr::var("x")),
@@ -2206,6 +2208,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
+                name_span: None,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),
             body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
@@ -2231,6 +2234,7 @@ mod tests {
                     kind: HistoryKind::Overwrite,
                 },
                 user_annotation: None,
+                name_span: None,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),
             body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
@@ -2738,6 +2742,7 @@ mod tests {
                     name: "x".into(),
                     ty: Type::infer(),
                     user_annotation: Some(ann),
+                    name_span: None,
                 },
                 body: Box::new(Expr::apply(Expr::var("x"), inner)),
             });
@@ -2781,6 +2786,7 @@ mod tests {
                     name: "x".into(),
                     ty: Type::infer(),
                     user_annotation: Some(Type::Base(BaseType::String)),
+                    name_span: None,
                 },
                 body: Box::new(Expr::var("x")),
             })),
@@ -2811,6 +2817,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::Int)),
+                name_span: None,
             },
             body: Box::new(Expr::lit(Lit::Unit)),
         });
@@ -3068,6 +3075,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -3128,6 +3136,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -3181,6 +3190,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Infer(var), // unsolved
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -3470,6 +3480,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Base(BaseType::String),
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
         })

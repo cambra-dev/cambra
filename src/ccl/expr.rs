@@ -5,6 +5,7 @@
 
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
+use crate::chl_parser::ast::Span;
 
 /// The `commit` tag of a writer **decision variant** —
 /// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
@@ -74,7 +75,7 @@ pub const F_WRITE: &str = "write";
 /// observe one (`infer::api::debug_assert_annotations_cleared`). What survives the
 /// clearing is nothing: mutability is answered by
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TypedBinding {
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
@@ -101,6 +102,40 @@ pub struct TypedBinding {
     /// then clears it — a retained annotation is a pre-inference marker that
     /// later passes can only misread.
     pub user_annotation: Option<Type>,
+    /// The source span of the **name** at this binder's binding site, when the
+    /// binder was written in the program: a parameter's
+    /// [`Param::name_span`](crate::chl_parser::ast::Param::name_span), an
+    /// assignment target's span, a `def`'s name span, a loop or comprehension
+    /// target's span. `None` for a compiler-minted binder, which was written
+    /// nowhere.
+    ///
+    /// A binder is not an expression, so no node's attribution covers it and no
+    /// pane can say which node binds a given source position. This is the
+    /// channel that says it: with a use's binder in hand — uid equality is
+    /// lexical resolution after uniquification — the binder's own site is a
+    /// read. See `src/ccl/design/ir.md`, "A binder carries its source site".
+    ///
+    /// Excluded from [`PartialEq`], deliberately: see the impl.
+    pub name_span: Option<Span>,
+}
+
+/// Equality ignores [`name_span`](TypedBinding::name_span).
+///
+/// Structural equality on terms coincides with α-equivalence after
+/// uniquification, and every equality-mediated decision in the crate relies on
+/// that (refinement dedup, demand satisfaction, structural reconciles). A span
+/// cannot join that comparison: passes rebuild a binder from its name and type
+/// — `mut_elim`'s and `transact_phase`'s `binding` helpers do — and a rebuilt
+/// binder carries no span, so comparing spans would make a term unequal to its
+/// own image. `Name`'s derived equality is safe for the opposite reason: its
+/// `base` is minted with the `uid` and copies preserve both, so the two can
+/// never disagree.
+impl PartialEq for TypedBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.ty == other.ty
+            && self.user_annotation == other.user_annotation
+    }
 }
 
 impl TypedBinding {
@@ -113,6 +148,7 @@ impl TypedBinding {
             name: name.into(),
             ty: Type::Hole,
             user_annotation: None,
+            name_span: None,
         }
     }
 
@@ -125,7 +161,17 @@ impl TypedBinding {
             name: name.into(),
             ty: Type::Hole,
             user_annotation: Some(annotation),
+            name_span: None,
         }
+    }
+
+    /// Record the source span of the name written at this binding site.
+    ///
+    /// The one way a [`name_span`](Self::name_span) is set: a lowering arm that
+    /// holds the source binder calls this, and every other binder keeps `None`.
+    pub fn at_name_span(mut self, span: Span) -> Self {
+        self.name_span = Some(span);
+        self
     }
 
     /// Attach a user annotation to an already-constructed binding.
@@ -1145,6 +1191,7 @@ impl TypedExpr {
                 name: name.into(),
                 ty,
                 user_annotation: None,
+                name_span: None,
             },
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
@@ -1200,6 +1247,7 @@ impl TypedExpr {
                 name: name.into(),
                 ty: history,
                 user_annotation: None,
+                name_span: None,
             },
             init: Box::new(init),
             body: Box::new(body),
@@ -1360,6 +1408,7 @@ impl TypedExpr {
                 name: param.into(),
                 ty: param_ty,
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(body),
         })
@@ -2178,6 +2227,7 @@ mod tests {
                 name: "x".into(),
                 ty: marker("param_ty"),
                 user_annotation: Some(marker("param_annotation")),
+                name_span: None,
             },
             body: Box::new(TypedExpr::lit(Lit::Unit)),
         });

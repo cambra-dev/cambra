@@ -2526,6 +2526,7 @@ mod letrec_typing {
             name: name.into(),
             ty,
             user_annotation: None,
+            name_span: None,
         }
     }
 

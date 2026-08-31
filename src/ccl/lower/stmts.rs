@@ -1520,6 +1520,7 @@ pub(super) fn lower_match(
                     name: binder.into(),
                     ty: Type::Hole,
                     user_annotation: None,
+                    name_span: None,
                 },
                 empty_payload,
             }),

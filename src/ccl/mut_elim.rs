@@ -612,6 +612,7 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
         name,
         ty,
         user_annotation: None,
+        name_span: None,
     }
 }
 
@@ -1789,6 +1790,7 @@ mod tests {
                 name: i.clone(),
                 ty: int.clone(),
                 user_annotation: None,
+                name_span: None,
             },
             iter: Box::new(list),
             body: Box::new(body),

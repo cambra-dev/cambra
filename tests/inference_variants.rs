@@ -57,6 +57,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 name: binding.into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                name_span: None,
             },
             empty_payload: false,
         }),
@@ -157,6 +158,7 @@ fn variant_param_accepts_subtype() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty.clone()),
+            name_span: None,
         },
         body: Box::new(var("v")),
     });
@@ -176,6 +178,7 @@ fn variant_extra_tag_rejected() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty),
+            name_span: None,
         },
         body: Box::new(var("v")),
     });
@@ -418,6 +421,7 @@ fn lambda_returns_variant() {
             name: "x".into(),
             ty: int(),
             user_annotation: Some(int()),
+            name_span: None,
         },
         body: Box::new(TypedExpr::variant_ctor("some", var("x"))),
     });
@@ -475,6 +479,7 @@ fn payload_covariance_accept() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty.clone()),
+            name_span: None,
         },
         body: Box::new(var("v")),
     });
@@ -492,6 +497,7 @@ fn payload_mismatch_reject() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty),
+            name_span: None,
         },
         body: Box::new(var("v")),
     });

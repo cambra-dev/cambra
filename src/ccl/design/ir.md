@@ -75,6 +75,37 @@ A scope is a type, `Binders`, not a collected list of binder references: it borr
 
 Consumers may rely on three properties of the walk, each asserted in `scope.rs`'s tests: the `Child` items come in `walk_children` order (so the `&mut` walk can pair scopes with children positionally), the binders it declares are exactly `walk_binders`', and a scope's children are consecutive with a binder-introducing scope entered only once. The last is what lets a consumer build per-scope state once per scope rather than once per child, and the `&mut` walk hands it the change point directly, as a `Scope` item ahead of the run of children it covers. Substitution needs both halves of that: restricting the substitution across the scope (`Subst::shadow_all`, which borrows instead of cloning whenever the scope names nothing the substitution acts on) and the Barendregt no-capture check, which is release-active and walks every replacement term — so a `LetRec` group of *n* binders owes *n* checks, and paying per child instead would cost *n*(*n*+1).
 
+### A binder carries its source site
+
+`TypedBinding::name_span` is the source span of the name written at a binding site, and `None` for a
+compiler-minted binder, which was written nowhere. Lowering sets it, `uniquify` rewrites `name` and
+leaves it alone, and no later pass reads it.
+
+It exists because a binder is not an expression. Nothing attributes one, so no pane's node → span map
+can say which node binds the name written at a given position, and a consumer asking "where is this
+name defined" had to re-resolve CHL scoping over the surface AST. With the span on the binder that
+question is two reads: uid equality is lexical resolution after uniquification, so a use's binder is
+the binder sharing its `uid`, and that binder's site is this field.
+`a_use_resolves_to_its_binders_source_site_by_uid` (`uniquify.rs`) is the whole rule.
+
+**The field is outside `PartialEq`.** Structural equality on terms coincides with α-equivalence after
+uniquification, and every equality-mediated decision depends on it. Passes rebuild a binder from its
+name and type — `mut_elim`'s and `transact_phase`'s `binding` helpers do — and a rebuilt binder
+carries no span, so comparing spans would make a term unequal to its own image. `Name`'s derived
+equality is safe for the opposite reason: its `base` is minted with the `uid` and copies preserve
+both, so the two can never disagree.
+
+**Populated for the binders lowering names directly.** A `def`/`lambda` parameter carries its
+[`Param::name_span`], single and curried alike. The forms whose lowering site does not yet hold the
+target span — assignment targets, a `def`'s own name, loop and comprehension targets, match-arm
+payload binders — carry `None` for now, so a missing site reads as "unknown" and never as a wrong
+one.
+
+**A substituted multi-param parameter has no binder to carry a site.** `uncurry_params` rewrites
+`Var(p)` to `__arg_tuple_N ▷ .i` and binds only the tuple, so nothing downstream binds `p` and no
+`name_span` can name it. Resolving such a use needs the mapping from a projection index to that
+parameter's site, which is per-lambda rather than per-binder.
+
 ### Application shape
 
 Function application is a single `Apply(Box<Expr>, Box<Expr>)` node. Single-argument CHL calls `f(a)` lower to `Apply(a, Var(f))` directly. Multi-argument CHL calls `f(a, b, ...)` lower to `Apply(Tuple([a, b, ...]), Var(f))` — the arguments are tupled so the call shape matches how multi-arg CHL lambdas are uncurried at lowering time (see [lowering.md](lowering.md)).

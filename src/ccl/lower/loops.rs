@@ -777,6 +777,7 @@ pub(super) fn lower_direct_mirror_loop(
                 name: iter_var.into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                name_span: None,
             },
             iter: Box::new(source),
             body: Box::new(chain),

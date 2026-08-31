@@ -799,4 +799,97 @@ mod tests {
         // The letrec body's f is the group's, shadowing the outer let.
         assert_eq!(rec_body.node, TypedExprNode::Var(f_rec.clone()));
     }
+    /// A use resolves to its binder's source site through the `uid` alone: uid
+    /// equality is lexical resolution after this pass, and the binder carries
+    /// the span of the name written at its binding site. Together those answer
+    /// "where is this name defined" over the IR, with no second scope walk.
+    ///
+    /// `resolve_use` is the whole resolution rule, and it is what a consumer
+    /// needing goto-definition runs.
+    #[test]
+    fn a_use_resolves_to_its_binders_source_site_by_uid() {
+        use crate::ccl::names::Uid;
+        use crate::ccl::{Name, TypedExprNode};
+        use crate::chl_parser::ast::Span;
+
+        let code = "\
+def f(p):
+  p + 1
+f(2)
+";
+        let tree = pipeline_front(code);
+
+        /// Every binder of `e`, as `uid -> name_span`.
+        fn binder_sites(e: &Expr, out: &mut Vec<(Uid, Option<Span>)>) {
+            e.walk_binders(|b| {
+                if let Name::Unique { uid, .. } = &b.name {
+                    out.push((*uid, b.name_span));
+                }
+            });
+            e.walk_children(|c| binder_sites(c, out));
+        }
+
+        /// The span of the binder a `Var` occurrence resolves to.
+        fn resolve_use(
+            tree: &Expr,
+            use_name: &Name,
+            sites: &[(Uid, Option<Span>)],
+        ) -> Option<Span> {
+            let Name::Unique { uid, .. } = use_name else {
+                return None;
+            };
+            let _ = tree;
+            sites.iter().find(|(u, _)| u == uid).and_then(|(_, s)| *s)
+        }
+
+        /// The first `Var` named `base` in the tree.
+        fn find_use<'a>(e: &'a Expr, base: &str) -> Option<&'a Name> {
+            if let TypedExprNode::Var(n) = &e.node
+                && n.base() == base
+            {
+                return Some(n);
+            }
+            let mut found = None;
+            e.walk_children(|c| {
+                if found.is_none() {
+                    found = find_use(c, base);
+                }
+            });
+            found
+        }
+
+        let mut sites = Vec::new();
+        binder_sites(&tree, &mut sites);
+        let use_of_p = find_use(&tree, "p").expect("the body mentions `p`");
+        let site = resolve_use(&tree, use_of_p, &sites).expect("`p`'s binder carries its site");
+
+        // `p` is written once, at the parameter position of `def f(p)`.
+        let expected = code.find("(p)").expect("the parameter is written") + 1;
+        assert_eq!(
+            (site.start, site.end),
+            (expected, expected + 1),
+            "the use of `p` resolves to the span of `p` in `def f(p)`; source is {code:?}"
+        );
+    }
+
+    /// A compiler-minted binder carries no site, because it was written nowhere.
+    #[test]
+    fn a_minted_binder_carries_no_source_site() {
+        // The comprehension's plumbing binders are lowering's, not the author's.
+        let tree = pipeline_front("xs = [1, 2]\nys = [x for x in xs]\nys\n");
+        fn minted_with_a_site(e: &Expr, out: &mut Vec<String>) {
+            e.walk_binders(|b| {
+                if b.name.base().starts_with("__") && b.name_span.is_some() {
+                    out.push(b.name.base().to_string());
+                }
+            });
+            e.walk_children(|c| minted_with_a_site(c, out));
+        }
+        let mut bad = Vec::new();
+        minted_with_a_site(&tree, &mut bad);
+        assert!(
+            bad.is_empty(),
+            "a minted binder claims a source site: {bad:?}"
+        );
+    }
 }

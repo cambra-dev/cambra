@@ -1472,6 +1472,7 @@ fn channelize_cluster(
                     name: name.clone(),
                     ty: channel.ty.clone(),
                     user_annotation: None,
+                    name_span: None,
                 },
                 channel,
             ));

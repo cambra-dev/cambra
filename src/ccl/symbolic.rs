@@ -1007,6 +1007,7 @@ in y"
                     name: "x".into(),
                     ty: Type::Base(BaseType::Int),
                     user_annotation: None,
+                    name_span: None,
                 },
                 Expr::lit(Lit::Int(0)),
             )],

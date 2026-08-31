@@ -417,6 +417,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                name_span: None,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Tuple(vec![
                 lit_int(1),
