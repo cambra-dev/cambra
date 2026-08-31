@@ -81,19 +81,19 @@ Consumers may rely on three properties of the walk, each asserted in `scope.rs`'
 compiler-minted binder, which was written nowhere. Lowering sets it, `uniquify` rewrites `name` and
 leaves it alone, and no later pass reads it.
 
-It exists because a binder is not an expression. Nothing attributes one, so no pane's node → span map
-can say which node binds the name written at a given position, and a consumer asking "where is this
-name defined" had to re-resolve CHL scoping over the surface AST. With the span on the binder that
-question is two reads: uid equality is lexical resolution after uniquification, so a use's binder is
-the binder sharing its `uid`, and that binder's site is this field.
+It exists because a binder is not an expression. Nothing attributes one, so no pane's node → span
+map can say which node binds the name written at a given position, and a consumer asking "where is
+this name defined" had to re-resolve CHL scoping over the surface AST. With the span on the binder
+that question is two reads: uid equality is lexical resolution after uniquification, so a use's
+binder is the binder sharing its `uid`, and that binder's site is this field.
 `a_use_resolves_to_its_binders_source_site_by_uid` (`uniquify.rs`) is the whole rule.
 
-**The field is outside `PartialEq`.** Structural equality on terms coincides with α-equivalence after
-uniquification, and every equality-mediated decision depends on it. Passes rebuild a binder from its
-name and type — `mut_elim`'s and `transact_phase`'s `binding` helpers do — and a rebuilt binder
-carries no span, so comparing spans would make a term unequal to its own image. `Name`'s derived
-equality is safe for the opposite reason: its `base` is minted with the `uid` and copies preserve
-both, so the two can never disagree.
+**The field is outside `PartialEq`.** Structural equality on terms coincides with α-equivalence
+after uniquification, and every equality-mediated decision depends on it. Passes rebuild a binder
+from its name and type — `mut_elim`'s and `transact_phase`'s `binding` helpers do — and a rebuilt
+binder carries no span, so comparing spans would make a term unequal to its own image. `Name`'s
+derived equality is safe for the opposite reason: its `base` is minted with the `uid` and copies
+preserve both, so the two can never disagree.
 
 **Every source binder form carries its site.** Assignment targets (`=`, `x: T = e`, and the `:=`
 introduction), a `def`'s own name, `def`/`lambda` parameters single and curried, `for` targets in
@@ -101,14 +101,16 @@ both loop encodings, comprehension targets, and a match arm's named payload bind
 `every_source_binder_form_carries_its_site` (`uniquify.rs`) checks each one by reading the source
 back at the span it reports.
 
-`lower::with_binder_site` is the one place that sets the field, because the alternative is the same
-assignment at every lowering arm that builds a binding and a form added later shipping `None`
-silently. A binder with no source name never goes through it, so lowering's own plumbing keeps
-`None` by construction: the tuple binder `uncurry_params` mints, a comprehension's correlation
-record, the reserved spelling standing in for a payload an arm declined to name.
+Two functions set the field, split by what the lowering arm holds: `lower::with_binder_site` takes
+an already-built node, `TypedBinding::at_name_span` a binding still under construction. Neither the
+field nor the assignment appears at a lowering arm, because an arm that writes the field directly is
+an arm a later form can be added beside while silently shipping `None`. A binder with no source name
+goes through neither, so lowering's own plumbing keeps `None` by construction: the tuple binder
+`uncurry_params` mints, a comprehension's correlation record, the reserved spelling standing in for
+a payload an arm declined to name.
 
 Two AST nodes gained a span to make this possible, both mirroring [`Param::name_span`]:
-`Stmt::FunctionDef::name_span` and `PayloadPattern::Named`'s second field.
+`Stmt::FunctionDef::name_span` and `PayloadPattern::Named::name_span`.
 
 A multi-argument function's parameters are the exception, and
 [a substituted parameter's site rides its projection](#a-substituted-parameters-site-rides-its-projection)
@@ -126,30 +128,38 @@ says how they are answered instead.
 So a multi-argument function's parameters bind nothing. No `TypedBinding` corresponds to `p`, and no
 `name_span` can name it. Two spans on the projection answer for it instead:
 
-- the projection **root** carries the **occurrence's** span, because substitution is root-carry — the
-  occurrence's own id and attribution replace the template root's;
-- the projection **interior** carries the parameter's **declaration**, because the template is tagged
-  with that parameter's `name_span` and every freshened copy inherits the tag.
+- the projection **root** carries the **occurrence's** span, because substitution is root-carry —
+  the occurrence's own id and attribution replace the template root's;
+- the projection **interior** carries the parameter's **declaration**, because the template is
+  tagged with that parameter's `name_span` and every freshened copy inherits the tag.
 
 A consumer at a use of `p` therefore reads which occurrence from the `Apply` and which declaration
 from its `Proj` child. `a_substituted_parameter_carries_occurrence_and_declaration_spans`
 (`lower/functions.rs`) pins both.
 
-The interior used to carry the whole `def` span, because the template is manufactured once per
-parameter before any occurrence exists and the function's span was the only one in hand. That said
-nothing a consumer could use: the projection is what became of the parameter, so its source position
-is where the parameter was written.
+The whole interior carries the declaration, the `Var(__arg_tuple_N)` as well as the `Proj`. Tagging
+it with the function's span instead is the reading the template invites — it is manufactured once
+per parameter, before any occurrence exists, where the function's span is the only one in hand — and
+it answers a use of `p` with the entire `def` block. The projection is what became of the parameter,
+so its source position is where the parameter was written.
+
+**The pair is readable only while no node carries both halves.** A `SourceAttribution`'s `spans` is
+a set and the fold unions attributions along its edges, so this is a per-pane property rather than a
+property of the tree. `a_substituted_parameters_two_spans_stay_on_distinct_nodes` (`panes.rs`)
+checks disjointness at `pre-inference`, `post-inference`, `post-channelize`, and `post-as-of-read`,
+and pins where the answer stops: `lambda_elim` rewrites the body point-free and carries neither span
+to its pane, so a consumer needing a parameter's site reads a pane above it.
 
 **Binding the parameters instead does not work.** Replacing the substitution with
-`let p = __arg_tuple_0.0 in …` gives each parameter a binder and a site, and reads better —
-a refinement over a parameter renders as `{Int | __elem >= a}` rather than
-`{Int | __elem >= __arg_tuple_0.0}`. It is unsound here. Inference derives refinements from the body,
-and those refinements land on the **lambda's own type**, where a `let` inside the body has not yet
-opened: `def add(a, b): a + b` infers `((Int, Int) ⇒ {Int | __elem == a ^+ b})` and the scope check
-rejects it, correctly, for naming binders that are not in scope at the type. Substituting the
-projection is what keeps the invariant that a tupled lambda's body mentions only the tuple binder,
-which *is* in scope at the lambda's type. Binding the parameters would need inference to expand a
-`let` into a refinement as it leaves the binder's scope.
+`let p = __arg_tuple_0.0 in …` gives each parameter a binder and a site, and a refinement over a
+parameter then renders as `{Int | __elem >= a}` rather than `{Int | __elem >= __arg_tuple_0.0}`. It
+is unsound here. Inference derives refinements from the body, and those refinements land on the
+**lambda's own type**, where a `let` inside the body has not yet opened: `def add(a, b): a + b`
+infers `((Int, Int) ⇒ {Int | __elem == a ^+ b})` and the scope check rejects it, correctly, for
+naming binders that are not in scope at the type. Substituting the projection is what keeps the
+invariant that a tupled lambda's body mentions only the tuple binder, which is in scope at the
+lambda's type where a body-local `let` binder is not. Binding the parameters would need inference to
+expand a `let` into a refinement as it leaves the binder's scope.
 
 ### Application shape
 

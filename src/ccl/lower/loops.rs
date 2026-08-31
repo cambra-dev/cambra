@@ -787,12 +787,7 @@ pub(super) fn lower_direct_mirror_loop(
     // `ExprStmt` splicing it before the continuation is manufactured.
     let for_node = ctx.tag_image(
         Expr::new(TypedExprNode::For {
-            target: TypedBinding {
-                name: iter_var.into(),
-                ty: Type::Hole,
-                user_annotation: None,
-                name_span: Some(target.span),
-            },
+            target: TypedBinding::new_unannotated(iter_var).at_name_span(target.span),
             iter: Box::new(source),
             body: Box::new(chain),
         }),

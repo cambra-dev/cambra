@@ -829,16 +829,13 @@ f(2)
             e.walk_children(|c| binder_sites(c, out));
         }
 
-        /// The span of the binder a `Var` occurrence resolves to.
-        fn resolve_use(
-            tree: &Expr,
-            use_name: &Name,
-            sites: &[(Uid, Option<Span>)],
-        ) -> Option<Span> {
+        /// The span of the binder a `Var` occurrence resolves to. No tree: the
+        /// uid *is* the resolution, so the lookup takes the use and the binder
+        /// table and nothing else.
+        fn resolve_use(use_name: &Name, sites: &[(Uid, Option<Span>)]) -> Option<Span> {
             let Name::Unique { uid, .. } = use_name else {
                 return None;
             };
-            let _ = tree;
             sites.iter().find(|(u, _)| u == uid).and_then(|(_, s)| *s)
         }
 
@@ -861,7 +858,7 @@ f(2)
         let mut sites = Vec::new();
         binder_sites(&tree, &mut sites);
         let use_of_p = find_use(&tree, "p").expect("the body mentions `p`");
-        let site = resolve_use(&tree, use_of_p, &sites).expect("`p`'s binder carries its site");
+        let site = resolve_use(use_of_p, &sites).expect("`p`'s binder carries its site");
 
         // `p` is written once, at the parameter position of `def f(p)`.
         let expected = code.find("(p)").expect("the parameter is written") + 1;
@@ -884,15 +881,23 @@ f(2)
     fn every_source_binder_form_carries_its_site() {
         use crate::ccl::Name;
 
+        // Every binder form appears here, and each one at a *distinct* lowering
+        // arm: the assignment and annotated-assignment arms differ, and each has
+        // a second copy for a statement inside a loop body. The comprehension
+        // carries a guard so the predicate lambda's binder is reached as well as
+        // the per-element one.
         let code = "\
 xs = [1, 2, 3]
 g = 10
+n: Int = 3
 def f(p):
-  p + g
-ys = [x * 2 for x in xs]
+  p + g + n
+ys = [x * 2 for x in xs if x > 1]
 acc := 0
 for i in xs:
-  acc += i
+  z = i * 2
+  w: Int = z + 1
+  acc += w
 total = acc + f(1)
 match total:
   case `some(v):
@@ -916,7 +921,9 @@ match total:
 
         // Each of these is written exactly once in the program above, so its
         // binder's site is the span of that spelling.
-        for name in ["xs", "g", "f", "p", "ys", "x", "acc", "i", "total", "v"] {
+        for name in [
+            "xs", "g", "n", "f", "p", "ys", "x", "acc", "i", "z", "w", "total", "v",
+        ] {
             let entries: Vec<_> = found.iter().filter(|(b, _)| b == name).collect();
             assert!(
                 !entries.is_empty(),
@@ -941,16 +948,29 @@ match total:
     fn a_minted_binder_carries_no_source_site() {
         // The comprehension's plumbing binders are lowering's, not the author's.
         let tree = pipeline_front("xs = [1, 2]\nys = [x for x in xs]\nys\n");
-        fn minted_with_a_site(e: &Expr, out: &mut Vec<String>) {
+        fn minted(e: &Expr, out: &mut Vec<(String, bool)>) {
             e.walk_binders(|b| {
-                if b.name.base().starts_with("__") && b.name_span.is_some() {
-                    out.push(b.name.base().to_string());
+                if b.name.base().starts_with("__") {
+                    out.push((b.name.base().to_string(), b.name_span.is_some()));
                 }
             });
-            e.walk_children(|c| minted_with_a_site(c, out));
+            e.walk_children(|c| minted(c, out));
         }
-        let mut bad = Vec::new();
-        minted_with_a_site(&tree, &mut bad);
+        let mut minted_binders = Vec::new();
+        minted(&tree, &mut minted_binders);
+        // Non-vacuity: lowering a comprehension mints binders (the correlation
+        // record, the tuple argument), so an empty set here means the walk stopped
+        // finding them and the check below proves nothing.
+        assert!(
+            !minted_binders.is_empty(),
+            "the comprehension's lowering mints binders; finding none means this \
+             test no longer checks anything"
+        );
+        let bad: Vec<_> = minted_binders
+            .iter()
+            .filter(|(_, has_site)| *has_site)
+            .map(|(b, _)| b)
+            .collect();
         assert!(
             bad.is_empty(),
             "a minted binder claims a source site: {bad:?}"

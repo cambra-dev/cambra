@@ -186,10 +186,12 @@ pub(super) fn uncurry_params(
             Some(Ok((mut_ty, _is_txn))) => mut_ty,
             _ => Type::Hole,
         };
-        let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
+        // The binder was written here, so it carries its own site.
+        let mut lam = with_binder_site(
+            Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr),
+            params[0].name_span,
+        );
         if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
-            // The binder was written here, so it carries its own site.
-            param.name_span = Some(params[0].name_span);
             // A `Mut(…)` annotation is already *in* `param.ty` above, and
             // `emit_lambda` binds at `user_annotation.or(param.ty)`, so restating it
             // as an annotation would be the same type twice.
@@ -233,11 +235,13 @@ pub(super) fn uncurry_params(
                 },
             };
             let param_ty = history_ty.clone().unwrap_or(Type::Hole);
-            let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
+            // A curried parameter stays a named binder, so it keeps its own
+            // site like a single parameter does.
+            let mut lam = with_binder_site(
+                Expr::lambda(param.name.as_str(), param_ty.clone(), acc),
+                param.name_span,
+            );
             if let TypedExprNode::Lambda { param: p, .. } = &mut lam.node {
-                // A curried `Mut` parameter stays a named binder, so it keeps
-                // its own site like a single parameter does.
-                p.name_span = Some(param.name_span);
                 match (history_ty, &param.annotation) {
                     // The carrier is both the binder type and its declaration.
                     (Some(_), _) => p.declare(param_ty),

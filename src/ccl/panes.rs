@@ -1034,4 +1034,78 @@ mod tests {
             );
         }
     }
+
+    /// A substituted parameter's two spans stay on **distinct** nodes, pane by
+    /// pane, for as long as the projection carries them at all.
+    ///
+    /// `uncurry_params` answers "where is `a` declared" with a pair — the
+    /// projection root carries the occurrence, its `Proj` child the declaration
+    /// (`src/ccl/design/ir.md`, "A substituted parameter's site rides its
+    /// projection"). A `SourceAttribution`'s `spans` is a *set* and the fold
+    /// unions attributions along its edges, so the pair is only readable while no
+    /// node holds both halves. `lower/functions.rs` pins the pair as lowering
+    /// emits it; this pins that folding four pane pairs onto it does not merge
+    /// them, which is the property a consumer reading a lowered pane depends on.
+    ///
+    /// It also pins where the answer stops. `lambda_elim` rewrites the body
+    /// point-free and the parameter spans do not reach its pane — so the
+    /// mechanism covers the panes before it and no further, and a change that
+    /// carried them through would fail here and be a guarantee worth widening in
+    /// `ir.md` rather than a silent improvement.
+    #[test]
+    fn a_substituted_parameters_two_spans_stay_on_distinct_nodes() {
+        use crate::chl_parser::ast::Span;
+
+        let code = "def add(a, b):\n  a + a + b\nadd(1, 2)\n";
+        // `a` and `b` as written: two declarations and three occurrences.
+        let decls = [Span::new(8, 9), Span::new(11, 12)];
+        let occurrences = [Span::new(17, 18), Span::new(21, 22), Span::new(25, 26)];
+
+        let panes = compile_ok(code).materialize_panes();
+        for name in [
+            "pre-inference",
+            "post-inference",
+            "post-channelize",
+            "post-as-of-read",
+        ] {
+            let projection = panes.projection(name);
+            let (mut saw_decl, mut saw_occurrence) = (false, false);
+            for (id, attr) in projection.iter() {
+                let decl = attr.spans.iter().any(|s| decls.contains(s));
+                let occurrence = attr.spans.iter().any(|s| occurrences.contains(s));
+                assert!(
+                    !(decl && occurrence),
+                    "pane {name}: {id:?} carries a parameter's declaration and an \
+                     occurrence at once ({:?}), so a consumer cannot tell the two \
+                     apart",
+                    attr.spans
+                );
+                saw_decl |= decl;
+                saw_occurrence |= occurrence;
+            }
+            assert!(
+                saw_decl && saw_occurrence,
+                "pane {name}: the projection carries no parameter spans at all \
+                 (declaration: {saw_decl}, occurrence: {saw_occurrence}), so the \
+                 disjointness above proves nothing"
+            );
+        }
+
+        // The bound: `lambda_elim` does not carry the parameter spans forward.
+        let after = panes.projection("post-lambda-elim");
+        let carried: Vec<_> = after
+            .iter()
+            .filter(|(_, a)| {
+                a.spans
+                    .iter()
+                    .any(|s| decls.contains(s) || occurrences.contains(s))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            carried.is_empty(),
+            "post-lambda-elim now carries parameter spans ({carried:?}) — widen \
+             the guarantee in `ir.md` and extend the pane list above"
+        );
+    }
 }

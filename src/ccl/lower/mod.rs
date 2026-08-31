@@ -685,17 +685,18 @@ impl LoweringContext {
     }
 }
 
-/// Prefix for synthetic parameter names representing the tupled domain of a
-/// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
-/// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
 /// Record `span` as the source site of the name the binder at `expr`'s root was
 /// written at.
 ///
-/// One place says "this node's binder came from that source name", because the
-/// alternative is the same field assignment at every lowering arm that builds a
-/// binding, and a form added later would silently ship `None`. Panics in debug
-/// on a node that introduces no binder, which is a caller bug rather than a
-/// program error.
+/// This and [`TypedBinding::at_name_span`] are the only two setters, split by
+/// what the arm holds: this one takes an already-built node, that one a binding
+/// still under construction. Neither the field nor the assignment appears at a
+/// lowering arm, because an arm that writes the field directly is an arm a later
+/// form can be added beside while silently shipping `None`. Panics in debug on a
+/// node that introduces no binder, which is a caller bug rather than a program
+/// error — and a bug the caller's own next test run reports, since the node kind
+/// is spelled out at the call site rather than decided by the program being
+/// lowered.
 ///
 /// A binder with no source name — lowering's own plumbing — simply does not go
 /// through here: `TypedBinding::name_span` is `None` by construction. See
@@ -716,6 +717,9 @@ pub(super) fn with_binder_site(mut expr: Expr, span: Span) -> Expr {
     expr
 }
 
+/// Prefix for synthetic parameter names representing the tupled domain of a
+/// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
+/// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
 const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
 
 /// Return the canonical data-source name for the requests side of

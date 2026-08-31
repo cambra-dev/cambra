@@ -132,9 +132,16 @@ pub struct TypedBinding {
 /// never disagree.
 impl PartialEq for TypedBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.ty == other.ty
-            && self.user_annotation == other.user_annotation
+        // Destructured so a field added later is a compile error here rather
+        // than a silent omission: the derive this replaces failed loudly, and a
+        // hand-written `eq` would not.
+        let TypedBinding {
+            name,
+            ty,
+            user_annotation,
+            name_span: _,
+        } = self;
+        *name == other.name && *ty == other.ty && *user_annotation == other.user_annotation
     }
 }
 
@@ -167,8 +174,11 @@ impl TypedBinding {
 
     /// Record the source span of the name written at this binding site.
     ///
-    /// The one way a [`name_span`](Self::name_span) is set: a lowering arm that
-    /// holds the source binder calls this, and every other binder keeps `None`.
+    /// One of the two ways a [`name_span`](Self::name_span) is set, and the one
+    /// for a binding under construction; `lower::with_binder_site` is the other,
+    /// and sets the field on the binder inside an already-built node. A lowering
+    /// arm holding the source binder calls one of them, and every other binder
+    /// keeps `None`.
     pub fn at_name_span(mut self, span: Span) -> Self {
         self.name_span = Some(span);
         self

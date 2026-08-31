@@ -1512,7 +1512,9 @@ pub(super) fn lower_match(
         // `_` because that is what `_` means, and for the payload-less form because
         // there is nothing there to read.
         let (binder, binder_span) = match &pat.payload {
-            PayloadPattern::Named(name, span) => (name.as_str().to_string(), Some(*span)),
+            PayloadPattern::Named { name, name_span } => {
+                (name.as_str().to_string(), Some(*name_span))
+            }
             // A reserved spelling standing in for a payload the arm declined to
             // name, so there is no source name and no site.
             PayloadPattern::Ignored | PayloadPattern::Absent => (ctx.fresh_ignored_payload(), None),
@@ -1531,11 +1533,9 @@ pub(super) fn lower_match(
         branches.push(Branch {
             pattern: Some(Pattern {
                 tag: pat.tag.as_str().to_string(),
-                binding: TypedBinding {
-                    name: binder.into(),
-                    ty: Type::Hole,
-                    user_annotation: None,
-                    name_span: binder_span,
+                binding: match binder_span {
+                    Some(span) => TypedBinding::new_unannotated(binder).at_name_span(span),
+                    None => TypedBinding::new_unannotated(binder),
                 },
                 empty_payload,
             }),

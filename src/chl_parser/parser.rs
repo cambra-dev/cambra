@@ -1543,7 +1543,7 @@ where
                 };
             }
             let payload = match binder {
-                Some(Some((name, span))) => PayloadPattern::Named(name, span),
+                Some(Some((name, name_span))) => PayloadPattern::Named { name, name_span },
                 Some(None) => PayloadPattern::Ignored,
                 None => PayloadPattern::Absent,
             };
@@ -2212,7 +2212,9 @@ mod tests {
                 assert_eq!(arms.len(), 2);
                 let p0 = arms[0].pattern.as_ref().expect("tagged arm");
                 assert_eq!(p0.tag.as_str(), "some");
-                assert!(matches!(&p0.payload, PayloadPattern::Named(n, _) if n.as_str() == "v"));
+                assert!(
+                    matches!(&p0.payload, PayloadPattern::Named { name, .. } if name.as_str() == "v")
+                );
                 let p1 = arms[1].pattern.as_ref().expect("tagged arm");
                 assert_eq!(p1.tag.as_str(), "none");
                 assert_eq!(p1.payload, PayloadPattern::Absent);
@@ -2250,7 +2252,7 @@ mod tests {
         assert_eq!(arms.len(), 2);
         assert!(matches!(
             &arms[0].pattern.as_ref().expect("tagged arm").payload,
-            PayloadPattern::Named(n, _) if n.as_str() == "n"
+            PayloadPattern::Named { name, .. } if name.as_str() == "n"
         ));
         assert_eq!(
             arms[1].pattern.as_ref().expect("tagged arm").payload,
