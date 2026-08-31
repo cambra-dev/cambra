@@ -31,10 +31,10 @@ use crate::{
 /// domain is decided this operator emits nothing, exactly as any operator awaiting its
 /// input does.
 pub struct CheckedLookup {
+    /// Identity and the answer's tiling, one `` {`none | `some{𝑉}} `` per key.
+    base: OperatorBase,
     /// Where the collection and the keys come from — see [`LookupSource`].
     source: LookupSource,
-    /// The answer, one `` {`none | `some{𝑉}} `` per key.
-    tiling: Tiling,
 }
 
 /// The two ways a lookup's operands reach this operator.
@@ -65,8 +65,8 @@ impl CheckedLookup {
     ) -> Self {
         let tiling = answer_tiling(keys.tiling(), option_extent);
         Self {
+            base: OperatorBase::new(tiling),
             source: LookupSource::Split { collection, keys },
-            tiling,
         }
     }
 
@@ -117,8 +117,8 @@ impl CheckedLookup {
             codomain: Box::new(Tiling::Scalar(option_extent)),
         };
         Ok(Self {
+            base: OperatorBase::new(tiling),
             source: LookupSource::Paired(pairs),
-            tiling,
         })
     }
 }
@@ -136,9 +136,7 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
 }
 
 impl TileOperator for CheckedLookup {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         match &self.source {
@@ -182,7 +180,7 @@ impl TileOperator for CheckedLookup {
             )),
         };
         Box::new(CheckedLookupProducer {
-            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &self.base.tiling),
             source,
             released: false,
         })

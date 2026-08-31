@@ -58,7 +58,7 @@ use crate::interpreter::{
 use crate::pretty_graph::VizOptions;
 use crate::pretty_tree::InspectNode;
 
-use crate::interpreter::tile_operators::impl_producer_base;
+use crate::interpreter::tile_operators::{OperatorBase, impl_operator_base, impl_producer_base};
 
 /// A commit timestamp — a position on the runtime's monotonic commit clock.
 ///
@@ -775,7 +775,8 @@ pub struct CommitOperator {
     /// trivial init operator; a collection key has no entry (its log starts
     /// empty). This is the op-conversion seeding path.
     init_ops: Vec<(Value, Box<dyn TileOperator>)>,
-    output_tiling: Tiling,
+    /// Identity and the store's output tiling.
+    base: OperatorBase,
     writer_inputs: Vec<CycleSlot<dyn TileOperator>>,
     /// Per writer, the keys it may write — its **static** footprint, so a
     /// conditionally-written key still counts. This is what lets the store close
@@ -802,7 +803,7 @@ impl CommitOperator {
         Self {
             init,
             init_ops: Vec::new(),
-            output_tiling,
+            base: OperatorBase::new(output_tiling),
             writer_inputs: (0..writer_write_keys.len())
                 .map(|_| CycleSlot::new())
                 .collect(),
@@ -827,7 +828,7 @@ impl CommitOperator {
         Self {
             init: HashMap::new(),
             init_ops,
-            output_tiling,
+            base: OperatorBase::new(output_tiling),
             writer_inputs: (0..writer_write_keys.len())
                 .map(|_| CycleSlot::new())
                 .collect(),
@@ -843,9 +844,7 @@ impl CommitOperator {
 }
 
 impl TileOperator for CommitOperator {
-    fn tiling(&self) -> &Tiling {
-        &self.output_tiling
-    }
+    impl_operator_base!();
 
     fn subscribe(
         &mut self,
@@ -901,13 +900,13 @@ impl TileOperator for CommitOperator {
             .collect::<Vec<_>>();
         let n = writer_producers.len();
         Box::new(CommitProducer {
-            base: ProducerBase::new(CommitProducer::alloc_id(), &self.output_tiling),
+            base: ProducerBase::new(CommitProducer::alloc_id(), &self.base.tiling),
             writer_producers,
             consumed: vec![0; n],
             writer_terminal: vec![false; n],
             writer_write_keys: self.writer_write_keys.clone(),
             engine: CommitEngine::new(init),
-            output_tiling: self.output_tiling.clone(),
+            output_tiling: self.base.tiling.clone(),
             drain_start: 0,
         })
     }
@@ -1258,7 +1257,8 @@ pub struct InductionStore {
     /// Reply-tap decision fields, appended to each write set (see
     /// [`body_decision_at`]). Empty for a store with no feed.
     tap_fields: Vec<String>,
-    output_tiling: Tiling,
+    /// Identity and the store's output tiling.
+    base: OperatorBase,
 }
 
 impl InductionStore {
@@ -1278,7 +1278,7 @@ impl InductionStore {
             body_input: CycleSlot::new(),
             write_keys,
             tap_fields,
-            output_tiling,
+            base: OperatorBase::new(output_tiling),
         }
     }
 
@@ -1291,9 +1291,7 @@ impl InductionStore {
 }
 
 impl TileOperator for InductionStore {
-    fn tiling(&self) -> &Tiling {
-        &self.output_tiling
-    }
+    impl_operator_base!();
 
     fn subscribe(
         &mut self,
@@ -1338,7 +1336,7 @@ impl TileOperator for InductionStore {
             body_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
         };
         Box::new(InductionStoreProducer {
-            base: ProducerBase::new(InductionStoreProducer::alloc_id(), &self.output_tiling),
+            base: ProducerBase::new(InductionStoreProducer::alloc_id(), &self.base.tiling),
             // Seed tick 0 with the accumulators' inits, so the changelog is
             // self-describing: `read_as_of`/`store_value_at` fold to the init below
             // the first *iteration* change (a leading carry) without an external
@@ -1348,7 +1346,7 @@ impl TileOperator for InductionStore {
             body_producer,
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
-            output_tiling: self.output_tiling.clone(),
+            output_tiling: self.base.tiling.clone(),
         })
     }
 }
@@ -1558,7 +1556,7 @@ impl TileProducer for InductionStoreProducer {
 /// [`AsOf`], sampling an arbitrary commit position. Which reader a program gets
 /// is selected by the term it wrote, never inferred from the reading loop.
 pub struct StoreValueStream {
-    tiling: Tiling,
+    base: OperatorBase,
     store_op: Box<dyn TileOperator>,
     key: Value,
     value_extent: Extent,
@@ -1579,10 +1577,10 @@ impl StoreValueStream {
         carry_forward: bool,
     ) -> Self {
         Self {
-            tiling: Tiling::SealedFunction {
+            base: OperatorBase::new(Tiling::SealedFunction {
                 domain: Extent::Base(BaseType::UInt),
                 codomain: Box::new(Tiling::Scalar(value_extent.clone())),
-            },
+            }),
             store_op,
             key,
             value_extent,
@@ -1592,9 +1590,7 @@ impl StoreValueStream {
 }
 
 impl TileOperator for StoreValueStream {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -1614,7 +1610,7 @@ impl TileOperator for StoreValueStream {
             .store_op
             .subscribe(g, forwarding_consumer(&consumer), scheduler);
         Box::new(StoreValueStreamProducer {
-            base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), &self.base.tiling),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -1770,7 +1766,7 @@ impl TileProducer for StoreValueStreamProducer {
 /// changelog holds the seed.
 pub struct StoreFinalRead {
     /// Output tiling `Scalar(V)` — a terminal read is one value, not a stream.
-    tiling: Tiling,
+    base: OperatorBase,
     /// The commit store (a [`Tile::Store`] fan branch).
     store_op: Box<dyn TileOperator>,
     /// The key whose settled value this reads.
@@ -1781,7 +1777,7 @@ pub struct StoreFinalRead {
 impl StoreFinalRead {
     pub fn new(store_op: Box<dyn TileOperator>, key: Value, value_extent: Extent) -> Self {
         Self {
-            tiling: Tiling::Scalar(value_extent.clone()),
+            base: OperatorBase::new(Tiling::Scalar(value_extent.clone())),
             store_op,
             key,
             value_extent,
@@ -1790,9 +1786,7 @@ impl StoreFinalRead {
 }
 
 impl TileOperator for StoreFinalRead {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("store", self.store_op.inspect(opts))
     }
@@ -1812,7 +1806,7 @@ impl TileOperator for StoreFinalRead {
             .store_op
             .subscribe(g, forwarding_consumer(&consumer), scheduler);
         Box::new(StoreFinalReadProducer {
-            base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), &self.base.tiling),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -1907,7 +1901,7 @@ impl TileProducer for StoreFinalReadProducer {
 /// `fan_in`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
     /// Output tiling `SealedFunction { domain: D, codomain: Scalar(V) }`.
-    tiling: Tiling,
+    base: OperatorBase,
     /// Enumerates the loop extent `D` (its positions drive the output domain, so
     /// it aligns with any co-iterated source over the same `D`).
     trigger: Box<dyn TileOperator>,
@@ -1949,7 +1943,7 @@ impl StoreDenseRead {
             codomain: Box::new(Tiling::Scalar(value_extent.clone())),
         };
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             trigger,
             store_op,
             key,
@@ -1960,9 +1954,7 @@ impl StoreDenseRead {
 }
 
 impl TileOperator for StoreDenseRead {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -1984,7 +1976,7 @@ impl TileOperator for StoreDenseRead {
                 .subscribe(g, forwarding_consumer(&consumer), scheduler)
         };
         Box::new(StoreDenseReadProducer {
-            base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), &self.base.tiling),
             trigger_producer,
             store_producer,
             key: self.key.clone(),
@@ -2261,7 +2253,7 @@ impl AsOfOutput {
 pub struct AsOf {
     /// Output tiling: `SealedFunction { domain: B, codomain }` where `codomain`
     /// is `Scalar(V)` (single mutable variable) or `Record{field: Scalar(V)}` (snapshot).
-    tiling: Tiling,
+    base: OperatorBase,
     /// The trigger stream `Fun(B, _)` — drives one output position each.
     trigger: Box<dyn TileOperator>,
     /// The shared commit store (a [`Tile::Store`] fan branch) — the sampled
@@ -2317,7 +2309,7 @@ impl AsOf {
             codomain: Box::new(output.codomain_tiling()),
         };
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             trigger,
             source,
             output,
@@ -2326,9 +2318,7 @@ impl AsOf {
 }
 
 impl TileOperator for AsOf {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("trigger", self.trigger.inspect(opts))
@@ -2355,12 +2345,12 @@ impl TileOperator for AsOf {
         let source = self
             .source
             .subscribe(sg, forwarding_consumer(&consumer), scheduler);
-        let b_extent = match &self.tiling {
+        let b_extent = match &self.base.tiling {
             Tiling::SealedFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiling is SealedFunction"),
         };
         Box::new(AsOfProducer {
-            base: ProducerBase::new(AsOfProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(AsOfProducer::alloc_id(), &self.base.tiling),
             trigger,
             source,
             output: self.output.clone(),
@@ -2802,7 +2792,7 @@ fn subscribe_driver_inputs(
 /// makes the cycle well-founded — the body is never asked for a position whose
 /// predecessor is undecided.
 pub struct InductionDriver {
-    tiling: Tiling,
+    base: OperatorBase,
     /// The store read back through the cyclic `FanOut`.
     store_op: Box<dyn TileOperator>,
     /// The iteration source `Fun(D, item)` — the loop extent's items in order.
@@ -2827,7 +2817,7 @@ impl InductionDriver {
             "each read key carries its own value extent"
         );
         Self {
-            tiling: body_input_tiling(&read_extents, &item_extent),
+            base: OperatorBase::new(body_input_tiling(&read_extents, &item_extent)),
             store_op,
             source_op,
             read_keys,
@@ -2838,9 +2828,7 @@ impl InductionDriver {
 }
 
 impl TileOperator for InductionDriver {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn subscribe(
         &mut self,
@@ -2855,7 +2843,7 @@ impl TileOperator for InductionDriver {
             scheduler,
         );
         Box::new(InductionDriverProducer {
-            base: ProducerBase::new(InductionDriverProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(InductionDriverProducer::alloc_id(), &self.base.tiling),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -3096,7 +3084,7 @@ impl TileProducer for InductionDriverProducer {
 /// writer's supersession release still in place. Measured both ways by
 /// `a_contended_item_keeps_the_drive_window_flat`.
 pub struct TransactDriver {
-    tiling: Tiling,
+    base: OperatorBase,
     /// The store read back through the cyclic `FanOut`.
     store_op: Box<dyn TileOperator>,
     /// The transaction source — one item per transaction to attempt.
@@ -3121,7 +3109,7 @@ impl TransactDriver {
             "each read key carries its own value extent"
         );
         Self {
-            tiling: body_input_tiling(&read_extents, &item_extent),
+            base: OperatorBase::new(body_input_tiling(&read_extents, &item_extent)),
             store_op,
             source_op,
             read_keys,
@@ -3132,9 +3120,7 @@ impl TransactDriver {
 }
 
 impl TileOperator for TransactDriver {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn subscribe(
         &mut self,
@@ -3149,7 +3135,7 @@ impl TileOperator for TransactDriver {
             scheduler,
         );
         Box::new(TransactDriverProducer {
-            base: ProducerBase::new(TransactDriverProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(TransactDriverProducer::alloc_id(), &self.base.tiling),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -3522,7 +3508,7 @@ fn body_decision_at(
 /// Releasing the driver row acks the attempt's finish, so the driver advances to the next
 /// item. Retries (a fresh attempt at a new frontier) append as new positions.
 pub struct TransactWriter {
-    tiling: Tiling,
+    base: OperatorBase,
     store_op: Box<dyn TileOperator>,
     body_op: Box<dyn TileOperator>,
     /// A second branch of the [`TransactDriver`] the body reads. The writer pulls
@@ -3559,7 +3545,7 @@ impl TransactWriter {
         value_extent: Extent,
     ) -> Self {
         Self {
-            tiling: proposal_stream_tiling(&key_extent, &value_extent),
+            base: OperatorBase::new(proposal_stream_tiling(&key_extent, &value_extent)),
             store_op,
             body_op,
             driver_op,
@@ -3571,9 +3557,7 @@ impl TransactWriter {
 }
 
 impl TileOperator for TransactWriter {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -3603,7 +3587,7 @@ impl TileOperator for TransactWriter {
             self.driver_op
                 .subscribe(dg, forwarding_consumer(&consumer), scheduler);
         Box::new(TransactWriterProducer {
-            base: ProducerBase::new(TransactWriterProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(TransactWriterProducer::alloc_id(), &self.base.tiling),
             store_producer,
             body_producer,
             driver_producer,
