@@ -2,11 +2,8 @@
 //!
 //! This is the [`NameBinderIndex`] — the source-level answer to lexical name
 //! questions, enumerated onto the wire as the payload's `definitions` (use →
-//! binder) and the name half of its `scopes` (the binders visible in a region).
-//! Unlike [`SpanIndex`], which projects the *typed IR* back onto source spans,
-//! this index resolves purely over the **surface AST** ([`Module`]).
-//!
-//! [`SpanIndex`]: crate::inspector_model::SpanIndex
+//! binder). It resolves purely over the **surface AST** ([`Module`]); a pane's
+//! node entries carry the typed IR's own spans.
 //!
 //! # Why source-level
 //!
@@ -42,19 +39,6 @@ use crate::chl_parser::ast::{
 };
 use smol_str::SmolStr;
 
-/// A name binding visible at some position: the bound name and the source span
-/// of its binding site (its definition span).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Binding {
-    /// The bound name.
-    pub name: SmolStr,
-    /// The source span of the binder — the `defSpan` a payload row carries. For
-    /// a parameter this is its [`Param.name_span`](crate::chl_parser::ast::Param::name_span);
-    /// for an assignment it is the target's span; for a `def` it is the name's
-    /// span.
-    pub def_span: Span,
-}
-
 /// One resolved use→binder pair, the enumeration unit behind the
 /// `/api/snapshot` `definitions` array: a `Name` use, the binder it resolves
 /// to, and the bound name.
@@ -68,32 +52,17 @@ pub struct Definition {
     pub name: SmolStr,
 }
 
-/// One scope region, the enumeration unit behind the `/api/snapshot` `scopes`
-/// array: a binder-bearing span plus the binders visible inside it. The type
-/// join (each binding's `type`) is added by the payload assembler, which has
-/// the [`SpanIndex`](crate::inspector_model::SpanIndex).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScopeRegion {
-    /// The source span of the region.
-    pub span: Span,
-    /// The binders visible inside it, outermost → innermost.
-    pub bindings: Vec<Binding>,
-}
-
 /// Source-level lexical name resolution over the parsed CHL [`Module`].
 ///
-/// Built once over the surface AST ([`build`](Self::build)); enumerated by
-/// [`definitions`](Self::definitions) (every resolved use→binder pair) and
-/// [`scopes`](Self::scopes) (every binder-bearing region with the names visible
-/// inside it).
+/// Built once over the surface AST ([`build`](Self::build)) and enumerated by
+/// [`definitions`](Self::definitions), every resolved use→binder pair.
 ///
 /// # Resolution by span
 ///
-/// Every handle the enumerations carry is a source [`Span`]: a use span, a
-/// binder's def-span, a region's span. Both enumerations walk the AST with the
-/// same scope bookkeeping, resolving each use against the binder stack live at
-/// it; an unbound use contributes no row. The index owns its copy of the
-/// `Module`, and each enumeration re-runs the walk rather than caching a
+/// Every handle the enumeration carries is a source [`Span`]: a use span and a
+/// binder's def-span. The walk resolves each use against the binder stack live
+/// at it; an unbound use contributes no row. The index owns its copy of the
+/// `Module`, and the enumeration re-runs the walk rather than caching a
 /// span→binder map with shadowing.
 #[derive(Clone, Debug)]
 pub struct NameBinderIndex {
@@ -148,61 +117,10 @@ impl NameBinderIndex {
         });
         out
     }
-
-    /// Enumerate every binder-introducing scope region in the module and the
-    /// binders visible inside it — the data behind the `/api/snapshot` `scopes`
-    /// array (the type join is the caller's, since it needs the `SpanIndex`).
-    ///
-    /// A region is emitted per statement and per expression, minus those where
-    /// no name is visible and those repeating a span and binder set already
-    /// emitted — a statement and its expression share a span, so the walk reaches
-    /// one region twice. The binders are the ones visible at the region's start,
-    /// outermost → innermost. See `src/inspector_model/design.md`, "Definitions
-    /// and scopes are source-level".
-    ///
-    /// Pure; re-walks the AST. Regions may nest and overlap (an inner body's
-    /// region is a sub-span of its enclosing sequence's), mirroring the lexical
-    /// structure — the schema's `scopes` is a flat list of such regions, not a
-    /// tree.
-    pub fn scopes(&self) -> Vec<ScopeRegion> {
-        let mut out: Vec<ScopeRegion> = Vec::new();
-        let mut seen: std::collections::HashSet<RegionKey> = std::collections::HashSet::new();
-        let mut scopes: Vec<Scoped> = Vec::new();
-        walk_module(&self.module, &mut scopes, &mut |ev| {
-            if let Event::Scope { span, scopes } = ev {
-                let bindings = visible_bindings(scopes, span.start);
-                // A statement and its expression share a span and see the same
-                // names, so the walk reaches one region twice. A repeat carries
-                // nothing a consumer can act on, so the first one stands.
-                if !bindings.is_empty() && seen.insert(region_key(span, &bindings)) {
-                    out.push(ScopeRegion { span, bindings });
-                }
-            }
-        });
-        out
-    }
-}
-
-/// What makes two [`ScopeRegion`]s the same row: one span over one set of
-/// visible binders. [`Span`] is not `Hash`, so the offsets stand in for it.
-type RegionKey = (usize, usize, Vec<(SmolStr, usize, usize)>);
-
-/// The deduplication key of a region — see [`RegionKey`].
-fn region_key(span: Span, bindings: &[Binding]) -> RegionKey {
-    (
-        span.start,
-        span.end,
-        bindings
-            .iter()
-            .map(|b| (b.name.clone(), b.def_span.start, b.def_span.end))
-            .collect(),
-    )
 }
 
 /// An event surfaced during the AST walk: an [`Event::Use`] at every `Name`
-/// occurrence and an [`Event::Scope`] at every statement and every expression,
-/// carrying the binder stack live there. Scope events are that dense because
-/// every region a name is visible in ships as a `scopes` row.
+/// occurrence, carrying the binder stack live there.
 ///
 /// Both borrows are tied to the single lifetime `'s` of the in-progress walk;
 /// the visitor (a higher-ranked `FnMut`) may inspect them only for the duration
@@ -211,11 +129,6 @@ enum Event<'s> {
     /// A `Name` use occurrence.
     Use {
         name: &'s SmolStr,
-        span: Span,
-        scopes: &'s [Scoped<'s>],
-    },
-    /// A binder-bearing region and the binder stack visible inside it.
-    Scope {
         span: Span,
         scopes: &'s [Scoped<'s>],
     },
@@ -229,29 +142,6 @@ fn resolve(name: &SmolStr, use_span: Span, in_scope: &[Scoped]) -> Option<Span> 
         .rev()
         .find(|b| b.name == name && use_span.start >= b.visible_from)
         .map(|b| b.def_span)
-}
-
-/// The set of visible bindings at `pos`, innermost shadowing outermost,
-/// returned outermost → innermost with shadowed names removed.
-fn visible_bindings(in_scope: &[Scoped], pos: usize) -> Vec<Binding> {
-    use std::collections::HashSet;
-    // Walk innermost → outermost so the first occurrence of a name is the one
-    // that wins; collect into the natural (outermost→innermost) order after.
-    let mut seen: HashSet<&SmolStr> = HashSet::new();
-    let mut innermost_first: Vec<Binding> = Vec::new();
-    for b in in_scope.iter().rev() {
-        if pos < b.visible_from {
-            continue;
-        }
-        if seen.insert(b.name) {
-            innermost_first.push(Binding {
-                name: b.name.clone(),
-                def_span: b.def_span,
-            });
-        }
-    }
-    innermost_first.reverse();
-    innermost_first
 }
 
 /// Callback invoked for every [`Event`] surfaced by the walk. The higher-ranked
@@ -283,12 +173,6 @@ fn walk_stmt_seq<'a>(
 
 fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &mut Visitor<'_>) {
     let stmt_end = stmt.span.end;
-    // Surface the scope live *at* this statement (binders preceding it in the
-    // sequence), so a `bindings_in_scope` position landing on it captures them.
-    visit(Event::Scope {
-        span: stmt.span,
-        scopes,
-    });
     match &stmt.node {
         Stmt::Expr(e) => walk_expr(e, scopes, visit),
 
@@ -345,7 +229,7 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
                 // unused-binder spelling and a bare `` case `tag: `` says the tag
                 // carries no payload, so neither names anything the body can use.
                 if let Some(MatchPattern {
-                    payload: PayloadPattern::Named(name, name_span),
+                    payload: PayloadPattern::Named { name, name_span },
                     ..
                 }) = pattern
                 {
@@ -438,13 +322,6 @@ fn walk_stmt<'a>(stmt: &'a Spanned<Stmt>, scopes: &mut Vec<Scoped<'a>>, visit: &
 }
 
 fn walk_expr<'a>(expr: &'a Spanned<Expr>, scopes: &mut Vec<Scoped<'a>>, visit: &mut Visitor<'_>) {
-    // Surface the scope live at this expression so a `bindings_in_scope`
-    // position inside a lambda/comprehension body (where the stack carries the
-    // params/targets) captures it.
-    visit(Event::Scope {
-        span: expr.span,
-        scopes,
-    });
     match &expr.node {
         Expr::Name(name) => visit(Event::Use {
             name,
@@ -754,80 +631,6 @@ x
             def_of(&index, trailing_use),
             Some(def1),
             "trailing x pairs with the innermost (shadowing) binder"
-        );
-    }
-
-    /// No two scope regions carry one span and one binder set: a statement and
-    /// its expression are reached separately by the walk and would otherwise
-    /// ship the same row twice.
-    #[test]
-    fn no_scope_region_repeats_a_span_and_binder_set() {
-        let code = "\
-g = 10
-def f(p, q):
-  p + q + g
-f(1, 2)
-";
-        let module = compile_source_ast(code);
-        let regions = NameBinderIndex::build(&module).scopes();
-        assert!(!regions.is_empty(), "the program has visible binders");
-
-        let mut seen = std::collections::HashSet::new();
-        for region in &regions {
-            let key = (
-                region.span.start,
-                region.span.end,
-                region
-                    .bindings
-                    .iter()
-                    .map(|b| b.name.to_string())
-                    .collect::<Vec<_>>(),
-            );
-            assert!(
-                seen.insert(key.clone()),
-                "region {key:?} repeats a row already emitted; {} regions",
-                regions.len()
-            );
-        }
-    }
-
-    /// The scope region at a nested position (inside a `def` body) lists the
-    /// expected visible names: the params + the enclosing-scope binders.
-    #[test]
-    fn scope_region_in_a_def_body_lists_the_visible_names() {
-        let code = "\
-g = 10
-def f(p, q):
-  p + q + g
-f(1, 2)
-";
-        let module = compile_source_ast(code);
-        let index = NameBinderIndex::build(&module);
-
-        // The region emitted for the body use of `p` — a region is emitted per
-        // expression, so this one's span is exactly that occurrence's.
-        let body_use_p = nth_span(code, "p", 1);
-        let region = index
-            .scopes()
-            .into_iter()
-            .find(|r| r.span == body_use_p)
-            .expect("a region is emitted at the body use of p");
-        let names: std::collections::HashSet<String> = region
-            .bindings
-            .into_iter()
-            .map(|b| b.name.to_string())
-            .collect();
-
-        // Inside f's body: params p, q and the outer g are visible. The def
-        // name `f` itself is *not* visible in its own body — CHL does not model
-        // recursion (lowering emits `let f = λ… in …`, with `f` bound only in
-        // the `in` continuation, not the lambda body).
-        assert!(names.contains("p"), "p in scope; got {names:?}");
-        assert!(names.contains("q"), "q in scope; got {names:?}");
-        assert!(names.contains("g"), "outer g in scope; got {names:?}");
-        assert!(
-            !names.contains("f"),
-            "def name f is NOT visible in its own body (no recursion); got {names:?}"
         );
     }
 

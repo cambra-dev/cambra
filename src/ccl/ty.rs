@@ -1623,6 +1623,30 @@ impl Type {
     /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
     /// refinement's predicate must handle [`Type::Refinement`] explicitly
     /// — e.g. by matching on it before calling this helper.
+    /// Every [`Refinement`] riding this type or any of its nested type children,
+    /// in pre-order: the refinements at each level before that level's children.
+    ///
+    /// The one place that shape is written. Three callers need it and each wants
+    /// something different from a refinement — the predicate's ids, the
+    /// predicate's `Rc` identity, the predicate itself as a child edge — so what
+    /// they share is the descent and not the projection. Written out per caller
+    /// it was the same `if let Type::Refinement(_, rs) = t { for r in rs … }`
+    /// followed by the same `t.walk_children(recurse)`, three times, and a type
+    /// variant that carries a nested type would have to be remembered in each.
+    ///
+    /// Does **not** descend into a predicate's own type slots: a predicate is a
+    /// [`TypedExpr`], so its slots are an expression walk's business. A caller
+    /// that needs them recurses itself, which `collect_tree_ids` and
+    /// `predicate_id_collisions` (`crate::ccl::context`) both do.
+    pub fn walk_refinements<'a>(&'a self, f: &mut impl FnMut(&'a Refinement)) {
+        if let Type::Refinement(_, refinements) = self {
+            for r in refinements.iter() {
+                f(r);
+            }
+        }
+        self.walk_children(|c| c.walk_refinements(f));
+    }
+
     pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         match self {
             Type::Base(_)

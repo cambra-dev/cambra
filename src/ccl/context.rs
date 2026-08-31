@@ -590,7 +590,7 @@ pub struct CompiledProgram {
     /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
     /// retained verbatim. It is the anchor for *source-language* questions —
     /// name resolution (`goto-definition`, the binder half of `scope-at`) —
-    /// answered by [`crate::inspector_model::NameBinderIndex`].
+    /// answered by `inspector_model`'s `NameBinderIndex`.
     ///
     /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
     /// (the typed IR): lowering destroys some source variables before any IR
@@ -728,18 +728,17 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         e.walk_children(|c| ids_of(c, out));
     }
     fn from_ty(t: &Type, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        if let Type::Refinement(_, rs) = t {
-            for r in rs.iter() {
-                let key = Rc::as_ptr(&r.predicate) as usize;
-                if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
-                    let mut s = HashSet::new();
-                    ids_of(&r.predicate, &mut s);
-                    slot.insert(s);
-                }
-                from_expr_ty(&r.predicate, acc);
+        t.walk_refinements(&mut |r| {
+            let key = Rc::as_ptr(&r.predicate) as usize;
+            if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
+                let mut s = HashSet::new();
+                ids_of(&r.predicate, &mut s);
+                slot.insert(s);
             }
-        }
-        t.walk_children(|c| from_ty(c, acc));
+            // A predicate is an expression, so its own type slots are an
+            // expression walk's business rather than the type descent's.
+            from_expr_ty(&r.predicate, acc);
+        });
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
         from_ty(&e.ty, acc);
@@ -802,14 +801,9 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut HashSet<NodeId>) {
-        if let Type::Refinement(_, refinements) = t {
-            // Every refinement's predicate rides the slot, so every one of them
-            // carries ids the projections must explain.
-            for r in refinements.iter() {
-                from_expr(&r.predicate, acc);
-            }
-        }
-        t.walk_children(|c| from_ty(c, acc));
+        // Every refinement's predicate rides the slot, so every one of them
+        // carries ids the projections must explain.
+        t.walk_refinements(&mut |r| from_expr(&r.predicate, acc));
     }
 
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {

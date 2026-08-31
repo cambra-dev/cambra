@@ -927,19 +927,21 @@ reference is
 usage model and the wire's versioning; what follows is what that layer reads out
 of this one.
 
-- `SpanIndex::build(ir, projection)` inverts a pane's projection to span → node.
-- `build_node_table` ships each attribution as it is stored: a node's spans
-  plus its `rewritten` tag (`{ via, nature, label }`). The tag serializes as
+- `build_node_table` ships each attribution as it is stored: every span the
+  attribution records, narrowest first, plus its `rewritten` tag
+  (`{ via, nature, label }`). The tag serializes as
   `null` for a direct image — `Nature::Source` null-compresses at the emission
   site via `Nature::is_source`, and the consumer's validator guards that a
   `"source"` nature never actually ships. The wire carries no flat
   `Source`/`Derived`/`Synthetic` label string; the frontend formats the tag
   itself.
 - `paneLinks` ship each pane-pair `ProvenanceMap` **dense** — self-edges included,
-  no identity-edge filter — via `wire::dense_edges`; the frontend only follows
-  edges, never reconstructing them, and reads each edge's label set to decide
-  whether to render the blame or prune it. Every edge endpoint is a live node id
-  in the pane it points into, which
+  no identity-edge filter — via `dense_edges`; the frontend only follows edges,
+  never reconstructing them. An edge's label set stays here and does not reach
+  the wire: resolution is bidirectional and transitive, so a consumer treats
+  `descends` and `relates` alike, while `has_ancestry` drives leak accounting in
+  this layer. Every edge endpoint is a live node id in the pane it points into,
+  which
   `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` pins at the
   producer and the consumer's validator re-checks on the shipped payload.
 - Ids inside refinement predicates are endpoints like any other, so every walk

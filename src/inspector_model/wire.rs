@@ -1,14 +1,11 @@
-//! The `/api/snapshot` bulk payload — the whole read-only model in one
-//! struct, assembled by enumerating the model's two indices.
+//! The `/api/snapshot` bulk payload — the whole read-only model in one struct.
 //!
-//! `/api/snapshot` is the primary read-only endpoint:
-//! source + the panes (each a node table + span→node index) + use→def
-//! definitions + per-scope bindings + diagnostics + meta. This module mirrors
-//! that JSON exactly as a serde-gated [`InspectorPayload`]; the actual
+//! `/api/snapshot` is the primary read-only endpoint: source + the panes (each
+//! a node table) + use→def definitions + diagnostics + meta. This module
+//! mirrors that JSON exactly as a serde-gated [`InspectorPayload`]; the actual
 //! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
 //! Building the payload is pure: it enumerates
-//! [`SpanIndex`](crate::inspector_model::SpanIndex) and
-//! [`NameBinderIndex`](crate::inspector_model::NameBinderIndex) and builds each
+//! `NameBinderIndex` and builds each
 //! pane's node table via [`build_node_table`], over the IR walk `walk.rs` owns.
 //!
 //! # Pane links
@@ -24,21 +21,21 @@
 //! `materialize_panes`. The wire ships it verbatim, so a surviving node's
 //! cross-pane link is a `[id, id]` self-edge and a genuine identity change
 //! (monomorphization or inline fan-out, channelize's cluster and fan-in copies)
-//! is a `u != d` edge. What the density and the labels promise a consumer:
-//! `src/inspector_model/design.md`, "Pane links are dense and labelled".
+//! is a `u != d` edge. What the density promises a consumer:
+//! `src/inspector_model/design.md`, "Pane links are dense".
 //!
 //! # Wire-type isolation
 //!
 //! Every type here carries `#[cfg_attr(feature = "serde", derive(Serialize))]`
-//! with camelCase field names (`spanIndex`, `useSpan`, `defSpan`,
+//! with camelCase field names (`nodeId`, `useSpan`, `defSpan`,
 //! `payloadKind`, …) to match the schema. `cambra` itself never compiles serde
 //! unless the feature is on — see the module-level note on
 //! [`inspector_model`](crate::inspector_model).
 //!
 //! # Populated vs. stubbed
 //!
-//! * `source`, `panes` (each with its own node table + span index),
-//!   `definitions`, `scopes`, `meta` — fully populated.
+//! * `source`, `panes` (each with its own node table), `definitions`, `meta` —
+//!   fully populated.
 //! * `diagnostics` — **always empty `[]`** in this payload: a `/api/snapshot`
 //!   describes a *successfully compiled* program, and there are no warnings. The
 //!   wire type ([`Diagnostic`]) drives the standalone compile-failure path
@@ -46,24 +43,23 @@
 //!   through [`InspectorPayload::degraded`], which carries the same
 //!   diagnostics in place of a real snapshot (see `cambra-inspector::server`'s
 //!   "Transport decision" note).
-//! * `outline` — **omitted** from the payload. Rather than ship an empty stub
-//!   of an undecided shape, the field is left out until an `outline` query
-//!   exists.
-//! * `meta.tick` — `null` (the live seam); `payloadKind` is `"post-inference"`,
-//!   `schema` is [`SCHEMA_VERSION`].
+//! * `outline` and `meta.tick` — **omitted**. Rather than ship an empty stub of
+//!   an undecided shape, or a `null` reserved for a live layer that does not
+//!   exist, a field stays off the wire until something reads it.
+//! * `payloadKind` is `"program"`; `schema` is [`SCHEMA_VERSION`].
 
-use crate::ccl::provenance::{EdgeLabels, NodeId, ProvenanceMap, SourceProjection};
-use crate::ccl::{Expr, FunKind, HistoryKind, Type};
+use crate::ccl::Expr;
+use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 use crate::chl_parser::ast::Span;
 
-use super::name_binder::{Definition, ScopeRegion};
-use super::program::{InspectedProgram, PaneProjection};
+use super::name_binder::Definition;
+use super::program::InspectedProgram;
 use super::walk::{node_label, predicate_children};
 
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
 /// both the success and degraded payloads. See [`Meta::schema`] for the
 /// versioning contract and the current version's field set.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// The `GET /api/snapshot` bulk payload — the whole static read-only model.
 ///
@@ -77,8 +73,6 @@ pub struct InspectorPayload {
     pub source: SourceInfo,
     /// Every resolved use→definition pair.
     pub definitions: Vec<DefinitionEntry>,
-    /// Per-scope visible-binding lists.
-    pub scopes: Vec<ScopeEntry>,
     /// Always empty on the success path (see the module doc's "Populated vs.
     /// stubbed" section) — a failed compile carries real diagnostics through
     /// [`InspectorPayload::degraded`] instead.
@@ -99,8 +93,8 @@ pub struct InspectorPayload {
 
 /// One IR pipeline pane in the multi-pane snapshot.
 ///
-/// Carries its own self-contained node table and span index — each pane
-/// resolves against its own (`Expr`, `SourceProjection`) pair.
+/// Carries its own self-contained node table — each pane resolves against its
+/// own (`Expr`, `SourceProjection`) pair.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
@@ -121,8 +115,6 @@ pub struct PaneEntry {
     /// type slots, most of all — is one entry here that each of those places
     /// names by id.
     pub nodes: Vec<IrNode>,
-    /// Every `(span → nodeId)` entry of this pane's span index.
-    pub span_index: Vec<SpanEntry>,
 }
 
 /// One node of a pane's shipped node table.
@@ -140,34 +132,26 @@ pub struct IrNode {
     /// The node's [`NodeId`](crate::ccl::provenance::NodeId) as a number — the
     /// handle every pane link and span row names.
     pub node_id: u64,
-    /// The **narrowest** source span this node traces to, absent when it traces
-    /// to none. A node several source spans fan into carries one of them here
-    /// and all of them in [`PaneEntry::span_index`], so it stays reachable from
-    /// each.
-    pub span: Option<Span>,
+    /// Every source span this node traces to, narrowest first, empty when it
+    /// traces to none.
+    ///
+    /// A node's attribution records each span that fans into it — `fold` unions
+    /// blame spans, so a node several source positions reach carries all of
+    /// them. Narrowest first because that is the one a consumer renders when it
+    /// wants a single position; a containment scan reads them all. Each distinct
+    /// span appears once.
+    pub spans: Vec<Span>,
     /// The node's rewrite tag, `None` for a
     /// [`Nature::Source`](crate::ccl::provenance::Nature::Source) tag — the root
     /// of a lowered source expression — and for a node the pane's projection
     /// does not cover. The spans channel of the same attribution rides
-    /// [`span`](Self::span).
+    /// [`spans`](Self::spans).
     pub rewritten: Option<RewriteInfo>,
     /// The node's type, rendered by `Display for Type`, so a change to that
     /// rendering changes this verbatim. See
     /// `src/inspector_model/design.md`, "Types on the wire".
     #[cfg_attr(feature = "serde", serde(rename = "type"))]
     pub ty: String,
-    /// Which constructor sits at the top of [`ty`](Self::ty) — `"base"`,
-    /// `"fun"`, `"dataFun"`, `"refinement"`, `"hole"`, … — so a consumer can
-    /// branch on the type without parsing the rendering. Says nothing about what
-    /// is inside the type.
-    pub type_kind: &'static str,
-    /// The predicates riding [`ty`](Self::ty), as ids into this pane's table.
-    ///
-    /// A node's `where.N` children cover every type slot it carries, so they do
-    /// not say which predicate refines *this node's* type; these do. They are the
-    /// node's leading predicate children, since the walk reaches the node's own
-    /// type first.
-    pub predicate_refs: Vec<u64>,
     /// The node's children, each named by id under the edge that reaches it.
     pub children: Vec<IrChild>,
 }
@@ -225,12 +209,9 @@ pub struct PaneLinkEntry {
     pub from: &'static str,
     /// The downstream pane id, e.g. `"post-inference"`.
     pub to: &'static str,
-    /// Every edge as `(upstream_node_id, downstream_node_id, labels)`,
-    /// self-edges included, sorted deterministically. `labels` is a non-empty
-    /// set drawn from `"descends"` (the downstream node was made from the
-    /// upstream one) and `"relates"` (it is *about* the upstream node but was
-    /// not made from it); an edge reachable both ways carries both.
-    pub edges: Vec<(u64, u64, Vec<&'static str>)>,
+    /// Every edge as `(upstream_node_id, downstream_node_id)`, self-edges
+    /// included, sorted deterministically.
+    pub edges: Vec<(u64, u64)>,
 }
 
 /// `{ name, text }` — the program identity + source.
@@ -241,17 +222,6 @@ pub struct SourceInfo {
     pub name: String,
     /// The full source text.
     pub text: String,
-}
-
-/// One `{ span, nodeId }` row of `spanIndex`.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct SpanEntry {
-    /// The origin span.
-    pub span: Span,
-    /// The node indexed under it.
-    pub node_id: NodeId,
 }
 
 /// One `{ useSpan, defSpan, name }` row of `definitions`. The schema's optional
@@ -267,35 +237,6 @@ pub struct DefinitionEntry {
     pub def_span: Span,
     /// The bound name.
     pub name: String,
-}
-
-/// One `{ span, bindings }` row of `scopes`. `nodeId` is omitted: scope regions
-/// are source-AST spans (the `NameBinderIndex` is source-level), not IR
-/// nodes, so there is no single node id to attach.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct ScopeEntry {
-    /// The region's source span.
-    pub span: Span,
-    /// The binders visible in the region, each joined with its type.
-    pub bindings: Vec<ScopeBindingEntry>,
-}
-
-/// One `{ name, defSpan, type }` binding inside a [`ScopeEntry`].
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct ScopeBindingEntry {
-    /// The bound name.
-    pub name: String,
-    /// The binder's source span.
-    pub def_span: Span,
-    /// The binder's declared type, read off the IR node that binds it. `None`
-    /// (serializes as `null`) when no IR node binds the name — a substituted
-    /// multi-param parameter (the deferred substituted-parameter fix).
-    #[cfg_attr(feature = "serde", serde(rename = "type"))]
-    pub ty: Option<Type>,
 }
 
 /// A diagnostic entry.
@@ -324,20 +265,12 @@ pub struct Diagnostic {
     /// The human-readable message (reuses the variant's rendered text).
     pub message: String,
     /// The primary source span, when one is known.
+    ///
+    /// One span, not a list: a diagnostic is built from one `CompileError`,
+    /// which carries at most one range. Pointing at several ranges with distinct
+    /// texts is a different type from this one, and needs a producer that has
+    /// those texts.
     pub span: Option<Span>,
-    /// Labelled spans (one per pointed-at range). Empty when no span is known.
-    pub labels: Vec<DiagnosticLabel>,
-}
-
-/// A `{ span, message }` label inside a [`Diagnostic`].
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct DiagnosticLabel {
-    /// The source range this label points at.
-    pub span: Span,
-    /// The label text.
-    pub message: String,
 }
 
 impl Diagnostic {
@@ -368,20 +301,11 @@ impl Diagnostic {
             CompileError::Conversion(e) => ("conversion", format!("{e:?}"), None),
             CompileError::Unsupported(msg) => ("unsupported", msg.clone(), None),
         };
-        let labels = span
-            .map(|span| {
-                vec![DiagnosticLabel {
-                    span,
-                    message: message.clone(),
-                }]
-            })
-            .unwrap_or_default();
         Diagnostic {
             severity: "error".to_string(),
             stage: stage.to_string(),
             message,
             span,
-            labels,
         }
     }
 }
@@ -400,11 +324,14 @@ pub fn diagnostics_from_compile_errors(
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct Meta {
-    /// Live seam: the engine tick — **always `null`** here ("the program, no
-    /// execution"). A live snapshot carries a real tick.
-    pub tick: Option<u64>,
-    /// The snapshot kind discriminant — `"post-inference"` for a successful
-    /// compile, `"failed"` for a degraded (compile-error) payload.
+    /// The payload kind discriminant — `"program"` for a successful compile,
+    /// `"failed"` for a degraded (compile-error) payload.
+    ///
+    /// Neither value is a pane id. A pane id names a position in the pipeline;
+    /// this names what the document is. Spelling the success case after the
+    /// anchor pane would put one word on the wire for two unrelated things, and
+    /// a consumer rendering this as a header badge would show the reader a pane
+    /// name where the kind belongs.
     pub payload_kind: String,
     /// The wire-format version. A client reads this to detect an incompatible
     /// payload before parsing the rest.
@@ -412,7 +339,7 @@ pub struct Meta {
     /// The current version is [`SCHEMA_VERSION`], whose field set is
     /// [`InspectorPayload`]'s as documented on that type. Each
     /// `panes[].nodes[]` entry carries its attribution as the spans channel on
-    /// `span` plus a `rewritten` tag (`null | { via, nature, label }`).
+    /// `spans` plus a `rewritten` tag (`null | { via, nature, label }`).
     ///
     /// **Bump the version** on any *breaking* wire change — a field removed,
     /// renamed, or retyped, or a value-shape change an old client would
@@ -422,98 +349,24 @@ pub struct Meta {
     pub schema: u32,
 }
 
-/// Every edge of a pane-pair [`ProvenanceMap`], as `(upstream, downstream, labels)`
-/// — **dense**: self-edges (`u == d`, a node preserved across the phase) are
-/// kept, so the frontend needs no identity special case.
+/// Every edge of a pane-pair [`ProvenanceMap`], as `(upstream, downstream)` —
+/// **dense**: self-edges (`u == d`, a node preserved across the phase) are kept,
+/// so the frontend needs no identity special case.
 ///
-/// The labels say what the edge *asserts*, which a consumer needs in order to
-/// render or prune the two apart: `"descends"` for an edge the downstream node
-/// was made from, `"relates"` for one it is about but was not made from. They
-/// are a **set** — an edge reachable both ways carries both — so this is an
-/// array rather than one discriminant, and an edge always carries at least one.
+/// An edge's label set stays in `ccl` and does not reach the wire. Upstream the
+/// distinction is load-bearing —
+/// [`EdgeLabels::has_ancestry`](crate::ccl::provenance::EdgeLabels::has_ancestry)
+/// drives leak accounting — but link resolution is bidirectional and transitive,
+/// so a consumer following edges treats `descends` and `relates` alike and has
+/// nothing to do with the label.
 ///
 /// [`ProvenanceMap::edges`] already yields sorted, deduplicated edges, one entry
-/// per pair; this only projects to the wire's `u64` and label strings.
-pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64, Vec<&'static str>)> {
+/// per pair; this only projects to the wire's `u64`.
+pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64)> {
     map.edges()
         .into_iter()
-        .map(|(u, d)| (u.as_u64(), d.id.as_u64(), wire_labels(d.labels)))
+        .map(|(u, d)| (u.as_u64(), d.id.as_u64()))
         .collect()
-}
-
-/// The wire spelling of an edge's label set, in a fixed order so the payload is
-/// deterministic.
-fn wire_labels(labels: EdgeLabels) -> Vec<&'static str> {
-    let mut out = Vec::with_capacity(2);
-    if labels.has_ancestry() {
-        out.push("descends");
-    }
-    if labels.has_blame() {
-        out.push("relates");
-    }
-    debug_assert!(!out.is_empty(), "an edge carries at least one label");
-    out
-}
-
-/// The wire's discriminant for a type: which constructor it is, without its
-/// contents.
-///
-/// A rendered type is one string ([`crate::inspector_model`]'s design doc,
-/// "Types on the wire"), so a consumer that wants to branch — colour the
-/// function-typed nodes, filter to the refined ones — has nothing to branch on.
-/// This is that datum, and nothing more: it says which constructor sits at the
-/// top of the type, never what is inside it.
-///
-/// A function's kind is part of the discriminant, since the two render
-/// differently (`⇒` against `⤇`) and mean different things. An unpinned kind
-/// variable reads as a compute function, matching how `Display` renders it.
-fn type_kind(ty: &Type) -> &'static str {
-    match ty {
-        Type::Base(_) => "base",
-        Type::UIntRange(_) => "range",
-        Type::Fun {
-            kind: FunKind::Data,
-            ..
-        } => "dataFun",
-        Type::Fun { .. } => "fun",
-        Type::Tuple(_) => "tuple",
-        Type::Record(_) => "record",
-        Type::Variant(..) => "variant",
-        Type::Refinement(..) => "refinement",
-        Type::Hole | Type::SharedHole(_) | Type::BoundedHole(_) => "hole",
-        Type::Infer(_) => "infer",
-        Type::DataSource(_) => "source",
-        Type::ChanDom(..) => "channel",
-        Type::Txn => "txn",
-        // A history is a mutable variable or a feed channel, and the two read
-        // differently enough that one discriminant would hide the distinction.
-        Type::History { kind, .. } => match kind {
-            HistoryKind::Overwrite => "mut",
-            HistoryKind::Append => "feed",
-        },
-    }
-}
-
-/// The predicates riding `ty` itself, as node ids, in the order
-/// [`predicate_children`] reaches them.
-///
-/// A node's `where.N` children cover every type slot it carries — its own type,
-/// an annotation, a `Cast` target, each binder's type — so a consumer holding
-/// them cannot tell which predicate refines *this node's* type. These are that
-/// subset, and because `predicate_children` walks the node's own type first,
-/// they are its leading children.
-fn own_type_predicates(ty: &Type) -> Vec<u64> {
-    fn walk(t: &Type, out: &mut Vec<u64>) {
-        if let Type::Refinement(_, refinements) = t {
-            for r in refinements.iter() {
-                out.push(r.predicate.node_id().as_u64());
-            }
-        }
-        t.walk_children(|c| walk(c, out));
-    }
-    let mut out = Vec::new();
-    walk(ty, &mut out);
-    out
 }
 
 /// Build one pane's node table against its `projection`, returning the root
@@ -543,11 +396,9 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         let mut node = IrNode {
             label: node_label(&expr.node),
             node_id: id.as_u64(),
-            span: None,
+            spans: Vec::new(),
             rewritten: None,
             ty: expr.ty.to_string(),
-            type_kind: type_kind(&expr.ty),
-            predicate_refs: own_type_predicates(&expr.ty),
             children: Vec::new(),
         };
         if let Some(attr) = projection.get(&id) {
@@ -563,13 +414,13 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
                     label: tag.label.to_string(),
                 });
             }
-            // The spans channel: the node's primary (narrowest) source span, if
-            // any.
-            node.span = attr
-                .spans
-                .iter()
-                .min_by_key(|s| s.end.saturating_sub(s.start))
-                .copied();
+            // The spans channel: every span the attribution records, narrowest
+            // first so a consumer wanting one position takes the first, and
+            // deduplicated so no span is claimed twice for one node.
+            let mut spans = attr.spans.clone();
+            spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end));
+            spans.dedup();
+            node.spans = spans;
         }
 
         // The entry claims its pre-order slot before its children are walked, so
@@ -611,41 +462,20 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
     (root, nodes)
 }
 
-/// Build one pane's node table — its root id and its nodes — and its span rows.
-///
-/// The rows are enumerated from the index the pane already carries; building a
-/// second one over the same pair would duplicate the walk. The nodes go through
-/// [`build_node_table`], the single source-linking node builder.
-fn build_pane_nodes_and_index(pane: &PaneProjection<'_>) -> (u64, Vec<IrNode>, Vec<SpanEntry>) {
-    let span_entries = pane
-        .span_index
-        .entries()
-        .map(|(span, node_id)| SpanEntry { span, node_id })
-        .collect();
-
-    let (root, nodes) = build_node_table(pane.ir, &pane.projection);
-
-    (root, nodes, span_entries)
-}
-
 impl InspectedProgram<'_> {
     /// Assemble the `/api/snapshot` bulk payload by enumerating the indices.
     ///
     /// `name` is the program name for `source.name` (a placeholder; the server
     /// picks it). Every other field is derived purely from the snapshot:
     ///
-    /// * `panes` — the panes in upstream → downstream order:
-    ///   one per declared pane in pipeline order, each with its
-    ///   own node table + span index.
+    /// * `panes` — the panes in upstream → downstream order: one per declared
+    ///   pane in pipeline order, each with its own node table.
     /// * `paneLinks` — per consecutive pane pair, the dense edges of the
     ///   pane-pair `ProvenanceMap` folded at that boundary, self-edges included (see
     ///   [`dense_edges`]).
-    /// * `definitions` — [`NameBinderIndex::definitions`](crate::inspector_model::NameBinderIndex::definitions).
-    /// * `scopes` — [`NameBinderIndex::scopes`](crate::inspector_model::NameBinderIndex::scopes),
-    ///   each binding's `type` read off the IR node that binds it.
+    /// * `definitions` — `NameBinderIndex::definitions`.
     /// * `diagnostics` — empty.
-    /// * `meta` — `tick: None`, `payloadKind: "post-inference"`, `schema:
-    ///   `[`SCHEMA_VERSION`].
+    /// * `meta` — `payloadKind: "program"`, `schema:` [`SCHEMA_VERSION`].
     pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
         let source = SourceInfo {
             name: name.into(),
@@ -669,40 +499,19 @@ impl InspectedProgram<'_> {
             )
             .collect();
 
-        let scopes = self
-            .name_binder_ref()
-            .scopes()
-            .into_iter()
-            .map(|ScopeRegion { span, bindings }| ScopeEntry {
-                span,
-                bindings: bindings
-                    .into_iter()
-                    .map(|b| ScopeBindingEntry {
-                        // The binder's own declared type, off the IR node that
-                        // binds it (`None` for a substituted multi-param
-                        // parameter, which no IR node binds).
-                        ty: self.binder_type(&b),
-                        name: b.name.to_string(),
-                        def_span: b.def_span,
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        // Build the panes (upstream → downstream) from the bundled
-        // pane projections — each ships its own node table + span index.
+        // Build the panes (upstream → downstream) from the bundled pane
+        // projections — each ships its own node table.
         let panes = self
             .panes()
             .iter()
             .map(|pane| {
-                let (root, nodes, span_index) = build_pane_nodes_and_index(pane);
+                let (root, nodes) = build_node_table(pane.ir, &pane.projection);
                 PaneEntry {
                     id: pane.id,
                     label: pane.label.clone(),
                     kind: pane.kind,
                     root,
                     nodes,
-                    span_index,
                 }
             })
             .collect();
@@ -730,11 +539,9 @@ impl InspectedProgram<'_> {
         InspectorPayload {
             source,
             definitions,
-            scopes,
             diagnostics: Vec::new(),
             meta: Meta {
-                tick: None,
-                payload_kind: "post-inference".to_string(),
+                payload_kind: "program".to_string(),
                 schema: SCHEMA_VERSION,
             },
             panes,
@@ -749,11 +556,11 @@ impl InspectorPayload {
     ///
     /// Built from the **same** [`InspectorPayload`] type as the success path
     /// (rather than a separately hand-rolled JSON object), so the two shapes
-    /// cannot silently diverge as the schema evolves — the `panes`/scope
-    /// collections are empty and `meta.payloadKind` is `"failed"`. The frontend
-    /// still renders the editor + squiggles from this.
+    /// cannot silently diverge as the schema evolves — the `panes` and
+    /// `definitions` collections are empty and `meta.payloadKind` is
+    /// `"failed"`. The frontend still renders the editor + squiggles from this.
     ///
-    /// TODO(degraded-panes): emit whatever panes *did* complete — if
+    /// TODO(degraded-panes): emit the panes that completed — if
     /// channelization succeeds and only inference fails, the post-channelize
     /// `panes[]` entry is still displayable. Today every degraded payload ships
     /// empty `panes`/`paneLinks` regardless of where the failure occurred. It
@@ -771,10 +578,8 @@ impl InspectorPayload {
                 text: text.into(),
             },
             definitions: Vec::new(),
-            scopes: Vec::new(),
             diagnostics,
             meta: Meta {
-                tick: None,
                 payload_kind: "failed".to_string(),
                 schema: SCHEMA_VERSION,
             },
@@ -936,7 +741,7 @@ mod tests {
                     link.from,
                     link.to
                 );
-                for (upstream, downstream, labels) in &link.edges {
+                for (upstream, downstream) in &link.edges {
                     assert!(
                         ids[link.from].contains(upstream),
                         "edge upstream {upstream} is absent from the {} tree",
@@ -947,30 +752,71 @@ mod tests {
                         "edge downstream {downstream} is absent from the {} tree",
                         link.to
                     );
-                    assert!(
-                        !labels.is_empty(),
-                        "an edge asserts at least one of descends/relates"
-                    );
                 }
             }
         }
     }
 
-    /// Every `spanIndex` row points at a node the same pane's tree carries, so a
-    /// span lookup cannot resolve to an id the consumer has no node for.
+    /// A node's `spans` are exactly the spans its pane's projection records for
+    /// it, narrowest first and each one once. This is what the retired parallel
+    /// span table used to pin as a round trip: with the spans on the node there
+    /// is one table to agree with itself, so the check is that the projection and
+    /// the wire say the same thing.
     #[test]
-    fn every_span_index_row_points_at_a_node_of_its_own_pane() {
+    fn a_nodes_spans_are_its_attributions_narrowest_first() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
-            for pane in &payload.panes {
-                let ids = pane_ids(pane);
-                for row in &pane.span_index {
+            let inspected = InspectedProgram::new(&prog);
+            let payload = inspected.build_payload("test");
+            for (wire_pane, pane) in payload.panes.iter().zip(inspected.panes()) {
+                assert_eq!(wire_pane.id, pane.id, "the panes line up");
+
+                // What the projection records, keyed the way the wire keys it.
+                let mut recorded: HashMap<u64, Vec<Span>> = HashMap::new();
+                fn collect(
+                    expr: &Expr,
+                    projection: &SourceProjection,
+                    seen: &mut HashSet<u64>,
+                    out: &mut HashMap<u64, Vec<Span>>,
+                ) {
+                    let id = expr.node_id();
+                    if !seen.insert(id.as_u64()) {
+                        return;
+                    }
+                    if let Some(attr) = projection.get(&id) {
+                        let mut spans = attr.spans.clone();
+                        spans.sort_by_key(|s| (s.start, s.end));
+                        spans.dedup();
+                        out.insert(id.as_u64(), spans);
+                    }
+                    expr.walk_children(|c| collect(c, projection, seen, out));
+                    for (_, predicate) in predicate_children(expr) {
+                        collect(predicate, projection, seen, out);
+                    }
+                }
+                collect(
+                    pane.ir,
+                    &pane.projection,
+                    &mut HashSet::new(),
+                    &mut recorded,
+                );
+
+                for node in &wire_pane.nodes {
+                    let mut shipped = node.spans.clone();
+                    shipped.sort_by_key(|s| (s.start, s.end));
+                    assert_eq!(
+                        shipped,
+                        recorded.get(&node.node_id).cloned().unwrap_or_default(),
+                        "{}'s shipped spans are the projection's",
+                        node.label
+                    );
+
+                    let widths: Vec<usize> = node.spans.iter().map(|s| s.end - s.start).collect();
                     assert!(
-                        ids.contains(&row.node_id.as_u64()),
-                        "spanIndex row {:?} names an id absent from the {} table",
-                        row.node_id,
-                        pane.id
+                        widths.windows(2).all(|w| w[0] <= w[1]),
+                        "{} ships its spans narrowest first; got {:?}",
+                        node.label,
+                        node.spans
                     );
                 }
             }
@@ -978,12 +824,12 @@ mod tests {
     }
 
     /// A shipped node carries the row `src/inspector_model/design.md`, "A node on
-    /// the wire" describes: an id, the narrowest span it traces to, a rendered
-    /// type, no rewrite tag when its tag is `Nature::Source`, positional edges
-    /// for its value children and `where.N`, marked `predicate`, for a predicate
-    /// riding one of its type slots.
+    /// the wire" describes: an id, the spans it traces to, a rendered type, no
+    /// rewrite tag when its tag is `Nature::Source`, positional edges for its
+    /// value children and `where.N`, marked `predicate`, for a predicate riding
+    /// one of its type slots.
     #[test]
-    fn a_wire_node_carries_its_id_span_type_and_edges() {
+    fn a_wire_node_carries_its_id_spans_type_and_edges() {
         let code = indoc! {r#"
             xs = [1, 2, 3, 4]
             ys = [x * 2 for x in xs if x > 2]
@@ -997,25 +843,7 @@ mod tests {
             .find(|s| s.id == "post-inference")
             .expect("the payload ships the post-inference pane");
 
-        let mut spans: HashMap<u64, Vec<Span>> = HashMap::new();
-        for row in &pane.span_index {
-            spans
-                .entry(row.node_id.as_u64())
-                .or_default()
-                .push(row.span);
-        }
-
         for node in &pane.nodes {
-            // The node ships one span and the rows ship all of them, so the one
-            // it ships is the narrowest.
-            let narrowest = spans
-                .get(&node.node_id)
-                .and_then(|s| s.iter().copied().min_by_key(|s| s.end - s.start));
-            assert_eq!(
-                node.span, narrowest,
-                "{} ships the narrowest of {:?}",
-                node.label, spans[&node.node_id]
-            );
             assert!(!node.ty.is_empty(), "{} ships a type", node.label);
 
             // Value children come first under their positional index; every
@@ -1038,7 +866,7 @@ mod tests {
         // `x * 2` is the root of a lowered source expression, so its rewrite tag
         // null-compresses; it carries its own span and its inferred type.
         let mul = node_named(pane, "BinOp(Arithmetic(Mul))");
-        assert_eq!(mul.span, Some(Span::new(24, 29)), "the span of `x * 2`");
+        assert_eq!(mul.spans, [Span::new(24, 29)], "the span of `x * 2`");
         assert_eq!(mul.ty, "Int");
         assert!(
             mul.rewritten.is_none(),
@@ -1047,14 +875,16 @@ mod tests {
         );
 
         // The comprehension's filter rides the `Cast`'s refined domain, so it
-        // hangs off a marked `where.N` edge rather than a positional one.
+        // hangs off a marked `where.N` edge rather than a positional one. One
+        // edge, not two: the filter sits in the `Cast`'s own type and in its
+        // target, and the two slots reach one predicate node.
         let cast = node_named(pane, "Cast");
         let edges: Vec<(&str, bool)> = cast
             .children
             .iter()
             .map(|c| (c.edge.as_str(), c.predicate))
             .collect();
-        assert_eq!(edges, [("0", false), ("where.0", true), ("where.1", true)]);
+        assert_eq!(edges, [("0", false), ("where.0", true)]);
         let predicate = node_with_id(pane, cast.children[1].id);
         assert_ne!(
             predicate.node_id, cast.node_id,
@@ -1140,38 +970,89 @@ mod tests {
         }
     }
 
-    /// No `(span, nodeId)` row repeats. The rows come from one visit per node,
-    /// so a node reached from several type slots contributes its rows once; a
-    /// node indexed under several *distinct* spans still contributes one row per
-    /// span.
+    /// No node claims one span twice. A node is visited once and its spans come
+    /// from that one attribution, so a repeat would mean the attribution itself
+    /// carries a duplicate.
     #[test]
-    fn no_span_index_row_repeats() {
+    fn no_node_repeats_a_span() {
         for code in corpus() {
             let prog = compile(code);
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
-                let mut seen = HashSet::new();
-                for row in &pane.span_index {
-                    assert!(
-                        seen.insert((row.span.start, row.span.end, row.node_id)),
-                        "the {} span index repeats ({:?}, {:?})",
-                        pane.id,
-                        row.span,
-                        row.node_id
-                    );
+                for node in &pane.nodes {
+                    let mut seen = HashSet::new();
+                    for span in &node.spans {
+                        assert!(
+                            seen.insert((span.start, span.end)),
+                            "{} in {} repeats span {:?}",
+                            node.label,
+                            pane.id,
+                            span
+                        );
+                    }
                 }
             }
         }
     }
 
-    /// A predicate reached from more than one type slot is one entry in the
-    /// table, named by each edge that reaches it. This is the repetition the
-    /// node table removes: the nested tree emitted the whole subtree once per
-    /// slot.
+    /// No node names one predicate twice. `walk_type_slots` yields a `Lambda`'s
+    /// own type and its binder's type, which for a lambda are the same `Type`, so
+    /// a slot-order walk reaches that type's predicates once per slot; the
+    /// repeats named one node and asserted nothing the first edge did not.
+    ///
+    /// A shared predicate reached from *different* parents is a different thing
+    /// and stays — `a_shared_predicate_is_one_entry_named_by_several_edges` pins
+    /// it.
+    #[test]
+    fn no_node_repeats_a_predicate_edge() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = InspectedProgram::new(&prog).build_payload("test");
+            for pane in &payload.panes {
+                for node in &pane.nodes {
+                    let mut seen = HashSet::new();
+                    for child in node.children.iter().filter(|c| c.predicate) {
+                        assert!(
+                            seen.insert(child.id),
+                            "{} in {} names predicate {} under both {:?} and a \
+                             later `where.N`",
+                            node.label,
+                            pane.id,
+                            child.id,
+                            child.edge
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Neither `payloadKind` value is a pane id. The success value was
+    /// `"post-inference"`, which is also a pane's id, so one word on the wire
+    /// named two unrelated things and a consumer rendering the kind as a header
+    /// badge showed the reader a pane name.
+    #[test]
+    fn a_payload_kind_is_never_a_pane_id() {
+        let prog = compile(corpus()[0]);
+        let payload = InspectedProgram::new(&prog).build_payload("test");
+        assert_eq!(payload.meta.payload_kind, "program");
+        let degraded = InspectorPayload::degraded("test", "x = 1", Vec::new());
+        assert_eq!(degraded.meta.payload_kind, "failed");
+        for kind in [&payload.meta.payload_kind, &degraded.meta.payload_kind] {
+            assert!(
+                !PANES.iter().any(|spec| spec.name == kind.as_str()),
+                "payloadKind {kind:?} is also a pane id"
+            );
+        }
+    }
+
+    /// A predicate several *nodes* reach is one entry in the table, named by an
+    /// edge from each of them. This is the repetition the node table removes: the
+    /// nested tree emitted the whole subtree once per parent.
     #[test]
     fn a_shared_predicate_is_one_entry_named_by_several_edges() {
-        // The comprehension's filter rides both the `Cast`'s own refined type
-        // and its target, so the same predicate term is reached twice.
+        // A refinement minted once and carried through a projection is reached
+        // from each node whose type slot holds it.
         let code = corpus()[0];
         let prog = compile(code);
         let payload = InspectedProgram::new(&prog).build_payload("test");
@@ -1242,12 +1123,6 @@ mod tests {
             "the span is a range in this source; got {span:?} over {} bytes",
             code.len()
         );
-        assert_eq!(
-            parse.labels.len(),
-            1,
-            "the span is also a label, so a consumer can underline it"
-        );
-        assert_eq!(parse.labels[0].span, span);
     }
 
     /// A lowering failure ships its own message rather than the enum's `Debug`
@@ -1267,12 +1142,12 @@ mod tests {
         assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
     }
 
-    /// Every node of every pane carries an attribution, so `span` and `rewritten`
-    /// are absent only where the node is a lowering root — never because the pane
-    /// failed to explain the node.
+    /// Every node of every pane carries an attribution, so `spans` and
+    /// `rewritten` are absent only where the node is a lowering root — never
+    /// because the pane failed to explain the node.
     ///
     /// The wire cannot tell those apart: a node the projection does not cover
-    /// ships the same `span: null, rewritten: null` as a `Nature::Source` root.
+    /// ships the same `spans: [], rewritten: null` as a `Nature::Source` root.
     /// This is what keeps the second case from arising, and it is the payload-wide
     /// form of the leak gate's promise that every node of a pane is explained.
     #[test]
@@ -1282,8 +1157,12 @@ mod tests {
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
-                let attributed: HashSet<u64> =
-                    pane.span_index.iter().map(|r| r.node_id.as_u64()).collect();
+                let attributed: HashSet<u64> = pane
+                    .nodes
+                    .iter()
+                    .filter(|n| !n.spans.is_empty())
+                    .map(|n| n.node_id)
+                    .collect();
                 let missing: Vec<u64> = ids.difference(&attributed).copied().collect();
                 assert!(
                     missing.is_empty(),
@@ -1291,73 +1170,6 @@ mod tests {
                     missing.len(),
                     pane.id
                 );
-            }
-        }
-    }
-
-    /// Every node carries a type discriminant, and a refined node's
-    /// `predicateRefs` name predicate nodes of its own pane — the two facts a
-    /// consumer needs to branch on a type it only receives rendered.
-    ///
-    /// `predicateRefs` is the leading part of a node's predicate children,
-    /// because the walk reaches the node's own type before its annotation, its
-    /// `Cast` target and its binders. That is what lets a consumer tell "the
-    /// predicate refining this node's type" from "a predicate riding some other
-    /// slot of it".
-    #[test]
-    fn a_node_carries_its_type_kind_and_its_own_predicates() {
-        for code in corpus() {
-            let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
-            for pane in &payload.panes {
-                let ids = pane_ids(pane);
-                let mut refined = 0;
-                for node in &pane.nodes {
-                    assert!(
-                        !node.type_kind.is_empty(),
-                        "node {} has no type discriminant",
-                        node.node_id
-                    );
-                    if node.type_kind == "refinement" {
-                        refined += 1;
-                        assert!(
-                            !node.predicate_refs.is_empty(),
-                            "a refined node names the predicates refining it; node {}",
-                            node.node_id
-                        );
-                    }
-                    for id in &node.predicate_refs {
-                        assert!(
-                            ids.contains(id),
-                            "predicate ref {id} resolves in the {} table",
-                            pane.id
-                        );
-                    }
-                    // The node's own type is walked first, so its predicates are
-                    // the leading predicate children.
-                    let predicate_children: Vec<u64> = node
-                        .children
-                        .iter()
-                        .filter(|c| c.predicate)
-                        .map(|c| c.id)
-                        .collect();
-                    assert_eq!(
-                        predicate_children[..node.predicate_refs.len()],
-                        node.predicate_refs[..],
-                        "node {}'s own-type predicates lead its predicate children",
-                        node.node_id
-                    );
-                }
-                // Inference types a literal by which literal it is, so a pane it
-                // has run on carries refined nodes; before it, the types are
-                // holes and this says nothing.
-                if pane.kind == "typed" {
-                    assert!(
-                        refined > 0,
-                        "the {} pane is typed, so a literal's singleton refines some node",
-                        pane.id
-                    );
-                }
             }
         }
     }
@@ -1404,7 +1216,7 @@ a
 
         assert!(!edges.is_empty(), "the pane-pair map has edges");
         assert!(
-            edges.iter().any(|(u, d, _)| u == d),
+            edges.iter().any(|(u, d)| u == d),
             "the dense map ships self-edges for nodes preserved across the phase"
         );
 
@@ -1412,7 +1224,7 @@ a
         // (dup used at Int and Bool) — counting only the genuine identity
         // changes, not the self-edges.
         let mut fanout: HashMap<u64, usize> = HashMap::new();
-        for (u, d, _) in &edges {
+        for (u, d) in &edges {
             if u != d {
                 *fanout.entry(*u).or_default() += 1;
             }
@@ -1431,7 +1243,7 @@ a
     /// This is the invariant the wire validators enforce on the shipped payload,
     /// asserted here against the source of truth.
     fn assert_endpoints_live(
-        edges: &[(u64, u64, Vec<&'static str>)],
+        edges: &[(u64, u64)],
         upstream: &Expr,
         downstream: &Expr,
         up_name: &str,
@@ -1442,7 +1254,7 @@ a
         };
         let up_ids = ids(upstream);
         let down_ids = ids(downstream);
-        for (u, d, _) in edges {
+        for (u, d) in edges {
             assert!(
                 up_ids.contains(u),
                 "edge upstream id {u} must be a node in the {up_name} tree"
@@ -1523,7 +1335,7 @@ x
 
         let mut changed_main = Vec::new();
         let mut changed_predicate = 0usize;
-        for (u, d, _) in &edges {
+        for (u, d) in &edges {
             if u == d {
                 continue;
             }
@@ -1581,25 +1393,20 @@ max(totals)
     /// node carrying that id in that pane's node table. This is the consumer's
     /// lookup, over the two shipped tables and nothing else.
     ///
-    /// Panics if a row names a node the table does not hold — the invariant
-    /// `span_index_round_trips_with_projection` (`span_index.rs`) pins.
     fn labels_at(payload: &InspectorPayload, pane_id: &str, span: Span) -> Vec<String> {
         let pane = payload
             .panes
             .iter()
             .find(|s| s.id == pane_id)
             .unwrap_or_else(|| panic!("the payload ships a {pane_id} pane"));
-        pane.span_index
+        pane.nodes
             .iter()
-            .filter(|row| row.span.start <= span.start && span.end <= row.span.end)
-            .map(|row| {
-                pane.nodes
+            .filter(|n| {
+                n.spans
                     .iter()
-                    .find(|n| n.node_id == row.node_id.as_u64())
-                    .unwrap_or_else(|| panic!("row node {:?} is in the table", row.node_id))
-                    .label
-                    .clone()
+                    .any(|s| s.start <= span.start && span.end <= s.end)
             })
+            .map(|n| n.label.clone())
             .collect()
     }
 
@@ -1760,7 +1567,7 @@ max(totals)
         let absent: Vec<&str> = pane
             .nodes
             .iter()
-            .filter(|n| n.span.is_none() && n.rewritten.is_none())
+            .filter(|n| n.spans.is_empty() && n.rewritten.is_none())
             .map(|n| n.label.as_str())
             .collect();
         assert!(

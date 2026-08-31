@@ -10,15 +10,12 @@ projections and maps — the leak gate reads the same folds' `leaks` under
 `CAMBRA_PROVENANCE_GATE`, see [provenance.md](../ccl/design/provenance.md#the-seam) — and a release
 compile reads the lowering projection alone.
 
-**Status.** This document describes code you can go read. Prose marked **planned** is the one
-exception, and describes what is designed and not built: the live-value path.
-
 ## At a glance
 
 | | |
 |---|---|
 | Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table, its root, and its span rows), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `scopes` (visible names per region), `diagnostics` (compile errors, empty on success), `meta` |
+| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table and its root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | the `cambra-inspector` crate, which serves the payload, and that crate's frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
@@ -33,21 +30,18 @@ Its frontend fetches that payload once and answers every interaction from it —
 hovering a span, following a link from one pane to the next. None of that reaches the compiler or a
 running program; reading a running program is the separate path below.
 
-Two rules follow.
-
 - **Every static fact ships in the payload.** A fact about the program as written or as compiled is
   a field, not a request.
-- **The consumer answers positional questions; this module ships the tables they are answered
-  over.** "Which node is at this position" is a lookup over the span rows and the tree, both
-  shipped. Answering it here as well would be a second implementation of one semantics, and the
-  consumer's is the copy that runs.
+- **The consumer answers positional questions; this module ships the table they are answered
+  over.** "Which node is at this position" is a scan of the shipped nodes. Answering it here as
+  well would be a second implementation of one semantics, and the consumer's is the copy that runs.
 
-So this module offers no positional query. `SpanIndex` and `NameBinderIndex` build their tables and
-enumerate them onto the wire; neither answers "what is at this position".
+So this module offers no positional query. `NameBinderIndex` builds its table and enumerates it
+onto the wire; it does not answer "what is at this position".
 
-The consumer's own lookup combines two shipped things: the `(span, node)` rows for containment, and
-the pane's tree for structure. Depth, which breaks a tie between byte-identical spans, comes from
-the tree it already walks, which is why a span row carries no depth.
+The consumer's own lookup reads one shipped table two ways: a node's `spans` for containment, and
+its `children` for structure. Depth, which breaks a tie between byte-identical spans, comes from the
+edges it already walks, which is why a node carries no depth.
 
 ### The live model is a separate path
 
@@ -76,18 +70,11 @@ declares rather than off its position. Adding a pane is an entry in `PANES` and 
 ids,
 the order, the arity and the kind split.
 
-### The anchor pane
-
-`ANCHOR_PANE` is `"post-inference"` — the first fully-typed tree that is still source-shaped. It
-decides which pane a binder's type is read from, so `scopes[].bindings[].type` is a post-inference
-type. The pane is named rather than positional, and `InspectedProgram::new` panics if `PANES` does
-not declare it, so inserting a pane ahead of it cannot silently move the anchor.
-
 ### A pane resolves against itself
 
-A pane carries its own node table and its own `(span, node)` rows, both resolved against its own
-attributions rather than the anchor's. A node id means the same thing in every pane that
-holds it; what each pane says about that node is that pane's own answer.
+A pane carries its own node table, resolved against its own attributions rather than a sibling
+pane's. A node id means the same thing in every pane that holds it; what each pane says about that
+node is that pane's own answer.
 
 ### A node on the wire
 
@@ -100,16 +87,18 @@ Each node carries:
 | field | what it holds |
 |---|---|
 | `label` | the node's kind, rendered — `BinOp(Arithmetic(Mul))`, `Lit(Int(1))`, `Let(x)` |
-| `nodeId` | its `NodeId` as a number, the handle every link and span row names |
-| `span` | the **narrowest** source span it traces to, or absent when it traces to none |
+| `nodeId` | its `NodeId` as a number, the handle every link names |
+| `spans` | every source span it traces to, narrowest first, empty when it traces to none |
 | `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
-| `typeKind` | which constructor sits at the top of that type — `"base"`, `"fun"`, `"dataFun"`, `"refinement"`, `"hole"`, … |
-| `predicateRefs` | the predicates riding this node's own type, as ids into the same table |
 | `children` | `{ edge, id, predicate }` — the child's id in this same table, its display label, and whether it is a type-interior subtree |
 
-A node's `span` is one span even where it traces to several; the `(span, node)` rows carry all of
-them, so a node several source spans fan into is reachable from each.
+A node carries every span its attribution records, so a node several source positions fan into is
+reachable from each of them. `fold` unions blame spans, which is what makes that plural. There is no
+second span → node table: it held one row per node per span, which is what `spans` says, and the
+node-table walk that would build it already reads the same attributions.
+`a_nodes_spans_are_its_attributions_narrowest_first` and `no_node_repeats_a_span` (`wire.rs`) pin
+the order and the uniqueness.
 
 `rewritten` is `null` for a `Nature::Source` tag, which null-compresses at the one emission site via
 `Nature::is_source`. `Source` is positional rather than a judgment about faithfulness: a node is
@@ -117,8 +106,8 @@ them, so a node several source spans fan into is reachable from each.
 text carries `Machinery` with the label `"lower.image"` instead — see
 [provenance.md](../ccl/design/provenance.md#the-seam).
 
-A node the pane's projection does not cover ships the same `null`, for both `rewritten` and `span`,
-so the wire cannot tell an unexplained node from a lowering root.
+A node the pane's projection does not cover ships the same empty `spans` and `null` `rewritten` as
+a lowering root, so the wire cannot tell an unexplained node from one.
 `every_node_of_every_pane_carries_an_attribution` (`wire.rs`) is what keeps the first case from
 arising, over the same corpus the other payload tests use.
 
@@ -132,18 +121,33 @@ for display and follows the same split: a value child's is its positional index 
 predicate's is `where.N`.
 
 `N` counts predicates in `walk_type_slots` order — the node's own type, its annotation, a `Cast`
-target, then each binder's type and annotation — flattened across nested type children. The order is
-stable, so a consumer can compare a node's predicate edges across panes.
+target, then each binder's type and annotation — flattened across nested type children, and
+deduplicated by node id. The order is stable, so a consumer can compare a node's predicate edges
+across panes.
 
-### Pane links are dense and labelled
+One node names one predicate once. The slots overlap: `walk_type_slots` yields a `Lambda`'s own type
+and its binder's type, and for a lambda those are the same `Type`, so a slot-order walk reaches that
+type's predicates once per slot. Since a shared predicate is one entry in the table, a second edge
+to it asserts nothing the first does, and `no_node_repeats_a_predicate_edge` (`wire.rs`) pins the
+absence. A predicate several *nodes* reach still carries an edge from each of them.
+
+`where.N` is a position in that sequence rather than a path through the type, so it does not say
+which slot a predicate came from. A consumer needing the slots apart needs a path; nothing on the
+wire asks.
+
+### Pane links are dense
 
 A `ProvenanceMap` is the compiler's node→node relation between two adjacent panes: what each node of
 the upstream pane became, and what each node of the downstream pane came from. It ships verbatim,
 self-edges included, so a node preserved across the phase appears as its own `[id, id]` edge and the
-consumer may follow edges with no identity special case. Each edge carries the labels it asserts —
-`"descends"` for a node made from the upstream one, `"relates"` for one that is about it but was not
-made from it — as a set, since an edge reachable both ways carries both. The label set is never
-empty.
+consumer may follow edges with no identity special case.
+
+An edge is `[upstream, downstream]` and carries no label. `EdgeLabels` distinguishes `descends` (the
+downstream node was made from the upstream one) from `relates` (it is about the upstream node but
+was not made from it), and that distinction is load-bearing in `ccl`, where `has_ancestry` drives
+leak accounting — see [provenance.md](../ccl/design/provenance.md#the-edge-labels). It stops at the
+wire: link resolution is bidirectional and transitive, so a consumer following edges treats the two
+alike.
 
 Every endpoint of every edge is a node of the tree it points into: an edge a consumer follows always
 lands somewhere. `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` (`wire.rs`)
@@ -161,10 +165,14 @@ walk here descends into predicates.
 
 **A predicate ships once.** One predicate term is shared — the same term is reachable from a node's
 own type, from a binder's type, and from the types of other nodes — so it is one entry in the node
-table that several child edges name. That is what the table is for. A tree had to repeat the whole
-subtree once per slot that reached it, and the span rows repeated with it: on the program measured
-under [Cost](#cost), 2,443 node positions for 465 nodes, and 1,978 of 2,443 span rows repeating a
-pair already present.
+table that several child edges name. A table can express that and a nested tree cannot: a tree
+carries a shared subtree once per position that reaches it.
+
+One descent reaches them. `Type::walk_refinements` visits every refinement riding a type or its
+nested type children, and the three callers that need it project differently from each one: this
+module's `where.N` child edges, `collect_tree_ids`' id domain, and `predicate_id_collisions`' per-term
+`Rc` keys. Written out per caller it was the same match-and-recurse three times, and a predicate this
+module enumerated but `collect_tree_ids` did not would be a node the pane fold never explains.
 
 ### Types on the wire
 
@@ -172,118 +180,45 @@ A node's `type` is rendered by `Display for Type`, and `Type`'s `Serialize` impl
 same `Display`, so every type on the wire is one rendered string. Every node has a type, so the
 field is never absent.
 
-The choice is provisional. A structural type would carry a refinement's predicate, which is an
-expression tree with node ids, re-creating inside every `type` field the repetition the predicate
-table removes;
-and the compact spelling — `⇒` against `⤇`, `T@lit` singletons, `{T | p}`, `Σ`, `?N` — would have to
-be reimplemented by the consumer.
+A structural type would carry a refinement's predicate, which is an expression tree with node ids,
+re-creating inside every `type` field the repetition the node table removes; and the compact
+spelling — `⇒` against `⤇`, `T@lit` singletons, `{T | p}`, `Σ`, `?N` — would have to be
+reimplemented by the consumer.
 
-Two narrow facts ride beside the string so a consumer is not left parsing it. `typeKind` is the
-type's top constructor, which is what a consumer branches on to filter or colour by type.
-`predicateRefs` names the predicates riding the node's own type, as ids into the pane's table, which
-is what turns "this type is refined" into the predicate's own node. Both say something the rendering
-cannot be asked for reliably, and neither describes what is inside the type.
+The rendering is all the wire says about a type. A consumer cannot diff a node's type across panes
+except by string comparison, cannot elide a long type by structure, and cannot branch on the top
+constructor without parsing. What it can do is reach a refinement's predicate, which is a node with
+an edge to it.
 
-What the rendering still forecloses: a consumer cannot diff a node's type across panes except by
-string comparison, and cannot elide a long type by structure.
+### Definitions are source-level
 
-A node's `where.N` children cover every type slot it carries — its own type, an annotation, a `Cast`
-target, each binder's — so they cannot say which predicate refines the node's *own* type.
-`predicateRefs` is that subset, and it is the leading part of those children, since the walk reaches
-the node's own type first.
-
-### A binder's type is the binder's
-
-A binding site takes its type from the IR binder occupying that site, not from the node whose span
-contains it. Take this program:
-
-```chl
-g = "abc"
-4
-```
-
-Its source spans:
-
-| written | span |
-|---|---|
-| `g` | 0…1 |
-| `"abc"` | 4…9 |
-| `4` | 10…11 |
-
-It lowers to one `Let` — `let g = "abc" in 4` — whose nodes carry:
-
-| node | span | type | binder it declares |
-|---|---|---|---|
-| `Let(g)` | 0…9 | `Int@4` | `g : String@"abc"` |
-| `Lit(String)` | 4…9 | `String@"abc"` | — |
-| `Lit(Int)` | 10…11 | `Int@4` | — |
-
-The binder `g` has no node of its own, because a name is not an expression. So the narrowest node
-containing `g`'s span is the whole `Let`, and a `Let`'s type is the type of what follows the
-binding — `Int@4` here, the trailing `4`. Clicking `"abc"` answers `String@"abc"` because the
-literal is a node; clicking `g` has to answer from the binder, or it answers with an unrelated type
-that happens to be well-formed.
-
-**Why the payload cannot simply say so.** An attribution maps a node to the source spans it came
-from. A binder is not a node, so nothing attributes it, and the `Let` holding it carries one span
-covering the whole statement. No field says "the binder written at 0…1 is this node's".
-
-`InspectedProgram::binder_type` recovers that correspondence by searching, among the nodes whose
-span covers the binding site, for the node that holds the binder — by two tests, in order.
-
-1. **The binder's name.** `g` is still a binder named `g` on the covering `Let`. Shadowed binders
-   separate on span, since each statement's `Let` covers only its own binding site:
-
-   | statement | span | the node binding it | its span |
-   |---|---|---|---|
-   | `x = 1` | 0…5 | outer `Let(x)` | 0…5 |
-   | `x = x + 1` | 6…15 | inner `Let(x)` | 6…15 |
-
-2. **The node's span equals the binding site.** A `def`'s binding site is its whole statement, and
-   monomorphization has replaced the source binder with a `__mono` specialization, so the name test
-   misses; the node standing at exactly that span is the binding one.
-
-A parameter's name span is no node's span and no binder carries the name, so both tests miss and the
-answer is `None`. `a_binder_joins_its_own_type_not_the_continuations`,
-`a_def_binder_joins_its_function_type` and `a_substituted_multi_param_binder_joins_no_type`
-(`program.rs`) pin the three outcomes.
-
-**A better design exists and is not built.** The two tests reconstruct a fact the compiler had and
-dropped. Either of two channels would replace them with a read, and both are follow-up work beyond
-the changes this document ratifies, carried as a `TODO(binder-site)` on `binder_type`:
-
-- a **source span on `TypedBinding`**, so a binder carries its own site; or
-- a **binder-site entry in a pane's attributions**, so the pane says which node binds a given site.
-
-Until one exists, a binder's type is recovered rather than looked up, and the recovery is only as
-good as its two tests.
-
-### Definitions and scopes are source-level
-
-Name resolution runs over the parsed surface AST, not the IR, because lowering destroys the *name*
-of a multi-param parameter: `uncurry_params` rewrites `Var(p)` to `__arg_tuple_N ▷ .i`, so nothing
-downstream binds or mentions `p`. The occurrence keeps its own id and span, so a *use* of `p` still
+Name resolution runs over the parsed surface AST, not the IR, because lowering destroys the name of
+a multi-param parameter: `uncurry_params` rewrites `Var(p)` to `__arg_tuple_N ▷ .i`, so nothing
+downstream binds or mentions `p`. The occurrence keeps its own id and span, so a use of `p` still
 resolves to a node and a type; what no IR pass can recover is which binder that use refers to, and
 that is what `NameBinderIndex` answers.
 
-A scope region is emitted per statement and per expression, minus those where no name is visible and
-those repeating a span and binder set already emitted — a statement and its expression share a span,
-so the walk reaches one region twice. The regions that remain are dense and nest.
+`definitions` is the whole of what it enumerates: one `{useSpan, defSpan, name}` row per resolved
+use. An unbound use contributes none.
 
 ### Diagnostics and the degraded payload
 
 `diagnostics` is empty on a successful payload: it describes a program that compiled, and there are
 no warnings. A failed compile ships `InspectorPayload::degraded` instead — same type, so the two
 shapes cannot drift — carrying the source text, the diagnostics, `meta.payloadKind: "failed"`, and
-empty `panes`, `paneLinks`, `definitions` and `scopes`.
+empty `panes`, `paneLinks` and `definitions`.
 
 A failed compile ships no panes even where the pipeline reached some: inference can fail after
 channelization succeeded, and that channelized IR is displayable. Shipping what a failed compile did
 reach is follow-up work beyond this document's ratified changes, since it needs the pipeline to hand
-back its partial panes rather than one error; it is carried as `TODO(degraded-stages)` on
+back its partial panes rather than one error; it is carried as `TODO(degraded-panes)` on
 `InspectorPayload::degraded`.
 
-A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span. The
+A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span. One
+span, not a list of labelled ranges: a diagnostic is built from one error, which carries at most one
+range, so a label list could only repeat the message against the span already there. Pointing at
+several ranges with distinct texts is a different type, and needs a producer holding those texts.
+The
 message is the error's `Display` rendering — the same single line the terminal's ariadne label
 carries — so the two renderers say the same thing rather than one of them shipping a struct dump.
 Two variants have no `Display` and use `Debug`: `InferError`, whose `Debug` is its message by
@@ -293,74 +228,52 @@ The span is the error's own wherever it has one. `Parse` and `Lower` read theirs
 `Infer`'s is resolved at the `compile_program` boundary; `ChannelizeDefers`, `LambdaElim`,
 `Conversion` and `Unsupported` carry none, so a consumer has nothing to underline for them.
 
-`meta` carries `payloadKind`, the always-null live seam `tick`, and `schema`. The schema's
-`outline` field is omitted rather than stubbed, until an outline query exists.
+`meta` carries `payloadKind` — `"program"` for a compiled program, `"failed"` for a degraded
+payload — and `schema`. Neither kind is a pane id, so one word never names both a pipeline position
+and a document kind; `a_payload_kind_is_never_a_pane_id` (`wire.rs`) pins that. The schema's
+`outline` field and a live-value `tick` are both omitted rather than stubbed, until something reads
+them.
 
 ### The schema version
 
-`SCHEMA_VERSION` is the payload's wire version, carried as `meta.schema`, and is **5**. A breaking
+`SCHEMA_VERSION` is the payload's wire version, carried as `meta.schema`, and is **1**. A breaking
 change — a field removed, renamed or retyped, or a value shape an old consumer would misread — bumps
 it; purely additive optional fields do not.
 
 The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
 every node id included, so any change re-blesses all of them; its wire validator pins the schema
-number, the pane list and the edge-label vocabulary as literal lists. Both live in the
-`cambra-inspector` crate, which owns the fixture corpus.
+number and the pane list as literal lists. Both live in the `cambra-inspector` crate, which owns the
+fixture corpus.
 
 ## Cost
 
-Building the payload is the module's only cost, and it is off the release path. Per pane it is
-O(tree) for the tree and the span rows; per scope binding it is one or two full walks of the anchor
-tree, since `binder_type`'s probes run in sequence and a parameter's site misses both. So the scope
-join is O(bindings × tree).
+Building the payload is the module's only cost, and it is off the release path. It is O(tree) per
+pane: one walk building the node table, each node's spans read off the attribution that walk already
+fetches. Name resolution is one walk of the surface AST.
 
-Measured at the time of writing on this program:
-
-```chl
-xs = [1, 2, 3, 4]
-ys = [x * 2 for x in xs if x > 2]
-g = 10
-def f(p, q):
-  p + q + g
-max(ys) + f(1, 2)
-```
-
-| | |
-|---|---|
-| nodes, six panes | 465, one entry per node |
-| `post-planning` alone | 184 |
-| span rows | 465 — one per node here, since every node of this program traces to exactly one span — with no pair repeated |
-| predicate edges | 198, naming 465 nodes between them |
-| pane-link edges | 419 |
-| scope regions | 25, over 76 bindings |
-| build time | about 10 ms, of which the payload is 2 ms |
-
-Size is the cost that binds rather than time. The node table is what bounds it: a pane ships one
-entry per node, so the payload grows with the program and not with how many type slots reach a
-shared term.
+Size is the cost that binds rather than time. The node table bounds it: a pane ships one entry per
+node, so the payload grows with the program and not with how many type slots reach a shared term.
 
 ## API shape
 
 | item | what it is for |
 |---|---|
-| `InspectedProgram::new` | bundle every pane of a `CompiledProgram` with the two indices — the whole read model over one compiled program |
-| `InspectedProgram::from_parts` | bundle one named pane; the payload then carries that pane alone and no pane links |
+| `InspectedProgram::new` | bundle every pane of a `CompiledProgram` with the name index — the whole read model over one compiled program |
 | `InspectedProgram::build_payload` | assemble the `InspectorPayload` — the whole read model |
-| `SpanIndex::build` / `entries` | build the `(span, node)` table over one pane and enumerate it for the wire |
-| `NameBinderIndex::build` / `definitions` / `scopes` | resolve names over the surface AST and enumerate the results |
-| `dense_edges` | project a pane pair's `ProvenanceMap` onto the wire |
 | `diagnostics_from_compile_errors` / `InspectorPayload::degraded` | the compile-failure path |
-| the wire types | `InspectorPayload`, `PaneEntry`, `PaneLinkEntry`, `SpanEntry`, `DefinitionEntry`, `ScopeEntry`, `ScopeBindingEntry`, `Diagnostic`, `DiagnosticLabel`, `Meta`, `SCHEMA_VERSION` |
+| the wire types | `InspectorPayload`, `PaneEntry`, `IrNode`, `IrChild`, `RewriteInfo`, `PaneLinkEntry`, `DefinitionEntry`, `Diagnostic`, `Meta`, `SourceInfo`, `SCHEMA_VERSION` |
 
-`InspectedProgram::binder_type` is internal.
+`new` and `build_payload` are the entry surface. `NameBinderIndex` and `dense_edges` are internal:
+the payload is what ships, and a consumer names the wire types through `InspectorPayload`'s fields.
+`InspectedProgram::from_parts` builds a one-pane model for tests and is `#[cfg(test)]`, because the
+shape it produces — one pane, no pane links — is one to assert against rather than one to serve.
 
 **Module layout.** One concept per module, each owning its type, its inherent impl and its unit
 tests, and no module depending on one below it:
 
 | module | owns |
 |---|---|
-| `walk` | the shared IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, node labels |
-| `span_index` | the `(span, node)` table over one pane |
+| `walk` | the IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, node labels |
 | `name_binder` | source-level name resolution over the surface AST |
 | `program` | `InspectedProgram` and its per-pane projections |
 | `wire` | the payload types, the schema version, the payload assembly, and the pane-link projection |
@@ -377,23 +290,18 @@ for a recurrence.
 
 ### The wire belongs to this module
 
-The payload's node type is this module's own, and `pretty_tree` is a renderer again: it carries no
-serde and no `ccl` types, which is its standing invariant. Before, the payload rode
-`pretty_tree::InspectNode` — a rendering type holding the tile-producer fields `annotations` and
-`tiling`, which the payload never set and no consumer read, plus a hand-written `Serialize`
-spelling this module's schema. A wire change was then a diff in a renderer.
-
-One encoder now writes a `RewriteTag` to the wire. There were two, the second on
-`SourceAttribution`, each with its own copy of the null-compression rule; it went with the query
-results that were its only reader.
+The payload's node type is this module's own. Two invariants hold the boundary: `pretty_tree`
+carries no serde and no `ccl` type, so a wire change is never a diff in a renderer; and exactly one
+encoder writes a `RewriteTag` to the wire, so the null-compression rule has one copy.
 
 ### Span containment is a scan
 
-Containment is the integer test `start <= pos < end`, so the span table is a flat vector. One
-program's tree is small enough that an interval tree would cost more complexity than it saves, and
-the table is enumerated here rather than searched, so swapping the structure later stays a change
-behind this API. `intervalsets` is not used: it is built for numeric value domains and carries a
-`contains` bug on half-bounded intervals (see `src/interpreter/tiling/predicate.rs`).
+Containment is the integer test `start <= pos < end`, and a position is resolved by scanning the
+shipped nodes. One program's tree is small enough that an interval tree would cost more complexity
+than it saves, and the scan is the consumer's, so a structure over the spans is a change behind the
+consumer's own API rather than a wire change. `intervalsets` is not used: it is built for numeric
+value domains and carries a `contains` bug on half-bounded intervals (see
+`src/interpreter/tiling/predicate.rs`).
 
 ### What the model cannot say
 
@@ -403,5 +311,9 @@ behind this API. `intervalsets` is not used: it is built for numeric value domai
   [provenance.md](../ccl/design/provenance.md#the-edge-labels).
 - **No pane exists past `post-planning`** until operator conversion carries a node identity. A pane
   may be issued at any point in the pipeline; that one has nothing to resolve against.
-- **No channel names a binder site**, which is what
-  [A binder's type is the binder's](#a-binders-type-is-the-binders) works around.
+- **No channel names a binder site.** A binder is not an expression, so nothing attributes it and no
+  field says which node binds the name written at a given span. The payload therefore carries no
+  binder types, and a consumer clicking a binder resolves the node whose span contains it — for
+  `g = "abc"` that is the whole `Let`, whose type is the type of what follows the binding. Closing
+  the gap means a source span on `TypedBinding`, after which the binder's type is a read; that is a
+  `ccl` change, carried as `TODO(binder-site)`.
