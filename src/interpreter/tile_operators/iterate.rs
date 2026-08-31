@@ -16,8 +16,9 @@ use crate::interpreter::{
 pub struct IterateExtent {
     /// The extent to iterate over.
     pub extent: Extent,
-    /// The tiling — always `Tiling::SealedFunction { domain: extent, codomain: extent }`.
-    pub tiling: Tiling,
+    /// Identity and the tiling — always
+    /// `Tiling::SealedFunction { domain: extent, codomain: extent }`.
+    pub base: OperatorBase,
 }
 
 impl IterateExtent {
@@ -26,7 +27,10 @@ impl IterateExtent {
             domain: extent.clone(),
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
-        Self { tiling, extent }
+        Self {
+            base: OperatorBase::new(tiling),
+            extent,
+        }
     }
 
     fn add_all_source_handles(
@@ -58,9 +62,7 @@ impl IterateExtent {
 }
 
 impl TileOperator for IterateExtent {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn subscribe(
         &mut self,
@@ -69,7 +71,7 @@ impl TileOperator for IterateExtent {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let mut producer = Box::new(IterateExtentProducer {
-            base: ProducerBase::new(IterateExtentProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(IterateExtentProducer::alloc_id(), &self.base.tiling),
             extent: self.extent.clone(),
             released: Predicate::False,
         });

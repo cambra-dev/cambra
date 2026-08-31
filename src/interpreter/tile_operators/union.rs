@@ -23,7 +23,8 @@ use crate::{
 /// already computed, by inference, and stamped on the union node as its value
 /// type. It is passed in rather than re-derived here (see [`new`](Self::new)).
 pub struct UnionOperator {
-    tiling: Tiling,
+    /// Identity and the output tiling: a `SealedFunction` over the arms' domains.
+    base: OperatorBase,
     /// Input operators; each must have a `SealedFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
     /// Flat-merge mode (see [`new_flat`](Self::new_flat)): arms share one domain
@@ -44,6 +45,17 @@ impl UnionOperator {
     /// record rule, so arms at different record widths came out a positional sum
     /// where the type layer said `{a: Int}`.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
+        let tiling = Self::coproduct_tiling(&inputs, declared_codomain);
+        Self {
+            base: OperatorBase::new(tiling),
+            inputs,
+            flat: false,
+        }
+    }
+
+    /// The tagged coproduct tiling the arms imply: one `Extent::Union` domain,
+    /// and the codomain they agree on or the declared one they merge into.
+    fn coproduct_tiling(inputs: &[Box<dyn TileOperator>], declared_codomain: Extent) -> Tiling {
         assert!(
             !inputs.is_empty(),
             "UnionOperator requires at least one input"
@@ -97,15 +109,38 @@ impl UnionOperator {
             Tiling::Scalar(declared_codomain)
         };
 
-        let tiling = Tiling::SealedFunction {
+        Tiling::SealedFunction {
             domain: Extent::Union(TagMap::from_positional(domains)),
             codomain: Box::new(codomain),
-        };
-        Self {
-            tiling,
-            inputs,
-            flat: false,
         }
+    }
+
+    /// Collapse the coproduct domain [`new`](Self::new) built back to the one
+    /// extent the arms share.
+    ///
+    /// Sharing it is the precondition — the arms are disjoint slices of one
+    /// collection, which is what makes the merge a reassembly rather than a
+    /// concatenation — so this is a check, not a reconciliation. Arms that
+    /// genuinely differ are a copairing, and [`new`](Self::new) is the
+    /// constructor for those.
+    fn flatten_domain(tiling: Tiling) -> Tiling {
+        let Tiling::SealedFunction { domain, codomain } = tiling else {
+            return tiling;
+        };
+        let mut arms = match domain {
+            Extent::Union(ds) => ds.into_values(),
+            other => vec![other],
+        }
+        .into_iter();
+        let domain = arms.next().expect("at least one arm");
+        for other in arms {
+            assert_eq!(
+                other, domain,
+                "a flat merge reassembles one domain, but the arms carry different \
+                 extents; arms over distinct index sets are a copairing"
+            );
+        }
+        Tiling::SealedFunction { domain, codomain }
     }
 
     /// A **flat-merge** union: arms over the *same* base extent (disjoint runtime
@@ -117,31 +152,15 @@ impl UnionOperator {
     /// is for a sourceless union whose arms have genuinely distinct extents — a Σ /
     /// C-form dispatch read by `final_or_default`.)
     pub fn new_flat(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
-        let mut op = Self::new(inputs, declared_codomain);
-        op.flat = true;
-        if let Tiling::SealedFunction { domain, codomain } = op.tiling {
-            // Collapse the coproduct `new` built back to the one domain the arms
-            // share. Sharing it is the precondition — the arms are disjoint slices
-            // of one collection, which is what makes the merge a reassembly rather
-            // than a concatenation — so this is a *check*, not a reconciliation.
-            // Arms that genuinely differ are a copairing, and `new` (not `new_flat`)
-            // is the constructor for those.
-            let mut arms = match domain {
-                Extent::Union(ds) => ds.into_values(),
-                other => vec![other],
-            }
-            .into_iter();
-            let domain = arms.next().expect("at least one arm");
-            for other in arms {
-                assert_eq!(
-                    other, domain,
-                    "a flat merge reassembles one domain, but the arms carry different \
-                     extents; arms over distinct index sets are a copairing"
-                );
-            }
-            op.tiling = Tiling::SealedFunction { domain, codomain };
+        // Narrow before minting, so the identity an operator is born with carries
+        // the tiling it keeps. Reaching into `base.tiling` afterwards would leave
+        // the shape recorded at construction stale.
+        let tiling = Self::flatten_domain(Self::coproduct_tiling(&inputs, declared_codomain));
+        Self {
+            base: OperatorBase::new(tiling),
+            inputs,
+            flat: true,
         }
-        op
     }
 }
 
@@ -248,9 +267,7 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
 }
 
 impl TileOperator for UnionOperator {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
@@ -280,7 +297,7 @@ impl TileOperator for UnionOperator {
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(UnionProducer::alloc_id(), &self.base.tiling),
             inputs: input_producers,
             flat: self.flat,
         })

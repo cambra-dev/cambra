@@ -19,8 +19,9 @@ use crate::{
 pub struct Aggregate {
     /// The `SealedFunction`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
-    /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
-    tiling: Tiling,
+    /// Identity and the output tiling — always
+    /// `Tiling::Aggregation { accumulator: <output extent> }`.
+    base: OperatorBase,
 }
 
 impl Aggregate {
@@ -39,14 +40,15 @@ impl Aggregate {
             kind,
             accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
         };
-        Self { input, tiling }
+        Self {
+            input,
+            base: OperatorBase::new(tiling),
+        }
     }
 }
 
 impl TileOperator for Aggregate {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -61,7 +63,10 @@ impl TileOperator for Aggregate {
         let input_producer =
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
-        Box::new(AggregateProducer::new(self.tiling.clone(), input_producer))
+        Box::new(AggregateProducer::new(
+            self.base.tiling.clone(),
+            input_producer,
+        ))
     }
 }
 
@@ -161,7 +166,8 @@ impl TileProducer for AggregateProducer {
 
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
-    tiling: Tiling,
+    /// Identity and the output tiling.
+    base: OperatorBase,
     kind: AggregateKind,
     only_terminal: bool,
 }
@@ -175,7 +181,7 @@ impl ExtractAggregate {
         };
         Self {
             input,
-            tiling,
+            base: OperatorBase::new(tiling),
             kind,
             only_terminal,
         }
@@ -183,9 +189,7 @@ impl ExtractAggregate {
 }
 
 impl TileOperator for ExtractAggregate {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -270,8 +274,9 @@ pub struct MapExtractAggregate {
     input: Box<dyn TileOperator>,
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
-    /// Output tiling: `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
-    tiling: Tiling,
+    /// Identity and the output tiling:
+    /// `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
+    base: OperatorBase,
 }
 
 impl MapExtractAggregate {
@@ -296,15 +301,13 @@ impl MapExtractAggregate {
         Self {
             input,
             kind,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 }
 
 impl TileOperator for MapExtractAggregate {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -320,7 +323,7 @@ impl TileOperator for MapExtractAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapExtractAggregateProducer {
-            base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), &self.base.tiling),
             input: input_producer,
             kind: self.kind,
         })
@@ -400,8 +403,9 @@ pub struct MapAggregate {
     input: Box<dyn TileOperator>,
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
-    /// Output tiling: `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
-    tiling: Tiling,
+    /// Identity and the output tiling:
+    /// `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
+    base: OperatorBase,
 }
 
 impl MapAggregate {
@@ -430,15 +434,13 @@ impl MapAggregate {
         Self {
             input,
             kind,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 }
 
 impl TileOperator for MapAggregate {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -454,7 +456,7 @@ impl TileOperator for MapAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapAggregateProducer {
-            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &self.base.tiling),
             input: input_producer,
             kind: self.kind,
             accumulators: HashMap::new(),

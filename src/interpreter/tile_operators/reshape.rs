@@ -14,7 +14,9 @@ use crate::{
 /// be extended if needed.
 pub struct PermuteRecordDomain {
     input: Box<dyn TileOperator>,
-    tiling: Tiling,
+    /// Identity and the output tiling: the input's `SealedFunction` with its
+    /// `Record` domain permuted.
+    base: OperatorBase,
     permutation: Vec<usize>,
 }
 
@@ -49,16 +51,14 @@ impl PermuteRecordDomain {
         };
         Self {
             input,
-            tiling,
+            base: OperatorBase::new(tiling),
             permutation,
         }
     }
 }
 
 impl TileOperator for PermuteRecordDomain {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -71,7 +71,7 @@ impl TileOperator for PermuteRecordDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(PermuteRecordDomainProducer {
-            base: ProducerBase::new(PermuteRecordDomainProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(PermuteRecordDomainProducer::alloc_id(), &self.base.tiling),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             permutation: self.permutation.clone(),
         })
@@ -313,8 +313,9 @@ fn flatten_result_correlation(
 /// For example, with domain `(_0: (_0: A, (_0: B, _1: C)), _1: (_0: D), _2: E)` and `indices_to_flatten = [0, 1]`,
 /// the output domain is `(_0: A, _1: (_0: B, _1: C), _2: D, _3: E)`.
 pub struct FlattenTupleDomain {
-    /// Output tiling: `SealedFunction` with a single-level `Record` domain.
-    tiling: Tiling,
+    /// Identity and the output tiling: `SealedFunction` with a single-level
+    /// `Record` domain.
+    base: OperatorBase,
     /// Input operator whose domain is a `Record`.
     input: Box<dyn TileOperator>,
     /// Maps output field index `i` to `(outer_field_key, inner_field_key_opt)`.
@@ -378,7 +379,7 @@ impl FlattenTupleDomain {
             codomain: codomain.clone(),
         };
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             input,
             field_map,
         }
@@ -386,9 +387,7 @@ impl FlattenTupleDomain {
 }
 
 impl TileOperator for FlattenTupleDomain {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -401,7 +400,7 @@ impl TileOperator for FlattenTupleDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(FlattenTupleDomainProducer {
-            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &self.base.tiling),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),

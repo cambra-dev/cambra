@@ -32,8 +32,9 @@ pub struct ExtractFinal {
     /// case to fall back from and no default value has to be invented. An empty
     /// source with no default is an invariant violation, not a fallback.
     default: Option<Box<dyn TileOperator>>,
-    /// Output tiling — the codomain of the source SealedFunction (always `Scalar`).
-    tiling: Tiling,
+    /// Identity and the output tiling — the codomain of the source
+    /// SealedFunction (always `Scalar`).
+    base: OperatorBase,
 }
 
 impl ExtractFinal {
@@ -67,7 +68,7 @@ impl ExtractFinal {
         Self {
             source,
             default: Some(default),
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 
@@ -82,7 +83,7 @@ impl ExtractFinal {
         Self {
             source,
             default: None,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 
@@ -95,9 +96,7 @@ impl ExtractFinal {
 }
 
 impl TileOperator for ExtractFinal {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         let node = node.child("source", self.source.inspect(opts));
@@ -128,7 +127,7 @@ impl TileOperator for ExtractFinal {
             .as_mut()
             .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), scheduler));
         Box::new(ExtractFinalProducer {
-            base: ProducerBase::new(ExtractFinalProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(ExtractFinalProducer::alloc_id(), &self.base.tiling),
             source: source_producer,
             default: default_producer,
             final_value: None,

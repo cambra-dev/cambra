@@ -10,9 +10,9 @@
 //!
 //! The operators are grouped into submodules by cohesive operator+producer
 //! cluster; this `mod.rs` carries the shared spine (the [`TileOperator`] /
-//! [`TileProducer`] traits, [`ProducerBase`], the [`impl_producer_base`] macro,
-//! and [`TilePathStep`]) and re-exports every cluster so consumers continue to
-//! reach items as `tile_operators::X`.
+//! [`TileProducer`] traits, [`OperatorBase`] and [`ProducerBase`] with their
+//! `impl_*_base` macros, and [`TilePathStep`]) and re-exports every cluster so
+//! consumers continue to reach items as `tile_operators::X`.
 
 use std::{
     collections::HashMap,
@@ -23,6 +23,7 @@ use log::trace;
 
 pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
+    ccl::provenance::NodeId,
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -70,6 +71,25 @@ pub trait TileOperator {
     /// from inputs to the output.
     fn tiling(&self) -> &Tiling;
 
+    /// This operator's identity, or `None` for a type that carries no
+    /// [`OperatorBase`].
+    ///
+    /// Production operators supply this through [`impl_operator_base`]. The
+    /// default exists for test doubles, which need no identity: nothing folds
+    /// them into a provenance table and nothing renders them in a pane.
+    fn operator_id(&self) -> Option<NodeId> {
+        None
+    }
+
+    /// The concrete type's short name, e.g. `"MapResult"`.
+    ///
+    /// Split out of [`inspect`](Self::inspect) so a caller that wants only the
+    /// name pays for the name: `inspect` recurses into upstream operators, so
+    /// reading a label off it is quadratic in the depth of the graph.
+    fn kind(&self) -> &'static str {
+        short_type_name::<Self>()
+    }
+
     /// Subscribe to this operator with an intent guard and consumer.
     /// Returns a producer that allows the consumer to get data and release regions.
     ///
@@ -93,7 +113,7 @@ pub trait TileOperator {
     ///
     /// Always includes name and tiling, and impls can add children with `add_inspect_children`
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let name: &'static str = std::any::type_name::<Self>().rsplit_once("::").unwrap().1;
+        let name: &'static str = self.kind();
         self.add_inspect_children(
             InspectNode::new(name).with_tiling(self.tiling().to_string()),
             opts,
@@ -124,6 +144,68 @@ pub trait TileOperator {
 // operator reads anything another operator computed, so the producer graph still
 // describes the whole dataflow.
 static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLock::new();
+
+/// The concrete type's name with its module path stripped, e.g. `"MapResult"`.
+///
+/// Four call sites want this and each had its own copy: the operator's
+/// [`TileOperator::kind`], the producer's [`TileProducer::name`] and
+/// [`TileProducer::alloc_id`] counter key, and [`TileOperator::inspect`]'s
+/// label.
+pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    full.rsplit_once("::").map_or(full, |(_, tail)| tail)
+}
+
+/// Common identity and tiling state shared by every [`TileOperator`].
+///
+/// The operator-side counterpart of [`ProducerBase`], and it exists for the same
+/// reason: 46 operators held a `tiling` field and a trivial accessor for it.
+/// Identity rides here too, because construction is the only point every
+/// operator type passes through — there is no shared constructor, so a
+/// [`NodeId`] taken anywhere else would be a call site's responsibility to
+/// remember.
+///
+/// The id is drawn from the same counter as an expression node's. Conversion
+/// runs after every rewrite phase and mints no expression nodes, so every
+/// operator id is greater than every expression id in the same compile, and the
+/// two sets are disjoint. `src/ccl/design/provenance.md` owns why that matters.
+pub struct OperatorBase {
+    /// Identity, minted at construction. See the type's own docs for why here.
+    pub(crate) id: NodeId,
+    /// Output tiling for this operator.
+    pub(crate) tiling: Tiling,
+}
+
+impl OperatorBase {
+    /// Mint an identity for an operator with the given output tiling.
+    pub(crate) fn new(tiling: Tiling) -> Self {
+        Self {
+            id: NodeId::fresh(),
+            tiling,
+        }
+    }
+}
+
+/// Implement [`TileOperator::tiling`] and [`TileOperator::operator_id`] for a
+/// concrete operator that stores its shared state in a field named
+/// `base: OperatorBase`.
+///
+/// Usage: place `impl_operator_base!();` inside the `impl TileOperator for Foo`
+/// block in place of the boilerplate accessors.
+macro_rules! impl_operator_base {
+    () => {
+        fn tiling(&self) -> &Tiling {
+            &self.base.tiling
+        }
+        fn operator_id(&self) -> Option<$crate::ccl::provenance::NodeId> {
+            Some(self.base.id)
+        }
+    };
+}
+// Re-exported within the crate so the cluster submodules can pull it in with
+// `use super::impl_operator_base;`, avoiding a `#[macro_export]` that would leak
+// it to the crate root.
+pub(crate) use impl_operator_base;
 
 /// Common identity and tiling state shared by every [`TileProducer`].
 ///
@@ -198,7 +280,7 @@ pub trait TileProducer {
     where
         Self: Sized,
     {
-        let raw: &'static str = std::any::type_name::<Self>().rsplit_once("::").unwrap().1;
+        let raw: &'static str = short_type_name::<Self>();
         let key: &'static str = raw.strip_suffix("Producer").unwrap_or(raw);
         let map = PRODUCER_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut counters = map.lock().unwrap();
@@ -213,7 +295,7 @@ pub trait TileProducer {
     /// type name by stripping the `"Producer"` suffix, then appends `#<id>`.
     /// For example, `MapApplyProducer` with id 3 → `"MapApply#3"`.
     fn name(&self) -> String {
-        let raw = std::any::type_name::<Self>().rsplit_once("::").unwrap().1;
+        let raw = short_type_name::<Self>();
         let base = raw.strip_suffix("Producer").unwrap_or(raw);
         format!("{}#{}", base, self.producer_id())
     }
