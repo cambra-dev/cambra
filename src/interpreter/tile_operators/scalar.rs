@@ -15,8 +15,8 @@ pub struct Constant {
     value: Value,
     /// The extent (type) of the produced value.
     pub extent: Extent,
-    /// The tiling — always `Tiling::Scalar`.
-    pub tiling: Tiling,
+    /// Identity and the tiling — always `Tiling::Scalar`.
+    pub base: OperatorBase,
 }
 
 impl Constant {
@@ -32,15 +32,13 @@ impl Constant {
         Self {
             value,
             extent,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 }
 
 impl TileOperator for Constant {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
         node.annotate(format!("{}", self.value))
@@ -54,7 +52,7 @@ impl TileOperator for Constant {
     ) -> Box<dyn TileProducer> {
         consumer.notify();
         Box::new(ConstantProducer {
-            base: ProducerBase::new(ConstantProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(ConstantProducer::alloc_id(), &self.base.tiling),
             value: self.value.clone(),
             released: false,
         })
@@ -107,8 +105,9 @@ impl TileProducer for ConstantProducer {
 pub struct ToScalar {
     /// The `SealedFunction`-typed input to unwrap.
     input: Box<dyn TileOperator>,
-    /// Output tiling: the codomain of the input's `SealedFunction` tiling.
-    tiling: Tiling,
+    /// Identity and the output tiling: the codomain of the input's
+    /// `SealedFunction` tiling.
+    base: OperatorBase,
 }
 
 impl ToScalar {
@@ -123,14 +122,15 @@ impl ToScalar {
                 input.tiling()
             )
         });
-        Self { input, tiling }
+        Self {
+            input,
+            base: OperatorBase::new(tiling),
+        }
     }
 }
 
 impl TileOperator for ToScalar {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -146,7 +146,7 @@ impl TileOperator for ToScalar {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(ToScalarProducer {
-            base: ProducerBase::new(ToScalarProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(ToScalarProducer::alloc_id(), &self.base.tiling),
             input: input_producer,
         })
     }
@@ -177,9 +177,9 @@ pub struct VariantWrap {
     tag: FieldKey,
     /// Per-variant extents of the full union; `input` feeds the `tag` arm.
     variant_extents: TagMap<Extent>,
-    /// Output tiling — `Scalar(Union)` for a scalar payload, or
+    /// Identity and the output tiling — `Scalar(Union)` for a scalar payload, or
     /// `SealedFunction { D ⇒ Scalar(Union) }` for a payload stream.
-    tiling: Tiling,
+    base: OperatorBase,
 }
 
 impl VariantWrap {
@@ -209,7 +209,7 @@ impl VariantWrap {
             input,
             tag,
             variant_extents,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 }
@@ -238,9 +238,7 @@ fn wrap_variant_column(
 }
 
 impl TileOperator for VariantWrap {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("payload", self.input.inspect(opts))
@@ -257,7 +255,7 @@ impl TileOperator for VariantWrap {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantWrapProducer {
-            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &self.base.tiling),
             input,
             tag: self.tag.clone(),
             variant_extents: self.variant_extents.clone(),
@@ -393,8 +391,8 @@ pub struct VariantProject {
     /// alongside the tiling so an empty result can be built at the right column
     /// shape without destructuring it back out.
     payload_extent: Extent,
-    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
-    tiling: Tiling,
+    /// Identity and the output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
+    base: OperatorBase,
 }
 
 impl VariantProject {
@@ -430,15 +428,13 @@ impl VariantProject {
             input,
             tag,
             payload_extent,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 }
 
 impl TileOperator for VariantProject {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("scrutinee", self.input.inspect(opts))
@@ -455,7 +451,7 @@ impl TileOperator for VariantProject {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantProjectProducer {
-            base: ProducerBase::new(VariantProjectProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(VariantProjectProducer::alloc_id(), &self.base.tiling),
             input,
             tag: self.tag.clone(),
             payload_extent: self.payload_extent.clone(),

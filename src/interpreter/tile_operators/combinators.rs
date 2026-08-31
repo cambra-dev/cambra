@@ -15,8 +15,9 @@ use crate::{
 /// `CurriedFunction { domain: codomain, codomain: domain }`.  Each codomain
 /// value maps to the list of domain values that produce it.
 pub struct Converse {
-    /// Output tiling: `CurriedFunction { domain: input.codomain, codomain: input.domain }`.
-    tiling: Tiling,
+    /// Identity and the output tiling:
+    /// `CurriedFunction { domain: input.codomain, codomain: input.domain }`.
+    base: OperatorBase,
     /// The sealed-function input to invert.
     input: Box<dyn TileOperator>,
 }
@@ -33,14 +34,15 @@ impl Converse {
             domain2: domain.clone(),
             codomain: domain,
         };
-        Self { tiling, input }
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
     }
 }
 
 impl TileOperator for Converse {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -236,8 +238,9 @@ impl TileProducer for ConverseProducer {
 /// Takes a `SealedFunction(domain → codomain)` and produces `SealedFunction(domain → Scalar(domain))`.
 /// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
 pub struct MapDomain {
-    /// Output tiling: `SealedFunction { domain, codomain: Scalar(domain) }`.
-    tiling: Tiling,
+    /// Identity and the output tiling:
+    /// `SealedFunction { domain, codomain: Scalar(domain) }`.
+    base: OperatorBase,
     /// The sealed-function input.
     input: Box<dyn TileOperator>,
 }
@@ -255,14 +258,15 @@ impl MapDomain {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(domain.clone())),
         };
-        Self { tiling, input }
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
     }
 }
 
 impl TileOperator for MapDomain {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -337,8 +341,9 @@ impl TileProducer for MapDomainProducer {
 /// The two domain extents are packed into a record domain with fields `_0` (outer domain) and `_1` (inner domain),
 /// while the codomain becomes a scalar version of the original codomain.
 pub struct Uncurry {
-    /// Output tiling: `SealedFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
-    tiling: Tiling,
+    /// Identity and the output tiling:
+    /// `SealedFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
+    base: OperatorBase,
     /// The curried-function input.
     input: Box<dyn TileOperator>,
 }
@@ -362,14 +367,15 @@ impl Uncurry {
             domain: pair_extent,
             codomain: Box::new(Tiling::Scalar(codomain.clone())),
         };
-        Self { tiling, input }
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
     }
 }
 
 impl TileOperator for Uncurry {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -510,8 +516,9 @@ impl TileProducer for UncurryProducer {
 /// TODO we should replace this with a Restrict node that filters based on a function of the domain,
 /// rather than this which filters based on a function of the codomain.
 pub struct Filter {
-    /// Output tiling, equal to the input tiling (filtering preserves the type).
-    tiling: Tiling,
+    /// Identity and the output tiling, equal to the input tiling (filtering
+    /// preserves the type).
+    base: OperatorBase,
     /// The sealed-function input to filter.
     input: Box<dyn TileOperator>,
     /// The boolean predicate applied to each domain element.
@@ -523,7 +530,7 @@ impl Filter {
     pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             input,
             predicate,
         }
@@ -531,9 +538,7 @@ impl Filter {
 }
 
 impl TileOperator for Filter {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -560,7 +565,7 @@ impl TileOperator for Filter {
             scheduler,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(FilterProducer::alloc_id(), &self.base.tiling),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -682,8 +687,9 @@ impl TileProducer for FilterProducer {
 /// and `domain1` are untouched, and [`Tile::retain`] rebuilds `offsets` for the
 /// surviving rows.
 pub struct MapFilter {
-    /// Output tiling, equal to the input's — filtering removes rows, not structure.
-    tiling: Tiling,
+    /// Identity and the output tiling, equal to the input's — filtering removes
+    /// rows, not structure.
+    base: OperatorBase,
     /// The curried-function input whose inner collections are filtered.
     input: Box<dyn TileOperator>,
     /// A `Bool`-codomain curried function over the input's keys and inner domain.
@@ -708,7 +714,7 @@ impl MapFilter {
             predicate.tiling()
         );
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             input,
             predicate,
         }
@@ -716,9 +722,7 @@ impl MapFilter {
 }
 
 impl TileOperator for MapFilter {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -745,7 +749,7 @@ impl TileOperator for MapFilter {
             scheduler,
         );
         Box::new(MapFilterProducer {
-            base: ProducerBase::new(MapFilterProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(MapFilterProducer::alloc_id(), &self.base.tiling),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -827,8 +831,9 @@ impl TileProducer for MapFilterProducer {
 /// `Restrict` returns `SealedFunction { domain: D', codomain: D' }` where D' ⊆ D is the
 /// subset of domain elements for which the predicate is `true`.
 pub struct Restrict {
-    /// Output tiling — `SealedFunction(D, D)` mirroring an [`IterateExtent`] over D.
-    tiling: Tiling,
+    /// Identity and the output tiling — `SealedFunction(D, D)` mirroring an
+    /// [`IterateExtent`] over D.
+    base: OperatorBase,
     /// The boolean predicate over the domain to restrict.
     predicate: Box<dyn TileOperator>,
 }
@@ -846,14 +851,15 @@ impl Restrict {
             domain: domain_extent.clone(),
             codomain: Box::new(Tiling::Scalar(domain_extent)),
         };
-        Self { tiling, predicate }
+        Self {
+            base: OperatorBase::new(tiling),
+            predicate,
+        }
     }
 }
 
 impl TileOperator for Restrict {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("predicate", self.predicate.inspect(opts))
@@ -871,7 +877,7 @@ impl TileOperator for Restrict {
             scheduler,
         );
         Box::new(RestrictProducer {
-            base: ProducerBase::new(RestrictProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(RestrictProducer::alloc_id(), &self.base.tiling),
             predicate: predicate_producer,
         })
     }

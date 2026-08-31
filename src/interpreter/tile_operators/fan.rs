@@ -15,10 +15,11 @@ use crate::{
 /// All inputs must have `SealedFunction` tilings with compatible domains.
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct FanIn {
-    /// Output tiling: either a `SealedFunction { domain, codomain: Record { … } }`
-    /// or a `CurriedFunction { domain1, domain2, codomain: Record { … } }`,
-    /// depending on the input operators.
-    tiling: Tiling,
+    /// Identity and the output tiling: either a
+    /// `SealedFunction { domain, codomain: Record { … } }` or a
+    /// `CurriedFunction { domain1, domain2, codomain: Record { … } }`, depending
+    /// on the input operators.
+    base: OperatorBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
     /// The input function operators to zip together (either all `SealedFunction` or all `CurriedFunction`).
@@ -145,7 +146,7 @@ impl FanIn {
             ),
         };
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             names,
             inputs: ops,
         }
@@ -188,9 +189,7 @@ pub fn fan_in_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn Til
 }
 
 impl TileOperator for FanIn {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
@@ -209,7 +208,7 @@ impl TileOperator for FanIn {
             consumer.notify();
         }));
         Box::new(FanInProducer {
-            base: ProducerBase::new(FanInProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(FanInProducer::alloc_id(), &self.base.tiling),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -452,7 +451,8 @@ impl TileProducer for FanInProducer {
 /// each input must produce a `Tile::Scalar` and the output is a
 /// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
 pub struct ScalarFanIn {
-    tiling: Tiling,
+    /// Identity and the output tiling: a `Record` of the inputs' scalar tilings.
+    base: OperatorBase,
     /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<String>,
     inputs: Vec<Box<dyn TileOperator>>,
@@ -495,7 +495,7 @@ impl ScalarFanIn {
                 .collect(),
         );
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             names,
             inputs,
         }
@@ -503,9 +503,7 @@ impl ScalarFanIn {
 }
 
 impl TileOperator for ScalarFanIn {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
@@ -524,7 +522,7 @@ impl TileOperator for ScalarFanIn {
             consumer.notify();
         }));
         Box::new(ScalarFanInProducer {
-            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &self.base.tiling),
             names: self.names.clone(),
             inputs: self
                 .inputs
