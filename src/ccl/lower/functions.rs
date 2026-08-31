@@ -273,9 +273,19 @@ pub(super) fn uncurry_params(
         // Harmless in the product (the projection is filtered to the output tree,
         // so the entry drops out), and the reason there is no produced-side leak
         // class: see `design/provenance.md`, "The fold".
-        let var = ctx.tag_machinery(Expr::var(&tuple_name), fn_span, up);
-        let idx = ctx.tag_machinery(Expr::proj_index(i), fn_span, up);
-        let proj = ctx.tag_machinery(Expr::apply(var, idx), fn_span, up);
+        //
+        // Tagged with the **parameter's declaration**, not the function's span.
+        // `__arg_tuple_N ▷ .i` is what became of `arg`, so its source position is
+        // where `arg` was written. Every occurrence inherits that tag on the
+        // freshened interior while keeping its own span on the root, which is the
+        // pair a consumer needs: the root says which occurrence, the interior says
+        // which declaration. A substituted parameter binds nothing, so this is the
+        // only channel that can name its site — see `src/ccl/design/ir.md`, "A
+        // substituted parameter's site rides its projection".
+        let site = arg.name_span;
+        let var = ctx.tag_machinery(Expr::var(&tuple_name), site, up);
+        let idx = ctx.tag_machinery(Expr::proj_index(i), site, up);
+        let proj = ctx.tag_machinery(Expr::apply(var, idx), site, up);
         substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
     });
     // Attach the *tuple* of per-parameter annotations (checking mode), mirroring the
@@ -526,14 +536,17 @@ in add"
         assert_eq!(symbolic(&ccl), expected);
     }
 
-    /// Occurrence fidelity: in a multi-param `def` whose params occur more than
-    /// once, uncurry substitutes a tuple-projection template into each occurrence,
-    /// and each projection *root* keeps that occurrence's own id (see
-    /// [`substitute_param_in_body`]), so it inherits that occurrence's own source
-    /// span instead of the one `def` span every copy of the template shares. The
-    /// corpus otherwise has no multi-param `def`, so pin the span fidelity here.
+    /// A substituted parameter's two spans, which together answer
+    /// goto-definition for it: the projection **root** carries the occurrence's
+    /// own span (its id is the occurrence's), and the projection **interior**
+    /// carries the parameter's **declaration** (the template's tag, inherited by
+    /// every freshened copy).
+    ///
+    /// A substituted parameter binds nothing, so no `TypedBinding::name_span` can
+    /// name it and this pair is the only channel that does. The corpus otherwise
+    /// has no multi-param `def`, so pin both halves here.
     #[test]
-    fn uncurry_projection_roots_carry_occurrence_spans() {
+    fn a_substituted_parameter_carries_occurrence_and_declaration_spans() {
         use crate::ccl::TypedExprNode;
         use crate::ccl::provenance::NodeId;
         use crate::ccl::provenance::{LoweringSession, Nature, SourceProjection, fold_lowering};
@@ -546,6 +559,9 @@ in add"
         let a1 = Span::new(19, 20);
         let a2 = Span::new(23, 24);
         let b = Span::new(27, 28);
+        // The declarations, in `def add(a, b)`.
+        let decl_a = Span::new(8, 9);
+        let decl_b = Span::new(11, 12);
 
         let stmts = parse_module(src);
         let mut ctx = LoweringContext::default();
@@ -591,6 +607,28 @@ in add"
             vec![a1, a2, b],
             "each projection root carries its OWN occurrence's span — the two `a` \
              uses at distinct spans, plus `b`, not the shared `def` span"
+        );
+
+        // The interior: the `Proj(Index(i))` under each projection root carries
+        // the declaration of the parameter that projection stands for. `a` is
+        // used twice, so its declaration appears twice.
+        fn interior_spans(e: &Expr, proj: &SourceProjection, out: &mut Vec<Span>) {
+            if let TypedExprNode::Apply { function, .. } = &e.node
+                && matches!(function.node, TypedExprNode::Proj(_))
+                && let Some(attr) = proj.get(&function.node_id())
+            {
+                out.extend(attr.spans.iter().copied());
+            }
+            e.walk_children(|c| interior_spans(c, proj, out));
+        }
+        let mut interiors = Vec::new();
+        interior_spans(&ccl, &projection, &mut interiors);
+        interiors.sort_by_key(|s| (s.start, s.end));
+        assert_eq!(
+            interiors,
+            vec![decl_a, decl_a, decl_b],
+            "each projection's interior names the parameter's declaration, so a \
+             consumer at an occurrence can reach the site the parameter was written at"
         );
     }
 }
