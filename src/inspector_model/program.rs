@@ -3,7 +3,7 @@
 //!
 //! [`InspectedProgram`] holds one [`PaneProjection`] per declared pane (that
 //! pane's IR tree and its `SourceProjection`), the pane-pair provenance maps,
-//! and the source-level [`NameBinderIndex`].
+//! and the pane-pair provenance maps.
 //! [`build_payload`](InspectedProgram::build_payload) in `wire.rs` is its consumer.
 //!
 //! There is no point-query layer: every static fact ships in the payload, and a
@@ -19,10 +19,12 @@ use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase};
 use crate::ccl::panes::PANES;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
-#[cfg(test)]
-use crate::chl_parser::ast::Module;
 
-use super::name_binder::NameBinderIndex;
+/// The pane use→binder resolution runs over: the lowered, uniquified tree before
+/// inference, where a source name occurs as often as it does in the program.
+///
+/// Must be one of [`PANES`]' names.
+pub(super) const DEFINITIONS_PANE: &str = "pre-inference";
 
 /// One pipeline pane's read-only projection: its IR tree and its
 /// `SourceProjection`.
@@ -59,9 +61,6 @@ pub(super) struct PaneProjection<'a> {
 pub struct InspectedProgram<'a> {
     /// The original program source text (the payload's `source.text`).
     source: &'a str,
-    /// Source-level lexical name resolution — the payload's `definitions`.
-    /// Pane-independent (built over the surface AST), so it is not per-pane.
-    name_binder: NameBinderIndex,
     /// The panes in order (upstream → downstream): pre-inference,
     /// post-inference, post-channelize, ….
     panes: Vec<PaneProjection<'a>>,
@@ -146,10 +145,8 @@ impl<'a> InspectedProgram<'a> {
                 )
             })
             .collect();
-        let name_binder = NameBinderIndex::build(&compiled.source_ast);
         InspectedProgram {
             source: &compiled.source,
-            name_binder,
             panes,
             // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
             // already one shorter than its projections, in the same order.
@@ -175,7 +172,6 @@ impl<'a> InspectedProgram<'a> {
         source: &'a str,
         ir: &'a Expr,
         projection: SourceProjection,
-        source_ast: &Module,
     ) -> Self {
         let panes = vec![PaneProjection::build(
             pane,
@@ -184,10 +180,8 @@ impl<'a> InspectedProgram<'a> {
             ir,
             projection,
         )];
-        let name_binder = NameBinderIndex::build(source_ast);
         InspectedProgram {
             source,
-            name_binder,
             panes,
             pane_maps: Vec::new(),
         }
@@ -210,8 +204,21 @@ impl<'a> InspectedProgram<'a> {
     }
 
     /// The source-level name index (for the payload's `definitions`).
-    pub(super) fn name_binder_ref(&self) -> &NameBinderIndex {
-        &self.name_binder
+    /// Every resolved use→binder pair, over the **pre-inference** pane: the tree
+    /// where a source name occurs as often as it does in the program, before
+    /// monomorphization copies a `def` body per specialization.
+    ///
+    /// The pane is named rather than positional, so inserting a pane ahead of it
+    /// cannot silently change which tree resolves names. A model built over some
+    /// other single pane ([`from_parts`](Self::from_parts)) has no pre-inference
+    /// tree and resolves nothing.
+    ///
+    /// See [`definitions`](super::definitions) for why the IR answers this.
+    pub(super) fn definitions(&self) -> Vec<super::definitions::Definition> {
+        let Some(pane) = self.panes.iter().find(|p| p.id == DEFINITIONS_PANE) else {
+            return Vec::new();
+        };
+        super::definitions::definitions(pane.ir, &pane.projection, self.source)
     }
 }
 

@@ -4,9 +4,9 @@
 //! a node table) + use→def definitions + diagnostics + meta. This module
 //! mirrors that JSON exactly as a serde-gated [`InspectorPayload`]; the actual
 //! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
-//! Building the payload is pure: it enumerates
-//! `NameBinderIndex` and builds each
-//! pane's node table via [`build_node_table`], over the IR walk `walk.rs` owns.
+//! Building the payload is pure: it resolves names over the pre-inference pane
+//! (`definitions`) and builds each pane's node table via [`build_node_table`],
+//! over the IR walk `walk.rs` owns.
 //!
 //! # Pane links
 //!
@@ -52,7 +52,7 @@ use crate::ccl::Expr;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 use crate::chl_parser::ast::Span;
 
-use super::name_binder::Definition;
+use super::definitions::Definition;
 use super::program::InspectedProgram;
 use super::walk::{node_label, predicate_children};
 
@@ -473,7 +473,7 @@ impl InspectedProgram<'_> {
     /// * `paneLinks` — per consecutive pane pair, the dense edges of the
     ///   pane-pair `ProvenanceMap` folded at that boundary, self-edges included (see
     ///   [`dense_edges`]).
-    /// * `definitions` — `NameBinderIndex::definitions`.
+    /// * `definitions` — [`InspectedProgram::definitions`](super::program::InspectedProgram).
     /// * `diagnostics` — empty.
     /// * `meta` — `payloadKind: "program"`, `schema:` [`SCHEMA_VERSION`].
     pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
@@ -483,7 +483,6 @@ impl InspectedProgram<'_> {
         };
 
         let definitions = self
-            .name_binder_ref()
             .definitions()
             .into_iter()
             .map(
@@ -494,7 +493,7 @@ impl InspectedProgram<'_> {
                  }| DefinitionEntry {
                     use_span,
                     def_span,
-                    name: name.to_string(),
+                    name,
                 },
             )
             .collect();
@@ -1516,7 +1515,6 @@ max(totals)
             &prog.source,
             &prog.post_channelize_ir,
             panes.projection("post-channelize").clone(),
-            &prog.source_ast,
         )
         .build_payload("test");
         let at = |span| labels_at(&payload, "post-channelize", span);

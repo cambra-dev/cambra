@@ -584,22 +584,6 @@ pub struct CompiledProgram {
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
     /// pair.
     pub(crate) provenance_table: ProvenanceTable,
-    /// The parsed CHL surface AST — the source-of-truth for source-level
-    /// (lexical) inspector queries.
-    ///
-    /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
-    /// retained verbatim. It is the anchor for *source-language* questions —
-    /// name resolution (`goto-definition`, the binder half of `scope-at`) —
-    /// answered by `inspector_model`'s `NameBinderIndex`.
-    ///
-    /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
-    /// (the typed IR): lowering destroys some source variables before any IR
-    /// node exists — notably `uncurry_params` rewrites multi-param references
-    /// `Var(x)` to `__arg_tuple_N ▷ .i` *before* uniquify, so the lowered/typed
-    /// tree structurally cannot resolve a multi-param `def`/`lambda` parameter
-    /// back to its binder. The surface AST still has `x`/`y` with their
-    /// `Param.name_span`, so lexical resolution over *this* is lossless.
-    pub source_ast: chl_parser::ast::Module,
     /// The original program source text, retained verbatim.
     ///
     /// Inspector queries need the source string to produce snippets (`hover`'s
@@ -1250,8 +1234,6 @@ struct Frontend {
     /// it is. A **pane** is exactly this: a captured phase output that outlives
     /// the run.
     panes: BTreeMap<Phase, Expr>,
-    /// The surface AST lowering consumed, retained for source-level queries.
-    module: chl_parser::ast::Module,
     /// Sink bindings discovered during lowering. Drained before the sources,
     /// which is the order [`LoweringContext`] requires.
     sink_bindings: HashMap<String, Arc<dyn DataSink>>,
@@ -1393,7 +1375,6 @@ fn run_frontend(
         return Ok(Frontend {
             expr,
             panes,
-            module,
             sink_bindings,
             lowering_projection,
             table_session,
@@ -1419,7 +1400,6 @@ fn run_frontend(
     Ok(Frontend {
         expr,
         panes,
-        module,
         sink_bindings,
         lowering_projection,
         table_session,
@@ -1759,7 +1739,6 @@ pub fn compile_program(
     let Frontend {
         expr: join_planned,
         mut panes,
-        module,
         sink_bindings: sink_bindings_registry,
         lowering_projection,
         table_session,
@@ -1874,7 +1853,6 @@ pub fn compile_program(
         post_as_of_read_ir,
         post_lambda_elim_ir,
         provenance_table,
-        source_ast: module,
         source: code.to_string(),
     };
 

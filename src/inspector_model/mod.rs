@@ -39,30 +39,24 @@
 //! at this position" is a scan of the shipped nodes, and it is the consumer's —
 //! see `src/inspector_model/design.md`, "A pane resolves against itself".
 //!
-//! # Scope
+//! # Names resolve over the IR
 //!
-//! One source-side index lives here, enumerated onto the wire rather than
-//! queried: `NameBinderIndex`, source-level lexical name resolution over the
-//! parsed CHL surface AST retained on
-//! [`source_ast`](crate::ccl::context::CompiledProgram::source_ast), shipped as
-//! the payload's `definitions`. It resolves at the *source* level because
-//! lowering destroys the **name** of a multi-param `def`/`lambda` parameter:
-//! `uncurry_params` rewrites `Var(p)` to `__arg_tuple_N ▷ .i`, so nothing
-//! downstream binds or mentions `p`. The occurrence's span survives
-//! (substitution is root-carry), which is why a *use* of such a parameter still
-//! resolves to a node and a type; what only the surface AST can say is which
-//! binder that use refers to.
+//! The payload's `definitions` pairs each use with the source site of the binder
+//! it names, read off the pre-inference pane. Uid equality is lexical resolution
+//! after uniquification, and a binder carries the span of the name written at it,
+//! so this is two reads rather than a scope walk — see
+//! `src/inspector_model/design.md`, "Definitions resolve over the IR".
 //!
 //! # One payload, no point queries
 //!
-//! [`InspectedProgram`] bundles the name index with the per-pane projections
-//! (source text, one IR tree and one `SourceProjection` per pane, surface AST),
-//! and [`InspectedProgram::build_payload`] assembles the payload from them. That
+//! [`InspectedProgram`] bundles the per-pane projections (source text, one IR
+//! tree and one `SourceProjection` per pane), and
+//! [`InspectedProgram::build_payload`] assembles the payload from them. That
 //! is the module's whole entry surface: a positional question is answered by the
 //! consumer over the shipped node table, which is the copy that runs. See
 //! `src/inspector_model/design.md`, "The usage model".
 
-mod name_binder;
+mod definitions;
 mod program;
 mod walk;
 mod wire;

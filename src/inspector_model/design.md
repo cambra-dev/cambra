@@ -36,8 +36,8 @@ running program; reading a running program is the separate path below.
   over.** "Which node is at this position" is a scan of the shipped nodes. Answering it here as
   well would be a second implementation of one semantics, and the consumer's is the copy that runs.
 
-So this module offers no positional query. `NameBinderIndex` builds its table and enumerates it
-onto the wire; it does not answer "what is at this position".
+So this module offers no positional query. It enumerates its tables onto the wire and answers
+nothing about a position.
 
 The consumer's own lookup reads one shipped table two ways: a node's `spans` for containment, and
 its `children` for structure. Depth, which breaks a tie between byte-identical spans, comes from the
@@ -190,16 +190,40 @@ except by string comparison, cannot elide a long type by structure, and cannot b
 constructor without parsing. What it can do is reach a refinement's predicate, which is a node with
 an edge to it.
 
-### Definitions are source-level
+### Definitions resolve over the IR
 
-Name resolution runs over the parsed surface AST, not the IR, because lowering destroys the name of
-a multi-param parameter: `uncurry_params` rewrites `Var(p)` to `__arg_tuple_N ▷ .i`, so nothing
-downstream binds or mentions `p`. The occurrence keeps its own id and span, so a use of `p` still
-resolves to a node and a type; what no IR pass can recover is which binder that use refers to, and
-that is what `NameBinderIndex` answers.
+`definitions` is one `{useSpan, defSpan, name}` row per resolved use, and it is read off the
+**pre-inference** pane rather than the parsed surface AST.
 
-`definitions` is the whole of what it enumerates: one `{useSpan, defSpan, name}` row per resolved
-use. An unbound use contributes none.
+Uid equality is lexical resolution. Every binder carries a globally-fresh `Uid` after
+uniquification, copies preserve it, and a bound occurrence names its binder — so a use's binder is
+the binder sharing its uid, capture-free by construction (`src/ccl/names.rs`). A binder is not a
+node and has no span of its own, so the site reported is the span of the node that binds it: a use of
+`g` in `g = 10` resolves to the statement rather than to the name, and a call resolves to the whole
+`def`.
+
+The pane is named, not positional: monomorphization splits a generalized definition into one
+specialization per resolved type, so a later pane holds one copy of a `def` body per specialization
+and would report each use once per copy. Pre-inference is the pane where a source name occurs as
+often as it does in the program.
+
+A multi-argument function's parameters bind nothing — `uncurry_params` substitutes
+`__arg_tuple_N ▷ .i` for every occurrence — so uid equality cannot answer for them. They resolve
+through the projection's two spans instead, the occurrence on the `Apply` and the declaration on its
+`Proj` child ([ir.md](../ccl/design/ir.md#a-substituted-parameters-site-rides-its-projection)). The
+projection is identified by its `lower.uncurry_proj` tag, so an author-written `t.0` is not mistaken
+for one.
+
+**What does not resolve.** A `Feed`, `Define` or `MutWrite` names a binder bound elsewhere, and that
+name is a field rather than a node, so the only span available is the whole node's. A use span
+covering a statement would contain the narrower uses inside it, and a consumer takes the first
+containing row, so a broad row would shadow them. Those uses contribute none: `out` in
+`out << value` does not resolve to its declaration. Closing it needs a span on the name field, which
+is a `ccl` change. Over the fixture corpus this is 2 rows of 31.
+
+This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
+and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a
+binding form added to the language cannot be answered wrong here without failing there first.
 
 ### Diagnostics and the degraded payload
 
@@ -263,7 +287,7 @@ node, so the payload grows with the program and not with how many type slots rea
 | `diagnostics_from_compile_errors` / `InspectorPayload::degraded` | the compile-failure path |
 | the wire types | `InspectorPayload`, `PaneEntry`, `IrNode`, `IrChild`, `RewriteInfo`, `PaneLinkEntry`, `DefinitionEntry`, `Diagnostic`, `Meta`, `SourceInfo`, `SCHEMA_VERSION` |
 
-`new` and `build_payload` are the entry surface. `NameBinderIndex` and `dense_edges` are internal:
+`new` and `build_payload` are the entry surface. `definitions` and `dense_edges` are internal:
 the payload is what ships, and a consumer names the wire types through `InspectorPayload`'s fields.
 `InspectedProgram::from_parts` builds a one-pane model for tests and is `#[cfg(test)]`, because the
 shape it produces — one pane, no pane links — is one to assert against rather than one to serve.
@@ -274,7 +298,7 @@ tests, and no module depending on one below it:
 | module | owns |
 |---|---|
 | `walk` | the IR traversal, named for `walk_children`/`walk_type_slots`: predicate children, node labels |
-| `name_binder` | source-level name resolution over the surface AST |
+| `definitions` | use→binder resolution over the IR |
 | `program` | `InspectedProgram` and its per-pane projections |
 | `wire` | the payload types, the schema version, the payload assembly, and the pane-link projection |
 
