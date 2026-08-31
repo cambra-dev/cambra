@@ -1,6 +1,6 @@
 //! Scalar primitives shared across the CCL pipeline: base types, literal
 //! constants, the binary / unary operator kinds, the [`Builtin`] combinator
-//! enum, projection keys, and the cross-phase [`TypeError`].
+//! enum, and projection keys.
 
 use std::fmt;
 
@@ -54,12 +54,6 @@ impl BaseType {
             _ => return None,
         })
     }
-}
-
-/// Errors about types that can be used by any phase of compilation
-pub enum TypeError {
-    /// Generic type error
-    Unsupported(String),
 }
 
 /// A literal constant value.
