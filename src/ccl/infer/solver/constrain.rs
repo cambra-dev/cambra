@@ -1046,6 +1046,8 @@ fn constrain_go_impl(
                 // resolves to a concrete base lacking those refinements.
                 let demanded = Type::refined(rbase.clone(), deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache)
+            } else if super::smt::smt_sub(lbase, lrefs, rrefs) {
+                constrain_go(lbase, rbase, sl, sr, cache)
             } else {
                 Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),

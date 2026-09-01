@@ -45,6 +45,7 @@ pub mod compact;
 pub mod constrain;
 pub mod scheme;
 pub mod simplify_type;
+pub mod smt;
 pub mod spec_key;
 pub mod traits;
 
