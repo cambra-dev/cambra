@@ -1351,7 +1351,7 @@ fn test_collection_uniform_consumers_accepted() {
     // annotation opened.
     assert_eq!(
         infer_program("def f(c: Collection(Int)):\n    c\nf").to_string(),
-        "(Σ σ ∈ *. (σ ⤇ Int) ⇒ Σ σ ∈ *. (σ ⤇ Int))"
+        "(Σ (σ : Type). (σ ⤇ Int) ⇒ Σ (σ : Type). (σ ⤇ Int))"
     );
     // A comprehension over a `Collection` maps it (domain-preserving), so the witness
     // survives into the result — the annotation's own, since an exact annotation binds
@@ -1360,7 +1360,7 @@ fn test_collection_uniform_consumers_accepted() {
     assert_eq!(
         infer_program("def f(c: Collection(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))")
             .to_string(),
-        "Σ σ ∈ *. (σ ⤇ Int)"
+        "Σ (σ : Type). (σ ⤇ Int)"
     );
 }
 
@@ -1372,14 +1372,14 @@ fn test_list_map_reseals_to_list() {
     // Identity round-trips the sum (compaction re-pairs the opened domain).
     assert_eq!(
         infer_program("def f(c: List(Int)):\n    c\nf").to_string(),
-        "(Σ σ ∈ [..]. (σ ⤇ Int) ⇒ Σ σ ∈ [..]. (σ ⤇ Int))"
+        "(Σ (σ : UIntRanges). (σ ⤇ Int) ⇒ Σ (σ : UIntRanges). (σ ⤇ Int))"
     );
     // `map` (domain-preserving) preserves the parameter's witness, which an exact
     // annotation fixes at the `List` kind — the caller's one-candidate kind never reaches
     // the domain.
     assert_eq!(
         infer_program("def f(c: List(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))").to_string(),
-        "Σ σ ∈ [..]. (σ ⤇ Int)"
+        "Σ (σ : UIntRanges). (σ ⤇ Int)"
     );
     // `sum` (collapsing) → the scalar element type; the domain collapses away.
     assert_eq!(
@@ -1410,14 +1410,14 @@ fn test_keyed_collection_widens_to_collection_like_any_other() {
             "def f(c: Collection(Int)):\n    sum(c)\ndef g(m: Map(Int, Int)):\n    f(m)\ng"
         )
         .to_string(),
-        "(Σ σ ∈ {Int?}. (σ ⤇ Int) ⇒ Int)"
+        "(Σ (σ : SubtypesOf(Int)). (σ ⤇ Int) ⇒ Int)"
     );
     // A positional collection widens by the same arm, so the edge is kind-blind rather
     // than keyed-specific.
     assert_eq!(
         infer_program("def f(c: Collection(Int)):\n    sum(c)\ndef g(l: List(Int)):\n    f(l)\ng")
             .to_string(),
-        "(Σ σ ∈ [..]. (σ ⤇ Int) ⇒ Int)"
+        "(Σ (σ : UIntRanges). (σ ⤇ Int) ⇒ Int)"
     );
 }
 
@@ -1591,8 +1591,12 @@ fn keyed_entry_checks_the_annotated_key_type() {
     // is left elided — a group is a bare data function, and `Collection(Int)` is a sum
     // only a term can enter, so naming one there would be a second, unrelated rejection.
     let ty = infer_program(&format!("g <: Map(Int, _) = {gb}\ng")).to_string();
+    // The key type, not a binder spelling: a reference to the type's own function is
+    // stored as an index and rendered at whichever binder the type carries
+    // (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of two
+    // forms"), so asserting the spelling would pin a display choice.
     assert!(
-        ty.contains("(__gb_k: "),
+        ty.contains("Int") && ty.contains(": σ) ⤇ "),
         "the matching key type must still reach the annotation, got {ty}"
     );
 }
@@ -1613,7 +1617,7 @@ fn keyed_entry_checks_the_annotated_key_type() {
 fn test_map_consumption_is_kind_blind_interim() {
     assert_eq!(
         infer_program("def g(m: Map(Int, Int)):\n    sum(m)\ng").to_string(),
-        "(Σ σ ∈ {Int?}. (σ ⤇ Int) ⇒ Int)"
+        "(Σ (σ : SubtypesOf(Int)). (σ ⤇ Int) ⇒ Int)"
     );
 }
 
@@ -4962,8 +4966,11 @@ f(box([1, 2]) if c else box([1, 2, 3]))"
 fn a_boxed_dependent_collection_declares_its_binder_on_the_witness() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
     let bare = infer_program(&format!("g = {gb}\ng")).to_string();
+    // The candidate is the argument's domain *exactly* — the group-by's present-key
+    // domain, refined — because `box`'s candidate position is invariant. What this pins is
+    // one level up: the Pi binder is declared on the witness `σ`, not on that candidate.
     assert!(
-        bare.starts_with("Σ (σ : [Int]). ((__box_k: σ) ⤇ "),
+        bare.starts_with("Σ (σ : [") && bare.contains("]). ((__box_k: σ) ⤇ "),
         "the Pi binder is declared on the witness domain, got {bare}"
     );
     assert!(
