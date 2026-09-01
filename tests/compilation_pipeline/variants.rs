@@ -1466,17 +1466,29 @@ fn test_const_lifted_arm_is_point_free(#[case] code: &str, #[case] expected: Val
             case _:
                 acc += 10
     acc"}, Value::Int(12))]
-// An arm that writes nothing is the carry position, as an `if` without an
-// `else` is.
+// An arm that does not write an accumulator is that accumulator's carry
+// position, as an `if` without an `else` is. Each arm here writes one of the
+// two, so each is a non-writing arm for the other.
 #[case(indoc! {"
     acc := 0
+    other := 0
     for m in [`a, `b, `a]:
         match m:
             case `a:
                 acc += 1
             case `b:
-                acc += 0
+                other += 100
     acc"}, Value::Int(2))]
+#[case(indoc! {"
+    acc := 0
+    other := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case `b:
+                other += 100
+    other"}, Value::Int(100))]
 fn test_match_in_a_for_loop_body(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -1520,8 +1532,8 @@ fn test_feed_inside_a_match_arm_in_a_loop_is_rejected() {
     );
 }
 
-// The program `docs/chl-spec.md`, "4.10 `match` — tag dispatch" states: a
-// payload-binding arm and a payload-less one, both writing.
+// A payload-binding arm and a payload-less one in the same `match`, both
+// writing — the mixed shape the two tests above take one side of each.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(indoc! {"
