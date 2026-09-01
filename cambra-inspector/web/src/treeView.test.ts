@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { resolvedTypeTooltip, serializeTree } from "./treeView";
-import { allNodesWithPredicates, fixture, paneById } from "./__fixtures__/helpers";
+import { allNodesWithPredicates, fixture, irPaneById } from "./__fixtures__/helpers";
 import type { IrChild, IrNode } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
@@ -123,10 +123,11 @@ describe("serializeTree", () => {
     // count is not the node count — a shared predicate gets a row per position —
     // so the check is on the id *set* the rows name.
     const snap = fixture(listMinJson);
-    const pane = paneById(snap, "post-inference");
-    const lines = serializeTree(pane.root, new Map(pane.nodes.map((n) => [n.nodeId, n]))).split(
-      "\n",
-    );
+    const pane = irPaneById(snap, "post-inference");
+    const lines = serializeTree(
+      pane.roots[0],
+      new Map(pane.nodes.map((n) => [n.nodeId, n])),
+    ).split("\n");
     expect(lines.length).toBeGreaterThan(1);
     const named = new Set(lines.map((l) => Number(l.trim().split("#").pop())));
     expect([...named].sort((a, b) => a - b)).toEqual(

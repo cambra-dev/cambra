@@ -139,7 +139,7 @@ mod tests {
     fn snapshot_panes_ordered_upstream_to_downstream() {
         let v = snapshot_value(PROG, "prog.chl");
         let panes = v["panes"].as_array().expect("panes is an array");
-        assert_eq!(panes.len(), 6, "six pipeline panes");
+        assert_eq!(panes.len(), 7, "seven pipeline panes");
         assert_eq!(panes[0]["id"], "pre-inference");
         assert_eq!(panes[1]["id"], "post-inference");
         assert_eq!(panes[2]["id"], "post-channelize");
@@ -154,8 +154,8 @@ mod tests {
         }
     }
 
-    /// A pane's `root` names an entry of its node table, and that entry carries
-    /// the type in the first-class `type` field.
+    /// A tree pane's single root names an entry of its node table, and that
+    /// entry carries the type in the first-class `type` field.
     #[test]
     fn snapshot_root_node_carries_type_field() {
         let v = snapshot_value(PROG, "prog.chl");
@@ -164,7 +164,9 @@ mod tests {
             .iter()
             .find(|s| s["id"] == "post-inference")
             .expect("the post-inference pane is present");
-        let root = pane["root"].as_u64().expect("root is a number");
+        let roots = pane["roots"].as_array().expect("roots is an array");
+        assert_eq!(roots.len(), 1, "a tree pane has one root");
+        let root = roots[0].as_u64().expect("root is a number");
         let node = pane["nodes"]
             .as_array()
             .expect("nodes is an array")

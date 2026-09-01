@@ -59,7 +59,9 @@
       "id": "pre-inference",
       "label": "IR (PRE-INFERENCE)",
       "kind": "holes",
-      "root": 24,
+      "roots": [
+        24
+      ],
       "nodes": [
         {
           "label": "Let(g)",
@@ -414,7 +416,9 @@
       "id": "post-inference",
       "label": "IR (POST-INFERENCE)",
       "kind": "typed",
-      "root": 24,
+      "roots": [
+        24
+      ],
       "nodes": [
         {
           "label": "Let(g)",
@@ -1070,7 +1074,9 @@
       "id": "post-channelize",
       "label": "IR (POST-CHANNELIZE)",
       "kind": "typed",
-      "root": 24,
+      "roots": [
+        24
+      ],
       "nodes": [
         {
           "label": "Let(g)",
@@ -1648,7 +1654,9 @@
       "id": "post-as-of-read",
       "label": "IR (POST-AS-OF-READ)",
       "kind": "typed",
-      "root": 24,
+      "roots": [
+        24
+      ],
       "nodes": [
         {
           "label": "Let(g)",
@@ -2226,7 +2234,9 @@
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
-      "root": 131,
+      "roots": [
+        131
+      ],
       "nodes": [
         {
           "label": "Let(g)",
@@ -2696,7 +2706,9 @@
       "id": "post-planning",
       "label": "IR (POST-PLANNING)",
       "kind": "typed",
-      "root": 131,
+      "roots": [
+        131
+      ],
       "nodes": [
         {
           "label": "Let(g)",
@@ -3677,6 +3689,306 @@
           ]
         }
       ]
+    },
+    {
+      "id": "post-conversion",
+      "label": "IR (POST-CONVERSION)",
+      "kind": "operators",
+      "roots": [
+        346,
+        356
+      ],
+      "nodes": [
+        {
+          "label": "Constant",
+          "nodeId": 345,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 4,
+              "end": 6
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "Memo",
+          "nodeId": 346,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 0,
+              "end": 6
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 345
+            }
+          ]
+        },
+        {
+          "label": "Constant",
+          "nodeId": 347,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 34,
+              "end": 35
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "Constant",
+          "nodeId": 348,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 37,
+              "end": 38
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "ScalarFanIn",
+          "nodeId": 349,
+          "role": "operator",
+          "tiling": "{Int, Int}",
+          "spans": [
+            {
+              "start": 22,
+              "end": 27
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "0",
+              "kind": "value",
+              "deferred": false,
+              "id": 347
+            },
+            {
+              "role": "1",
+              "kind": "value",
+              "deferred": false,
+              "id": 348
+            }
+          ]
+        },
+        {
+          "label": "Constant",
+          "nodeId": 350,
+          "role": "operator",
+          "tiling": "({Int, Int} -> Int)",
+          "spans": [
+            {
+              "start": 22,
+              "end": 27
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "MapResult",
+          "nodeId": 351,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 22,
+              "end": 27
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 349
+            },
+            {
+              "role": "fn",
+              "kind": "value",
+              "deferred": false,
+              "id": 350
+            }
+          ]
+        },
+        {
+          "label": "FanOutBranch",
+          "nodeId": 352,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 30,
+              "end": 31
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "fan",
+              "kind": "share",
+              "deferred": false,
+              "id": 346
+            }
+          ]
+        },
+        {
+          "label": "ScalarFanIn",
+          "nodeId": 353,
+          "role": "operator",
+          "tiling": "{Int, Int}",
+          "spans": [
+            {
+              "start": 22,
+              "end": 31
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "0",
+              "kind": "value",
+              "deferred": false,
+              "id": 351
+            },
+            {
+              "role": "1",
+              "kind": "value",
+              "deferred": false,
+              "id": 352
+            }
+          ]
+        },
+        {
+          "label": "Constant",
+          "nodeId": 354,
+          "role": "operator",
+          "tiling": "({Int, Int} -> Int)",
+          "spans": [
+            {
+              "start": 22,
+              "end": 31
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "MapResult",
+          "nodeId": 355,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 22,
+              "end": 31
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 353
+            },
+            {
+              "role": "fn",
+              "kind": "value",
+              "deferred": false,
+              "id": 354
+            }
+          ]
+        },
+        {
+          "label": "Sink(main)",
+          "nodeId": 356,
+          "role": "sink",
+          "tiling": null,
+          "spans": [
+            {
+              "start": 0,
+              "end": 6
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "output",
+              "kind": "value",
+              "deferred": false,
+              "id": 355
+            }
+          ]
+        }
+      ]
     }
   ],
   "paneLinks": [
@@ -4263,6 +4575,60 @@
         [
           149,
           149
+        ]
+      ]
+    },
+    {
+      "from": "post-planning",
+      "to": "post-conversion",
+      "edges": [
+        [
+          131,
+          346
+        ],
+        [
+          131,
+          356
+        ],
+        [
+          132,
+          345
+        ],
+        [
+          136,
+          347
+        ],
+        [
+          142,
+          348
+        ],
+        [
+          143,
+          349
+        ],
+        [
+          144,
+          350
+        ],
+        [
+          144,
+          351
+        ],
+        [
+          146,
+          352
+        ],
+        [
+          147,
+          353
+        ],
+        [
+          148,
+          354
+        ],
+        [
+          148,
+          355
         ]
       ]
     }

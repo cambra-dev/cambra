@@ -14,7 +14,9 @@
       "id": "pre-inference",
       "label": "IR (PRE-INFERENCE)",
       "kind": "holes",
-      "root": 5,
+      "roots": [
+        5
+      ],
       "nodes": [
         {
           "label": "List",
@@ -104,7 +106,9 @@
       "id": "post-inference",
       "label": "IR (POST-INFERENCE)",
       "kind": "typed",
-      "root": 5,
+      "roots": [
+        5
+      ],
       "nodes": [
         {
           "label": "List",
@@ -454,7 +458,9 @@
       "id": "post-channelize",
       "label": "IR (POST-CHANNELIZE)",
       "kind": "typed",
-      "root": 5,
+      "roots": [
+        5
+      ],
       "nodes": [
         {
           "label": "List",
@@ -804,7 +810,9 @@
       "id": "post-as-of-read",
       "label": "IR (POST-AS-OF-READ)",
       "kind": "typed",
-      "root": 5,
+      "roots": [
+        5
+      ],
       "nodes": [
         {
           "label": "List",
@@ -1154,7 +1162,9 @@
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
-      "root": 42,
+      "roots": [
+        42
+      ],
       "nodes": [
         {
           "label": "List",
@@ -1524,7 +1534,9 @@
       "id": "post-planning",
       "label": "IR (POST-PLANNING)",
       "kind": "typed",
-      "root": 256,
+      "roots": [
+        256
+      ],
       "nodes": [
         {
           "label": "Compose",
@@ -2706,6 +2718,108 @@
           "children": []
         }
       ]
+    },
+    {
+      "id": "post-conversion",
+      "label": "IR (POST-CONVERSION)",
+      "kind": "operators",
+      "roots": [
+        392
+      ],
+      "nodes": [
+        {
+          "label": "IterateExtent",
+          "nodeId": 389,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → {[0, 3]})",
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "Constant",
+          "nodeId": 390,
+          "role": "operator",
+          "tiling": "({[0, 3]} -> Int)",
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "MapResult",
+          "nodeId": 391,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → Int)",
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 389
+            },
+            {
+              "role": "fn",
+              "kind": "value",
+              "deferred": false,
+              "id": 390
+            }
+          ]
+        },
+        {
+          "label": "Sink(main)",
+          "nodeId": 392,
+          "role": "sink",
+          "tiling": null,
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "output",
+              "kind": "value",
+              "deferred": false,
+              "id": 391
+            }
+          ]
+        }
+      ]
     }
   ],
   "paneLinks": [
@@ -3228,6 +3342,28 @@
         [
           46,
           46
+        ]
+      ]
+    },
+    {
+      "from": "post-planning",
+      "to": "post-conversion",
+      "edges": [
+        [
+          42,
+          390
+        ],
+        [
+          42,
+          391
+        ],
+        [
+          255,
+          389
+        ],
+        [
+          256,
+          392
         ]
       ]
     }
