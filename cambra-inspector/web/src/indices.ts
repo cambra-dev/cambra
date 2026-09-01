@@ -37,7 +37,7 @@ function spanContains(start: number, end: number, off: number): boolean {
 }
 
 export function buildIndices(
-  root: number | null,
+  roots: number[],
   nodes: IrNode[],
   definitions: Definition[],
 ): Indices {
@@ -56,33 +56,37 @@ export function buildIndices(
 
   // Depth and predicate-ness are properties of a *position* in the tree, and the
   // table is a DAG: a shared predicate hangs off several parents. Both are
-  // resolved at first visit of a pre-order walk from `root` — the same order the
-  // producer emits `nodes` in, so a node's depth here is the depth of the
-  // position that put it in the array. Value children precede predicate children
-  // at every node, so a node reachable both as an operand and inside a type is
-  // first reached as the operand and is correctly not a predicate interior.
+  // resolved at first visit of a pre-order walk from the pane's roots — the same
+  // order the producer emits `nodes` in, so a node's depth here is the depth of
+  // the position that put it in the array. Value children precede predicate
+  // children at every node, so a node reachable both as an operand and inside a
+  // type is first reached as the operand and is correctly not a predicate
+  // interior.
+  //
+  // A tree pane names exactly one root, so the stack starts with one entry; an
+  // empty `roots` walks nothing.
   const depthById = new Map<number, number>();
   const predicateIds = new Set<number>();
-  if (root !== null) {
-    const stack: Array<{ id: number; depth: number; inPredicate: boolean }> = [
-      { id: root, depth: 0, inPredicate: false },
-    ];
-    while (stack.length > 0) {
-      const { id, depth, inPredicate } = stack.pop()!;
-      if (depthById.has(id)) continue;
-      depthById.set(id, depth);
-      if (inPredicate) predicateIds.add(id);
-      const node = nodeById.get(id);
-      if (!node) continue;
-      // Reversed, so the LIFO stack pops children in wire order.
-      for (let i = node.children.length - 1; i >= 0; i--) {
-        const child = node.children[i];
-        stack.push({
-          id: child.id,
-          depth: depth + 1,
-          inPredicate: inPredicate || child.predicate,
-        });
-      }
+  const stack: Array<{ id: number; depth: number; inPredicate: boolean }> = roots.map((id) => ({
+    id,
+    depth: 0,
+    inPredicate: false,
+  }));
+  while (stack.length > 0) {
+    const { id, depth, inPredicate } = stack.pop()!;
+    if (depthById.has(id)) continue;
+    depthById.set(id, depth);
+    if (inPredicate) predicateIds.add(id);
+    const node = nodeById.get(id);
+    if (!node) continue;
+    // Reversed, so the LIFO stack pops children in wire order.
+    for (let i = node.children.length - 1; i >= 0; i--) {
+      const child = node.children[i];
+      stack.push({
+        id: child.id,
+        depth: depth + 1,
+        inPredicate: inPredicate || child.predicate,
+      });
     }
   }
 

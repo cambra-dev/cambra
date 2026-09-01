@@ -21,26 +21,40 @@ use serde_json::Value;
 /// validator agree with the producer by construction and check nothing. A
 /// pane added upstream is meant to fail this list, and the failure is the
 /// notice that the wire changed.
-const PANE_IDS: [&str; 6] = [
+const PANE_IDS: [&str; 7] = [
     "pre-inference",
     "post-inference",
     "post-channelize",
     "post-as-of-read",
     "post-lambda-elim",
     "post-planning",
+    "post-conversion",
 ];
 /// The per-pane `kind` discriminants, aligned with [`PANE_IDS`]: the
 /// pre-inference tree is hole-typed (`"holes"`); every tree from
-/// post-inference on is fully typed (`"typed"`).
-const PANE_KINDS: [&str; 6] = ["holes", "typed", "typed", "typed", "typed", "typed"];
+/// post-inference on is fully typed (`"typed"`); the terminal pane holds the
+/// dataflow operator graph (`"operators"`).
+///
+/// The kind is also the node-shape discriminant: `"holes"` and `"typed"`
+/// panes hold IR nodes, an `"operators"` pane holds operator nodes.
+const PANE_KINDS: [&str; 7] = [
+    "holes",
+    "typed",
+    "typed",
+    "typed",
+    "typed",
+    "typed",
+    "operators",
+];
 /// The adjacent pane windows, in order — the exact `paneLinks` from/to
 /// pairs a successful payload ships. One shorter than [`PANE_IDS`].
-const PANE_WINDOWS: [(&str, &str); 5] = [
+const PANE_WINDOWS: [(&str, &str); 6] = [
     ("pre-inference", "post-inference"),
     ("post-inference", "post-channelize"),
     ("post-channelize", "post-as-of-read"),
     ("post-as-of-read", "post-lambda-elim"),
     ("post-lambda-elim", "post-planning"),
+    ("post-planning", "post-conversion"),
 ];
 /// The observed rewrite-tag `via` vocabulary on the wire (the `Phase` names
 /// that appear in a node's `rewritten.via`). Pinned so a new `via` reaching
@@ -58,6 +72,7 @@ const ALLOWED_VIA: &[&str] = &[
     "AsOfRead",
     "LambdaElim",
     "Planning",
+    "Convert",
 ];
 /// The rewrite-tag `nature` discriminants (the wire lowercases them).
 /// Deliberately **omits** `"source"`: a direct-image (`Nature::Source`) tag
@@ -65,6 +80,17 @@ const ALLOWED_VIA: &[&str] = &[
 /// must never reach the wire — `assert_rewrite_shape` guards that boundary
 /// explicitly, and this list would fail it regardless.
 const ALLOWED_NATURE: &[&str] = &["expansion", "machinery"];
+
+/// The pane `kind` whose node table holds operator nodes rather than IR
+/// nodes. `kind` is the node-shape discriminant, so the validator dispatches
+/// on it.
+const OPERATOR_PANE_KIND: &str = "operators";
+/// The operator-node `role` discriminants: an operator, or one of the two
+/// program boundaries.
+const ALLOWED_OPERATOR_ROLE: &[&str] = &["operator", "source", "sink"];
+/// The operator-input `kind` discriminants: an exclusively owned input, one
+/// several consumers reach, and one that closes a cycle.
+const ALLOWED_EDGE_KIND: &[&str] = &["value", "share", "feedback"];
 
 /// The `meta.payloadKind` discriminants: `"program"` for a compiled program,
 /// `"failed"` for the degraded payload.
@@ -94,17 +120,18 @@ fn kind_for(id: &str) -> &'static str {
     PANE_KINDS[i]
 }
 
-/// Assert `v` is a structurally-valid **successful** `/api/snapshot`
-/// payload.
+/// Assert `v` is a structurally-valid **successful** `/api/snapshot` payload
+/// under `ctx`.
 ///
 /// Pins the full pane contract: the retired top-level `ir`/`spanIndex`
 /// absent, the panes in pipeline order with their kinds, each pane's node
-/// table closed under its own child edges and `root`, each pane's
+/// table closed under its own inbound edges and `roots`, each pane's
 /// `spanIndex` non-empty, the windowed `paneLinks` with matching from/to ids
 /// and every edge endpoint a live node id in its respective pane (self-edges
 /// legal), and every node's `rewritten` tag in the observed vocabulary.
 /// Panics naming the offending path otherwise. Does not assert
 /// program-specific content — that is each caller's job.
+///
 pub fn assert_snapshot_shape(v: &Value) {
     assert_common_shape(v);
 
@@ -127,7 +154,7 @@ pub fn assert_snapshot_shape(v: &Value) {
         ids, PANE_IDS,
         "panes are the pipeline panes in upstream → downstream order"
     );
-    // Each pane carries the kind its id mandates.
+    // Each retained pane carries the kind its id mandates (subset-safe).
     for (i, pane) in panes.iter().enumerate() {
         let id = pane["id"].as_str().expect("pane id is a string");
         let kind = pane["kind"].as_str().expect("pane kind is a string");
@@ -298,16 +325,16 @@ fn assert_rewrite_shape(node: &Value, at: &str) {
     }
 }
 
-/// Assert a pane's node table: `root` and every child `id` name an entry of
-/// this same pane's `nodes`, no id appears twice, and every node carries the
-/// wire's node shape.
+/// Assert a pane's node table: every root and every inbound `id` names an
+/// entry of this same pane's `nodes`, no id appears twice, and every node
+/// carries the node shape its pane's `kind` mandates.
 ///
 /// The closure check is what the table buys over the nested tree it
 /// replaced: an edge a consumer follows always lands on an entry it holds.
 fn assert_node_table(pane: &Value, at: &str) {
     assert!(
         pane.get("ir").is_none(),
-        "{at} has no `ir` tree — a pane ships `root` + `nodes`"
+        "{at} has no `ir` tree — a pane ships `roots` + `nodes`"
     );
     // The parallel span table shipped one row per node per span, which is
     // what a node's own `spans` says.
@@ -315,6 +342,9 @@ fn assert_node_table(pane: &Value, at: &str) {
         pane.get("spanIndex").is_none(),
         "{at} has no `spanIndex` — a node carries its own spans"
     );
+    let kind = pane["kind"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{at}.kind is a string"));
     let nodes = pane["nodes"]
         .as_array()
         .unwrap_or_else(|| panic!("{at}.nodes is an array"));
@@ -328,43 +358,110 @@ fn assert_node_table(pane: &Value, at: &str) {
             "{at}.nodes[{i}] repeats node id {id} — the table holds each node once"
         );
     }
-    let root = pane["root"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("{at}.root is a number"));
-    assert!(
-        ids.contains(&root),
-        "{at}.root {root} names an entry of {at}.nodes"
-    );
+    // A tree has the one node nothing owns; an operator graph has several —
+    // a sink per compiled output and a fan input per share point.
+    let roots = pane["roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{at}.roots is an array"));
+    assert!(!roots.is_empty(), "{at}.roots is non-empty");
+    if kind != OPERATOR_PANE_KIND {
+        assert_eq!(
+            roots.len(),
+            1,
+            "{at} is a tree pane, so {at}.roots holds exactly one id; got {roots:?}"
+        );
+    }
+    let mut seen_roots: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for (i, r) in roots.iter().enumerate() {
+        let root = r
+            .as_u64()
+            .unwrap_or_else(|| panic!("{at}.roots[{i}] is a number"));
+        assert!(
+            ids.contains(&root),
+            "{at}.roots[{i}] {root} names an entry of {at}.nodes"
+        );
+        assert!(
+            seen_roots.insert(root),
+            "{at}.roots repeats {root} — a node is a root once"
+        );
+    }
     for (i, n) in nodes.iter().enumerate() {
-        assert_ir_node(n, &format!("{at}.nodes[{i}]"), &ids);
-        assert_rewrite_shape(n, &format!("{at}.nodes[{i}]"));
+        let node_at = format!("{at}.nodes[{i}]");
+        if kind == OPERATOR_PANE_KIND {
+            assert_operator_node(n, &node_at, &ids);
+        } else {
+            assert_ir_node(n, &node_at, &ids);
+        }
+        // The rewrite tag is one channel with one meaning on both shapes.
+        assert_rewrite_shape(n, &node_at);
     }
 }
 
-/// Assert one entry of a pane's node table: the scalar fields, the retired
-/// fields' absence, and `{edge, id, predicate}` children resolving within
-/// `ids`.
-fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
+/// Assert one entry of an **operator** pane's node table: the scalar fields,
+/// the expression-node fields' absence, and every input `id` resolving
+/// within `ids`.
+fn assert_operator_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
     assert!(v["label"].is_string(), "{at}.label is a string");
     assert!(v["nodeId"].is_number(), "{at}.nodeId is a number");
-    // `annotations` and `tiling` were tile-producer fields on the renderer's
-    // node that the payload never set; the wire's own node type has neither.
+    // An operator holds typed input edges, not a type and children. Mirrors
+    // the IR shape's absence assertions.
+    assert!(v.get("type").is_none(), "{at} has no type field");
+    assert!(v.get("children").is_none(), "{at} has no children field");
+    let role = v["role"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{at}.role is a string"));
     assert!(
-        v.get("annotations").is_none(),
-        "{at} has no annotations field"
+        ALLOWED_OPERATOR_ROLE.contains(&role),
+        "{at}.role {role:?} is not one of {ALLOWED_OPERATOR_ROLE:?}"
     );
-    assert!(v.get("tiling").is_none(), "{at} has no tiling field");
-    // Every node has a type, so the field is a string and never null.
-    assert!(v["type"].is_string(), "{at}.type is a string");
-    // `typeKind` and `predicateRefs` rode beside the rendered type for a
-    // consumer that never read either.
-    assert!(v.get("typeKind").is_none(), "{at} has no typeKind field");
-    assert!(
-        v.get("predicateRefs").is_none(),
-        "{at} has no predicateRefs field"
-    );
-    // A node carries every span its attribution records, narrowest first and
-    // each one once.
+    // A tiling is an operator's output shape; a boundary node has no output
+    // of its own to tile.
+    if role == "operator" {
+        assert!(
+            v["tiling"].is_string(),
+            "{at}.role is \"operator\", so {at}.tiling is a rendered string"
+        );
+    } else {
+        assert!(
+            v["tiling"].is_null(),
+            "{at}.role is {role:?}, which has no tiling; got {}",
+            v["tiling"]
+        );
+    }
+    assert_spans(v, at);
+    let inputs = v["inputs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{at}.inputs is an array"));
+    for (i, e) in inputs.iter().enumerate() {
+        assert!(e["role"].is_string(), "{at}.inputs[{i}].role is a string");
+        let kind = e["kind"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{at}.inputs[{i}].kind is a string"));
+        assert!(
+            ALLOWED_EDGE_KIND.contains(&kind),
+            "{at}.inputs[{i}].kind {kind:?} is not one of {ALLOWED_EDGE_KIND:?}"
+        );
+        // That the `value` edges form a forest is asserted at the producer,
+        // by `operator_graph::assert_graph_invariants`, where the whole graph
+        // is in hand. Re-walking it here would restate a check the payload
+        // cannot fail independently.
+        assert!(
+            e["deferred"].is_boolean(),
+            "{at}.inputs[{i}].deferred is a boolean"
+        );
+        let id = e["id"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{at}.inputs[{i}].id is a number"));
+        assert!(
+            ids.contains(&id),
+            "{at}.inputs[{i}].id {id} names an entry of this pane's nodes"
+        );
+    }
+}
+
+/// Assert a node's `spans`: every entry a `{start, end}` pair, each one once,
+/// narrowest first. Same channel and same meaning on both node shapes.
+fn assert_spans(v: &Value, at: &str) {
     let spans = v["spans"]
         .as_array()
         .unwrap_or_else(|| panic!("{at}.spans is an array"));
@@ -387,6 +484,34 @@ fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
         widths.windows(2).all(|w| w[0] <= w[1]),
         "{at}.spans is narrowest first; got widths {widths:?}"
     );
+}
+
+/// Assert one entry of an **IR** pane's node table: the scalar fields, the
+/// retired fields' absence, and `{edge, id, predicate}` children resolving
+/// within `ids`.
+fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
+    assert!(v["label"].is_string(), "{at}.label is a string");
+    assert!(v["nodeId"].is_number(), "{at}.nodeId is a number");
+    // `annotations` and `tiling` were tile-producer fields on the renderer's
+    // node that the payload never set; the wire's IR node type has neither.
+    // Scoped to the IR shape: an operator node carries a real `tiling`.
+    assert!(
+        v.get("annotations").is_none(),
+        "{at} has no annotations field"
+    );
+    assert!(v.get("tiling").is_none(), "{at} has no tiling field");
+    // Every node has a type, so the field is a string and never null.
+    assert!(v["type"].is_string(), "{at}.type is a string");
+    // `typeKind` and `predicateRefs` rode beside the rendered type for a
+    // consumer that never read either.
+    assert!(v.get("typeKind").is_none(), "{at} has no typeKind field");
+    assert!(
+        v.get("predicateRefs").is_none(),
+        "{at} has no predicateRefs field"
+    );
+    // A node carries every span its attribution records, narrowest first and
+    // each one once.
+    assert_spans(v, at);
     let children = v["children"]
         .as_array()
         .unwrap_or_else(|| panic!("{at}.children is an array"));

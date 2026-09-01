@@ -14,8 +14,9 @@
 import { describe, expect, it } from "vitest";
 
 import { Store } from "./store";
+import { isIrPane } from "./types";
 import { PANE_IDS } from "./wireValidate";
-import { allNodes, fixture, paneById, theNode } from "./__fixtures__/helpers";
+import { allNodes, fixture, irPaneById, theNode } from "./__fixtures__/helpers";
 
 import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
@@ -45,6 +46,7 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
         "typed",
         "typed",
         "typed",
+        "operators",
       ]);
       expect(snap.paneLinks.map((l) => [l.from, l.to])).toEqual([
         ["pre-inference", "post-inference"],
@@ -52,6 +54,7 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
         ["post-channelize", "post-as-of-read"],
         ["post-as-of-read", "post-lambda-elim"],
         ["post-lambda-elim", "post-planning"],
+        ["post-planning", "post-conversion"],
       ]);
       // Every edge is a [number, number, string[]] triple.
       for (const link of snap.paneLinks) {
@@ -66,12 +69,18 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
       const store = new Store(snap);
       expect(store.panes.map((s) => s.id)).toEqual(PANE_IDS);
       expect(store.sourceAnchorPaneId).toBe("post-inference");
+      // The indices are tree-shaped, so the operator pane has none — and says
+      // so by being absent rather than by holding an empty one.
       for (const pane of store.panes) {
-        const idx = store.indicesFor(pane.id)!;
-        expect(idx.nodeById.size).toBeGreaterThan(0);
+        const idx = store.indicesFor(pane.id);
+        if (!isIrPane(pane)) {
+          expect(idx).toBeUndefined();
+          continue;
+        }
+        expect(idx!.nodeById.size).toBeGreaterThan(0);
         // The table is the index: one entry per shipped node, no walk to lose
         // a node reached from several places.
-        expect(idx.nodeById.size).toBe(pane.nodes.length);
+        expect(idx!.nodeById.size).toBe(pane.nodes.length);
       }
     });
   }
@@ -90,7 +99,7 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
 describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
   it("arithmetic: an identity hole resolves to its single downstream type", () => {
     const store = new Store(arithmetic);
-    const pre = paneById(arithmetic, "pre-inference");
+    const pre = irPaneById(arithmetic, "pre-inference");
 
     const lit = theNode(pre, "Lit(Int(10))");
     expect(lit.type).toBe("_"); // local type is a hole pre-inference
@@ -106,7 +115,7 @@ describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
 
   it("polymorphic: a monomorphized hole resolves to the downstream type *set*", () => {
     const store = new Store(polymorphic);
-    const pre = paneById(polymorphic, "pre-inference");
+    const pre = irPaneById(polymorphic, "pre-inference");
 
     // The `(x, x)` body: one pre-inference Tuple, two specialized clones.
     const tuple = theNode(pre, "Tuple");
@@ -128,7 +137,7 @@ describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
   it("the typed panes do not stitch (they already carry real types)", () => {
     const store = new Store(arithmetic);
     for (const paneId of ["post-inference", "post-channelize"]) {
-      const pane = paneById(arithmetic, paneId);
+      const pane = irPaneById(arithmetic, paneId);
       for (const node of allNodes(pane)) {
         expect(store.resolvedTypesFor(paneId, node.nodeId)).toEqual([]);
       }
@@ -139,7 +148,7 @@ describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
 describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
   it("a node click highlights its identity twin in the downstream panes + a source span", () => {
     const store = new Store(arithmetic);
-    const pre = paneById(arithmetic, "pre-inference");
+    const pre = irPaneById(arithmetic, "pre-inference");
     const lit = theNode(pre, "Lit(Int(10))"); // shared id (identity) across panes
 
     store.setSelection({ kind: "node", paneId: "pre-inference", nodeId: lit.nodeId });
@@ -156,7 +165,7 @@ describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
 
   it("a mono-fan-out node click highlights every downstream clone", () => {
     const store = new Store(polymorphic);
-    const pre = paneById(polymorphic, "pre-inference");
+    const pre = irPaneById(polymorphic, "pre-inference");
     const lambda = theNode(pre, "Lambda(x)");
 
     store.setSelection({ kind: "node", paneId: "pre-inference", nodeId: lambda.nodeId });
@@ -186,20 +195,26 @@ describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
 
   it("a source click seeds each pane's tightest node (all panes light up)", () => {
     const store = new Store(arithmetic);
-    const pre = paneById(arithmetic, "pre-inference");
+    const pre = irPaneById(arithmetic, "pre-inference");
     const lit = theNode(pre, "Lit(Int(10))");
 
     store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
     const { result, primaryByPane } = store.getResolved();
-    for (const paneId of PANE_IDS) {
-      expect(result.highlightsByPane.get(paneId)!.size).toBeGreaterThan(0);
-      expect(primaryByPane.get(paneId)).not.toBeNull();
+    // Every *tree* pane: the seed is a pane's tightest enclosing node at the
+    // offset, which only a tree pane can answer. The operator pane takes no seed
+    // of its own and lights up only where a link reaches it, so it carries no
+    // anchor and is not pinned here.
+    const trees = store.panes.filter(isIrPane);
+    expect(trees.map((p) => p.id)).toEqual(PANE_IDS.filter((id) => id !== "post-conversion"));
+    for (const pane of trees) {
+      expect(result.highlightsByPane.get(pane.id)!.size).toBeGreaterThan(0);
+      expect(primaryByPane.get(pane.id)).not.toBeNull();
     }
   });
 
   it("clearing the selection empties the resolved state", () => {
     const store = new Store(arithmetic);
-    const pre = paneById(arithmetic, "pre-inference");
+    const pre = irPaneById(arithmetic, "pre-inference");
     store.setSelection({
       kind: "node",
       paneId: "pre-inference",

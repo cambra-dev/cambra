@@ -41,7 +41,7 @@ const definitions: Definition[] = [
   { useSpan: { start: 8, end: 9 }, defSpan: { start: 0, end: 1 }, name: "x" },
 ];
 
-const idx = buildIndices(1, nodes, definitions);
+const idx = buildIndices([1], nodes, definitions);
 
 describe("buildIndices: flattening", () => {
   it("maps every node by id", () => {
@@ -71,7 +71,7 @@ describe("buildIndices: predicate interiors", () => {
     ]),
     node(13, "Lit(Int(2))", null, "Int@2"),
   ];
-  const idx = buildIndices(10, shared, []);
+  const idx = buildIndices([10], shared, []);
 
   it("marks a predicate subtree and everything under it", () => {
     expect([...idx.predicateIds].sort((a, b) => a - b)).toEqual([12, 13]);
@@ -132,7 +132,7 @@ describe("definitionAt", () => {
 
 describe("buildIndices: degraded (no nodes)", () => {
   it("is empty but queries are safe", () => {
-    const degraded = buildIndices(null, [], []);
+    const degraded = buildIndices([], [], []);
     expect(degraded.nodeById.size).toBe(0);
     expect(degraded.tightestNodeAt(0)).toBeNull();
     expect(degraded.typesAt(0)).toEqual([]);

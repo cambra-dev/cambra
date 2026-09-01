@@ -2,11 +2,12 @@
 //!
 //! DEPRECATED. The program inspector (`cambra --inspect-only`, served by
 //! [`inspector_server`](crate::inspector_server)) is the intended replacement,
-//! but cannot fully supplant this yet: it models only the static IR passes (one
-//! per declared pane) and has no operator/dataflow graph pane and no live
-//! per-tick view. Once the operator graph is instrumented (operators carrying a
-//! `NodeId`, recorded at conversion) and a live/tick layer lands, this module —
-//! and the `InspectNode::to_json` wire it depends on — can be removed.
+//! and one thing still stands in the way: it has no live per-tick view. The
+//! operator graph it also lacked is now its terminal pane (`post-conversion`),
+//! reached by operators carrying a `NodeId` recorded at conversion, so this
+//! dashboard's remaining sole claim is the run. Once a live/tick layer lands,
+//! this module — and the `InspectNode::to_json` wire it depends on — can be
+//! removed.
 
 use std::sync::{Arc, Mutex};
 use std::thread;

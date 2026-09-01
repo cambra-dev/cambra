@@ -15,7 +15,8 @@ import {
   type ResolveResult,
 } from "./links";
 import { OffsetMap } from "./offsets";
-import type { PaneEntry, Snapshot } from "./types";
+import { isIrPane } from "./types";
+import type { PaneEntry, Snapshot, Span } from "./types";
 
 // A click in any pane: a node in a specific pane, a raw source byte offset, or
 // nothing selected.
@@ -47,9 +48,13 @@ type Listener = (resolved: Resolved) => void;
 export class Store {
   readonly snapshot: Snapshot;
   readonly offsets: OffsetMap;
-  /** The IR panes in pipeline order (empty on a degraded snapshot). */
+  /** The pipeline panes in order (empty on a degraded snapshot). */
   readonly panes: PaneEntry[];
-  /** Per-pane derived indices, keyed by pane id. */
+  /**
+   * Per-pane derived indices, keyed by pane id — tree panes only. The indices
+   * are tree-shaped (depth, predicate interiors, a node's rendered type), and
+   * the operator pane has none of that, so it has no entry here.
+   */
   readonly indicesByPane: Map<string, Indices>;
   /** The pane the source view anchors its hover/goto-def/squiggles on. */
   readonly sourceAnchorPaneId: string | null;
@@ -77,27 +82,34 @@ export class Store {
 
     this.indicesByPane = new Map();
     for (const pane of this.panes) {
+      if (!isIrPane(pane)) continue;
       this.indicesByPane.set(
         pane.id,
-        buildIndices(pane.root, pane.nodes, snapshot.definitions),
+        buildIndices(pane.roots, pane.nodes, snapshot.definitions),
       );
     }
 
     // Hover/goto-def/squiggles read fully-resolved types, so they anchor on the
     // post-inference pane — by *id* (the middle pane), never by kind (the
-    // post-channelize pane is also "typed") or position. Fallback: the
-    // most-downstream pane, for payloads without that id.
+    // post-channelize pane is also "typed") or position. Fallback, for payloads
+    // without that id: the most-downstream *tree* pane. The anchor answers type
+    // and tightest-node queries, which the operator pane has no tree to serve.
     const post = this.panes.find((s) => s.id === "post-inference");
-    this.sourceAnchorPaneId = post?.id ?? this.panes.at(-1)?.id ?? null;
+    this.sourceAnchorPaneId = post?.id ?? this.panes.filter(isIrPane).at(-1)?.id ?? null;
 
+    // Every pane joins the link graph, the operator pane included: provenance is
+    // an id relation over the whole pipeline, and both node shapes carry the id
+    // and the spans the resolver reads. Built from the node tables directly, so
+    // it needs no tree-shaped index.
     this.linkGraph = buildLinkGraph(
       this.panes.map((pane) => {
-        const idx = this.indicesByPane.get(pane.id)!;
+        // The narrowest span, which is the first one a node carries.
+        const narrowest = new Map<number, Span | null>();
+        for (const node of pane.nodes) narrowest.set(node.nodeId, node.spans[0] ?? null);
         return {
           id: pane.id,
-          nodeIds: new Set(idx.nodeById.keys()),
-          // The narrowest span, which is the first one a node carries.
-          spanOf: (nodeId: number) => idx.nodeById.get(nodeId)?.spans[0] ?? null,
+          nodeIds: new Set(narrowest.keys()),
+          spanOf: (nodeId: number) => narrowest.get(nodeId) ?? null,
         };
       }),
       snapshot.paneLinks,
@@ -203,8 +215,11 @@ export class Store {
     } else {
       // A source click has no node: resolve the byte offset to each pane's
       // tightest enclosing node, seed them all, and let the graph merge them.
+      // The operator pane has no such index and so takes no seed of its own; the
+      // graph still reaches it through the post-planning window.
       for (const pane of this.panes) {
-        const node = this.indicesByPane.get(pane.id)!.tightestNodeAt(selection.byteOffset);
+        const node =
+          this.indicesByPane.get(pane.id)?.tightestNodeAt(selection.byteOffset) ?? null;
         if (node !== null) {
           seeds.push({ paneId: pane.id, nodeId: node });
           primaryByPane.set(pane.id, node);

@@ -20,6 +20,7 @@ import {
   serializeDiagnostics,
 } from "./main";
 import { Store } from "./store";
+import { isIrPane } from "./types";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
@@ -140,14 +141,26 @@ describe("describePanes", () => {
   const listMin = fixture(listMinJson);
   const failed = fixture(failedJson);
 
-  it("names the source pane first, then one pane per pipeline pane in order", () => {
+  it("names the source pane first, then one pane per tree pane in order", () => {
     // Source-first is not cosmetic: it is mounted first, so the CodeMirror
     // editor lays out against a panel that is briefly the whole row.
     const store = new Store(listMin);
     expect(describePanes(store).map((p) => p.id)).toEqual([
       "source",
-      ...store.panes.map((s) => s.id),
+      ...store.panes.filter(isIrPane).map((s) => s.id),
     ]);
+  });
+
+  it("leaves the operator pane off the roster while it has no renderer", () => {
+    // The pane is on the wire and in the store; what it is missing is a view.
+    // `TreeView` walks one root and a node's children, and an operator graph
+    // has several roots and inputs, so a half-rendered tree is the failure this
+    // exclusion prevents.
+    const store = new Store(listMin);
+    const operatorPanes = store.panes.filter((pane) => !isIrPane(pane));
+    const roster = describePanes(store).map((p) => p.id);
+    for (const pane of operatorPanes) expect(roster).not.toContain(pane.id);
+    expect(roster.length).toBe(1 + store.panes.length - operatorPanes.length);
   });
 
   it("badges the holes pane and nothing else", () => {

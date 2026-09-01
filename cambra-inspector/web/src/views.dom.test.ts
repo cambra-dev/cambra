@@ -19,12 +19,15 @@ import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { TreeView, serializeTree } from "./treeView";
 
-import { fixture, paneById, stubLayout, theNode } from "./__fixtures__/helpers";
+import { fixture, irPaneById, stubLayout, theNode } from "./__fixtures__/helpers";
+import { isIrPane } from "./types";
 import type { Snapshot } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
 const listMin = fixture(listMinJson);
+// The panes the layout draws: the tree-shaped ones.
+const treePanes = listMin.panes.filter(isIrPane);
 
 // Mount the full app (source + one tree pane per pane entry) into a fresh
 // container, returning the store and the per-pane tree-pane DOM roots.
@@ -45,11 +48,13 @@ function mountApp(snap: Snapshot): {
   new SourceView(sourceBody, store);
 
   const trees = new Map<string, HTMLElement>();
-  for (const pane of store.panes) {
+  // The tree panes only: an operator pane holds a graph, which `TreeView` cannot
+  // draw, so `describePanes` leaves it off the layout too.
+  for (const pane of store.panes.filter(isIrPane)) {
     const body = document.createElement("div");
     root.appendChild(body);
     trees.set(pane.id, body);
-    if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.root);
+    if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.roots[0]);
   }
   return { store, source: sourceBody, trees };
 }
@@ -59,7 +64,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
   it("a tree-node selection highlights the source span AND the tree rows", () => {
     const { store, source, trees } = mountApp(listMin);
-    const pre = paneById(listMin, "pre-inference");
+    const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))"); // span [1,2), identity across panes
 
     store.setSelection({ kind: "node", paneId: "pre-inference", nodeId: lit.nodeId });
@@ -75,7 +80,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
   it("a source selection highlights every tree pane (reverse direction)", () => {
     const { store, trees } = mountApp(listMin);
-    const pre = paneById(listMin, "pre-inference");
+    const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))");
 
     // posAtCoords is unusable in jsdom (no layout); drive the store directly,
@@ -89,7 +94,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
   it("a source selection produces a primary source highlight (.cm-sel-node)", () => {
     const { store, source } = mountApp(listMin);
-    const pre = paneById(listMin, "pre-inference");
+    const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))");
 
     store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
@@ -110,7 +115,7 @@ describe("pre-inference resolved-type display (Bug 2)", () => {
   it("shows the resolved type as a hover tooltip on a pre-inference row", () => {
     const { store, trees } = mountApp(listMin);
     const pre = trees.get("pre-inference")!;
-    const lit = theNode(paneById(listMin, "pre-inference"), "Lit(Int(1))");
+    const lit = theNode(irPaneById(listMin, "pre-inference"), "Lit(Int(1))");
     // Sanity: this hole resolves downstream to the literal's singleton type.
     expect(store.resolvedTypesFor("pre-inference", lit.nodeId)).toEqual(["Int@1"]);
 
@@ -159,7 +164,9 @@ describe("pane copy button", () => {
 
   it("gives every pane a copy button", () => {
     const root = mount();
-    expect(root.querySelectorAll(".pane-copy").length).toBe(1 + listMin.panes.length);
+    // Source, plus one per tree pane. The operator pane is off the roster until
+    // it has a renderer, so it has no panel and no button.
+    expect(root.querySelectorAll(".pane-copy").length).toBe(1 + treePanes.length);
   });
 
   it("copies the source text verbatim from the source pane", () => {
@@ -175,12 +182,12 @@ describe("pane copy button", () => {
     const root = mount();
     // Panes render source-first, then one per pipeline pane in order.
     const panels = root.querySelectorAll<HTMLElement>(".panel.tree");
-    expect(panels.length).toBe(listMin.panes.length);
+    expect(panels.length).toBe(treePanes.length);
 
-    const pane = listMin.panes[1];
+    const pane = treePanes[1];
     panels[1].querySelector<HTMLButtonElement>(".pane-copy")!.click();
     expect(writeText).toHaveBeenCalledWith(
-      serializeTree(pane.root, new Map(pane.nodes.map((n) => [n.nodeId, n]))),
+      serializeTree(pane.roots[0], new Map(pane.nodes.map((n) => [n.nodeId, n]))),
     );
   });
 

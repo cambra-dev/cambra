@@ -49,8 +49,9 @@ edges it already walks, which is why a node carries no depth.
 recent, not-yet-released data. A value is data-dependent and keyed by a tick, so it cannot ride a
 payload built at compile time.
 
-That path needs node identity in operator conversion and a tick channel; neither exists. On the
-first, see
+That path needs node identity in operator conversion and a tick channel. The first exists —
+conversion records, and `post-conversion` is a pane — and the tick channel does not. On the first,
+see
 [provenance.md](../ccl/design/provenance.md#known-prerequisites-for-panes-past-post-planning).
 
 It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
@@ -98,7 +99,8 @@ reachable from each of them. `fold` unions blame spans, which is what makes that
 second span → node table: it held one row per node per span, which is what `spans` says, and the
 node-table walk that would build it already reads the same attributions.
 `a_nodes_spans_are_its_attributions_narrowest_first` and `no_node_repeats_a_span` (`wire.rs`) pin
-the order and the uniqueness.
+the order and the uniqueness over the corpus, and `wire_spans_orders_narrowest_first_and_dedups`
+pins the function both shapes get them from.
 
 `rewritten` is `null` for a `Nature::Source` tag, which null-compresses at the one emission site via
 `Nature::is_source`. `Source` is positional rather than a judgment about faithfulness: a node is
@@ -127,6 +129,27 @@ and its binder's type, and for a lambda those are the same `Type`, so a slot-ord
 type's predicates once per slot. Since a shared predicate is one entry in the table, a second child
 naming it asserts nothing the first does, and `no_node_repeats_a_predicate_edge` (`wire.rs`) pins
 the absence. A predicate several nodes reach still carries a child edge from each of them.
+
+### An operator node on the wire
+
+The operator pane ships the dataflow graph, so its node is a different shape: several `roots`
+rather than one, `inputs` rather than `children`, and no type. It carries `label`, `nodeId`,
+`spans` and `rewritten` on the same terms as a tree node, plus:
+
+| field | what it holds |
+|---|---|
+| `role` | `operator`, `source` or `sink` |
+| `tiling` | the operator's output tiling, rendered; `null` for a boundary node |
+| `inputs` | the graph inputs it holds, each `{ id, role, kind, deferred }` |
+
+`spans` means what it means on a tree node, down to the ordering: narrowest first, each span once.
+Both shapes take them from `wire_spans` (`wire.rs`) for that reason. Stating the invariant twice
+and implementing it twice is what let the two disagree — the operator table shipped the fold's
+union order, so `spans[0]` was the widest span rather than the narrowest, and a consumer taking the
+first span to render one position rendered the wrong one.
+
+A node whose id the pane's projection does not cover ships empty `spans` and `null` `rewritten`,
+exactly as a tree node does.
 
 ### Pane links are dense
 
@@ -332,8 +355,10 @@ value domains and carries a `contains` bug on half-bounded intervals (see
   pass-through nodes. `lambda_elim` is that phase today, so each pass-through node reads to a
   consumer as a rewrite of its predecessor — see
   [provenance.md](../ccl/design/provenance.md#the-edge-labels).
-- **No pane exists past `post-planning`** until operator conversion carries a node identity. A pane
-  may be issued at any point in the pipeline; that one has nothing to resolve against.
+- **The operator pane resolves against ids, not positions.** `post-conversion` is a real pane now
+  that conversion records what it builds, but an operator is not an expression: it has no type, and
+  the positional queries (`tightestNodeAt` and its kin) are defined over the tree panes only. A
+  consumer reaches an operator through the pane links, never by asking where the cursor is.
 - **No channel names a binder site.** A binder is not an expression, so nothing attributes it and no
   field says which node binds the name written at a given span. The payload therefore carries no
   binder types, and a consumer clicking a binder resolves the node whose span contains it — for
