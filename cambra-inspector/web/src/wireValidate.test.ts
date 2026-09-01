@@ -11,6 +11,7 @@ import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 import failedJson from "./__fixtures__/failed.snapshot.json";
 import deferLiftJson from "./__fixtures__/defer_lift.snapshot.json";
+import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
 
 describe("validateSnapshot: real fixtures", () => {
   for (const [name, json] of [
@@ -19,6 +20,7 @@ describe("validateSnapshot: real fixtures", () => {
     ["list_min", listMinJson],
     ["failed", failedJson],
     ["defer_lift", deferLiftJson],
+    ["source_shared", sourceSharedJson],
   ] as const) {
     it(`${name} validates and round-trips identity`, () => {
       const snap = validateSnapshot(json);
@@ -26,6 +28,26 @@ describe("validateSnapshot: real fixtures", () => {
       expect(snap.meta.schema).toBe(SCHEMA_VERSION);
     });
   }
+
+  it("source_shared pins a source node: null tiling, shared by both readers", () => {
+    const snap = validateSnapshot(sourceSharedJson);
+    const pane = snap.panes.find((p) => p.kind === "operators");
+    expect(pane).toBeDefined();
+    const sources = pane!.nodes.filter((n) => "role" in n && n.role === "source");
+    expect(sources).toHaveLength(1);
+    const source = sources[0] as { nodeId: number; tiling: string | null; spans: unknown[] };
+    // A boundary node has no tiling, which the validator asserts and this pins
+    // as a real payload rather than a hand-built one.
+    expect(source.tiling ?? null).toBeNull();
+    expect(source.spans.length).toBeGreaterThanOrEqual(2);
+    const reads = pane!.nodes.flatMap((n) =>
+      "inputs" in n ? n.inputs.filter((e) => e.id === source.nodeId) : [],
+    );
+    expect(reads.length).toBeGreaterThanOrEqual(2);
+    // A shared target has no owner: recording a read as `value` is what trips
+    // the producer's exclusive-ownership assertion.
+    expect(reads.every((e) => e.kind === "share")).toBe(true);
+  });
 
   it("the failed (degraded) fixture validates with empty panes", () => {
     const snap = validateSnapshot(failedJson);
