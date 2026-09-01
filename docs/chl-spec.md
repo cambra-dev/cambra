@@ -1341,27 +1341,6 @@ branch must produce a value, and an `if` with no `else` is rejected (§4.5); a
 one-line spelling of the same thing is the ternary (§3.6) or, for `match`, the
 bracketed form in §4.10.
 
-A branch may write, and the write carries past the assignment. The two
-spellings below agree, so a conditional that both writes and yields a value
-needs no rewriting into a statement `if`:
-
-```python
-acc := 0
-for i in [1, 2, 3]:
-    t = if i > 1:
-            acc += i
-            0
-        else:
-            0
-    yield t
-acc                     # 5
-```
-
-A branch's value may read what that branch wrote (`acc += i` then `acc` yields
-the updated value), and a write inside a `with begin():` block commits with the
-rest of its block. The statement `if` carries its writes the same way, in a
-for-loop body and outside one alike.
-
 Annotated assignment **requires** a value (`x: T` alone is a parse error,
 unlike Python's bare type-only declarations).
 

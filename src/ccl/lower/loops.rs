@@ -624,8 +624,7 @@ fn mutation_target_name(stmt: &Spanned<ChlStmt>) -> Option<&str> {
 /// invisible to them without this. It is a loop-carried write like any other:
 /// `push_bindings_into_writing_cases` pushes the binding into the branches,
 /// which puts the write on a spine `transform_chain` merges into the writer
-/// decision (`src/ccl/design/mutability.md`, "A write inside a `Case` bound by
-/// a `Let`").
+/// decision.
 fn block_value_stmt(stmt: &Spanned<ChlStmt>) -> Option<&Spanned<ChlStmt>> {
     let value = match &stmt.node {
         ChlStmt::Assign { value, .. }

@@ -172,8 +172,7 @@ a `MutWrite` in one of its branches sits in a `Let`'s bound expression rather
 than on the statement spine the mutability phases read. Lowering does not move
 it: the phases own that normalization, and they own it for the writes inlining
 already buries there. `push_bindings_into_writing_cases` pushes the binding and
-the continuation into the branches — see
-[mutability.md](mutability.md), "A write inside a `Case` bound by a `Let`".
+the continuation into the branches.
 
 ## Variants and match
 

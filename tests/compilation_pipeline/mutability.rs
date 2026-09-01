@@ -1657,8 +1657,7 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
 
 // A write inside a block right-hand side is a write like any other: the
 // mutability phases put it back on the statement spine by pushing the binding
-// into the branches (`src/ccl/design/mutability.md`, "A write inside a `Case`
-// bound by a `Let`"), so the block right-hand side and the statement `if`
+// into the branches, so the block right-hand side and the statement `if`
 // spelling of the same conditional agree. The cases cover the two write
 // operators, `if` and `match`, and the three positions a block right-hand side
 // sits in: a for-loop body, the top level, and a `with begin():` block.
@@ -1805,8 +1804,7 @@ fn test_block_right_hand_side_writes_its_own_mutable(#[case] code: &str) {
 
 // A write inside a statement `if` outside a for-loop body carries past the
 // conditional. There is no recurrence to hold it there, so the continuation is
-// pushed into the branches instead and each write's advance scopes over it
-// (`src/ccl/design/mutability.md`, "A write inside a `Case` bound by a `Let`").
+// pushed into the branches instead and each write's advance scopes over it.
 // Inside a loop body the same shape is the recurrence's, and is left alone —
 // the last case is that one, unchanged.
 #[rstest]
