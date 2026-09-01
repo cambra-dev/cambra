@@ -1430,8 +1430,8 @@ fn lower_type_application(
             };
             Ok(Type::list_of(lower_type_expr(elem, ctx)?))
         }
-        // `Map(K, V)` = `Σ (𝐷: SubtypesOf(K)). 𝐷 ⤇ V` — a sum over the kind of every key
-        // domain on `K` (`Type::map_of`, `src/ccl/design/collections.md`, "The five
+        // `Map(K, V)` = `Σ (𝐷 : SubtypesOf(K)). 𝐷 ⤇ V` — a sum over the kind of every key
+        // domain on `K` (`Type::map_of`, `src/ccl/design/collections.md`, "The six
         // collection types").
         "Map" => {
             let [k, v] = args else {
@@ -1444,7 +1444,7 @@ fn lower_type_application(
         }
         // `FullMap(K, V)` = `(𝑘: K) ⤇ V` — a *total* map, and not a sum: its key set is
         // readable from `K` instead of hidden behind a witness (`Type::full_map_of`,
-        // `src/ccl/design/collections.md`, "`FullMap` is the unboxed map"). Reaching a
+        // `src/ccl/design/collections.md`, "The six collection types"). Reaching a
         // `Map(K, V)` from here is `box`, which is where that readability is given up.
         "FullMap" => {
             let [k, v] = args else {

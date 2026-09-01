@@ -2543,7 +2543,7 @@ mod tests {
     }
 
     /// `([1, 2, 3] : Collection(Int))` is rejected for the same reason its `List` twin
-    /// is: `Any` is the ⊤ of the kind order, and ⊤ is still *entered by a term*. A
+    /// is: `Type` is the ⊤ of the kind order, and ⊤ is still *entered by a term*. A
     /// structural top that a bare `𝐷 ⤇ 𝑉` fell into would be an upper bound of every
     /// pair of data functions — exactly the implicit join `box` exists to surface.
     #[test]
@@ -2562,7 +2562,7 @@ mod tests {
 
     /// A `Collection(int)` **parameter** round-trips through the compact/coalesce
     /// carrier (like the `List` param), and **consuming** it (`sum`) drives the
-    /// `TypeKind::Any` elimination — the opaque domain is opened, the codomain flows,
+    /// `TypeKind::Type` elimination — the opaque domain is opened, the codomain flows,
     /// so `sum` over a `Collection(int)` is `Int`.
     #[test]
     fn test_infer_collection_param_and_consume() {
@@ -2607,7 +2607,7 @@ mod tests {
 
     /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
     /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
-    /// does not inject into `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ Int`
+    /// does not inject into `Σ (𝐷 : UIntRanges). 𝐷 ⤇ Int`
     /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
     /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
     /// witness's type kind through `emit_annotation_predicates`. A conflicting element type is

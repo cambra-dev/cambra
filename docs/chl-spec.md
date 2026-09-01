@@ -1588,7 +1588,7 @@ collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
 > collection — so a map iterates its values (as `groupby` results do) and a set
 > iterates `unit`. Entry/key iteration is the [Planned] work; it only *adds* the
 > type-directed element choice, so `for k -> v in m` is the form to write once it
-> lands. Design: [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
+> lands. Design: [collections.md, "Operations: how the trait layer is realized [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-is-realized-planned).
 
 **Iterations are unordered and may run in parallel** (§3): unless the
 body introduces a data dependency from one iteration to the next, the
@@ -2223,7 +2223,7 @@ are not.
 
 ### 6.3 Direction: collection types [Decided]
 
-CHL has five collection types, and they are distinct types rather than one type
+CHL has six collection types, and they are distinct types rather than one type
 in different clothes: each has its own lookup, its own iteration element
 (§4.6), and its own answer to whether it is ordered. How they are represented,
 and how the checker carries the distinction, is
@@ -2238,12 +2238,14 @@ and how the checker carries the distinction, is
   is no subscript, because the keys are the content.
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
   `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
+- `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]: V` needs no
+  proof of presence. It stands to `Map` as `Array` stands to `List`: the key set
+  is readable from the type rather than known only at runtime.
 - `Collection(T)` — some collection of `T`, saying nothing about which. Every
   other collection type widens to it.
 
-`FullMap(K, V)` is a `Map` that holds a value for every `K`, so `m[k]: V` needs
-no proof of presence. Totality is earned by refining the key type down to keys
-known to exist rather than by promising it over an open type:
+A `FullMap`'s totality is earned by refining the key type down to keys known to
+exist rather than by promising it over an open type:
 `FullMap({String where _ in ks}, Int)` is total because its domain says which
 strings it holds (§6.4). That makes "the lookup hits" an obligation on whatever
 builds the map. **[Open]**: what that obligation is — a literal must cover the

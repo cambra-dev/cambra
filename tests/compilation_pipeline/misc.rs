@@ -124,7 +124,7 @@ fn test_multi_arg_param_in_filter_predicate() {
 //
 // DEFERRED: `groupby` infers the honest keyed type
 // `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`
-// (see `src/ccl/design/collections.md`, "`groupby` is a `Map`"), so a direct lookup
+// (see `src/ccl/design/collections.md`, "`groupby`'s exact type"), so a direct lookup
 // `g(k)` at a plain key demands proving the key is in *that* key domain — the
 // discharge described in `src/ccl/design/collections.md`, "Lookup: membership
 // discharge", which will re-enable these as discharged / `Option` lookups. They

@@ -1285,7 +1285,7 @@ fn test_conditional_record_arms_join_by_field_intersection() {
 // A `Collection(T) = Σ D. D ⤇ T` has an opaque (Σ-witness) domain, so it may
 // only be consumed *uniformly* (a var-domain consumer that works at any domain).
 // A consumer demanding a **concrete** domain (`Array(N)`) must be rejected — the
-// collection is not known to have that domain. This is the `TypeKind::Any` Σ-elim
+// collection is not known to have that domain. This is the `TypeKind::Type` Σ-elim
 // presenting the sum itself as the consumed domain: a concrete domain is not `<:` a
 // sum. (Regression for the soundness hole where a `Collection` was silently accepted
 // as a fixed-domain `Array`.)
@@ -1388,21 +1388,16 @@ fn test_list_map_reseals_to_list() {
     );
 }
 
-/// Width-to-top (`Σ <: Collection`) holds for **every** kind, keyed included — `Any`
-/// is ⊤ structurally rather than by a row per kind
-/// (`src/ccl/design/type-inference.md`, "Kind containment"). A
-/// `Map(𝐾, 𝑉)` *is* a data function with codomain `𝑉`, so there is nothing for the
-/// kind lattice to withhold, and a map handed to a `Collection(𝑉)` slot is read as
-/// its values.
+/// The edge to ⊤ (`Σ <: Collection`) holds for **every** type kind, keyed included —
+/// `Type` is ⊤ structurally rather than by a row per kind
+/// (`src/ccl/design/type-inference.md`, "Type kind containment"). A `Map(𝐾, 𝑉)` is a data
+/// function with codomain `𝑉`, so there is nothing for the kind lattice to withhold, and a
+/// map handed to a `Collection(𝑉)` slot is read as its values.
 ///
-/// What should reject `sum(m)` is not this edge but the **iteration element**:
-/// iterating a `Map` yields `(𝐾, 𝑉)` entries, and entries cannot be summed. Until
-/// `sum` lowers as `sum([x for x in m])` the rejection has nowhere to come from
-/// (`src/ccl/design/collections.md`, "Operations: how the trait layer is realized [Planned]"). That leaves the two
-/// routes into a map's values *agreeing* — see
-/// [`test_map_consumption_is_kind_blind_interim`] for the direct one — rather than
-/// one of them closed by a kind row that cannot tell a user's `sum(m)` from lowering
-/// consuming a `groupby` per key.
+/// Whether that edge *should* hold is the open nominal question
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"); what this
+/// pins is that the two routes into a map's values agree today — see
+/// [`test_map_consumption_is_kind_blind_interim`] for the direct one.
 #[test]
 fn test_keyed_collection_widens_to_collection_like_any_other() {
     assert_eq!(
@@ -1421,28 +1416,17 @@ fn test_keyed_collection_widens_to_collection_like_any_other() {
     );
 }
 
-/// A keyed kind's key type is a **parameter**, so injecting a concrete keyed
-/// collection into a `Map`/`Set` annotation *relates* the two key types rather than
-/// ignoring them. Before kind parameters were discharged through the solver,
-/// `FullMap(𝐾, 𝑉)` is the **unboxed** map: the dependent data function `(𝑘: 𝐾) ⤇ 𝑉`,
-/// not a sum. Its key set is readable from `𝐾`, so a lookup needs no proof of presence
-/// and answers `𝑉` (`src/ccl/design/collections.md`, "`FullMap` is the unboxed map").
+/// A `FullMap` lookup needs no proof of presence, and this pins the **rule** on a function
+/// nothing can call.
 ///
-/// What this pins is the **rule**, on a function nothing can call. `FullMap(Int, Int)`
-/// claims a value for every `Int`, and no producer has an unrefined base type as its
-/// domain — a list literal's is a `UIntRange`, a group-by's is the present-key refinement —
-/// so the annotation has no inhabitants. That is a fact about this key type, not about the
-/// annotation form: `FullMap(_, Int)` is satisfied by a list literal, as a binding and as a
-/// parameter (`full_map_annotations_are_satisfiable`).
-///
-/// The lookup is what no program reaches, for two unrelated reasons. A keyed domain needs
-/// the key to *acquire* its membership refinement
-/// ([`a_key_from_the_source_does_not_yet_carry_its_key_domain`]); a range domain needs
-/// `UIntRange` to stop being a primitive that relates only by equality
+/// `FullMap(Int, Int)` claims a value for every `Int`, and no producer has an unrefined
+/// base type as its domain — a list literal's is a `UIntRange`, a group-by's is the
+/// present-key refinement — so the annotation has no inhabitants. That is a fact about this
+/// key type rather than the annotation form: `FullMap(_, Int)` is satisfied by a list
+/// literal (`full_map_annotations_are_satisfiable`). The lookup itself is unreachable for
+/// two unrelated reasons, a keyed domain needing the key to acquire its membership
+/// refinement and a range domain needing `UIntRange` to stop relating only by equality
 /// (`src/ccl/design/collections.md`, "Lookup: membership discharge").
-///
-/// Totality is also claimed rather than checked — nothing verifies the annotation against
-/// whatever built the map, which is the spec's `[Open]` question.
 #[test]
 fn full_map_lookup_needs_no_presence_proof() {
     let f = "def f(m: FullMap(Int, Int)):\n";
@@ -1558,17 +1542,16 @@ fn a_groupby_is_a_full_map_but_its_key_type_is_not_yet_writable() {
     );
 }
 
-/// containment inspected only the domain's refinement *shape* and dropped the key
-/// type entirely — so a wrong annotation was silently accepted.
+/// A keyed annotation's **key type** is checked, not just the shape of the domain's
+/// refinement: an `Int`-keyed `groupby` does not satisfy `Map(String, _)`.
 ///
-/// The **bounded** form, because a `groupby` is a *dependent* collection — its value
-/// type names the key binder — and that is a shape `Map(𝐾, 𝑉)` cannot hold: `𝑉` is one
-/// type, with no binder to name. An exact annotation binds `g` at the annotation, so
-/// filling `𝑉` from the initializer captures `__gb_k`; a bound leaves `g` its own type
-/// and checks the width edge, which is what this pins. Today that exact spelling reports
-/// the capture as a scope violation labelled "compiler bug" rather than as the annotation
-/// error it is (`src/ccl/design/collections.md`, "Key-domain identity is the key morphism
-/// (load-bearing)").
+/// The annotation is the **bounded** form because a `groupby` is a *dependent*
+/// collection — its value type names the key binder — and that is a shape `Map(𝐾, 𝑉)`
+/// cannot hold: `𝑉` is one type, with no binder to name. An exact annotation binds `g`
+/// at the annotation, so filling `𝑉` from the initializer captures `__gb_k`; a bound
+/// leaves `g` its own type and checks the subtyping edge, which is what this pins. Today
+/// that exact spelling reports the capture as a scope violation labelled "compiler bug"
+/// rather than as the annotation error it is.
 #[test]
 fn keyed_entry_checks_the_annotated_key_type() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
@@ -1623,8 +1606,7 @@ fn test_map_consumption_is_kind_blind_interim() {
 
 // A conditional (`Enumerated` Σ) collection may likewise not be consumed at a
 // concrete domain: its arms flow individually into the consumer and a too-small
-// arm fails the contravariant edge (`consumer_domain <: arm_domain`). Pins the
-// per-arm rejection that was previously untested.
+// arm fails the contravariant edge (`consumer_domain <: arm_domain`).
 #[test]
 fn test_conditional_collection_consumed_at_concrete_domain_is_rejected() {
     // Arms `{[0,1], [0,2]}` (2- and 3-element); a concrete `Array(N)` consumer is
@@ -2262,7 +2244,7 @@ fn test_groupby_lookup_at_wrong_key_type_rejected() {
 
 // NOTE: direct key lookup on a group-by (`g = groups(k)`) is deferred. `groupby`
 // infers the honest keyed type `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (see
-// `src/ccl/design/collections.md`, "`groupby` is a `Map`"), so applying it at a plain
+// `src/ccl/design/collections.md`, "`groupby`'s exact type"), so applying it at a plain
 // key demands proving the key is in *that* key domain — the discharge described in
 // `src/ccl/design/collections.md`, "Lookup: membership discharge", which will
 // re-enable this test as a discharged / `Option`-typed lookup. It "worked" before

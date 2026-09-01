@@ -380,8 +380,8 @@ fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
     // The final `sum`'s domain is the honest present-key domain — the key type refined
     // by membership in what this group-by's key morphism produces, rather than the old
-    // imprecise total `Int` (see `src/ccl/design/collections.md`, "`groupby` is a
-    // `Map`"). It rides this type annotation only; it is never executed (the group-by
+    // imprecise total `Int` (see `src/ccl/design/collections.md`, "`groupby`'s exact
+    // type"). It rides this type annotation only; it is never executed (the group-by
     // is realized as `converse`), and the compiled tile below is unchanged. The
     // morphism inside it stays **pointful** — planning point-frees the predicates it
     // reifies into a `Restrict`, and this one it never reaches.

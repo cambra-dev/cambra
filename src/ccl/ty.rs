@@ -2587,29 +2587,21 @@ impl Type {
         Type::map_of(key, Type::Base(BaseType::Unit))
     }
 
-    /// The type of a **full map**: the data function `(𝑘: 𝐾) ⤇ 𝑉` — a map holding a value
-    /// for every key of `𝐾`, so a lookup needs no proof of presence.
+    /// The type of a **full map**: the data function `(𝑘: 𝐾) ⤇ 𝑉`, holding a value for
+    /// every key of `𝐾` so a lookup needs no proof of presence. Not a sum
+    /// (`src/ccl/design/collections.md`, "The six collection types").
     ///
-    /// Not a sum. Totality is earned by `𝐾` being refined down to keys known to exist, so
-    /// the key set is readable from the type rather than standing behind a witness, which
-    /// is what a [`map`](Self::map_of) gives up. Crossing from here to a map is therefore
-    /// [`Builtin::Box`](crate::ccl::Builtin), and that `box` is where the key type stops
-    /// being available to reason with.
-    ///
-    /// **A Pi, always.** A full map's value may depend on its key — a `groupby` is one,
-    /// and its group is `{𝐼 | key(𝑖) == 𝑘} ⤇ 𝑉` — so the type has to declare the binder
-    /// that dependence names. Without one, the codomain edge has no name to put the
-    /// initializer's binder in correspondence with (`constrain_go`'s `cod_sl`), and the
-    /// dependent codomain lands as a bound naming a binder the holder's telescope does not
-    /// hold (`src/ccl/design/type-inference.md`, "The invariant"). A codomain that does
-    /// not reference the binder is an ordinary function either way, so the Pi costs a
+    /// **A Pi, always.** A full map's value may depend on its key — a `groupby`'s group is
+    /// `{𝐼 | key(𝑖) == 𝑘} ⤇ 𝑉` — so the type declares the binder that dependence names.
+    /// Without one the codomain edge has no name to put the initializer's binder in
+    /// correspondence with (`constrain_go`'s `cod_sl`), and the dependent codomain lands as
+    /// a bound naming a binder the holder's telescope does not hold
+    /// (`src/ccl/design/type-inference.md`, "The invariant"). A codomain that does not
+    /// reference the binder is an ordinary function either way, so the Pi costs a
     /// non-dependent full map nothing.
     ///
-    /// The binder is **freshly minted**, because two annotation sites are two binding
-    /// sites and the closure check is a lookup by uid. Its spelling is an opening and
-    /// display handle only: a reference to the type's own function is stored as an index
-    /// (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of two
-    /// forms").
+    /// The binder is **freshly minted**: two annotation sites are two binding sites and the
+    /// closure check is a lookup by uid.
     pub fn full_map_of(key: Type, value: Type) -> Self {
         Type::pi_kinded(
             crate::ccl::Name::fresh("__map_k"),
