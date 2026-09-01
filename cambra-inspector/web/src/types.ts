@@ -66,6 +66,52 @@ export interface IrNode {
   children: IrChild[];
 }
 
+// One node of an operator pane: an operator, or one of the two program
+// boundaries.
+export interface OperatorNode {
+  // What to show: the operator's type name, or `Source(name)` / `Sink(name)`
+  // for a boundary.
+  label: string;
+  // The node's `NodeId`, in the same space as an expression node's — an
+  // operator carries a `NodeId` so a pane pair spanning conversion is
+  // homogeneous like every other.
+  nodeId: number;
+  // Which of the three node kinds this is: "operator", "source", "sink". Data,
+  // not display policy.
+  role: string;
+  // The operator's output tiling, rendered, and null for a boundary node.
+  tiling: string | null;
+  // Every source span this node traces to, narrowest first. Same channel and
+  // same meaning as `IrNode.spans`.
+  spans: Span[];
+  // The node's rewrite tag, on the same terms as `IrNode.rewritten`.
+  rewritten: RewriteInfo | null;
+  // The graph inputs this node holds.
+  inputs: OperatorEdge[];
+}
+
+// One input edge of an operator node.
+//
+// A *construction* edge — which operator holds which, and how. Runtime dataflow
+// follows a different relation, and nothing here asserts the two coincide.
+export interface OperatorEdge {
+  // What names this input at its consumer: a field name, a position, or a store
+  // key, rendered.
+  role: string;
+  // "value" for an exclusively owned input, "share" for one several consumers
+  // may reach, "feedback" for a share that closes a cycle.
+  //
+  // The value edges form a forest, which is what lets a renderer walk them as a
+  // child relation with no cycle guard; share and feedback are the
+  // cross-references.
+  kind: string;
+  // Whether the edge was wired after its consumer was constructed. An attribute
+  // of when, not of ownership.
+  deferred: boolean;
+  // The input's node id.
+  id: number;
+}
+
 export interface Definition {
   useSpan: Span;
   defSpan: Span;
@@ -90,19 +136,48 @@ export interface Meta {
   schema: number;
 }
 
-// One ordered pipeline pane (upstream -> downstream). Each pane carries its own
-// self-contained node table; it resolves against its own
-// (Expr, SourceProjection) projection on the backend.
-export interface PaneEntry {
+// What every pane carries, whichever shape its node table holds. Each pane is
+// one position in the pipeline (upstream -> downstream) and resolves against its
+// own (Expr, SourceProjection) projection on the backend.
+interface PaneCommon {
   id: string;
   label: string;
-  // "holes" (the still-hole-typed pre-inference tree) or "typed" (a fully
-  // typed tree — every pane from post-inference on).
-  kind: string;
-  // The id of the node the pane's walk starts from — an entry of `nodes`.
-  root: number;
+  // The ids a consumer starts walking `nodes` from — each an entry of `nodes`.
+  //
+  // One for a tree. An operator graph has several: a sink per compiled output,
+  // and a fan input per share point, which are the nodes nothing owns.
+  roots: number[];
+}
+
+// A pane holding an expression tree: "holes" for the still-hole-typed
+// pre-inference tree, "typed" for a fully typed one (every tree pane from
+// post-inference on).
+export interface IrPane extends PaneCommon {
+  kind: "holes" | "typed";
   // Every node of this pane exactly once, in first-visit pre-order.
   nodes: IrNode[];
+}
+
+// The pane holding the dataflow operator graph.
+export interface OperatorPane extends PaneCommon {
+  kind: "operators";
+  // Every node of this pane exactly once, in conversion order.
+  nodes: OperatorNode[];
+}
+
+// One ordered pipeline pane. `kind` is the discriminant for which shape `nodes`
+// holds: the two share an id, a label and an attribution, and nothing else — an
+// expression node has a type and children, an operator has a tiling and typed
+// input edges, and neither field set is meaningful for the other.
+export type PaneEntry = IrPane | OperatorPane;
+
+/**
+ * Narrow a pane to the tree-shaped panes. The one place the `kind` discriminant
+ * is read as a predicate, so a caller that needs `IrNode`s — a tree walk, a
+ * type query — states that need once rather than re-spelling the kind set.
+ */
+export function isIrPane(pane: PaneEntry): pane is IrPane {
+  return pane.kind !== "operators";
 }
 
 // The dense node->node links between two adjacent panes — each adjacent pane

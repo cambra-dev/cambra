@@ -92,7 +92,9 @@
       "id": "pre-inference",
       "label": "IR (PRE-INFERENCE)",
       "kind": "holes",
-      "root": 27,
+      "roots": [
+        27
+      ],
       "nodes": [
         {
           "label": "Let(make_totals)",
@@ -614,7 +616,9 @@
       "id": "post-inference",
       "label": "IR (POST-INFERENCE)",
       "kind": "typed",
-      "root": 97,
+      "roots": [
+        97
+      ],
       "nodes": [
         {
           "label": "Let(__mono)",
@@ -1416,7 +1420,9 @@
       "id": "post-channelize",
       "label": "IR (POST-CHANNELIZE)",
       "kind": "typed",
-      "root": 18,
+      "roots": [
+        18
+      ],
       "nodes": [
         {
           "label": "Let(readings)",
@@ -2026,7 +2032,9 @@
       "id": "post-as-of-read",
       "label": "IR (POST-AS-OF-READ)",
       "kind": "typed",
-      "root": 18,
+      "roots": [
+        18
+      ],
       "nodes": [
         {
           "label": "Let(readings)",
@@ -2636,7 +2644,9 @@
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
-      "root": 170,
+      "roots": [
+        170
+      ],
       "nodes": [
         {
           "label": "Let(readings)",
@@ -3264,7 +3274,9 @@
       "id": "post-planning",
       "label": "IR (POST-PLANNING)",
       "kind": "typed",
-      "root": 170,
+      "roots": [
+        170
+      ],
       "nodes": [
         {
           "label": "Let(readings)",
@@ -4833,6 +4845,415 @@
           "children": []
         }
       ]
+    },
+    {
+      "id": "post-conversion",
+      "label": "IR (POST-CONVERSION)",
+      "kind": "operators",
+      "roots": [
+        602,
+        610,
+        614
+      ],
+      "nodes": [
+        {
+          "label": "IterateExtent",
+          "nodeId": 599,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → {[0, 3]})",
+          "spans": [
+            {
+              "start": 73,
+              "end": 84
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "Constant",
+          "nodeId": 600,
+          "role": "operator",
+          "tiling": "({[0, 3]} -> Int)",
+          "spans": [
+            {
+              "start": 73,
+              "end": 84
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "MapResult",
+          "nodeId": 601,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → Int)",
+          "spans": [
+            {
+              "start": 73,
+              "end": 84
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 599
+            },
+            {
+              "role": "fn",
+              "kind": "value",
+              "deferred": false,
+              "id": 600
+            }
+          ]
+        },
+        {
+          "label": "Memo",
+          "nodeId": 602,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → Int)",
+          "spans": [
+            {
+              "start": 61,
+              "end": 84
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 601
+            }
+          ]
+        },
+        {
+          "label": "IterateExtent",
+          "nodeId": 603,
+          "role": "operator",
+          "tiling": "SF(Unit → Unit)",
+          "spans": [
+            {
+              "start": 46,
+              "end": 53
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "FanOutBranch",
+          "nodeId": 604,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → Int)",
+          "spans": [
+            {
+              "start": 50,
+              "end": 52
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "fan",
+              "kind": "share",
+              "deferred": false,
+              "id": 602
+            }
+          ]
+        },
+        {
+          "label": "Aggregate",
+          "nodeId": 605,
+          "role": "operator",
+          "tiling": "agg(Sum, Int)",
+          "spans": [
+            {
+              "start": 46,
+              "end": 53
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 604
+            }
+          ]
+        },
+        {
+          "label": "ExtractAggregate",
+          "nodeId": 606,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 46,
+              "end": 53
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 605
+            }
+          ]
+        },
+        {
+          "label": "MapResultToConst",
+          "nodeId": 607,
+          "role": "operator",
+          "tiling": "SF(Unit → Int)",
+          "spans": [
+            {
+              "start": 46,
+              "end": 53
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 603
+            },
+            {
+              "role": "constant",
+              "kind": "value",
+              "deferred": false,
+              "id": 606
+            }
+          ]
+        },
+        {
+          "label": "FanOutBranch",
+          "nodeId": 608,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → Int)",
+          "spans": [
+            {
+              "start": 125,
+              "end": 133
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "fan",
+              "kind": "share",
+              "deferred": false,
+              "id": 602
+            }
+          ]
+        },
+        {
+          "label": "UnionOperator",
+          "nodeId": 609,
+          "role": "operator",
+          "tiling": "SF({`0 | `1{[0, 3]}} → Int)",
+          "spans": [
+            {
+              "start": 85,
+              "end": 115
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "0",
+              "kind": "value",
+              "deferred": false,
+              "id": 607
+            },
+            {
+              "role": "1",
+              "kind": "value",
+              "deferred": false,
+              "id": 608
+            }
+          ]
+        },
+        {
+          "label": "Memo",
+          "nodeId": 610,
+          "role": "operator",
+          "tiling": "SF({`0 | `1{[0, 3]}} → Int)",
+          "spans": [
+            {
+              "start": 85,
+              "end": 115
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 609
+            }
+          ]
+        },
+        {
+          "label": "FanOutBranch",
+          "nodeId": 611,
+          "role": "operator",
+          "tiling": "SF({`0 | `1{[0, 3]}} → Int)",
+          "spans": [
+            {
+              "start": 155,
+              "end": 161
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "fan",
+              "kind": "share",
+              "deferred": false,
+              "id": 610
+            }
+          ]
+        },
+        {
+          "label": "Aggregate",
+          "nodeId": 612,
+          "role": "operator",
+          "tiling": "agg(Max, Int)",
+          "spans": [
+            {
+              "start": 151,
+              "end": 162
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 611
+            }
+          ]
+        },
+        {
+          "label": "ExtractAggregate",
+          "nodeId": 613,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 151,
+              "end": 162
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "input",
+              "kind": "value",
+              "deferred": false,
+              "id": 612
+            }
+          ]
+        },
+        {
+          "label": "Sink(main)",
+          "nodeId": 614,
+          "role": "sink",
+          "tiling": null,
+          "spans": [
+            {
+              "start": 61,
+              "end": 84
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": "output",
+              "kind": "value",
+              "deferred": false,
+              "id": 613
+            }
+          ]
+        }
+      ]
     }
   ],
   "paneLinks": [
@@ -5659,6 +6080,76 @@
         [
           196,
           196
+        ]
+      ]
+    },
+    {
+      "from": "post-planning",
+      "to": "post-conversion",
+      "edges": [
+        [
+          170,
+          602
+        ],
+        [
+          170,
+          614
+        ],
+        [
+          171,
+          600
+        ],
+        [
+          171,
+          601
+        ],
+        [
+          182,
+          607
+        ],
+        [
+          184,
+          604
+        ],
+        [
+          186,
+          605
+        ],
+        [
+          186,
+          606
+        ],
+        [
+          188,
+          608
+        ],
+        [
+          193,
+          609
+        ],
+        [
+          194,
+          611
+        ],
+        [
+          196,
+          612
+        ],
+        [
+          196,
+          613
+        ],
+        [
+          221,
+          610
+        ],
+        [
+          279,
+          603
+        ],
+        [
+          465,
+          599
         ]
       ]
     }

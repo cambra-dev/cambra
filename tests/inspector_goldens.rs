@@ -557,10 +557,11 @@ fn every_gallery_program_produces_a_valid_payload() {
 /// in place, and likewise every inference-variable number inside a rendered
 /// type.
 ///
-/// The id fields are exactly `panes[].root`, `panes[].nodes[].nodeId`,
-/// `panes[].nodes[].children[].id` and both endpoints of every
-/// `paneLinks[].edges` pair; spans and the pane's own string `id` are not ids
-/// and are left alone. Renumbering is global rather than per-pane because a
+/// The id fields are exactly every entry of `panes[].roots`, every
+/// `panes[].nodes[].nodeId`, every inbound edge id a node names — `children[].id`
+/// on a tree pane, `inputs[].id` on an operator pane — and both endpoints of
+/// every `paneLinks[].edges` pair; spans and the pane's own string `id` are not
+/// ids and are left alone. Renumbering is global rather than per-pane because a
 /// surviving node keeps one id across every pane it appears in, and that
 /// identity — not the number — is what the frontend joins on.
 ///
@@ -619,12 +620,19 @@ fn canonicalize_ids(v: &mut Value) {
     };
 
     for pane in v["panes"].as_array_mut().into_iter().flatten() {
-        renumber(&mut pane["root"]);
+        for root in pane["roots"].as_array_mut().into_iter().flatten() {
+            renumber(root);
+        }
         for node in pane["nodes"].as_array_mut().into_iter().flatten() {
             renumber(&mut node["nodeId"]);
             canonical_type(&mut node["type"]);
-            for child in node["children"].as_array_mut().into_iter().flatten() {
-                renumber(&mut child["id"]);
+            // A tree pane names its inbound edges `children`, an operator pane
+            // `inputs`. Both carry the id under `id`, and a node has one of the
+            // two, so walking both reaches every edge without a kind test.
+            for channel in ["children", "inputs"] {
+                for edge in node[channel].as_array_mut().into_iter().flatten() {
+                    renumber(&mut edge["id"]);
+                }
             }
         }
     }

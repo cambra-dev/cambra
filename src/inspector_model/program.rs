@@ -19,6 +19,7 @@ use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase};
 use crate::ccl::panes::{PANES, PaneKind};
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
+use crate::interpreter::operator_graph::OperatorGraph;
 
 /// The pane use→binder resolution runs over: the lowered, uniquified tree before
 /// inference, where a source name occurs as often as it does in the program.
@@ -41,10 +42,11 @@ pub(super) struct PaneProjection<'a> {
     /// Human-readable label for the pane header, derived from `id`.
     pub(super) label: String,
     /// Discriminant for the pane kind: `"holes"` for a tree inference has not
-    /// run on yet, `"typed"` for one it has.
+    /// run on yet, `"typed"` for one it has, `"operators"` for the dataflow
+    /// graph.
     pub(super) kind: &'static str,
-    /// This pane's IR tree.
-    pub(super) ir: &'a Expr,
+    /// What this pane holds.
+    pub(super) content: PaneContent<'a>,
     /// Node → attribution for this pane, materialized by folding this pane's
     /// rows.
     pub(super) projection: SourceProjection,
@@ -88,27 +90,51 @@ fn pane_kind(pane: &str) -> &'static str {
     for spec in PANES.iter() {
         inference_has_run |= spec.phases.contains(&Phase::Infer);
         if spec.name == pane {
-            return if inference_has_run { "typed" } else { "holes" };
+            return match spec.content {
+                PaneKind::Operators => "operators",
+                PaneKind::Ir if inference_has_run => "typed",
+                PaneKind::Ir => "holes",
+            };
         }
     }
     panic!("no pane named {pane}");
 }
 
+/// What a pane holds, borrowed from the [`CompiledProgram`] that retained it.
+///
+/// The compiler's [`PaneKind`] says which a pane declares; this carries the value.
+pub(super) enum PaneContent<'a> {
+    /// An expression tree.
+    Ir(&'a Expr),
+    /// The dataflow operator graph.
+    Operators(&'a OperatorGraph),
+}
+
+impl<'a> PaneContent<'a> {
+    /// The expression tree, or `None` for an operator pane.
+    pub(super) fn ir(&self) -> Option<&'a Expr> {
+        match self {
+            PaneContent::Ir(ir) => Some(ir),
+            PaneContent::Operators(_) => None,
+        }
+    }
+}
+
 impl<'a> PaneProjection<'a> {
-    /// Build a pane projection: keep the IR borrow and take ownership of the
-    /// materialized pane projection.
+    /// Build a pane projection: keep the content borrow and take ownership of
+    /// the materialized pane projection.
     fn build(
         id: &'static str,
         label: String,
         kind: &'static str,
-        ir: &'a Expr,
+        content: PaneContent<'a>,
         projection: SourceProjection,
     ) -> Self {
         PaneProjection {
             id,
             label,
             kind,
-            ir,
+            content,
             projection,
         }
     }
@@ -128,38 +154,36 @@ impl<'a> InspectedProgram<'a> {
     /// topology once.
     pub fn new(compiled: &'a CompiledProgram) -> Self {
         let materialized = compiled.materialize_panes();
-        let trees = compiled.pane_trees();
-        // This layer renders expression trees, so it takes the `PaneKind::Ir`
-        // panes and stops. The operator pane is declared in `PANES` and folded
-        // like any other, and is not on the wire yet.
+        let mut trees = compiled.pane_trees().into_iter();
+        // `PANES`, the pane contents and the materialized projections are the
+        // same length by construction, so this zip drops nothing.
         let panes: Vec<_> = PANES
             .iter()
             .zip(materialized.projections)
-            .filter(|(spec, _)| spec.content == PaneKind::Ir)
-            .zip(trees)
-            .map(|((spec, projection), tree)| {
+            .map(|(spec, projection)| {
+                let content = match spec.content {
+                    PaneKind::Ir => PaneContent::Ir(
+                        trees
+                            .next()
+                            .unwrap_or_else(|| unreachable!("one tree per declared IR pane")),
+                    ),
+                    PaneKind::Operators => PaneContent::Operators(&compiled.operator_graph),
+                };
                 PaneProjection::build(
                     spec.name,
                     pane_label(spec.name),
                     pane_kind(spec.name),
-                    tree,
+                    content,
                     projection,
                 )
             })
             .collect();
-        // One map per adjacent pair of the panes above, so `pane_maps` stays
-        // aligned with `panes.windows(2)`. A pair with an endpoint this layer
-        // does not render is dropped with it.
-        let pane_maps: Vec<_> = materialized
-            .pairs
-            .into_iter()
-            .take(panes.len().saturating_sub(1))
-            .map(|p| p.map)
-            .collect();
         InspectedProgram {
             source: &compiled.source,
             panes,
-            pane_maps,
+            // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
+            // already one shorter than its projections, in the same order.
+            pane_maps: materialized.pairs.into_iter().map(|p| p.map).collect(),
         }
     }
 
@@ -186,7 +210,7 @@ impl<'a> InspectedProgram<'a> {
             pane,
             pane_label(pane),
             pane_kind(pane),
-            ir,
+            PaneContent::Ir(ir),
             projection,
         )];
         InspectedProgram {
@@ -227,7 +251,11 @@ impl<'a> InspectedProgram<'a> {
         let Some(pane) = self.panes.iter().find(|p| p.id == DEFINITIONS_PANE) else {
             return Vec::new();
         };
-        super::definitions::definitions(pane.ir, &pane.projection, self.source)
+        let ir = pane
+            .content
+            .ir()
+            .unwrap_or_else(|| unreachable!("{DEFINITIONS_PANE} is an IR pane"));
+        super::definitions::definitions(ir, &pane.projection, self.source)
     }
 }
 
