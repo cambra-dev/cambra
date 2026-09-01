@@ -552,11 +552,10 @@ fn build_scrutinee_case_cform(
         )))
         .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
-        // `elim_lambda` abstracts the binder and leaves the walk to its caller
-        // (`src/ccl/design/optimization.md`, "`elim_lambda`'s caller walks its
-        // result"). An arm not mentioning its payload binder takes a `const`
-        // rule, which lifts the body whole, and operator conversion refuses a
-        // `BinOp` or a nested `Lambda` inside a lifted value.
+        // `elim_lambda` abstracts the binder and leaves the walk to its caller.
+        // An arm not mentioning its payload binder takes a `const` rule, which
+        // lifts the body whole, and operator conversion refuses a `BinOp` or a
+        // nested `Lambda` inside a lifted value.
         let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
         let arm_fn = elim_lambdas(ctx, arm_fn)?;
         arms.push(arm_compose(

@@ -124,25 +124,6 @@ where `src_refined` is `src_elim` with its domain wrapped in `Type::Refinement` 
 
 The filter check happens at the `Compose` level (rather than inside the `Lambda` arm) because the refinement must be attached to the source, which is only visible alongside the lambda at the compose level.
 
-### `elim_lambda`'s caller walks its result
-
-`elim_lambda` abstracts one binder and returns a morphism whose sub-terms may still need
-eliminating. Three of its rules lift a body under `const` without descending into it: `λ 𝑥 → 𝑒` with
-`𝑥 ∉ fv(𝑒)`, the same shape with `𝑥` free only in `𝑒`'s refinement, and the cast-wrapped form of
-that second one. Operator conversion accepts a point-free value only, so a `BinOp` or a nested
-`Lambda` left inside a lifted body is refused there.
-
-Every caller hands the result to `elim_lambdas`, whose structural descent reaches those bodies: the
-`Lambda`, filter and map arms of `elim_lambdas` itself, and the `match`-arm rule in
-`build_scrutinee_case_cform`. One walk at the caller covers all three rules, and `elim_lambda` calls
-nothing in `elim_lambdas`.
-
-The `match`-arm rule is the caller the walk is load-bearing for. An arm reaches the first rule
-whenever it does not mention its payload binder, so an arm computing over a name bound outside the
-`match` needs the walk, and so does every write in a `match` arm — the mutability phases lift the
-write onto the arm's spine and leave the arm computing ([mutability.md](mutability.md), "A write
-inside a `Case` bound by a `Let`").
-
 ### `Let` nodes after rule 7
 
 When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bound variable changes type from `T` to `ParamTy ⇒ T`. The rewritten `Let` node has `bound_ty: None` because the old annotation is stale and would be incorrect.

@@ -1387,11 +1387,10 @@ p"#;
 
 // A `match` arm that does not mention its payload binder is a constant function
 // of it, and `elim_lambda`'s constant rule lifts the body whole. The `match`-arm
-// rule walks what `elim_lambda` returns, as every caller does
-// (`src/ccl/design/optimization.md`, "`elim_lambda`'s caller walks its result");
-// without that walk an arm computing over a name bound outside the `match`
-// reaches operator conversion as the `BinOp` it was written as. All three
-// `match` spellings route through that rule.
+// rule walks what `elim_lambda` returns, as every caller does; without that
+// walk an arm computing over a name bound outside the `match` reaches operator
+// conversion as the `BinOp` it was written as. All three `match` spellings
+// route through that rule.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // On the right of an assignment.
