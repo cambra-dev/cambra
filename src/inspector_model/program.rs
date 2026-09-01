@@ -17,7 +17,7 @@
 
 use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase};
-use crate::ccl::panes::PANES;
+use crate::ccl::panes::{PANES, PaneKind};
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 
 /// The pane use→binder resolution runs over: the lowered, uniquified tree before
@@ -129,13 +129,15 @@ impl<'a> InspectedProgram<'a> {
     pub fn new(compiled: &'a CompiledProgram) -> Self {
         let materialized = compiled.materialize_panes();
         let trees = compiled.pane_trees();
-        // `PANES`, `pane_trees()` and the materialized projections are the same
-        // length by construction (`PANE_COUNT`), so this zip drops nothing.
+        // This layer renders expression trees, so it takes the `PaneKind::Ir`
+        // panes and stops. The operator pane is declared in `PANES` and folded
+        // like any other, and is not on the wire yet.
         let panes: Vec<_> = PANES
             .iter()
-            .zip(trees)
             .zip(materialized.projections)
-            .map(|((spec, tree), projection)| {
+            .filter(|(spec, _)| spec.content == PaneKind::Ir)
+            .zip(trees)
+            .map(|((spec, projection), tree)| {
                 PaneProjection::build(
                     spec.name,
                     pane_label(spec.name),
@@ -145,12 +147,19 @@ impl<'a> InspectedProgram<'a> {
                 )
             })
             .collect();
+        // One map per adjacent pair of the panes above, so `pane_maps` stays
+        // aligned with `panes.windows(2)`. A pair with an endpoint this layer
+        // does not render is dropped with it.
+        let pane_maps: Vec<_> = materialized
+            .pairs
+            .into_iter()
+            .take(panes.len().saturating_sub(1))
+            .map(|p| p.map)
+            .collect();
         InspectedProgram {
             source: &compiled.source,
             panes,
-            // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
-            // already one shorter than its projections, in the same order.
-            pane_maps: materialized.pairs.into_iter().map(|p| p.map).collect(),
+            pane_maps,
         }
     }
 

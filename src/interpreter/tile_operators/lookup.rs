@@ -1,6 +1,7 @@
 use bit_set::BitSet;
 
 use super::*;
+use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::FieldKey,
     interpreter::{
@@ -65,7 +66,10 @@ impl CheckedLookup {
     ) -> Self {
         let tiling = answer_tiling(keys.tiling(), option_extent);
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("collection", &*collection), value("keys", &*keys)],
+            ),
             source: LookupSource::Split { collection, keys },
         }
     }
@@ -117,7 +121,7 @@ impl CheckedLookup {
             codomain: Box::new(Tiling::Scalar(option_extent)),
         };
         Ok(Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[value("pairs", &*pairs)]),
             source: LookupSource::Paired(pairs),
         })
     }

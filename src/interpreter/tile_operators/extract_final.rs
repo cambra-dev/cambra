@@ -1,4 +1,5 @@
 use super::*;
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{ColumnValue, Consumer, Scheduler, Value},
     pretty_graph::VizOptions,
@@ -66,9 +67,12 @@ impl ExtractFinal {
             default.tiling(),
         );
         Self {
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("source", &*source), value("default", &*default)],
+            ),
             source,
             default: Some(default),
-            base: OperatorBase::new(tiling),
         }
     }
 
@@ -81,9 +85,9 @@ impl ExtractFinal {
     pub fn without_default(source: Box<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("source", &*source)]),
             source,
             default: None,
-            base: OperatorBase::new(tiling),
         }
     }
 

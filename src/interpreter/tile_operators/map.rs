@@ -2,6 +2,7 @@ use bit_set::BitSet;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
         BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
@@ -55,10 +56,13 @@ impl MapResult {
                     "a single-key lookup's key extent must match the collection's key extent"
                 );
                 return Self {
-                    base: OperatorBase::new(Tiling::SealedFunction {
-                        domain: fn_domain2.clone(),
-                        codomain: Box::new(Tiling::Scalar(fn_codomain.clone())),
-                    }),
+                    base: OperatorBase::new::<Self>(
+                        Tiling::SealedFunction {
+                            domain: fn_domain2.clone(),
+                            codomain: Box::new(Tiling::Scalar(fn_codomain.clone())),
+                        },
+                        &[value("input", &*input), value("fn", &*function)],
+                    ),
                     input,
                     function,
                 };
@@ -101,7 +105,10 @@ impl MapResult {
                 codomain: fn_codomain.clone(),
             };
             return Self {
-                base: OperatorBase::new(tiling),
+                base: OperatorBase::new::<Self>(
+                    tiling,
+                    &[value("input", &*input), value("fn", &*function)],
+                ),
                 input,
                 function,
             };
@@ -130,7 +137,10 @@ impl MapResult {
             output_tiling
         });
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("input", &*input), value("fn", &*function)],
+            ),
             input,
             function,
         }
@@ -554,7 +564,10 @@ impl MapResultToConst {
             }),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("input", &*input), value("constant", &*constant)],
+            ),
             input,
             constant,
             mode,
@@ -738,9 +751,9 @@ impl MapResultWithSource {
             Tiling::Scalar(output_extent)
         });
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
             source: source.clone(),
-            base: OperatorBase::new(tiling),
         }
     }
 }

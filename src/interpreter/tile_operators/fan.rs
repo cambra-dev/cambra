@@ -3,6 +3,7 @@ use log::trace;
 use std::collections::HashMap;
 
 use super::*;
+use crate::interpreter::operator_graph::value_at;
 use crate::{
     interpreter::{
         ColumnValue, Consumer, Extent, Scheduler, forwarding_consumer, shared_consumer, tuple_field,
@@ -147,8 +148,13 @@ impl FanIn {
                 "FanIn: all inputs must have function tilings (SealedFunction or CurriedFunction)"
             ),
         };
+        let edges: Vec<InputEdgeSpec> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| value_at(i, &**op))
+            .collect();
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &edges),
             names,
             inputs: ops,
         }
@@ -494,8 +500,13 @@ impl ScalarFanIn {
                 .map(|(name, op)| (name.clone(), op.tiling().clone()))
                 .collect(),
         );
+        let edges: Vec<InputEdgeSpec> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, op)| value_at(i, &**op))
+            .collect();
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &edges),
             names,
             inputs,
         }

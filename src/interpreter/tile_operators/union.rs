@@ -1,6 +1,7 @@
 use bit_set::BitSet;
 
 use super::*;
+use crate::interpreter::operator_graph::value_at;
 use crate::{
     ccl::TagMap,
     interpreter::{
@@ -48,8 +49,13 @@ impl UnionOperator {
     /// where the type layer said `{a: Int}`.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
         let tiling = Self::coproduct_tiling(&inputs, declared_codomain);
+        let edges: Vec<InputEdgeSpec> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, op)| value_at(i, &**op))
+            .collect();
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &edges),
             inputs,
             flat: false,
         }
@@ -158,8 +164,13 @@ impl UnionOperator {
         // the tiling it keeps. Reaching into `base.tiling` afterwards would leave
         // the shape recorded at construction stale.
         let tiling = Self::flatten_domain(Self::coproduct_tiling(&inputs, declared_codomain));
+        let edges: Vec<InputEdgeSpec> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, op)| value_at(i, &**op))
+            .collect();
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &edges),
             inputs,
             flat: true,
         }
