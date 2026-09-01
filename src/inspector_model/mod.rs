@@ -26,10 +26,11 @@
 //!
 //! A refinement predicate riding a type slot is an expression tree with its own
 //! [`NodeId`](crate::ccl::provenance::NodeId)s, so every walk here descends into
-//! them and a predicate reaches the wire as a child edge labelled `where.N`
-//! rather than a positional index. A predicate shared across type slots is one
-//! node and one edge. Why the ids are in the walk's domain at all:
-//! `src/inspector_model/design.md`, "Predicates are nodes".
+//! them and a predicate reaches the wire as a child marked `predicate`, after
+//! the node's value children. A predicate shared across type slots is one node
+//! and one child. How a refinement ships is provisional; why the ids are in the
+//! walk's domain at all is not — `src/inspector_model/design.md`, "Predicates
+//! are nodes".
 //!
 //! # A node carries its own spans
 //!

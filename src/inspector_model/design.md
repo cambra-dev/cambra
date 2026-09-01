@@ -91,7 +91,7 @@ Each node carries:
 | `spans` | every source span it traces to, narrowest first, empty when it traces to none |
 | `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
-| `children` | `{ edge, id, predicate }` — the child's id in this same table, its display label, and whether it is a type-interior subtree |
+| `children` | `{ id, predicate }` — the child's id in this same table, and whether it is a type-interior subtree |
 
 A node carries every span its attribution records, so a node several source positions fan into is
 reachable from each of them. `fold` unions blame spans, which is what makes that plural. There is no
@@ -116,24 +116,17 @@ itself.
 
 **A refinement predicate is a child node.** A predicate is an expression tree in its own right
 ([Predicates are nodes](#predicates-are-nodes)), and it reaches the consumer as a child of the node
-whose type carries it. `predicate` on the edge is what a consumer branches on. The `edge` label is
-for display and follows the same split: a value child's is its positional index (`"0"`, `"1"`), a
-predicate's is `where.N`.
+whose type carries it. `predicate` is what a consumer branches on.
 
-`N` counts predicates in `walk_type_slots` order — the node's own type, its annotation, a `Cast`
-target, then each binder's type and annotation — flattened across nested type children, and
-deduplicated by node id. The order is stable, so a consumer can compare a node's predicate edges
-across panes.
+A child edge carries no label. Children ship in order — the value children, then the predicates in
+`walk_type_slots` order — so a value child's position in `children` is its positional index, and the
+predicates are the marked tail.
 
 One node names one predicate once. The slots overlap: `walk_type_slots` yields a `Lambda`'s own type
 and its binder's type, and for a lambda those are the same `Type`, so a slot-order walk reaches that
-type's predicates once per slot. Since a shared predicate is one entry in the table, a second edge
-to it asserts nothing the first does, and `no_node_repeats_a_predicate_edge` (`wire.rs`) pins the
-absence. A predicate several *nodes* reach still carries an edge from each of them.
-
-`where.N` is a position in that sequence rather than a path through the type, so it does not say
-which slot a predicate came from. A consumer needing the slots apart needs a path; nothing on the
-wire asks.
+type's predicates once per slot. Since a shared predicate is one entry in the table, a second child
+naming it asserts nothing the first does, and `no_node_repeats_a_predicate_edge` (`wire.rs`) pins
+the absence. A predicate several nodes reach still carries a child edge from each of them.
 
 ### Pane links are dense
 
@@ -145,9 +138,11 @@ consumer may follow edges with no identity special case.
 An edge is `[upstream, downstream]` and carries no label. `EdgeLabels` distinguishes `descends` (the
 downstream node was made from the upstream one) from `relates` (it is about the upstream node but
 was not made from it), and that distinction is load-bearing in `ccl`, where `has_ancestry` drives
-leak accounting — see [provenance.md](../ccl/design/provenance.md#the-edge-labels). It stops at the
-wire: link resolution is bidirectional and transitive, so a consumer following edges treats the two
-alike.
+leak accounting — see [provenance.md](../ccl/design/provenance.md#the-edge-labels).
+
+**Provisional.** Today's consumer resolves links bidirectionally and transitively, so it treats the
+two labels alike and the wire omits them. A consumer that separates descent from mention wants the
+label; carrying it is an additive field.
 
 Every endpoint of every edge is a node of the tree it points into: an edge a consumer follows always
 lands somewhere. `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` (`wire.rs`)
@@ -170,9 +165,15 @@ carries a shared subtree once per position that reaches it.
 
 One descent reaches them. `Type::walk_refinements` visits every refinement riding a type or its
 nested type children, and the three callers that need it project differently from each one: this
-module's `where.N` child edges, `collect_tree_ids`' id domain, and `predicate_id_collisions`' per-term
-`Rc` keys. Written out per caller it was the same match-and-recurse three times, and a predicate this
-module enumerated but `collect_tree_ids` did not would be a node the pane fold never explains.
+module's predicate child edges, `collect_tree_ids`' id domain, and `predicate_id_collisions`'
+per-term `Rc` keys. Written out per caller it was the same match-and-recurse three times, and a
+predicate this module enumerated but `collect_tree_ids` did not would be a node the pane fold never
+explains.
+
+**Provisional.** A predicate ships as a marked child and nothing more: the wire does not say which
+type slot it rode, or where inside that type it sat, so two occurrences of one predicate in one type
+are indistinguishable on the wire. That is enough to display a predicate and not enough to do
+anything else with it. Work in this area replaces the shape rather than extending it.
 
 ### Types on the wire
 
@@ -180,15 +181,9 @@ A node's `type` is rendered by `Display for Type`, and `Type`'s `Serialize` impl
 same `Display`, so every type on the wire is one rendered string. Every node has a type, so the
 field is never absent.
 
-A structural type would carry a refinement's predicate, which is an expression tree with node ids,
-re-creating inside every `type` field the repetition the node table removes; and the compact
-spelling — `⇒` against `⤇`, `T@lit` singletons, `{T | p}`, `Σ`, `?N` — would have to be
-reimplemented by the consumer.
-
-The rendering is all the wire says about a type. A consumer cannot diff a node's type across panes
-except by string comparison, cannot elide a long type by structure, and cannot branch on the top
-constructor without parsing. What it can do is reach a refinement's predicate, which is a node with
-an edge to it.
+**Provisional.** The string is what today's consumer displays. Structure a consumer could branch on
+— the top constructor, a type's children, a refinement's predicate as an id — is a later addition,
+not a settled omission.
 
 ### Definitions resolve over the IR
 
@@ -232,11 +227,11 @@ no warnings. A failed compile ships `InspectorPayload::degraded` instead — sam
 shapes cannot drift — carrying the source text, the diagnostics, `meta.payloadKind: "failed"`, and
 empty `panes`, `paneLinks` and `definitions`.
 
-A failed compile ships no panes even where the pipeline reached some: inference can fail after
-channelization succeeded, and that channelized IR is displayable. Shipping what a failed compile did
-reach is follow-up work beyond this document's ratified changes, since it needs the pipeline to hand
-back its partial panes rather than one error; it is carried as `TODO(degraded-panes)` on
-`InspectorPayload::degraded`.
+A failed compile ships no panes even where the pipeline reached some. A program that fails inference
+has its pre-inference pane already built, and one that fails a later phase has that pane and every
+pane before the failure; all of them are dropped. Shipping them needs `compile_program` to hand back
+its partial panes rather than one error, so the change is mostly outside this module; it is carried
+as `TODO(degraded-panes)` on `InspectorPayload::degraded`.
 
 A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span. One
 span, not a list of labelled ranges: a diagnostic is built from one error, which carries at most one
@@ -263,6 +258,10 @@ them.
 `SCHEMA_VERSION` is the payload's wire version, carried as `meta.schema`, and is **1**. A breaking
 change — a field removed, renamed or retyped, or a value shape an old consumer would misread — bumps
 it; purely additive optional fields do not.
+
+No bump is due yet. Nothing durable consumes this payload — the frontend is rebuilt from this repo —
+so the version stays at 1 through any change until a consumer exists that an old version could
+reach. The rule above is what a bump means once one does.
 
 The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
 every node id included, so any change re-blesses all of them; its wire validator pins the schema

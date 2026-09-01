@@ -152,27 +152,28 @@ pub struct IrNode {
     /// `src/inspector_model/design.md`, "Types on the wire".
     #[cfg_attr(feature = "serde", serde(rename = "type"))]
     pub ty: String,
-    /// The node's children, each named by id under the edge that reaches it.
+    /// The node's children by id: the value children in positional order,
+    /// then every refinement predicate riding one of its type slots, each
+    /// marked [`predicate`](IrChild::predicate).
     pub children: Vec<IrChild>,
 }
 
-/// One `{ edge, id, predicate }` child of an [`IrNode`] — an edge into the
-/// pane's node table.
+/// One `{ id, predicate }` child of an [`IrNode`] — an edge into the pane's
+/// node table.
+///
+/// The edge carries no label. Children ship in order — value children under
+/// their positional index, then the parent's predicates — so the position in
+/// [`children`](IrNode::children) is the label a consumer would read, and
+/// [`predicate`](Self::predicate) is what it branches on.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct IrChild {
-    /// The edge's display label: a value child's positional index (`"0"`,
-    /// `"1"`, …), or `where.N` for a refinement predicate riding one of the
-    /// parent's type slots.
-    pub edge: String,
     /// The child node's id — an entry of the same pane's
     /// [`nodes`](PaneEntry::nodes).
     pub id: u64,
     /// Whether the child is a type-interior subtree: `true` for a refinement
-    /// predicate, `false` for a value child. This is what a consumer branches
-    /// on, rather than reading a `where.` prefix off
-    /// [`edge`](Self::edge); see `src/inspector_model/design.md`, "Predicates
-    /// are nodes".
+    /// predicate, `false` for a value child. See
+    /// `src/inspector_model/design.md`, "Predicates are nodes".
     pub predicate: bool,
 }
 
@@ -346,6 +347,10 @@ pub struct Meta {
     /// misread. Purely *additive* optional fields do **not** bump it (an old
     /// client ignores them). The frontend pins this in its wire-shape contract
     /// test, so a bump is a deliberate, reviewed event on both sides.
+    ///
+    /// No bump is due yet. Nothing durable consumes this payload — the frontend
+    /// is rebuilt from this repo — so the version stays at 1 through any change
+    /// until a consumer exists that an old version could reach.
     pub schema: u32,
 }
 
@@ -356,9 +361,12 @@ pub struct Meta {
 /// An edge's label set stays in `ccl` and does not reach the wire. Upstream the
 /// distinction is load-bearing —
 /// [`EdgeLabels::has_ancestry`](crate::ccl::provenance::EdgeLabels::has_ancestry)
-/// drives leak accounting — but link resolution is bidirectional and transitive,
-/// so a consumer following edges treats `descends` and `relates` alike and has
-/// nothing to do with the label.
+/// drives leak accounting.
+///
+/// **Provisional.** Today's consumer resolves links bidirectionally and
+/// transitively, so it treats `descends` and `relates` alike and the wire omits
+/// the label. A consumer that separates descent from mention wants it; carrying
+/// it is an additive field.
 ///
 /// [`ProvenanceMap::edges`] already yields sorted, deduplicated edges, one entry
 /// per pair; this only projects to the wire's `u64`.
@@ -429,19 +437,17 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         out.push(node);
 
         let mut children = Vec::new();
-        for (idx, child) in expr.child_exprs().into_iter().enumerate() {
+        for child in expr.child_exprs() {
             children.push(IrChild {
-                edge: idx.to_string(),
                 id: visit(child, projection, visited, out),
                 predicate: false,
             });
         }
-        // Predicate subtrees come after the value children so a consumer that
-        // reads children positionally is unaffected; `predicate` is what marks
-        // them (see [`predicate_children`]).
-        for (edge, predicate) in predicate_children(expr) {
+        // Predicate subtrees come after the value children, so a value child's
+        // index in `children` is its positional index; `predicate` is what marks
+        // the rest (see [`predicate_children`]).
+        for predicate in predicate_children(expr) {
             children.push(IrChild {
-                edge,
                 id: visit(predicate, projection, visited, out),
                 predicate: true,
             });
@@ -559,13 +565,14 @@ impl InspectorPayload {
     /// `definitions` collections are empty and `meta.payloadKind` is
     /// `"failed"`. The frontend still renders the editor + squiggles from this.
     ///
-    /// TODO(degraded-panes): emit the panes that completed — if
-    /// channelization succeeds and only inference fails, the post-channelize
-    /// `panes[]` entry is still displayable. Today every degraded payload ships
-    /// empty `panes`/`paneLinks` regardless of where the failure occurred. It
-    /// needs `compile_program` to hand back its partial panes rather than one
-    /// error, so the change is mostly outside this module; see
-    /// `src/inspector_model/design.md`, "Diagnostics and the degraded payload".
+    /// TODO(degraded-panes): emit the panes that completed — a program that
+    /// fails inference has already built its pre-inference pane, and one that
+    /// fails a later phase has that pane and every pane before the failure.
+    /// Today every degraded payload ships empty `panes`/`paneLinks` regardless
+    /// of where the failure occurred. It needs `compile_program` to hand back
+    /// its partial panes rather than one error, so the change is mostly outside
+    /// this module; see `src/inspector_model/design.md`, "Diagnostics and the
+    /// degraded payload".
     pub fn degraded(
         name: impl Into<String>,
         text: impl Into<String>,
@@ -789,7 +796,7 @@ mod tests {
                         out.insert(id.as_u64(), spans);
                     }
                     expr.walk_children(|c| collect(c, projection, seen, out));
-                    for (_, predicate) in predicate_children(expr) {
+                    for predicate in predicate_children(expr) {
                         collect(predicate, projection, seen, out);
                     }
                 }
@@ -824,11 +831,11 @@ mod tests {
 
     /// A shipped node carries the row `src/inspector_model/design.md`, "A node on
     /// the wire" describes: an id, the spans it traces to, a rendered type, no
-    /// rewrite tag when its tag is `Nature::Source`, positional edges for its
-    /// value children and `where.N`, marked `predicate`, for a predicate riding
-    /// one of its type slots.
+    /// rewrite tag when its tag is `Nature::Source`, and its children — the
+    /// value children first, then every predicate riding one of its type slots,
+    /// marked `predicate`.
     #[test]
-    fn a_wire_node_carries_its_id_spans_type_and_edges() {
+    fn a_wire_node_carries_its_id_spans_type_and_children() {
         let code = indoc! {r#"
             xs = [1, 2, 3, 4]
             ys = [x * 2 for x in xs if x > 2]
@@ -845,19 +852,13 @@ mod tests {
         for node in &pane.nodes {
             assert!(!node.ty.is_empty(), "{} ships a type", node.label);
 
-            // Value children come first under their positional index; every
-            // predicate follows, under `where.N`, and the flag says which is
-            // which without reading the label.
+            // The value children come first and the predicates follow, so a
+            // value child's index in `children` is its positional index and the
+            // marked ones are one contiguous tail.
             let positional = node.children.iter().take_while(|c| !c.predicate).count();
-            let edges: Vec<&str> = node.children.iter().map(|c| c.edge.as_str()).collect();
-            let expected: Vec<String> = (0..positional)
-                .map(|i| i.to_string())
-                .chain((0..edges.len() - positional).map(|i| format!("where.{i}")))
-                .collect();
-            assert_eq!(edges, expected, "{}'s edges", node.label);
             assert!(
                 node.children[positional..].iter().all(|c| c.predicate),
-                "{}'s `where.N` edges are the marked ones",
+                "{}'s predicate children are the tail",
                 node.label
             );
         }
@@ -874,16 +875,12 @@ mod tests {
         );
 
         // The comprehension's filter rides the `Cast`'s refined domain, so it
-        // hangs off a marked `where.N` edge rather than a positional one. One
-        // edge, not two: the filter sits in the `Cast`'s own type and in its
-        // target, and the two slots reach one predicate node.
+        // hangs off a marked child rather than a value one. One child, not two:
+        // the filter sits in the `Cast`'s own type and in its target, and the
+        // two slots reach one predicate node.
         let cast = node_named(pane, "Cast");
-        let edges: Vec<(&str, bool)> = cast
-            .children
-            .iter()
-            .map(|c| (c.edge.as_str(), c.predicate))
-            .collect();
-        assert_eq!(edges, [("0", false), ("where.0", true)]);
+        let marks: Vec<bool> = cast.children.iter().map(|c| c.predicate).collect();
+        assert_eq!(marks, [false, true]);
         let predicate = node_with_id(pane, cast.children[1].id);
         assert_ne!(
             predicate.node_id, cast.node_id,
@@ -919,11 +916,10 @@ mod tests {
                     for child in &node.children {
                         assert!(
                             ids.contains(&child.id),
-                            "{}'s child edge {} of {} names {}, absent from the {} table",
+                            "{}'s child {} of {} is absent from the {} table",
                             node.label,
-                            child.edge,
-                            node.node_id,
                             child.id,
+                            node.node_id,
                             pane.id
                         );
                     }
@@ -999,7 +995,7 @@ mod tests {
     /// a slot-order walk reaches that type's predicates once per slot; the
     /// repeats named one node and asserted nothing the first edge did not.
     ///
-    /// A shared predicate reached from *different* parents is a different thing
+    /// A shared predicate reached from different parents is a different thing
     /// and stays — `a_shared_predicate_is_one_entry_named_by_several_edges` pins
     /// it.
     #[test]
@@ -1013,12 +1009,10 @@ mod tests {
                     for child in node.children.iter().filter(|c| c.predicate) {
                         assert!(
                             seen.insert(child.id),
-                            "{} in {} names predicate {} under both {:?} and a \
-                             later `where.N`",
+                            "{} in {} names predicate {} twice",
                             node.label,
                             pane.id,
-                            child.id,
-                            child.edge
+                            child.id
                         );
                     }
                 }

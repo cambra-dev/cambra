@@ -9,7 +9,15 @@ use crate::ccl::{Expr, TypedExprNode};
 use std::collections::HashSet;
 
 /// Every refinement predicate riding one of `expr`'s own type slots, once each,
-/// paired with the wire label its child edge carries.
+/// in [`TypedExpr::walk_type_slots`] order.
+///
+/// **Provisional.** How a refinement reaches the consumer is not settled. A
+/// predicate ships as a child subtree marked `predicate`, and the wire says
+/// nothing about which type slot it rode or where inside that type it sat — a
+/// consumer that displays the predicate needs no more, and a consumer that
+/// tells two occurrences apart needs a shape this one does not extend into.
+/// Work in this area replaces it; see `src/inspector_model/design.md`,
+/// "Predicates are nodes".
 ///
 /// A predicate is a real expression tree with its own
 /// [`NodeId`](crate::ccl::provenance::NodeId)s, and the pane fold explains those
@@ -20,49 +28,34 @@ use std::collections::HashSet;
 /// validators call a dead endpoint. This is the descent that keeps the shipped
 /// node table and the shipped links over the same id domain.
 ///
-/// # One edge per predicate
+/// # One child per predicate
 ///
 /// A node's type slots overlap: [`TypedExpr::walk_type_slots`] yields a
 /// [`Lambda`](TypedExprNode::Lambda)'s own type and its binder's type, and for a
 /// lambda those are the same [`Type`], so a slot-order walk reaches each of that
 /// type's predicates once per slot. The repeats name one node — the pane's node
-/// table holds a shared predicate once — so a second edge to it asserts nothing
-/// the first does not. Predicates are therefore deduplicated by
+/// table holds a shared predicate once — so a second child naming it asserts
+/// nothing the first does not. Predicates are therefore deduplicated by
 /// [`NodeId`](crate::ccl::provenance::NodeId), keeping each one's first-reached
 /// position. Deduplication cannot narrow the id domain: it drops repeated ids
 /// and no distinct one, so the descent still reaches everything
 /// `collect_tree_ids` enumerates.
-///
-/// The label is for display; the edge's `predicate` flag is what a consumer
-/// branches on to tell "this subtree lives inside a type" from "this subtree is
-/// an operand". Order is [`TypedExpr::walk_type_slots`] order, which is stable,
-/// so the labels are stable too, and a consumer can compare one node's predicate
-/// edges across panes.
-///
-/// `where.N` is a position in this sequence and not a path through the type, so
-/// it does not say which slot a predicate came from. Nothing on the wire asks:
-/// the flat counter is what a consumer needs to name an edge, and a path is what
-/// it would need to tell two slots apart.
 ///
 /// Shares `collect_tree_ids`' type descent rather than mirroring it
 /// ([`Type::walk_refinements`](crate::ccl::Type::walk_refinements)): a predicate
 /// that walk enumerates and this one does not is a node the fold explains and
 /// the table omits, so the two cannot be allowed to drift apart. They now cannot,
 /// because there is one descent.
-pub(super) fn predicate_children(expr: &Expr) -> Vec<(String, &Expr)> {
-    // Every refinement's predicate rides the slot, so each is its own `where.N`
-    // child. The descent is `Type::walk_refinements`, which is also what
+pub(super) fn predicate_children(expr: &Expr) -> Vec<&Expr> {
+    // Every refinement's predicate rides the slot, so each is its own child.
+    // The descent is `Type::walk_refinements`, which is also what
     // `collect_tree_ids` folds over — one function, so the shipped node table and
     // the shipped links cannot drift onto different id domains.
     let mut roots: Vec<&Expr> = Vec::new();
     expr.walk_type_slots(|t| t.walk_refinements(&mut |r| roots.push(&r.predicate)));
     let mut seen: HashSet<NodeId> = HashSet::new();
+    roots.retain(|p| seen.insert(p.node_id()));
     roots
-        .into_iter()
-        .filter(|p| seen.insert(p.node_id()))
-        .enumerate()
-        .map(|(i, p)| (format!("where.{i}"), p))
-        .collect()
 }
 
 /// A short kind label for a node, mirroring the symbolic vocabulary at a glance
