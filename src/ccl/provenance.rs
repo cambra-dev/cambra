@@ -135,6 +135,16 @@ impl NodeId {
     pub fn fresh() -> Self {
         NodeId(FRESH_NODE_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// The id's underlying number, for use as an opaque serialization handle
+    /// (the inspector wire shape carries a `NodeId` as a JSON number; see
+    /// [`crate::inspector_model`]). This is the *only* place the numeric value
+    /// is observed — internal logic compares ids by equality, never by value —
+    /// so it is exposed solely so a client can round-trip a handle, not to give
+    /// the value any in-compiler meaning.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 impl std::fmt::Debug for NodeId {
@@ -146,10 +156,10 @@ impl std::fmt::Debug for NodeId {
 // Wire shape (inspector, feature `serde`): a bare JSON number. A `NodeId` is an
 // opaque handle the client round-trips, so it serializes as its underlying
 // `u64`, read off the field directly, not as a struct. Hand-written rather than
-// `#[serde(transparent)]` because the inner field is private. There is no
-// accessor for the number: nothing in the compiler reads it — ids are compared
-// by equality — so the wire impl is its only reader, and an accessor can come
-// back when a caller needs one.
+// `#[serde(transparent)]` because the inner field is private. Nothing in the
+// compiler reads the number — ids are compared by equality — so the only
+// readers are this impl and [`NodeId::as_u64`], which the inspector model uses
+// to project an id onto the wire outside a `Serialize` context.
 //
 // TODO(wire-stability): the mint-order value is not stable across compiler
 // changes — anything that shifts upstream mint *counts* renumbers every later id,
@@ -216,16 +226,11 @@ pub enum Nature {
 
 impl Nature {
     /// The lowercase wire discriminant (`"source"` / `"expansion"` /
-    /// `"machinery"`), shared by the per-node `ir` tree tag and the
-    /// `SourceAttribution` query wire so the two encodings never diverge.
+    /// `"machinery"`) a payload tree node's `rewritten` tag carries.
     ///
     /// `"source"` never reaches the wire: the sole emission path branches on
     /// [`is_source`](Self::is_source) first and writes `null` instead. The arm
     /// exists for completeness.
-    ///
-    /// Compiled only under the `serde` feature (the `Serialize` impl below is its
-    /// sole caller), so a default build sees it as dead.
-    #[allow(dead_code)]
     pub(crate) fn wire_str(self) -> &'static str {
         match self {
             Nature::Source => "source",
@@ -235,8 +240,8 @@ impl Nature {
     }
 
     /// Whether this is the [`Source`](Self::Source) direct-image nature — the
-    /// wire null-compression predicate. A `SourceAttribution` whose tag
-    /// `is_source()` serializes its `rewritten` as `null`.
+    /// wire null-compression predicate. A node whose attribution tag
+    /// `is_source()` ships `rewritten: null`.
     pub(crate) fn is_source(self) -> bool {
         matches!(self, Nature::Source)
     }
@@ -483,46 +488,6 @@ pub struct SourceAttribution {
     /// that produced the node. Null-compressed on the wire when the tag
     /// [`is_source`](Nature::is_source).
     pub rewritten: RewriteTag,
-}
-
-// Wire shape (inspector, feature `serde`): the attribution ships natively. The
-// query endpoints (`/api/resolve`, `/api/hover`) carry a `SourceAttribution` as
-// `{ spans, rewritten: null | { via, nature, label } }` — the same two-channel
-// shape the per-node `ir` tree carries (spans + rewrite tag), letting the
-// frontend format the tag itself rather than consuming a pre-flattened string.
-//
-// Null-compression: a `Source`-nature tag (a direct image) serializes its
-// `rewritten` as `null`. This is the sole emission path, so a `"source"` nature
-// cannot reach the wire.
-#[cfg(feature = "serde")]
-impl serde::Serialize for SourceAttribution {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
-        /// The wire form of a [`RewriteTag`]: `via` as the `Phase` debug name,
-        /// `nature` as the lowercase discriminant, `label` verbatim.
-        #[derive(serde::Serialize)]
-        struct WireTag {
-            via: String,
-            nature: &'static str,
-            label: &'static str,
-        }
-
-        // Direct images null-compress: a Source-nature tag ships as `null`.
-        let rewritten = if self.rewritten.nature.is_source() {
-            None
-        } else {
-            Some(WireTag {
-                via: format!("{:?}", self.rewritten.via),
-                nature: self.rewritten.nature.wire_str(),
-                label: self.rewritten.label,
-            })
-        };
-        let mut s = serializer.serialize_struct("SourceAttribution", 2)?;
-        s.serialize_field("spans", &self.spans)?;
-        s.serialize_field("rewritten", &rewritten)?;
-        s.end()
-    }
 }
 
 /// How a rewritten node came to exist, for tooltips and display policy.

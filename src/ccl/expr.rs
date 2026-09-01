@@ -1707,7 +1707,7 @@ impl TypedExpr {
     ///
     /// Immutable analog of [`walk_binders_mut`](Self::walk_binders_mut), which
     /// is kept in lockstep — a new binder-bearing variant appears in both.
-    pub fn walk_binders(&self, mut f: impl FnMut(&TypedBinding)) {
+    pub fn walk_binders<'a>(&'a self, mut f: impl FnMut(&'a TypedBinding)) {
         match &self.node {
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
@@ -1839,7 +1839,7 @@ impl TypedExpr {
     /// refinement predicate's own type slots) compose this with
     /// [`Type::walk_children`] — see
     /// [`crate::ccl::ccl_utils::distinct_predicate_rcs`].
-    pub fn walk_type_slots(&self, mut f: impl FnMut(&Type)) {
+    pub fn walk_type_slots<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         f(&self.ty);
         if let Some(annotation) = &self.user_annotation {
             f(annotation);

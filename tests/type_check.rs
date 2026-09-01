@@ -3496,3 +3496,61 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
         infer_program(&program("[g, f]")).without_pi_names(),
     );
 }
+
+/// TODO(refinement-let-scope): a `let` in a function body whose binder reaches
+/// the result refinement produces an ill-formed function type. **This test pins
+/// a defect, not a decision — it should start failing when the defect is fixed.**
+///
+/// `^+` records its sum in the result type, so `m ^+ 1` has type
+/// `{Int | __elem == m ^+ 1}` whose predicate holds the operand terms. Inference
+/// derives that refinement from the body and lands it on the lambda's own type,
+/// where a `let` inside the body has not opened, so the predicate names a binder
+/// that is not in scope at the position the type sits. `ScopeViolation` is
+/// labelled a compiler bug, so a reachable program reports an internal invariant
+/// failure.
+///
+/// The fix is to eliminate the binder as the refinement leaves its scope, by
+/// substituting the `let`'s definition into the predicate: `m` defined as
+/// `n ^+ 1` makes the refinement `{Int | __elem == (n ^+ 1) ^+ 1}`, whose only
+/// free name is the parameter, which the function type binds. Two things to
+/// settle first: nested `let`s compose, so the predicate grows multiplicatively
+/// and wants a size bound; and a binder that cannot be eliminated should widen
+/// the type to the unrefined base rather than error.
+///
+/// This also blocks binding a multi-argument function's parameters rather than
+/// substituting them away — see `src/ccl/design/ir.md`, "A substituted
+/// parameter's site rides its projection". The two are one fix.
+#[test]
+fn let_binder_escaping_into_a_result_refinement_is_ill_scoped() {
+    let errors = infer_program_err(indoc! {r#"
+        def g(n: Int):
+            m = n ^+ 1
+            m ^+ 1
+
+        g
+    "#});
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            InferError::ScopeViolation { unbound, .. } if unbound.iter().any(|b| b == "m")
+        )),
+        "expected a ScopeViolation naming `m`; got {errors:?}"
+    );
+}
+
+/// The contrast that isolates the defect above: the same refinement over the
+/// **parameter** is well-formed, because the function type binds it.
+#[test]
+fn a_result_refinement_over_the_parameter_is_well_scoped() {
+    let ty = infer_program(indoc! {r#"
+        def h(n: Int):
+            n ^+ 1
+
+        h
+    "#});
+    let rendered = ty.to_string();
+    assert!(
+        rendered.contains("^+") && rendered.contains("__elem"),
+        "the parameter's refinement rides the function type; got {rendered}"
+    );
+}

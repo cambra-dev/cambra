@@ -9,8 +9,10 @@
 //! └── right: Literal(2)
 //! ```
 //!
-//! This module has no dependencies on interpreter or domain types — it is
-//! purely a tree renderer used by [`crate::pretty_graph`].
+//! The module depends on no interpreter or domain type and compiles no serde;
+//! rendering is all it does. Tile operators build the tree through
+//! [`crate::pretty_graph`], and the inspector's wire node is a type of its own
+//! in [`crate::inspector_model`].
 
 // Box-drawing connector strings, used by render_node.
 const CONNECTOR_LAST: &str = "└── ";
@@ -38,7 +40,8 @@ pub struct InspectNode {
     pub obsolete_guard: Option<String>,
     /// Formatted intent guard; shown in verbose mode.
     pub intent_guard: Option<String>,
-    /// Children with optional edge labels, e.g. ("left", child_desc)
+    /// Children with edge labels, e.g. `("left", child_desc)`. An empty label
+    /// renders the child with no `edge: ` prefix.
     pub children: Vec<(String, InspectNode)>,
 }
 

@@ -64,9 +64,12 @@ use crate::{
 ///
 /// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
 /// span-carrying inference errors get ariadne reports with underlines; the
-/// remaining variants render as plain `error: …` lines. Lambda-elim/conversion
-/// spans remain future work; the enum is shaped so they migrate without
-/// changing the list-of-errors return contract.
+/// remaining variants render as plain `error: …` lines. The same
+/// [`CompileError`]s feed the web [`Diagnostic`](crate::inspector_model::Diagnostic)
+/// JSON path via [`diagnostics_from_compile_errors`](crate::inspector_model::diagnostics_from_compile_errors)
+/// — one error model, two renderers. Lambda-elim/conversion spans remain
+/// future work; the enum is shaped so they migrate without changing the
+/// list-of-errors return contract.
 #[derive(Debug)]
 pub enum CompileError {
     /// The parser rejected one token / token sequence.
@@ -579,27 +582,8 @@ pub struct CompiledProgram {
     /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
     /// authoritative provenance surface:
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
-    /// pane pair.
-    // Consumed by `materialize_panes` and the inspector model; the compiler
-    // itself never reads it.
-    #[allow(dead_code)]
+    /// pair.
     pub(crate) provenance_table: ProvenanceTable,
-    /// The parsed CHL surface AST — the source-of-truth for source-level
-    /// (lexical) inspector queries.
-    ///
-    /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
-    /// retained verbatim. It is the anchor for *source-language* questions —
-    /// name resolution (`goto-definition`, the binder half of `scope-at`) —
-    /// answered by the inspector's name-binder index.
-    ///
-    /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
-    /// (the typed IR): lowering destroys some source variables before any IR
-    /// node exists — notably `uncurry_params` rewrites multi-param references
-    /// `Var(x)` to `__arg_tuple_N ▷ .i` *before* uniquify, so the lowered/typed
-    /// tree structurally cannot resolve a multi-param `def`/`lambda` parameter
-    /// back to its binder. The surface AST still has `x`/`y` with their
-    /// `Param.name_span`, so lexical resolution over *this* is lossless.
-    pub source_ast: chl_parser::ast::Module,
     /// The original program source text, retained verbatim.
     ///
     /// Inspector queries need the source string to produce snippets (`hover`'s
@@ -728,18 +712,17 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         e.walk_children(|c| ids_of(c, out));
     }
     fn from_ty(t: &Type, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        if let Type::Refinement(_, rs) = t {
-            for r in rs.iter() {
-                let key = Rc::as_ptr(&r.predicate) as usize;
-                if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
-                    let mut s = HashSet::new();
-                    ids_of(&r.predicate, &mut s);
-                    slot.insert(s);
-                }
-                from_expr_ty(&r.predicate, acc);
+        t.walk_refinements(&mut |r| {
+            let key = Rc::as_ptr(&r.predicate) as usize;
+            if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
+                let mut s = HashSet::new();
+                ids_of(&r.predicate, &mut s);
+                slot.insert(s);
             }
-        }
-        t.walk_children(|c| from_ty(c, acc));
+            // A predicate is an expression, so its own type slots are an
+            // expression walk's business rather than the type descent's.
+            from_expr_ty(&r.predicate, acc);
+        });
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
         from_ty(&e.ty, acc);
@@ -802,14 +785,9 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut HashSet<NodeId>) {
-        if let Type::Refinement(_, refinements) = t {
-            // Every refinement's predicate rides the slot, so every one of them
-            // carries ids the projections must explain.
-            for r in refinements.iter() {
-                from_expr(&r.predicate, acc);
-            }
-        }
-        t.walk_children(|c| from_ty(c, acc));
+        // Every refinement's predicate rides the slot, so every one of them
+        // carries ids the projections must explain.
+        t.walk_refinements(&mut |r| from_expr(&r.predicate, acc));
     }
 
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
@@ -1256,8 +1234,6 @@ struct Frontend {
     /// it is. A **pane** is exactly this: a captured phase output that outlives
     /// the run.
     panes: BTreeMap<Phase, Expr>,
-    /// The surface AST lowering consumed, retained for source-level queries.
-    module: chl_parser::ast::Module,
     /// Sink bindings discovered during lowering. Drained before the sources,
     /// which is the order [`LoweringContext`] requires.
     sink_bindings: HashMap<String, Arc<dyn DataSink>>,
@@ -1399,7 +1375,6 @@ fn run_frontend(
         return Ok(Frontend {
             expr,
             panes,
-            module,
             sink_bindings,
             lowering_projection,
             table_session,
@@ -1425,7 +1400,6 @@ fn run_frontend(
     Ok(Frontend {
         expr,
         panes,
-        module,
         sink_bindings,
         lowering_projection,
         table_session,
@@ -1765,7 +1739,6 @@ pub fn compile_program(
     let Frontend {
         expr: join_planned,
         mut panes,
-        module,
         sink_bindings: sink_bindings_registry,
         lowering_projection,
         table_session,
@@ -1880,7 +1853,6 @@ pub fn compile_program(
         post_as_of_read_ir,
         post_lambda_elim_ir,
         provenance_table,
-        source_ast: module,
         source: code.to_string(),
     };
 

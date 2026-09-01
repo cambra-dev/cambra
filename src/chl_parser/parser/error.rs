@@ -118,7 +118,7 @@ impl fmt::Display for ParseError {
     /// (ariadne reports), call [`ParseResult::render_errors`] instead.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ParseError::Lex(e) => write!(f, "lex error: {e:?}"),
+            ParseError::Lex(e) => write!(f, "lex error: {e}"),
             ParseError::Parse(info) if info.custom.is_some() => {
                 let msg = info.custom.as_deref().expect("guarded by the match arm");
                 f.write_str(msg)?;
@@ -248,6 +248,19 @@ fn label_range(span: Span) -> std::ops::Range<usize> {
 }
 
 impl ParseError {
+    /// The source span this error points at — the failure position for a parse
+    /// error, the offending range for a lex error.
+    ///
+    /// [`to_report`](Self::to_report) underlines this range; a caller rendering
+    /// the error some other way (a JSON diagnostic, an editor squiggle) needs it
+    /// on its own.
+    pub fn span(&self) -> Span {
+        match self {
+            ParseError::Lex(e) => e.span(),
+            ParseError::Parse(info) => info.span,
+        }
+    }
+
     /// Build an ariadne [`Report`] with default (colour-on) configuration.
     pub fn to_report<'a>(
         &self,

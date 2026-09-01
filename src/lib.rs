@@ -2,6 +2,7 @@
 
 pub mod ccl;
 pub mod chl_parser;
+pub mod inspector_model;
 pub mod interpreter;
 pub mod pretty_graph;
 pub mod pretty_tree;

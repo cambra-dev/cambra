@@ -75,6 +75,45 @@ A scope is a type, `Binders`, not a collected list of binder references: it borr
 
 Consumers may rely on three properties of the walk, each asserted in `scope.rs`'s tests: the `Child` items come in `walk_children` order (so the `&mut` walk can pair scopes with children positionally), the binders it declares are exactly `walk_binders`', and a scope's children are consecutive with a binder-introducing scope entered only once. The last is what lets a consumer build per-scope state once per scope rather than once per child, and the `&mut` walk hands it the change point directly, as a `Scope` item ahead of the run of children it covers. Substitution needs both halves of that: restricting the substitution across the scope (`Subst::shadow_all`, which borrows instead of cloning whenever the scope names nothing the substitution acts on) and the Barendregt no-capture check, which is release-active and walks every replacement term — so a `LetRec` group of *n* binders owes *n* checks, and paying per child instead would cost *n*(*n*+1).
 
+### A substituted parameter's site rides its projection
+
+`def f(p, q)` lowers to one lambda over a tupled binder, and `uncurry_params` substitutes
+`__arg_tuple_N ▷ .i` into every occurrence of a parameter:
+
+```
+λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1
+```
+
+So a multi-argument function's parameters bind nothing: no `TypedBinding` corresponds to `p`, and a
+consumer asking where `p` is defined has no binder to read. Two spans on the projection answer for it
+instead:
+
+- the projection **root** carries the **occurrence's** span, because substitution is root-carry — the
+  occurrence's own id and attribution replace the template root's;
+- the projection **interior** carries the parameter's **declaration**, because the template is tagged
+  with that parameter's [`Param::name_span`] and every freshened copy inherits the tag.
+
+A consumer at a use of `p` therefore reads which occurrence from the `Apply` and which declaration
+from its `Proj` child. `a_substituted_parameter_carries_occurrence_and_declaration_spans`
+(`lower/functions.rs`) pins both.
+
+The interior used to carry the whole `def` span, because the template is manufactured once per
+parameter before any occurrence exists and the function's span was the only one in hand. That said
+nothing a consumer could use: the projection is what became of the parameter, so its source position
+is where the parameter was written.
+
+**Binding the parameters instead does not work.** Replacing the substitution with
+`let p = __arg_tuple_0.0 in …` gives each parameter a binder and a site, and reads better —
+a refinement over a parameter renders as `{Int | __elem >= a}` rather than
+`{Int | __elem >= __arg_tuple_0.0}`. It is blocked here, by a defect that exists independently of multi-argument functions. Inference
+derives refinements from the body,
+and those refinements land on the **lambda's own type**, where a `let` inside the body has not yet
+opened: `def add(a, b): a + b` infers `((Int, Int) ⇒ {Int | __elem == a ^+ b})` and the scope check
+rejects it, correctly, for naming binders that are not in scope at the type. Substituting the
+projection is what keeps the invariant that a tupled lambda's body mentions only the tuple binder,
+which *is* in scope at the lambda's type. Binding the parameters would need inference to expand a
+`let` into a refinement as it leaves the binder's scope.
+
 ### Application shape
 
 Function application is a single `Apply(Box<Expr>, Box<Expr>)` node. Single-argument CHL calls `f(a)` lower to `Apply(a, Var(f))` directly. Multi-argument CHL calls `f(a, b, ...)` lower to `Apply(Tuple([a, b, ...]), Var(f))` — the arguments are tupled so the call shape matches how multi-arg CHL lambdas are uncurried at lowering time (see [lowering.md](lowering.md)).

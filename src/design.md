@@ -10,6 +10,7 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 | --- | --- | --- |
 | `ccl/` | Cambra Core Language: lowering (CHL AST → CCL), type inference, the optimization/compilation passes, and the typed AST programs lower into. | [design/](ccl/design/README.md) — IR, type inference, lowering, mutability, optimization; [CLAUDE.md](ccl/CLAUDE.md) |
 | `chl_parser/` | Parser for the Cambra High-level Language: lexer, grammar, AST, and error recovery. | [design-chl-parser.md](chl_parser/design-chl-parser.md) |
+| `inspector_model/` | The read-only model the program inspector serves: the payload, the span and name-binder indices, the per-pane node tables, and the pane-pair links. | [design.md](inspector_model/design.md) |
 | `interpreter/` | Dataflow runtime: the tile producer/consumer operators, tilings, the scheduler, and data sources/sinks. | [design-operators.md](interpreter/design-operators.md), [design-http-server.md](interpreter/design-http-server.md), [CLAUDE.md](interpreter/CLAUDE.md) |
 | `pretty_graph.rs`, `pretty_tree.rs` | Human-readable rendering of the operator graph and AST trees (debug / inspector output). | — |
 | `web_inspector.rs` | Live web dashboard served with `--inspect`; renders the CHL AST, lowered CCL, operator graph, and runtime producer state. Static assets in `resources/`. | — |
