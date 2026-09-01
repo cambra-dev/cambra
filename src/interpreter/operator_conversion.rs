@@ -25,7 +25,7 @@ use crate::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
         },
-        operator_graph::drop_operator,
+        operator_graph::{drop_operator, record_sink, record_source_read},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
@@ -91,7 +91,14 @@ pub fn convert_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    convert_impl(expr, None, ctx)
+    let op = convert_impl(expr, None, ctx)?;
+    // A pure program has one synthetic output, so its sink belongs to the
+    // expression that produced it — the program root.
+    {
+        let _scope = crate::ccl::provenance::converting(expr.node_id());
+        record_sink("main", op.operator_id());
+    }
+    Ok(op)
 }
 
 /// One compiled operator per field of a trailing record.
@@ -219,7 +226,14 @@ pub fn convert_record_fields_to_operators(
         }
         TypedExprNode::Record(fields) => fields
             .iter()
-            .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
+            .map(|(name, elt)| {
+                let op = convert_impl(elt, None, ctx)?;
+                // The sink is the program's output boundary, so it belongs to the
+                // field expression rather than to the record or the program root.
+                let _scope = crate::ccl::provenance::converting(elt.node_id());
+                record_sink(name, op.operator_id());
+                Ok((name.clone(), op))
+            })
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
             "convert_record_fields_to_operators: expected Let* Record, got {other:?}"
@@ -1378,7 +1392,9 @@ fn convert_impl_inner(
         TypedExprNode::Source(name) => {
             let input = expect_input(input, &format!("Source({name})"))?;
             let source = ctx.get_source(name)?;
-            Ok(Box::new(MapResultWithSource::new(source, input)))
+            let reader = MapResultWithSource::new(source, input);
+            record_source_read(name, expr.node_id(), reader.operator_id());
+            Ok(Box::new(reader))
         }
 
         // A raw `LetRec` never compiles directly: op-conversion *recognizes

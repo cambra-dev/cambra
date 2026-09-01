@@ -44,7 +44,12 @@ pub enum EdgeKind {
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
     Value { deferred: bool },
-    /// A `FanOutBranch`'s edge to its fan input.
+    /// An edge to a node more than one consumer may reach: a `FanOutBranch`'s
+    /// edge to its fan input, or a reader's edge to a data source.
+    ///
+    /// What separates this from [`Value`](Self::Value) is exclusivity, not
+    /// indirection. A shared target has no single owner, which is why the forest
+    /// invariant ranges over value edges alone.
     Share,
     /// A `FanOutBranch`'s edge to the fan input of a cyclic fan. Every cycle in
     /// the graph is one of these, which is what makes the cycle set explicit and
@@ -131,9 +136,9 @@ pub(crate) fn share(fan_input: Option<NodeId>, cyclic: bool) -> InputEdgeSpec {
 
 /// One node of the graph.
 ///
-/// Operators only, for now. The program-boundary nodes — a source per registered
-/// data source, a sink per compiled output — are nodes too, and arrive with the
-/// entry-point work that has the expression they attribute to in hand.
+/// Operators, plus the two program-boundary kinds. Without the boundary the graph
+/// begins and ends in the middle of nothing: a data source is not an operator, and
+/// an output is a field name the boundary holds rather than an operator itself.
 #[derive(Clone, Debug)]
 pub enum GraphNode {
     /// An operator, with the inputs it holds.
@@ -142,6 +147,19 @@ pub enum GraphNode {
         kind: &'static str,
         tiling: String,
         inputs: Vec<InputEdge>,
+    },
+    /// A registered data source. In-degree 0, and where a path through the graph
+    /// starts.
+    ///
+    /// One per registered source rather than one per read site, so the graph is
+    /// truthful about sharing the way it is everywhere else — a shared input is a
+    /// node several consumers point at, never a node duplicated per consumer.
+    Source { id: NodeId, name: String },
+    /// A compiled output field. Out-degree 0, and a root of every walk.
+    Sink {
+        id: NodeId,
+        name: String,
+        input: InputEdge,
     },
 }
 
@@ -153,6 +171,22 @@ pub enum GraphNode {
 pub struct OperatorGraph {
     nodes: Vec<GraphNode>,
     roots: Vec<NodeId>,
+    /// Read sites per registered source, accumulated during the walk and spent by
+    /// [`materialize_sources`].
+    ///
+    /// A source node cannot be minted at the first read site: its row names every
+    /// site that reads it, and a row's parents are fixed when its recording
+    /// closes. So the sites are collected and the node minted once the walk is
+    /// done.
+    pending_sources: Vec<(String, Vec<SourceRead>)>,
+}
+
+/// One read of a registered data source: the expression that read it, and the
+/// operator that read reached.
+#[derive(Clone, Copy, Debug)]
+struct SourceRead {
+    expr: NodeId,
+    reader: NodeId,
 }
 
 impl OperatorGraph {
@@ -177,15 +211,25 @@ impl OperatorGraph {
     /// Every node's id.
     pub fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes.iter().map(|n| match n {
-            GraphNode::Operator { id, .. } => *id,
+            GraphNode::Operator { id, .. }
+            | GraphNode::Source { id, .. }
+            | GraphNode::Sink { id, .. } => *id,
         })
     }
 
     /// Every edge, as `(consumer, edge)`.
     pub fn edges(&self) -> impl Iterator<Item = (NodeId, &InputEdge)> + '_ {
-        self.nodes.iter().flat_map(|n| match n {
-            GraphNode::Operator { id, inputs, .. } => inputs.iter().map(move |e| (*id, e)),
-        })
+        self.nodes
+            .iter()
+            .flat_map(|n| -> Box<dyn Iterator<Item = _>> {
+                match n {
+                    GraphNode::Operator { id, inputs, .. } => {
+                        Box::new(inputs.iter().map(move |e| (*id, e)))
+                    }
+                    GraphNode::Sink { id, input, .. } => Box::new(std::iter::once((*id, input))),
+                    GraphNode::Source { .. } => Box::new(std::iter::empty()),
+                }
+            })
     }
 }
 
@@ -201,10 +245,10 @@ impl OperatorGraph {
 ///   input is a `Box`, and acyclicity comes from cycles routing through the two
 ///   cyclic fans rather than through owned inputs. The renderer's absence of a
 ///   cycle guard rests on this.
-/// * **Every node is reachable from a root**, where a root is an operator no
-///   other operator owns. An unreachable node is one a construction site built
-///   and dropped, which nothing else notices.
-pub(crate) fn assert_graph_invariants(graph: &OperatorGraph, output_roots: &[NodeId]) {
+/// * **Every node is reachable from a root** — a sink, or a fan input, which are
+///   the two kinds of node nothing owns. An unreachable node is one a
+///   construction site built and dropped, which nothing else notices.
+pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
     if !cfg!(any(debug_assertions, test)) {
         return;
     }
@@ -233,26 +277,34 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph, output_roots: &[Nod
     // Reachability follows every edge kind: a fan input is reached through its
     // branches' share edges, not by being owned.
     let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    let mut stack: Vec<NodeId> = output_roots.iter().chain(graph.roots()).copied().collect();
+    let mut stack: Vec<NodeId> = graph.roots().to_vec();
     let by_id: std::collections::HashMap<NodeId, &GraphNode> = graph
         .nodes()
         .iter()
         .map(|n| match n {
-            GraphNode::Operator { id, .. } => (*id, n),
+            GraphNode::Operator { id, .. }
+            | GraphNode::Source { id, .. }
+            | GraphNode::Sink { id, .. } => (*id, n),
         })
         .collect();
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
-        if let Some(GraphNode::Operator { inputs, .. }) = by_id.get(&id) {
-            stack.extend(inputs.iter().map(|e| e.target));
+        match by_id.get(&id) {
+            Some(GraphNode::Operator { inputs, .. }) => {
+                stack.extend(inputs.iter().map(|e| e.target));
+            }
+            Some(GraphNode::Sink { input, .. }) => stack.push(input.target),
+            Some(GraphNode::Source { .. }) | None => {}
         }
     }
     let stranded: Vec<String> = ids
         .difference(&seen)
         .map(|id| match by_id.get(id) {
             Some(GraphNode::Operator { kind, tiling, .. }) => format!("{id:?} {kind} {tiling}"),
+            Some(GraphNode::Source { name, .. }) => format!("{id:?} Source({name})"),
+            Some(GraphNode::Sink { name, .. }) => format!("{id:?} Sink({name})"),
             None => format!("{id:?} <no node>"),
         })
         .collect();
@@ -341,6 +393,110 @@ pub(crate) fn record_operator(
     });
 }
 
+/// Note that `reader` reads the source registered under `name`, at expression
+/// `expr`.
+///
+/// The node itself is minted later, by [`materialize_sources`]; see
+/// [`OperatorGraph::pending_sources`].
+pub(crate) fn record_source_read(name: &str, expr: NodeId, reader: Option<NodeId>) {
+    let Some(reader) = reader else {
+        return;
+    };
+    ACTIVE_GRAPH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(graph) = slot.as_mut() else {
+            return;
+        };
+        let read = SourceRead { expr, reader };
+        match graph.pending_sources.iter_mut().find(|(n, _)| n == name) {
+            Some((_, reads)) => reads.push(read),
+            None => graph.pending_sources.push((name.to_string(), vec![read])),
+        }
+    });
+}
+
+/// Mint one source node per registered source, and the edge from every operator
+/// that reads it.
+///
+/// Must run inside the conversion phase scope, since each node needs a provenance
+/// row like any other node of the pane. Each row names every read site: the first
+/// through the recording, the rest through
+/// [`RecordingGuard::also_consumes`](crate::ccl::provenance::RecordingGuard::also_consumes),
+/// which is what a node consumed from several places is for.
+pub(crate) fn materialize_sources() {
+    let pending = ACTIVE_GRAPH.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|graph| std::mem::take(&mut graph.pending_sources))
+            .unwrap_or_default()
+    });
+    for (name, reads) in pending {
+        let Some(first) = reads.first() else {
+            continue;
+        };
+        let id = {
+            let guard = crate::ccl::provenance::enter(
+                first.expr,
+                "opconv.source",
+                crate::ccl::provenance::Nature::Machinery,
+            );
+            let rest: Vec<NodeId> = reads[1..].iter().map(|r| r.expr).collect();
+            for extra in &rest {
+                guard.also_consumes(*extra);
+            }
+            let id = NodeId::fresh();
+            crate::ccl::provenance::on_mint(id);
+            id
+        };
+        ACTIVE_GRAPH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(graph) = slot.as_mut() else {
+                return;
+            };
+            graph.nodes.push(GraphNode::Source {
+                id,
+                name: name.clone(),
+            });
+            for read in &reads {
+                // Shared, not owned: one registered source may be read by
+                // several expressions, and each reader holds it through an `Rc`
+                // the way a fan branch holds its fan.
+                push_edge(
+                    graph,
+                    read.reader,
+                    EdgeRole::Named("source"),
+                    EdgeKind::Share,
+                    id,
+                );
+            }
+        });
+    }
+}
+
+/// Record a compiled output field, reading `target`.
+pub(crate) fn record_sink(name: &str, target: Option<NodeId>) -> Option<NodeId> {
+    let target = target?;
+    let id = NodeId::fresh();
+    crate::ccl::provenance::on_mint(id);
+    ACTIVE_GRAPH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(graph) = slot.as_mut() else {
+            return;
+        };
+        graph.nodes.push(GraphNode::Sink {
+            id,
+            name: name.to_string(),
+            input: InputEdge {
+                role: EdgeRole::Named("output"),
+                kind: EdgeKind::Value { deferred: false },
+                target,
+            },
+        });
+        graph.roots.push(id);
+    });
+    Some(id)
+}
+
 /// Remove an operator a conversion arm built and then discarded.
 ///
 /// Not a correctness fix: the discarded operator is unreachable, so nothing ever
@@ -360,6 +516,7 @@ pub(crate) fn drop_operator(op: &dyn TileOperator) {
         if let Some(graph) = slot.borrow_mut().as_mut() {
             graph.nodes.retain(|n| match n {
                 GraphNode::Operator { id: node, .. } => *node != id,
+                GraphNode::Source { .. } | GraphNode::Sink { .. } => true,
             });
             graph.roots.retain(|root| *root != id);
         }
@@ -393,22 +550,34 @@ pub(crate) fn record_deferred_edge(owner: NodeId, role: EdgeRole, target: Option
     };
     ACTIVE_GRAPH.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(graph) = slot.as_mut() else {
-            return;
-        };
-        for node in &mut graph.nodes {
-            if let GraphNode::Operator { id, inputs, .. } = node
-                && *id == owner
-            {
-                inputs.push(InputEdge {
-                    role,
-                    kind: EdgeKind::Value { deferred: true },
-                    target,
-                });
-                return;
-            }
+        if let Some(graph) = slot.as_mut() {
+            push_edge(
+                graph,
+                owner,
+                role,
+                EdgeKind::Value { deferred: true },
+                target,
+            );
         }
     });
+}
+
+/// Append an edge onto an operator already in the graph.
+fn push_edge(
+    graph: &mut OperatorGraph,
+    owner: NodeId,
+    role: EdgeRole,
+    kind: EdgeKind,
+    target: NodeId,
+) {
+    for node in &mut graph.nodes {
+        if let GraphNode::Operator { id, inputs, .. } = node
+            && *id == owner
+        {
+            inputs.push(InputEdge { role, kind, target });
+            return;
+        }
+    }
 }
 
 fn resolve(specs: &[InputEdgeSpec]) -> Vec<InputEdge> {

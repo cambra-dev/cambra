@@ -958,6 +958,62 @@ mod tests {
         }
     }
 
+    /// **The graph has both program boundaries**: a sink per compiled output, and
+    /// a source per registered data source that some expression reads.
+    ///
+    /// Without them the graph begins and ends in the middle of nothing, and a
+    /// reader has no way to tell an output from an operator whose consumer the
+    /// capture missed. Both are pane nodes like any other, so each carries a
+    /// provenance row and resolves to a span.
+    #[test]
+    fn the_operator_graph_carries_its_boundary_nodes() {
+        use crate::interpreter::operator_graph::GraphNode;
+
+        let mut saw_a_source = false;
+        for (name, code) in corpus() {
+            let program = compile_ok(&code);
+            let graph = &program.operator_graph;
+            let sinks: Vec<&str> = graph
+                .nodes()
+                .iter()
+                .filter_map(|n| match n {
+                    GraphNode::Sink { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !sinks.is_empty(),
+                "{name}: the graph has no sink, so it has no output boundary",
+            );
+
+            let projection = program.materialize_panes();
+            let attribution = projection
+                .projections
+                .last()
+                .expect("the operator pane's projection");
+            for node in graph.nodes() {
+                let (id, what) = match node {
+                    GraphNode::Source { id, name } => (*id, format!("source {name}")),
+                    GraphNode::Sink { id, name, .. } => (*id, format!("sink {name}")),
+                    GraphNode::Operator { .. } => continue,
+                };
+                assert!(
+                    attribution.contains_key(&id),
+                    "{name}: {what} carries no attribution, so it resolves to no span",
+                );
+            }
+
+            saw_a_source |= graph
+                .nodes()
+                .iter()
+                .any(|n| matches!(n, GraphNode::Source { .. }));
+        }
+        assert!(
+            saw_a_source,
+            "no corpus program reads a data source, so the source-node path is unexercised",
+        );
+    }
+
     /// **Each writer of a transaction names some operator of its own.**
     ///
     /// Every operator of the commit complex is minted after the writer's own
@@ -997,7 +1053,6 @@ mod tests {
             }
         }
     }
-
 
     /// Rough compile-time and retained-memory sanity for pane capture. Ignored
     /// by default — it is a measurement, not an assertion.

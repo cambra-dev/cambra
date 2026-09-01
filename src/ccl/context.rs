@@ -36,7 +36,9 @@ use crate::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
         },
-        operator_graph::{GraphSession, OperatorGraph, assert_graph_invariants},
+        operator_graph::{
+            GraphSession, OperatorGraph, assert_graph_invariants, materialize_sources,
+        },
         sinks::{DoneNotifier, SinkConsumer},
         tile_operators::{TileOperator, TileProducer},
     },
@@ -1791,23 +1793,21 @@ pub fn compile_program(
     // rows reach the same table.
     let graph_session = GraphSession::install();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
-        if sink_bindings_registry.is_empty() {
+        let ops = if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
                 .map(|op| vec![("main".to_string(), op)])
         } else {
             convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())
-        }
+        };
+        // A source node names every expression that read it, so it can only be
+        // minted once the walk has found them all. Inside the phase scope,
+        // because each needs a row like any other node of the pane.
+        materialize_sources();
+        ops
     })
     .errs()?;
     let operator_graph = graph_session.into_graph();
-    // The compiled fields are roots the graph cannot know about: only the
-    // boundary knows which operator a field compiled to. The graph supplies the
-    // rest — see `OperatorGraph::roots`.
-    let output_roots: Vec<_> = per_field_ops
-        .iter()
-        .filter_map(|(_, op)| op.operator_id())
-        .collect();
-    assert_graph_invariants(&operator_graph, &output_roots);
+    assert_graph_invariants(&operator_graph);
 
     let sink_count = per_field_ops
         .iter()
