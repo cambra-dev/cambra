@@ -191,9 +191,11 @@ ci_fast() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fmt || failed=1
-  # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
+  # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`. `-p
+  # cambra` for the same reason every gate above names it: widening to the
+  # workspace unifies the inspector's `serde` feature into the library.
   # shellcheck disable=SC2310
-  { cargo clippy -- -D warnings; } || failed=1
+  { cargo clippy -p cambra -- -D warnings; } || failed=1
   # shellcheck disable=SC2310
   ci_test || failed=1
   exit "${failed}"

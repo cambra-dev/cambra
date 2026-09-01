@@ -35,8 +35,8 @@ compiles zero serde (serde is an optional, default-off feature on `cambra`).
   monomorphization fan-out). Pre-inference holes (`_`/`?N`) show their resolved
   downstream type on hover.
 - **Refinement predicates** — a predicate riding a type slot is a node like any
-  other, reached as a `where.N`-labelled child rather than a positional one, so
-  it links across panes the same way the value tree does.
+  other, reaching the frontend as a child edge marked `predicate`, so it links
+  across panes the same way the value tree does.
 
 See `web/README.md` for the full interaction table and the <!-- doc-refs-ignore -->
 frontend's design.
@@ -52,9 +52,8 @@ round-trips).
   its serde-gated wire types). That is the serde-isolation boundary. It answers
   no positional query: every lookup is the frontend's, over the shipped tables.
 - **This crate is the transport edge**: it turns the model into JSON
-  (`snapshot_json` / `diagnose_json`) and serves it over HTTP (`src/server.rs`).
-  The frontend that consumes it, and the route that delivers it, land with the
-  frontend.
+  (`snapshot_json`) and serves it over HTTP (`src/server.rs`). The frontend that
+  consumes it, and the route that delivers it, land with the frontend.
 
 ```
 client ──HTTP──> cambra-inspector (this crate) ──> cambra::inspector_model ──> cambra compiler
@@ -66,8 +65,8 @@ client ──HTTP──> cambra-inspector (this crate) ──> cambra::inspector
 | Path | What it is |
 |---|---|
 | `Cargo.toml` | Crate manifest. Depends on `cambra` (with `serde`), `serde_json`, `tiny_http`. |
-| `src/lib.rs` | The transport edge: `snapshot_json` / `diagnose_json` (build-then-serialize). |
-| `src/server.rs` | The `tiny_http` server, its routes, and `snapshot_body` (used by `--dump-snapshot`). |
+| `src/lib.rs` | The transport edge: `snapshot_json` (build-then-serialize), and `wire_check`, the structural validator both the crate's tests and `tests/goldens.rs` assert the wire against. |
+| `src/server.rs` | The `tiny_http` server, its routes, and `snapshot_body_pretty` (what `--dump-snapshot` prints). |
 | `src/main.rs` | The `cambra-inspector` binary / CLI (run the server, or `--dump-snapshot`). |
 | `web/src/__fixtures__/` | The golden snapshot corpus the frontend's tests read, blessed by `scripts/regen-fixtures.sh`. The frontend itself lands separately. |
 | `examples/` | Sample CHL programs (`arithmetic.chl`, `list_min.chl`, `polymorphic.chl`, `defer_*.chl`, `type_error.chl`, …). |
@@ -82,7 +81,8 @@ cargo run -p cambra-inspector -- program.chl --port 9000    # custom port
 cargo run -p cambra-inspector                               # no arg: a built-in demo program
 ```
 
-Then open <http://localhost:8080>. Ready-made programs live in `examples/`:
+Then open <http://localhost:8080> — the server binds loopback only. Ready-made
+programs live in `examples/`:
 
 ```bash
 cargo run -p cambra-inspector -- cambra-inspector/examples/polymorphic.chl
@@ -103,10 +103,10 @@ cargo run -q -p cambra-inspector -- cambra-inspector/examples/list_min.chl --dum
 Use this for inspecting the payload or regenerating the frontend's golden test
 fixtures (see the README in the web frontend's `__fixtures__` directory).
 
-Two flags shape a committed fixture and apply only with `--dump-snapshot`:
-`--panes <comma-list>` retains a subset of the pipeline panes, and
-`--elide-pane-links` omits `paneLinks` from the payload. `scripts/fixtures.manifest`
-carries them per fixture; the served payload and a flagless dump stay full.
+A dump is always the whole payload. `scripts/fixtures.manifest` maps each
+committed fixture to the example program it is dumped from, and a program whose
+payload is too large to commit is asserted structurally in `tests/goldens.rs`
+instead of being pinned as a document.
 
 ## Testing
 

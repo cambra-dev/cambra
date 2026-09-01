@@ -1,5 +1,5 @@
 # The golden-fixture corpus, one row per line:
-#   <fixture-basename> <example-basename> [panes=<comma-list>|all] [links=all|none]
+#   <fixture-basename> <example-basename>
 #
 # Single source of truth for which example programs have committed snapshot
 # fixtures (web/src/__fixtures__/<fixture>.snapshot.json). Read by BOTH
@@ -7,39 +7,16 @@
 # golden tests (cambra-inspector/tests/goldens.rs), so the two can never
 # disagree about the corpus. Keep it bounded — every entry adds regen churn.
 #
-# Retention spec (optional, default `panes=all links=all` = full wire):
-#   panes=a,b   retain only these panes (subset, in pipeline order)
-#   links=none  elide `paneLinks` from the committed fixture (the field is
-#               OMITTED, never an empty array — an empty array would lie that
-#               the live wire ships no edges)
-# Slimming trims what the byte-exact corpus pins on the big, volatile programs:
-# `paneLinks` is ~4 lines/edge and grows super-linearly in the collapsed
-# channelize window, and the panes are the bulk of a large fixture's bytes. It
-# never changes the LIVE wire — `--dump-snapshot`
-# without flags, and the served payload, stay full. goldens.rs applies the SAME
-# per-row flags to its fresh dumps (so committed == fresh stays exact) and adds
-# structural link/pane assertions over a FULL dump to keep the bug-catching that
-# the pinned bytes used to provide.
-#
-# KEEP FULL (do not slim): list_min and arithmetic are the end-to-end canaries
-# that pin the whole wire (all panes + all links) so at least one small fixture
-# always exercises the complete payload byte-for-byte. The web vitest suite also
-# imports arithmetic/polymorphic/udf_fanout/list_min/failed and walks their
-# node tables + paneLinks, so those must remain full-wire.
+# Every fixture is the full wire. A fixture is a whole payload document, and a
+# corpus program whose payload is too large to commit whole belongs in
+# goldens.rs as a structural assertion over a fresh dump instead — which is
+# where `txn_multi_read` and `mutation_loop` live.
 arithmetic arithmetic
 polymorphic polymorphic
 list_min list_min
 # A deliberate type error -> the degraded (payloadKind: "failed") payload.
 failed type_error
-# The recorder-fixes regression corpus (RT shapes from the fixed passes):
 # inline fan-out (RT-3): Derived(Inline) copies + post-inference -> post-channelize edges.
 udf_fanout udf_fanout
-# transactional store read at 2 sites per block (RT-4a subst_env freshening).
-# Slimmed: the largest fixture (heavy channelize synthesis); pins only the panes it
-# uniquely exercises. goldens.rs asserts its dense window structurally.
-txn_multi_read txn_multi_read panes=post-inference,post-channelize links=none
-# loop accumulator read at 2 sites (RT-4 letrec subst_env/scaffolding).
-# Slimmed for the same reason as txn_multi_read.
-mutation_loop mutation_loop panes=post-inference,post-channelize links=none
 # UDF-of-defer: try_lift_defer fires, lifted feed head keeps its id (RT-5).
 defer_lift defer_lift

@@ -17,14 +17,14 @@
 //! [`InspectorPayload`](cambra::inspector_model::InspectorPayload) (via
 //! `InspectedProgram::build_payload`) and renders it with `serde_json`. The [`server`]'s
 //! `GET /api/snapshot` route calls exactly this.
+//!
+//! Every path emits the whole payload. The wire has one shape, and
+//! [`snapshot_json_pretty`] differs from [`snapshot_json`] in whitespace alone.
 
 pub mod server;
 
-use cambra::ccl::context::{CompiledProgram, GlobalContext, compile_program};
-use cambra::inspector_model::{
-    InspectedProgram, InspectorPayload, diagnostics_from_compile_errors,
-};
-use cambra::interpreter::Consumer;
+use cambra::ccl::context::CompiledProgram;
+use cambra::inspector_model::InspectedProgram;
 
 /// Build the `/api/snapshot` payload for a compiled program and serialize it to
 /// a JSON string.
@@ -49,173 +49,29 @@ pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
 /// Cargo.lock, not an external tool. Piping through `python3 -m json.tool` made
 /// the corpus a function of the local Python version, and of `FORCE_COLOR` —
 /// either silently rewrites every fixture and the gate reads it as drift.
-/// Serializes the typed payload directly wherever it can. The slimmed path
-/// cannot, and [`render_pretty`] carries what makes its `serde_json::Value`
-/// round-trip byte-identical anyway.
-///
-/// `retention` slims the committed fixture on the big/volatile corpus programs
-/// (a pane subset and/or elided `paneLinks`, per
-/// `cambra-inspector/scripts/fixtures.manifest`). The live server never calls
-/// this with anything but [`FixtureRetention::FULL`] — the pruning is a fixture
-/// concern, applied *after* building the full payload so the build path stays
-/// single.
-pub fn snapshot_json_pretty(
-    compiled: &CompiledProgram,
-    name: &str,
-    retention: &FixtureRetention,
-) -> String {
+pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str) -> String {
     let inspected = InspectedProgram::new(compiled);
     let payload = inspected.build_payload(name);
-    render_pretty(&payload, retention)
+    serde_json::to_string_pretty(&payload).expect("snapshot payload serializes")
 }
 
-/// Fixture-only payload slimming: which panes a golden dump retains and whether
-/// it ships `paneLinks`.
+/// Structural validators for the `/api/snapshot` wire shape — the Rust mirror
+/// of the frontend's `validateSnapshot` (`web/src/wireValidate.ts`). Asserting
+/// the wire contract in one place lets the lib, `server` and `tests/goldens.rs`
+/// check one contract (the cross-language twin of the TS validator, since the
+/// two cannot literally share code).
 ///
-/// This exists **solely** for the `--dump-snapshot` fixture path (driven by
-/// `cambra-inspector/scripts/fixtures.manifest`). The live server and a
-/// flagless `--dump-snapshot` always emit the full wire ([`FixtureRetention::FULL`]).
-/// Slimming trims what the byte-exact golden corpus pins on the big, volatile
-/// programs — `paneLinks` is ~4 lines per edge and grows super-linearly across
-/// the collapsed channelize window — without touching the live contract.
-///
-/// It lives in this crate rather than in `cambra::inspector_model` because it is
-/// a property of the *corpus*, not of the read model: this crate owns the
-/// fixtures (`src/inspector_model/design.md`, "The schema version"), and the
-/// payload type must not grow an `Option` field so a test corpus can be smaller.
-#[derive(Clone, Debug)]
-pub struct FixtureRetention {
-    /// Pane ids to retain (in the payload's existing pipeline order), or `None`
-    /// to keep every pane.
-    pub panes: Option<Vec<String>>,
-    /// Whether to ship `paneLinks`. `false` omits the field entirely — never an
-    /// empty array, which would claim the live wire carries no edges.
-    pub links: bool,
-}
-
-impl FixtureRetention {
-    /// The full wire: every pane, links shipped. The live default.
-    pub const FULL: FixtureRetention = FixtureRetention {
-        panes: None,
-        links: true,
-    };
-
-    /// Is this the full wire (no pruning)? The fast path that lets
-    /// [`render_pretty`] serialize the typed payload directly.
-    pub fn is_full(&self) -> bool {
-        self.panes.is_none() && self.links
-    }
-}
-
-impl Default for FixtureRetention {
-    fn default() -> Self {
-        FixtureRetention::FULL
-    }
-}
-
-/// Pretty-print a payload, pruned per `retention`.
-///
-/// The full-wire case serializes the typed payload directly, which is what the
-/// live path and every unslimmed fixture take. Pruning needs a field *omitted*
-/// rather than emptied, which `Serialize` on a fixed struct cannot express, so
-/// the slimmed case goes through `serde_json::Value`. That is byte-safe only
-/// because this crate enables `serde_json/preserve_order`: a `Value` is an
-/// insertion-ordered map, so a round-trip re-emits the struct's field order
-/// rather than sorting it. `both_render_paths_agree_on_a_full_payload` pins that
-/// the two paths produce identical bytes.
-fn render_pretty(payload: &InspectorPayload, retention: &FixtureRetention) -> String {
-    if retention.is_full() {
-        return serde_json::to_string_pretty(payload).expect("snapshot payload serializes");
-    }
-    let mut value = serde_json::to_value(payload).expect("snapshot payload serializes");
-    prune_for_fixture(&mut value, retention);
-    serde_json::to_string_pretty(&value).expect("pruned snapshot payload serializes")
-}
-
-/// Slim a serialized payload for the committed golden corpus.
-///
-/// * `panes = Some(keep)` retains only the listed panes (preserving the
-///   payload's pipeline order) and drops any `paneLinks` window naming a dropped
-///   pane, so the slimmed payload still validates.
-/// * `links = false` omits `paneLinks` entirely.
-fn prune_for_fixture(value: &mut serde_json::Value, retention: &FixtureRetention) {
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-    if let Some(keep) = &retention.panes {
-        let named = |v: Option<&serde_json::Value>| {
-            v.and_then(serde_json::Value::as_str)
-                .is_some_and(|id| keep.iter().any(|k| k == id))
-        };
-        if let Some(panes) = obj
-            .get_mut("panes")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            panes.retain(|p| named(p.get("id")));
-        }
-        if let Some(links) = obj
-            .get_mut("paneLinks")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            links.retain(|l| named(l.get("from")) && named(l.get("to")));
-        }
-    }
-    if !retention.links {
-        obj.remove("paneLinks");
-    }
-}
-
-/// Compile `code` and serialize the resulting diagnostics to JSON.
-///
-/// The web half of the dual-use diagnostics: the same `CompileError`s
-/// the terminal renders via ariadne, emitted as `{ "diagnostics": [...] }`.
-/// On a successful compile the array is empty (M1 has no warnings); on failure
-/// each error becomes a structured
-/// [`Diagnostic`](cambra::inspector_model::Diagnostic) — for inference errors
-/// carrying the source span resolved at the `compile_program` boundary, so the
-/// browser can underline the offending range exactly as the terminal does.
-///
-/// `name` is the program's display name (unused in the diagnostics payload
-/// today, but kept symmetric with [`snapshot_json`]'s signature).
-pub fn diagnose_json(ctx: &mut GlobalContext, code: &str, _name: &str) -> String {
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let diagnostics = match compile_program(ctx, code, consumer) {
-        Ok(_) => Vec::new(),
-        Err(errors) => diagnostics_from_compile_errors(&errors),
-    };
-    serde_json::to_string(&serde_json::json!({ "diagnostics": diagnostics }))
-        .expect("diagnostics payload serializes")
-}
-
-/// Shared test helpers: structural validators for the `/api/snapshot` wire
-/// shape — the Rust mirror of the frontend's `validateSnapshot`
-/// (`web/src/wireValidate.ts`). Asserting the wire contract in one place
-/// lets both the lib and `server` test modules reuse it (the cross-language
-/// twin of the TS validator, since the two cannot literally share code).
-///
-/// The validator is parameterized by a [`FixtureContext`]: the **live** contract
-/// (all three panes, `paneLinks` present) is the default; the **fixture** context
-/// additionally accepts a slimmed golden dump (a non-empty ordered pane subset,
-/// and an absent `paneLinks` meaning "elided for fixture slimming"). Slimming
-/// only ever relaxes the fixture path — the live wire contract is unchanged.
-#[cfg(test)]
-pub(crate) mod test_support {
+/// **Public, not `#[cfg(test)]`.** `tests/goldens.rs` is a separate crate
+/// linking the library as a consumer does, so a `#[cfg(test)]` item is
+/// invisible to it — and the committed golden corpus is the payload set that
+/// most needs validating, being the one the frontend reads. Gating this behind
+/// a feature instead would add a build configuration no CI pass compiles, which
+/// is the failure mode `ci_clippy_serde` and `ci_clippy_lib` exist to prevent.
+pub mod wire_check {
     use serde_json::Value;
 
-    /// Which contract a payload is validated against. The live wire always ships
-    /// the full pipeline; a committed fixture dump may be slimmed.
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    pub(crate) enum FixtureContext {
-        /// A live/served payload: every pane, `paneLinks` present.
-        Live,
-        /// A committed golden fixture: `panes` may be an ordered subset and
-        /// `paneLinks` may be absent (elided for slimming).
-        Fixture,
-    }
-
-    /// The pane ids, in upstream → downstream order — the exact pane list a live
-    /// successful payload ships as `panes` (a slimmed fixture retains an ordered
-    /// subset).
+    /// The pane ids, in upstream → downstream order — the exact pane list a
+    /// successful payload ships as `panes`.
     ///
     /// This is a **pin, not a derivation**: the producer builds its panes from
     /// the compiler's `PANES` table, so reading that table here would make the
@@ -235,9 +91,7 @@ pub(crate) mod test_support {
     /// post-inference on is fully typed (`"typed"`).
     const PANE_KINDS: [&str; 6] = ["holes", "typed", "typed", "typed", "typed", "typed"];
     /// The adjacent pane windows, in order — the exact `paneLinks` from/to
-    /// pairs a live successful payload ships (a slimmed fixture may retain an
-    /// ordered subset, or omit `paneLinks` entirely). One shorter than
-    /// [`PANE_IDS`].
+    /// pairs a successful payload ships. One shorter than [`PANE_IDS`].
     const PANE_WINDOWS: [(&str, &str); 5] = [
         ("pre-inference", "post-inference"),
         ("post-inference", "post-channelize"),
@@ -286,9 +140,9 @@ pub(crate) mod test_support {
 
     /// The `kind` a given pane id must carry (aligned with [`PANE_IDS`]).
     ///
-    /// A slimmed fixture holds a pane subset, so the kinds cannot be compared
-    /// positionally against [`PANE_KINDS`]; each retained pane is checked against
-    /// the kind its own id mandates instead.
+    /// Keyed by id rather than by position, so a pane list that is right in
+    /// content and wrong in order fails on the order rather than reading a
+    /// neighbour's kind.
     fn kind_for(id: &str) -> &'static str {
         let i = PANE_IDS
             .iter()
@@ -297,8 +151,8 @@ pub(crate) mod test_support {
         PANE_KINDS[i]
     }
 
-    /// Assert `v` is a structurally-valid **successful** `/api/snapshot` payload
-    /// under `ctx`.
+    /// Assert `v` is a structurally-valid **successful** `/api/snapshot`
+    /// payload.
     ///
     /// Pins the full pane contract: the retired top-level `ir`/`spanIndex`
     /// absent, the panes in pipeline order with their kinds, each pane's node
@@ -308,12 +162,7 @@ pub(crate) mod test_support {
     /// legal), and every node's `rewritten` tag in the observed vocabulary.
     /// Panics naming the offending path otherwise. Does not assert
     /// program-specific content — that is each caller's job.
-    ///
-    /// [`FixtureContext::Live`] pins the full pipeline (every pane, `paneLinks`
-    /// present); [`FixtureContext::Fixture`] additionally accepts a slimmed
-    /// golden dump (a non-empty ordered pane subset, and an absent `paneLinks`
-    /// meaning "elided for slimming").
-    pub(crate) fn assert_snapshot_shape(v: &Value, ctx: FixtureContext) {
+    pub fn assert_snapshot_shape(v: &Value) {
         assert_common_shape(v);
 
         // An earlier wire retired the legacy top-level `ir`/`spanIndex` (byte-for-byte
@@ -325,28 +174,17 @@ pub(crate) mod test_support {
             "the wire has no top-level spanIndex"
         );
 
-        // The panes, in pipeline order, with their kinds. Live: exactly the
-        // declared list. Fixture: a non-empty, in-pipeline-order subset (fixture
-        // slimming may drop panes).
+        // The panes, in pipeline order, with their kinds.
         let panes = v["panes"].as_array().expect("panes is an array");
         let ids: Vec<&str> = panes
             .iter()
             .map(|s| s["id"].as_str().expect("pane id is a string"))
             .collect();
-        match ctx {
-            FixtureContext::Live => assert_eq!(
-                ids, PANE_IDS,
-                "panes are the pipeline panes in upstream → downstream order"
-            ),
-            FixtureContext::Fixture => {
-                assert!(!ids.is_empty(), "a slimmed fixture retains ≥1 pane");
-                assert!(
-                    is_ordered_subsequence(&ids, &PANE_IDS),
-                    "slimmed panes {ids:?} are a non-empty subset of {PANE_IDS:?} in order"
-                );
-            }
-        }
-        // Each retained pane carries the kind its id mandates (subset-safe).
+        assert_eq!(
+            ids, PANE_IDS,
+            "panes are the pipeline panes in upstream → downstream order"
+        );
+        // Each pane carries the kind its id mandates.
         for (i, pane) in panes.iter().enumerate() {
             let id = pane["id"].as_str().expect("pane id is a string");
             let kind = pane["kind"].as_str().expect("pane kind is a string");
@@ -368,19 +206,9 @@ pub(crate) mod test_support {
             );
         }
 
-        // paneLinks. Live: always present. Fixture: may be *absent* (elided for
-        // slimming) — but if present, still validated.
-        let links = match v.get("paneLinks") {
-            None => {
-                assert_eq!(
-                    ctx,
-                    FixtureContext::Fixture,
-                    "paneLinks is absent — only a slimmed fixture may elide it"
-                );
-                return;
-            }
-            Some(l) => l.as_array().expect("paneLinks is an array"),
-        };
+        let links = v["paneLinks"]
+            .as_array()
+            .expect("paneLinks is present and an array");
 
         // The live node-id set per pane, keyed by pane id, for endpoint-liveness
         // checks on the pane links below.
@@ -403,17 +231,11 @@ pub(crate) mod test_support {
                 )
             })
             .collect();
-        match ctx {
-            FixtureContext::Live => assert_eq!(
-                windows,
-                PANE_WINDOWS.to_vec(),
-                "paneLinks are the adjacent pane windows in pipeline order"
-            ),
-            FixtureContext::Fixture => assert!(
-                is_ordered_subsequence(&windows, &PANE_WINDOWS),
-                "slimmed paneLinks {windows:?} are a subset of {PANE_WINDOWS:?} in order"
-            ),
-        }
+        assert_eq!(
+            windows,
+            PANE_WINDOWS.to_vec(),
+            "paneLinks are the adjacent pane windows in pipeline order"
+        );
         for (i, link) in links.iter().enumerate() {
             let at = format!("paneLinks[{i}]");
             let (from, to) = windows[i];
@@ -447,19 +269,11 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Is `sub` a subsequence of `full` (same relative order, gaps allowed)?
-    /// Used to accept a slimmed fixture's pane / window subset.
-    fn is_ordered_subsequence<T: PartialEq>(sub: &[T], full: &[T]) -> bool {
-        let mut it = full.iter();
-        sub.iter().all(|x| it.any(|y| y == x))
-    }
-
     /// Assert `v` is a structurally-valid **degraded** payload: the
     /// retired top-level `ir`/`spanIndex` absent, empty `panes`/`paneLinks`,
-    /// `payloadKind: "failed"`. A degraded payload always ships an (empty but
-    /// present) `paneLinks` array — only a slimmed *success* fixture ever omits
-    /// the field.
-    pub(crate) fn assert_degraded_snapshot_shape(v: &Value) {
+    /// `payloadKind: "failed"`. `paneLinks` is empty but present: no payload
+    /// ever omits the field.
+    pub fn assert_degraded_snapshot_shape(v: &Value) {
         assert_common_shape(v);
         assert!(v.get("ir").is_none(), "the wire has no top-level ir");
         assert!(
@@ -660,19 +474,20 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{FixtureContext, assert_snapshot_shape};
+    use super::wire_check::assert_snapshot_shape;
     use super::*;
     use cambra::ccl::context::{GlobalContext, compile_program};
 
     use cambra::interpreter::Consumer;
+    use indoc::indoc;
     use serde_json::Value;
 
-    const PROG: &str = "\
-g = 10
-def f(p, q):
-  p + q + g
-f(1, 2)
-";
+    const PROG: &str = indoc! {r#"
+        g = 10
+        def f(p, q):
+          p + q + g
+        f(1, 2)
+    "#};
 
     /// Compile `code` and parse its `/api/snapshot` JSON back to a `Value`.
     fn snapshot_value(code: &str, name: &str) -> Value {
@@ -687,75 +502,7 @@ f(1, 2)
     /// focused tests below.
     #[test]
     fn snapshot_json_is_structurally_valid() {
-        assert_snapshot_shape(&snapshot_value(PROG, "prog.chl"), FixtureContext::Live);
-    }
-
-    /// A slimmed fixture dump — a pane subset with `paneLinks` elided — omits
-    /// `paneLinks`, keeps every retained pane's own node table and `spanIndex`,
-    /// and validates under the fixture context (the live contract rejects the
-    /// subset). Exercises both `prune_for_fixture` and the validator relaxation.
-    #[test]
-    fn slimmed_fixture_payload_validates_in_fixture_context() {
-        let mut ctx = GlobalContext::default();
-        let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, PROG, consumer).expect("program compiles");
-        let retention = FixtureRetention {
-            panes: Some(vec![
-                "post-inference".to_string(),
-                "post-channelize".to_string(),
-            ]),
-            links: false,
-        };
-        let json = snapshot_json_pretty(&compiled, "prog.chl", &retention);
-        let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
-        let panes = v["panes"].as_array().expect("panes array");
-        assert_eq!(
-            panes.iter().map(|p| &p["id"]).collect::<Vec<_>>(),
-            vec!["post-inference", "post-channelize"],
-            "the pane subset retained exactly the two named panes, in pipeline order"
-        );
-        assert!(v.get("paneLinks").is_none(), "elided paneLinks is absent");
-        // Slimming drops panes and links; it never touches what a retained pane
-        // says about itself.
-        assert!(
-            panes[0]["nodes"]
-                .as_array()
-                .expect("nodes array")
-                .iter()
-                .any(|n| !n["spans"].as_array().expect("spans array").is_empty()),
-            "a retained pane keeps its nodes' own spans"
-        );
-        assert_snapshot_shape(&v, FixtureContext::Fixture);
-    }
-
-    /// A pane subset that keeps `paneLinks` drops the windows naming a dropped
-    /// pane, rather than shipping an edge into a pane the fixture no longer
-    /// holds.
-    #[test]
-    fn a_pane_subset_drops_the_windows_naming_a_dropped_pane() {
-        let mut ctx = GlobalContext::default();
-        let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, PROG, consumer).expect("program compiles");
-        let retention = FixtureRetention {
-            panes: Some(vec![
-                "post-inference".to_string(),
-                "post-channelize".to_string(),
-            ]),
-            links: true,
-        };
-        let json = snapshot_json_pretty(&compiled, "prog.chl", &retention);
-        let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
-        assert_eq!(
-            v["paneLinks"]
-                .as_array()
-                .expect("paneLinks array")
-                .iter()
-                .map(|l| (l["from"].as_str().unwrap(), l["to"].as_str().unwrap()))
-                .collect::<Vec<_>>(),
-            vec![("post-inference", "post-channelize")],
-            "only the window whose both endpoints survive is retained"
-        );
-        assert_snapshot_shape(&v, FixtureContext::Fixture);
+        assert_snapshot_shape(&snapshot_value(PROG, "prog.chl"));
     }
 
     /// meta seams + source round-trip + empty M1 diagnostics.
@@ -795,44 +542,6 @@ f(1, 2)
         assert!(
             g_def["defSpan"]["start"].is_number(),
             "definition carries a defSpan {{start,end}}"
-        );
-    }
-
-    /// The two `render_pretty` paths agree byte-for-byte on a full payload.
-    ///
-    /// The slimmed path round-trips through `serde_json::Value`, which is only
-    /// byte-safe because this crate enables `serde_json/preserve_order`. Without
-    /// that feature a `Value` sorts its keys and every slimmed fixture would
-    /// differ from an unslimmed one in field order alone. Pinning the agreement
-    /// here is what makes the feature load-bearing rather than incidental.
-    #[test]
-    fn both_render_paths_agree_on_a_full_payload() {
-        let mut ctx = GlobalContext::default();
-        let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, PROG, consumer).expect("program compiles");
-        let payload =
-            cambra::inspector_model::InspectedProgram::new(&compiled).build_payload("prog.chl");
-        // `panes: Some(every id)` is not the full wire by `is_full`, so it takes
-        // the Value path while pruning nothing.
-        let every_pane = FixtureRetention {
-            panes: Some(
-                payload
-                    .panes
-                    .iter()
-                    .map(|p| p.id.to_string())
-                    .collect::<Vec<_>>(),
-            ),
-            links: true,
-        };
-        assert!(
-            !every_pane.is_full(),
-            "the Value path is the one under test"
-        );
-        assert_eq!(
-            render_pretty(&payload, &FixtureRetention::FULL),
-            render_pretty(&payload, &every_pane),
-            "the direct and Value render paths disagree — serde_json/preserve_order \
-             is missing or a field order changed"
         );
     }
 
@@ -934,12 +643,12 @@ f(1, 2)
     /// produces non-identity cross-pane edges alongside the dense self-edges.
     #[test]
     fn pane_links_edges_non_empty_for_polymorphic_program() {
-        let code = "\
-dup = \\x -> (x, x)
-a = dup(1)
-b = dup(2 == 2)
-a
-";
+        let code = indoc! {r#"
+            dup = \x -> (x, x)
+            a = dup(1)
+            b = dup(2 == 2)
+            a
+        "#};
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
@@ -975,12 +684,12 @@ a
     /// second window would ship identity-only, i.e. empty edges).
     #[test]
     fn pane_links_inline_fanout_edges_non_empty_for_udf_program() {
-        let code = "\
-add1 = \\x -> x + 1
-a = add1(10)
-b = add1(20)
-a + b
-";
+        let code = indoc! {r#"
+            add1 = \x -> x + 1
+            a = add1(10)
+            b = add1(20)
+            a + b
+        "#};
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
@@ -1028,64 +737,5 @@ a + b
                 "edges[{i}] downstream id {d} is a node in the post-channelize pane"
             );
         }
-    }
-
-    /// Web dual-use: a program with a type error yields a non-empty
-    /// `diagnostics` array, each entry structured `{severity, stage, message,
-    /// span:{start,end}}`. The infer diagnostic carries the span
-    /// resolved at the `compile_program` boundary — the same span the terminal
-    /// underlines — proving one `resolve`, two consumers.
-    #[test]
-    fn diagnose_json_emits_structured_infer_diagnostic() {
-        let code = "1 and 2\n";
-        let mut ctx = GlobalContext::default();
-        let json = diagnose_json(&mut ctx, code, "prog.chl");
-        let v: Value = serde_json::from_str(&json).expect("diagnostics JSON is valid");
-
-        let diags = v["diagnostics"]
-            .as_array()
-            .expect("diagnostics is an array");
-        assert!(!diags.is_empty(), "a type error produces diagnostics");
-
-        let infer = diags
-            .iter()
-            .find(|d| d["stage"] == "infer")
-            .expect("an infer diagnostic is present");
-        assert_eq!(infer["severity"], "error");
-        assert!(
-            infer["message"].as_str().is_some_and(|m| !m.is_empty()),
-            "the diagnostic carries a non-empty message"
-        );
-
-        // span resolves to the offending source range (the `1 and 2` expression).
-        let start = infer["span"]["start"].as_u64().expect("span.start");
-        let end = infer["span"]["end"].as_u64().expect("span.end");
-        assert!(start < end, "span is a non-empty range, got {start}..{end}");
-        let pointed = &code[start as usize..end as usize];
-        assert!(
-            pointed.contains("and"),
-            "span {start}..{end} covers the offending expression, points at {pointed:?}"
-        );
-
-        // The span is the whole of what a consumer underlines: a diagnostic is
-        // built from one error, so a label list could only repeat it.
-        assert!(
-            infer.get("labels").is_none(),
-            "a diagnostic ships no labels array"
-        );
-    }
-
-    /// A successful compile yields an empty `diagnostics` array (M1 has no
-    /// warnings) — the standalone diagnostics endpoint's success shape.
-    #[test]
-    fn diagnose_json_empty_on_success() {
-        let code = "1 + 2\n";
-        let mut ctx = GlobalContext::default();
-        let json = diagnose_json(&mut ctx, code, "prog.chl");
-        let v: Value = serde_json::from_str(&json).expect("diagnostics JSON is valid");
-        assert!(
-            v["diagnostics"].as_array().expect("array").is_empty(),
-            "a clean compile has no diagnostics"
-        );
     }
 }

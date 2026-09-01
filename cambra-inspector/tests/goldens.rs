@@ -10,7 +10,7 @@
 //! advanced and can never byte-match — which is also why `regen-fixtures.sh`
 //! invokes the CLI once per fixture.
 //!
-//! Three ratchets, coarsest backstop of the provenance test stack (semantic
+//! Four ratchets, coarsest backstop of the provenance test stack (semantic
 //! unit tests state intent; the boundary invariants enforce error classes;
 //! these catch everything-composed drift):
 //! 1. every corpus dump is cross-process deterministic (two spawns,
@@ -18,42 +18,26 @@
 //! 2. every committed fixture equals a fresh dump of its program
 //!    (content-level; the ci.sh `ci_fixtures` gate does the byte-level file
 //!    diff through `regen-fixtures.sh`);
-//! 3. the corpus programs still trigger the passes they were chosen to pin.
+//! 3. every committed fixture is a structurally-valid payload, not merely one
+//!    that equals a fresh dump of itself;
+//! 4. the corpus programs still trigger the passes they were chosen to pin.
+//!
+//! Two programs — `txn_multi_read` and `mutation_loop` — are in the corpus
+//! without a committed fixture. Their payloads run to five figures of lines
+//! each, which is a document nobody reads and a re-bless nobody can review, so
+//! what they are here for is asserted structurally over a fresh dump instead:
+//! the dense channelize window, and the `Transact`/`Letrec` rewrite tags that
+//! reach the wire from no other program.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
 
-/// One corpus row: the fixture basename, the example-program basename, and the
-/// optional fixture-slimming retention spec (`panes=…`, `links=none`) parsed
-/// from the manifest. The retention is applied to the fresh `--dump-snapshot`
-/// so a fresh dump byte-matches the (slimmed) committed fixture; the LIVE wire
-/// is never slimmed (see `scripts/fixtures.manifest`).
+/// One corpus row: the fixture basename and the example-program basename.
 struct CorpusEntry {
     fixture: String,
     example: String,
-    /// `--panes` comma-list, or `None` for all panes.
-    panes: Option<String>,
-    /// `true` ⇒ pass `--elide-pane-links` (omit `paneLinks` from the fixture).
-    elide_pane_links: bool,
-}
-
-impl CorpusEntry {
-    /// The `--dump-snapshot` flags this row's retention spec implies (empty for
-    /// a full-wire row). Shared by every fresh dump of a slimmed fixture so it
-    /// stays byte-identical to the committed copy.
-    fn dump_flags(&self) -> Vec<String> {
-        let mut flags = Vec::new();
-        if let Some(panes) = &self.panes {
-            flags.push("--panes".to_string());
-            flags.push(panes.clone());
-        }
-        if self.elide_pane_links {
-            flags.push("--elide-pane-links".to_string());
-        }
-        flags
-    }
 }
 
 /// The `cambra/` repo root (the parent of this crate's manifest dir) — the
@@ -68,10 +52,9 @@ fn repo_root() -> PathBuf {
 }
 
 /// Parse `scripts/fixtures.manifest` — the corpus's single source of truth,
-/// shared with `regen-fixtures.sh`. Lines are
-/// `<fixture> <example> [panes=<comma-list>|all] [links=all|none]`; `#`
-/// comments and blank lines are skipped. The retention tokens are parsed with
-/// the SAME grammar `regen-fixtures.sh` uses, so the two never disagree.
+/// shared with `regen-fixtures.sh`. A row is `<fixture> <example>`; `#`
+/// comments and blank lines are skipped. Two words and nothing else, so the
+/// shell parser and this one have no grammar to disagree about.
 fn corpus() -> Vec<CorpusEntry> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures.manifest");
     let text = std::fs::read_to_string(&path)
@@ -86,23 +69,13 @@ fn corpus() -> Vec<CorpusEntry> {
             let example = parts
                 .next()
                 .unwrap_or_else(|| panic!("manifest line {l:?} lacks an example name"));
-            let mut panes = None;
-            let mut elide_pane_links = false;
-            for tok in parts {
-                match tok {
-                    "panes=all" | "links=all" => {}
-                    "links=none" => elide_pane_links = true,
-                    _ if tok.starts_with("panes=") => {
-                        panes = Some(tok["panes=".len()..].to_string());
-                    }
-                    _ => panic!("manifest line {l:?} has unknown retention token {tok:?}"),
-                }
-            }
+            assert!(
+                parts.next().is_none(),
+                "manifest line {l:?} has more than a fixture and an example"
+            );
             CorpusEntry {
                 fixture: fixture.to_string(),
                 example: example.to_string(),
-                panes,
-                elide_pane_links,
             }
         })
         .collect();
@@ -110,16 +83,13 @@ fn corpus() -> Vec<CorpusEntry> {
     entries
 }
 
-/// Run `cambra-inspector <example>.chl --dump-snapshot [flags]` as a fresh
-/// process and return its raw stdout. With `flags` = the row's retention this is
-/// exactly what `regen-fixtures.sh` pipes into a fixture (before pretty-printing).
-fn dump_with(example: &str, flags: &[String]) -> Vec<u8> {
+/// Run `cambra-inspector <example>.chl --dump-snapshot` as a fresh process and
+/// return its raw stdout — exactly what `regen-fixtures.sh` writes to a fixture.
+fn dump(example: &str) -> Vec<u8> {
     let prog = format!("cambra-inspector/examples/{example}.chl");
-    let mut args = vec![prog, "--dump-snapshot".to_string()];
-    args.extend(flags.iter().cloned());
     let output = Command::new(env!("CARGO_BIN_EXE_cambra-inspector"))
         .current_dir(repo_root())
-        .args(&args)
+        .args([prog.as_str(), "--dump-snapshot"])
         .output()
         .expect("the cambra-inspector binary spawns");
     assert!(
@@ -128,13 +98,6 @@ fn dump_with(example: &str, flags: &[String]) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
-}
-
-/// A full-wire dump (no slimming flags) — the live payload shape. Used by the
-/// structural assertions, which run against the whole `paneLinks` graph even
-/// when the committed fixture elides it.
-fn dump(example: &str) -> Vec<u8> {
-    dump_with(example, &[])
 }
 
 /// The determinism self-check the golden fixtures depend on: dumping the same
@@ -149,14 +112,27 @@ fn dump(example: &str) -> Vec<u8> {
 #[test]
 fn snapshot_dumps_are_cross_process_deterministic() {
     for entry in corpus() {
-        let flags = entry.dump_flags();
-        let first = dump_with(&entry.example, &flags);
-        let second = dump_with(&entry.example, &flags);
+        assert_dumps_agree(&entry.example);
+    }
+    // The two programs whose payloads are too large to commit (see
+    // `assert_dense_window_sanity`) are the heaviest synthesis in the corpus and
+    // so the likeliest to expose hash-iteration-ordered minting — exactly what
+    // this test exists to catch. They carry no fixture, so the manifest loop
+    // above does not reach them.
+    assert_dumps_agree("txn_multi_read");
+    assert_dumps_agree("mutation_loop");
+}
+
+/// Two spawns of one program produce byte-identical dumps.
+fn assert_dumps_agree(example: &str) {
+    {
+        let first = dump(example);
+        let second = dump(example);
         if first != second {
             // Preserve both dumps for diffing before panicking.
             let dir = std::env::temp_dir();
-            let a = dir.join(format!("{}.dump1.json", entry.example));
-            let b = dir.join(format!("{}.dump2.json", entry.example));
+            let a = dir.join(format!("{example}.dump1.json"));
+            let b = dir.join(format!("{example}.dump2.json"));
             std::fs::write(&a, &first).expect("writing first dump");
             std::fs::write(&b, &second).expect("writing second dump");
             let diff_at = first
@@ -165,11 +141,11 @@ fn snapshot_dumps_are_cross_process_deterministic() {
                 .position(|(x, y)| x != y)
                 .unwrap_or_else(|| first.len().min(second.len()));
             panic!(
-                "--dump-snapshot for {} is NOT cross-process deterministic \
+                "--dump-snapshot for {example} is NOT cross-process deterministic \
                  (first difference at byte {diff_at}; dumps preserved at {} and {}). \
                  Golden fixtures cannot be blessed until the nondeterminism source \
-                 is fixed — see the test doc comment for the first suspects.",
-                entry.example,
+                 is fixed — see `snapshot_dumps_are_cross_process_deterministic` \
+                 for the first suspects.",
                 a.display(),
                 b.display()
             );
@@ -252,9 +228,7 @@ fn committed_fixtures_match_fresh_dumps() {
         let committed: Value = serde_json::from_str(&committed)
             .unwrap_or_else(|e| panic!("{} is valid JSON: {e}", fixture_path.display()));
 
-        // Apply the row's retention flags so a slimmed fixture's fresh dump
-        // matches its (slimmed) committed copy byte-for-byte.
-        let raw = dump_with(&entry.example, &entry.dump_flags());
+        let raw = dump(&entry.example);
         let fresh: Value = serde_json::from_slice(&raw)
             .unwrap_or_else(|e| panic!("dump for {} is valid JSON: {e}", entry.example));
 
@@ -314,16 +288,14 @@ fn pane_node_ids(pane: &Value) -> std::collections::HashSet<u64> {
         .collect()
 }
 
-/// Dense-window sanity over a FULL (unpruned) dump's
-/// `post-inference → post-channelize` window — the structural bug-catcher that
-/// replaces the pinned edge bytes for the pane-slimmed fixtures (`txn_multi_read`,
-/// `mutation_loop`, whose committed goldens elide `paneLinks`). Mirrors the
-/// `udf_fanout` fan-out pattern, strengthened to the properties the pinned bytes
-/// used to guarantee: (a) the window carries genuine non-identity edges, (b) some
-/// upstream node fans out to ≥2 downstream nodes (the substitution copies these
-/// programs were chosen to exercise), and (c) every edge endpoint is a live node
-/// in its pane. Runs against the full dump precisely because the fixture no
-/// longer ships the edges.
+/// Dense-window sanity over a dump's `post-inference → post-channelize` window
+/// — the structural bug-catcher that stands in for a committed fixture on the
+/// two programs whose payloads are too large to commit (`txn_multi_read`,
+/// `mutation_loop`). Mirrors the `udf_fanout` fan-out pattern, strengthened to
+/// what a pinned document would have guaranteed: (a) the window carries genuine
+/// non-identity edges, (b) some upstream node fans out to ≥2 downstream nodes
+/// (the substitution copies these programs were chosen to exercise), and (c)
+/// every edge endpoint is a live node in its pane.
 fn assert_dense_window_sanity(example: &str) {
     let raw = dump(example); // full wire — the slimmed fixture omits paneLinks
     let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
@@ -375,16 +347,77 @@ fn assert_dense_window_sanity(example: &str) {
     );
 }
 
-/// `txn_multi_read` (pane-slimmed; its committed fixture omits `paneLinks`)
-/// still exercises the dense channelize-window fan-out structurally.
+/// `txn_multi_read` (no committed fixture) exercises the dense channelize-window
+/// fan-out structurally.
 #[test]
 fn txn_multi_read_produces_dense_channelize_window() {
     assert_dense_window_sanity("txn_multi_read");
 }
 
-/// `mutation_loop` (pane-slimmed; its committed fixture omits `paneLinks`)
-/// still exercises the dense channelize-window fan-out structurally.
+/// `mutation_loop` (no committed fixture) exercises the dense channelize-window
+/// fan-out structurally.
 #[test]
 fn mutation_loop_produces_dense_channelize_window() {
     assert_dense_window_sanity("mutation_loop");
+}
+
+/// Every `rewritten.via` a pane of `dump` carries.
+fn dump_vias(example: &str) -> std::collections::HashSet<String> {
+    let raw = dump(example);
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let mut out = std::collections::HashSet::new();
+    for pane in v["panes"].as_array().expect("panes is an array") {
+        for node in pane["nodes"].as_array().expect("nodes is an array") {
+            if let Some(via) = node["rewritten"]["via"].as_str() {
+                out.insert(via.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The two mutability-elimination phases reach the wire, and only these two
+/// programs put them there.
+///
+/// Both validators pin a `rewritten.via` allowlist. An allowlist rejects a
+/// *new* via on its own, but says nothing when a pinned entry stops being
+/// produced — so a `Transact` or `Letrec` that vanished from the wire, or was
+/// renamed, would leave a dead entry in two vocabularies and fail nothing.
+/// Asserting presence is what an allowlist cannot do.
+#[test]
+fn the_recurrence_phases_reach_the_wire() {
+    let txn = dump_vias("txn_multi_read");
+    assert!(
+        txn.contains("Transact"),
+        "txn_multi_read is the only program that tags nodes `Transact`; got {txn:?}"
+    );
+    let loop_vias = dump_vias("mutation_loop");
+    assert!(
+        loop_vias.contains("Letrec"),
+        "mutation_loop is the only program that tags nodes `Letrec`; got {loop_vias:?}"
+    );
+}
+
+/// RT-1b — every committed fixture is a structurally-valid payload.
+///
+/// The byte comparison above cannot see a *wrongly built* dump: a bad dump
+/// equals a fresh copy of itself, so committed == fresh holds and the fixture
+/// still reaches the frontend. This is the check that reads the document
+/// instead of comparing it, and it runs here rather than in the lib's own tests
+/// because these files are what the frontend actually loads.
+#[test]
+fn committed_fixtures_are_structurally_valid() {
+    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/__fixtures__");
+    for entry in corpus() {
+        let path = fixtures_dir.join(format!("{}.snapshot.json", entry.fixture));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let v: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} is valid JSON: {e}", path.display()));
+        if v["meta"]["payloadKind"] == "failed" {
+            cambra_inspector::wire_check::assert_degraded_snapshot_shape(&v);
+        } else {
+            cambra_inspector::wire_check::assert_snapshot_shape(&v);
+        }
+    }
 }

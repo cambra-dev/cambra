@@ -6,19 +6,23 @@
 //! per-request recompilation, no mutation endpoint, no live ticks — M1 is "the
 //! program, no execution".
 //!
-//! This is a *sibling* of [`crate::web_inspector`](cambra)'s internal dev
-//! dashboard, not an extension of it: that one serves live runtime state on a
-//! background thread; this one serves the read-only post-inference snapshot to
-//! the embedded CodeMirror frontend. They share only the `tiny_http` idiom.
+//! This is a *sibling* of [`cambra::web_inspector`]'s internal dev dashboard,
+//! not an extension of it: that one serves live runtime state on a background
+//! thread; this one serves the read-only payload — one pane per pipeline stage
+//! — to the embedded CodeMirror frontend. They share only the `tiny_http`
+//! idiom.
 //!
 //! # Routes
 //!
 //! - `GET /api/snapshot` — the [`snapshot_json`](crate::snapshot_json) body on a
 //!   successful compile; a **degraded** JSON body on compile failure (see below).
 //!   `application/json`.
-//! - `GET /api/diagnostics` — the [`diagnose_json`](crate::diagnose_json) body
+//! - `GET /api/diagnostics` — [`diagnostics_body`]
 //!   (`{"diagnostics":[]}` on success, structured diagnostics on failure).
 //!   `application/json`.
+//!
+//! Both bodies come from [`build_bodies`]' single compile, so the diagnostics
+//! the two routes report can never disagree.
 //! - anything else — `404 Not Found`. The frontend's own route lands with the
 //!   frontend.
 //!
@@ -40,7 +44,7 @@ use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use cambra::interpreter::Consumer;
 
-use crate::{FixtureRetention, snapshot_json, snapshot_json_pretty};
+use crate::{snapshot_json, snapshot_json_pretty};
 
 /// The pre-rendered response bodies for the one static program.
 ///
@@ -91,56 +95,31 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
         .expect("degraded snapshot payload serializes")
 }
 
-fn degraded_snapshot_json_pretty(
-    name: &str,
-    code: &str,
-    diagnostics: Vec<Diagnostic>,
-    retention: &FixtureRetention,
-) -> String {
-    crate::render_pretty(
-        &InspectorPayload::degraded(name, code, diagnostics),
-        retention,
-    )
-}
-
-/// Compile `code` once and return the `/api/snapshot` body — the full payload
-/// on success, the degraded form (source + diagnostics, no panes) on failure.
-///
-/// This is the compact form the HTTP route serves; `--dump-snapshot` calls
-/// [`snapshot_body_pretty`] instead, so the committed fixtures stay reviewable.
-pub fn snapshot_body(code: &str, name: &str) -> String {
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    match compile_program(&mut ctx, code, consumer) {
-        Ok(compiled) => snapshot_json(&compiled, name),
-        Err(errors) => degraded_snapshot_json(name, code, diagnostics_from_compile_errors(&errors)),
-    }
-}
-
-/// Pretty-printed [`snapshot_body`] — what `--dump-snapshot` prints, and
-/// therefore the exact bytes of the committed golden fixtures (see
-/// [`crate::snapshot_json_pretty`] for why the binary owns this format).
+/// Compile `code` once and return the pretty-printed `/api/snapshot` body —
+/// what `--dump-snapshot` prints, and therefore the exact bytes of the
+/// committed golden fixtures (see [`crate::snapshot_json_pretty`] for why the
+/// binary owns this format). The degraded form (source + diagnostics, no panes)
+/// on a compile failure, as the route serves.
 ///
 /// One-shot and exits: this regenerates the frontend's golden test fixtures
 /// **without** standing up the never-exiting HTTP server (see
 /// `web/src/__fixtures__/`). The HTTP route keeps the compact form.
-///
-/// `retention` slims the committed fixture on the big/volatile corpus programs
-/// (pane subset and/or elided `paneLinks`). Pass [`FixtureRetention::FULL`] for
-/// the whole wire — the default `--dump-snapshot` and every live path do.
-pub fn snapshot_body_pretty(code: &str, name: &str, retention: &FixtureRetention) -> String {
+pub fn snapshot_body_pretty(code: &str, name: &str) -> String {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
-        Ok(compiled) => snapshot_json_pretty(&compiled, name, retention),
-        Err(errors) => degraded_snapshot_json_pretty(
+        Ok(compiled) => snapshot_json_pretty(&compiled, name),
+        Err(errors) => serde_json::to_string_pretty(&InspectorPayload::degraded(
             name,
             code,
             diagnostics_from_compile_errors(&errors),
-            retention,
-        ),
+        ))
+        .expect("degraded snapshot payload serializes"),
     }
 }
+
+/// The 404 body, as bytes so it types the same as a served body.
+const NOT_FOUND: &[u8] = b"Not Found";
 
 fn json_header() -> tiny_http::Header {
     "Content-Type: application/json"
@@ -154,26 +133,39 @@ fn text_header() -> tiny_http::Header {
         .expect("static header parses")
 }
 
-/// Compile `code` once and serve it over HTTP on `0.0.0.0:port` until the process
-/// is killed. Blocks the calling thread (this is the binary's main loop).
+/// Compile `code` once and serve it over HTTP on `127.0.0.1:port` until the
+/// process is killed. Blocks the calling thread (this is the binary's main
+/// loop).
+///
+/// Loopback, not `0.0.0.0`: the payload is the user's source text and the whole
+/// compiler IR for it, and this is a local development tool. Reaching it from
+/// another host is a port-forward.
 pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
     let bodies = build_bodies(code, name);
-    let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
+    let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
     eprintln!("cambra-inspector serving {name} at http://localhost:{port}");
 
     for request in server.incoming_requests() {
-        let response = match request.url() {
-            "/api/snapshot" => {
-                tiny_http::Response::from_string(bodies.snapshot.clone()).with_header(json_header())
-            }
-            "/api/diagnostics" => tiny_http::Response::from_string(bodies.diagnostics.clone())
-                .with_header(json_header()),
-            _ => tiny_http::Response::from_string("Not Found")
-                .with_status_code(404)
-                .with_header(text_header()),
+        // `bodies` outlives the loop, so a response borrows it: the snapshot is
+        // megabytes on a large program and every request would otherwise copy it.
+        let (body, status, header) = match request.url() {
+            "/api/snapshot" => (bodies.snapshot.as_bytes(), 200, json_header()),
+            "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
+            _ => (NOT_FOUND, 404, text_header()),
         };
-        let _ = request.respond(response);
+        let response = tiny_http::Response::new(
+            tiny_http::StatusCode(status),
+            vec![header],
+            body,
+            Some(body.len()),
+            None,
+        );
+        if let Err(e) = request.respond(response) {
+            // A client that hung up mid-response is routine; the next request is
+            // unaffected, so this reports rather than stops.
+            eprintln!("cambra-inspector: responding failed: {e}");
+        }
     }
     Ok(())
 }
@@ -181,9 +173,7 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        FixtureContext, assert_degraded_snapshot_shape, assert_snapshot_shape,
-    };
+    use crate::wire_check::{assert_degraded_snapshot_shape, assert_snapshot_shape};
     use serde_json::Value;
 
     /// A valid program's snapshot body is the full payload: a node table per
@@ -195,7 +185,7 @@ mod tests {
         let bodies = build_bodies("1 + 2\n", "prog.chl");
         let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
 
-        assert_snapshot_shape(&v, FixtureContext::Live);
+        assert_snapshot_shape(&v);
         let anchor = v["panes"]
             .as_array()
             .expect("panes is an array")

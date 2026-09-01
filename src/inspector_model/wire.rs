@@ -38,11 +38,11 @@
 //!   fully populated.
 //! * `diagnostics` — **always empty `[]`** in this payload: a `/api/snapshot`
 //!   describes a *successfully compiled* program, and there are no warnings. The
-//!   wire type ([`Diagnostic`]) drives the standalone compile-failure path
-//!   (`cambra-inspector::diagnose_json`); a failed compile instead flows
-//!   through [`InspectorPayload::degraded`], which carries the same
-//!   diagnostics in place of a real snapshot (see `cambra-inspector::server`'s
-//!   "Transport decision" note).
+//!   wire type ([`Diagnostic`]) drives the compile-failure path instead: a
+//!   failed compile flows through [`InspectorPayload::degraded`], which carries
+//!   the diagnostics in place of a real snapshot, and `/api/diagnostics` serves
+//!   the same array (see `cambra-inspector::server`'s "Transport decision"
+//!   note).
 //! * `outline` and `meta.tick` — **omitted**. Rather than ship an empty stub of
 //!   an undecided shape, or a `null` reserved for a live layer that does not
 //!   exist, a field stays off the wire until something reads it.
@@ -247,8 +247,8 @@ pub struct DefinitionEntry {
 /// [`Diagnostic::from_compile_error`] / [`diagnostics_from_compile_errors`].
 ///
 /// `diagnostics` on [`InspectorPayload`] stays `[]` for *successful* compiles
-/// (no warnings); these are produced on the compile-failure path by the
-/// standalone `diagnose_json` entry, not by `build_payload`.
+/// (no warnings); these are produced on the compile-failure path, not by
+/// `build_payload`.
 ///
 /// [`CompileError`]: crate::ccl::context::CompileError
 #[derive(Clone, Debug)]

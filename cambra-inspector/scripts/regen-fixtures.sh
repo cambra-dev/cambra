@@ -12,7 +12,8 @@
 #
 # The corpus (fixture -> example mapping) lives in fixtures.manifest next to
 # this script — shared with the cargo golden tests (tests/goldens.rs) so the
-# regen path and the tests can never disagree about the corpus.
+# regen path and the tests can never disagree about the corpus. A row is two
+# words and nothing else, so the two parsers have nothing to disagree about.
 #
 # Usage: cambra-inspector/scripts/regen-fixtures.sh [output-dir]
 #
@@ -27,29 +28,16 @@ MANIFEST="cambra-inspector/scripts/fixtures.manifest"
 FIX="${1:-cambra-inspector/web/src/__fixtures__}"
 mkdir -p "${FIX}"
 
-while read -r name example rest; do
+while read -r name example; do
   # Skip blank lines and comments.
   if [[ -z ${name} || ${name} == \#* ]]; then continue; fi
+  if [[ -z ${example} ]]; then
+    echo "regen-fixtures.sh: manifest row '${name}' names no example program" >&2
+    exit 1
+  fi
   prog="cambra-inspector/examples/${example}.chl"
   out="${FIX}/${name}.snapshot.json"
-  # Parse the optional per-row retention spec (`panes=a,b`, `links=none`) into
-  # dump flags. Defaults (`panes=all`, `links=all`) add no flags = full wire.
-  # goldens.rs parses the SAME spec and applies the SAME flags, so the committed
-  # fixture and a fresh dump stay byte-identical.
-  flags=()
-  for tok in ${rest}; do
-    case "${tok}" in
-      panes=all | links=all) ;;
-      panes=*) flags+=(--panes "${tok#panes=}") ;;
-      links=none) flags+=(--elide-pane-links) ;;
-      \#*) break ;; # an inline comment ends the spec
-      *)
-        echo "regen-fixtures.sh: unknown retention token '${tok}' on row '${name}'" >&2
-        exit 1
-        ;;
-    esac
-  done
-  echo "regen ${out}  <-  ${prog} ${flags[*]}"
+  echo "regen ${out}  <-  ${prog}"
   # `< /dev/null`: the command must not inherit the loop's stdin, or it eats
   # the rest of the manifest and only the first fixture regenerates.
   #
@@ -59,7 +47,7 @@ while read -r name example rest; do
   # caller cannot distinguish from a real one that legitimately shrank. Failing
   # atomically means a failed regen leaves the output directory untouched.
   partial="${out}.partial"
-  if cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot "${flags[@]}" < /dev/null > "${partial}"; then
+  if cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot < /dev/null > "${partial}"; then
     mv "${partial}" "${out}"
   else
     rm -f "${partial}"
