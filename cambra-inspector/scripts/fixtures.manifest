@@ -19,7 +19,9 @@
 # Every fixture is the full wire. A fixture is a whole payload document, and a
 # corpus program whose payload is too large to commit whole belongs in
 # tests/inspector_goldens.rs as a structural assertion over a fresh dump
-# instead — which is where `txn_multi_read` and `for_accumulator` live.
+# instead — which is where `txn_multi_read` and `for_accumulator` live. Those two
+# are the only corpus programs with a store, so their bytes would re-bless on
+# every change to how a store is built.
 #
 # A program added for backend coverage alone needs NO row here: ratchet 5 of
 # tests/inspector_goldens.rs already walks every gallery source through the
@@ -34,11 +36,12 @@
 arithmetic udf_closure
 # Monomorph clones + the Derived(Inline) copies they carry, so the type-set
 # stitch (_ -> (Int, Int) | (Bool, Bool)) and non-identity edges in both
-# paneLinks windows.
+# paneLinks windows. Its three-root operator graph is what
+# operatorView.dom.test.ts walks.
 polymorphic polymorphic
 # The smallest payload in the corpus: one list literal, every node carrying its
-# own span, identity-linked across every pane. The one to read when asking what
-# the wire looks like at all.
+# own span, identity-linked across every pane, and the degenerate single-root
+# operator graph. The one to read when asking what the wire looks like at all.
 list_min list_min
 # A deliberate type error -> the degraded (payloadKind: "failed") payload: empty
 # panes and paneLinks, non-empty diagnostics. The only row that is not a

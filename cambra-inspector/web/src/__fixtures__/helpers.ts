@@ -21,8 +21,8 @@ export function fixture(json: unknown): Snapshot {
     throw new Error(
       `${String(e)}\n` +
         "  This is a golden fixture. If the wire shape changed on purpose, regenerate via\n" +
-        "  cambra-inspector/scripts/regen-fixtures.sh, updating any hand-written\n" +
-        "  expectations in the same change — re-bless discipline in\n" +
+        "  cambra-inspector/scripts/regen-fixtures.sh, updating both validators and any\n" +
+        "  hand-written expectations in the same change — re-bless discipline in\n" +
         "  web/src/__fixtures__/README.md.",
     );
   }
