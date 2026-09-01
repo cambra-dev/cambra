@@ -1,0 +1,344 @@
+# Storefront V2 — the budgeted flash sale of V1, augmented with the two things a
+# conventional stack buys a separate system for: durable execution and an
+# ETL-to-warehouse path.  The diff from `v1.cambra` IS the augmentation.
+#
+# Durable execution enters as two primitives and no orchestration construct:
+#
+#   - an outbound call is the dual of `http.serve` — an outgoing collection of
+#     requests paired with an incoming collection of results, keyed by an
+#     idempotency key the program supplies.  The runtime dispatches at most one
+#     call per key and records its result durably before any consumer sees it.
+#   - a deadline is a source over transactional state.  `clock.due(m)` yields a
+#     key once its deadline passes, so scheduling and rescheduling are writes
+#     and cancelling is a delete.
+#
+# Everything a workflow engine otherwise supplies falls out of those two.  The
+# checkout saga is a per-key state machine over `checkouts`, advanced by one
+# `for` loop per event source; compensation is an ordinary transaction the
+# machine reaches; retry with backoff is a failed result writing a new deadline
+# and re-dispatching under a new attempt key, so it needs no loop.  What durable
+# execution adds over plain state is the guarantee that a half-finished process
+# resumes, and that guarantee is the durability of `checkouts` plus the
+# at-most-once contract on the call — nothing else.
+#
+# The ETL path splits in two.  The mart (`/analytics/daily-revenue`) is a rollup
+# over the same `orders` feed the operational endpoints write, so the outbox,
+# topic, consumer, and loader of a conventional pipeline have no counterpart
+# here.  The archive does cross a boundary — retention and cold storage are not
+# met by an in-program view — and `store.parquet` is the surface it needs.
+#
+# The invariants of V0 and V1 hold across the augmentation by construction:
+# `Qty` still makes overselling ill-typed, and it is what makes the saga's
+# compensating restock typecheck; `quote`'s inherited postcondition still
+# rejects a below-cost line.
+
+# Type aliases, not new types.
+Dollars = Int
+Qty = {Int where _ >= 0}
+ItemPricing = {{price: Dollars, cost: Dollars} where _.price >= _.cost}
+
+catalog: Map(String, ItemPricing) = [
+    "tee-black" -> (price=25, cost=11),
+    "hoodie"    -> (price=60, cost=34),
+    "poster"    -> (price=10, cost=9),   # low margin: the discount clamps here
+]
+
+# The type of catalog keys.
+SKU = {String where _ in catalog.keys()}
+
+# A mutable, transactional map, like a column in a database.
+# A full map has an entry for every element of its domain,
+# so lookups are statically guaranteed to never miss.
+# Negative stock is prevented by the type checker on `Qty`.
+inventory: Mut(FullMap(SKU, Qty), Txn) := [
+    "tee-black" -> 500,
+    "hoodie"    -> 200,
+    "poster"    -> 1000,
+]
+
+# The stage a checkout has reached.  `failed` and `compensated` are distinct:
+# the first records why the saga stopped, the second that its reservation went
+# back.  Collapsing them would lose the fact a compensation is owed.
+Stage = {`reserved | `authorized{String} | `fulfilled{String} | `confirmed
+       | `failed{String} | `compensated{String}}
+
+Checkout = {stage: Stage, sku: SKU, qty: Qty, amount: Dollars, attempt: Int}
+
+# The saga's durable state.  Its key set is exactly the set of ids dispatched
+# into `charges`, which is what makes the lookups in the result handlers total.
+checkouts: Mut(FullMap(String, Checkout), Txn) := []
+
+# Carts, and the deadline each one is abandoned at.  Cancelling is deleting the
+# entry, so a checkout that lands first cannot race the timer that would have
+# released its lines.
+carts: Mut(FullMap(String, {sku: SKU, qty: Qty}), Txn) := []
+deadlines: Mut(Map(String, Time), Txn) := []
+
+abandon_after = 86400        # 24 hours, as a commit-order offset
+retry_backoff = 30           # seconds before the next charge attempt
+max_attempts  = 3
+
+import http
+import clock
+import store
+
+order_reqs,   order_resps   = http.serve("8080", "POST", "/order")
+restock_reqs, restock_resps = http.serve("8080", "POST", "/restock")
+stats_reqs,   stats_resps   = http.serve("8080", "GET", "/stats")
+cart_reqs,    cart_resps    = http.serve("8080", "POST", "/carts")
+checkout_reqs, checkout_resps = http.serve("8080", "POST", "/checkout")
+status_reqs,  status_resps  = http.serve("8080", "GET", "/checkout/status")
+rev_reqs,     rev_resps     = http.serve("8080", "GET", "/analytics/daily-revenue")
+
+# The outbound half of the HTTP library: requests out, results in, paired by
+# key.  Every step of the saga that leaves the program is one of these.
+charges,     charge_results     = http.call("payments", "POST", "/charges")
+voids,       void_results       = http.call("payments", "POST", "/voids")
+fulfilments, fulfilment_results = http.call("warehouse", "POST", "/shipments")
+confirms,    confirm_results    = http.call("email", "POST", "/send")
+
+# Timers.  One deadline map per kind of wait, so a cart's abandonment and a
+# charge's backoff cannot collide on a key.
+abandoned = clock.due(deadlines)
+retries: Mut(Map(String, Time), Txn) := []
+due_retries = clock.due(retries)
+
+# Whether the cumulative promo spend as of the calling transaction exceeds the budget.
+# Naming the aggregate makes it a view: denotationally it is just this sum, but the
+# runtime is free to materialize it and maintain it incrementally as orders commit,
+# rather than rescanning order history on every quote.
+def is_promo_spent() => Bool requires Transaction:
+    promo_budget = 1000
+    now = summon(Transaction).current_time()
+    past = orders.filter(\o -> o.time < now)
+    promo_budget <= sum([o.discount for o in past])
+
+def quote(item: ItemPricing, qty: Qty) => Dollars requires Transaction:
+    list_price = item.price * qty
+    sale = list_price // 2
+    floor = item.cost * qty
+    p = if is_promo_spent():
+            list_price
+        else:
+            max([sale, floor])
+    # Checked at compile time: both branches provably respect the cost floor.
+    static assert p >= item.cost * qty
+    p
+
+def reserve(sku: SKU, qty: Qty) => Bool requires Transaction:
+    stock = inventory[sku] # Always present because of the `SKU` type.
+    if stock >= qty:
+        inventory[sku] := stock - qty # Typechecks only under the check above.
+        true
+    else:
+        false
+
+# The loops below run concurrently, as requests come in for each endpoint.
+
+for req in restock_reqs:
+    result = with begin():
+        # `req.body.sku` is inferred to be in the catalog, checked by HTTP lib.
+        stock = inventory[req.body.sku]
+        # `qty` is inferred to be a non-neg int, checked by HTTP lib.
+        inventory[req.body.sku] := stock + req.body.qty
+        http.ok("restocked")
+
+    restock_resps[req.id] = result
+
+# Committed order lines; each carries its transaction's commit time.
+orders: Feed({sku: SKU, qty: Qty, price: Dollars, discount: Dollars, time: Time})
+
+for req in order_reqs:
+    # The HTTP lib uses inferred type constraints to validate and parse requests,
+    # rejecting malformed requests.
+    result = match catalog[req.body.sku]:
+        case `none:
+            http.not_found("no such sku")
+        case `some(item):
+            with txn = begin():
+                # `req.body.sku` is refined to the SKU type by the enclosing conditional.
+                if reserve(req.body.sku, req.body.qty):
+                    price = quote(item, req.body.qty)
+                    # Feed the collection of orders.
+                    orders << (
+                        sku = req.body.sku,
+                        qty = req.body.qty,
+                        price = price,
+                        discount = item.price * req.body.qty - price,
+                        time = txn.current_time(),
+                    )
+                    http.ok(str(price))
+                else:
+                    http.conflict("out of stock")
+
+    order_resps[req.id] = result
+
+# Revenue per SKU, as of this request's own transaction time.
+for req in stats_reqs:
+    with txn = begin():
+        paid = orders.filter(\o -> o.time < txn.current_time())
+        revenue = [key -> sum([o.price for o in g])
+            for key -> g in groupby(paid, \o -> o.sku)]
+
+    stats_resps[req.id] = revenue
+
+# --- Carts and the abandonment timer ----------------------------------------
+
+for req in cart_reqs:
+    result = with txn = begin():
+        carts[req.body.cart] := (sku=req.body.sku, qty=req.body.qty)
+        deadlines[req.body.cart] := txn.current_time() + abandon_after
+        http.ok(req.body.cart)
+
+    cart_resps[req.id] = result
+
+# Abandoned carts.  A cart's lines were never reserved, so there is nothing to
+# put back; the feed is what the reminder campaign reads.
+abandonments: Feed({cart: String, sku: SKU, qty: Qty, time: Time})
+
+for cart in abandoned:
+    with txn = begin():
+        c = carts[cart]
+        abandonments << (cart=cart, sku=c.sku, qty=c.qty, time=txn.current_time())
+        del deadlines[cart]
+
+# --- The checkout saga ------------------------------------------------------
+
+# Every outbound request carries the checkout it belongs to, because the
+# idempotency key is per *attempt* and a retry is a different call.  The result
+# echoes the request, which is how a handler gets back from an attempt key to
+# its checkout.
+
+# Step 1 — reserve and dispatch, in one transaction.  A checkout is never
+# recorded without its reservation and never charged without being recorded, so
+# there is no state in which a compensation is owed and unrecorded.  Checking
+# out cancels the cart's abandonment timer in the same transaction, which is why
+# the timer cannot fire on a cart that has already been paid for.
+for req in checkout_reqs:
+    result = match catalog[req.body.sku]:
+        case `none:
+            http.not_found("no such sku")
+        case `some(item):
+            with begin():
+                if reserve(req.body.sku, req.body.qty):
+                    amount = quote(item, req.body.qty)
+                    checkouts[req.body.id] := (
+                        stage = `reserved(unit),
+                        sku = req.body.sku,
+                        qty = req.body.qty,
+                        amount = amount,
+                        attempt = 0,
+                    )
+                    del deadlines[req.body.cart]
+                    charges << (key=req.body.id, checkout=req.body.id, amount=amount)
+                    http.ok(req.body.id)
+                else:
+                    http.conflict("out of stock")
+
+    checkout_resps[req.id] = result
+
+# Step 2 — the charge lands.  Success advances; failure either schedules another
+# attempt or compensates.  The compensating restock and the stage write commit
+# together, so a reservation is never released twice however often this runs.
+for key -> r in charge_results:
+    with txn = begin():
+        id = r.request.checkout
+        c = checkouts[id]
+        match r.outcome:
+            case `ok(receipt):
+                checkouts[id] := (
+                    stage = `authorized(receipt.auth_code),
+                    sku = c.sku, qty = c.qty, amount = c.amount, attempt = c.attempt,
+                )
+                fulfilments << (key=id, checkout=id, sku=c.sku, qty=c.qty)
+            case `failed(reason):
+                if c.attempt + 1 < max_attempts:
+                    checkouts[id] := (
+                        stage = `reserved(unit),
+                        sku = c.sku, qty = c.qty, amount = c.amount,
+                        attempt = c.attempt + 1,
+                    )
+                    retries[id] := txn.current_time() + retry_backoff * (c.attempt + 1)
+                else:
+                    inventory[c.sku] := inventory[c.sku] + c.qty
+                    checkouts[id] := (
+                        stage = `compensated(reason),
+                        sku = c.sku, qty = c.qty, amount = c.amount, attempt = c.attempt,
+                    )
+
+# The backoff fires.  A new attempt key means the at-most-once contract still
+# holds: a retry is a different call, not the same one dispatched twice.
+for id in due_retries:
+    with begin():
+        c = checkouts[id]
+        charges << (
+            key = id + "#" + str(c.attempt),
+            checkout = id,
+            amount = c.amount,
+        )
+        del retries[id]
+
+# Step 3 — fulfilment.  A failure here compensates two completed steps: void the
+# authorization and release the reservation.
+for key -> r in fulfilment_results:
+    with begin():
+        id = r.request.checkout
+        c = checkouts[id]
+        match r.outcome:
+            case `ok(shipment):
+                checkouts[id] := (
+                    stage = `fulfilled(shipment.tracking),
+                    sku = c.sku, qty = c.qty, amount = c.amount, attempt = c.attempt,
+                )
+                confirms << (key=id, checkout=id, tracking=shipment.tracking)
+            case `failed(reason):
+                voids << (key=id, checkout=id, amount=c.amount)
+                inventory[c.sku] := inventory[c.sku] + c.qty
+                checkouts[id] := (
+                    stage = `compensated(reason),
+                    sku = c.sku, qty = c.qty, amount = c.amount, attempt = c.attempt,
+                )
+
+# A void that fails leaves money authorized against a cancelled order, so it is
+# the one step that retries forever rather than giving up.
+for key -> r in void_results:
+    with txn = begin():
+        id = r.request.checkout
+        match r.outcome:
+            case `ok(ack):
+                pass
+            case `failed(reason):
+                retries[id] := txn.current_time() + retry_backoff
+
+# Step 4 — the confirmation is the last step, so its failure compensates
+# nothing: the order stands whether or not the mail went out.
+for key -> r in confirm_results:
+    with begin():
+        id = r.request.checkout
+        c = checkouts[id]
+        checkouts[id] := (
+            stage = `confirmed(unit),
+            sku = c.sku, qty = c.qty, amount = c.amount, attempt = c.attempt,
+        )
+
+for req in status_reqs:
+    stage = with begin():
+        checkouts[req.body.id].stage
+
+    status_resps[req.id] = stage
+
+# --- The warehouse path -----------------------------------------------------
+
+# The mart: revenue per day, as of the reading transaction's own time.  Nothing
+# moved to get here — this is the same feed `/order` writes.
+for req in rev_reqs:
+    with txn = begin():
+        paid = orders.filter(\o -> o.time < txn.current_time())
+        daily = [day -> sum([o.price for o in g])
+            for day -> g in groupby(paid, \o -> clock.day(o.time))]
+
+    rev_resps[req.id] = daily
+
+# The archive: one object per day, for the readers that are not this program.
+archive = store.parquet("s3://storefront/order-lines", \o -> clock.day(o.time))
+archive <<= orders

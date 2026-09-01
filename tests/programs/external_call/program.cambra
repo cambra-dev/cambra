@@ -1,0 +1,33 @@
+# An outbound call is the dual of `http.serve`: where a server endpoint is an
+# incoming collection of requests paired with a deferred outgoing collection of
+# responses, a client call is an outgoing collection of requests paired with an
+# incoming collection of results.  The pairing is by a key the program supplies.
+#
+# That key is the idempotency key, and the durability contract rides on it: for
+# each key the runtime dispatches at most one call and records its result
+# durably before any consumer observes it.  A restart between dispatch and
+# result re-dispatches only if no result was recorded.  This is what a
+# durable-execution engine sells, expressed as a property of one source.
+#
+# A result that has not arrived is not a missing value — it is an unfilled tile.
+# `results[key]` is the result type, not `Option` of it, and the read below
+# waits for the tile the way every other dataflow read does.  The apparent cycle
+# (a feed of this program causes a source of this program) is well-founded for
+# the usual reason: the result at key `k` depends only on the request at `k`.
+
+import http
+
+pay_reqs, pay_resps = http.serve("8080", "POST", "/pay")
+
+charges, results = http.call("payments", "POST", "/charges")
+
+for req in pay_reqs:
+    charges << (key=req.body.order_id, amount=req.body.amount)
+
+    result = match results[req.body.order_id]:
+        case `ok(receipt):
+            http.ok(receipt.auth_code)
+        case `failed(reason):
+            http.bad_request(reason)
+
+    pay_resps[req.id] = result

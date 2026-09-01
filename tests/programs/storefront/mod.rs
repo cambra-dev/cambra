@@ -10,8 +10,8 @@
 //! statically hit, and `quote`'s `static assert` makes selling below cost
 //! ill-typed — in every version.
 //!
-//! `v0.cambra` and `v1.cambra` are the two sides of the version-upgrade
-//! dimension: V1
+//! `v0.cambra`, `v1.cambra`, and `v2.cambra` are a version chain, and each
+//! diff is an upgrade.  V1
 //! changes only `quote` (and adds the `is_promo_spent` view) — a
 //! budgeted flash sale, half off list until cumulative discount spend
 //! exhausts the budget.  `is_promo_spent` is a time-pinned aggregate over the
@@ -22,6 +22,34 @@
 //! because the inherited postcondition rejects the naive discount on the
 //! low-margin "poster".  The diff between the files is the upgrade;
 //! inventory and the order feed persist across the branch point.
+//!
+//! V2 adds the two capabilities a conventional stack buys separate systems
+//! for — durable execution and an ETL-to-warehouse path — and adds two
+//! primitives to carry them.  An **outbound call** is the dual of `http.serve`:
+//! requests out, results in, paired by a key the program supplies, with the
+//! contract that the runtime dispatches at most one call per key and records
+//! its result durably before any consumer observes it.  A **deadline** is a
+//! source over transactional state: `clock.due(m)` yields a key once its
+//! deadline passes, so scheduling is a write and cancelling is a delete.
+//!
+//! Everything else a workflow engine supplies falls out of those two.  The
+//! checkout saga is a per-key state machine over `checkouts`, advanced by one
+//! `for` loop per event source; compensation is an ordinary transaction the
+//! machine reaches; retry with backoff is a failed result writing a new
+//! deadline and re-dispatching under a new attempt key, which needs no loop and
+//! so does not wait on `while` lowering.  What durable execution adds over
+//! plain durable state is the guarantee that a half-finished process resumes,
+//! and that decomposes into the durability of `checkouts` plus the at-most-once
+//! call contract, with nothing left over.  `external_call`, `checkout_saga`,
+//! and `abandoned_cart` pin those pieces one at a time.
+//!
+//! The ETL path splits in two, and only one half is a saving.  The mart
+//! (`/analytics/daily-revenue`) is a rollup over the same `orders` feed the
+//! operational endpoints write, so a conventional pipeline's outbox, topic,
+//! consumer, and loader have no counterpart here.  The archive does cross a
+//! boundary — retention and cold storage are not met by an in-program view —
+//! and `store.parquet` is surface Cambra does not have.  `warehouse_export`
+//! pins both halves; `docs/REPORT.md` measures them.
 //!
 //! ### What the orchestration will look like once unblocked
 //!
@@ -97,14 +125,30 @@
 //!   above (`static assert`, `requires`, `<<`) and one the refinements exposed:
 //!   `SKU`'s predicate `_ in catalog.keys()` parses only as far as `in`, which is
 //!   no expression operator.
-//! - **v1 — a layout failure, which lexing hits first.**  `quote` writes a
+//! - **v1 and v2 — a layout failure, which lexing hits first.**  `quote` writes a
 //!   multi-line `if`/`else` **expression** whose `else:` sits at a shallower
 //!   indent than the then-branch body it follows.  The off-side rule dedents to a
 //!   level that was never opened and the lexer reports inconsistent indentation.
 //!   What is missing is a continuation rule for a bracket-less multi-line
 //!   expression: `docs/chl-spec.md`, "1.4 Implicit line continuation" covers only
 //!   bracketed forms.  Behind it, v0's map-literal entries and everything else
-//!   listed above.
+//!   listed above.  V2 inherits `quote` unchanged, so it is blocked at the same
+//!   line; a lex error aborts the run, which is why its own surfaces never
+//!   reach a diagnostic and the satellites carry their pins instead.
+//!
+//! What V2 adds to the dependency list above, none of it reachable today:
+//!
+//! - The outbound call `http.call(name, method, path)` and its at-most-once
+//!   contract — `external_call`.
+//! - `clock.due(deadlines)` over a `Mut(Map(K, Time), Txn)` variable, and
+//!   map-entry deletion, which has no decided spelling (`del m[k]` here) —
+//!   `abandoned_cart`.
+//! - `clock.day` and arithmetic on `Time`, which today is a position in the
+//!   commit order with no algebra, and the partitioned object-storage sink
+//!   `store.parquet` — `warehouse_export`.
+//! - A `FullMap` whose key set grows with the program (`checkouts`), which
+//!   `docs/chl-spec.md`, "6.3 Direction: collections as functions [Tentative]"
+//!   leaves `[Open]` as the construction-site obligation — `checkout_saga`.
 
 use super::common::expect_compile_error;
 
@@ -112,4 +156,5 @@ use super::common::expect_compile_error;
 fn storefront_currently_blocked_in_the_front_end() {
     expect_compile_error(include_str!("v0.cambra"), "found '->'");
     expect_compile_error(include_str!("v1.cambra"), "inconsistent indentation");
+    expect_compile_error(include_str!("v2.cambra"), "inconsistent indentation");
 }

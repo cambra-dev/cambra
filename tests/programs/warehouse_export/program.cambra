@@ -1,0 +1,37 @@
+# The analytical mart and the archive.  The mart is a rollup over the same feed
+# the operational endpoint writes, keyed by day: there is no pipeline between
+# them because there is no boundary between them, and steps a conventional stack
+# spends on an outbox, a topic, a consumer, and a loader have no counterpart
+# here at all.
+#
+# The archive is the part that does cross a boundary, and it is the part Cambra
+# cannot write.  Retention, cold storage, and a reader that is not this program
+# are requirements an in-program view does not meet, so `store.parquet` below is
+# a gap and not a saving.
+
+import http
+import clock
+import store
+
+orders: Feed({sku: String, price: Int, time: Time})
+
+order_reqs, order_resps = http.serve("8080", "POST", "/order")
+rev_reqs,   rev_resps   = http.serve("8080", "GET", "/analytics/daily-revenue")
+
+for req in order_reqs:
+    with txn = begin():
+        orders << (sku=req.body.sku, price=req.body.price, time=txn.current_time())
+    order_resps[req.id] = http.ok("recorded")
+
+# Revenue per day, as of the reading transaction's own time.
+for req in rev_reqs:
+    with txn = begin():
+        paid = orders.filter(\o -> o.time < txn.current_time())
+        daily = [day -> sum([o.price for o in g])
+            for day -> g in groupby(paid, \o -> clock.day(o.time))]
+
+    rev_resps[req.id] = daily
+
+# Partitioned archive to object storage: the whole feed, one object per day.
+archive = store.parquet("s3://warehouse/order-lines", \o -> clock.day(o.time))
+archive <<= orders

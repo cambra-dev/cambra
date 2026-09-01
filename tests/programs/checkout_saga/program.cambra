@@ -1,0 +1,74 @@
+# A checkout saga: reserve inventory, authorize payment, then either advance or
+# compensate.  No orchestration construct appears.  The saga is a per-key state
+# machine over transactional state, advanced by one `for` loop per event source,
+# and compensation is an ordinary transaction the machine reaches.
+#
+# What durable execution adds is not the compensating step but the guarantee it
+# runs.  That guarantee is the durability of `checkouts` plus the at-most-once
+# contract on the outbound call, and nothing else.
+#
+# Retry with backoff needs no loop: a failed result writes a new deadline and
+# re-dispatches under a new attempt key, so the retry construct a workflow SDK
+# supplies as a configuration object is two writes here.  `attempt` carries the
+# count; the deadline source is `abandoned_cart`'s.
+
+Qty = {Int where _ >= 0}
+
+Stage = {`reserved | `authorized{String} | `failed{String}}
+
+Checkout = {stage: Stage, sku: String, qty: Qty, attempt: Int}
+
+inventory: Mut(FullMap(String, Qty), Txn) := ["widget" -> 100]
+
+# The key set is exactly the set of ids dispatched into `charges`, which is what
+# makes the lookup in the second loop total.
+checkouts: Mut(FullMap(String, Checkout), Txn) := []
+
+import http
+
+checkout_reqs, checkout_resps = http.serve("8080", "POST", "/checkout")
+
+charges, charge_results = http.call("payments", "POST", "/charges")
+
+# Reserve and dispatch in one transaction, so a checkout is never recorded
+# without its reservation and never charged without being recorded.
+for req in checkout_reqs:
+    result = with begin():
+        stock = inventory[req.body.sku]
+        if stock >= req.body.qty:
+            inventory[req.body.sku] := stock - req.body.qty
+            checkouts[req.body.id] := (
+                stage = `reserved(unit),
+                sku = req.body.sku,
+                qty = req.body.qty,
+                attempt = 0,
+            )
+            charges << (key=req.body.id, amount=req.body.amount)
+            http.ok(req.body.id)
+        else:
+            http.conflict("out of stock")
+
+    checkout_resps[req.id] = result
+
+# The charge lands.  Success advances the machine; failure compensates by
+# returning the reserved stock in the same transaction that records the failure,
+# so a reservation is never released twice.
+for id -> outcome in charge_results:
+    with begin():
+        c = checkouts[id]
+        match outcome:
+            case `ok(receipt):
+                checkouts[id] := (
+                    stage = `authorized(receipt.auth_code),
+                    sku = c.sku,
+                    qty = c.qty,
+                    attempt = c.attempt,
+                )
+            case `failed(reason):
+                inventory[c.sku] := inventory[c.sku] + c.qty
+                checkouts[id] := (
+                    stage = `failed(reason),
+                    sku = c.sku,
+                    qty = c.qty,
+                    attempt = c.attempt,
+                )
