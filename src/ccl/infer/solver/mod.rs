@@ -13,8 +13,9 @@
 //! Refinements ride the lattice natively, as a **set** per position. A
 //! refined type `{T | S}` carries a set `S` of [`Refinement`](crate::ccl::Refinement)
 //! refinements (matched by structural predicate equality — see
-//! [`Refinement`](crate::ccl::Refinement)'s
-//! `PartialEq` — but never by predicate implication). Subtyping is
+//! [`Refinement`](crate::ccl::Refinement)'s `PartialEq`). Where structural
+//! matching leaves a deficit, [`smt`] decides the entailment semantically over
+//! the linear-integer-arithmetic fragment. Subtyping is
 //! superset-on-refinements, structurally identical to record width-subtyping
 //! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a refinement set therefore
 //! merges with the same polarity rule as `rec` (positive ⇒ intersect,

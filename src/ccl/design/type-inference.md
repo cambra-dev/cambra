@@ -183,7 +183,7 @@ def identity(x):
 **Not yet implemented:**
 
 * **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. Does not block today's coverage; a natural next step.
-* **SMT-backed refinements.** Augmenting the lattice-carried refinements (today compared by structural equality only) with logical payloads (e.g. `v > 0`) reasoned about — implication, not just equality — by an external SMT solver such as Z3.
+* **SMT-backed refinements outside linear integer arithmetic.** [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) discharges an `Int`/`Bool` predicate in linear integer arithmetic to Z3 when structural matching leaves a deficit. A predicate outside that fragment — a `String` base, `//`, a product of two unknowns — is still compared by structural equality only.
 
 *(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
@@ -777,7 +777,35 @@ Singletons are *not* erased after inference. They are ordinary refinements and r
 
 #### Refinements on the lattice
 
-A **refined type** `{T | p}` carries a *set* of [`Refinement`]s, and the lattice treats each as a black box: it accumulates them and matches them by identity, never reasoning about what they imply (the predicate's logical content is real and used by the runtime, just opaque *here*). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{b₁ | S₁} <: {b₂ | S₂}` iff `b₁ <: b₂` and `S₂ ⊆ S₁ ∪ refinements(b₁)`** — more refinements ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}`. Refinements match by **type-blind structural equality of their predicate terms** (`Refinement`'s `PartialEq` / `eq_refinement_predicate`) — *not* by predicate implication (`{T | x > 0} ⊀ {T | x > -1}`). Structural matching makes refinement identity agnostic to *where* a predicate was constructed (join planning re-mints `{D | p}` at every marker it emits — `make_iterate` / `make_restrict` / `refine_with` — and must match the structurally-identical contract recorded elsewhere on the tree) and to in-place type resolution (copies of one predicate along a monomorphization descent line differ only in their inferred-type slots); a pointer-equal predicate `Rc` short-circuits as the fast path, since a refinement that merely flows around shares its `Rc`. The refinement set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (refinements are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
+A **refined type** `{T | p}` carries a *set* of [`Refinement`]s, and the lattice treats each as a black box: it accumulates them and matches them by identity, reasoning about what they imply only through the fallback below (the predicate's logical content is real and used by the runtime, otherwise opaque *here*). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{b₁ | S₁} <: {b₂ | S₂}` iff `b₁ <: b₂` and `S₂ ⊆ S₁ ∪ refinements(b₁)`** — more refinements ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}`. Refinements match by **type-blind structural equality of their predicate terms** (`Refinement`'s `PartialEq` / `eq_refinement_predicate`) and not by predicate implication, which is what [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) supplies for the cases structural matching leaves. Structural matching makes refinement identity agnostic to *where* a predicate was constructed (join planning re-mints `{D | p}` at every marker it emits — `make_iterate` / `make_restrict` / `refine_with` — and must match the structurally-identical contract recorded elsewhere on the tree) and to in-place type resolution (copies of one predicate along a monomorphization descent line differ only in their inferred-type slots); a pointer-equal predicate `Rc` short-circuits as the fast path, since a refinement that merely flows around shares its `Rc`. The refinement set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (refinements are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
+
+##### Semantic entailment as a fallback
+
+A deficit `S₂ \ S₁` over a concrete `b₁` asks `smt_sub`
+([`crate::ccl::infer::solver::smt`]) whether `S₁` entails `S₂` before the rule reports a
+mismatch. `{Int | __elem == 1 ^+ 3 ^+ 2} <: {Int | __elem == 1 ^+ 5}` holds by that route and
+not by structural matching.
+
+The query is `∀ __elem. ⋀S₁ ⇒ ⋀S₂`, decided by asking Z3 for unsatisfiability of
+`⋀S₁ ∧ ¬⋀S₂`. `__elem` is declared once at `b₁`'s sort and shared by both sides. Every other
+free name is declared at the sort of the node referencing it, so it is universally quantified
+too and the refinements its own type carries are dropped — an assumption left out weakens the
+antecedent. Both sides are transported into the ambient frame (`Subst::force_refinement`)
+first, because the query compares terms and the two sides' predicates are written in different
+binder contexts.
+
+The encoding covers linear integer arithmetic over `Int` and `Bool` bases: literals,
+variables, `+`/`^+`/`-`, `*` with a literal factor, the comparisons, and the boolean
+connectives. Anything else yields `false` — a `String` base, `//` (SMT-LIB's `div` is
+Euclidean, so it disagrees with floor division at a negative divisor), a product of two
+unknowns, a predicate mentioning an application or a projection — as does a solver that will
+not start or answers `unknown`. The check therefore only ever turns a rejection into an
+acceptance, and an absent Z3 costs completeness rather than soundness.
+
+Structural matching remains the rule the rest of the pipeline implements. `inline`'s
+`refinement_discharged_by` and the post-planning typecheck each decide refinement entailment
+structurally, so a program inference accepts on semantic grounds can still be rejected there,
+and later than inference.
 
 ##### The set is the representation, not just the reading
 
@@ -1926,7 +1954,7 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | **`FieldKey`** | Algebraic subtyping | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
 | **`Variant` (tagged sum)** | Both | The single sum representation: `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `` `tag(…) ``; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). |
 | **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Hole` is normalized to a fresh var, while `Refinement` is kept and rides the lattice as a refinement. |
-| **Refinement** | Both | A `Type::Refinement(T, r)` carries a refinement `r` (an immutable predicate `Rc<TypedExpr>`) — a refinement in its role as a black box to the subtyping lattice. A type holds a *set* of refinements, width-subtyped like records (more refinements ⇒ subtype; `{T\|p,q} <: {T\|p}`). Refinements compare by type-blind structural predicate equality (`Refinement`'s `PartialEq`; pointer-equal predicates short-circuit) — not implication. A refinement is *required* — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
+| **Refinement** | Both | A `Type::Refinement(T, r)` carries a refinement `r` (an immutable predicate `Rc<TypedExpr>`) — a refinement in its role as a black box to the subtyping lattice. A type holds a *set* of refinements, width-subtyped like records (more refinements ⇒ subtype; `{T\|p,q} <: {T\|p}`). Refinements compare by type-blind structural predicate equality (`Refinement`'s `PartialEq`; pointer-equal predicates short-circuit), with implication reached for only as a fallback (`smt_sub`). A refinement is *required* — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
 | **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |
 | **`InferArena`** | Cambra-Specific | The single owner of every inference variable minted during one `infer()` run. Captures each mint through a thread-local sink and, on `Drop`, clears all variables' bounds to break the `Rc` cycles that mutual subtyping constraints form — the end-of-inference cleanup that reference counting alone cannot do. See §3.2. |
 | **Pi type** | Both | A `Type::Fun` with `name: Some(𝑥)` — the dependent function type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain` and referenceable by nested refinement predicates. `name: None` is the ordinary function type. See §4.5. |
