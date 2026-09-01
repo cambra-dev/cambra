@@ -1,0 +1,128 @@
+name: storefront-reference
+
+x-app: &app
+  build: .
+  depends_on:
+    postgres: {condition: service_healthy}
+    redpanda: {condition: service_healthy}
+  environment:
+    DATABASE_URL: postgresql+asyncpg://storefront:storefront@postgres:5432/storefront
+    KAFKA_BOOTSTRAP: redpanda:9092
+    TEMPORAL_TARGET: temporal:7233
+    PAYMENTS_URL: http://payments:8090
+    WAREHOUSE_URL: http://payments:8090
+    EMAIL_URL: http://payments:8090
+    # The compressed clock. Production waits 24 hours; the local environment
+    # waits seconds, so the abandonment timer is observable in a test run
+    # without a second code path for it.
+    ABANDON_AFTER_SECONDS: ${ABANDON_AFTER_SECONDS:-20}
+    OBJECT_STORE_ROOT: /data/objects
+    WAREHOUSE_PATH: /data/warehouse/storefront.duckdb
+  restart: unless-stopped
+  volumes:
+    - appdata:/data
+    # The source is mounted rather than baked in, so an edit is visible without
+    # a rebuild. The image still owns the dependency set.
+    - ./storefront:/app/storefront
+    - ./migrations:/app/migrations
+    - ./tests:/app/tests
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: storefront
+      POSTGRES_PASSWORD: storefront
+      POSTGRES_DB: storefront
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storefront"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./ops/init-temporal-db.sql:/docker-entrypoint-initdb.d/init-temporal-db.sql:ro
+
+  redpanda:
+    image: redpandadata/redpanda:v25.2.5
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports: ["9092:9092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  temporal:
+    image: temporalio/auto-setup:1.29.0
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: storefront
+      POSTGRES_PWD: storefront
+      POSTGRES_SEEDS: postgres
+    ports: ["7233:7233"]
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator cluster health --address temporal:7233 2>/dev/null | grep -q SERVING"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+
+  # Migrations run once, before anything that reads the schema starts. Letting
+  # each service run them on boot races: whichever loses finds a half-built
+  # schema, and a crashed process with no restart policy stays down.
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  payments:
+    <<: *app
+    command: ["uvicorn", "storefront.payments.app:app", "--host", "0.0.0.0", "--port", "8090"]
+    depends_on: {}
+    ports: ["8090:8090"]
+
+  api:
+    <<: *app
+    command: ["uvicorn", "storefront.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redpanda: {condition: service_healthy}
+      temporal: {condition: service_healthy}
+    ports: ["8080:8080"]
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "storefront.temporal_app.worker"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      temporal: {condition: service_healthy}
+
+  relay:
+    <<: *app
+    command: ["python", "-m", "storefront.outbox_relay"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redpanda: {condition: service_healthy}
+
+  etl:
+    <<: *app
+    command: ["python", "-m", "storefront.etl.pipeline"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redpanda: {condition: service_healthy}
+
+volumes:
+  pgdata:
+  appdata:
