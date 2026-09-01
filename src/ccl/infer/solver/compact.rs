@@ -1094,10 +1094,10 @@ fn compact_go(
             // This fallback handles a *bare* under-determined domain var: it
             // materializes the type locally at coalesce from the lower-bound
             // side. The other half of the contravariant-domain story — a
-            // *structured* domain (a tuple/record with `Infer`s inside, which
-            // this per-var read cannot reassemble) — is recovered separately
-            // by `coalesce_node`'s `specialize_projection_domain` /
-            // `specialize_lambda_domain`. Both Apply edges are one-way (no
+            // *structured* domain whose untouched positions are variables no
+            // edge ever reaches, which is a `Proj`'s dense-prefix requirement
+            // and nothing else — is recovered separately by `coalesce_node`'s
+            // `specialize_projection_domain`. Both Apply edges are one-way (no
             // emit-time reverse whose eager cross-component propagation would
             // cover these halves); see `design/type-inference.md` ("Apply is
             // one-way" and "Closing the single-sided blind spots (no separate
@@ -1125,17 +1125,16 @@ fn compact_go(
                 let bc = compact_go(&b.ty, pol, &inner_acc, Some(&new_parents), st);
                 bound = CompactType::merge(pol, bound, bc);
             }
-            // Opposite-polarity fallback: walk the other side too if the
-            // primary walk did not produce any concrete (atom / shape)
-            // contribution. Without this, a variable whose only concrete
-            // information lives on the opposite polarity coalesces to
-            // `Type::Infer(?N)` instead of its real type — most commonly
-            // a fresh lambda param whose Apply-site bound flows in at the
-            // opposite polarity from where the lambda is coalesced. This is the
-            // coalesce-time read of monomorphization; it is sound because every
-            // var reaching coalesce is monomorphically determined (one type or
-            // an `IncompatibleBounds` error). See the rationale above, and
-            // [`fallback_allowed`] for why it happens only at a position.
+            // Whether the *shape* collapse fires: the primary walk produced no
+            // concrete (atom / shape) contribution. Without it a variable whose only
+            // concrete information lives on the opposite polarity coalesces to
+            // `Type::Infer(?N)` instead of its real type — most commonly a fresh
+            // lambda param whose Apply-site bound flows in at the opposite polarity
+            // from where the lambda is coalesced. This is the coalesce-time read of
+            // monomorphization; it is sound because every var reaching coalesce is
+            // monomorphically determined (one type or an `IncompatibleBounds`
+            // error). See the rationale above, and [`fallback_allowed`] for why it
+            // happens only at a position.
             let no_concrete = {
                 let CompactType {
                     atoms,
@@ -1166,7 +1165,13 @@ fn compact_go(
                     && history_slot.is_none()
                     && !var_is_shape
             };
-            if no_concrete && allow_fallback {
+            // A negative position reads the opposite side whether or not the shape
+            // needed recovering, because both sides narrow it: the requirement side
+            // records what the uses demand, the value side what actually arrives (see
+            // `src/ccl/design/type-inference.md`, "The collapse happens at the
+            // position").
+            let read_opposite = allow_fallback && (no_concrete || !pol);
+            let recovered = read_opposite.then(|| {
                 let mut recovered: Option<CompactType> = None;
                 for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
@@ -1176,17 +1181,23 @@ fn compact_go(
                         Some(acc) => CompactType::merge(!pol, acc, bc),
                     });
                 }
-                if let Some(mut recovered) = recovered {
+                recovered
+            });
+            match (recovered.flatten(), no_concrete) {
+                (Some(mut recovered), true) => {
                     // Carry what the polarity-correct walk *did* find — variable
                     // identities and refinement demands — across without letting
                     // it into the structural fold.
                     //
-                    // Replacing rather than merging is what the *negative* case
-                    // needs: there the primary result may hold a variant shape,
-                    // and it is the arms the body can handle rather than anything
-                    // that flowed in, so merging would union those tags into the
-                    // domain. (At a positive position `no_concrete` now implies
-                    // there is no shape at all to lose.)
+                    // Replacing rather than meeting is what an *undetermined*
+                    // position needs, and the difference is that the collapse here is
+                    // a choice rather than a narrowing: there is no settled structure
+                    // for the two sides to narrow jointly. At a negative position the
+                    // primary result may still hold a variant shape, and it is the
+                    // arms the body can handle rather than anything that flowed in, so
+                    // meeting would intersect those tags into the domain. (At a
+                    // positive position `no_concrete` implies there is no shape at all
+                    // to lose.)
                     //
                     // Refinements union instead of intersecting: a demanded
                     // predicate is checked against the value the fallback found,
@@ -1200,6 +1211,15 @@ fn compact_go(
                     }
                     bound = recovered;
                 }
+                // Both sides are narrowings of a structure the primary walk already
+                // settled, so the reading is their meet — which is what merging at the
+                // position's own polarity computes. One rule covers every slot: a
+                // refinement set narrows a position exactly as a record's fields do,
+                // and the negative merge unions both.
+                (Some(recovered), false) => {
+                    bound = CompactType::merge(pol, bound, recovered);
+                }
+                (None, _) => {}
             }
             st.in_process.remove(&key);
             // Recursive types: store the bound under the placeholder
@@ -1217,8 +1237,69 @@ fn compact_go(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::infer::solver::{CoalesceError, coalesce_compact};
-    use crate::ccl::{BaseType, Refinement, TypedExpr};
+    use crate::ccl::infer::solver::{
+        CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,
+    };
+    use crate::ccl::{BaseType, Lit, Refinement, TypedExpr};
+
+    /// A negative position's reading is the meet of both sides: the requirement side
+    /// says what the uses demand, the value side what actually arrives, and the
+    /// position accepts only what satisfies both.
+    ///
+    /// One rule covers every slot, so the two cases here differ only in which slot
+    /// carries the value side's contribution. The refinement case is the reachable
+    /// one — the trait sweep deposits a bare `Type::Base` on every operand place it
+    /// resolves, which settles the shape and establishes no refinement, so without
+    /// the meet a data domain and its own binder's occurrences spell one invariant
+    /// position two ways (`src/ccl/design/type-inference.md`, "The collapse happens
+    /// at the position").
+    #[test]
+    fn a_negative_position_meets_both_sides() {
+        let int = || Type::Base(BaseType::Int);
+        let field = |n: &str| (n.to_string(), int());
+        // `demand` is what the body asks of the parameter; `value` is what reaches it.
+        let domain_of = |value: Type, demand: Type| {
+            let dom = fresh_var(0);
+            let mut cache = ConstrainCache::new();
+            constrain_subtype(&value, &dom, &mut cache).expect("the value flows in");
+            constrain_subtype(&dom, &demand, &mut cache).expect("and meets the demand");
+            compact_type(&Type::fun(dom, int()))
+                .term
+                .fun
+                .expect("a function slot")
+                .domains
+                .iter()
+                .exactly_one()
+                .expect("one domain alternative")
+                .clone()
+        };
+
+        // Refinements: the demand settles the shape and carries none of its own.
+        let refined = domain_of(crate::ccl::infer::lit_singleton(&Lit::Int(1)), int());
+        assert!(
+            refined.atoms.contains(&AtomKey::Prim(BaseType::Int)),
+            "the demand still settles the shape"
+        );
+        assert_eq!(
+            refined.refinements.as_ref().map(RefinementSet::len),
+            Some(1),
+            "and the singleton the value establishes narrows it further"
+        );
+
+        // Record width, the same rule one slot over: a body that reads `a` demands
+        // only `a`, and the value's `b` survives because the negative merge unions
+        // fields exactly as it unions refinements.
+        let wide = domain_of(
+            Type::Record(vec![field("a"), field("b")]),
+            Type::Record(vec![field("a")]),
+        );
+        let fields = wide.rec.expect("a record shape");
+        assert!(
+            fields.contains_key(&FieldKey::Name(SmolStr::from("a")))
+                && fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
+            "both the demanded field and the one only the value carries: {fields:?}"
+        );
+    }
 
     /// The landing-closes check asks whether a refinement holds a **free**
     /// reference to the function's binder. A predicate that binds the same

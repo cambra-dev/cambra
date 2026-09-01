@@ -1148,30 +1148,22 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // rely on, so the order states it.)
             coalesce_node(function, level, ctx);
             coalesce_node(argument, level, ctx);
-            // A projection or lambda applied to a resolved argument:
-            // monomorphize its domain to the argument flowing in — the
-            // closed-form use-site specialization (see
-            // `specialize_projection_domain` / `specialize_lambda_domain`),
-            // the structural recovery for the one-way Apply edges. The
-            // cast-target / join-filter predicate case is reached the same way:
-            // `coalesce_type_predicates` (end of this fn) runs `coalesce_node` on
-            // each refinement predicate, so its projections recover here too.
+            // A projection applied to a resolved argument: monomorphize its domain
+            // to the argument flowing in (see `specialize_projection_domain`). A
+            // projection is polymorphic in its input's width, so this supplies the
+            // one width the use site needs rather than repairing anything the graph
+            // lost. The cast-target / join-filter predicate case is reached the same
+            // way: `coalesce_type_predicates` (end of this fn) runs `coalesce_node`
+            // on each refinement predicate, so its projections monomorphize here
+            // too.
+            //
+            // A *lambda*'s domain needs no counterpart: its binder is one variable
+            // carrying both the argument (below) and the body's demands (above), and
+            // a negative position reads their meet
+            // (`src/ccl/design/type-inference.md`, "The collapse happens at the
+            // position"). Only a projection's domain is unreassemblable from the graph,
+            // because its untouched positions are variables nothing constrains.
             specialize_projection_domain(function, &argument.ty);
-            specialize_lambda_domain(function, &argument.ty);
-            // Higher-order argument position: a lambda passed *as* the
-            // argument (e.g. the key/filter functions of `filter`/`groupby`
-            // and comprehension lowering). The function's resolved type is
-            // `Fun(Fun(expected_dom, _), _)`; that inner domain is the value
-            // the lambda will be fed, so specialize the lambda to it.
-            if let Type::Fun { domain: param, .. } = function.ty.peel_refinements()
-                && let Type::Fun {
-                    domain: expected_dom,
-                    ..
-                } = param.peel_refinements()
-            {
-                let expected_dom = (**expected_dom).clone();
-                specialize_lambda_domain(argument, &expected_dom);
-            }
         }
         // The cast's refinement predicate rides the `target` type slot, which
         // is distinct from `expr.ty`; the end-of-function
@@ -1285,10 +1277,6 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 };
                 let prev_cod = prev_cod.as_ref().clone();
                 specialize_projection_domain(&mut elts[i], &prev_cod);
-                // Lambda morphisms (for-loop bodies lower to
-                // `Compose([source, Lambda])`) have the same under-determined
-                // domain; recover it from the preceding codomain identically.
-                specialize_lambda_domain(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
                 && let (
@@ -1452,7 +1440,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // end-of-pass re-resolution sees every bound a later
             // specialization added — and must still yield `ty`. (Parent arms
             // may overwrite `expr.ty` afterwards via *structural* recovery
-            // — `specialize_lambda_domain`, let-closing — which is not a
+            // — `specialize_projection_domain`, let-closing — which is not a
             // graph read and so is not what this guards.)
             ctx.record_read(&expr.ty, &ty, || label.clone());
             expr.ty = ty;
@@ -1548,9 +1536,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // `refresh_lambda_param_slot`). Run it *after* `coalesce_type_predicates`
     // so the slot copies the domain's *resolved* refinement predicate (the
     // immutable predicate is a distinct `Rc`, so copying it before resolution
-    // would strand the param slot on an unresolved predicate). It is re-derived
-    // again whenever a parent arm later rewrites the domain
-    // (`specialize_lambda_domain`).
+    // would strand the param slot on an unresolved predicate).
     refresh_lambda_param_slot(expr);
 
     // A `Cast`'s `target` and its `expr.ty` converge on the **canonical cast
@@ -2078,163 +2064,64 @@ fn typecheck_discarded_definition(def: &mut Expr, level: Level, ctx: &mut Coales
     }
 }
 
-/// Specialize a projection morphism to the value flowing into it — the
-/// **closed-form** case of use-site specialization, the sibling of
-/// [`specialize_use`].
+/// The type [`specialize_projection_domain`] writes, given the value `input`
+/// flowing in.
 ///
-/// A projection `.i` is a *polymorphic* morphism: its principal type is
-/// `∀ρ. ρ ⇒ ρ.i` for any record/tuple `ρ` carrying field `i`. the solver never
-/// generalizes it (it is a builtin, not a `let`) and its single-sided
-/// `Var <: Var` rule feeds the domain var only the one field the projection
-/// touches, so the domain coalesces under-determined. Recovering it from the
-/// concrete `input` flowing in at the use site **monomorphizes** the projection
-/// to that use — exactly what [`specialize_use`] does for a generalized `let`
-/// (and what `compact_go`'s opposite-polarity fallback does for a bare
-/// contravariant domain var). The realizations differ only because the
-/// relationship differs: a `let`'s use type relates to its definition by
-/// arbitrary subtyping (so it needs freshen + pin + re-coalesce), whereas a
-/// projection's domain *equals* its input (`domain = ρ`), so the specialization
-/// collapses to a single overwrite — no clone, constraint, or re-coalesce. The
-/// codomain (the field extracted) is preserved.
-///
-/// `input` is supplied by the use site: the argument at an `Apply`, or the
-/// preceding morphism's codomain inside a `Compose`. No-op unless `morphism` is
-/// a `Proj` whose coalesced type is a function.
-///
-/// Invoked from `coalesce_node`'s `Apply`/`Compose` arms, which run bottom-up so
-/// the `input` (argument / preceding codomain) is already resolved. The
-/// cast-target / join-filter predicate case is reached the same way:
-/// `coalesce_type_predicates` runs `coalesce_node` over each refinement
-/// predicate, so its projections recover through the `Apply` arm too.
-/// The type a use-site domain recovery writes, given the position's own coalesced
-/// `domain` and the value `input` flowing in.
-///
-/// A recovery overwrites a domain with the type flowing in, read off the argument
-/// **node** — and a node's recorded type is the mutable variable *handle* wherever one was
-/// passed, because the read [`emit_apply`](super::emit::emit_apply) performed lives
-/// in the `arg <: domain` edge, not on the node. So a recovery has to make that same
-/// decision again, and it is the same decision: **a mutable variable mention reads, unless
-/// the position being specialized is itself a handle position** — which its own
-/// coalesced domain states outright, no spine walk required.
-///
-/// Both recoveries need this, and they need opposite halves of it:
-///
-/// - A **projection**'s domain is never a mutable variable — rule 2 keeps `Mut` out of every
-///   composite, so nothing projects *into* one, only through one — so this always
-///   derefs there. Without it a projection off a mutable variable (`acc.0` on a compound
-///   accumulator) re-acquires the handle here and fails `emit_proj`'s
-///   `domain <: {tuple/record}` requirement at the post-inference wall.
-/// - A **lambda**'s domain *is* a mutable variable exactly when the parameter was declared
-///   `Mut(…)`: pass-by-reference, the one position where the handle must reach the
-///   parameter. Overwriting with the handle is right there and wrong everywhere else
-///   — and wrong *silently*, since it retypes an ordinary value parameter as a
-///   mutable variable that the body still reads at its value type.
-fn recovered_input(domain: &Type, input: &Type) -> Type {
-    if domain.peel_refinements().mut_value_type().is_some() {
-        input.clone()
-    } else {
-        input.mut_value_type().unwrap_or(input).clone()
-    }
+/// The overwrite reads the argument **node**, and a node's recorded type is the
+/// mutable variable *handle* wherever one was passed, because the read
+/// [`emit_apply`](super::emit::emit_apply) performed lives in the `arg <: domain`
+/// edge, not on the node. So this has to make that same decision again, and for a
+/// projection it is always the same one: **deref**. Rule 2
+/// keeps `Mut` out of every composite, so nothing projects *into* a mutable variable,
+/// only through one. Without the deref a projection off a mutable variable (`acc.0` on
+/// a compound accumulator) re-acquires the handle here and fails `emit_proj`'s
+/// `domain <: {tuple/record}` requirement at the post-inference wall.
+fn recovered_input(input: &Type) -> Type {
+    input.mut_value_type().unwrap_or(input).clone()
 }
 
+/// Monomorphize a projection to the value flowing into it — the **closed-form**
+/// case of use-site specialization, the sibling of [`specialize_use`].
+///
+/// A projection `.i` is a *polymorphic* morphism: its principal type is
+/// `∀ρ. ρ ⇒ ρ.i` for any record/tuple `ρ` carrying field `i`, and that is the type
+/// the solver gives it. The width of `ρ` belongs to the use site rather than to
+/// the projection, so a domain that does not name it is the principal type doing
+/// its job — not information the graph lost. Op-conversion needs one concrete `ρ`
+/// to emit a field access, and the use site is the only thing that has it.
+///
+/// The solver never generalizes `.i` (it is a builtin, not a `let`), so there is
+/// no scheme to instantiate and overwriting the coalesced domain with `input` *is*
+/// the instantiation — what [`specialize_use`] does for a generalized `let`, and
+/// what `compact_go`'s opposite-polarity collapse does for a bare contravariant
+/// domain var. The realizations differ only because the relationship differs: a
+/// `let`'s use type relates to its definition by arbitrary subtyping (so it needs
+/// freshen + pin + re-coalesce), whereas a projection's domain *equals* its input
+/// (`domain = ρ`), so it collapses to a single overwrite — no clone, constraint,
+/// or re-coalesce. The codomain (the field extracted) is preserved.
+///
+/// Where the argument's own type is already concrete when `arg <: domain` is
+/// drawn, the width reaches the domain variable as a lower bound and the negative
+/// reading meets it, so this is a no-op. What it is for is the argument that is
+/// still a variable at that point, whose width arrives only as its coalesced node
+/// type.
+///
+/// `input` is supplied by the use site: the argument at an `Apply`, or the
+/// preceding morphism's codomain inside a `Compose`. No-op unless `morphism` is a
+/// `Proj` whose coalesced type is a function.
+///
+/// Invoked from `coalesce_node`'s `Apply`/`Compose` arms, which run bottom-up so
+/// `input` is already resolved. The cast-target / join-filter predicate case is
+/// reached the same way: `coalesce_type_predicates` runs `coalesce_node` over each
+/// refinement predicate, so its projections monomorphize through the `Apply` arm
+/// too.
 pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
-        && let Some(dom) = morphism.ty.domain()
         && let Some(cod) = morphism.ty.codomain()
     {
         // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
-        morphism.ty = Type::fun(recovered_input(&dom, input), cod);
+        morphism.ty = Type::fun(recovered_input(input), cod);
     }
-}
-
-/// Specialize a lambda's domain to the value flowing into it — the lambda
-/// sibling of [`specialize_projection_domain`].
-///
-/// With both Apply edges one-way (`fn_ty <: domain ⇒ codomain`,
-/// `arg <: domain`), a lambda's domain var only ever receives what its *body*
-/// demands, so it coalesces narrower than the value flowing in: a record
-/// narrowed to the fields the body touches (`{label}` instead of
-/// `{id, label}`), a sparsely-touched tuple shortened, an untouched parameter
-/// left `Infer`. The value actually flowing in is known once the use site's
-/// children have coalesced, so the domain is recovered structurally there.
-/// Overwriting (rather than merging) the base is sound: `arg <: domain` was
-/// constrained at emit, so the input satisfies every body demand.
-///
-/// The lambda's coalesced domain may carry refinements (body-usage facts
-/// that exist only in this negative-polarity position); they are preserved by
-/// re-wrapping them around `input`, deduping against refinements `input` already
-/// carries (structural [`Refinement`](crate::ccl::Refinement) equality). Outer
-/// refinements on the function type itself are likewise preserved.
-///
-/// `input` is supplied by the use site: the argument at a direct-redex
-/// `Apply`, the enclosing function's parameter domain when the lambda is
-/// itself an argument, or the preceding morphism's codomain inside a
-/// `Compose`. No-op unless `lambda` is a `Lambda` with a resolved `Fun` type
-/// and `input` is resolved (an `Infer` input would clobber the domain with
-/// nothing). Function values reached through opaque positions (`Var`-bound
-/// functions applied at distant call sites) are out of scope — the same
-/// opaque-vs-direct boundary as the projection recovery.
-pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
-    if matches!(input, Type::Infer(_)) {
-        return;
-    }
-    if !matches!(lambda.node, TypedExprNode::Lambda { .. }) {
-        return;
-    }
-    // Split the coalesced function type into its outer (function-level)
-    // refinements and the `Fun` shape.
-    let mut fn_layers = Vec::new();
-    let mut cur = lambda.ty.clone();
-    while let Type::Refinement(inner, r) = cur {
-        fn_layers.push(r);
-        cur = *inner;
-    }
-    let Type::Fun {
-        name,
-        kind,
-        domain: dom,
-        codomain: cod,
-    } = cur
-    else {
-        return;
-    };
-    // Peel the domain's refinements down to the base `input` replaces.
-    let mut dom_layers = Vec::new();
-    let mut base = *dom;
-    while let Type::Refinement(inner, r) = base {
-        dom_layers.push(r);
-        base = *inner;
-    }
-    // Re-wrap the collected refinements around `input`, skipping refinements it
-    // already carries (the argument edge may have deposited the same refinement on both).
-    let mut input_refinements = Vec::new();
-    let mut t = input;
-    while let Type::Refinement(inner, r) = t {
-        input_refinements.push(r);
-        t = inner;
-    }
-    // A mutable variable mention reads unless this parameter was *declared* one — see
-    // [`recovered_input`]. `base` is the peeled domain, so a declared `Mut(V, D)`
-    // parameter is visible here whatever refinements rode in on it.
-    let new_dom = dom_layers
-        .into_iter()
-        .rev()
-        .filter(|r| !input_refinements.contains(&r))
-        .fold(recovered_input(&base, input), Type::refined);
-    lambda.ty = fn_layers.into_iter().rev().fold(
-        // Preserve the Pi binder: specialization rewrites only the domain
-        // *shape*; a dependent codomain still refers to the same binder.
-        Type::Fun {
-            name,
-            kind,
-            domain: Box::new(new_dom),
-            codomain: cod,
-        },
-        Type::refined,
-    );
-    // The param slot was derived from the pre-specialization domain during the
-    // lambda's own `coalesce_node`; re-derive it from the rewritten one.
-    refresh_lambda_param_slot(lambda);
 }
 
 /// Fill a lambda's `param.ty` binder slot from its coalesced function type's
@@ -2257,22 +2144,21 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
 
-    // ----- use-site domain recovery (`recovered_input`) -----
+    // ----- the projection's monomorphization (`recovered_input`) -----
 
-    /// A use-site domain recovery overwrites a morphism's domain with the type read
-    /// off the argument **node**, and that type is the mutable variable *handle* — the read
-    /// `emit_apply` performed lives in the `arg <: domain` edge, not on the node. So
-    /// the recovery has to redo the decision, and it must land on the same answer.
+    /// The projection's monomorphization overwrites a morphism's domain with the type
+    /// read off the argument **node**, and that type is the mutable variable *handle* —
+    /// the read `emit_apply` performed lives in the `arg <: domain` edge, not on the
+    /// node. So it has to redo the decision, and for a projection the answer is always
+    /// to deref.
     ///
-    /// Driven at [`recovered_input`] rather than through a program because neither
-    /// arm is reachable from source today: a lambda in function position is only ever
-    /// the comprehension shape until `inline` runs (after inference), and a lambda
-    /// parameter cannot be annotated at all, so a directly-applied `Mut` parameter has
-    /// no spelling. Both become reachable the moment direct application does, and the
-    /// wrong answer is silent in both directions — a value parameter retyped as a
-    /// mutable variable, or a pass-by-reference parameter degraded to a value copy.
+    /// Driven at [`recovered_input`] rather than through a program because a
+    /// projection off a mutable variable needs a compound accumulator, and the wrong
+    /// answer there is silent: the domain re-acquires the handle and fails
+    /// `emit_proj`'s `domain <: {tuple/record}` requirement at the post-inference
+    /// wall rather than at the projection.
     #[test]
-    fn a_recovery_reads_a_mut_var_unless_the_position_is_a_handle() {
+    fn the_projection_monomorphization_reads_through_a_mut_var() {
         use super::recovered_input;
         use crate::ccl::{HistoryKind, Refinement};
         let mut_var = |value: Type| Type::History {
@@ -2291,22 +2177,13 @@ mod tests {
         let int = Type::Base(BaseType::Int);
         let handle = mut_var(int.clone());
 
-        // An ordinary value position reads through the handle.
-        assert_eq!(recovered_input(&int, &handle), int);
-        // ...including one still unresolved, and one carrying body-usage refinements:
-        // the decision is the *position's*, and neither of those is a handle position.
-        assert_eq!(recovered_input(&Type::Hole, &handle), int);
-        assert_eq!(recovered_input(&refined(int.clone()), &handle), int);
-
-        // A declared `Mut(…)` parameter is the one position the handle must reach —
-        // dereffing here would turn pass-by-reference into a silent value copy.
-        assert_eq!(recovered_input(&handle, &handle), handle);
-        // A refinement on the handle does not stop it being one (a refined mutable variable is
-        // still a mutable variable), so the position is still recognised.
-        assert_eq!(recovered_input(&refined(handle.clone()), &handle), handle);
-
-        // A non-mutable variable input is untouched either way.
-        assert_eq!(recovered_input(&int, &int), int);
+        // The handle reads through to its value type.
+        assert_eq!(recovered_input(&handle), int);
+        // A refinement on the handle does not stop it being one (a refined mutable
+        // variable is still a mutable variable), so it still reads through.
+        assert_eq!(recovered_input(&refined(handle.clone())), int);
+        // A non-mutable variable input is untouched.
+        assert_eq!(recovered_input(&int), int);
     }
 
     // ----- ordering-invariant comparison (`types_agree_modulo_unread`) -----

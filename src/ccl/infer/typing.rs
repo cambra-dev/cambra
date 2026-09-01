@@ -235,8 +235,7 @@ pub(super) trait Typing {
     /// the value actually flowing in — is recovered *structurally* in
     /// `coalesce_node` (its `Apply`/`Compose` arms) by monomorphizing the
     /// morphism to its input
-    /// ([`specialize_projection_domain`](super::solve::specialize_projection_domain) /
-    /// [`specialize_lambda_domain`](super::solve::specialize_lambda_domain)),
+    /// ([`specialize_projection_domain`](super::solve::specialize_projection_domain)),
     /// the closed-form case of the same use-site specialization
     /// [`specialize_use`](super::solve::specialize_use) performs for generalized
     /// `let`s.

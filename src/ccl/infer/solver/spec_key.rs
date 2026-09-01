@@ -501,8 +501,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // A variable contributes its **polarity-correct** bounds only. Following
         // both here instead is what leaks out of this use's cone and into every
         // other use's arguments; the two root reads are what cover both
-        // directions without ever mixing them at one variable. There is no
-        // opposite-polarity fallback either — the dual read subsumes it.
+        // directions without ever mixing them at one variable. Neither
+        // opposite-polarity read `compact_go` performs is mirrored here — the
+        // undetermined position's collapse or the negative position's meet — because
+        // the dual read already sees every bound either could reach, on whichever
+        // root read follows that side.
         Type::Infer(state) => {
             let visit_key = (state.uid, pol);
             let memo_key = (state.uid, pol, ctx.scope.enclosing().to_vec());
@@ -620,10 +623,12 @@ mod tests {
         assert_eq!(spec_key(&fresh_var(0)), SpecKey::default());
     }
 
-    /// The defect the key exists to fix: an argument's refinement reaches a domain
-    /// variable as a **lower** bound, where a negative-position materialization
-    /// cannot see it. The saturated key sees it, so two calls differing only
-    /// there key apart.
+    /// An argument's refinement reaches a domain variable as a **lower** bound, and
+    /// a negative position meets it there (`src/ccl/design/type-inference.md`,
+    /// "The collapse happens at the position"), so two calls differing only in that
+    /// refinement resolve to different domains. The key must therefore keep them
+    /// apart, which its dual read does — the *negative* root read follows the
+    /// domain's lower bounds.
     #[test]
     fn lower_bound_refinement_is_visible_where_a_materialization_narrows() {
         let mut keys = Vec::new();
@@ -633,8 +638,7 @@ mod tests {
             // The emit-time `arg <: domain` edge, for an argument carrying its
             // literal's singleton.
             constrain_subtype(&singleton(n), &dom, &mut cache).expect("arg flows into domain");
-            // And the definition's demand, which is all a negative resolution of
-            // `dom` would consult.
+            // And the definition's demand, which settles the domain's shape.
             constrain_subtype(&dom, &int(), &mut cache).expect("domain meets the body's demand");
             keys.push(spec_key(&Type::fun(dom, int())));
         }
