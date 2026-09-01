@@ -25,6 +25,7 @@ use crate::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
         },
+        operator_graph::drop_operator,
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
@@ -105,6 +106,94 @@ pub type RecordFieldOperators = Vec<(String, Box<dyn TileOperator>)>;
 /// branches off the same memoised upstream operators rather than each sink
 /// re-compiling the shared prefix into a fresh, independent subgraph.
 ///
+/// What a `Let` binding compiles to, for the `Var` uses that read it.
+///
+/// Both variants carry the input the body is converted with, because whether the
+/// enclosing input is fanned depends on which variant this is: a transaction
+/// store consumes no input and hands the body the original.
+enum LetBinding {
+    /// A transaction store, registered under the binding's name. `__hist` is
+    /// never a plain `Var` use, so it binds no scope entry.
+    Store {
+        body_input: Option<Box<dyn TileOperator>>,
+    },
+    /// A fan-out over the memoized bound operator, and how a `Var` use reads it.
+    Bound {
+        fan_out: Rc<FanOut>,
+        kind: BindingKind,
+        body_input: Option<Box<dyn TileOperator>>,
+    },
+}
+
+/// Compile a `Let`'s bound expression, shared by both conversion entry points.
+///
+/// Extracted because both entry points need it and a duplicate of it is how the
+/// second copy goes stale — the record-fields entry point had its own copy, and
+/// that copy's operators were minted with no recording open.
+///
+/// The recording is opened here rather than left to the caller for the same
+/// reason: `convert_impl` has a frame for the enclosing `Let` and the
+/// record-fields walk has none, so putting it in the shared path makes the
+/// invariant hold whoever calls.
+fn compile_let_binding(
+    let_id: crate::ccl::provenance::NodeId,
+    binding: &crate::ccl::TypedBinding,
+    bound_expr: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    ctx: &mut OpConversionContext,
+) -> Result<LetBinding, ConversionError> {
+    let _scope = crate::ccl::provenance::converting(let_id);
+
+    // `let __hist = Transact{…}`: build the shared store once and register it
+    // under the binding's name; the reads (`__hist.k`) project keys off it. The
+    // check precedes the fan because a store consumes no input, so fanning first
+    // would hand the body a branch where it expects the original operator.
+    if let TypedExprNode::Transact {
+        keys,
+        writers,
+        domain,
+    } = &bound_expr.node
+    {
+        let info = build_transact_store(keys, writers, domain, ctx)?;
+        ctx.register_store(binding.name.clone(), info);
+        return Ok(LetBinding::Store { body_input: input });
+    }
+
+    let (bound_input, body_input) = match input {
+        Some(input) => {
+            let fan_out = Rc::new(FanOut::new(input));
+            (Some(fan_out.branch()), Some(fan_out.branch()))
+        }
+        None => (None, None),
+    };
+
+    // `kind` captures whether this binding was created inside an iteration
+    // scope: an iteration-aligned binding (compiled with `Some(input)`) yields
+    // an op whose tile-domain matches the surrounding stream, so `Var` lookups
+    // must pass through rather than re-apply via `MapResult`. A free binding
+    // (no input) is a standalone function; references under an iteration must
+    // wrap it in `MapResult` to look up at each position.
+    let kind = if bound_input.is_some() {
+        BindingKind::Aligned
+    } else {
+        BindingKind::Free
+    };
+    // `bound_expr` is compiled unconditionally — whether or not the body
+    // references the binding. This is why `planning` must make every
+    // function-typed bound expr iteration-bearing: an unused,
+    // non-iteration-bearing function-typed binding would otherwise reach an
+    // `input=None` arm here and error. It also means a dead iterable binding is
+    // materialised rather than dropped; #232 tracks making iteration use-driven
+    // (lazy `Let` compilation / DCE) so this eager compile is no longer forced.
+    let bound_op = convert_impl(bound_expr, bound_input, ctx)?;
+    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
+    Ok(LetBinding::Bound {
+        fan_out,
+        kind,
+        body_input,
+    })
+}
+
 /// The expression must consist of zero or more `Let` bindings followed by a
 /// trailing `Record`; any other shape returns [`ConversionError::Unsupported`].
 pub fn convert_record_fields_to_operators(
@@ -117,27 +206,16 @@ pub fn convert_record_fields_to_operators(
             bound_expr,
             body,
         } => {
-            // `let __hist = Transact{…}`: build the shared store and register it
-            // (the reads `__hist.k` in the fields project off it), the same as
-            // the `convert_impl` `Let` arm. Multi-sink programs (a trailing
-            // `Record`) reach the store binding through here.
-            if let TypedExprNode::Transact {
-                keys,
-                writers,
-                domain,
-            } = &bound_expr.node
-            {
-                let info = build_transact_store(keys, writers, domain, ctx)?;
-                ctx.register_store(binding.name.clone(), info);
-                return convert_record_fields_to_operators(body, ctx);
+            // No surrounding iteration here — this entry point compiles a
+            // `Let* Record` chain from the top — so every binding is free.
+            match compile_let_binding(expr.node_id(), binding, bound_expr, None, ctx)? {
+                LetBinding::Store { .. } => convert_record_fields_to_operators(body, ctx),
+                LetBinding::Bound { fan_out, kind, .. } => {
+                    let mut scope = ctx.enter_scope();
+                    scope.bind(&binding.name, fan_out, kind);
+                    convert_record_fields_to_operators(body, &mut scope)
+                }
             }
-            let bound_op = convert_impl(bound_expr, None, ctx)?;
-            let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
-            let mut scope = ctx.enter_scope();
-            // No surrounding iteration here (this entry point compiles a
-            // Let* Record* chain from the top); every binding is free.
-            scope.bind(&binding.name, fan_out, BindingKind::Free);
-            convert_record_fields_to_operators(body, &mut scope)
         }
         TypedExprNode::Record(fields) => fields
             .iter()
@@ -497,6 +575,11 @@ fn convert_impl_inner(
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
+    // Every operator minted while this frame is innermost attributes to `expr`.
+    // Nested frames open their own, so a child's operators go to the child; what
+    // lands here is what this arm built around them. See
+    // `provenance::converting`.
+    let _scope = crate::ccl::provenance::converting(expr.node_id());
     trace!("Converting {}", symbolic(expr));
     let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
@@ -556,54 +639,18 @@ fn convert_impl_inner(
             binding,
             bound_expr,
             body,
-        } => {
-            // `let __hist = Transact{…} in body`: build the shared store once
-            // and register it under `__hist`; the variable reads (`__hist.k`)
-            // in `body` project keys off it. `__hist` is never a plain `Var`
-            // use, so it needs no scope binding.
-            if let TypedExprNode::Transact {
-                keys,
-                writers,
-                domain,
-            } = &bound_expr.node
-            {
-                let info = build_transact_store(keys, writers, domain, ctx)?;
-                ctx.register_store(binding.name.clone(), info);
-                return convert_impl(body, input, ctx);
+        } => match compile_let_binding(expr.node_id(), binding, bound_expr, input, ctx)? {
+            LetBinding::Store { body_input } => convert_impl(body, body_input, ctx),
+            LetBinding::Bound {
+                fan_out,
+                kind,
+                body_input,
+            } => {
+                let mut scope = ctx.enter_scope();
+                scope.bind(&binding.name, fan_out, kind);
+                convert_impl(body, body_input, &mut scope)
             }
-            let (bound_input, body_input) = match input {
-                Some(input) => {
-                    let fan_out = Rc::new(FanOut::new(input));
-                    (Some(fan_out.branch()), Some(fan_out.branch()))
-                }
-                None => (None, None),
-            };
-            // `kind` captures whether this binding was created inside an
-            // iteration scope: an iteration-aligned binding (compiled with
-            // `Some(input)`) yields an op whose tile-domain matches the
-            // surrounding stream, so Var lookups must passthrough rather
-            // than re-apply via `MapResult`.  A free binding (no input)
-            // is a standalone function; references under an iteration must
-            // wrap it in `MapResult` to look up at each position.
-            let kind = if bound_input.is_some() {
-                BindingKind::Aligned
-            } else {
-                BindingKind::Free
-            };
-            // `bound_expr` is compiled unconditionally — whether or not
-            // `body` references the binding.  This is why `planning` must
-            // make every function-typed bound expr iteration-bearing: an
-            // unused, non-iteration-bearing function-typed binding would
-            // otherwise reach an `input=None` arm here and error.  It also
-            // means a dead iterable binding is materialised rather than
-            // dropped; #232 tracks making iteration use-driven (lazy `Let`
-            // compilation / DCE) so this eager compile is no longer forced.
-            let bound_op = convert_impl(bound_expr, bound_input, ctx)?;
-            let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
-            let mut scope = ctx.enter_scope();
-            scope.bind(&binding.name, fan_out, kind);
-            convert_impl(body, body_input, &mut scope)
-        }
+        },
 
         // const(c): maps every domain element to the constant value c.
         TypedExprNode::Apply { argument, function }
@@ -1120,7 +1167,19 @@ fn convert_impl_inner(
                 // Free bindings are standalone functions; under an
                 // iteration we apply them pointwise via `MapResult`.
                 match (kind, input) {
-                    (BindingKind::Aligned, _) | (BindingKind::Free, None) => Ok(op),
+                    // An aligned use reads its binding directly, so the branch the
+                    // enclosing `Let` fanned for this position is surplus. Take it
+                    // out of the graph: it is unreachable, nothing subscribes it,
+                    // and at runtime it does not exist — left in, it would render
+                    // as a node leading nowhere that a reader cannot tell from a
+                    // real operator with a missing consumer.
+                    (BindingKind::Aligned, input) => {
+                        if let Some(surplus) = input {
+                            drop_operator(&*surplus);
+                        }
+                        Ok(op)
+                    }
+                    (BindingKind::Free, None) => Ok(op),
                     (BindingKind::Free, Some(input)) => Ok(Box::new(MapResult::new(input, op))),
                 }
             } else {
@@ -1606,6 +1665,11 @@ fn build_commit_store(
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
 
     for (set_writer, w) in setters.into_iter().zip(writers.iter()) {
+        // Attribute this writer's operators to the writer, not to the binding
+        // the whole store hangs off. Without this every operator of a
+        // transaction resolves to one span, since each is minted after its
+        // children have returned and closed their own recordings.
+        let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
         let item_ty = w.source.ty.codomain().ok_or_else(|| {
             ConversionError::TypeError(format!(
                 "transact writer source must have function type, got {}",
@@ -1846,6 +1910,10 @@ fn build_induction_store_single(
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
 
+    // As in `build_commit_store`: the store, its fan branches and its driver are
+    // all minted after the writer's own subexpressions have been converted, so
+    // they attribute to the writer rather than to the enclosing binding.
+    let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
     let store = InductionStore::new(init_ops, write_keys, tap_fields, key_extent, value_extent);
     let set_body = store.body_input_setter();
     // Cyclic: the driver reads this store's changelog back to recover each

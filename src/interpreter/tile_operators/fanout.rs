@@ -2,6 +2,7 @@ use log::trace;
 use std::{cell::RefCell, rc::Rc};
 
 use super::*;
+use crate::interpreter::operator_graph::{record_fan_input, share, value};
 use crate::{
     interpreter::{Consumer, Scheduler},
     pretty_graph::VizOptions,
@@ -117,6 +118,15 @@ pub struct FanOut {
     // passed between operators — the same reason `CycleSlot` is legitimate.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
+    /// The fan input's identity, and whether this fan closes a cycle.
+    ///
+    /// Cached here because [`FanOut::branch`] can reach neither afterwards: the
+    /// input sits behind an `Rc<RefCell>` and the cyclic flag inside `shared`.
+    /// Every branch records its edge to the fan input from these, and that edge
+    /// is the only place a share is distinguishable from an owned input — at a
+    /// consumer the two have the same field type.
+    input_id: Option<NodeId>,
+    cyclic: bool,
     /// All mutable shared state.  Created eagerly so that branches produced by
     /// [`FanOut::branch`] always share the same object.
     shared: Rc<RefCell<FanOutShared>>,
@@ -160,6 +170,11 @@ impl FanOut {
         reentrancy: Option<FanOutReentrancy>,
     ) -> Self {
         let tiling = input.tiling().clone();
+        let input_id = input.operator_id();
+        let cyclic = reentrancy.is_some();
+        // The fan owns its input from here on, and the fan itself is dropped when
+        // conversion ends, so nothing in the graph owns this operator.
+        record_fan_input(input_id);
         let shared = Rc::new(RefCell::new(FanOutShared {
             id: FanOutProducer::alloc_id(),
             producer: None,
@@ -170,6 +185,8 @@ impl FanOut {
         Self {
             input: Rc::new(RefCell::new(input)),
             tiling,
+            input_id,
+            cyclic,
             shared,
             used: RefCell::new(false),
         }
@@ -181,7 +198,10 @@ impl FanOut {
     pub fn branch(&self) -> Box<dyn TileOperator> {
         let result = FanOutBranch {
             input: self.input.clone(),
-            base: OperatorBase::new(self.tiling.clone()),
+            base: OperatorBase::new::<FanOutBranch>(
+                self.tiling.clone(),
+                &[share(self.input_id, self.cyclic)],
+            ),
             shared: self.shared.clone(), // shares the Rc — always connected
             primary: !*self.used.borrow(),
         };
@@ -443,8 +463,8 @@ impl Memo {
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
-            base: OperatorBase::new(tiling),
         }
     }
 }

@@ -58,6 +58,7 @@ use crate::interpreter::{
 use crate::pretty_graph::VizOptions;
 use crate::pretty_tree::InspectNode;
 
+use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed};
 use crate::interpreter::tile_operators::{OperatorBase, impl_operator_base, impl_producer_base};
 
 /// A commit timestamp — a position on the runtime's monotonic commit clock.
@@ -760,6 +761,14 @@ pub struct CommitOperator {
     writer_write_keys: Vec<Vec<Value>>,
 }
 
+/// Graph edges for a store's per-key tick-0 operators, keyed by the store key.
+fn init_op_edges(init_ops: &[(Value, Box<dyn TileOperator>)]) -> Vec<InputEdgeSpec> {
+    init_ops
+        .iter()
+        .map(|(key, op)| value_keyed(key.to_string(), &**op))
+        .collect()
+}
+
 impl CommitOperator {
     /// Create a commit operator whose store starts at `init` (the tick-0 state),
     /// with keys in `key_extent` and values in `value_extent`.
@@ -777,7 +786,7 @@ impl CommitOperator {
         Self {
             init,
             init_ops: Vec::new(),
-            base: OperatorBase::new(output_tiling),
+            base: OperatorBase::new::<Self>(output_tiling, &[]),
             writer_inputs: (0..writer_write_keys.len())
                 .map(|_| CycleSlot::new())
                 .collect(),
@@ -799,10 +808,11 @@ impl CommitOperator {
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
+        let init_edges = init_op_edges(&init_ops);
         Self {
             init: HashMap::new(),
             init_ops,
-            base: OperatorBase::new(output_tiling),
+            base: OperatorBase::new::<Self>(output_tiling, &init_edges),
             writer_inputs: (0..writer_write_keys.len())
                 .map(|_| CycleSlot::new())
                 .collect(),
@@ -813,7 +823,7 @@ impl CommitOperator {
     /// Wire writer `k`'s input. Call after the operator is boxed, so the writer
     /// can be built around a branch of the operator's store output (the cycle).
     pub fn writer_input_setter(&self, k: usize) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
-        self.writer_inputs[k].setter()
+        self.writer_inputs[k].setter(Some(self.base.id), EdgeRole::Positional(k))
     }
 }
 
@@ -1247,12 +1257,13 @@ impl InductionStore {
         value_extent: Extent,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
+        let init_edges = init_op_edges(&init_ops);
         Self {
             init_ops,
             body_input: CycleSlot::new(),
             write_keys,
             tap_fields,
-            base: OperatorBase::new(output_tiling),
+            base: OperatorBase::new::<Self>(output_tiling, &init_edges),
         }
     }
 
@@ -1260,7 +1271,8 @@ impl InductionStore {
     /// `FanOut` — the same late wiring [`CommitOperator::writer_input_setter`]
     /// performs, and for the same reason.
     pub fn body_input_setter(&self) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
-        self.body_input.setter()
+        self.body_input
+            .setter(Some(self.base.id), EdgeRole::Named("body"))
     }
 }
 
@@ -1546,10 +1558,13 @@ impl StoreValueStream {
         carry_forward: bool,
     ) -> Self {
         Self {
-            base: OperatorBase::new(Tiling::SealedFunction {
-                domain: Extent::Base(BaseType::UInt),
-                codomain: Box::new(Tiling::Scalar(value_extent.clone())),
-            }),
+            base: OperatorBase::new::<Self>(
+                Tiling::SealedFunction {
+                    domain: Extent::Base(BaseType::UInt),
+                    codomain: Box::new(Tiling::Scalar(value_extent.clone())),
+                },
+                &[value("store_op", &*store_op)],
+            ),
             store_op,
             key,
             value_extent,
@@ -1746,7 +1761,10 @@ pub struct StoreFinalRead {
 impl StoreFinalRead {
     pub fn new(store_op: Box<dyn TileOperator>, key: Value, value_extent: Extent) -> Self {
         Self {
-            base: OperatorBase::new(Tiling::Scalar(value_extent.clone())),
+            base: OperatorBase::new::<Self>(
+                Tiling::Scalar(value_extent.clone()),
+                &[value("store_op", &*store_op)],
+            ),
             store_op,
             key,
             value_extent,
@@ -1912,7 +1930,10 @@ impl StoreDenseRead {
             codomain: Box::new(Tiling::Scalar(value_extent.clone())),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("trigger", &*trigger), value("store_op", &*store_op)],
+            ),
             trigger,
             store_op,
             key,
@@ -2278,7 +2299,10 @@ impl AsOf {
             codomain: Box::new(output.codomain_tiling()),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("trigger", &*trigger), value("source", &*source)],
+            ),
             trigger,
             source,
             output,
@@ -2775,7 +2799,13 @@ impl InductionDriver {
             "each read key carries its own value extent"
         );
         Self {
-            base: OperatorBase::new(body_input_tiling(&read_extents, &item_extent)),
+            base: OperatorBase::new::<Self>(
+                body_input_tiling(&read_extents, &item_extent),
+                &[
+                    value("store_op", &*store_op),
+                    value("source_op", &*source_op),
+                ],
+            ),
             store_op,
             source_op,
             read_keys,
@@ -3040,7 +3070,13 @@ impl TransactDriver {
             "each read key carries its own value extent"
         );
         Self {
-            base: OperatorBase::new(body_input_tiling(&read_extents, &item_extent)),
+            base: OperatorBase::new::<Self>(
+                body_input_tiling(&read_extents, &item_extent),
+                &[
+                    value("store_op", &*store_op),
+                    value("source_op", &*source_op),
+                ],
+            ),
             store_op,
             source_op,
             read_keys,
@@ -3451,7 +3487,14 @@ impl TransactWriter {
         value_extent: Extent,
     ) -> Self {
         Self {
-            base: OperatorBase::new(proposal_stream_tiling(&key_extent, &value_extent)),
+            base: OperatorBase::new::<Self>(
+                proposal_stream_tiling(&key_extent, &value_extent),
+                &[
+                    value("store_op", &*store_op),
+                    value("body_op", &*body_op),
+                    value("driver_op", &*driver_op),
+                ],
+            ),
             store_op,
             body_op,
             driver_op,

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{ColumnValue, Consumer, Extent, Scheduler, tuple_field},
     pretty_graph::VizOptions,
@@ -50,8 +51,8 @@ impl PermuteRecordDomain {
             codomain: codomain.clone(),
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
-            base: OperatorBase::new(tiling),
             permutation,
         }
     }
@@ -379,7 +380,7 @@ impl FlattenTupleDomain {
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
             field_map,
         }

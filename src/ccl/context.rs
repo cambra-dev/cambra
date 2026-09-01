@@ -36,6 +36,7 @@ use crate::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
         },
+        operator_graph::{GraphSession, OperatorGraph, assert_graph_invariants},
         sinks::{DoneNotifier, SinkConsumer},
         tile_operators::{TileOperator, TileProducer},
     },
@@ -584,6 +585,13 @@ pub struct CompiledProgram {
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
     /// pair.
     pub(crate) provenance_table: ProvenanceTable,
+    /// The static structure of the operator graph, captured as conversion built
+    /// it.
+    ///
+    /// Recorded rather than walked: an edge's kind is not recoverable from the
+    /// operators, and `subscribe` empties the `CycleSlot`s before this struct
+    /// exists. See [`operator_graph`](crate::interpreter::operator_graph).
+    pub operator_graph: OperatorGraph,
     /// The original program source text, retained verbatim.
     ///
     /// Inspector queries need the source string to produce snippets (`hover`'s
@@ -685,6 +693,14 @@ pub enum Phase {
     /// Join/dataflow planning: hash-join and restrict scaffolding, clause
     /// fusion, refinement-predicate compilation.
     Planning,
+    /// Operator conversion: building the dataflow operator graph from the
+    /// planned tree.
+    ///
+    /// The one phase whose products are not expression nodes. An operator
+    /// carries a [`NodeId`](crate::ccl::provenance::NodeId) like any other
+    /// artifact, and conversion mints no expression nodes, so the rows this
+    /// phase writes key on ids disjoint from every pane above it.
+    Convert,
 }
 
 /// Ids carried by two *distinct* predicate terms, or by a predicate term and the
@@ -1769,12 +1785,29 @@ pub fn compile_program(
     // tail of the `Let*` chain rather than a `Record`; we synthesise a single
     // `("main", op)` entry for them so the rest of the function operates
     // uniformly on `Vec<(name, op)>`.
-    let per_field_ops = if sink_bindings_registry.is_empty() {
-        let op = convert_to_operators(&join_planned, ctx.conversion_ctx()).errs()?;
-        vec![("main".to_string(), op)]
-    } else {
-        convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx()).errs()?
-    };
+    // The one phase scope `compile_program` opens itself: every earlier phase
+    // runs inside `run_frontend`, and conversion is past the frontend's last
+    // pane. `table_session` is still installed here, which is what lets these
+    // rows reach the same table.
+    let graph_session = GraphSession::install();
+    let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
+        if sink_bindings_registry.is_empty() {
+            convert_to_operators(&join_planned, ctx.conversion_ctx())
+                .map(|op| vec![("main".to_string(), op)])
+        } else {
+            convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())
+        }
+    })
+    .errs()?;
+    let operator_graph = graph_session.into_graph();
+    // The compiled fields are roots the graph cannot know about: only the
+    // boundary knows which operator a field compiled to. The graph supplies the
+    // rest — see `OperatorGraph::roots`.
+    let output_roots: Vec<_> = per_field_ops
+        .iter()
+        .filter_map(|(_, op)| op.operator_id())
+        .collect();
+    assert_graph_invariants(&operator_graph, &output_roots);
 
     let sink_count = per_field_ops
         .iter()
@@ -1852,6 +1885,7 @@ pub fn compile_program(
         post_as_of_read_ir,
         post_lambda_elim_ir,
         provenance_table,
+        operator_graph,
         source: code.to_string(),
     };
 

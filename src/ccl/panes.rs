@@ -15,6 +15,8 @@
 //! reason: the methods are the pane layer's, not the pipeline's. See
 //! `design/provenance.md`, "The seam".
 
+use std::collections::HashSet;
+
 use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase, collect_tree_ids};
 use crate::ccl::provenance::{Leak, NodeId, ProvenanceMap, SourceProjection, fold};
@@ -37,8 +39,7 @@ impl CompiledProgram {
     // Cold path: the inspector's snapshot serve, which is not in this workspace.
     #[allow(dead_code)]
     pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
-        let trees = self.pane_trees();
-        let ids: Vec<_> = trees.iter().map(|t| collect_tree_ids(t)).collect();
+        let ids = self.pane_ids();
 
         // The anchor pane's projection is the lowering projection: `uniquify`
         // preserves every id in place, so lowering's keys are still its keys.
@@ -77,7 +78,7 @@ impl CompiledProgram {
     ///
     /// The inspector model reads this alongside [`PANES`] to build one snapshot
     /// pane per entry.
-    pub(crate) fn pane_trees(&self) -> [&Expr; PANES.len()] {
+    pub(crate) fn pane_trees(&self) -> [&Expr; IR_PANE_COUNT] {
         [
             &self.pre_inference_ir,
             &self.post_inference_ir,
@@ -87,6 +88,26 @@ impl CompiledProgram {
             &self.ast,
         ]
     }
+
+    /// Each pane's id set, in pipeline order, element for element with
+    /// [`PANES`].
+    ///
+    /// This is all the fold wants from a pane — it never reads content — which
+    /// is what lets a pane hold an operator graph rather than a tree.
+    pub(crate) fn pane_ids(&self) -> Vec<HashSet<NodeId>> {
+        let mut trees = self.pane_trees().into_iter();
+        PANES
+            .iter()
+            .map(|spec| match spec.content {
+                PaneKind::Ir => collect_tree_ids(
+                    trees
+                        .next()
+                        .unwrap_or_else(|| unreachable!("one tree per declared IR pane")),
+                ),
+                PaneKind::Operators => self.operator_graph.ids().collect(),
+            })
+            .collect()
+    }
 }
 
 /// One pane — a retained AST snapshot — and the phases that produced it from the
@@ -94,9 +115,25 @@ impl CompiledProgram {
 ///
 /// [`PANES`] declares the whole topology in one place, so adding a pane is one
 /// entry there plus its tree in [`CompiledProgram::pane_trees`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PaneKind {
+    /// An expression tree.
+    Ir,
+    /// The dataflow operator graph.
+    Operators,
+}
+
 pub(crate) struct PaneSpec {
     /// The pane's name, e.g. `"post-channelize"`.
     pub(crate) name: &'static str,
+    /// What this pane holds.
+    ///
+    /// The fold reads id sets rather than content, so this distinction reaches
+    /// only the consumers that render a pane. Declaration order is pipeline
+    /// order and conversion runs last, so every [`PaneKind::Ir`] pane precedes
+    /// every [`PaneKind::Operators`] one — asserted by
+    /// `ir_panes_precede_operator_panes`.
+    pub(crate) content: PaneKind,
     /// The phases that ran between the previous pane and this one — the set
     /// [`CompiledProgram::materialize_panes`] restricts the whole-compile table
     /// by.
@@ -139,19 +176,29 @@ pub(crate) struct PaneSpec {
 /// compiles. `pre-inference → post-inference` reaches that only because the fold's
 /// id domain was widened to the slot domain the passes rewrite and inference's
 /// per-instantiation predicate freshen took a copy recording.
-pub(crate) const PANES: [PaneSpec; 6] = [
+/// How many panes hold an expression tree.
+///
+/// [`CompiledProgram::pane_trees`]' arity, kept beside [`PANES`] so the two
+/// cannot disagree; `ir_panes_precede_operator_panes` checks it against the
+/// declared contents.
+pub(crate) const IR_PANE_COUNT: usize = 6;
+
+pub(crate) const PANES: [PaneSpec; 7] = [
     PaneSpec {
         name: "pre-inference",
+        content: PaneKind::Ir,
         phases: &[],
         gated: false,
     },
     PaneSpec {
         name: "post-inference",
+        content: PaneKind::Ir,
         phases: &[Phase::Infer],
         gated: true,
     },
     PaneSpec {
         name: "post-channelize",
+        content: PaneKind::Ir,
         phases: &[
             Phase::Inline,
             Phase::Transact,
@@ -162,17 +209,26 @@ pub(crate) const PANES: [PaneSpec; 6] = [
     },
     PaneSpec {
         name: "post-as-of-read",
+        content: PaneKind::Ir,
         phases: &[Phase::AsOfRead],
         gated: true,
     },
     PaneSpec {
         name: "post-lambda-elim",
+        content: PaneKind::Ir,
         phases: &[Phase::LambdaElim],
         gated: true,
     },
     PaneSpec {
         name: "post-planning",
+        content: PaneKind::Ir,
         phases: &[Phase::Planning],
+        gated: true,
+    },
+    PaneSpec {
+        name: "post-conversion",
+        content: PaneKind::Operators,
+        phases: &[Phase::Convert],
         gated: true,
     },
 ];
@@ -479,15 +535,11 @@ mod tests {
     /// pinning that turns every corpus edit into a list edit.
     #[test]
     fn the_pane_folds_derive_a_non_vacuous_provenance_map() {
-        let mut exercised: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut exercised: HashSet<usize> = HashSet::new();
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let panes = program.materialize_panes();
-            let ids: Vec<_> = program
-                .pane_trees()
-                .iter()
-                .map(|t| collect_tree_ids(t))
-                .collect();
+            let ids = program.pane_ids();
 
             for (i, pane_pair) in panes.pairs.iter().enumerate() {
                 if !pane_pair.gated {
@@ -614,7 +666,7 @@ mod tests {
                 .iter()
                 .find(|p| p.name == "post-lambda-elim → post-planning")
                 .expect("the planning pane pair");
-            let blamed: std::collections::HashSet<NodeId> = pair
+            let blamed: HashSet<NodeId> = pair
                 .map
                 .edges()
                 .into_iter()
@@ -794,6 +846,7 @@ mod tests {
             vec![
                 Phase::AsOfRead,
                 Phase::Channelize,
+                Phase::Convert,
                 Phase::Infer,
                 Phase::LambdaElim,
                 Phase::Letrec,
@@ -889,6 +942,62 @@ mod tests {
         ("feed", 6),
         ("feed", 12),
     ];
+
+    /// Each `Transact` writer's own ids — its source and its body — paired with a
+    /// description for the failure message.
+    fn collect_writer_domains(expr: &Expr, out: &mut Vec<(HashSet<NodeId>, String)>) {
+        if let crate::ccl::TypedExprNode::Transact { writers, .. } = &expr.node {
+            for (i, w) in writers.iter().enumerate() {
+                let mut ids = collect_tree_ids(&w.source);
+                ids.extend(collect_tree_ids(&w.body));
+                out.push((ids, format!("writer {i}")));
+            }
+        }
+        for child in expr.child_exprs() {
+            collect_writer_domains(child, out);
+        }
+    }
+
+    /// **Each writer of a transaction names some operator of its own.**
+    ///
+    /// Every operator of the commit complex is minted after the writer's own
+    /// subexpressions have been converted and closed their recordings, so
+    /// without a scope per writer they all attribute to the `let __hist =
+    /// Transact{…}` binding and the pane's whole transaction region resolves to
+    /// one span. No leak class can see that: the rows are present and the
+    /// parents are live, only coarse.
+    ///
+    /// A tripwire for that collapse rather than a measure of attribution
+    /// quality — it would pass on a partial collapse where one writer swallowed
+    /// another's operators. It asserts nothing about *how many* operators a
+    /// writer compiles into, which is what keeps it stable across changes to the
+    /// complex.
+    #[test]
+    fn every_writer_site_has_an_operator_attributed_inside_it() {
+        for (name, code) in corpus() {
+            let program = compile_ok(&code);
+            let mut writers: Vec<(HashSet<NodeId>, String)> = Vec::new();
+            collect_writer_domains(&program.ast, &mut writers);
+            if writers.is_empty() {
+                continue;
+            }
+            let panes = program.materialize_panes();
+            let pair = panes
+                .pairs
+                .last()
+                .expect("the operator pane pair is the last one");
+            for (ids, what) in &writers {
+                let attributed = ids.iter().any(|id| !pair.map.downstream(id).is_empty());
+                assert!(
+                    attributed,
+                    "{name}: no operator attributes to anything inside {what}, so the whole \
+                     transaction resolves to its binding — `build_commit_store` needs its \
+                     per-writer recording",
+                );
+            }
+        }
+    }
+
 
     /// Rough compile-time and retained-memory sanity for pane capture. Ignored
     /// by default — it is a measurement, not an assertion.

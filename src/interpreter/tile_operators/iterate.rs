@@ -28,7 +28,7 @@ impl IterateExtent {
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[]),
             extent,
         }
     }

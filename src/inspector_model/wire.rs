@@ -589,7 +589,7 @@ impl InspectorPayload {
 mod tests {
     use super::*;
     use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
-    use crate::ccl::panes::PANES;
+    use crate::ccl::panes::{PANES, PaneKind};
     use crate::interpreter::Consumer;
     use indoc::indoc;
     use std::collections::{HashMap, HashSet};
@@ -688,8 +688,14 @@ mod tests {
             let payload = InspectedProgram::new(&prog).build_payload("test");
 
             let ids: Vec<&str> = payload.panes.iter().map(|s| s.id).collect();
-            let declared: Vec<&str> = PANES.iter().map(|p| p.name).collect();
-            assert_eq!(ids, declared, "panes are `PANES`, in order");
+            // Every pane this layer renders, which is the `PaneKind::Ir` ones.
+            // The operator pane is declared and folded but not yet on the wire.
+            let declared: Vec<&str> = PANES
+                .iter()
+                .filter(|p| p.content == PaneKind::Ir)
+                .map(|p| p.name)
+                .collect();
+            assert_eq!(ids, declared, "panes are `PANES`' IR entries, in order");
 
             assert_eq!(
                 payload.pane_links.len(),
