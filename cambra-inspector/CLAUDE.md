@@ -23,7 +23,8 @@ as that.
 **What a re-bless pins, beyond the shape.** Each node's `type` is `Display for
 Type`'s rendering — `src/ccl/ty.rs`'s `Serialize` hands `collect_str` that
 string — so the corpus pins the type notation on every node in every pane. A
-literal's singleton spelling is part of that. Changing any of the notation is a
+literal's singleton spelling is part of that, and an operator node's `tiling` is
+`Display for Tiling`'s rendering the same way. Changing either notation is a
 deliberate corpus-wide re-bless.
 
 ## Frontend

@@ -23,12 +23,12 @@ import type { OperatorNode, OperatorPane, Snapshot } from "./types";
 import { fixture, irPaneById, operatorPaneById, stubLayout } from "./__fixtures__/helpers";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
-import udfFanoutJson from "./__fixtures__/udf_fanout.snapshot.json";
+import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 
-// `udf_fanout` is the fixture with a fanned-out graph: three roots (two shared
-// `Memo`s and the sink) and two `share` edges into them. `list_min` is the
-// degenerate one — a single root, all value edges.
-const udfFanout = fixture(udfFanoutJson);
+// `polymorphic` is the fixture with a fanned-out graph: three roots and a
+// `share` edge into one of them. `list_min` is the degenerate one — a single
+// root, all value edges.
+const polymorphic = fixture(polymorphicJson);
 const listMin = fixture(listMinJson);
 
 function mountGraph(snap: Snapshot, paneId: string): {
@@ -86,7 +86,7 @@ describe("OperatorView: the graph as a forest", () => {
 
   it("draws one tree per root", () => {
     for (const [snap, id] of [
-      [udfFanout, "post-conversion"],
+      [polymorphic, "post-conversion"],
       [listMin, "post-conversion"],
     ] as const) {
       const { body, pane } = mountGraph(snap, id);
@@ -101,14 +101,14 @@ describe("OperatorView: the graph as a forest", () => {
   it("draws every node of the graph exactly once", () => {
     // The forest covers the table: a node reachable only through a share edge
     // is a root of its own, so nothing is dropped and nothing is duplicated.
-    const { body, pane } = mountGraph(udfFanout, "post-conversion");
+    const { body, pane } = mountGraph(polymorphic, "post-conversion");
     expect(nodeRows(body).map(rowNodeId).sort((a, b) => a - b)).toEqual(
       pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b),
     );
   });
 
   it("shows an operator's tiling and a boundary node's absence of one", () => {
-    const { body, pane } = mountGraph(udfFanout, "post-conversion");
+    const { body, pane } = mountGraph(polymorphic, "post-conversion");
     const sink = pane.nodes.find((n) => n.role === "sink")!;
     const operator = pane.nodes.find((n) => n.role === "operator")!;
 
@@ -131,7 +131,7 @@ describe("OperatorView: share edges as reference leaves", () => {
     );
 
   it("renders a share input as an `.op-ref` leaf naming its target", () => {
-    const { body, pane } = mountGraph(udfFanout, "post-conversion");
+    const { body, pane } = mountGraph(polymorphic, "post-conversion");
     const shares = sharers(pane);
     expect(shares.length).toBeGreaterThan(0);
 
@@ -151,7 +151,7 @@ describe("OperatorView: share edges as reference leaves", () => {
   });
 
   it("does not nest the shared subtree under its consumer", () => {
-    const { body, pane } = mountGraph(udfFanout, "post-conversion");
+    const { body, pane } = mountGraph(polymorphic, "post-conversion");
     const [consumer, edge] = sharers(pane)[0];
     const target = pane.nodes.find((n) => n.nodeId === edge.id)!;
     // The share target owns inputs of its own; those are what a nested draw
@@ -165,7 +165,7 @@ describe("OperatorView: share edges as reference leaves", () => {
   });
 
   it("selects the target when a reference leaf is clicked", () => {
-    const { store, body, pane } = mountGraph(udfFanout, "post-conversion");
+    const { store, body, pane } = mountGraph(polymorphic, "post-conversion");
     const [, edge] = sharers(pane)[0];
     const selection = watchSelection(store);
 
@@ -181,23 +181,23 @@ describe("OperatorView: the cross-pane link", () => {
   it("a click on an operator row highlights the linked nodes upstream", () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
-    const store = new Store(udfFanout);
+    const store = new Store(polymorphic);
 
     const graphBody = document.createElement("div");
     container.appendChild(graphBody);
-    const pane = operatorPaneById(udfFanout, "post-conversion");
+    const pane = operatorPaneById(polymorphic, "post-conversion");
     new OperatorView(graphBody, store, pane);
 
     // The pane immediately upstream of conversion — where the operator pane's
     // provenance edges land.
-    const upstream = irPaneById(udfFanout, "post-planning");
+    const upstream = irPaneById(polymorphic, "post-planning");
     const treeBody = document.createElement("div");
     container.appendChild(treeBody);
     new TreeView(treeBody, store, upstream.id, upstream.roots[0]);
 
     const sink = pane.nodes.find((n) => n.role === "sink")!;
     const expected = new Set(
-      udfFanout.paneLinks
+      polymorphic.paneLinks
         .filter((l) => l.from === upstream.id && l.to === pane.id)
         .flatMap((l) => l.edges.filter(([, down]) => down === sink.nodeId).map(([up]) => up)),
     );
