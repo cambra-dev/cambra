@@ -348,7 +348,7 @@ fn refined_add() {
 fn refined_add_let() {
     check_scalar(
         "
-def foo(t: Int) => {Int where _ == 1 ^+ 3}:
+def foo(t: Int) => {Int where _ == 1 ^+ 5}:
     x = 1 ^+ 3
     y = x ^+ 2
     y
