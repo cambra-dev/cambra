@@ -371,6 +371,78 @@ fn for_accumulator_produces_dense_channelize_window() {
     assert_dense_window_sanity("for_accumulator");
 }
 
+/// The operator-pane edge shapes only a store produces, over a fresh dump.
+///
+/// A store is the one construct that closes a cycle and wires an input late, so
+/// `feedback` and `deferred` edges exist nowhere else — and neither does a
+/// store-keyed edge role. Every committed fixture carries `value` and `share`
+/// alone. The renderer draws feedback and deferred each their own way, so
+/// without this nothing checks that either reaches the wire at all.
+///
+/// Structural rather than a fixture, matching the two window checks above: a
+/// transaction program's operator pane is 77 nodes, and pinning its bytes would
+/// re-bless on every change to how a store is built.
+fn assert_store_edge_shapes(example: &str) {
+    let raw = dump(example);
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let pane = v["panes"]
+        .as_array()
+        .expect("panes is an array")
+        .iter()
+        .find(|p| p["kind"] == "operators")
+        .unwrap_or_else(|| panic!("{example}: no operator pane"));
+
+    let mut kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deferred = 0usize;
+    let mut store_keyed = 0usize;
+    for node in pane["nodes"].as_array().expect("nodes is an array") {
+        for edge in node["inputs"].as_array().expect("inputs is an array") {
+            if let Some(kind) = edge["kind"].as_str() {
+                kinds.insert(kind.to_string());
+            }
+            if edge["deferred"] == Value::Bool(true) {
+                deferred += 1;
+            }
+            // A store key is rendered as its `Value`, which quotes a string —
+            // the one edge role that is neither a field name nor a position.
+            if let Some(role) = edge["role"].as_str()
+                && role.starts_with('"')
+            {
+                store_keyed += 1;
+            }
+        }
+    }
+
+    for want in ["value", "share", "feedback"] {
+        assert!(
+            kinds.contains(want),
+            "{example}: the operator pane carries no {want} edge; got {kinds:?}"
+        );
+    }
+    assert!(
+        deferred > 0,
+        "{example}: no edge is deferred, so the `CycleSlot` wiring reached no edge"
+    );
+    assert!(
+        store_keyed > 0,
+        "{example}: no edge carries a store-keyed role"
+    );
+}
+
+/// `txn_multi_read` (no committed fixture) exercises the store-only operator
+/// edge shapes.
+#[test]
+fn txn_multi_read_produces_store_edge_shapes() {
+    assert_store_edge_shapes("txn_multi_read");
+}
+
+/// `for_accumulator` (no committed fixture) exercises the store-only operator
+/// edge shapes.
+#[test]
+fn for_accumulator_produces_store_edge_shapes() {
+    assert_store_edge_shapes("for_accumulator");
+}
+
 /// Every `rewritten.via` a pane of `dump` carries.
 fn dump_vias(example: &str) -> std::collections::HashSet<String> {
     let raw = dump(example);
