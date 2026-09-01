@@ -1,0 +1,41 @@
+# A deadline is a source over transactional state.  `clock.due(deadlines)`
+# yields one element per key whose deadline has passed, so scheduling a timer is
+# a write, rescheduling is a write, and cancelling is a delete — all ordinary
+# transactional mutation.  Cancellation is therefore a transaction and cannot
+# race the fire it cancels, which is the property a separate timer service has
+# to reconstruct.
+#
+# `clock.due` takes the mutable variable by reference, under the same
+# downward-only `Mut(…)` parameter discipline a user function gets: what it
+# watches is the deadline map's history, not a snapshot, and a bare read of a
+# `Txn` variable outside a block is an error.
+#
+# The 24-hour wait is what makes this durable execution rather than a sleep:
+# nothing about the pending cart may live in a worker's memory across it.
+
+import http
+import clock
+
+open_reqs,  open_resps  = http.serve("8080", "POST", "/carts")
+close_reqs, close_resps = http.serve("8080", "POST", "/checkout")
+
+abandon_after = 86400
+
+deadlines: Mut(Map(String, Time), Txn) := []
+
+reminders: Feed({cart: String, at: Time})
+
+for req in open_reqs:
+    with txn = begin():
+        deadlines[req.body.cart] := txn.current_time() + abandon_after
+    open_resps[req.id] = http.ok("open")
+
+for req in close_reqs:
+    with begin():
+        del deadlines[req.body.cart]
+    close_resps[req.id] = http.ok("closed")
+
+for cart in clock.due(deadlines):
+    with txn = begin():
+        reminders << (cart=cart, at=txn.current_time())
+        del deadlines[cart]

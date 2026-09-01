@@ -13,8 +13,11 @@
 
 mod common;
 
+mod abandoned_cart;
 mod arithmetic;
+mod checkout_saga;
 mod discount_contract;
+mod external_call;
 mod fanout;
 mod filter_and_aggregate;
 mod for_accumulator;
@@ -34,4 +37,5 @@ mod refinement;
 mod storefront;
 mod streaming_echo;
 mod txn_kv;
+mod warehouse_export;
 mod while_counter;

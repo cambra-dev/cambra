@@ -10,3 +10,9 @@ docs/Scratch.md
 # Python bytecode from the tooling scripts under .github/scripts/
 __pycache__/
 *.pyc
+
+# The reference app's local state and Python bytecode.
+reference-app/data/
+reference-app/.env
+reference-app/.pytest_cache/
+reference-app/**/*.egg-info/

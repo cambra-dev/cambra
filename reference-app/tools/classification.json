@@ -1,0 +1,302 @@
+{
+  "note": [
+    "Every line of both implementations is assigned exactly one purpose.",
+    "File globs classify whole files; `ranges` overrides a file line-range at a",
+    "time, and count_loc.py reports how many lines came from each mechanism.",
+    "Glob order matters: the first match wins."
+  ],
+  "categories": {
+    "domain": "Business logic: pricing, reservation, the saga's state advances",
+    "serialization": "DTOs, request validation, response mapping, endpoint declaration",
+    "connections": "Pools, clients, and connection lifetime",
+    "schema": "Data model, constraints, hand-written migrations, seed data",
+    "fault-tolerance": "Retries, backoff, timeouts, compensation, timers",
+    "flow-control": "Batching, backpressure, offset and delivery management",
+    "authorization": "Authentication, authorization, policy",
+    "etl": "Data movement and the warehouse: outbox relay, landing, loading, marts",
+    "observability": "Logging, metrics, tracing",
+    "config-infra": "Configuration, compose, images, build and run tooling",
+    "tests-unit": "Unit tests",
+    "tests-integration": "Integration and end-to-end tests",
+    "generated": "Produced by a tool: Alembic autogenerate and its scaffolding",
+    "stubs": "Local stand-ins for external services; excluded from application totals"
+  },
+  "excluded_from_application_total": [
+    "tests-unit",
+    "tests-integration",
+    "stubs"
+  ],
+  "implementations": {
+    "cambra": {
+      "root": "../tests/programs/storefront",
+      "include": [
+        "v2.cambra"
+      ],
+      "force_lang": [
+        "Python,cambra"
+      ]
+    },
+    "conventional": {
+      "root": ".",
+      "include": [
+        "storefront",
+        "migrations",
+        "tests",
+        "ops",
+        "Dockerfile",
+        "Makefile",
+        "docker-compose.yml",
+        "pyproject.toml",
+        "alembic.ini",
+        ".env.example"
+      ],
+      "force_lang": [
+        "INI,example"
+      ]
+    }
+  },
+  "globs": [
+    [
+      "migrations/env.py",
+      "generated"
+    ],
+    [
+      "migrations/script.py.mako",
+      "generated"
+    ],
+    [
+      "migrations/versions/0002_seed_catalog.py",
+      "schema"
+    ],
+    [
+      "migrations/versions/*.py",
+      "generated"
+    ],
+    [
+      "tests/unit/*",
+      "tests-unit"
+    ],
+    [
+      "tests/integration/*",
+      "tests-integration"
+    ],
+    [
+      "tests/*",
+      "tests-integration"
+    ],
+    [
+      "storefront/payments/*",
+      "stubs"
+    ],
+    [
+      "storefront/domain/*",
+      "domain"
+    ],
+    [
+      "storefront/models.py",
+      "schema"
+    ],
+    [
+      "storefront/schemas.py",
+      "serialization"
+    ],
+    [
+      "storefront/api/analytics.py",
+      "etl"
+    ],
+    [
+      "storefront/api/deps.py",
+      "connections"
+    ],
+    [
+      "storefront/api/*",
+      "serialization"
+    ],
+    [
+      "storefront/platform/db.py",
+      "connections"
+    ],
+    [
+      "storefront/platform/bus.py",
+      "connections"
+    ],
+    [
+      "storefront/platform/objectstore.py",
+      "etl"
+    ],
+    [
+      "storefront/platform/observability.py",
+      "observability"
+    ],
+    [
+      "storefront/temporal_app/workflows.py",
+      "fault-tolerance"
+    ],
+    [
+      "storefront/temporal_app/worker.py",
+      "config-infra"
+    ],
+    [
+      "storefront/etl/consumer.py",
+      "flow-control"
+    ],
+    [
+      "storefront/etl/*",
+      "etl"
+    ],
+    [
+      "storefront/outbox_relay.py",
+      "etl"
+    ],
+    [
+      "storefront/tools/*",
+      "config-infra"
+    ],
+    [
+      "storefront/config.py",
+      "config-infra"
+    ],
+    [
+      "ops/*",
+      "config-infra"
+    ],
+    [
+      "Dockerfile",
+      "config-infra"
+    ],
+    [
+      "Makefile",
+      "config-infra"
+    ],
+    [
+      "docker-compose.yml",
+      "config-infra"
+    ],
+    [
+      "pyproject.toml",
+      "config-infra"
+    ],
+    [
+      "alembic.ini",
+      "config-infra"
+    ],
+    [
+      ".env.example",
+      "config-infra"
+    ],
+    [
+      "*/__init__.py",
+      "config-infra"
+    ],
+    [
+      "__init__.py",
+      "config-infra"
+    ]
+  ],
+  "ranges": {
+    "storefront/temporal_app/activities.py": [
+      [
+        1,
+        22,
+        "connections"
+      ],
+      [
+        23,
+        41,
+        "fault-tolerance"
+      ],
+      [
+        42,
+        78,
+        "domain"
+      ],
+      [
+        79,
+        110,
+        "fault-tolerance"
+      ],
+      [
+        111,
+        130,
+        "observability"
+      ]
+    ],
+    "v2.cambra": [
+      [
+        1,
+        34,
+        "domain"
+      ],
+      [
+        35,
+        76,
+        "schema"
+      ],
+      [
+        77,
+        79,
+        "config-infra"
+      ],
+      [
+        80,
+        94,
+        "serialization"
+      ],
+      [
+        95,
+        98,
+        "connections"
+      ],
+      [
+        99,
+        109,
+        "fault-tolerance"
+      ],
+      [
+        110,
+        148,
+        "domain"
+      ],
+      [
+        149,
+        149,
+        "schema"
+      ],
+      [
+        150,
+        196,
+        "domain"
+      ],
+      [
+        197,
+        197,
+        "schema"
+      ],
+      [
+        198,
+        216,
+        "fault-tolerance"
+      ],
+      [
+        217,
+        242,
+        "domain"
+      ],
+      [
+        243,
+        314,
+        "fault-tolerance"
+      ],
+      [
+        315,
+        329,
+        "domain"
+      ],
+      [
+        330,
+        400,
+        "etl"
+      ]
+    ]
+  }
+}

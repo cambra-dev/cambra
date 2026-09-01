@@ -12,8 +12,8 @@ one starts failing), the test goes red and prompts an update.
 ## Running a program manually
 
 Every program in the table below is a runnable `.cambra` file (named
-`program.cambra`, except `storefront`, which has `v0.cambra` and `v1.cambra`
-— the two sides of its version upgrade).  To run one by hand:
+`program.cambra`, except `storefront`, which has `v0.cambra`, `v1.cambra`, and
+`v2.cambra` — a version chain whose diffs are its upgrades).  To run one by hand:
 
 ```bash
 cargo run -- tests/programs/<name>/program.cambra
@@ -63,11 +63,14 @@ HTTP-sink and subprocess utilities).
 
 The gallery's north-star is [`storefront`](../tests/programs/storefront/) —
 one operational application spanning transactions, streaming, analytics,
-and serving, in two versions (`v0.cambra`, `v1.cambra`) whose diff is a
-version upgrade.  Corpus policy: the storefront is **not** staged into
+serving, durable execution, and an ETL-to-warehouse path, in three versions
+(`v0.cambra`, `v1.cambra`, `v2.cambra`) whose diffs are its upgrades.  Corpus
+policy: the storefront is **not** staged into
 progressive versions-as-tests.  Each capability it needs is isolated by a
 small feature-focused satellite program that pins that gap alone
-(`discount_contract`, `nonneg_inventory`, `ledger_balance`, alongside the
+(`discount_contract`, `nonneg_inventory`, `ledger_balance`, and V2's
+`external_call`, `checkout_saga`, `abandoned_cart`, `warehouse_export`,
+alongside the
 earlier north-stars `txn_kv`, `reachability`, and `fanout`).  The
 satellites keep failures legible — one gap, one red test — while the
 storefront keeps the composition honest: features that pass in isolation
@@ -97,7 +100,11 @@ plan and the full dependency map.
 | [discount_contract](../tests/programs/discount_contract/) | Function contract via boundary asserts | `assert` preconditions + postcondition, lift to CCL refinements, call-site discharge | 🚧 blocked | The CHL contract surface (see [the function-contracts Direction note](chl-spec.md#6-types-informal-sketch)). Parse-blocked on `assert`; behind it, the lift itself. Expected `75` once working. |
 | [nonneg_inventory](../tests/programs/nonneg_inventory/) | Stock reservation against a refined store | `Mut(Map(String, {Int where _ >= 0}), Txn)` value refinement, map literal `[k -> v]`, guarded decrement discharging it, `match`/`Option` | 🚧 blocked | The storefront's oversell invariant in isolation — deleting the guard must be a type error. Lex-blocked on the `` ` `` variant tag; behind it, the `->` map entry in the store literal. |
 | [ledger_balance](../tests/programs/ledger_balance/) | Deposit ledger + time-pinned `/balance` view | feed written inside transactions, transaction time on feed elements, `restrict(\e -> e.time < txn.current_time())`, `sum` | 🚧 blocked | Lifts `txn_kv`'s `/stats` idiom from request streams to feeds — `e.time` comes from the feed's transaction-time domain, not the feeder. Lex-blocked on the `\` lambda. |
-| [storefront](../tests/programs/storefront/) | **North-star app**: transactional orders + inventory + contract-checked pricing + time-indexed revenue views, in V0 and V1 | everything the four rows above pin, plus type aliases (`Dollars`/`Qty`/`ItemPricing`/`SKU`), record refinements, a value-dependent key type, `FullMap` total lookups, `static assert`, HTTP-lib validation derived from handler types, `groupby` rollup iterated as `key -> g` entry pairs, map comprehension `[k -> v for …]`, status-code response constructors (`http.ok`/`http.not_found`/`http.conflict`, via `import http`), map-valued `/stats` response, version upgrade | 🚧 blocked | Two sources (`v0.cambra`, `v1.cambra` — the diff is the budgeted-flash-sale upgrade) under one orchestrating test; its `mod.rs` documents the full dependency list. See [the corpus policy above](#north-star-programs-and-corpus-policy). Lex-blocked on the `` ` `` variant tag. |
+| [external_call](../tests/programs/external_call/) | Charge an external payment service | `http.call` keyed outbound call, at-most-once dispatch per key, `match` on the result | 🚧 blocked | The dual of `http.serve` — the first of the two primitives durable execution needs. Blocked at lowering: the `(requests, results)` destructuring is special-cased to `http_serve`. |
+| [abandoned_cart](../tests/programs/abandoned_cart/) | 24-hour cart-abandonment timer with cancellation | `clock.due` over a `Mut(Map(K, Time), Txn)` variable, schedule/cancel as write/delete | 🚧 blocked | The second primitive: a deadline is a source over transactional state, so cancelling cannot race the fire. Blocked at lowering on the method-position call; map-entry deletion (`del m[k]`) has no decided spelling. |
+| [checkout_saga](../tests/programs/checkout_saga/) | Reserve → authorize → compensate | per-key state machine over `Mut(FullMap(K, V), Txn)`, compensation as an ordinary transaction, backoff without a loop | 🚧 blocked | Shows that compensation and retry need no new surface once the two primitives above exist. Blocked at parsing on the `k -> v` entry-pair `for` binder over the result source. |
+| [warehouse_export](../tests/programs/warehouse_export/) | Daily-revenue mart, and the archive to object storage | day-bucketed `groupby` rollup, map comprehension, partitioned `store.parquet` sink | 🚧 blocked | The mart needs no pipeline because there is no boundary; the archive does cross one and is a real gap. Blocked at lowering on the sink constructor; `Time` has no arithmetic for `clock.day`. |
+| [storefront](../tests/programs/storefront/) | **North-star app**: transactional orders + inventory + contract-checked pricing + time-indexed revenue views, plus V2's checkout saga, abandonment timer, and warehouse path, in V0, V1, and V2 | everything the four rows above pin, plus type aliases (`Dollars`/`Qty`/`ItemPricing`/`SKU`), record refinements, a value-dependent key type, `FullMap` total lookups, `static assert`, HTTP-lib validation derived from handler types, `groupby` rollup iterated as `key -> g` entry pairs, map comprehension `[k -> v for …]`, status-code response constructors (`http.ok`/`http.not_found`/`http.conflict`, via `import http`), map-valued `/stats` response, version upgrade, plus V2's `http.call`, `clock.due`, `clock.day`, and `store.parquet` | 🚧 blocked | Three sources (`v0.cambra`, `v1.cambra`, `v2.cambra` — the diffs are the budgeted-flash-sale and durable-execution upgrades) under one orchestrating test; its `mod.rs` documents the full dependency list. `docs/REPORT.md` measures V2 against the same application on a conventional stack. See [the corpus policy above](#north-star-programs-and-corpus-policy). Lex-blocked on the `` ` `` variant tag. |
 
 ## Known issues surfaced by these programs
 
