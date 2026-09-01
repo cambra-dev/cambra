@@ -611,44 +611,22 @@ pub enum Builtin {
     /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
     VariantWrap(FieldKey),
 
-    /// `collection_contains : (𝐼 ⤇ 𝐾) ⇒ (𝐾 ⇒ Bool)` — the **characteristic
-    /// predicate of a collection's outputs**. Applied to a morphism it yields the
-    /// predicate that tests membership in what that morphism produces, so a concrete
-    /// keyed collection's domain is
-    /// `{𝐾 | __elem ▷ ((c ≫ key) ▷ collection_contains)}` — the keys `c ≫ key`
-    /// produces. A member of [`TypeKind::SubtypesOf`](crate::ccl::ty::TypeKind::SubtypesOf) is a
-    /// domain of that shape: the kind is *every* key domain over 𝐾, and one morphism
-    /// names one of them.
+    /// `collection_contains : (𝐼 ⤇ 𝐾) ⇒ (𝐾 ⇒ Bool)` — the **characteristic predicate of a
+    /// collection's outputs**. Applied to a key morphism it yields the predicate testing
+    /// membership in what that morphism produces, which is how a concrete keyed collection
+    /// states its domain (`src/ccl/design/collections.md`, "Representation: the key domain is
+    /// the key morphism's image"). Nothing enumerates the set; the image is tested.
     ///
-    /// **Membership is in the codomain.** The argument is the key morphism, so its
-    /// outputs are the keys and "contains" asks whether a value is among them. Nothing
-    /// enumerates or materializes that set; the image is tested, never built.
+    /// The `⤇` is load-bearing — membership in a collection's outputs is defined only where
+    /// the domain is the data. Unlike the other type-carried builtins this one has an
+    /// [`crate::ccl::infer::OperatorSchemes`] scheme, `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)`, because
+    /// `κ` is shared between the morphism's codomain and the predicate's domain.
     ///
-    /// **Identity is the morphism.** Two key domains are the same type iff they name
-    /// the same morphism, which is what keeps one map's membership proof from
-    /// discharging against another's. Two re-keyings of one source by one key function
-    /// therefore share a domain, as they should.
-    ///
-    /// The key type arrives from **inside** the refinement: the scheme
-    /// `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)` shares `κ` between the morphism's codomain and the
-    /// predicate's domain, so the refinement's base unifies with the keys the morphism
-    /// produces. The `⤇` is load-bearing — membership in a collection's outputs is
-    /// defined only where the domain is the data.
-    ///
-    /// Unlike the other type-carried builtins this one has a
-    /// [`crate::ccl::infer::OperatorSchemes`] scheme, because `κ` is shared across
-    /// positions.
-    ///
-    /// **Never executed.** Membership would be evaluated only at a keyed *lookup*
-    /// (`m[k]` totality) or a membership *filter* (`x in s`), neither of which exists
-    /// yet. Until then it is a *carried* refinement term: planning compiles it to
-    /// point-free form along with every other surviving predicate, so it does appear in
-    /// post-planning types, but it is never lowered to a `Restrict` — `Converse`
-    /// discharges the present-key domain structurally. That makes "no
-    /// `collection_contains` reaches op-conversion" a real invariant rather than a
-    /// coincidence, so op-conversion **asserts** it
-    /// (`debug_assert_no_unexecutable_atoms`) instead of relying on no code path
-    /// picking the predicate up. See `src/ccl/design/collections.md`.
+    /// **Never executed.** Membership would be evaluated at a keyed lookup or an `x in s`
+    /// filter, neither of which exists. Until then it is a carried refinement term: planning
+    /// compiles it to point-free form like any other surviving predicate, but never lowers it
+    /// to a `Restrict`, so no `collection_contains` reaches op-conversion as a term. That
+    /// holds because nothing reifies it, not because a check rejects one that does.
     CollectionContains,
 }
 

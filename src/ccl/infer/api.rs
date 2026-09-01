@@ -2607,7 +2607,7 @@ mod tests {
 
     /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
     /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
-    /// does not inject into `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ Int`
+    /// does not inject into `Σ (𝐷 : UIntRanges). 𝐷 ⤇ Int`
     /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
     /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
     /// witness's type kind through `emit_annotation_predicates`. A conflicting element type is

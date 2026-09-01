@@ -55,26 +55,16 @@ pub(super) fn lower_call(
     };
 
     match name {
-        // groupby(c: I ⤇ A, key: A → K) lowers to a **keyed collection** — a
-        // Map(K, group(k)) over this site's key domain:
+        // groupby(c: I ⤇ A, key: A → K) lowers to a keyed collection over this site's
+        // key domain (`src/ccl/design/collections.md`, "Lowering realization: the key
+        // binder states its domain"):
         //
         //   λ (k : {K | __elem ▷ ((c ≫ key) ▷ collection_contains)}) →
         //     cast(λ i → c(i), {I | key(c(__elem)) == k} ⤇ A)
         //
-        // Two layers realize the keyed Σ (see `src/ccl/design/collections.md`,
-        // "Lowering realization: the key binder states its domain"):
-        //
-        //   * **Inner group** — the cast wraps the unrefined `λ i → c(i)` under a
-        //     function type whose domain carries the partition predicate
-        //     `key(c(__elem)) == k` (element = the implicit REFINEMENT_BINDER,
-        //     capturing `k`). This is the dependent-refinement site, unchanged.
-        //   * **Outer binder** — `k`'s domain is the keys the collection actually has:
-        //     `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`, membership in what the
-        //     key morphism produces. The morphism is the same `c` and `key` the inner
-        //     predicate names, so the domain says what the codomain already says, on its
-        //     own side of the arrow, and the key type resolves from the morphism's
-        //     codomain rather than from outside.
-        //
+        // The inner cast is the dependent-refinement site, unchanged; the outer binder's
+        // domain names the same `c` and `key` the inner predicate does, so the key type
+        // resolves from the morphism's codomain rather than from outside.
         // The arrow is a collection because the `data_fun` annotation says so, which
         // `emit_node` stamps onto the arrow `emit_lambda` builds. Planning rewrites the
         // shape to `Converse`, which discharges the present-key domain: the extraction
@@ -307,33 +297,19 @@ pub(super) fn lower_call(
 }
 
 /// The **present-key domain** of a re-keying: `{𝐾 | __elem ▷ ((c ≫ key) ▷
-/// collection_contains)}` — the keys the key morphism produces.
-///
-/// The domain names the morphism rather than an opaque identity, so two re-keyings
-/// have the same key domain iff they re-key the same source by the same function.
-/// That is what keeps one map's membership proof from discharging against another's,
-/// and it is also what makes such a proof *possible*: an opaque token has no
-/// introduction form, so nothing could ever produce a key at the domain it names.
+/// collection_contains)}` — the keys the key morphism produces, which is how a keyed
+/// collection states its domain (`src/ccl/design/collections.md`, "Representation: the key
+/// domain is the key morphism's image").
 ///
 /// `key` is the [`Type::SharedHole`] naming the key type, written into both the
-/// refinement's base and the morphism's codomain. [`Builtin::CollectionContains`]'s
-/// scheme alone does not pin it: `__elem` binds at the base and is *applied* to the
-/// characteristic predicate, so the scheme's shared variable receives the base as a
-/// **lower bound** rather than being equated with it. A key type contradicting the
-/// morphism's would then join with it instead of conflicting, and `Map(String, _)` over
-/// `Int` keys would be accepted.
+/// refinement's base and the morphism's codomain. The builtin's scheme alone does not pin
+/// it — `__elem` is *applied* to the characteristic predicate, so the shared variable takes
+/// the base as a lower bound only, and `Map(String, _)` over `Int` keys would be accepted.
 ///
-/// The predicate sits in the **function** position of the ordinary bare-predicate
-/// shape `__elem ▷ p`, so every existing predicate mechanism
-/// (`fn_of_bare_predicate`, point-free compilation) handles it with no special case.
-///
-/// Writing this domain down at *lowering* is what lets a keyed collection inject
-/// into a nominal `Map`/`Set`: the structural gate on entering it
-/// ([`keyed_domain_key`](crate::ccl::infer::solver)) runs at constraint-emission
-/// time, so a producer whose key domain only became concrete at coalesce could not
-/// discharge the keyed Σ witness. Every re-keying producer therefore stamps its own
-/// key binder with this (see `src/ccl/design/collections.md`, "Keyed entry needs
-/// the key domain written down at lowering").
+/// Every re-keying producer stamps its own key binder with this, because the gate on
+/// entering a keyed Σ runs at constraint-emission time and a domain that only became
+/// concrete at coalesce could not discharge it (same doc, "Keyed entry needs the key domain
+/// written down at lowering").
 fn present_key_domain(
     collection: &Expr,
     key_fn: &Expr,

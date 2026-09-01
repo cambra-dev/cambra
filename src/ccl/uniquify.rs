@@ -221,7 +221,21 @@ impl Uniquifier {
         // carry refinement predicates whose free variables live in the
         // *enclosing* scope — the scope as of this node, before any binder
         // this node introduces.
-        self.ty(&mut e.ty);
+        //
+        // **A lambda's own arrow is the exception, by the same rule.**
+        // [`crate::ccl::TypedExpr::lambda`] sets the node's type to
+        // `param_ty ⇒ body_ty`, so its codomain is a copy of the body's type and belongs
+        // to the *binder's* scope rather than this one. Its arm walks the two halves each
+        // at its own scope.
+        let lambda = matches!(&e.node, TypedExprNode::Lambda { .. });
+        // Taken out and put back: the arm below matches `e.node` mutably, and the two
+        // halves are walked around the mint that sits between them.
+        let mut e_ty = if lambda {
+            std::mem::replace(&mut e.ty, Type::Hole)
+        } else {
+            self.ty(&mut e.ty);
+            Type::Hole
+        };
         if let Some(ann) = &mut e.user_annotation {
             self.ty(ann);
         }
@@ -244,8 +258,21 @@ impl Uniquifier {
             }
 
             TypedExprNode::Lambda { param, body } => {
+                // The domain half is the param's declared type, so it resolves against the
+                // enclosing scope, alongside `binding_tys`. The codomain half is the body's
+                // type and resolves under the binder. Walking the whole arrow before the
+                // mint decides the codomain's names in the wrong scope — and a predicate is
+                // rebuilt **once**, with every occurrence re-pointed at that rebuild, so a
+                // decision made here is the one the copies visited later under the binder
+                // get too.
+                if let Type::Fun { domain, .. } = &mut e_ty {
+                    self.ty(domain);
+                }
                 self.binding_tys(param);
                 let base = self.bind(param);
+                if let Type::Fun { codomain, .. } = &mut e_ty {
+                    self.ty(codomain);
+                }
                 self.expr(body);
                 self.unbind(base);
             }
@@ -344,6 +371,9 @@ impl Uniquifier {
             // Everything else introduces no binders and no type anchors of
             // its own: plain structural recursion.
             _ => e.walk_children_mut(|c| self.expr(c)),
+        }
+        if lambda {
+            e.ty = e_ty;
         }
     }
 
