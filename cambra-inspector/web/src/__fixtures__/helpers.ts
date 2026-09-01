@@ -4,7 +4,7 @@
 // survive id churn in the compiler.
 
 import { isIrPane } from "../types";
-import type { IrNode, IrPane, PaneEntry, Snapshot } from "../types";
+import type { IrNode, IrPane, OperatorPane, PaneEntry, Snapshot } from "../types";
 import { validateSnapshot } from "../wireValidate";
 
 /**
@@ -43,6 +43,18 @@ export function paneById(snap: Snapshot, id: string): PaneEntry {
 export function irPaneById(snap: Snapshot, id: string): IrPane {
   const pane = paneById(snap, id);
   if (!isIrPane(pane)) throw new Error(`pane ${id} holds an operator graph, not a tree`);
+  return pane;
+}
+
+/**
+ * The operator pane with the given id (throws if absent, or if it holds a
+ * tree). The mirror of `irPaneById`: `OperatorView` and
+ * `serializeOperatorGraph` take an `OperatorPane`, so a test reaching for one
+ * narrows here rather than at each use.
+ */
+export function operatorPaneById(snap: Snapshot, id: string): OperatorPane {
+  const pane = paneById(snap, id);
+  if (isIrPane(pane)) throw new Error(`pane ${id} holds a tree, not an operator graph`);
   return pane;
 }
 
