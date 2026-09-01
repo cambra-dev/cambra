@@ -47,3 +47,7 @@ failed type_error
 # UDF-of-defer: try_lift_defer fires and the lifted feed head keeps its id, plus
 # the two-site channel union channelization builds.
 defer_lift defer_lift
+# One data source read twice: the only fixture with a `Source` node, and so the
+# only one pinning a boundary node's null tiling and a `share` edge to something
+# that is not an operator.
+source_shared source_shared

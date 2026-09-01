@@ -443,6 +443,83 @@ fn for_accumulator_produces_store_edge_shapes() {
     assert_store_edge_shapes("for_accumulator");
 }
 
+/// **One source node per registered source, attributed to every read site.**
+///
+/// The shape decision the source half of the graph rests on: a source read from
+/// several expressions is one node several readers point at, never a node
+/// duplicated per reader — sharing is reified everywhere else in this graph and
+/// the boundary is no exception.
+///
+/// The span count is the assertion that matters. A source node cannot be minted
+/// at the first read site, because its row names every site that reads it and a
+/// row's parents are fixed when its recording closes; `materialize_sources`
+/// mints once the walk is done, for that reason alone. Minting at the first read
+/// site instead would look correct, would keep the node count right, and would
+/// silently attribute the source to one of its readers. Only the span count
+/// catches it.
+#[test]
+fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
+    let raw = dump("source_shared");
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let pane = v["panes"]
+        .as_array()
+        .expect("panes is an array")
+        .iter()
+        .find(|p| p["kind"] == "operators")
+        .expect("source_shared has an operator pane");
+
+    let sources: Vec<&Value> = pane["nodes"]
+        .as_array()
+        .expect("nodes is an array")
+        .iter()
+        .filter(|n| n["role"] == "source")
+        .collect();
+    assert_eq!(
+        sources.len(),
+        1,
+        "source_shared reads one source, so the graph holds one source node; got {}",
+        sources.len()
+    );
+    let source = sources[0];
+    let source_id = source["nodeId"].as_u64().expect("nodeId is a number");
+
+    let readers: Vec<&Value> = pane["nodes"]
+        .as_array()
+        .expect("nodes is an array")
+        .iter()
+        .filter(|n| {
+            n["inputs"]
+                .as_array()
+                .is_some_and(|es| es.iter().any(|e| e["id"].as_u64() == Some(source_id)))
+        })
+        .collect();
+    assert!(
+        readers.len() >= 2,
+        "source_shared reads stdin twice, so at least two operators read the source node; got {}",
+        readers.len()
+    );
+
+    for reader in &readers {
+        for edge in reader["inputs"].as_array().expect("inputs is an array") {
+            if edge["id"].as_u64() == Some(source_id) {
+                assert_eq!(
+                    edge["kind"], "share",
+                    "a source has no single owner, so a read of it is a share edge"
+                );
+            }
+        }
+    }
+
+    let spans = source["spans"].as_array().expect("spans is an array");
+    assert!(
+        spans.len() >= readers.len(),
+        "the source node carries {} span(s) for {} read site(s): it was minted against one \
+         read rather than after the walk, so `also_consumes` reached none of the others",
+        spans.len(),
+        readers.len()
+    );
+}
+
 /// Every `rewritten.via` a pane of `dump` carries.
 fn dump_vias(example: &str) -> std::collections::HashSet<String> {
     let raw = dump(example);

@@ -1,0 +1,3 @@
+tagged = ["> " + line for line in stdin()]
+shouted = [line + "!" for line in stdin()]
+(tagged, shouted)
