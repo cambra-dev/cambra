@@ -3,6 +3,7 @@ use bit_set::BitSet;
 use super::*;
 use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::UnionArm;
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{BaseType, ColumnValue, Consumer, Extent, FunctionDef, Scheduler, Value},
     pretty_graph::VizOptions,
@@ -32,7 +33,7 @@ impl Constant {
         Self {
             value,
             extent,
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[]),
         }
     }
 }
@@ -123,8 +124,8 @@ impl ToScalar {
             )
         });
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
-            base: OperatorBase::new(tiling),
         }
     }
 }
@@ -206,10 +207,10 @@ impl VariantWrap {
             _ => Tiling::Scalar(union_ext),
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
             tag,
             variant_extents,
-            base: OperatorBase::new(tiling),
         }
     }
 }
@@ -425,10 +426,10 @@ impl VariantProject {
             codomain: Box::new(Tiling::Scalar(payload_extent.clone())),
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("scrutinee", &*input)]),
             input,
             tag,
             payload_extent,
-            base: OperatorBase::new(tiling),
         }
     }
 }

@@ -24,6 +24,7 @@ use log::trace;
 pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
     ccl::provenance::NodeId,
+    interpreter::operator_graph::InputEdgeSpec,
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -177,12 +178,27 @@ pub struct OperatorBase {
 }
 
 impl OperatorBase {
-    /// Mint an identity for an operator with the given output tiling.
-    pub(crate) fn new(tiling: Tiling) -> Self {
-        Self {
-            id: NodeId::fresh(),
-            tiling,
-        }
+    /// Mint an identity for an operator, row it against the expression the
+    /// ambient conversion recording names, and record the inputs it holds.
+    ///
+    /// Construction is the recording point because it is the only place every
+    /// operator type passes through: there is no shared constructor, and 80 call
+    /// sites build operators directly. It is also the only point at which an
+    /// edge's kind is known — see [`operator_graph`](crate::interpreter::operator_graph).
+    ///
+    /// State the inputs with [`value`](crate::interpreter::operator_graph::value)
+    /// and its siblings. An input that answers no id is a test double and its
+    /// edge is dropped.
+    pub(crate) fn new<T: ?Sized>(tiling: Tiling, inputs: &[InputEdgeSpec]) -> Self {
+        let id = NodeId::fresh();
+        crate::ccl::provenance::on_mint(id);
+        crate::interpreter::operator_graph::record_operator(
+            id,
+            short_type_name::<T>(),
+            &tiling,
+            inputs,
+        );
+        Self { id, tiling }
     }
 }
 

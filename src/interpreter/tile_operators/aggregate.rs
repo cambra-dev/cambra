@@ -4,6 +4,7 @@ use log::trace;
 use std::collections::HashMap;
 
 use super::*;
+use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
     interpreter::{ColumnValue, Consumer, Scheduler, Value},
@@ -41,8 +42,8 @@ impl Aggregate {
             accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
-            base: OperatorBase::new(tiling),
         }
     }
 }
@@ -180,8 +181,8 @@ impl ExtractAggregate {
             todo!("functions on partial aggregates")
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
-            base: OperatorBase::new(tiling),
             kind,
             only_terminal,
         }
@@ -299,9 +300,9 @@ impl MapExtractAggregate {
             t => panic!("MapExtractAggregate expected SealedFunction input, got {t:?}"),
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
             kind,
-            base: OperatorBase::new(tiling),
         }
     }
 }
@@ -432,9 +433,9 @@ impl MapAggregate {
             }),
         };
         Self {
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
             kind,
-            base: OperatorBase::new(tiling),
         }
     }
 }

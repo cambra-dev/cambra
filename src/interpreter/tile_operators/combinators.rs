@@ -3,6 +3,7 @@ use log::trace;
 use std::{cell::RefCell, collections::HashMap, iter, rc::Rc};
 
 use super::*;
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field},
     pretty_graph::VizOptions,
@@ -35,7 +36,7 @@ impl Converse {
             codomain: domain,
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -259,7 +260,7 @@ impl MapDomain {
             codomain: Box::new(Tiling::Scalar(domain.clone())),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -368,7 +369,7 @@ impl Uncurry {
             codomain: Box::new(Tiling::Scalar(codomain.clone())),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -530,7 +531,10 @@ impl Filter {
     pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("input", &*input), value("predicate", &*predicate)],
+            ),
             input,
             predicate,
         }
@@ -714,7 +718,10 @@ impl MapFilter {
             predicate.tiling()
         );
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(
+                tiling,
+                &[value("input", &*input), value("predicate", &*predicate)],
+            ),
             input,
             predicate,
         }
@@ -852,7 +859,7 @@ impl Restrict {
             codomain: Box::new(Tiling::Scalar(domain_extent)),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new::<Self>(tiling, &[value("predicate", &*predicate)]),
             predicate,
         }
     }

@@ -1728,6 +1728,27 @@ pub(crate) fn enter(named_id: NodeId, label: RewriteLabel, nature: Nature) -> Re
     })
 }
 
+/// Open a recording over the conversion of one expression node, for the whole
+/// extent of that node's conversion including its children.
+///
+/// The sibling of [`enter`] for a phase that walks rather than rewrites, and the
+/// difference is which of the two contracts holds. `enter`'s says to open it
+/// *after* recursing into children, because a rewrite that adopts a callee's
+/// products has attributed them to the wrong node. Operator conversion has no
+/// such hazard: every frame of the walk opens one of these, so a nested frame's
+/// recording is innermost while it runs and [`on_mint`] attaches to that one.
+/// What reaches this recording is exactly what the frame minted outside its
+/// children — which is the answer conversion wants, since an operator built after
+/// a child returns belongs to the parent expression.
+///
+/// One consequence to design around rather than fix: an operator minted in a
+/// parent arm *after* a child returns attributes to the parent. A site wanting
+/// finer grain opens its own recording — the commit-store builder does, once per
+/// writer, so a transaction's operators do not all resolve to its binding.
+pub(crate) fn converting(named_id: NodeId) -> RecordingGuard {
+    enter(named_id, "opconv.convert", Nature::Machinery)
+}
+
 /// RAII finalizer for an open recording. Popping and writing on `Drop` is
 /// panic-safe: an unwind through an open recording still pops it, so the stack
 /// is never left corrupt, and writes what was captured before the panic.
