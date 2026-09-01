@@ -1444,13 +1444,7 @@ fn test_const_lifted_arm_is_point_free(#[case] code: &str, #[case] expected: Val
 
 // A `match` in a for-loop body dispatches on `variant_is` guards, so its arms
 // are the boolean-guard `Case` an `if` chain builds and the writer decision
-// merges them the same way (`src/ccl/design/mutability.md`, "A `match` in a
-// for-loop body").
-//
-// Selecting an arm by *reading* it — the fan-out of `variant_project`s a `match`
-// compiles to everywhere else — cannot drive a writer body: the decision selects
-// on a predicate over its whole driver domain, and a projection restricts that
-// domain rather than answering over it.
+// merges them the same way.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(indoc! {"
