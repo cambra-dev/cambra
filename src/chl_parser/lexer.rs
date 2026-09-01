@@ -387,6 +387,10 @@ impl LexError {
 /// `min` pins it. That is what makes `elif` and `else` indent one level in from
 /// the statement and the branch bodies one level further
 /// (`docs/chl-spec.md`, "4.3 Assignment forms").
+///
+/// Telling the two apart is the one place layout reads what a line says rather
+/// than only where it starts: where a block may open mid-line, where the block
+/// began is what decides where it continues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
     /// A line must match this column exactly to continue the block.

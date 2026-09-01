@@ -380,12 +380,6 @@ fn push_binding_into_case(e: &mut Expr) -> Option<Expr> {
                 let branch_body = std::mem::take(&mut br.body);
                 br.body = splice_branch_value(&binding.name, branch_body, body.as_ref().clone());
             }
-            // The `Case` now yields what the continuation yields, not what the
-            // binding bound. A continuation that yields nothing is a statement
-            // chain, and `transform_chain` reads a guard-`Case` as a statement:
-            // put it back in effect position, before the `unit` a chain ends in.
-            // A continuation that yields a value *is* the value, so the `Case`
-            // stands where the `Let` stood.
             case.ty = body.ty.clone();
             if matches!(case.ty, Type::Base(BaseType::Unit)) {
                 Expr::expr_stmt(case, unit_expr())
@@ -424,10 +418,8 @@ fn push_continuation_into_case(e: &mut Expr) -> Option<Expr> {
     let TypedExprNode::ExprStmt { expr: effect, body } = taken.node else {
         unreachable!("guarded by the match above")
     };
-    // The rewrite duplicates the continuation once per branch, so only the
-    // `Case` survives 1:1 — mutated in place, keeping its id, type and
-    // annotation. Every copy of the continuation is a mint standing in for the
-    // `ExprStmt` being dissolved, which is what the recording names.
+    // Recorded as `push_binding_into_case` does, the `ExprStmt` standing in for
+    // the `Let` as the node being dissolved.
     let pushed = {
         let _g = provenance::enter(
             stmt_id,

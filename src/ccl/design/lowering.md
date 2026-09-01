@@ -149,31 +149,6 @@ and the one-line `match` ([chl-spec.md](../../../docs/chl-spec.md#the-one-line-f
 `lower_final_stmt`, so a block right-hand side lowers to the `Case` its
 tail-position and ternary counterparts already produce and adds no IR node.
 
-`lower_block_value` is the single entry point, and it takes the enclosing
-scope. That scope decides what a name in the block means: `x := e` writes a
-variable when `x` is bound above the block and introduces one when it is not,
-and a `for` inside a branch reads the same scope to tell a loop-carried
-accumulator from a branch-local (`find_mutation_loop_vars`). Every position that
-assigns carries it. A statement block carries it as `preceding` and
-`outer_bindings`; a for-loop body carries the names bound above the loop, in
-`ForSite`; a `with begin():` block carries the names bound above the
-transaction, through `lower_tx_block`.
-
-The one-line `match` passes an empty scope, and is the one position that can.
-Its arms are expressions
-([chl-spec.md](../../../docs/chl-spec.md#the-one-line-form), "The one-line
-form"), so no statement, and so no name, is bound inside it for a scope to
-disambiguate.
-
-### A write in a branch leaves lowering off the statement spine
-
-Lowering emits a block right-hand side's `Case` where the assignment stood, so
-a `MutWrite` in one of its branches sits in a `Let`'s bound expression rather
-than on the statement spine the mutability phases read. Lowering does not move
-it: the phases own that normalization, and they own it for the writes inlining
-already buries there. `push_bindings_into_writing_cases` pushes the binding and
-the continuation into the branches.
-
 ## Variants and match
 
 Surface variants ([chl-spec.md](../../../docs/chl-spec.md#315-variant-constructors) §3.15, [§4.10](../../../docs/chl-spec.md#410-match--tag-dispatch)) add **no IR node**. Both halves already existed for the conditionals stack: `match` is the surface for a concept the IR already had.

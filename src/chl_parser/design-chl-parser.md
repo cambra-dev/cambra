@@ -63,36 +63,6 @@ A layout post-pass then walks that stream and:
 `InconsistentIndent` is a hard error: dedenting to an indent level that
 never appeared on the stack (e.g. `0 → 4 → 2`) is rejected at lex time.
 
-#### A block right-hand side opens a level of its own
-
-A stack entry is a column a line returns to in order to continue the block that
-opened it, and for a block whose header starts its own line that column is the
-line's — `elif` returns to the column the `if` sits at, already on the stack as
-the enclosing level. A block standing on the right of an assignment has no such
-column: its header sits mid-line, and the statement's column belongs to the
-statement.
-
-So it opens an entry with no column yet — `Level::Pending`, carrying the
-statement's column as the floor a continuation must clear — and the first line
-to dedent into it fixes the column for the rest of the chain. That is the rule
-[chl-spec.md](../../docs/chl-spec.md#43-assignment-forms), "4.3 Assignment
-forms" states as one indent in for the chain and one further for the bodies.
-
-The layout pass tells the two apart by the first token of the statement whose
-line ends in `:`. It reads the logical line: a bracketed header wraps onto
-further physical lines, and both the keyword test and the floor belong to the
-statement that opened the block, not to the line the `:` lands on. This is the
-one place layout depends on what a line says rather than only on where it
-starts, and it is intrinsic: where a block may open mid-line, where the block
-began is what decides where it continues.
-
-A level opened this way emits no `Indent` — no line indented onto it — but its
-`Dedent` closes it like any other, so a block right-hand side ends with one
-`Dedent` more than the blocks inside it opened. `block_value` consumes that one.
-It is also what rejects a chain written at the statement's own column: that
-spelling closes the level early and leaves the `Dedent` for a parser that has
-nothing to do with it.
-
 ### Stage 2 — Parser (`parser.rs`)
 
 A chumsky combinator parser consumes the layout-resolved token stream and
