@@ -1518,18 +1518,9 @@ fn transform_chain(
         }
         // A statement-position tag-`Case` (``match m: case `t(w): acc += e``,
         // lowered by `lower_loop_body_chain`). Rewrite it into the guard-`Case`
-        // the arm below already merges into a writer decision, and re-enter.
-        //
-        // Selecting an arm by reading it — the fan-out of `variant_project`s a
-        // `match` compiles to everywhere else — cannot drive a writer body: the
-        // decision selects on a predicate over its whole driver domain, and a
-        // projection restricts that domain rather than answering over it.
-        // `variant_is` answers every position, so the arms become ordinary
-        // boolean guards and `synthesize_arm_predicate` gives each its
-        // first-match predicate, exactly as for an `elif` chain.
-        // The payload stays a projection, bound at the head of its arm where
-        // `decision_writes` inlines it. See `src/ccl/design/mutability.md`,
-        // "A `match` in a for-loop body".
+        // the arm below already merges into a writer decision, and re-enter. The
+        // payload stays a projection, bound at the head of its arm where
+        // `decision_writes` inlines it.
         TypedExprNode::ExprStmt { expr: effect, body }
             if matches!(
                 &effect.node,
@@ -1842,13 +1833,16 @@ fn conditional_decision(
 }
 
 /// Rewrite a tag-dispatching `Case` into the boolean-guard `Case` a writer
-/// decision is built from.
+/// decision is built from ([`Builtin::VariantIs`](crate::ccl::Builtin::VariantIs)
+/// for why the guard is a total test rather than a projection).
 ///
 /// Each arm's `Pattern` becomes a `variant_is(tag)` guard over the scrutinee and
 /// a `let` binding its payload to the same arm's `variant_project(tag)`, so the
 /// arm reads as `if` does. A `match` without a `case _:` arm gains the trailing
 /// `true → unit` carry every lowered guard-`Case` ends in — the position where
-/// the accumulators keep their previous value.
+/// the accumulators keep their previous value. The arms partition the tags, so
+/// the decision commits at every position where a guard-`Case` leaves the
+/// changelog sparse.
 ///
 /// The scrutinee is duplicated once per arm rather than bound: a `let` around
 /// the `Case` would put its name in the write set, where it escapes the writer

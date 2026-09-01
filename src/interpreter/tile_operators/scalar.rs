@@ -368,11 +368,6 @@ impl TileProducer for VariantWrapProducer {
 /// step. There is no separate boolean `Restrict` and no tag-discriminating
 /// `Predicate`.
 ///
-/// The projection **narrows** the domain but preserves keys — output key `d` is
-/// scrutinee key `d` — so a domain release, which names keys rather than a
-/// count, forwards to the scrutinee verbatim. That is what lets it sit inside an
-/// induction writer body, whose driver reclaims the prefix it has consumed.
-///
 /// A domain-level `Restrict` could not express this anyway: the tag lives in the
 /// scrutinee's *codomain* (the union value), not its domain, and `Restrict`
 /// consumes a boolean-producing operator over the domain.
@@ -572,19 +567,9 @@ impl TileProducer for VariantProjectProducer {
 /// stream carries the arm named `c`.
 ///
 /// The **total** counterpart of [`VariantProject`]: same scrutinee, same domain
-/// out as in, `true` on the rows the arm holds and `false` on the rest. Reading
-/// an arm is the tag restriction, so dispatching a `match` needs no test at all
-/// where an arm may narrow its domain — a fan-out of projections re-totalled by
-/// a flat [`UnionOperator`]. This exists for the position that takes a boolean
-/// instead.
-///
-/// An induction writer decision selects on a predicate over its whole driver
-/// domain: the commit selector is a disjunction of the arms' guards, and each
-/// guard is complemented against the ones before it into a first-match
-/// predicate. A projection restricts that domain rather than answering over it,
-/// so it cannot stand there. A total test answers every position, which is what
-/// lets a `match` in a for-loop body ride the same first-match `Case` an `if`
-/// chain does.
+/// out as in, `true` on the rows the arm holds and `false` on the rest. Why a
+/// total test rather than a projection is on
+/// [`Builtin::VariantIs`](crate::ccl::Builtin::VariantIs).
 ///
 /// **An absent arm is not an error** — it answers `false` everywhere, matching
 /// [`VariantProject`]'s empty projection on a width-subtype scrutinee.

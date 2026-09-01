@@ -633,40 +633,6 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
-### A `match` in a for-loop body
-
-`lower_loop_body_chain` lowers a statement `match` in a loop body to a scrutinee-`Case`, sharing the
-tag rules and `Pattern` construction with every other `match` through `lower_match_over`, and
-`transform_chain` reads it: each accumulator's value after the `match` is a `Case` over the same
-scrutinee, one arm per path, which the chain carries as its read-your-writes value. A `match` so
-compiled commits at every position and writes the entering value on the arms that do not write —
-dense where a guard-`Case` leaves the changelog sparse, and correct for the same reason the
-guard-`Case`'s carry arm is.
-
-A `yield` or `<<` inside an arm is rejected at lowering: a conditional feed rides its path's
-predicate as a `to_<defer>__fire` gate, and an arm is selected by its tag rather than by a
-predicate.
-
-`tag_case_to_guard_case` then rewrites it into the boolean-guard `Case` the writer decision is built
-from: each arm's `Pattern` becomes a `variant_is(tag)` guard over the scrutinee and a `let` binding
-its payload to that arm's `variant_project(tag)`, and a `match` without a `case _:` arm gains the
-trailing `true → unit` carry. From there `synthesize_arm_predicate` gives each arm its first-match
-predicate exactly as it does for an `elif` chain, and nothing about the decision is
-`match`-specific.
-
-**Why not select by reading the arm.** Everywhere else a `match` compiles to a fan-out of
-`variant_project`s re-totalled by a flat union — reading an arm *is* the tag restriction, so no test
-is needed. A writer decision takes a boolean at every position instead: its commit selector is a
-disjunction of the arms' guards, and `synthesize_arm_predicate` complements each guard against the
-ones before it. Both are operations on a predicate over the whole driver domain, and a projection
-restricts that domain rather than answering over it. `variant_is` answers the same question
-**totally**, one `Bool` per driver position, which is what the decision consumes.
-
-An arm reading its payload projects it out of the scrutinee, inside the writer body. That works for
-a separate reason: the projection narrows the domain but preserves keys, so a domain release — which
-names keys rather than a count — forwards to the scrutinee verbatim, and the projection sits inside
-a writer body like any other operator.
-
 ## Worked example
 
 A transactional mutable variable and an induction counter shared across two HTTP endpoints:

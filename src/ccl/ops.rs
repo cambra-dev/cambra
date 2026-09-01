@@ -608,15 +608,13 @@ pub enum Builtin {
     ///
     /// Reading an arm *is* the tag restriction, so a `match` compiled as a
     /// fan-out of projections needs no predicate — but an induction writer
-    /// decision selects on a predicate
-    /// over its whole driver domain: its commit selector is a disjunction of the
-    /// arms' guards, and each guard is complemented against the ones before it
-    /// into a first-match predicate. A projection restricts that domain rather
-    /// than answering over it, so it cannot stand there. A total boolean test
-    /// answers every position, so a `match` in a for-loop body dispatches on
-    /// `variant_is` guards and rides the same first-match `Case` machinery an
-    /// `if` chain does
-    /// (`src/ccl/design/mutability.md`, "A `match` in a for-loop body").
+    /// decision selects on a predicate over its whole driver domain: its commit
+    /// selector is a disjunction of the arms' guards, and each guard is
+    /// complemented against the ones before it into a first-match predicate. A
+    /// projection restricts that domain rather than answering over it, so it
+    /// cannot stand there. A total boolean test answers every position, so a
+    /// `match` in a for-loop body dispatches on `variant_is` guards and rides
+    /// the same first-match `Case` machinery an `if` chain does.
     ///
     /// **A tag the scrutinee does not carry is not an error** — it answers `false`
     /// everywhere, matching [`Self::VariantProject`]'s empty projection.

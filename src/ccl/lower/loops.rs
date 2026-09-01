@@ -294,7 +294,7 @@ fn in_loop_mut_var_error(span: Span, name: &str) -> LoweringError {
 /// A conditional feed rides its path's predicate as a `to_<defer>__fire` gate,
 /// and a `match` arm has no predicate to ride: it is selected by its tag, which
 /// the writer decision reads as a `Case` over the scrutinee rather than as a
-/// boolean (`src/ccl/design/mutability.md`, "A `match` in a for-loop body").
+/// boolean.
 fn feed_in_match_arm_error(span: Span) -> LoweringError {
     LoweringError::unsupported(
         span,
@@ -1022,8 +1022,7 @@ fn lower_loop_body_chain(
             // ``match m: case `tag(w): …`` — tag dispatch over a conditional
             // write path, the `match` counterpart of the `if` below. Every arm
             // is a write path; there is no complement, because the arms
-            // partition the scrutinee's tags. See
-            // `src/ccl/design/mutability.md`, "A `match` in a for-loop body".
+            // partition the scrutinee's tags.
             ChlStmt::Match { scrutinee, arms } => {
                 if let Some(bad) = arms
                     .iter()
