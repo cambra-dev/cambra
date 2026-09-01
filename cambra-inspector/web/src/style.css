@@ -292,6 +292,33 @@ body {
   font-size: 11px;
   opacity: 0.85;
 }
+/* An operator pane's share and feedback edges: a leaf naming its target rather
+   than a subtree, since the target is drawn once at its own root. Dimmed so the
+   value edges — the child relation the eye follows — stay dominant. */
+.op-ref .node-label {
+  font-weight: 400;
+  opacity: 0.8;
+}
+/* A value edge wired after its consumer was constructed. Ownership is exclusive
+   either way, so the row nests normally and the marker is all that differs. */
+.op-deferred {
+  color: var(--edge);
+  font-size: 10px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 0.2em;
+  opacity: 0.75;
+}
+.op-ref-arrow {
+  color: var(--edge);
+  padding-right: 0.15em;
+}
+/* A feedback edge closes a cycle, which is the one thing in the graph a reader
+   cannot infer from the indentation. */
+.op-ref-feedback .op-ref-arrow {
+  color: var(--type);
+  font-weight: 600;
+}
 .tree-children {
   margin-left: 1.1em;
   border-left: 1px dotted var(--border);

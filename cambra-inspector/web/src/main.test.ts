@@ -141,33 +141,41 @@ describe("describePanes", () => {
   const listMin = fixture(listMinJson);
   const failed = fixture(failedJson);
 
-  it("names the source pane first, then one pane per tree pane in order", () => {
+  it("names the source pane first, then one pane per pipeline pane in order", () => {
     // Source-first is not cosmetic: it is mounted first, so the CodeMirror
     // editor lays out against a panel that is briefly the whole row.
     const store = new Store(listMin);
     expect(describePanes(store).map((p) => p.id)).toEqual([
       "source",
-      ...store.panes.filter(isIrPane).map((s) => s.id),
+      ...store.panes.map((s) => s.id),
     ]);
   });
 
-  it("leaves the operator pane off the roster while it has no renderer", () => {
-    // The pane is on the wire and in the store; what it is missing is a view.
-    // `TreeView` walks one root and a node's children, and an operator graph
-    // has several roots and inputs, so a half-rendered tree is the failure this
-    // exclusion prevents.
+  it("puts the operator pane last on the roster and mounts its renderer", () => {
+    // The operator pane is a pane like any other now that `OperatorView` draws
+    // the graph: it holds the roster slot its pipeline position gives it, which
+    // is last — conversion is the most downstream pane.
     const store = new Store(listMin);
     const operatorPanes = store.panes.filter((pane) => !isIrPane(pane));
-    const roster = describePanes(store).map((p) => p.id);
-    for (const pane of operatorPanes) expect(roster).not.toContain(pane.id);
-    expect(roster.length).toBe(1 + store.panes.length - operatorPanes.length);
+    expect(operatorPanes.length).toBe(1);
+
+    const roster = describePanes(store);
+    expect(roster[roster.length - 1].id).toBe(operatorPanes[0].id);
+
+    // The descriptor mounts a real view, not an empty body.
+    const body = document.createElement("div");
+    document.body.appendChild(body);
+    roster[roster.length - 1].mount(body);
+    expect(body.querySelectorAll(".tree-row").length).toBe(operatorPanes[0].nodes.length);
   });
 
-  it("badges the holes pane and nothing else", () => {
+  it("badges the holes pane and the operator pane", () => {
     const panes = describePanes(new Store(listMin));
     const badged = panes.filter((p) => p.badge !== undefined);
-    expect(badged.map((p) => p.id)).toEqual(["pre-inference"]);
-    expect(badged[0].badge).toBe("pre-inference (holes)");
+    expect(badged.map((p) => [p.id, p.badge])).toEqual([
+      ["pre-inference", "pre-inference (holes)"],
+      ["post-conversion", "dataflow"],
+    ]);
   });
 
   it("replaces the IR panes with a diagnostics pane on a degraded snapshot", () => {

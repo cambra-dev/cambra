@@ -30,6 +30,7 @@ import {
 } from "./paneVisibility";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
+import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
 import { validateSnapshot } from "./wireValidate";
 import { isIrPane } from "./types";
@@ -151,8 +152,8 @@ export interface PaneDescriptor {
 
 /**
  * Every pane the layout renders, in order: the source pane, then one per
- * tree-shaped pipeline stage — or, on a degraded snapshot, a single diagnostics
- * pane. The operator pane is not on the roster: nothing here can draw a graph.
+ * pipeline stage — or, on a degraded snapshot, a single diagnostics pane. A
+ * stage is drawn by `TreeView` or, for the operator graph, by `OperatorView`.
  *
  * Source is first and mounted first, and that ordering is load-bearing:
  * CodeMirror lays out against its panel's size, so the editor is built while
@@ -195,10 +196,21 @@ export function describePanes(store: Store): PaneDescriptor[] {
   }
 
   for (const pane of store.panes) {
-    // The operator pane holds a dataflow graph: several roots, and inputs rather
-    // than children. `TreeView` draws neither, so the pane stays off the roster
-    // until it has a renderer of its own.
-    if (!isIrPane(pane)) continue;
+    // The operator pane holds a dataflow graph — several roots, and inputs
+    // rather than children — so it gets its own view.
+    if (!isIrPane(pane)) {
+      panes.push({
+        id: pane.id,
+        label: pane.label,
+        badge: "dataflow",
+        paneClass: "tree",
+        copyText: () => serializeOperatorGraph(pane),
+        mount: (body) => {
+          if (pane.nodes.length > 0) new OperatorView(body, store, pane);
+        },
+      });
+      continue;
+    }
     // Holes-kind panes (still hole-typed, pre-inference) carry a badge
     // mirroring the static-no-values one.
     const holes = pane.kind === "holes";
