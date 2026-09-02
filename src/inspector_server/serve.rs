@@ -1,16 +1,16 @@
-//! The user-facing inspector HTTP server.
+//! The inspector's data endpoints: a read-only `tiny_http` server that answers
+//! with JSON and never with a page. What a user looks at is the frontend, which
+//! fetches these two routes.
 //!
-//! A small, read-only `tiny_http` server that serves a single, **statically
-//! compiled** program: `code` is compiled exactly *once* at startup and the
-//! response bodies are rendered then and reused for every request. There is no
-//! per-request recompilation, no mutation endpoint, no live ticks — M1 is "the
-//! program, no execution".
+//! One **statically compiled** program is served. `code` is compiled once at
+//! startup and the response bodies are rendered then and reused for every
+//! request, so there is no per-request recompilation, no mutation endpoint, and
+//! no live ticks.
 //!
-//! This is a *sibling* of [`crate::web_inspector`]'s internal dev dashboard,
-//! not an extension of it: that one serves live runtime state on a background
-//! thread; this one serves the read-only payload — one pane per pipeline stage
-//! — to the embedded CodeMirror frontend. They share only the `tiny_http`
-//! idiom.
+//! This is a sibling of [`crate::web_inspector`]'s internal dev dashboard, not
+//! an extension of it: that one serves live runtime state on a background
+//! thread; this one serves the read-only payload, one pane per pipeline stage.
+//! They share only the `tiny_http` idiom.
 //!
 //! # Routes
 //!

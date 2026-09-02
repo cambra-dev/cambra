@@ -14,7 +14,6 @@
 mod common;
 
 mod arithmetic;
-mod defer_fanin;
 mod defer_generators;
 mod defer_lift;
 mod discount_contract;
@@ -31,18 +30,15 @@ mod inner_join;
 mod join_then_groupby;
 mod ledger_balance;
 mod list_min;
-mod mutation_loop;
 mod nonneg_inventory;
 mod polymorphic;
 mod prefix_lines;
 mod reachability;
 mod refinement;
-mod scopes;
 mod storefront;
 mod streaming_echo;
 mod txn_kv;
 mod txn_multi_read;
 mod type_error;
 mod udf_closure;
-mod udf_fanout;
 mod while_counter;

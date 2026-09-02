@@ -1,4 +1,5 @@
 dup = \x -> (x, x)
 a = dup(1)
-b = dup(2 == 2)
+b = dup(2)
+c = dup(2 == 2)
 a

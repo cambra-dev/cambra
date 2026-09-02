@@ -1,14 +1,17 @@
 //! Two `yield` generators feeding one explicit `defer()` channel from two
-//! sites — the generator route to [`super::defer_fanin`]'s channel union.
+//! sites.
 //!
 //! Currently rejected: after lambda elimination the `zip`-of-generators result
 //! is typed as a compute function (`⇒`) where the letrec binder wants a data
 //! collection (`⤇`), and the two kinds are incomparable. Expected `16` once the
-//! kinds agree.
+//! kinds agree. This is the gallery's record of that limitation — no other
+//! program reaches it — and the one entry in `tests/inspector_goldens.rs`'
+//! `DUMP_PANICS`, since a program that does not compile has no payload to
+//! validate.
 //!
-//! The needle names the *mismatch*, not the check that reports it. Which
-//! checkpoint fires first depends on the build: the always-on pass-boundary wall
-//! says "post-lambda-elim produced an invalid tree", while under
+//! The needle names the mismatch, not the check that reports it. Which
+//! checkpoint fires first depends on the build: the always-on pass-boundary
+//! check says "post-lambda-elim produced an invalid tree", while under
 //! `--features deep-typecheck` (which CI sets via `DEEP_TYPECHECK=1`) the
 //! per-operation typecheck reaches it earlier and says "Failed post-transform
 //! typecheck". Both render the same incomparable-kinds sentence, so pinning that

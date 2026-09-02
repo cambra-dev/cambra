@@ -1346,7 +1346,7 @@ x
     // These pin which source construct maps to which IR node, over two programs
     // whose lowering produces synthetic wrapper chains: a `yield` generator and
     // a `defer()`/`<<` feed pipeline. They mirror the manual web-validation
-    // gallery programs (`tests/programs/defer_fanin/`, `generator_pipeline/`) but
+    // gallery programs (`tests/programs/defer_lift/`, `generator_pipeline/`) but
     // inline the source so the flow is exercised without the front end.
     //
     // The question they ask is the consumer's — "what is at this span" — and it

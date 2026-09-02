@@ -1,10 +1,14 @@
-//! Let-polymorphism and the monomorphization fan-out. `dup` is used at two
-//! distinct types, so inference specializes it into two clones.
+//! One lambda applied at four sites, three at `Int` and one at `Bool` — the two
+//! duplication mechanisms in one program.
 //!
-//! The pre-inference body `(x, x)` carries a hole that resolves downstream to a
-//! *set* of tuple types (`Int` and `Bool`); that fan-out is what makes the
-//! inspector's `paneLinks` carry a non-identity edge, pinned by the
-//! `polymorphic` snapshot fixture.
+//! Inference specializes `dup` per type, so the two argument types make two
+//! clones; `inline` then duplicates each specialization's body per call site,
+//! and the `Int` specialization has three of them — one copy keeps the input
+//! ids, the rest are freshened `Replicated` copies tagged `Derived { via:
+//! Inline }`. Both fan-outs land in the `post-inference → post-channelize`
+//! `paneLinks` window as non-identity edges, pinned whole by the `polymorphic`
+//! snapshot fixture and asserted structurally by
+//! `tests/inspector_goldens.rs`.
 
 use super::common::expect_scalar;
 

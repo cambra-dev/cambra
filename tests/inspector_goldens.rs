@@ -21,22 +21,22 @@
 //! 3. every committed fixture is a structurally-valid payload, not merely one
 //!    that equals a fresh dump of itself;
 //! 4. the corpus programs still trigger the passes they were chosen to pin;
-//! 5. **every** program in the gallery — not just the six with fixtures —
+//! 5. **every** program in the gallery — not just the five with fixtures —
 //!    produces a payload the wire validator accepts;
 //! 6. two compiles of one program in one process differ in id numbering and
 //!    nothing else.
 //!
 //! Ratchets 5 and 6 are what keeps the corpus bounded. Pinned bytes are the
-//! narrowest of the six and the only one that costs a re-bless, so a program
-//! added for backend coverage belongs in ratchet 5, which reads every gallery
-//! source and commits nothing.
+//! narrowest of the six ratchets and the only one that costs a re-bless, so a
+//! program added for backend coverage belongs in ratchet 5, which reads every
+//! gallery source and commits nothing.
 //!
-//! Two programs — `txn_multi_read` and `mutation_loop` — are in the corpus
+//! Two programs — `txn_multi_read` and `for_accumulator` — are in the corpus
 //! without a committed fixture. Their payloads run to five figures of lines
 //! each, which is a document nobody reads and a re-bless nobody can review, so
 //! what they are here for is asserted structurally over a fresh dump instead:
 //! the dense channelize window, and the `Transact`/`Letrec` rewrite tags that
-//! reach the wire from no other program.
+//! reach the wire.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,7 +131,7 @@ fn snapshot_dumps_are_cross_process_deterministic() {
     // this test exists to catch. They carry no fixture, so the manifest loop
     // above does not reach them.
     assert_dumps_agree("txn_multi_read");
-    assert_dumps_agree("mutation_loop");
+    assert_dumps_agree("for_accumulator");
 }
 
 /// Two spawns of one program produce byte-identical dumps.
@@ -264,15 +264,14 @@ fn committed_fixtures_match_fresh_dumps() {
     }
 }
 
-/// The corpus programs added for the recorder-fixes batch actually exercise
-/// what they were added for, at the wire level: the UDF fan-out program's
-/// `post-inference -> post-channelize` paneLinks window carries a genuine
-/// non-identity (`u != d`) inline fan-out edge — not just the dense self-edges.
-/// Guards against the corpus rotting into programs that no longer trigger the
-/// pass they were chosen to pin.
+/// The corpus programs still exercise what they were chosen for, at the wire
+/// level: `polymorphic`'s `post-inference -> post-channelize` paneLinks window
+/// carries a genuine non-identity (`u != d`) fan-out edge — not just the dense
+/// self-edges. Guards against the corpus rotting into programs that no longer
+/// trigger the pass they were chosen to pin.
 #[test]
-fn udf_fanout_corpus_program_produces_inline_fanout_edges() {
-    let raw = dump("udf_fanout");
+fn polymorphic_corpus_program_produces_fanout_edges() {
+    let raw = dump("polymorphic");
     let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
     let links = v["paneLinks"].as_array().expect("paneLinks is an array");
     let window = links
@@ -285,7 +284,7 @@ fn udf_fanout_corpus_program_produces_inline_fanout_edges() {
             let p = e.as_array().expect("edge is a pair");
             p[0].as_u64() != p[1].as_u64()
         }),
-        "udf_fanout must yield a genuine (u != d) inline fan-out edge in window 2"
+        "polymorphic must yield a genuine (u != d) fan-out edge in window 2"
     );
 }
 
@@ -302,13 +301,13 @@ fn pane_node_ids(pane: &Value) -> std::collections::HashSet<u64> {
 /// Dense-window sanity over a dump's `post-inference → post-channelize` window
 /// — the structural bug-catcher that stands in for a committed fixture on the
 /// two programs whose payloads are too large to commit (`txn_multi_read`,
-/// `mutation_loop`). Mirrors the `udf_fanout` fan-out pattern, strengthened to
+/// `for_accumulator`). Mirrors the `polymorphic` fan-out pattern, strengthened to
 /// what a pinned document would have guaranteed: (a) the window carries genuine
 /// non-identity edges, (b) some upstream node fans out to ≥2 downstream nodes
 /// (the substitution copies these programs were chosen to exercise), and (c)
 /// every edge endpoint is a live node in its pane.
 fn assert_dense_window_sanity(example: &str) {
-    let raw = dump(example); // full wire — the slimmed fixture omits paneLinks
+    let raw = dump(example);
     let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
     let panes = v["panes"].as_array().expect("panes is an array");
     let pane = |id: &str| {
@@ -365,11 +364,11 @@ fn txn_multi_read_produces_dense_channelize_window() {
     assert_dense_window_sanity("txn_multi_read");
 }
 
-/// `mutation_loop` (no committed fixture) exercises the dense channelize-window
-/// fan-out structurally.
+/// `for_accumulator` (no committed fixture) exercises the dense
+/// channelize-window fan-out structurally.
 #[test]
-fn mutation_loop_produces_dense_channelize_window() {
-    assert_dense_window_sanity("mutation_loop");
+fn for_accumulator_produces_dense_channelize_window() {
+    assert_dense_window_sanity("for_accumulator");
 }
 
 /// Every `rewritten.via` a pane of `dump` carries.
@@ -387,14 +386,13 @@ fn dump_vias(example: &str) -> std::collections::HashSet<String> {
     out
 }
 
-/// The two mutability-elimination phases reach the wire, and only these two
-/// programs put them there.
+/// The two mutability-elimination phases reach the wire.
 ///
-/// Both validators pin a `rewritten.via` allowlist. An allowlist rejects a
-/// *new* via on its own, but says nothing when a pinned entry stops being
-/// produced — so a `Transact` or `Letrec` that vanished from the wire, or was
-/// renamed, would leave a dead entry in two vocabularies and fail nothing.
-/// Asserting presence is what an allowlist cannot do.
+/// Both validators pin a `rewritten.via` allowlist. An allowlist rejects a new
+/// via on its own, but says nothing when a pinned entry stops being produced, so
+/// a `Transact` or `Letrec` that vanished from the wire, or was renamed, would
+/// leave a dead entry in two vocabularies and fail nothing. Asserting presence is
+/// what an allowlist cannot do.
 #[test]
 fn the_recurrence_phases_reach_the_wire() {
     let txn = dump_vias("txn_multi_read");
@@ -402,10 +400,10 @@ fn the_recurrence_phases_reach_the_wire() {
         txn.contains("Transact"),
         "txn_multi_read is the only program that tags nodes `Transact`; got {txn:?}"
     );
-    let loop_vias = dump_vias("mutation_loop");
+    let loop_vias = dump_vias("for_accumulator");
     assert!(
         loop_vias.contains("Letrec"),
-        "mutation_loop is the only program that tags nodes `Letrec`; got {loop_vias:?}"
+        "for_accumulator tags nodes `Letrec`; got {loop_vias:?}"
     );
 }
 
@@ -572,7 +570,7 @@ fn every_gallery_program_produces_a_valid_payload() {
 /// carries one would churn on every change to how many variables inference
 /// allocates upstream. No committed fixture carries one today.
 ///
-/// A `?N` on this wire is not itself a defect. `mutation_loop`'s post-inference
+/// A `?N` on this wire is not itself a defect. `for_accumulator`'s post-inference
 /// pane ships `Mut(Int, ?N)` because an induction accumulator's domain is
 /// necessarily `Infer` until the unified phase resolves it — see the transient-
 /// variant table on `Type` in `src/ccl/ty.rs`. Normalizing it here is about the
@@ -658,7 +656,12 @@ fn ids_are_the_only_difference_between_two_compiles() {
     use cambra::ccl::context::{GlobalContext, compile_program};
     use cambra::interpreter::Consumer;
 
-    for example in ["udf_closure", "polymorphic", "udf_fanout", "mutation_loop"] {
+    for example in [
+        "udf_closure",
+        "polymorphic",
+        "defer_lift",
+        "for_accumulator",
+    ] {
         let source = std::fs::read_to_string(repo_root().join(program_path(example)))
             .expect("a corpus program is readable");
         let payload = |name: &str| {
