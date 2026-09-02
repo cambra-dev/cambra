@@ -206,9 +206,12 @@ describe("OperatorView: the cross-pane link", () => {
     const selection = watchSelection(store);
     nodeRow(graphBody, sink.nodeId).click();
 
-    // The clicked row is the operator pane's own anchor.
+    // The clicked row is an anchor. Not the *only* one: an anchor's images
+    // under the pane links are anchors too, and a round trip can bring several
+    // back into this pane, so the row is asserted directly rather than by
+    // taking the first `.selected` in the DOM.
     expect(selection()).toEqual({ kind: "node", paneId: pane.id, nodeId: sink.nodeId });
-    expect(rowNodeId(graphBody.querySelector(".tree-row.selected")!)).toBe(sink.nodeId);
+    expect(nodeRow(graphBody, sink.nodeId).classList.contains("selected")).toBe(true);
 
     // …and every node the link graph reaches upstream is highlighted there.
     const highlighted = new Set(

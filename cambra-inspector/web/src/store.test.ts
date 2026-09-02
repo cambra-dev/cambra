@@ -193,23 +193,82 @@ describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
     expect(downstream.has(copy)).toBe(true);
   });
 
-  it("a source click seeds each pane's tightest node (all panes light up)", () => {
+  it("a click's anchors are the node it resolved to and that node's images", () => {
     const store = new Store(arithmetic);
     const pre = irPaneById(arithmetic, "pre-inference");
     const lit = theNode(pre, "Lit(Int(10))");
 
     store.setSelection({ kind: "source", from: lit.spans[0]!.start, to: lit.spans[0]!.start });
-    const { result, primaryByPane } = store.getResolved();
-    // Every *tree* pane: the seed is a pane's tightest enclosing node at the
-    // offset, which only a tree pane can answer. The operator pane takes no seed
-    // of its own and lights up only where a link reaches it, so its anchor set
-    // is empty and is not pinned here.
+    const { result, primaryByPane, pointedAt } = store.getResolved();
+
+    // The strong region is the token under the caret, not the extent of the
+    // node it resolved to.
+    expect(pointedAt).toEqual({ from: lit.spans[0]!.start, to: lit.spans[0]!.end });
+
+    // Every tree pane lights up — the cross-pane link working.
     const trees = store.panes.filter(isIrPane);
     expect(trees.map((p) => p.id)).toEqual(PANE_IDS.filter((id) => id !== "post-conversion"));
     for (const pane of trees) {
       expect(result.highlightsByPane.get(pane.id)!.size).toBeGreaterThan(0);
-      expect(primaryByPane.get(pane.id)!.size).toBeGreaterThan(0);
     }
+
+    // Anchors are the resolved node and its images, so they appear wherever the
+    // node has one — not only in the pane that answered the position. Every
+    // anchor is also a highlight; the rest of the highlights are traces.
+    let anchored = 0;
+    for (const pane of store.panes) {
+      const anchors = primaryByPane.get(pane.id)!;
+      const highlights = result.highlightsByPane.get(pane.id)!;
+      for (const id of anchors) {
+        expect(highlights, `${pane.id} anchor is a highlight`).toContain(id);
+      }
+      if (anchors.size > 0) anchored += 1;
+      expect(anchors.size).toBeLessThanOrEqual(highlights.size);
+    }
+    expect(anchored).toBeGreaterThan(0);
+  });
+
+  it("a partial drag explains the construct it stopped inside", () => {
+    // A drag rarely lines up with a construct, and the nodes it fully covers
+    // are only part of what the reader is looking at. Stopping part-way through
+    // one traces the construct containing the range, which is what a click
+    // inside that construct already traced — the two gestures explain the same
+    // thing and differ only in what they claim as selected.
+    const store = new Store(arithmetic);
+    const pane = irPaneById(arithmetic, "post-inference");
+    const idx = store.indicesFor("post-inference")!;
+
+    // A node with room to stop inside, and with children to lose.
+    const outer = allNodes(pane)
+      .filter((n) => n.spans[0] !== undefined && n.children.length > 0)
+      .map((n) => n.spans[0]!)
+      .find((sp) => sp.end - sp.start >= 6)!;
+    expect(outer).toBeDefined();
+
+    const partial = { from: outer.start + 1, to: outer.end - 1 };
+    const region = idx.selectionRegion(partial.from, partial.to);
+    // The region is at least the construct, never merely the range.
+    expect(region.from).toBeLessThanOrEqual(partial.from);
+    expect(region.to).toBeGreaterThanOrEqual(partial.to);
+
+    store.setSelection({ kind: "source", from: partial.from, to: partial.to });
+    const { result, primaryByPane, pointedAt } = store.getResolved();
+
+    // Blue is the drag itself, not the construct it widened to.
+    expect(pointedAt).toEqual(partial);
+
+    // Every node the region contains is highlighted, and the ones the drag did
+    // not fully cover are traces rather than anchors.
+    const highlighted = result.highlightsByPane.get("post-inference")!;
+    const anchors = primaryByPane.get("post-inference")!;
+    const covered = new Set(idx.nodesInRange(partial.from, partial.to));
+    for (const id of idx.nodesInRange(region.from, region.to)) {
+      expect(highlighted, `#${id} is highlighted`).toContain(id);
+      if (!covered.has(id)) expect(anchors, `#${id} is a trace`).not.toContain(id);
+    }
+    // Not asserted: that traces exist here. Whether the construct has nodes the
+    // range missed depends on which construct the corpus offers, and the claim
+    // that matters — the region is the construct, not the range — is above.
   });
 
   it("clearing the selection empties the resolved state", () => {

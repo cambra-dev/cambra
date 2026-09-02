@@ -20,6 +20,7 @@ import {
   Decoration,
   type DecorationSet,
   EditorView,
+  drawSelection,
   hoverTooltip,
   lineNumbers,
   type Tooltip,
@@ -79,7 +80,7 @@ export function resolveSourceClick(
   return { kind: "source", from: byte, to: byte };
 }
 
-interface HighlightSpan {
+export interface HighlightSpan {
   from: number;
   to: number;
   primary: boolean;
@@ -90,6 +91,62 @@ const setHighlights = StateEffect.define<HighlightSpan[] | null>();
 
 const primaryMark = Decoration.mark({ class: "cm-sel-node" });
 const linkedMark = Decoration.mark({ class: "cm-link-node" });
+
+type Interval = { from: number; to: number };
+
+/** Overlapping and touching intervals joined into one, ascending. */
+function merge(xs: Interval[]): Interval[] {
+  const out: Interval[] = [];
+  for (const x of [...xs].sort((a, b) => a.from - b.from || a.to - b.to)) {
+    if (x.to <= x.from) continue;
+    const last = out[out.length - 1];
+    if (last && x.from <= last.to) last.to = Math.max(last.to, x.to);
+    else out.push({ from: x.from, to: x.to });
+  }
+  return out;
+}
+
+/** `a` minus `b`, both already merged and ascending. */
+function subtract(a: Interval[], b: Interval[]): Interval[] {
+  const out: Interval[] = [];
+  let j = 0;
+  for (const iv of a) {
+    let from = iv.from;
+    while (j < b.length && b[j].to <= from) j += 1;
+    for (let k = j; k < b.length && b[k].from < iv.to; k += 1) {
+      if (b[k].from > from) out.push({ from, to: Math.min(b[k].from, iv.to) });
+      from = Math.max(from, b[k].to);
+      if (from >= iv.to) break;
+    }
+    if (from < iv.to) out.push({ from, to: iv.to });
+  }
+  return out;
+}
+
+/**
+ * The highlight spans as a **partition** of the text: no offset is covered
+ * twice, and a primary region wins over a linked one.
+ *
+ * The marks are translucent, so a doubly-covered offset paints its colour twice
+ * and reads as a third shade nobody chose. That is not hypothetical: a source
+ * click seeds every pane's tightest node, and the panes disagree about extent —
+ * clicking the `if` in `txn_multi_read` gives `post-inference` the statement and
+ * the two downstream panes the enclosing `with` block, two primary spans
+ * nesting one inside the other. Flattening first is what makes the rendered
+ * shade mean "primary" or "linked" rather than "however many spans happened to
+ * land here".
+ */
+export function flattenHighlights(spans: HighlightSpan[]): HighlightSpan[] {
+  const primary = merge(spans.filter((s) => s.primary));
+  const linked = subtract(
+    merge(spans.filter((s) => !s.primary)),
+    primary,
+  );
+  return [
+    ...primary.map((iv) => ({ ...iv, primary: true })),
+    ...linked.map((iv) => ({ ...iv, primary: false })),
+  ].sort((a, b) => a.from - b.from || a.to - b.to);
+}
 
 const highlightField = StateField.define<DecorationSet>({
   create() {
@@ -102,12 +159,12 @@ const highlightField = StateField.define<DecorationSet>({
         if (!e.value || e.value.length === 0) {
           next = Decoration.none;
         } else {
-          // CodeMirror requires ranges sorted by `from` (ties: startSide).
-          const ranges = e.value
-            .filter((s) => s.to > s.from)
-            .sort((a, b) => a.from - b.from || a.to - b.to)
-            .map((s) => (s.primary ? primaryMark : linkedMark).range(s.from, s.to));
-          next = Decoration.set(ranges, true);
+          // Flattened first, so no offset carries two translucent marks; the
+          // result is already sorted by `from`, which `Decoration.set` needs.
+          const ranges = flattenHighlights(e.value).map((s) =>
+            (s.primary ? primaryMark : linkedMark).range(s.from, s.to),
+          );
+          next = ranges.length === 0 ? Decoration.none : Decoration.set(ranges, true);
         }
       }
     }
@@ -243,6 +300,11 @@ export class SourceView {
     // into this view, and CodeMirror refuses a dispatch made while an update is
     // in progress. The reply carries no selection change, so it does not
     // re-enter this listener.
+    //
+    // A pointer selection is left alone while the button is down: snapping
+    // mid-drag would move the end of the range the reader is still dragging.
+    // `mouseup` below snaps once the gesture is finished. A keyboard selection
+    // has no such window, so it snaps as it arrives.
     const selectionSync = EditorView.updateListener.of((update) => {
       if (!update.selectionSet) return;
       const range = update.state.selection.main;
@@ -255,6 +317,10 @@ export class SourceView {
       doc: snapshot.source.text,
       extensions: [
         lineNumbers(),
+        // CodeMirror draws no caret in non-editable content, so nothing showed
+        // where the reader clicked; `drawSelection` draws both the caret and
+        // the selection itself, and puts their colours under this app's CSS.
+        drawSelection(),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         EditorView.lineWrapping,
@@ -274,45 +340,40 @@ export class SourceView {
   /** Reflect the resolved selection as source-span highlights. */
   private renderSelection(resolved: Resolved): void {
     const spans = resolved.result.sourceSpans;
-    if (spans.length === 0) {
+    const pointedAt = resolved.pointedAt;
+    if (spans.length === 0 && pointedAt === null) {
       this.view.dispatch({ effects: setHighlights.of(null) });
       return;
-    }
-
-    // The primary span(s): the source spans of every pane's anchor nodes.
-    const primaryKeys = new Set<string>();
-    for (const [paneId, nodeIds] of resolved.primaryByPane) {
-      const indices = this.store.indicesFor(paneId);
-      if (!indices) continue;
-      for (const nodeId of nodeIds) {
-        const span = indices.nodeById.get(nodeId)?.spans[0];
-        if (span) primaryKeys.add(`${span.start}:${span.end}`);
-      }
     }
 
     // Call on the OffsetMap object: `byteToChar` reads `this.byteAt`, so a
     // destructured `const { byteToChar } = ...` would lose its binding and throw.
     const offsets = this.store.offsets;
-    const highlights: HighlightSpan[] = spans.map((span) => ({
-      from: offsets.byteToChar(span.start),
-      to: offsets.byteToChar(span.end),
-      primary: primaryKeys.has(`${span.start}:${span.end}`),
-    }));
+    const mark = (from: number, to: number, primary: boolean): HighlightSpan => ({
+      from: offsets.byteToChar(from),
+      to: offsets.byteToChar(to),
+      primary,
+    });
 
-    // Scroll to the earliest highlighted span, which puts the top of what the
-    // reader selected at the top of the editor. `sourceSpans` carries the link
-    // resolver's traversal order, so the earliest one has to be found rather
-    // than read off the front.
-    //
+    // Strong is what the reader pointed at, and nothing else — never a node's
+    // extent. Every span the resolution reached is a trace, including the one
+    // the pointed-at bytes sit inside; `flattenHighlights` subtracts the strong
+    // region out of them, so the token reads as itself and the statement around
+    // it as what it resolved to.
+    const highlights: HighlightSpan[] = [];
+    if (pointedAt !== null) highlights.push(mark(pointedAt.from, pointedAt.to, true));
+    for (const span of spans) highlights.push(mark(span.start, span.end, false));
+
     // Not when the selection was made here: the caret is already where the
     // reader put it, and scrolling under a drag fights the gesture. A jump —
     // goto-definition, or a click in another pane — carries a different origin
     // and does move the editor.
     const effects: StateEffect<unknown>[] = [setHighlights.of(highlights)];
-    if (resolved.origin !== SOURCE_PANE) {
+    if (resolved.origin !== SOURCE_PANE && highlights.length > 0) {
       const focus = highlights.reduce((a, b) => (b.from < a.from ? b : a));
       effects.push(EditorView.scrollIntoView(focus.from, { y: "start" }));
     }
     this.view.dispatch({ effects });
   }
+
 }

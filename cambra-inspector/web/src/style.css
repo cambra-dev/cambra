@@ -9,6 +9,12 @@
   --type: #0a6b3c;
   --node-id: #9a6a00;
   --edge: #2a5fa5;
+  /* The three source-highlight roles. Distinct hues, not one hue at three
+     alphas: the tiers have to be told apart at a glance, and stacked alpha of
+     one colour is what made the old two-tier split unreadable. */
+  --sel-here: rgba(42, 95, 165, 0.26);
+  --sel-elsewhere: rgba(245, 163, 55, 0.34);
+  --caret: #d75a2e;
   --err: #c0392b;
   --warn: #b8860b;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -25,6 +31,9 @@
     --type: #6fcf97;
     --node-id: #d8b25a;
     --edge: #79a9e8;
+    --sel-here: rgba(121, 169, 232, 0.30);
+    --sel-elsewhere: rgba(245, 163, 55, 0.30);
+    --caret: #f18b40;
     --err: #ff6b5b;
     --warn: #e0b34a;
   }
@@ -434,15 +443,36 @@ body {
   text-decoration: underline;
 }
 
-/* Source-editor span highlights: the primary anchor span (strong) and the
-   transitively-linked spans reached across stages (lighter). */
+/* Source-editor span highlights. Three roles, three hues:
+     - the caret is where the reader clicked;
+     - `.cm-sel-node` is the span the click resolved to, in the pane the
+       gesture happened in;
+     - `.cm-link-node` is a span some *other* pane traces the same node to,
+       which is a different claim and so a different colour rather than the
+       same one fainter. */
 .cm-sel-node {
-  background: rgba(121, 169, 232, 0.28);
+  background: var(--sel-here);
   border-radius: 2px;
 }
 .cm-link-node {
-  background: rgba(121, 169, 232, 0.13);
+  background: var(--sel-elsewhere);
   border-radius: 2px;
+  box-shadow: inset 0 -1px 0 var(--caret);
+}
+
+/* `drawSelection` renders the caret and the selection itself, which the native
+   ones do not do under `editable: false` — CodeMirror draws no caret in
+   non-editable content, so until now nothing showed where the reader clicked.
+   `!important` overrides CodeMirror's injected base theme. */
+.cm-cursor,
+.cm-dropCursor {
+  border-left: 2px solid var(--caret) !important;
+  display: block !important;
+}
+.cm-selectionBackground,
+.cm-editor .cm-selectionBackground,
+.cm-content ::selection {
+  background: var(--sel-here) !important;
 }
 
 /* F2: tree row selection + clickable twisty */
@@ -454,11 +484,27 @@ body {
 }
 /* Primary selection (the directly-clicked / anchor node) — strong; linked
    nodes reached across stages — lighter. */
+/* Shown in a pane holding no part of the selection itself — every row in it is
+   a node the links reached. Amber, because that is what the rows are. */
+.no-anchor-notice {
+  font-size: 11px;
+  color: var(--fg-muted);
+  padding: 2px 6px;
+  margin-bottom: 2px;
+  border-left: 3px solid var(--sel-elsewhere);
+  background: var(--bg-header);
+  cursor: help;
+}
+
+/* The same two roles the source pane paints, in the same two colours: blue for
+   what the reader selected, amber for where the panes trace it. The coding has
+   to be one coding — a row lit for a different reason than the span that lit it
+   is the thing that made this unreadable. */
 .tree-row.selected {
-  background: rgba(121, 169, 232, 0.28);
+  background: var(--sel-here);
 }
 .tree-row.linked {
-  background: rgba(121, 169, 232, 0.13);
+  background: var(--sel-elsewhere);
 }
 .twisty.clickable {
   cursor: pointer;

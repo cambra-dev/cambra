@@ -112,13 +112,19 @@ describe("view integration: cross-pane source<->tree linking", () => {
     const resolved = store.getResolved();
     expect(resolved.selection).toEqual({ kind: "source", from: 1, to: 8 });
 
-    const pre = irPaneById(listMin, "pre-inference");
-    const names = (label: string): number => theNode(pre, label).nodeId;
-    expect([...resolved.primaryByPane.get("pre-inference")!].sort((a, b) => a - b)).toEqual(
-      [names("Lit(Int(1))"), names("Lit(Int(2))"), names("Lit(Int(3))")].sort((a, b) => a - b),
-    );
-    // Three separate primary spans reach the editor, not one merged blob.
-    expect(source.querySelectorAll(".cm-sel-node").length).toBe(3);
+    // Anchors live on the anchor pane now, not on every pane.
+    const anchorPane = irPaneById(listMin, "post-inference");
+    const names = (label: string): number => theNode(anchorPane, label).nodeId;
+    const anchors = [...resolved.primaryByPane.get("post-inference")!].sort((a, b) => a - b);
+    for (const label of ["Lit(Int(1))", "Lit(Int(2))", "Lit(Int(3))"]) {
+      expect(anchors, `${label} is an anchor`).toContain(names(label));
+    }
+    expect(anchors).not.toContain(names("Lit(Int(4))"));
+    // One strong region: the dragged range itself. Strong is what the reader
+    // pointed at, and a drag points at one contiguous run of text — the nodes
+    // inside it are what it *resolved* to, and read as traces.
+    expect(source.querySelectorAll(".cm-sel-node").length).toBe(1);
+    expect(resolved.pointedAt).toEqual({ from: 1, to: 8 });
   });
 
   it("a caret in the editor selects one node, as a click always did", async () => {
@@ -128,10 +134,71 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
     const resolved = store.getResolved();
     expect(resolved.selection).toEqual({ kind: "source", from: 1, to: 1 });
-    const pre = irPaneById(listMin, "pre-inference");
-    expect([...resolved.primaryByPane.get("pre-inference")!]).toEqual([
-      theNode(pre, "Lit(Int(1))").nodeId,
-    ]);
+    // A caret points at the token under it — `1` — and resolves to the node
+    // that token sits in. The node is an anchor; so are its images, which a
+    // round trip can bring back into this pane, so containment is the claim.
+    expect(resolved.pointedAt).toEqual({ from: 1, to: 2 });
+    const anchorPane = irPaneById(listMin, "post-inference");
+    expect([...resolved.primaryByPane.get("post-inference")!]).toContain(
+      theNode(anchorPane, "Lit(Int(1))").nodeId,
+    );
+  });
+
+  it("draws only the clicked pane's span strongly when panes disagree on extent", () => {
+    // The behaviour `txn_multi_read` exposed and no committed fixture covers:
+    // the panes disagree about how much source a node claims, so reading every
+    // pane's anchor as primary drew the widest of them strongly and a click
+    // anywhere inside it looked the same. Widening one downstream twin
+    // reproduces the disagreement over a real payload.
+    //
+    // `[1, 2, 3, 4]` — the literal `1` is [1,2) in post-inference; its
+    // post-channelize twin is widened to [1,5) (`1, 2`). Clicking the literal
+    // must draw `1` strongly and the rest of the wider span lightly, not the
+    // whole of `1, 2` strongly.
+    const snap = structuredClone(listMin) as Snapshot;
+    const widened = snap.panes.find((p) => p.id === "post-channelize")!;
+    const twin = (widened as { nodes: { nodeId: number; spans: unknown[] }[] }).nodes.find(
+      (n) => n.nodeId === 1,
+    )!;
+    twin.spans = [{ start: 1, end: 5 }];
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const store = new Store(snap);
+    new SourceView(root, store);
+
+    store.setSelection({ kind: "source", from: 1, to: 1 });
+
+    const strong = [...root.querySelectorAll(".cm-sel-node")].map((e) => e.textContent).join("");
+    const light = [...root.querySelectorAll(".cm-link-node")].map((e) => e.textContent).join("");
+    expect(strong).toBe("1");
+    expect(light).toBe(", 2");
+  });
+
+
+
+  it("says so in a pane that holds no part of the selection", () => {
+    // `ExprStmt` is rewritten away by channelize, so a click on a statement
+    // has no counterpart downstream: those panes light up entirely as traces.
+    // A pane of amber rows with no explanation reads as a fault, so the pane
+    // says which it is. Reproduced here by widening a downstream twin so the
+    // pane holds a highlight that is not an anchor.
+    const snap = structuredClone(listMin) as Snapshot;
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const store = new Store(snap);
+    const pane = snap.panes.find((p) => p.id === "post-channelize")!;
+    const body = document.createElement("div");
+    root.appendChild(body);
+    new TreeView(body, store, pane.id, (pane as { roots: number[] }).roots[0]);
+
+    // An anchor in this pane: no notice.
+    store.setSelection({ kind: "node", paneId: pane.id, nodeId: 1 }, pane.id);
+    expect(body.querySelector(".no-anchor-notice")).toBeNull();
+
+    // Nothing selected: no notice either.
+    store.setSelection(null);
+    expect(body.querySelector(".no-anchor-notice")).toBeNull();
   });
 
   it("the pane a selection came from does not scroll itself", () => {

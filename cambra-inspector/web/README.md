@@ -36,7 +36,7 @@ See [Running it](../README.md#running-it). No `cargo`? After `npm run build`,
 |---|---|
 | **Hover** an identifier or expression in the source | Tooltip with the tightest enclosing IR node's `label`, its type(s), and `provenance`. A monomorphized definition shows the *set* of specialized types (e.g. `Int \| String`). On a use-site, the tooltip also offers a **"→ jump to definition"** link. |
 | **Left-click** a term in the source | Selects the tightest enclosing IR node — highlights it in the source and reveals + highlights it in the IR tree (expanding ancestors). The source → tree cross-link. |
-| **Drag** across source text | Selects every node the range covers, and traces all of them through every pane at once. A click is the same gesture with an empty range, so there is no modifier to learn. A range edge cutting through a node takes that node whole, as a click there would. |
+| **Drag** across source text | Selects every node the range covers, and traces all of them through every pane at once. A click is the same gesture with an empty range, so there is no modifier to learn. The range is left exactly where the reader put it — an edge cutting a node still pulls that node in, and the difference shows as blue-versus-amber rather than by moving the selection. |
 | **Ctrl/Cmd-click** a variable use in the source | Goto-definition: jumps + scrolls to the def-site and selects its node in both panels. The IDE/LSP-standard gesture (Ctrl, or ⌘ on macOS); the hover-tooltip link does the same thing for discoverability. |
 | **Click** a node row in the IR tree | Selects the node — highlights its source span in the editor and scrolls to it. The tree → source cross-link. |
 | **Click the ▸ / ▾ twisty** on a tree row | Expands / collapses that subtree (distinct from selecting the row). |
@@ -194,11 +194,33 @@ expand/collapse in a tree, and come back blank (the views react to selection
     markers + hover messages mapped from `diagnostics[]`. **These render in the
     degraded snapshot too** (no panes but diagnostics present), so a type-error
     program still underlines its error.
-  - **selection highlight**: a `StateField<DecorationSet>` marking the resolved
-    source spans — the **primary** anchor spans strongly, transitively-**linked**
-    spans lightly. There is no active-line highlight: CodeMirror's stock one
-    rendered its own base-theme colour next to the span mark, so two similar
-    blues marked different things.
+  - **selection highlight**: three roles, three hues, because they are three
+    different claims and one hue at three alphas cannot be told apart:
+    - the **caret** (`--caret`, ember) is where the reader clicked. It needs
+      `drawSelection()`: CodeMirror draws no caret in non-editable content, so
+      before that nothing showed the click position at all.
+    - **`.cm-sel-node`** (`--sel-here`, blue) is what the reader *pointed at*
+      and nothing more — the token under a click, the dragged range, or the
+      span of a row clicked in a pane (`Resolved.pointedAt`). Deliberately not
+      a node's extent: clicking `if` resolves to the statement it opens, and
+      painting that strongly made a click anywhere inside a block look the
+      same.
+    - **`.cm-link-node`** (`--sel-elsewhere`, amber) is every span the
+      resolution reached. On the `if` above that is the rest of the statement
+      *and* the `with begin():` line above it, which the downstream panes
+      attribute to the same construct.
+
+    `flattenHighlights` partitions the spans before they become decorations, so
+    no offset carries two marks and a colour means its role rather than however
+    many spans landed there. The tree panes carry the same two roles in the
+    same two colours: blue for the nodes that *are* the selection — the anchor
+    and its images — and amber for every node the links reached. A pane can
+    hold no anchor at all (`ExprStmt` is rewritten away by channelize, so a
+    statement has no counterpart downstream) and says so with a
+    `no-anchor-notice` line rather than leaving a pane of amber to read as a
+    fault. There is no active-line highlight: CodeMirror's
+    stock one rendered its own base-theme colour next to the span mark, so two
+    similar blues marked different things.
   - **range selection**: the editor's own selection is the gesture. An
     `updateListener` on `selectionSet` turns `state.selection.main` into a
     `{ kind: "source", from, to }` store selection, so a drag needs no mouse

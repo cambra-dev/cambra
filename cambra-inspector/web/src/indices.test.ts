@@ -41,7 +41,7 @@ const definitions: Definition[] = [
   { useSpan: { start: 8, end: 9 }, defSpan: { start: 0, end: 1 }, name: "x" },
 ];
 
-const idx = buildIndices([1], nodes, definitions);
+const idx = buildIndices([1], nodes, definitions, "");
 
 describe("buildIndices: flattening", () => {
   it("maps every node by id", () => {
@@ -71,7 +71,7 @@ describe("buildIndices: predicate interiors", () => {
     ]),
     node(13, "Lit(Int(2))", null, "Int@2"),
   ];
-  const idx = buildIndices([10], shared, []);
+  const idx = buildIndices([10], shared, [], "");
 
   it("marks a predicate subtree and everything under it", () => {
     expect([...idx.predicateIds].sort((a, b) => a - b)).toEqual([12, 13]);
@@ -107,6 +107,185 @@ describe("tightestNodeAt (D4 policy)", () => {
   });
 });
 
+
+describe("nodesInRange: containment is decided on visible text", () => {
+  // The `txn_multi_read` shape. `with begin():` and its body is one construct
+  // whose span runs to the newline ending the last line; a drag over those
+  // lines stops at the last character the reader can see, one byte short. The
+  // enclosing construct then fell out of a selection that visibly covered it.
+  const text = "a = 1\nblock:\n  body\n";
+  //             0      6       13
+  // `block:\n  body\n` is [6, 20): the trailing newline is the 19th byte.
+  const nodes: IrNode[] = [
+    node(60, "Root", { start: 0, end: 20 }, "Unit", [value(61), value(62)]),
+    node(61, "Assign", { start: 0, end: 5 }, "Int"),
+    node(62, "Block", { start: 6, end: 20 }, "Unit", [value(63)]),
+    node(63, "Body", { start: 15, end: 19 }, "Unit"),
+  ];
+  const t = buildIndices([60], nodes, [], text);
+
+  it("takes a construct whose span ends in the newline just past the drag", () => {
+    // Dragging line 2 to the end of its visible text: [6, 19).
+    expect(t.nodesInRange(6, 19).sort((a, b) => a - b)).toEqual([62, 63]);
+  });
+
+  it("agrees with the drag that does include the newline", () => {
+    expect(t.nodesInRange(6, 20).sort((a, b) => a - b)).toEqual([62, 63]);
+  });
+
+  it("a sliced node arrives through the region, not through containment", () => {
+    // Ending inside `body` covers no node whole, so containment finds nothing.
+    // The slice is the region's business: it takes `Body` whole, and the nodes
+    // in that region are what gets traced.
+    expect(t.nodesInRange(6, 17)).toEqual([]);
+    const region = t.selectionRegion(6, 17);
+    expect(t.nodesInRange(region.from, region.to)).toContain(63);
+  });
+
+  it("a border on whitespace slices nothing", () => {
+    // Ending a drag at a line end used to ask what contains the newline, which
+    // is the enclosing construct — so stopping at the end of a line pulled in
+    // the whole block around it.
+    expect(t.nodesInRange(6, 19)).not.toContain(60);
+    expect(t.nodesInRange(0, 6)).not.toContain(60);
+  });
+
+  it("does not let whitespace pull in a neighbour", () => {
+    // The drag covers line 1 and the newline after it; the Block starts on the
+    // next line and stays out.
+    expect(t.nodesInRange(0, 6).sort((a, b) => a - b)).toEqual([61]);
+  });
+});
+
+describe("nodesInRange: visible extents are measured in bytes", () => {
+  // Spans are byte offsets; a JavaScript string is indexed in UTF-16 code
+  // units. They coincide only for ASCII, so a source with one multi-byte
+  // character shifts every offset after it — `txn_multi_read` has em dashes in
+  // its comments, and indexing the text with a span offset read the wrong
+  // character, which made the trim below silently do nothing and dropped the
+  // enclosing construct out of a drag that covered it.
+  const text = "# \u2014\nblock:\n  body\n";
+  //             0 1      (3 bytes)      chars:  0 1 2  3 4...
+  const bytes = (upTo: number): number => new TextEncoder().encode(text.slice(0, upTo)).length;
+  const blockStart = bytes(text.indexOf("block:"));
+  const blockEnd = bytes(text.length);
+  const bodyStart = bytes(text.indexOf("body"));
+  const bodyEnd = bytes(text.indexOf("body") + 4);
+
+  const nodes: IrNode[] = [
+    node(70, "Block", { start: blockStart, end: blockEnd }, "Unit", [value(71)]),
+    node(71, "Body", { start: bodyStart, end: bodyEnd }, "Unit"),
+  ];
+  const t = buildIndices([70], nodes, [], text);
+
+  it("trims the trailing newline of a span past a multi-byte character", () => {
+    // The drag ends at the last visible byte, one short of the Block's span.
+    expect(t.nodesInRange(blockStart, blockEnd - 1).sort((a, b) => a - b)).toEqual([70, 71]);
+  });
+
+  it("would have failed on a char-indexed trim", () => {
+    // The byte offset of the newline is 2 past its char offset here, so a
+    // char-indexed test reads a letter and trims nothing. Pinning the offsets
+    // differ is what makes the test above meaningful.
+    expect(blockEnd).toBe(text.length + 2);
+  });
+});
+
+describe("selectionRegion (how much a selection explains)", () => {
+  it("takes the tightest node containing a range", () => {
+    // Inner is [2,5) with Leaf [3,4) inside it. A range covering part of Leaf
+    // and part of Inner is inside Inner.
+    expect(idx.selectionRegion(3, 4)).toEqual({ from: 3, to: 4 }); // Leaf exactly
+    expect(idx.selectionRegion(2, 5)).toEqual({ from: 2, to: 5 }); // Inner exactly
+    expect(idx.selectionRegion(2, 4)).toEqual({ from: 2, to: 5 }); // inside Inner
+  });
+
+  it("takes a caret's node, which is what a click already explained", () => {
+    expect(idx.selectionRegion(3, 3)).toEqual({ from: 3, to: 4 });
+    expect(idx.selectionRegion(8, 8)).toEqual({ from: 0, to: 10 }); // only the root
+  });
+
+  it("rises to the common parent for a range spanning siblings", () => {
+    // Inner [2,5) and DupShallow [6,7) are siblings under Root [0,10). A drag
+    // across both is inside the root, so the traces explain the root.
+    expect(idx.selectionRegion(4, 7)).toEqual({ from: 0, to: 10 });
+  });
+
+  it("returns the range when nothing contains it", () => {
+    expect(idx.selectionRegion(20, 30)).toEqual({ from: 20, to: 30 });
+  });
+
+  it("is what makes a partial drag explain the whole construct", () => {
+    // The reported case, in miniature: a drag stopping part-way through Leaf
+    // covers no node whole, so `nodesInRange` on the raw range finds only the
+    // node it cuts. Over the enclosing extent it finds the construct's
+    // contents, which is what a click inside it already found.
+    const raw = idx.nodesInRange(2, 4).sort((a, b) => a - b);
+    const region = idx.selectionRegion(2, 4);
+    const widened = idx.nodesInRange(region.from, region.to).sort((a, b) => a - b);
+    expect(widened).toEqual([2, 3]);
+    expect(widened.length).toBeGreaterThan(raw.length);
+  });
+});
+
+describe("growing a selection never un-selects anything", () => {
+  // The property the old border rule broke. Dragging one byte further changed
+  // which node was "the tightest at the border", so an enclosing `Apply` was
+  // claimed at `dup(`, claimed by nothing at `dup(1`, and claimed again at the
+  // end of the line — blue, gone, blue. Monotonicity is the invariant that
+  // makes toggling impossible, so it is asserted directly rather than through
+  // the cases that happened to expose it.
+  const text = "dup = \\x -> (x, x)\na = dup(1)\nb = dup(2 == 2)\na\n";
+  const nodes: IrNode[] = [
+    node(80, "Let(dup)", { start: 0, end: 18 }, "_", [value(81)]),
+    node(81, "Lambda(x)", { start: 6, end: 18 }, "_", [value(82)]),
+    node(82, "Tuple", { start: 13, end: 18 }, "_"),
+    node(83, "Let(a)", { start: 19, end: 29 }, "_", [value(84)]),
+    node(84, "Apply", { start: 23, end: 29 }, "_", [value(85), value(86)]),
+    node(85, "Var(dup)", { start: 23, end: 26 }, "_"),
+    node(86, "Lit(Int(1))", { start: 27, end: 28 }, "_"),
+  ];
+  const m = buildIndices([80], nodes, [], text);
+
+  it("nodesInRange only grows", () => {
+    for (const from of [0, 6, 19, 23]) {
+      let previous = new Set<number>();
+      for (let to = from + 1; to <= text.length; to += 1) {
+        const now = new Set(m.nodesInRange(from, to));
+        for (const id of previous) {
+          expect(now, `#${id} dropped out at [${from},${to})`).toContain(id);
+        }
+        previous = now;
+      }
+    }
+  });
+
+  it("selectionRegion only grows", () => {
+    for (const from of [0, 6, 19, 23]) {
+      let previous: { from: number; to: number } | null = null;
+      for (let to = from + 1; to <= text.length; to += 1) {
+        const now = m.selectionRegion(from, to);
+        expect(now.from, `region start grew at [${from},${to})`).toBeLessThanOrEqual(from);
+        expect(now.to, `region end shrank at [${from},${to})`).toBeGreaterThanOrEqual(to);
+        if (previous !== null) {
+          expect(now.from).toBeLessThanOrEqual(previous.from);
+          expect(now.to).toBeGreaterThanOrEqual(previous.to);
+        }
+        previous = now;
+      }
+    }
+  });
+
+  it("the reported drag explains the Apply at every width", () => {
+    // `dup(` is [0,27), `dup(1` is [0,28), the whole of both lines is [0,29).
+    // The Apply must be part of what the selection explains in all three.
+    for (const to of [27, 28, 29]) {
+      const region = m.selectionRegion(0, to);
+      expect(m.nodesInRange(region.from, region.to), `Apply at [0,${to})`).toContain(84);
+    }
+  });
+});
+
 describe("nodesInRange: predicate interiors are not seeds", () => {
   // The real synthesized shape: inference builds `__elem == 1` *from* the
   // literal, so the predicate's nodes inherit the literal's span exactly. The
@@ -121,20 +300,64 @@ describe("nodesInRange: predicate interiors are not seeds", () => {
     node(22, "BinOp(Eq)", { start: 4, end: 5 }, "Bool", [{ id: 23, predicate: false }]),
     node(23, "Lit(Int(1))", { start: 4, end: 5 }, "Int@1"),
   ];
-  const p = buildIndices([20], withPred, []);
+  const p = buildIndices([20], withPred, [], "");
 
   it("skips them in the containment pass", () => {
     expect(p.nodesInRange(4, 5)).toEqual([21]);
   });
 
-  it("skips them when a border cuts", () => {
-    // Asking at byte 4 must not answer with the predicate interior sharing
-    // that span, and the cut must resolve to a drawn node.
-    expect(p.nodesInRange(3, 5).sort((a, b) => a - b)).toEqual([20, 21]);
+  it("skips them in the region a cut produces", () => {
+    // The predicate interior shares the literal's span, so a region taking the
+    // cut node whole must still not offer it.
+    const region = p.selectionRegion(3, 5);
+    expect(p.nodesInRange(region.from, region.to).sort((a, b) => a - b)).toEqual([20, 21]);
   });
 
   it("covering everything still names only the drawn nodes", () => {
     expect(p.nodesInRange(0, 6).sort((a, b) => a - b)).toEqual([20, 21]);
+  });
+});
+
+describe("tightestNodeAt: a synthesized unit is not what a click means", () => {
+  // The `txn_multi_read` case. `if pool > r:` with no `else` mints a unit for
+  // the statement's value, and that unit carries the *statement's* whole span —
+  // so it ties the `ExprStmt` that owns the statement on width and wins on
+  // depth. A click on `if` then answers with a node the reader never wrote.
+  const withUnit: IrNode[] = [
+    node(40, "ExprStmt", { start: 10, end: 30 }, "Unit", [value(41)]),
+    node(41, "Lit(Unit)", { start: 10, end: 30 }, "Unit"),
+  ];
+  const u = buildIndices([40], withUnit, [], "");
+
+  it("prefers the construct over the unit standing for its value", () => {
+    expect(u.tightestNodeAt(15)).toBe(40);
+  });
+
+  it("still answers with the unit when nothing else covers the offset", () => {
+    // A preference, not an exclusion: a unit that is the only candidate is
+    // still the answer, so an explicitly written one stays reachable.
+    const only = buildIndices([41], [node(41, "Lit(Unit)", { start: 2, end: 4 }, "Unit")], [], "");
+    expect(only.tightestNodeAt(3)).toBe(41);
+  });
+
+  it("does not disturb the depth tie-break between two constructs", () => {
+    // What depth-first is for: the innermost of two coincident constructs.
+    expect(idx.tightestNodeAt(6)).toBe(5);
+  });
+
+  it("prefers a narrower unit over a wider construct", () => {
+    // Width still decides first, so a unit that really is the tightest thing
+    // at the offset wins over an enclosing construct.
+    const mixed = buildIndices(
+      [50],
+      [
+        node(50, "ExprStmt", { start: 0, end: 20 }, "Unit", [value(51)]),
+        node(51, "Lit(Unit)", { start: 5, end: 7 }, "Unit"),
+      ],
+      [],
+      "",
+    );
+    expect(mixed.tightestNodeAt(6)).toBe(51);
   });
 });
 
@@ -158,12 +381,13 @@ describe("nodesInRange (source-selection seeds)", () => {
     expect(idx.nodesInRange(0, 10)).toContain(1);
   });
 
-  it("names a node its range cuts, whole", () => {
-    // [4,7) starts inside Inner [2,5): the cut node comes in whole, exactly as
-    // a click at byte 4 would have answered it.
-    const cut = idx.nodesInRange(4, 7).sort((a, b) => a - b);
-    expect(cut).toContain(2);
-    expect(cut).toEqual([2, 4, 5]);
+  it("covers only what it wholly contains", () => {
+    // [4,7) starts inside Inner [2,5), so Inner is not covered. Taking a cut
+    // node whole is `selectionRegion`'s job, and doing it here made the result
+    // depend on which node each border landed in.
+    expect(idx.nodesInRange(4, 7).sort((a, b) => a - b)).toEqual([4, 5]);
+    const region = idx.selectionRegion(4, 7);
+    expect(idx.nodesInRange(region.from, region.to).sort((a, b) => a - b)).toContain(2);
   });
 
   it("a border sitting on a node edge is not a cut", () => {
@@ -207,7 +431,7 @@ describe("definitionAt", () => {
 
 describe("buildIndices: degraded (no nodes)", () => {
   it("is empty but queries are safe", () => {
-    const degraded = buildIndices([], [], []);
+    const degraded = buildIndices([], [], [], "");
     expect(degraded.nodeById.size).toBe(0);
     expect(degraded.tightestNodeAt(0)).toBeNull();
     expect(degraded.typesAt(0)).toEqual([]);

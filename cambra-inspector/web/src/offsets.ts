@@ -80,3 +80,28 @@ export class OffsetMap {
 function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
+
+/**
+ * The word-shaped token containing `charOffset`, or that single character when
+ * it is not part of one.
+ *
+ * What the reader pointed at, as opposed to what it resolves to. Clicking `if`
+ * resolves to the statement it opens, so the resolved extent is the wrong thing
+ * to paint as "here": it is several lines, and painting it strongly made a
+ * click anywhere in a block look the same. A token is the smallest honest
+ * answer available from the text alone — no node spans a keyword.
+ */
+export function wordRangeAt(text: string, charOffset: number): { from: number; to: number } {
+  const at = Math.max(0, Math.min(charOffset, text.length));
+  const isWord = (i: number): boolean => /[A-Za-z0-9_]/.test(text[i] ?? "");
+  if (!isWord(at)) {
+    // Punctuation, a space, or the end of the document: the character itself,
+    // and an empty range at the very end rather than one past it.
+    return { from: at, to: Math.min(at + 1, text.length) };
+  }
+  let from = at;
+  while (from > 0 && isWord(from - 1)) from -= 1;
+  let to = at;
+  while (to < text.length && isWord(to)) to += 1;
+  return { from, to };
+}
