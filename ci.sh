@@ -12,18 +12,12 @@ ci_fmt() {
 # targets regardless. That extra target-checking is why `ci_fast` drops
 # `--all-targets` for the local iteration loop (it is kept here so the full gate
 # still lints test code).
-ci_clippy() { cargo clippy --all-targets -- -D warnings; }
+ci_clippy() { cargo clippy -p cambra --all-targets -- -D warnings; }
 # Same lint, in release. The debug checks never compile the test target in
 # release, so a `#[cfg(debug_assertions)]`-gated item referenced by ungated code
 # (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
 # scoped to our crate, not deps.
-ci_clippy_release() { cargo clippy --release --all-targets -- -D warnings; }
-# The `serde` feature is default-OFF, so the default passes above compile none of
-# the serde-gated wire code — the hand-written `Serialize` impls and everything
-# only they reach. Nothing else in the gate turns the feature on, so without this
-# pass that code is compiled by nobody and its warnings (a dead `wire_str`, say)
-# never surface.
-ci_clippy_serde() { cargo clippy --features serde --all-targets -- -D warnings; }
+ci_clippy_release() { cargo clippy -p cambra --release --all-targets -- -D warnings; }
 # The library alone, with no features unified in. Every pass above uses
 # `--all-targets`, which pulls in the dev-dependencies — including the *self*
 # dev-dependency that enables `test-helpers`. Cargo unifies that feature into the
@@ -32,9 +26,9 @@ ci_clippy_serde() { cargo clippy --features serde --all-targets -- -D warnings; 
 # is compiled by nothing. Edition 2024 / resolver 3 keeps the feature out of a
 # plain `cargo build --lib`, which is what makes the gap silent rather than loud:
 # ungated library code calling a `test-helpers`-gated item passes the whole gate
-# and fails `cargo build --lib`. Same argument as `ci_clippy_serde` — a
-# configuration nothing compiles is a configuration that rots.
-ci_clippy_lib() { cargo clippy --lib -- -D warnings; }
+# and fails `cargo build --lib`. A configuration nothing compiles is a
+# configuration that rots.
+ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # `DEEP_TYPECHECK=1` turns on the opt-in per-operation typecheck (see the
 # `deep-typecheck` feature). The GitHub workflow sets it so automated runs keep
 # exercising that check; it stays off for a bare local `./ci.sh` because it is
@@ -45,16 +39,16 @@ ci_clippy_lib() { cargo clippy --lib -- -D warnings; }
 # both ways: set semantics makes that order meaningless by contract, but a
 # consumer that lets it become observable — or a dedup keeping the
 # first-inserted of two `eq`-equal refinements — compiles clean either way. Same
-# argument as `ci_clippy_serde`: a configuration nothing runs is a
+# argument as `ci_clippy_lib`: a configuration nothing runs is a
 # configuration that rots.
-ci_test() { cargo test -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
+ci_test() { cargo test -p cambra -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list
 # (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
 # then diff the model's verdicts against the solver's. Those tests skip
 # themselves when the oracle binary is absent, so without this gate nothing
 # notices the model drifting from the solver — the same rot argument as
-# `ci_clippy_serde`, and the drift is silent in both directions. A machine with
+# `ci_clippy_lib`, and the drift is silent in both directions. A machine with
 # no Lean toolchain skips, loudly; under CI a missing toolchain is a broken gate
 # rather than a local convenience, so it fails instead.
 ci_formal() {
@@ -77,7 +71,56 @@ ci_formal() {
 }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
-    cargo doc --no-deps
+    cargo doc -p cambra --no-deps
+}
+# Golden-fixture drift gate: regenerate the frontend's snapshot fixtures into a
+# temp dir through the same script the fix path uses (regen-fixtures.sh, driven
+# by scripts/fixtures.manifest) and fail on any byte difference from the
+# committed copies. The fix on an intended wire change is the script itself:
+#   cambra-inspector/scripts/regen-fixtures.sh   # then commit the diff
+# (Cross-process dump determinism — the property this gate relies on — is
+# pinned corpus-wide by tests/inspector_goldens.rs under ci_test.)
+ci_fixtures() {
+  (
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+    # A regen failure is a BUILD error, not fixture drift — bail before the
+    # comparisons below, which read "absent from the temp dir" as a fixture
+    # problem. Falling through would report the empty/partial temp dir as drift
+    # and, worse, name every unreached fixture an "orphan" and advise deleting
+    # it — its manifest row is fine, regen just never got there. Checked
+    # explicitly (`if !`) rather than via `set -e`: `ci_all` calls this gate on
+    # the left of a `||`, which suppresses errexit for this whole subshell.
+    if ! cambra-inspector/scripts/regen-fixtures.sh "${tmp}"; then
+      echo "ci_fixtures FAILED: fixture regeneration failed (see the error above) — a build/regen failure, NOT fixture drift" >&2
+      exit 1
+    fi
+    fix="cambra-inspector/web/src/__fixtures__"
+    drifted=0
+    for f in "${tmp}"/*.snapshot.json; do
+      name="$(basename "${f}")"
+      # cmp + a short excerpt, not a full `git diff`: a drifted snapshot diff
+      # is thousands of lines and buries which fixture failed.
+      if ! cmp -s "${fix}/${name}" "${f}"; then
+        committed_size="$(wc -c < "${fix}/${name}")"
+        regen_size="$(wc -c < "${f}")"
+        echo "ci_fixtures FAILED: fixture drift: ${name} (committed ${committed_size} bytes vs regenerated ${regen_size} bytes)" >&2
+        diff -u "${fix}/${name}" "${f}" | head -n 12 >&2 || true
+        echo "  re-bless via: cambra-inspector/scripts/regen-fixtures.sh, then commit the diff" >&2
+        drifted=1
+      fi
+    done
+    # Orphan check: a committed fixture with no manifest row would otherwise be
+    # compared against nothing and rot silently.
+    for committed in "${fix}"/*.snapshot.json; do
+      name="$(basename "${committed}")"
+      if [[ ! -f "${tmp}/${name}" ]]; then
+        echo "ci_fixtures FAILED: orphan fixture: ${name} is committed but has no row in cambra-inspector/scripts/fixtures.manifest (add the row or delete the fixture)" >&2
+        drifted=1
+      fi
+    done
+    exit "${drifted}"
+  )
 }
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
 # Validate intra-repo doc references so they can't silently rot: Markdown
@@ -121,51 +164,56 @@ ci_fast() {
   ci_fmt || failed=1
   # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
   # shellcheck disable=SC2310
-  { cargo clippy -- -D warnings; } || failed=1
+  { cargo clippy -p cambra -- -D warnings; } || failed=1
   # shellcheck disable=SC2310
   ci_test || failed=1
   exit "${failed}"
 }
 
 ci_all() {
-  local failed=0
+  # Names of failed gates, so the last lines of a long run say WHAT failed.
+  local failed=""
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_shellcheck || failed=1
+  ci_shellcheck || failed="${failed} shellcheck"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_doc_refs || failed=1
+  ci_doc_refs || failed="${failed} doc_refs"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_shared_state || failed=1
+  ci_shared_state || failed="${failed} shared_state"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_fmt || failed=1
+  ci_fmt || failed="${failed} fmt"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy || failed=1
+  ci_clippy || failed="${failed} clippy"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_release || failed=1
+  ci_clippy_release || failed="${failed} clippy_release"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_serde || failed=1
+  ci_clippy_lib || failed="${failed} clippy_lib"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_lib || failed=1
-  # shellcheck disable=SC2310
-  # intentional: || captures failure without exiting
-  ci_doc || failed=1
+  ci_doc || failed="${failed} doc"
   # Before `ci_test`, so the oracle binary exists by the time the suite runs:
   # the differential tests skip themselves without it, and a skip in the middle
   # of the gate is the failure mode this step exists to remove.
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_formal || failed=1
+  ci_formal || failed="${failed} formal"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_test || failed=1
-  exit "${failed}"
+  ci_test || failed="${failed} test"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_fixtures || failed="${failed} fixtures"
+  if [[ -n "${failed}" ]]; then
+    echo "ci.sh FAILED:${failed}" >&2
+    exit 1
+  fi
+  echo "ci.sh: all gates passed"
 }
 
 fix=0

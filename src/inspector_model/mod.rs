@@ -10,10 +10,9 @@
 //! [`Expr`](crate::ccl::Expr) snapshot and reads the per-pane
 //! [`SourceProjection`](crate::ccl::provenance::SourceProjection)s materialized by
 //! [`CompiledProgram::materialize_panes`](crate::ccl::context::CompiledProgram::materialize_panes).
-//! The wire types here derive `Serialize` under the optional, default-off
-//! `serde` feature, and nothing else about serialization lives here: no
-//! `serde_json`, no transport. A plain `ccl`/interpreter build
-//! (`cargo build -p cambra`) compiles none of it.
+//! The wire types here derive `Serialize`, and nothing else about
+//! serialization lives here: the transport that turns the typed payload into
+//! JSON is [`inspector_server`](crate::inspector_server).
 //!
 //! # The pane set is the compiler's, not this module's
 //!

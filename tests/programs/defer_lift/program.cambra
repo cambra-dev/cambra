@@ -1,0 +1,10 @@
+def make_totals(xs):
+    t = defer()
+    t << sum(xs)
+    t
+
+readings = [1, 2, 3, 4]
+totals = make_totals(readings)
+for x in readings:
+    totals << x
+max(totals)

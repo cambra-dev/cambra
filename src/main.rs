@@ -132,6 +132,29 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
     Ok(())
 }
 
+/// The default port for every inspector surface. `Run` and `InspectOnly` are
+/// mutually exclusive, so the shared default binds one server at a time.
+const DEFAULT_INSPECT_PORT: u16 = 8080;
+
+/// What the binary does with the program it was given.
+///
+/// The modes are mutually exclusive by construction rather than by a check on
+/// two flags that each mean something: a program is either run or it is not, and
+/// `--inspect-only` is the not.
+enum Mode {
+    /// Run the program. With a port, attach [`WebInspector`]'s live runtime
+    /// dashboard to the run.
+    Run { inspect_port: Option<u16> },
+    /// Compile the program and serve its panes, without running it — the
+    /// read-only program inspector. Answers what the program *is*, so there is
+    /// no execution to attach to.
+    InspectOnly { port: u16 },
+    /// Print the `/api/snapshot` payload for the program and exit. The one-shot
+    /// form of `InspectOnly`, for the golden-fixture corpus (whose server would
+    /// never exit).
+    DumpSnapshot,
+}
+
 /// Runs a given Cambra file, specified as the first command-line argument.
 fn main() {
     env_logger::init();
@@ -139,32 +162,71 @@ fn main() {
 
     let mut input_file = None;
     let mut inspect_port: Option<u16> = None;
+    let mut inspect_only_port: Option<u16> = None;
+    let mut dump_snapshot = false;
 
     for arg in &args[1..] {
         if arg == "--inspect" {
-            inspect_port = Some(8080);
+            inspect_port = Some(DEFAULT_INSPECT_PORT);
         } else if let Some(port_str) = arg.strip_prefix("--inspect=") {
             inspect_port = Some(port_str.parse().expect("Invalid port for --inspect"));
+        } else if arg == "--inspect-only" {
+            inspect_only_port = Some(DEFAULT_INSPECT_PORT);
+        } else if let Some(port_str) = arg.strip_prefix("--inspect-only=") {
+            inspect_only_port = Some(port_str.parse().expect("Invalid port for --inspect-only"));
+        } else if arg == "--dump-snapshot" {
+            dump_snapshot = true;
         } else {
             input_file = Some(arg.clone());
         }
     }
 
+    let usage =
+        "Usage: cambra [--inspect[=PORT] | --inspect-only[=PORT] | --dump-snapshot] <input_file>";
+    let mode = match (inspect_port, inspect_only_port, dump_snapshot) {
+        (None, Some(port), false) => Mode::InspectOnly { port },
+        (None, None, true) => Mode::DumpSnapshot,
+        (inspect_port, None, false) => Mode::Run { inspect_port },
+        _ => {
+            eprintln!("error: --inspect, --inspect-only and --dump-snapshot are exclusive");
+            eprintln!("{usage}");
+            std::process::exit(1);
+        }
+    };
+
     let input_file = input_file.unwrap_or_else(|| {
-        eprintln!("Usage: cambra [--inspect[=PORT]] <input_file>");
+        eprintln!("{usage}");
         std::process::exit(1);
     });
 
     let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
 
-    if run_program(&input_file, &code, inspect_port).is_err() {
-        std::process::exit(1);
-    }
+    match mode {
+        Mode::DumpSnapshot => {
+            println!(
+                "{}",
+                cambra::inspector_server::snapshot_body_pretty(&code, &input_file)
+            );
+        }
+        Mode::InspectOnly { port } => {
+            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port) {
+                eprintln!("error: serving the inspector: {e}");
+                std::process::exit(1);
+            }
+        }
+        Mode::Run { inspect_port } => {
+            if run_program(&input_file, &code, inspect_port).is_err() {
+                std::process::exit(1);
+            }
 
-    if let Some(port) = inspect_port {
-        eprintln!("Program finished. Inspector at http://localhost:{port} — press Ctrl+C to exit.");
-        loop {
-            std::thread::park();
+            if let Some(port) = inspect_port {
+                eprintln!(
+                    "Program finished. Inspector at http://localhost:{port} — press Ctrl+C to exit."
+                );
+                loop {
+                    std::thread::park();
+                }
+            }
         }
     }
 }

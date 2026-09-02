@@ -1,0 +1,6440 @@
+{
+  "source": {
+    "name": "tests/programs/polymorphic/program.cambra",
+    "text": "dup = \\x -> (x, x)\na = dup(1)\nb = dup(2)\nc = dup(2 == 2)\na\n"
+  },
+  "definitions": [
+    {
+      "useSpan": {
+        "start": 13,
+        "end": 14
+      },
+      "defSpan": {
+        "start": 6,
+        "end": 18
+      },
+      "name": "x"
+    },
+    {
+      "useSpan": {
+        "start": 16,
+        "end": 17
+      },
+      "defSpan": {
+        "start": 6,
+        "end": 18
+      },
+      "name": "x"
+    },
+    {
+      "useSpan": {
+        "start": 23,
+        "end": 26
+      },
+      "defSpan": {
+        "start": 0,
+        "end": 18
+      },
+      "name": "dup"
+    },
+    {
+      "useSpan": {
+        "start": 34,
+        "end": 37
+      },
+      "defSpan": {
+        "start": 0,
+        "end": 18
+      },
+      "name": "dup"
+    },
+    {
+      "useSpan": {
+        "start": 45,
+        "end": 48
+      },
+      "defSpan": {
+        "start": 0,
+        "end": 18
+      },
+      "name": "dup"
+    },
+    {
+      "useSpan": {
+        "start": 57,
+        "end": 58
+      },
+      "defSpan": {
+        "start": 19,
+        "end": 29
+      },
+      "name": "a"
+    }
+  ],
+  "diagnostics": [],
+  "meta": {
+    "payloadKind": "program",
+    "schema": 1
+  },
+  "panes": [
+    {
+      "id": "pre-inference",
+      "label": "IR (PRE-INFERENCE)",
+      "kind": "holes",
+      "root": 22,
+      "nodes": [
+        {
+          "label": "Let(dup)",
+          "nodeId": 22,
+          "spans": [
+            {
+              "start": 0,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": [
+            {
+              "id": 21,
+              "predicate": false
+            },
+            {
+              "id": 17,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lambda(x)",
+          "nodeId": 21,
+          "spans": [
+            {
+              "start": 6,
+              "end": 18
+            }
+          ],
+          "rewritten": null,
+          "type": "(_ ⇒ _)",
+          "children": [
+            {
+              "id": 20,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 20,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": [
+            {
+              "id": 18,
+              "predicate": false
+            },
+            {
+              "id": 19,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 18,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 19,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Let(a)",
+          "nodeId": 17,
+          "spans": [
+            {
+              "start": 19,
+              "end": 29
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": [
+            {
+              "id": 16,
+              "predicate": false
+            },
+            {
+              "id": 13,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 16,
+          "spans": [
+            {
+              "start": 23,
+              "end": 29
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": [
+            {
+              "id": 15,
+              "predicate": false
+            },
+            {
+              "id": 14,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(dup)",
+          "nodeId": 15,
+          "spans": [
+            {
+              "start": 23,
+              "end": 26
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 14,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Let(b)",
+          "nodeId": 13,
+          "spans": [
+            {
+              "start": 30,
+              "end": 40
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": [
+            {
+              "id": 12,
+              "predicate": false
+            },
+            {
+              "id": 9,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 12,
+          "spans": [
+            {
+              "start": 34,
+              "end": 40
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": [
+            {
+              "id": 11,
+              "predicate": false
+            },
+            {
+              "id": 10,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(dup)",
+          "nodeId": 11,
+          "spans": [
+            {
+              "start": 34,
+              "end": 37
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 10,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Let(c)",
+          "nodeId": 9,
+          "spans": [
+            {
+              "start": 41,
+              "end": 56
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": [
+            {
+              "id": 8,
+              "predicate": false
+            },
+            {
+              "id": 1,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 8,
+          "spans": [
+            {
+              "start": 45,
+              "end": 56
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": [
+            {
+              "id": 7,
+              "predicate": false
+            },
+            {
+              "id": 6,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(dup)",
+          "nodeId": 7,
+          "spans": [
+            {
+              "start": 45,
+              "end": 48
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 6,
+          "spans": [
+            {
+              "start": 49,
+              "end": 55
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": [
+            {
+              "id": 4,
+              "predicate": false
+            },
+            {
+              "id": 5,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 4,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 5,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        },
+        {
+          "label": "Var(a)",
+          "nodeId": 1,
+          "spans": [
+            {
+              "start": 57,
+              "end": 58
+            }
+          ],
+          "rewritten": null,
+          "type": "_",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "post-inference",
+      "label": "IR (POST-INFERENCE)",
+      "kind": "typed",
+      "root": 78,
+      "nodes": [
+        {
+          "label": "Let(__mono)",
+          "nodeId": 78,
+          "spans": [
+            {
+              "start": 0,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.coalesce_let"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 37,
+              "predicate": false
+            },
+            {
+              "id": 77,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lambda(x)",
+          "nodeId": 37,
+          "spans": [
+            {
+              "start": 6,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "(Int@1 ⇒ (Int@1, Int@1))",
+          "children": [
+            {
+              "id": 38,
+              "predicate": false
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 38,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 39,
+              "predicate": false
+            },
+            {
+              "id": 40,
+              "predicate": false
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 39,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 41,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 42,
+              "predicate": false
+            },
+            {
+              "id": 43,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 42,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 43,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 40,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(__mono)",
+          "nodeId": 77,
+          "spans": [
+            {
+              "start": 0,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.coalesce_let"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 53,
+              "predicate": false
+            },
+            {
+              "id": 76,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lambda(x)",
+          "nodeId": 53,
+          "spans": [
+            {
+              "start": 6,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "(Int@2 ⇒ (Int@2, Int@2))",
+          "children": [
+            {
+              "id": 54,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 54,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 55,
+              "predicate": false
+            },
+            {
+              "id": 56,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 55,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 57,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 58,
+              "predicate": false
+            },
+            {
+              "id": 59,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 58,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 59,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 56,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(__mono)",
+          "nodeId": 76,
+          "spans": [
+            {
+              "start": 0,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.coalesce_let"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 63,
+              "predicate": false
+            },
+            {
+              "id": 17,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lambda(x)",
+          "nodeId": 63,
+          "spans": [
+            {
+              "start": 6,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "(Bool ⇒ (Bool, Bool))",
+          "children": [
+            {
+              "id": 64,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 64,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "(Bool, Bool)",
+          "children": [
+            {
+              "id": 65,
+              "predicate": false
+            },
+            {
+              "id": 66,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 65,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "Var(x)",
+          "nodeId": 66,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "expansion",
+            "label": "mono.specialize"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "Let(a)",
+          "nodeId": 17,
+          "spans": [
+            {
+              "start": 19,
+              "end": 29
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 16,
+              "predicate": false
+            },
+            {
+              "id": 13,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 16,
+          "spans": [
+            {
+              "start": 23,
+              "end": 29
+            }
+          ],
+          "rewritten": null,
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 15,
+              "predicate": false
+            },
+            {
+              "id": 14,
+              "predicate": false
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(__mono)",
+          "nodeId": 15,
+          "spans": [
+            {
+              "start": 23,
+              "end": 26
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1 ⇒ (Int@1, Int@1))",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 14,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(b)",
+          "nodeId": 13,
+          "spans": [
+            {
+              "start": 30,
+              "end": 40
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 12,
+              "predicate": false
+            },
+            {
+              "id": 9,
+              "predicate": false
+            },
+            {
+              "id": 70,
+              "predicate": true
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 12,
+          "spans": [
+            {
+              "start": 34,
+              "end": 40
+            }
+          ],
+          "rewritten": null,
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 11,
+              "predicate": false
+            },
+            {
+              "id": 10,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(__mono)",
+          "nodeId": 11,
+          "spans": [
+            {
+              "start": 34,
+              "end": 37
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@2 ⇒ (Int@2, Int@2))",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 10,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(c)",
+          "nodeId": 9,
+          "spans": [
+            {
+              "start": 41,
+              "end": 56
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 8,
+              "predicate": false
+            },
+            {
+              "id": 1,
+              "predicate": false
+            },
+            {
+              "id": 67,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 8,
+          "spans": [
+            {
+              "start": 45,
+              "end": 56
+            }
+          ],
+          "rewritten": null,
+          "type": "(Bool, Bool)",
+          "children": [
+            {
+              "id": 7,
+              "predicate": false
+            },
+            {
+              "id": 6,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__mono)",
+          "nodeId": 7,
+          "spans": [
+            {
+              "start": 45,
+              "end": 48
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Bool ⇒ (Bool, Bool))",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 6,
+          "spans": [
+            {
+              "start": 49,
+              "end": 55
+            }
+          ],
+          "rewritten": null,
+          "type": "Bool",
+          "children": [
+            {
+              "id": 4,
+              "predicate": false
+            },
+            {
+              "id": 5,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 4,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 5,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(a)",
+          "nodeId": 1,
+          "spans": [
+            {
+              "start": 57,
+              "end": 58
+            }
+          ],
+          "rewritten": null,
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 67,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 68,
+              "predicate": false
+            },
+            {
+              "id": 69,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 68,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 69,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 70,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 71,
+              "predicate": false
+            },
+            {
+              "id": 72,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 71,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 72,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 73,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 74,
+              "predicate": false
+            },
+            {
+              "id": 75,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 74,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 75,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "post-channelize",
+      "label": "IR (POST-CHANNELIZE)",
+      "kind": "typed",
+      "root": 17,
+      "nodes": [
+        {
+          "label": "Let(a)",
+          "nodeId": 17,
+          "spans": [
+            {
+              "start": 19,
+              "end": 29
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 158,
+              "predicate": false
+            },
+            {
+              "id": 13,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 158,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 159,
+              "predicate": false
+            },
+            {
+              "id": 160,
+              "predicate": false
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 159,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 41,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 42,
+              "predicate": false
+            },
+            {
+              "id": 43,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 42,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 43,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 160,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(b)",
+          "nodeId": 13,
+          "spans": [
+            {
+              "start": 30,
+              "end": 40
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 142,
+              "predicate": false
+            },
+            {
+              "id": 9,
+              "predicate": false
+            },
+            {
+              "id": 70,
+              "predicate": true
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 142,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 143,
+              "predicate": false
+            },
+            {
+              "id": 144,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 143,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 57,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 58,
+              "predicate": false
+            },
+            {
+              "id": 59,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 58,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 59,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 144,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(c)",
+          "nodeId": 9,
+          "spans": [
+            {
+              "start": 41,
+              "end": 56
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 122,
+              "predicate": false
+            },
+            {
+              "id": 1,
+              "predicate": false
+            },
+            {
+              "id": 67,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 122,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "(Bool, Bool)",
+          "children": [
+            {
+              "id": 123,
+              "predicate": false
+            },
+            {
+              "id": 124,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 123,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 125,
+              "predicate": false
+            },
+            {
+              "id": 126,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 125,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 126,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 124,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 127,
+              "predicate": false
+            },
+            {
+              "id": 128,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 127,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 128,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(a)",
+          "nodeId": 1,
+          "spans": [
+            {
+              "start": 57,
+              "end": 58
+            }
+          ],
+          "rewritten": null,
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 67,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 68,
+              "predicate": false
+            },
+            {
+              "id": 69,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 68,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 69,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 70,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 71,
+              "predicate": false
+            },
+            {
+              "id": 72,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 71,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 72,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 73,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 74,
+              "predicate": false
+            },
+            {
+              "id": 75,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 74,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 75,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "post-as-of-read",
+      "label": "IR (POST-AS-OF-READ)",
+      "kind": "typed",
+      "root": 17,
+      "nodes": [
+        {
+          "label": "Let(a)",
+          "nodeId": 17,
+          "spans": [
+            {
+              "start": 19,
+              "end": 29
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 158,
+              "predicate": false
+            },
+            {
+              "id": 13,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 158,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 159,
+              "predicate": false
+            },
+            {
+              "id": 160,
+              "predicate": false
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 159,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 41,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 42,
+              "predicate": false
+            },
+            {
+              "id": 43,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 42,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 43,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 160,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(b)",
+          "nodeId": 13,
+          "spans": [
+            {
+              "start": 30,
+              "end": 40
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 142,
+              "predicate": false
+            },
+            {
+              "id": 9,
+              "predicate": false
+            },
+            {
+              "id": 70,
+              "predicate": true
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 142,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 143,
+              "predicate": false
+            },
+            {
+              "id": 144,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 143,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 57,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 58,
+              "predicate": false
+            },
+            {
+              "id": 59,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 58,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 59,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 144,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(c)",
+          "nodeId": 9,
+          "spans": [
+            {
+              "start": 41,
+              "end": 56
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 122,
+              "predicate": false
+            },
+            {
+              "id": 1,
+              "predicate": false
+            },
+            {
+              "id": 67,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 122,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "(Bool, Bool)",
+          "children": [
+            {
+              "id": 123,
+              "predicate": false
+            },
+            {
+              "id": 124,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 123,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 125,
+              "predicate": false
+            },
+            {
+              "id": 126,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 125,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 126,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 124,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.udf"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 127,
+              "predicate": false
+            },
+            {
+              "id": 128,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 127,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 128,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "Inline",
+            "nature": "expansion",
+            "label": "inline.beta"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(a)",
+          "nodeId": 1,
+          "spans": [
+            {
+              "start": 57,
+              "end": 58
+            }
+          ],
+          "rewritten": null,
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 67,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 68,
+              "predicate": false
+            },
+            {
+              "id": 69,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 68,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 69,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 70,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 71,
+              "predicate": false
+            },
+            {
+              "id": 72,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 71,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 72,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 73,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 74,
+              "predicate": false
+            },
+            {
+              "id": 75,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 74,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 75,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "post-lambda-elim",
+      "label": "IR (POST-LAMBDA-ELIM)",
+      "kind": "typed",
+      "root": 173,
+      "nodes": [
+        {
+          "label": "Let(a)",
+          "nodeId": 173,
+          "spans": [
+            {
+              "start": 19,
+              "end": 29
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 174,
+              "predicate": false
+            },
+            {
+              "id": 177,
+              "predicate": false
+            },
+            {
+              "id": 73,
+              "predicate": true
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 174,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 175,
+              "predicate": false
+            },
+            {
+              "id": 176,
+              "predicate": false
+            },
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 175,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 41,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 42,
+              "predicate": false
+            },
+            {
+              "id": 43,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 42,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 43,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 176,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@1",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(b)",
+          "nodeId": 177,
+          "spans": [
+            {
+              "start": 30,
+              "end": 40
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 178,
+              "predicate": false
+            },
+            {
+              "id": 181,
+              "predicate": false
+            },
+            {
+              "id": 70,
+              "predicate": true
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 178,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 179,
+              "predicate": false
+            },
+            {
+              "id": 180,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 179,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 57,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 58,
+              "predicate": false
+            },
+            {
+              "id": 59,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 58,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 59,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 180,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(c)",
+          "nodeId": 181,
+          "spans": [
+            {
+              "start": 41,
+              "end": 56
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 182,
+              "predicate": false
+            },
+            {
+              "id": 193,
+              "predicate": false
+            },
+            {
+              "id": 67,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 182,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Bool, Bool)",
+          "children": [
+            {
+              "id": 187,
+              "predicate": false
+            },
+            {
+              "id": 192,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 187,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 186,
+              "predicate": false
+            },
+            {
+              "id": 185,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 186,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int@2, Int@2) ⇒ Bool)",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 185,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 183,
+              "predicate": false
+            },
+            {
+              "id": 184,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 183,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 184,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 192,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 191,
+              "predicate": false
+            },
+            {
+              "id": 190,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 191,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int@2, Int@2) ⇒ Bool)",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 190,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@2, Int@2)",
+          "children": [
+            {
+              "id": 188,
+              "predicate": false
+            },
+            {
+              "id": 189,
+              "predicate": false
+            },
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 188,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 189,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int@2",
+          "children": [
+            {
+              "id": 57,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(a)",
+          "nodeId": 193,
+          "spans": [
+            {
+              "start": 57,
+              "end": 58
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int@1, Int@1)",
+          "children": [
+            {
+              "id": 41,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 67,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 68,
+              "predicate": false
+            },
+            {
+              "id": 69,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 68,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 69,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 70,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 71,
+              "predicate": false
+            },
+            {
+              "id": 72,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 71,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 72,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 73,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 74,
+              "predicate": false
+            },
+            {
+              "id": 75,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 74,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 75,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "post-planning",
+      "label": "IR (POST-PLANNING)",
+      "kind": "typed",
+      "root": 173,
+      "nodes": [
+        {
+          "label": "Let(a)",
+          "nodeId": 173,
+          "spans": [
+            {
+              "start": 19,
+              "end": 29
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 174,
+              "predicate": false
+            },
+            {
+              "id": 177,
+              "predicate": false
+            },
+            {
+              "id": 268,
+              "predicate": true
+            },
+            {
+              "id": 313,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 174,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 175,
+              "predicate": false
+            },
+            {
+              "id": 176,
+              "predicate": false
+            },
+            {
+              "id": 313,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 175,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 313,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 313,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 311,
+              "predicate": false
+            },
+            {
+              "id": 312,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Compose",
+          "nodeId": 311,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "simplify.const_apply"
+          },
+          "type": "(Int ⇒ Bool)",
+          "children": [
+            {
+              "id": 300,
+              "predicate": false
+            },
+            {
+              "id": 309,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 300,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int, Int))",
+          "children": [
+            {
+              "id": 301,
+              "predicate": false
+            },
+            {
+              "id": 302,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(zip)",
+          "nodeId": 301,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 302,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "children": [
+            {
+              "id": 303,
+              "predicate": false
+            },
+            {
+              "id": 304,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(id)",
+          "nodeId": 303,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 304,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": [
+            {
+              "id": 305,
+              "predicate": false
+            },
+            {
+              "id": 306,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(const)",
+          "nodeId": 305,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int ⇒ Int))",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 306,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 309,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int, Int) ⇒ Bool)",
+          "children": []
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 312,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 176,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 313,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(b)",
+          "nodeId": 177,
+          "spans": [
+            {
+              "start": 30,
+              "end": 40
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 178,
+              "predicate": false
+            },
+            {
+              "id": 181,
+              "predicate": false
+            },
+            {
+              "id": 358,
+              "predicate": true
+            },
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 178,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 179,
+              "predicate": false
+            },
+            {
+              "id": 180,
+              "predicate": false
+            },
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 179,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 403,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 401,
+              "predicate": false
+            },
+            {
+              "id": 402,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Compose",
+          "nodeId": 401,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "simplify.const_apply"
+          },
+          "type": "(Int ⇒ Bool)",
+          "children": [
+            {
+              "id": 390,
+              "predicate": false
+            },
+            {
+              "id": 399,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 390,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int, Int))",
+          "children": [
+            {
+              "id": 391,
+              "predicate": false
+            },
+            {
+              "id": 392,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(zip)",
+          "nodeId": 391,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 392,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "children": [
+            {
+              "id": 393,
+              "predicate": false
+            },
+            {
+              "id": 394,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(id)",
+          "nodeId": 393,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 394,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": [
+            {
+              "id": 395,
+              "predicate": false
+            },
+            {
+              "id": 396,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(const)",
+          "nodeId": 395,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int ⇒ Int))",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 396,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 399,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int, Int) ⇒ Bool)",
+          "children": []
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 402,
+          "spans": [
+            {
+              "start": 38,
+              "end": 39
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 180,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Let(c)",
+          "nodeId": 181,
+          "spans": [
+            {
+              "start": 41,
+              "end": 56
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 182,
+              "predicate": false
+            },
+            {
+              "id": 193,
+              "predicate": false
+            },
+            {
+              "id": 448,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 182,
+          "spans": [
+            {
+              "start": 13,
+              "end": 18
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Bool, Bool)",
+          "children": [
+            {
+              "id": 187,
+              "predicate": false
+            },
+            {
+              "id": 192,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 187,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 186,
+              "predicate": false
+            },
+            {
+              "id": 185,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 186,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(({Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}) ⇒ Bool)",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 185,
+          "spans": [
+            {
+              "start": 13,
+              "end": 14
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 183,
+              "predicate": false
+            },
+            {
+              "id": 184,
+              "predicate": false
+            },
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 183,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 184,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 192,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 191,
+              "predicate": false
+            },
+            {
+              "id": 190,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 191,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(({Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}) ⇒ Bool)",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 190,
+          "spans": [
+            {
+              "start": 16,
+              "end": 17
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 188,
+              "predicate": false
+            },
+            {
+              "id": 189,
+              "predicate": false
+            },
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 188,
+          "spans": [
+            {
+              "start": 49,
+              "end": 50
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(2))",
+          "nodeId": 189,
+          "spans": [
+            {
+              "start": 54,
+              "end": 55
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "{Int | __elem ▷ ((id, 2 ▷ const) ▷ zip ≫ eq)}",
+          "children": [
+            {
+              "id": 403,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Var(a)",
+          "nodeId": 193,
+          "spans": [
+            {
+              "start": 57,
+              "end": 58
+            }
+          ],
+          "rewritten": {
+            "via": "LambdaElim",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "({Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}, {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)})",
+          "children": [
+            {
+              "id": 313,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 448,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 446,
+              "predicate": false
+            },
+            {
+              "id": 447,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Compose",
+          "nodeId": 446,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "simplify.const_apply"
+          },
+          "type": "(Int ⇒ Bool)",
+          "children": [
+            {
+              "id": 435,
+              "predicate": false
+            },
+            {
+              "id": 444,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 435,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int, Int))",
+          "children": [
+            {
+              "id": 436,
+              "predicate": false
+            },
+            {
+              "id": 437,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(zip)",
+          "nodeId": 436,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 437,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "children": [
+            {
+              "id": 438,
+              "predicate": false
+            },
+            {
+              "id": 439,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(id)",
+          "nodeId": 438,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 439,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": [
+            {
+              "id": 440,
+              "predicate": false
+            },
+            {
+              "id": 441,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(const)",
+          "nodeId": 440,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int ⇒ Int))",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 441,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 444,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int, Int) ⇒ Bool)",
+          "children": []
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 447,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 358,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 356,
+              "predicate": false
+            },
+            {
+              "id": 357,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Compose",
+          "nodeId": 356,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "simplify.const_apply"
+          },
+          "type": "(Int ⇒ Bool)",
+          "children": [
+            {
+              "id": 345,
+              "predicate": false
+            },
+            {
+              "id": 354,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 345,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int, Int))",
+          "children": [
+            {
+              "id": 346,
+              "predicate": false
+            },
+            {
+              "id": 347,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(zip)",
+          "nodeId": 346,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 347,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "children": [
+            {
+              "id": 348,
+              "predicate": false
+            },
+            {
+              "id": 349,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(id)",
+          "nodeId": 348,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 349,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": [
+            {
+              "id": 350,
+              "predicate": false
+            },
+            {
+              "id": 351,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(const)",
+          "nodeId": 350,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int ⇒ Int))",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 351,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 354,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int, Int) ⇒ Bool)",
+          "children": []
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 357,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 268,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 266,
+              "predicate": false
+            },
+            {
+              "id": 267,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Compose",
+          "nodeId": 266,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "simplify.const_apply"
+          },
+          "type": "(Int ⇒ Bool)",
+          "children": [
+            {
+              "id": 255,
+              "predicate": false
+            },
+            {
+              "id": 264,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 255,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int, Int))",
+          "children": [
+            {
+              "id": 256,
+              "predicate": false
+            },
+            {
+              "id": 257,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(zip)",
+          "nodeId": 256,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 257,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "children": [
+            {
+              "id": 258,
+              "predicate": false
+            },
+            {
+              "id": 259,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(id)",
+          "nodeId": 258,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 259,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ Int)",
+          "children": [
+            {
+              "id": 260,
+              "predicate": false
+            },
+            {
+              "id": 261,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(const)",
+          "nodeId": 260,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "(Int ⇒ (Int ⇒ Int))",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(1))",
+          "nodeId": 261,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Builtin(eq)",
+          "nodeId": 264,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "lambda_elim.point_free"
+          },
+          "type": "((Int, Int) ⇒ Bool)",
+          "children": []
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 267,
+          "spans": [
+            {
+              "start": 27,
+              "end": 28
+            }
+          ],
+          "rewritten": {
+            "via": "Planning",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        }
+      ]
+    }
+  ],
+  "paneLinks": [
+    {
+      "from": "pre-inference",
+      "to": "post-inference",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ],
+        [
+          6,
+          6
+        ],
+        [
+          7,
+          7
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          9,
+          9
+        ],
+        [
+          10,
+          10
+        ],
+        [
+          10,
+          57
+        ],
+        [
+          10,
+          58
+        ],
+        [
+          10,
+          59
+        ],
+        [
+          11,
+          11
+        ],
+        [
+          12,
+          12
+        ],
+        [
+          13,
+          13
+        ],
+        [
+          14,
+          14
+        ],
+        [
+          14,
+          41
+        ],
+        [
+          14,
+          42
+        ],
+        [
+          14,
+          43
+        ],
+        [
+          14,
+          67
+        ],
+        [
+          14,
+          68
+        ],
+        [
+          14,
+          69
+        ],
+        [
+          14,
+          70
+        ],
+        [
+          14,
+          71
+        ],
+        [
+          14,
+          72
+        ],
+        [
+          14,
+          73
+        ],
+        [
+          14,
+          74
+        ],
+        [
+          14,
+          75
+        ],
+        [
+          15,
+          15
+        ],
+        [
+          16,
+          16
+        ],
+        [
+          17,
+          17
+        ],
+        [
+          18,
+          39
+        ],
+        [
+          18,
+          55
+        ],
+        [
+          18,
+          65
+        ],
+        [
+          19,
+          40
+        ],
+        [
+          19,
+          56
+        ],
+        [
+          19,
+          66
+        ],
+        [
+          20,
+          38
+        ],
+        [
+          20,
+          54
+        ],
+        [
+          20,
+          64
+        ],
+        [
+          21,
+          37
+        ],
+        [
+          21,
+          53
+        ],
+        [
+          21,
+          63
+        ],
+        [
+          22,
+          76
+        ],
+        [
+          22,
+          77
+        ],
+        [
+          22,
+          78
+        ]
+      ]
+    },
+    {
+      "from": "post-inference",
+      "to": "post-channelize",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          4,
+          125
+        ],
+        [
+          4,
+          127
+        ],
+        [
+          5,
+          126
+        ],
+        [
+          5,
+          128
+        ],
+        [
+          9,
+          9
+        ],
+        [
+          13,
+          13
+        ],
+        [
+          17,
+          17
+        ],
+        [
+          38,
+          158
+        ],
+        [
+          39,
+          159
+        ],
+        [
+          40,
+          160
+        ],
+        [
+          41,
+          41
+        ],
+        [
+          42,
+          42
+        ],
+        [
+          43,
+          43
+        ],
+        [
+          54,
+          142
+        ],
+        [
+          55,
+          143
+        ],
+        [
+          56,
+          144
+        ],
+        [
+          57,
+          57
+        ],
+        [
+          58,
+          58
+        ],
+        [
+          59,
+          59
+        ],
+        [
+          64,
+          122
+        ],
+        [
+          65,
+          123
+        ],
+        [
+          66,
+          124
+        ],
+        [
+          67,
+          67
+        ],
+        [
+          68,
+          68
+        ],
+        [
+          69,
+          69
+        ],
+        [
+          70,
+          70
+        ],
+        [
+          71,
+          71
+        ],
+        [
+          72,
+          72
+        ],
+        [
+          73,
+          73
+        ],
+        [
+          74,
+          74
+        ],
+        [
+          75,
+          75
+        ]
+      ]
+    },
+    {
+      "from": "post-channelize",
+      "to": "post-as-of-read",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          9,
+          9
+        ],
+        [
+          13,
+          13
+        ],
+        [
+          17,
+          17
+        ],
+        [
+          41,
+          41
+        ],
+        [
+          42,
+          42
+        ],
+        [
+          43,
+          43
+        ],
+        [
+          57,
+          57
+        ],
+        [
+          58,
+          58
+        ],
+        [
+          59,
+          59
+        ],
+        [
+          67,
+          67
+        ],
+        [
+          68,
+          68
+        ],
+        [
+          69,
+          69
+        ],
+        [
+          70,
+          70
+        ],
+        [
+          71,
+          71
+        ],
+        [
+          72,
+          72
+        ],
+        [
+          73,
+          73
+        ],
+        [
+          74,
+          74
+        ],
+        [
+          75,
+          75
+        ],
+        [
+          122,
+          122
+        ],
+        [
+          123,
+          123
+        ],
+        [
+          124,
+          124
+        ],
+        [
+          125,
+          125
+        ],
+        [
+          126,
+          126
+        ],
+        [
+          127,
+          127
+        ],
+        [
+          128,
+          128
+        ],
+        [
+          142,
+          142
+        ],
+        [
+          143,
+          143
+        ],
+        [
+          144,
+          144
+        ],
+        [
+          158,
+          158
+        ],
+        [
+          159,
+          159
+        ],
+        [
+          160,
+          160
+        ]
+      ]
+    },
+    {
+      "from": "post-as-of-read",
+      "to": "post-lambda-elim",
+      "edges": [
+        [
+          1,
+          193
+        ],
+        [
+          9,
+          181
+        ],
+        [
+          13,
+          177
+        ],
+        [
+          17,
+          173
+        ],
+        [
+          41,
+          41
+        ],
+        [
+          42,
+          42
+        ],
+        [
+          43,
+          43
+        ],
+        [
+          57,
+          57
+        ],
+        [
+          58,
+          58
+        ],
+        [
+          59,
+          59
+        ],
+        [
+          67,
+          67
+        ],
+        [
+          68,
+          68
+        ],
+        [
+          69,
+          69
+        ],
+        [
+          70,
+          70
+        ],
+        [
+          71,
+          71
+        ],
+        [
+          72,
+          72
+        ],
+        [
+          73,
+          73
+        ],
+        [
+          74,
+          74
+        ],
+        [
+          75,
+          75
+        ],
+        [
+          122,
+          182
+        ],
+        [
+          123,
+          185
+        ],
+        [
+          123,
+          186
+        ],
+        [
+          123,
+          187
+        ],
+        [
+          124,
+          190
+        ],
+        [
+          124,
+          191
+        ],
+        [
+          124,
+          192
+        ],
+        [
+          125,
+          183
+        ],
+        [
+          126,
+          184
+        ],
+        [
+          127,
+          188
+        ],
+        [
+          128,
+          189
+        ],
+        [
+          142,
+          178
+        ],
+        [
+          143,
+          179
+        ],
+        [
+          144,
+          180
+        ],
+        [
+          158,
+          174
+        ],
+        [
+          159,
+          175
+        ],
+        [
+          160,
+          176
+        ]
+      ]
+    },
+    {
+      "from": "post-lambda-elim",
+      "to": "post-planning",
+      "edges": [
+        [
+          41,
+          300
+        ],
+        [
+          41,
+          301
+        ],
+        [
+          41,
+          302
+        ],
+        [
+          41,
+          309
+        ],
+        [
+          41,
+          311
+        ],
+        [
+          41,
+          312
+        ],
+        [
+          41,
+          313
+        ],
+        [
+          42,
+          303
+        ],
+        [
+          43,
+          304
+        ],
+        [
+          43,
+          305
+        ],
+        [
+          43,
+          306
+        ],
+        [
+          57,
+          390
+        ],
+        [
+          57,
+          391
+        ],
+        [
+          57,
+          392
+        ],
+        [
+          57,
+          399
+        ],
+        [
+          57,
+          401
+        ],
+        [
+          57,
+          402
+        ],
+        [
+          57,
+          403
+        ],
+        [
+          58,
+          393
+        ],
+        [
+          59,
+          394
+        ],
+        [
+          59,
+          395
+        ],
+        [
+          59,
+          396
+        ],
+        [
+          67,
+          435
+        ],
+        [
+          67,
+          436
+        ],
+        [
+          67,
+          437
+        ],
+        [
+          67,
+          444
+        ],
+        [
+          67,
+          446
+        ],
+        [
+          67,
+          447
+        ],
+        [
+          67,
+          448
+        ],
+        [
+          68,
+          438
+        ],
+        [
+          69,
+          439
+        ],
+        [
+          69,
+          440
+        ],
+        [
+          69,
+          441
+        ],
+        [
+          70,
+          345
+        ],
+        [
+          70,
+          346
+        ],
+        [
+          70,
+          347
+        ],
+        [
+          70,
+          354
+        ],
+        [
+          70,
+          356
+        ],
+        [
+          70,
+          357
+        ],
+        [
+          70,
+          358
+        ],
+        [
+          71,
+          348
+        ],
+        [
+          72,
+          349
+        ],
+        [
+          72,
+          350
+        ],
+        [
+          72,
+          351
+        ],
+        [
+          73,
+          255
+        ],
+        [
+          73,
+          256
+        ],
+        [
+          73,
+          257
+        ],
+        [
+          73,
+          264
+        ],
+        [
+          73,
+          266
+        ],
+        [
+          73,
+          267
+        ],
+        [
+          73,
+          268
+        ],
+        [
+          74,
+          258
+        ],
+        [
+          75,
+          259
+        ],
+        [
+          75,
+          260
+        ],
+        [
+          75,
+          261
+        ],
+        [
+          173,
+          173
+        ],
+        [
+          174,
+          174
+        ],
+        [
+          175,
+          175
+        ],
+        [
+          176,
+          176
+        ],
+        [
+          177,
+          177
+        ],
+        [
+          178,
+          178
+        ],
+        [
+          179,
+          179
+        ],
+        [
+          180,
+          180
+        ],
+        [
+          181,
+          181
+        ],
+        [
+          182,
+          182
+        ],
+        [
+          183,
+          183
+        ],
+        [
+          184,
+          184
+        ],
+        [
+          185,
+          185
+        ],
+        [
+          186,
+          186
+        ],
+        [
+          187,
+          187
+        ],
+        [
+          188,
+          188
+        ],
+        [
+          189,
+          189
+        ],
+        [
+          190,
+          190
+        ],
+        [
+          191,
+          191
+        ],
+        [
+          192,
+          192
+        ],
+        [
+          193,
+          193
+        ]
+      ]
+    }
+  ]
+}

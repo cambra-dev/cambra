@@ -14,6 +14,8 @@
 mod common;
 
 mod arithmetic;
+mod defer_generators;
+mod defer_lift;
 mod discount_contract;
 mod fanout;
 mod filter_and_aggregate;
@@ -27,11 +29,16 @@ mod http_greeter;
 mod inner_join;
 mod join_then_groupby;
 mod ledger_balance;
+mod list_min;
 mod nonneg_inventory;
+mod polymorphic;
 mod prefix_lines;
 mod reachability;
 mod refinement;
 mod storefront;
 mod streaming_echo;
 mod txn_kv;
+mod txn_multi_read;
+mod type_error;
+mod udf_closure;
 mod while_counter;

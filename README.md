@@ -88,6 +88,16 @@ cargo run -- --inspect tests/programs/inner_join/program.cambra
 
 The inspector defaults to port 8080 (`--inspect=9090` to change it). After the program finishes, the process stays alive so you can browse `http://localhost:<port>`; Ctrl+C to exit.
 
+### Program inspector
+
+Pass `--inspect-only` to compile a program and serve a read-only view of it — the source alongside one IR tree pane per compiler stage, cross-linked by node→node provenance — without running it:
+
+```bash
+cargo run -- --inspect-only tests/programs/polymorphic/program.cambra
+```
+
+Same default port, and exclusive with `--inspect`: one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).

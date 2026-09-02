@@ -1,0 +1,16 @@
+def doubled(xs):
+    for x in xs:
+        yield x * 2
+
+def squared(xs):
+    for x in xs:
+        yield x * x
+
+readings = [1, 2, 3, 4]
+
+totals = defer()
+totals << sum(doubled(readings))
+for x in squared(readings):
+    totals << x
+
+max(totals)

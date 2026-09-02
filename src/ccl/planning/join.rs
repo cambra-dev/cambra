@@ -1537,7 +1537,9 @@ mod tests {
     fn test_spanning_tree_n_one_single_leaf() {
         // No edges needed; the single node is already its own spanning tree.
         let children = spanning_tree_children(&[], 1).unwrap();
-        assert_eq!(children, vec![vec![]]);
+        // The element type is spelled out because `serde_json`'s
+        // `PartialEq<Value> for usize` makes an empty `vec![vec![]]` ambiguous.
+        assert_eq!(children, vec![Vec::<usize>::new()]);
     }
 
     #[test]

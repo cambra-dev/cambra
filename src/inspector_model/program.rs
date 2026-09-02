@@ -2,9 +2,9 @@
 //! assembled for the payload.
 //!
 //! [`InspectedProgram`] holds one [`PaneProjection`] per declared pane (that
-//! pane's IR tree and its `SourceProjection`), the pane-pair provenance maps,
-//! and the pane-pair provenance maps.
-//! [`build_payload`](InspectedProgram::build_payload) in `wire.rs` is its consumer.
+//! pane's IR tree and its `SourceProjection`) and the pane-pair provenance
+//! maps. [`build_payload`](InspectedProgram::build_payload) in `wire.rs` is its
+//! consumer.
 //!
 //! There is no point-query layer: every static fact ships in the payload, and a
 //! positional question ("which node is at this position") is answered by the
@@ -13,7 +13,7 @@
 //!
 //! No serde and no I/O: the wire types and their builders are `wire.rs`'s, the
 //! shared IR walk is `walk.rs`'s, and the serialization is the
-//! `cambra-inspector` crate's.
+//! `inspector_server` module's.
 
 use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase};

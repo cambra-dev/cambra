@@ -3,7 +3,7 @@
 //! `/api/snapshot` is the primary read-only endpoint: source + the panes (each
 //! a node table) + use→def definitions + diagnostics + meta. This module
 //! mirrors that JSON exactly as a serde-gated [`InspectorPayload`]; the actual
-//! serialization (and `serde_json`) lives in the `cambra-inspector` crate.
+//! serialization (and `serde_json`) lives in `crate::inspector_server`.
 //! Building the payload is pure: it resolves names over the pre-inference pane
 //! (`definitions`) and builds each pane's node table via [`build_node_table`],
 //! over the IR walk `walk.rs` owns.
@@ -26,10 +26,10 @@
 //!
 //! # Wire-type isolation
 //!
-//! Every type here carries `#[cfg_attr(feature = "serde", derive(Serialize))]`
-//! with camelCase field names (`nodeId`, `useSpan`, `defSpan`,
-//! `payloadKind`, …) to match the schema. `cambra` itself never compiles serde
-//! unless the feature is on — see the module-level note on
+//! Every type here derives `Serialize` with camelCase field names (`nodeId`,
+//! `useSpan`, `defSpan`, `payloadKind`, …) to match the schema. `serde_json`
+//! does not live here: this module builds the typed payload and the transport
+//! turns it into JSON — see the module-level note on
 //! [`inspector_model`](crate::inspector_model).
 //!
 //! # Populated vs. stubbed
@@ -38,11 +38,11 @@
 //!   fully populated.
 //! * `diagnostics` — **always empty `[]`** in this payload: a `/api/snapshot`
 //!   describes a *successfully compiled* program, and there are no warnings. The
-//!   wire type ([`Diagnostic`]) drives the standalone compile-failure path
-//!   (`cambra-inspector::diagnose_json`); a failed compile instead flows
-//!   through [`InspectorPayload::degraded`], which carries the same
-//!   diagnostics in place of a real snapshot (see `cambra-inspector::server`'s
-//!   "Transport decision" note).
+//!   wire type ([`Diagnostic`]) drives the compile-failure path instead: a
+//!   failed compile flows through [`InspectorPayload::degraded`], which carries
+//!   the diagnostics in place of a real snapshot, and `/api/diagnostics` serves
+//!   the same array (see `src/inspector_server/serve.rs`'s "Transport decision"
+//!   note).
 //! * `outline` and `meta.tick` — **omitted**. Rather than ship an empty stub of
 //!   an undecided shape, or a `null` reserved for a live layer that does not
 //!   exist, a field stays off the wire until something reads it.
@@ -65,9 +65,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 ///
 /// Field order/names mirror the schema. `outline` is intentionally absent (see
 /// the module note); `diagnostics` is always empty on the success path.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InspectorPayload {
     /// The program's name + full source text.
     pub source: SourceInfo,
@@ -95,9 +94,8 @@ pub struct InspectorPayload {
 ///
 /// Carries its own self-contained node table — each pane resolves against its
 /// own (`Expr`, `SourceProjection`) pair.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PaneEntry {
     /// Stable machine id — the pane's declared name, e.g. `"pre-inference"`,
     /// `"post-inference"`, `"post-channelize"`.
@@ -122,9 +120,8 @@ pub struct PaneEntry {
 /// The wire's own node type, owned here rather than borrowed from the terminal
 /// renderer: the fields are this payload's and nothing else sets them. See
 /// `src/inspector_model/design.md`, "A node on the wire".
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IrNode {
     /// The node's kind, rendered — `BinOp(Arithmetic(Mul))`, `Lit(Int(1))`,
     /// `Let(x)`. Built by `node_label`.
@@ -150,7 +147,7 @@ pub struct IrNode {
     /// The node's type, rendered by `Display for Type`, so a change to that
     /// rendering changes this verbatim. See
     /// `src/inspector_model/design.md`, "Types on the wire".
-    #[cfg_attr(feature = "serde", serde(rename = "type"))]
+    #[serde(rename = "type")]
     pub ty: String,
     /// The node's children by id: the value children in positional order,
     /// then every refinement predicate riding one of its type slots, each
@@ -165,8 +162,7 @@ pub struct IrNode {
 /// their positional index, then the parent's predicates — so the position in
 /// [`children`](IrNode::children) is the label a consumer would read, and
 /// [`predicate`](Self::predicate) is what it branches on.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct IrChild {
     /// The child node's id — an entry of the same pane's
     /// [`nodes`](PaneEntry::nodes).
@@ -180,8 +176,7 @@ pub struct IrChild {
 /// A node's rewrite tag — the
 /// [`RewriteTag`](crate::ccl::provenance::RewriteTag) of its attribution,
 /// rendered for the wire.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct RewriteInfo {
     /// The phase that performed the rewrite — the
     /// [`Phase`](crate::ccl::context::Phase) debug name, e.g. `"Infer"`.
@@ -202,9 +197,8 @@ pub struct RewriteInfo {
 /// `[id, id]` self-edge, so the consumer follows edges only (no identity special
 /// case). Genuine identity changes (monomorphization / inline fan-out) are the
 /// `u != d` edges.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PaneLinkEntry {
     /// The upstream pane id, e.g. `"pre-inference"`.
     pub from: &'static str,
@@ -216,8 +210,7 @@ pub struct PaneLinkEntry {
 }
 
 /// `{ name, text }` — the program identity + source.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SourceInfo {
     /// A program name (a placeholder; the server can override it).
     pub name: String,
@@ -228,9 +221,8 @@ pub struct SourceInfo {
 /// One `{ useSpan, defSpan, name }` row of `definitions`. The schema's optional
 /// `uid` is omitted — resolution is over the source AST, which keys on spans,
 /// not uniquify uids.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DefinitionEntry {
     /// The use-site span.
     pub use_span: Span,
@@ -247,13 +239,12 @@ pub struct DefinitionEntry {
 /// [`Diagnostic::from_compile_error`] / [`diagnostics_from_compile_errors`].
 ///
 /// `diagnostics` on [`InspectorPayload`] stays `[]` for *successful* compiles
-/// (no warnings); these are produced on the compile-failure path by the
-/// standalone `diagnose_json` entry, not by `build_payload`.
+/// (no warnings); these are produced on the compile-failure path, not by
+/// `build_payload`.
 ///
 /// [`CompileError`]: crate::ccl::context::CompileError
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
     /// Severity discriminant — `"error"` (no warnings).
     pub severity: String,
@@ -321,9 +312,8 @@ pub fn diagnostics_from_compile_errors(
 }
 
 /// `meta` — snapshot metadata + the forward-compat live seams.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Meta {
     /// The payload kind discriminant — `"program"` for a successful compile,
     /// `"failed"` for a degraded (compile-error) payload.
@@ -688,7 +678,7 @@ mod tests {
     /// naming the panes it joins.
     ///
     /// This is what "adding a pane is an entry in `PANES` and no edit here" means
-    /// operationally. The `cambra-inspector` crate pins the same set as a literal
+    /// operationally. The wire validator pins the same set as a literal
     /// list, so that a pane added upstream fails a test rather than appearing
     /// unannounced; this asserts the two agree at the producer.
     #[test]
@@ -1356,7 +1346,7 @@ x
     // These pin which source construct maps to which IR node, over two programs
     // whose lowering produces synthetic wrapper chains: a `yield` generator and
     // a `defer()`/`<<` feed pipeline. They mirror the manual web-validation
-    // examples (`cambra-inspector/examples/{generator_min,defer_min}.chl`) but
+    // gallery programs (`tests/programs/defer_lift/`, `generator_pipeline/`) but
     // inline the source so the flow is exercised without the front end.
     //
     // The question they ask is the consumer's — "what is at this span" — and it

@@ -170,7 +170,6 @@ impl std::fmt::Debug for NodeId {
 // (the uniquify binder-index precedent), so mint-count changes produce no fixture
 // diff and a genuine reordering produces one proportional to it. Not yet
 // implemented.
-#[cfg(feature = "serde")]
 impl serde::Serialize for NodeId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u64(self.0)
