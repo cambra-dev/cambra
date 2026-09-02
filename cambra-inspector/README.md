@@ -28,7 +28,11 @@ serves.
   other, reaching the frontend as a child edge marked `predicate: true` rather
   than a positional one, so it links across panes the same way the value tree
   does. One predicate term shared by several type slots is one entry of the
-  pane's node table that several edges name.
+  pane's node table that several edges name. The tree panes draw no row for one:
+  the node's rendered `type` already shows the predicate, and the interiors
+  outnumber the program (arithmetic's post-planning pane is 121 predicate rows
+  to 11 of program). They stay on the wire because their ids are endpoints of
+  the pane links.
 
 See [`web/README.md`](web/README.md) for the full interaction table and the
 frontend's design.
