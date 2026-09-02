@@ -152,6 +152,44 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
+
+/// A group-by whose element type is a singleton refinement (`[1]`, `[1, 1]`) keys
+/// the same as one whose elements only share a base type (`[1, 2]`). The singleton
+/// rides the group key's lower bounds, which a domain's reading meets
+/// (`src/ccl/design/type-inference.md`, "The collapse happens at the position").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    "[sum(x) for x in groupby([1], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[sum(x) for x in groupby([1, 1], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[sum(x) for x in groupby([1, 2], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+fn test_groupby_over_a_singleton_element_literal(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
 // 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
