@@ -216,6 +216,12 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       { start: 2, end: 3 },
     ];
     expect(() => validateSnapshot(widest)).toThrow(/nodes\[0\]\.spans\[1\].*narrowest first/);
+    // The message has to carry the numbers it rejected. It reported
+    // `got object` for every violation until the span was rendered by value,
+    // which made a real payload's mis-ordered spans unreadable in the browser.
+    expect(() => validateSnapshot(widest)).toThrow(/width >= 9/);
+    expect(() => validateSnapshot(widest)).toThrow(/"start":2,"end":3/);
+    expect(() => validateSnapshot(repeated)).toThrow(/"start":0,"end":1/);
   });
 
   it("throws when a node names one predicate under two edges", () => {
