@@ -25,8 +25,8 @@
 # tests/inspector_goldens.rs already walks every gallery source through the
 # wire validator.
 arithmetic udf_closure
-# Both duplication mechanisms: monomorph clones + Derived(Inline) copies, and the
-# post-inference -> post-channelize edges they put in the paneLinks window.
+# Monomorph clones + the Derived(Inline) copies they carry, and the non-identity
+# edges both paneLinks windows get from them.
 polymorphic polymorphic
 list_min list_min
 # A deliberate type error -> the degraded (payloadKind: "failed") payload.
