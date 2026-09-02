@@ -10,7 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { Store } from "./store";
-import { hoverPayloadAt, resolveSourceClick } from "./sourceView";
+import { flattenHighlights, hoverPayloadAt, resolveSourceClick } from "./sourceView";
 
 import { fixture, irPaneById, theNode } from "./__fixtures__/helpers";
 import type { Indices } from "./indices";
@@ -105,3 +105,55 @@ describe("resolveSourceClick", () => {
     });
   });
 });
+
+describe("flattenHighlights", () => {
+  const p = (from: number, to: number) => ({ from, to, primary: true });
+  const l = (from: number, to: number) => ({ from, to, primary: false });
+
+  it("joins two nested primary spans into one region", () => {
+    // The `txn_multi_read` case: clicking the `if` gives post-inference the
+    // statement [393,435) and the downstream panes the enclosing `with` block
+    // [371,435). Rendered raw, the inner range paints twice and reads as a
+    // shade that means nothing.
+    expect(flattenHighlights([p(371, 435), p(393, 435)])).toEqual([p(371, 435)]);
+  });
+
+  it("joins overlapping and touching spans of the same tier", () => {
+    expect(flattenHighlights([p(0, 5), p(3, 9)])).toEqual([p(0, 9)]);
+    expect(flattenHighlights([p(0, 5), p(5, 9)])).toEqual([p(0, 9)]);
+  });
+
+  it("keeps disjoint spans apart", () => {
+    expect(flattenHighlights([p(0, 2), p(6, 8)])).toEqual([p(0, 2), p(6, 8)]);
+  });
+
+  it("gives an offset to primary when both tiers cover it", () => {
+    expect(flattenHighlights([l(0, 10), p(4, 6)])).toEqual([l(0, 4), p(4, 6), l(6, 10)]);
+  });
+
+  it("drops a linked span a primary one covers entirely", () => {
+    expect(flattenHighlights([l(4, 6), p(0, 10)])).toEqual([p(0, 10)]);
+  });
+
+  it("subtracts several primary regions from one linked span", () => {
+    expect(flattenHighlights([l(0, 20), p(2, 4), p(10, 12)])).toEqual([
+      l(0, 2),
+      p(2, 4),
+      l(4, 10),
+      p(10, 12),
+      l(12, 20),
+    ]);
+  });
+
+  it("emits nothing for empty input or empty spans", () => {
+    expect(flattenHighlights([])).toEqual([]);
+    expect(flattenHighlights([p(3, 3)])).toEqual([]);
+  });
+
+  it("returns spans ascending, whatever order they arrive in", () => {
+    const out = flattenHighlights([p(20, 25), l(0, 30), p(5, 7)]);
+    expect(out.map((x) => x.from)).toEqual([...out.map((x) => x.from)].sort((a, b) => a - b));
+    expect(out.every((x, i) => i === 0 || out[i - 1].to <= x.from)).toBe(true);
+  });
+});
+
