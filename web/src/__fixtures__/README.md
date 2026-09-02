@@ -32,13 +32,15 @@ shape `nodes` holds, and for which of the two keys the pane carries.
 
 A **tree pane** (`holes`, `typed`) holds expression nodes, in first-visit
 pre-order, and names its start under `root` — one id, since a tree has one by
-construction. A child is `{ edge, id, predicate }` — the
-id names an entry of the same table, so a node reached from several places is one
+construction. A child is `{ id, predicate }` — the id names an entry of the same
+table, so a node reached from several places is one
 entry that several edges name. A refinement predicate riding a type slot is a
-node like any other, reached under a `where.N`-labelled child edge instead of a
-positional index; `predicate: true` on the edge is what distinguishes a subtree
-inside a type from an operand, and the label is for display. Each node carries
-its type as a rendered string in `type` (`"Int"`, `"_"`).
+node like any other, and `predicate: true` is what distinguishes a subtree
+inside a type from an operand. The edge carries no label: the frontend derives a
+value child's position from its index. Predicates stay on the wire because their
+ids are endpoints of the pane links, and the tree pane draws no row for one —
+the node's `type` already shows the predicate. Each node carries its type as a
+rendered string in `type` (`"Int"`, `"_"`).
 
 The **operator pane** (`operators`) holds the dataflow graph, in conversion
 order, and names no walk start. A walk begins at the nodes no `value` edge
