@@ -1,50 +1,50 @@
 {
   "source": {
-    "name": "cambra-inspector/examples/arithmetic.chl",
-    "text": "# Let-bindings + arithmetic. A simple post-inference tree:\n# Lit nodes carry \": Int\", BinOp nodes show operator dispatch.\ng = 10\ndef f(p, q):\n  p + q + g\nf(1, 2)\n"
+    "name": "tests/programs/udf_closure/program.cambra",
+    "text": "g = 10\ndef f(p, q):\n  p + q + g\nf(1, 2)\n"
   },
   "definitions": [
     {
       "useSpan": {
-        "start": 144,
-        "end": 145
+        "start": 22,
+        "end": 23
       },
       "defSpan": {
-        "start": 135,
-        "end": 136
+        "start": 13,
+        "end": 14
       },
       "name": "p"
     },
     {
       "useSpan": {
-        "start": 148,
-        "end": 149
+        "start": 26,
+        "end": 27
       },
       "defSpan": {
-        "start": 138,
-        "end": 139
+        "start": 16,
+        "end": 17
       },
       "name": "q"
     },
     {
       "useSpan": {
-        "start": 152,
-        "end": 153
+        "start": 30,
+        "end": 31
       },
       "defSpan": {
-        "start": 122,
-        "end": 128
+        "start": 0,
+        "end": 6
       },
       "name": "g"
     },
     {
       "useSpan": {
-        "start": 154,
-        "end": 155
+        "start": 32,
+        "end": 33
       },
       "defSpan": {
-        "start": 129,
-        "end": 154
+        "start": 7,
+        "end": 32
       },
       "name": "f"
     }
@@ -66,8 +66,8 @@
           "nodeId": 24,
           "spans": [
             {
-              "start": 122,
-              "end": 128
+              "start": 0,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -92,8 +92,8 @@
           "nodeId": 23,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": null,
@@ -105,8 +105,8 @@
           "nodeId": 22,
           "spans": [
             {
-              "start": 129,
-              "end": 154
+              "start": 7,
+              "end": 32
             }
           ],
           "rewritten": {
@@ -131,8 +131,8 @@
           "nodeId": 21,
           "spans": [
             {
-              "start": 129,
-              "end": 154
+              "start": 7,
+              "end": 32
             }
           ],
           "rewritten": {
@@ -153,8 +153,8 @@
           "nodeId": 10,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": null,
@@ -175,8 +175,8 @@
           "nodeId": 8,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": null,
@@ -197,8 +197,8 @@
           "nodeId": 6,
           "spans": [
             {
-              "start": 144,
-              "end": 145
+              "start": 22,
+              "end": 23
             }
           ],
           "rewritten": null,
@@ -219,8 +219,8 @@
           "nodeId": 14,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -236,8 +236,8 @@
           "nodeId": 15,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -253,8 +253,8 @@
           "nodeId": 7,
           "spans": [
             {
-              "start": 148,
-              "end": 149
+              "start": 26,
+              "end": 27
             }
           ],
           "rewritten": null,
@@ -275,8 +275,8 @@
           "nodeId": 19,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -292,8 +292,8 @@
           "nodeId": 20,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -309,8 +309,8 @@
           "nodeId": 9,
           "spans": [
             {
-              "start": 152,
-              "end": 153
+              "start": 30,
+              "end": 31
             }
           ],
           "rewritten": null,
@@ -322,8 +322,8 @@
           "nodeId": 5,
           "spans": [
             {
-              "start": 154,
-              "end": 161
+              "start": 32,
+              "end": 39
             }
           ],
           "rewritten": null,
@@ -344,8 +344,8 @@
           "nodeId": 4,
           "spans": [
             {
-              "start": 154,
-              "end": 155
+              "start": 32,
+              "end": 33
             }
           ],
           "rewritten": {
@@ -361,8 +361,8 @@
           "nodeId": 3,
           "spans": [
             {
-              "start": 156,
-              "end": 160
+              "start": 34,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -387,8 +387,8 @@
           "nodeId": 1,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": null,
@@ -400,8 +400,8 @@
           "nodeId": 2,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": null,
@@ -421,8 +421,8 @@
           "nodeId": 24,
           "spans": [
             {
-              "start": 122,
-              "end": 128
+              "start": 0,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -451,8 +451,8 @@
           "nodeId": 23,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": null,
@@ -469,8 +469,8 @@
           "nodeId": 62,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -495,8 +495,8 @@
           "nodeId": 63,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -512,8 +512,8 @@
           "nodeId": 64,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -529,8 +529,8 @@
           "nodeId": 95,
           "spans": [
             {
-              "start": 129,
-              "end": 154
+              "start": 7,
+              "end": 32
             }
           ],
           "rewritten": {
@@ -563,8 +563,8 @@
           "nodeId": 65,
           "spans": [
             {
-              "start": 129,
-              "end": 154
+              "start": 7,
+              "end": 32
             }
           ],
           "rewritten": {
@@ -593,8 +593,8 @@
           "nodeId": 66,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -619,8 +619,8 @@
           "nodeId": 67,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -645,8 +645,8 @@
           "nodeId": 68,
           "spans": [
             {
-              "start": 144,
-              "end": 145
+              "start": 22,
+              "end": 23
             }
           ],
           "rewritten": {
@@ -675,8 +675,8 @@
           "nodeId": 69,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -701,8 +701,8 @@
           "nodeId": 89,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -727,8 +727,8 @@
           "nodeId": 90,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -744,8 +744,8 @@
           "nodeId": 91,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -761,8 +761,8 @@
           "nodeId": 92,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -787,8 +787,8 @@
           "nodeId": 93,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -804,8 +804,8 @@
           "nodeId": 94,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -821,8 +821,8 @@
           "nodeId": 70,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -847,8 +847,8 @@
           "nodeId": 71,
           "spans": [
             {
-              "start": 148,
-              "end": 149
+              "start": 26,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -877,8 +877,8 @@
           "nodeId": 72,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -903,8 +903,8 @@
           "nodeId": 73,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -929,8 +929,8 @@
           "nodeId": 74,
           "spans": [
             {
-              "start": 152,
-              "end": 153
+              "start": 30,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -951,8 +951,8 @@
           "nodeId": 5,
           "spans": [
             {
-              "start": 154,
-              "end": 161
+              "start": 32,
+              "end": 39
             }
           ],
           "rewritten": null,
@@ -973,8 +973,8 @@
           "nodeId": 4,
           "spans": [
             {
-              "start": 154,
-              "end": 155
+              "start": 32,
+              "end": 33
             }
           ],
           "rewritten": {
@@ -999,8 +999,8 @@
           "nodeId": 3,
           "spans": [
             {
-              "start": 156,
-              "end": 160
+              "start": 34,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1033,8 +1033,8 @@
           "nodeId": 1,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": null,
@@ -1051,8 +1051,8 @@
           "nodeId": 2,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": null,
@@ -1077,8 +1077,8 @@
           "nodeId": 24,
           "spans": [
             {
-              "start": 122,
-              "end": 128
+              "start": 0,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1107,8 +1107,8 @@
           "nodeId": 23,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": null,
@@ -1125,8 +1125,8 @@
           "nodeId": 62,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1151,8 +1151,8 @@
           "nodeId": 63,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1168,8 +1168,8 @@
           "nodeId": 64,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1185,8 +1185,8 @@
           "nodeId": 112,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -1211,8 +1211,8 @@
           "nodeId": 113,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -1237,8 +1237,8 @@
           "nodeId": 114,
           "spans": [
             {
-              "start": 144,
-              "end": 145
+              "start": 22,
+              "end": 23
             }
           ],
           "rewritten": {
@@ -1267,8 +1267,8 @@
           "nodeId": 115,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -1293,8 +1293,8 @@
           "nodeId": 89,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1319,8 +1319,8 @@
           "nodeId": 90,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1336,8 +1336,8 @@
           "nodeId": 91,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1353,8 +1353,8 @@
           "nodeId": 92,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1379,8 +1379,8 @@
           "nodeId": 93,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1396,8 +1396,8 @@
           "nodeId": 94,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1413,8 +1413,8 @@
           "nodeId": 116,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -1447,8 +1447,8 @@
           "nodeId": 124,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1469,8 +1469,8 @@
           "nodeId": 125,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1491,8 +1491,8 @@
           "nodeId": 117,
           "spans": [
             {
-              "start": 148,
-              "end": 149
+              "start": 26,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -1521,8 +1521,8 @@
           "nodeId": 118,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -1547,8 +1547,8 @@
           "nodeId": 119,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -1581,8 +1581,8 @@
           "nodeId": 129,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1603,8 +1603,8 @@
           "nodeId": 130,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1625,8 +1625,8 @@
           "nodeId": 120,
           "spans": [
             {
-              "start": 152,
-              "end": 153
+              "start": 30,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -1655,8 +1655,8 @@
           "nodeId": 24,
           "spans": [
             {
-              "start": 122,
-              "end": 128
+              "start": 0,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1685,8 +1685,8 @@
           "nodeId": 23,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": null,
@@ -1703,8 +1703,8 @@
           "nodeId": 62,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1729,8 +1729,8 @@
           "nodeId": 63,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1746,8 +1746,8 @@
           "nodeId": 64,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -1763,8 +1763,8 @@
           "nodeId": 112,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -1789,8 +1789,8 @@
           "nodeId": 113,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -1815,8 +1815,8 @@
           "nodeId": 114,
           "spans": [
             {
-              "start": 144,
-              "end": 145
+              "start": 22,
+              "end": 23
             }
           ],
           "rewritten": {
@@ -1845,8 +1845,8 @@
           "nodeId": 115,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -1871,8 +1871,8 @@
           "nodeId": 89,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1897,8 +1897,8 @@
           "nodeId": 90,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1914,8 +1914,8 @@
           "nodeId": 91,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -1931,8 +1931,8 @@
           "nodeId": 92,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1957,8 +1957,8 @@
           "nodeId": 93,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1974,8 +1974,8 @@
           "nodeId": 94,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -1991,8 +1991,8 @@
           "nodeId": 116,
           "spans": [
             {
-              "start": 135,
-              "end": 136
+              "start": 13,
+              "end": 14
             }
           ],
           "rewritten": {
@@ -2025,8 +2025,8 @@
           "nodeId": 124,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -2047,8 +2047,8 @@
           "nodeId": 125,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -2069,8 +2069,8 @@
           "nodeId": 117,
           "spans": [
             {
-              "start": 148,
-              "end": 149
+              "start": 26,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -2099,8 +2099,8 @@
           "nodeId": 118,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -2125,8 +2125,8 @@
           "nodeId": 119,
           "spans": [
             {
-              "start": 138,
-              "end": 139
+              "start": 16,
+              "end": 17
             }
           ],
           "rewritten": {
@@ -2159,8 +2159,8 @@
           "nodeId": 129,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -2181,8 +2181,8 @@
           "nodeId": 130,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -2203,8 +2203,8 @@
           "nodeId": 120,
           "spans": [
             {
-              "start": 152,
-              "end": 153
+              "start": 30,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -2233,8 +2233,8 @@
           "nodeId": 131,
           "spans": [
             {
-              "start": 122,
-              "end": 128
+              "start": 0,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2263,8 +2263,8 @@
           "nodeId": 132,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2285,8 +2285,8 @@
           "nodeId": 62,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2311,8 +2311,8 @@
           "nodeId": 63,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2328,8 +2328,8 @@
           "nodeId": 64,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2345,8 +2345,8 @@
           "nodeId": 149,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -2371,8 +2371,8 @@
           "nodeId": 148,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -2393,8 +2393,8 @@
           "nodeId": 147,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -2423,8 +2423,8 @@
           "nodeId": 145,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -2449,8 +2449,8 @@
           "nodeId": 144,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -2475,8 +2475,8 @@
           "nodeId": 89,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -2501,8 +2501,8 @@
           "nodeId": 90,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -2518,8 +2518,8 @@
           "nodeId": 91,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -2535,8 +2535,8 @@
           "nodeId": 92,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -2561,8 +2561,8 @@
           "nodeId": 93,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -2578,8 +2578,8 @@
           "nodeId": 94,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -2595,8 +2595,8 @@
           "nodeId": 143,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -2629,8 +2629,8 @@
           "nodeId": 136,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -2651,8 +2651,8 @@
           "nodeId": 142,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -2673,8 +2673,8 @@
           "nodeId": 146,
           "spans": [
             {
-              "start": 152,
-              "end": 153
+              "start": 30,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -2703,8 +2703,8 @@
           "nodeId": 131,
           "spans": [
             {
-              "start": 122,
-              "end": 128
+              "start": 0,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2733,8 +2733,8 @@
           "nodeId": 132,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2755,8 +2755,8 @@
           "nodeId": 221,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2781,8 +2781,8 @@
           "nodeId": 219,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2807,8 +2807,8 @@
           "nodeId": 208,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2833,8 +2833,8 @@
           "nodeId": 209,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2850,8 +2850,8 @@
           "nodeId": 210,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2876,8 +2876,8 @@
           "nodeId": 211,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2893,8 +2893,8 @@
           "nodeId": 212,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2919,8 +2919,8 @@
           "nodeId": 213,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2936,8 +2936,8 @@
           "nodeId": 214,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2953,8 +2953,8 @@
           "nodeId": 217,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2970,8 +2970,8 @@
           "nodeId": 220,
           "spans": [
             {
-              "start": 126,
-              "end": 128
+              "start": 4,
+              "end": 6
             }
           ],
           "rewritten": {
@@ -2987,8 +2987,8 @@
           "nodeId": 149,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -3013,8 +3013,8 @@
           "nodeId": 148,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -3035,8 +3035,8 @@
           "nodeId": 147,
           "spans": [
             {
-              "start": 144,
-              "end": 153
+              "start": 22,
+              "end": 31
             }
           ],
           "rewritten": {
@@ -3065,8 +3065,8 @@
           "nodeId": 145,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -3091,8 +3091,8 @@
           "nodeId": 144,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -3117,8 +3117,8 @@
           "nodeId": 266,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3143,8 +3143,8 @@
           "nodeId": 264,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3169,8 +3169,8 @@
           "nodeId": 253,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3195,8 +3195,8 @@
           "nodeId": 254,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3212,8 +3212,8 @@
           "nodeId": 255,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3238,8 +3238,8 @@
           "nodeId": 256,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3255,8 +3255,8 @@
           "nodeId": 257,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3281,8 +3281,8 @@
           "nodeId": 258,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3298,8 +3298,8 @@
           "nodeId": 259,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3315,8 +3315,8 @@
           "nodeId": 262,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3332,8 +3332,8 @@
           "nodeId": 265,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3349,8 +3349,8 @@
           "nodeId": 311,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3375,8 +3375,8 @@
           "nodeId": 309,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3401,8 +3401,8 @@
           "nodeId": 298,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3427,8 +3427,8 @@
           "nodeId": 299,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3444,8 +3444,8 @@
           "nodeId": 300,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3470,8 +3470,8 @@
           "nodeId": 301,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3487,8 +3487,8 @@
           "nodeId": 302,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3513,8 +3513,8 @@
           "nodeId": 303,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3530,8 +3530,8 @@
           "nodeId": 304,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3547,8 +3547,8 @@
           "nodeId": 307,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3564,8 +3564,8 @@
           "nodeId": 310,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3581,8 +3581,8 @@
           "nodeId": 143,
           "spans": [
             {
-              "start": 144,
-              "end": 149
+              "start": 22,
+              "end": 27
             }
           ],
           "rewritten": {
@@ -3615,8 +3615,8 @@
           "nodeId": 136,
           "spans": [
             {
-              "start": 156,
-              "end": 157
+              "start": 34,
+              "end": 35
             }
           ],
           "rewritten": {
@@ -3637,8 +3637,8 @@
           "nodeId": 142,
           "spans": [
             {
-              "start": 159,
-              "end": 160
+              "start": 37,
+              "end": 38
             }
           ],
           "rewritten": {
@@ -3659,8 +3659,8 @@
           "nodeId": 146,
           "spans": [
             {
-              "start": 152,
-              "end": 153
+              "start": 30,
+              "end": 31
             }
           ],
           "rewritten": {

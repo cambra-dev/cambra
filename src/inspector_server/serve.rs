@@ -6,7 +6,7 @@
 //! per-request recompilation, no mutation endpoint, no live ticks — M1 is "the
 //! program, no execution".
 //!
-//! This is a *sibling* of [`cambra::web_inspector`]'s internal dev dashboard,
+//! This is a *sibling* of [`crate::web_inspector`]'s internal dev dashboard,
 //! not an extension of it: that one serves live runtime state on a background
 //! thread; this one serves the read-only payload — one pane per pipeline stage
 //! — to the embedded CodeMirror frontend. They share only the `tiny_http`
@@ -14,7 +14,7 @@
 //!
 //! # Routes
 //!
-//! - `GET /api/snapshot` — the [`snapshot_json`](crate::snapshot_json) body on a
+//! - `GET /api/snapshot` — the [`snapshot_json`](super::snapshot_json) body on a
 //!   successful compile; a **degraded** JSON body on compile failure (see below).
 //!   `application/json`.
 //! - `GET /api/diagnostics` — [`diagnostics_body`]
@@ -40,11 +40,11 @@
 
 use std::io;
 
-use cambra::ccl::context::{GlobalContext, compile_program};
-use cambra::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
-use cambra::interpreter::Consumer;
+use crate::ccl::context::{GlobalContext, compile_program};
+use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
+use crate::interpreter::Consumer;
 
-use crate::{snapshot_json, snapshot_json_pretty};
+use super::{snapshot_json, snapshot_json_pretty};
 
 /// The pre-rendered response bodies for the one static program.
 ///
@@ -87,7 +87,7 @@ fn diagnostics_body(diagnostics: &[Diagnostic]) -> String {
 
 /// The degraded `/api/snapshot` body for a program that failed to compile:
 /// source text + diagnostics, no IR. Built from the same
-/// [`InspectorPayload`](cambra::inspector_model::InspectorPayload) type as the
+/// [`InspectorPayload`](crate::inspector_model::InspectorPayload) type as the
 /// success path (via [`InspectorPayload::degraded`]), so the two shapes cannot
 /// drift; the frontend still renders the editor + squiggles from it.
 fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) -> String {
@@ -97,7 +97,7 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
 
 /// Compile `code` once and return the pretty-printed `/api/snapshot` body —
 /// what `--dump-snapshot` prints, and therefore the exact bytes of the
-/// committed golden fixtures (see [`crate::snapshot_json_pretty`] for why the
+/// committed golden fixtures (see [`super::snapshot_json_pretty`] for why the
 /// binary owns this format). The degraded form (source + diagnostics, no panes)
 /// on a compile failure, as the route serves.
 ///
@@ -144,7 +144,10 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
     let bodies = build_bodies(code, name);
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
-    eprintln!("cambra-inspector serving {name} at http://localhost:{port}");
+    // Names the scheme and says the server holds the terminal: this call never
+    // returns, and `https://` to a plain-HTTP port fails the handshake and
+    // renders as a blank page with nothing logged here.
+    eprintln!("cambra: inspecting {name} at http://localhost:{port} — Ctrl+C to stop");
 
     for request in server.incoming_requests() {
         // `bodies` outlives the loop, so a response borrows it: the snapshot is
@@ -173,7 +176,9 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire_check::{assert_degraded_snapshot_shape, assert_snapshot_shape};
+    use crate::inspector_server::wire_check::{
+        assert_degraded_snapshot_shape, assert_snapshot_shape,
+    };
     use serde_json::Value;
 
     /// A valid program's snapshot body is the full payload: a node table per

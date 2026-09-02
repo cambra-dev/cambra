@@ -1,0 +1,9 @@
+out = defer()
+pool: Mut(Int, Txn) := 100
+for r in [10, 20, 30]:
+    with begin():
+        if pool > r:
+            pool := pool - r
+with begin():
+    out << pool
+out

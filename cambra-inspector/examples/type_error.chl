@@ -1,3 +1,0 @@
-# Deliberate type error: `and` expects Bool operands but gets Ints.
-# Demonstrates the degraded (snapshotKind: "failed") inspector path.
-1 and 2

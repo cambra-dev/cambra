@@ -18,19 +18,6 @@ ci_clippy() { cargo clippy -p cambra --all-targets -- -D warnings; }
 # (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
 # scoped to our crate, not deps.
 ci_clippy_release() { cargo clippy -p cambra --release --all-targets -- -D warnings; }
-# Every core gate names `-p cambra` explicitly. The root package is also the
-# workspace root, so an unqualified cargo invocation already resolves to it — but
-# `cambra-inspector` depends on `cambra` with `features = ["serde"]`, so anything
-# that widens to the whole workspace unifies serde into the library and the
-# feature-off configuration these gates exist to check stops being compiled.
-# Naming the package is what keeps that a typo rather than a silent hole.
-#
-# The `serde` feature is default-OFF, so the default passes above compile none of
-# the serde-gated wire code — the hand-written `Serialize` impls and everything
-# only they reach. Nothing else in the gate turns the feature on, so without this
-# pass that code is compiled by nobody and its warnings (a dead `wire_str`, say)
-# never surface.
-ci_clippy_serde() { cargo clippy -p cambra --features serde --all-targets -- -D warnings; }
 # The library alone, with no features unified in. Every pass above uses
 # `--all-targets`, which pulls in the dev-dependencies — including the *self*
 # dev-dependency that enables `test-helpers`. Cargo unifies that feature into the
@@ -39,8 +26,8 @@ ci_clippy_serde() { cargo clippy -p cambra --features serde --all-targets -- -D 
 # is compiled by nothing. Edition 2024 / resolver 3 keeps the feature out of a
 # plain `cargo build --lib`, which is what makes the gap silent rather than loud:
 # ungated library code calling a `test-helpers`-gated item passes the whole gate
-# and fails `cargo build --lib`. Same argument as `ci_clippy_serde` — a
-# configuration nothing compiles is a configuration that rots.
+# and fails `cargo build --lib`. A configuration nothing compiles is a
+# configuration that rots.
 ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # `DEEP_TYPECHECK=1` turns on the opt-in per-operation typecheck (see the
 # `deep-typecheck` feature). The GitHub workflow sets it so automated runs keep
@@ -52,7 +39,7 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # both ways: set semantics makes that order meaningless by contract, but a
 # consumer that lets it become observable — or a dedup keeping the
 # first-inserted of two `eq`-equal refinements — compiles clean either way. Same
-# argument as `ci_clippy_serde`: a configuration nothing runs is a
+# argument as `ci_clippy_lib`: a configuration nothing runs is a
 # configuration that rots.
 ci_test() { cargo test -p cambra -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
@@ -61,7 +48,7 @@ ci_test() { cargo test -p cambra -q ${DEEP_TYPECHECK:+--features deep-typecheck}
 # then diff the model's verdicts against the solver's. Those tests skip
 # themselves when the oracle binary is absent, so without this gate nothing
 # notices the model drifting from the solver — the same rot argument as
-# `ci_clippy_serde`, and the drift is silent in both directions. A machine with
+# `ci_clippy_lib`, and the drift is silent in both directions. A machine with
 # no Lean toolchain skips, loudly; under CI a missing toolchain is a broken gate
 # rather than a local convenience, so it fails instead.
 ci_formal() {
@@ -86,29 +73,13 @@ ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc -p cambra --no-deps
 }
-# The `cambra-inspector` workspace member: its crate lints + tests. Kept separate
-# from the core `cambra` checks above (which stay serde-free and fast) and run
-# explicitly with `-p` because the root `cargo` invocations only build the root
-# package. Building the inspector pulls `cambra` with the `serde` feature, so
-# this also exercises the serde-gated wire types in the core.
-# `|| return 1` per command, not bare `set -e`: `ci_all` calls each gate on the
-# left of a `||` to collect the failing gate's name, and that disables errexit
-# for the whole dynamic extent — including this function. Without it a clippy
-# failure would fall through to the tests below and the function would report
-# the *tests'* status, so a lint break passed the gate whenever tests were green.
-# (`return`, not `exit`: this body is not a subshell, so `exit` would tear down
-# the whole run instead of recording one failed gate.)
-ci_inspector() {
-  cargo clippy -p cambra-inspector --all-targets -- -D warnings || return 1
-  cargo test -p cambra-inspector -q || return 1
-}
 # Golden-fixture drift gate: regenerate the frontend's snapshot fixtures into a
 # temp dir through the same script the fix path uses (regen-fixtures.sh, driven
 # by scripts/fixtures.manifest) and fail on any byte difference from the
 # committed copies. The fix on an intended wire change is the script itself:
 #   cambra-inspector/scripts/regen-fixtures.sh   # then commit the diff
 # (Cross-process dump determinism — the property this gate relies on — is
-# pinned corpus-wide by cambra-inspector/tests/goldens.rs under ci_inspector.)
+# pinned corpus-wide by tests/inspector_goldens.rs under ci_test.)
 ci_fixtures() {
   (
     tmp="$(mktemp -d)"
@@ -191,9 +162,7 @@ ci_fast() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fmt || failed=1
-  # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`. `-p
-  # cambra` for the same reason every gate above names it: widening to the
-  # workspace unifies the inspector's `serde` feature into the library.
+  # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
   # shellcheck disable=SC2310
   { cargo clippy -p cambra -- -D warnings; } || failed=1
   # shellcheck disable=SC2310
@@ -224,9 +193,6 @@ ci_all() {
   ci_clippy_release || failed="${failed} clippy_release"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_serde || failed="${failed} clippy_serde"
-  # shellcheck disable=SC2310
-  # intentional: || captures failure without exiting
   ci_clippy_lib || failed="${failed} clippy_lib"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
@@ -240,9 +206,6 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test || failed="${failed} test"
-  # shellcheck disable=SC2310
-  # intentional: || captures failure without exiting
-  ci_inspector || failed="${failed} inspector"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fixtures || failed="${failed} fixtures"

@@ -26,6 +26,13 @@ the lowered CCL, the operator graph, and runtime producer state):
 cargo run -- --inspect tests/programs/<name>/program.cambra
 ```
 
+To open the read-only program inspector *without* running the program — the
+source alongside one IR pane per compiler stage:
+
+```bash
+cargo run -- --inspect-only tests/programs/<name>/program.cambra
+```
+
 Two programs need a small substitution before they'll run as-is:
 
 - **`http_greeter`** uses `{PORT}` as a placeholder so the integration test
@@ -59,6 +66,18 @@ for the helpers each `mod.rs` uses (`expect_scalar`,
 `expect_compile_error`, `expect_scalar_currently_buggy`, plus the
 HTTP-sink and subprocess utilities).
 
+## The inspector reads this gallery
+
+The program inspector has no example corpus of its own: `cambra --inspect-only
+<program>` takes any of these sources, and
+[`cambra-inspector/scripts/fixtures.manifest`](../cambra-inspector/scripts/fixtures.manifest)
+selects the few whose payload is committed as a golden fixture. A program added
+for pane coverage alone needs no fixture row — ratchet 5 of
+[tests/inspector_goldens.rs](../tests/inspector_goldens.rs) walks every source
+in this directory through the wire validator. So a program that pins an IR shape
+is also a program that runs and asserts its own value, and its `mod.rs` records
+both.
+
 ## North-star programs and corpus policy
 
 The gallery's north-star is [`storefront`](../tests/programs/storefront/) —
@@ -80,6 +99,17 @@ plan and the full dependency map.
 
 | Program | Use case | Exercises | Status | Notes / Blocker |
 | --- | --- | --- | --- | --- |
+| [udf_closure](../tests/programs/udf_closure/) | Call a UDF that closes over an outer binding | `def`, call site, free variable | ✅ working | Returns `13`. One of the inspector's two full-wire fixture canaries (fixture `arithmetic`): `Lit` nodes carry `: Int` and `BinOp` nodes show operator dispatch. |
+| [list_min](../tests/programs/list_min/) | A bare list literal | list literal | ✅ working | Returns `Function [ 1, 2, 3, 4 ]`. The inspector's other full-wire canary, and the smallest payload in the corpus — the one to read when asking what the wire looks like at all. |
+| [scopes](../tests/programs/scopes/) | A `def` with several parameters plus an outer binding | `def` params, name resolution | ✅ working | Returns `106`. Exercises the inspector's scopes table and goto-definition: every use of `p`, `q`, `r`, `base` must resolve to its own binder. |
+| [polymorphic](../tests/programs/polymorphic/) | Use one lambda at two types | let-polymorphism, monomorphization, tuple result | ✅ working | Returns `(1, 1)`. `dup` specializes into two clones, so the pre-inference hole in `(x, x)` resolves downstream to a *set* of tuple types — the fan-out that makes the inspector's `paneLinks` carry non-identity edges. |
+| [udf_fanout](../tests/programs/udf_fanout/) | Call one scalar UDF at two sites at the same type | monomorphization, inlining | ✅ working | Returns `32`. `inline` duplicates the body per call site — one copy keeps the input ids, the other is a freshened `Replicated` copy tagged `Derived { via: Inline }`. |
+| [defer_fanin](../tests/programs/defer_fanin/) | Feed one `defer()` channel from two sites | `defer()`, `<<` feed, `max` | ✅ working | Returns `10`. A scalar seed and a per-iteration feed fan in to one channel during channelization; that channel union is the synthesized structure. |
+| [defer_lift](../tests/programs/defer_lift/) | A UDF that creates, feeds, and returns a defer channel | `defer()` returned from a `def`, defer-scope merge | ✅ working | Returns `10`. Inlining produces the shape `try_lift_defer` rewrites; the lifted feed head must keep its `NodeId` so its source span survives into the post-channelize span index. |
+| [defer_generators](../tests/programs/defer_generators/) | Two `yield` generators feeding one `defer()` channel | `def` + `yield`, `defer()`, `<<` feed | 🚧 blocked | Expected `16`. `post-lambda-elim` produces a tree in which the `zip` of two generators is typed as a compute function (`⇒`) where the letrec binder wants a data collection (`⤇`); the two kinds are incomparable. The generator route to `defer_fanin`'s channel union. |
+| [mutation_loop](../tests/programs/mutation_loop/) | Read a mutable accumulator twice per step | `:=`, for-loop, two reads per iteration | ✅ working | Returns `11`. The induction phase substitutes the read-your-writes value once per read, so the copies and the `step_view` scaffolding clones must carry freshened, unique `NodeId`s. |
+| [txn_multi_read](../tests/programs/txn_multi_read/) | Read a transactional store twice per block | `Mut(Int, Txn)`, `with begin()`, guarded write | ⚠ wrong answer | Should return `Function [ 40 ]`; returns `Function [ 100 ]`. The write sits inside an `if` inside the transaction and does not survive the conditional, so the feed sees the seed. Pinned by `expect_scalar_currently_buggy`. |
+| [type_error](../tests/programs/type_error/) | A deliberate type error | `and` on `Int` operands | 🚫 rejected, by design | The corpus's one failing program, and the only source of the inspector's degraded payload — source and diagnostics with empty panes and `meta.payloadKind: "failed"` (fixture `failed`). |
 | [arithmetic](../tests/programs/arithmetic/) | Chain two bindings | `let`, binops | ✅ working | Smoke-test for sequencing and reference resolution. |
 | [prefix_lines](../tests/programs/prefix_lines/) | Transform a list of strings | list comprehension, string concat | ✅ working | The canonical streaming-pipeline shape; precursor to a real stdin/echo program. |
 | [filter_and_aggregate](../tests/programs/filter_and_aggregate/) | "SELECT SUM(score) FROM users WHERE age >= 18" | record literal, field access, comp filter on let-bound source, `sum` | ✅ working | Returns `253`. Exercises a comp filter on a let-bound source — the filter must survive lowering through planning (it rides a `Cast` node on the refined domain). |

@@ -630,8 +630,7 @@ impl CompiledProgram {
 /// neither wrapping the other — one tags `NodeId`s (expression nodes), the other
 /// tags `Uid`s (binders), and merging them would put a binder-role payload on
 /// the column that names a phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum Phase {
     /// Lowering CHL source into CCL.
     Lower,

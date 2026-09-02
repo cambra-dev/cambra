@@ -326,7 +326,7 @@ pub fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: 
 /// Drive `source` through the full pipeline and return the compacted
 /// `main`-output [`Tile`].  Panics if the program has no `main` output
 /// (e.g. a sink-only program — those use [`compile_sink`] instead).
-fn run_to_tile(source: &str) -> Tile {
+pub(crate) fn run_to_tile(source: &str) -> Tile {
     let mut ctx = GlobalContext::default();
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -434,6 +434,37 @@ pub fn tile_to_canonical(tile: Tile) -> String {
                 });
             }
             format!("{}", Value::Function(bindings))
+        }
+        Tile::Record(fields) => {
+            // A tuple lowers to a record with `_0`/`_1`/… fields, so the two
+            // render differently: positionally when every field is an index,
+            // and `name: value` otherwise. Both orders are the field name's,
+            // not the `HashMap`'s, which has none.
+            let mut rows: Vec<(String, String)> = fields
+                .into_iter()
+                .map(|(name, tile)| (name, tile_to_canonical(tile)))
+                .collect();
+            let positional: Option<Vec<usize>> = rows
+                .iter()
+                .map(|(name, _)| name.strip_prefix('_').and_then(|i| i.parse().ok()))
+                .collect();
+            match positional {
+                Some(indices) => {
+                    let mut by_index: Vec<(usize, String)> = indices
+                        .into_iter()
+                        .zip(rows.into_iter().map(|(_, v)| v))
+                        .collect();
+                    by_index.sort_by_key(|(i, _)| *i);
+                    let vals: Vec<String> = by_index.into_iter().map(|(_, v)| v).collect();
+                    format!("({})", vals.join(", "))
+                }
+                None => {
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    let vals: Vec<String> =
+                        rows.into_iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                    format!("({})", vals.join(", "))
+                }
+            }
         }
         other => panic!("result tile shape not yet supported by the programs harness: {other:?}"),
     }

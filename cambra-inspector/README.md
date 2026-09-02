@@ -1,24 +1,17 @@
-# cambra-inspector
+# The Cambra program inspector
 
-The user-facing **Cambra program inspector**: a small, read-only web app that
-compiles a Cambra (CHL) program once and serves an interactive view of it —
-the source alongside one IR tree pane per compiler stage, cross-linked by true
-node→node provenance.
+A read-only web view of a compiled Cambra program: the source alongside one IR
+tree pane per compiler stage, cross-linked by true node→node provenance. It is
+served by the `cambra` binary itself — `cambra --inspect-only <program>` — and
+this directory holds the browser frontend that renders what that server sends.
 
-It is the second member of the Cambra workspace (the first is the `cambra`
-compiler/engine crate at the repo root). This crate owns the pieces the core
-deliberately keeps out — **serde + `serde_json`**, the **`tiny_http` server**,
-and, once the frontend lands, the embedded bundle — so that `cargo build -p cambra`
-compiles zero serde (serde is an optional, default-off feature on `cambra`).
+> **Milestone 1 — static, no values.** The inspector shows the *program*, not an
+> execution: types and structure, no runtime values or ticks. It is strictly
+> read-only (no mutation endpoints).
 
-> **Milestone 1 — static, no values.** The inspector currently shows the
-> *program*, not an execution: types and structure, no runtime values or ticks.
-> It is strictly read-only (no mutation endpoints).
-
-> **Transport edge only.** What is here: the crate, the JSON edge, the server's
-> `/api/*` routes, and the golden-fixture corpus with its gates. The `web/`
-> frontend this README describes, its `GET /` route and its committed bundle
-> land separately.
+> **Frontend pending.** What is here: the golden-fixture corpus and its gates.
+> The `web/` frontend this README describes, its `GET /` route and its committed
+> bundle land separately.
 
 ## What it shows
 
@@ -27,8 +20,8 @@ compiles zero serde (serde is an optional, default-off feature on `cambra`).
 - **IR panes** — one collapsible tree per pipeline stage, ordered
   upstream → downstream: **pre-inference**, **post-inference**,
   **post-channelize**, **post-as-of-read**, **post-lambda-elim** and
-  **post-planning**. The set is the compiler's `PANES` table, not a list this
-  crate keeps.
+  **post-planning**. The set is the compiler's `PANES` table, not a list the
+  inspector keeps.
 - **Cross-stage links** — clicking in any pane highlights the corresponding
   node(s) in every other pane and the source span(s) they trace to, following
   the retained per-phase provenance (identity ∪ explicit remaps such as the
@@ -47,49 +40,51 @@ Compile once at startup, serve a static snapshot; every interaction is then a
 pure client-side lookup over that one payload (no per-request recompilation, no
 round-trips).
 
+Both halves of the server live in the `cambra` crate, because the thing being
+inspected is the compiler:
+
 - The **read-only model** — the payload shape and the span/name indices it is
-  built from — lives in the **core** crate at `cambra::inspector_model` (behind
-  its serde-gated wire types). That is the serde-isolation boundary. It answers
-  no positional query: every lookup is the frontend's, over the shipped tables.
-- **This crate is the transport edge**: it turns the model into JSON
-  (`snapshot_json`) and serves it over HTTP (`src/server.rs`). The frontend that
-  consumes it, and the route that delivers it, land with the frontend.
+  built from — is `src/inspector_model/`. It answers no positional query: every
+  lookup is the frontend's, over the shipped tables.
+- The **transport** is `src/inspector_server/`: it turns the model into JSON
+  (`snapshot_json`) and serves it over HTTP (`serve.rs`), and `wire_check.rs`
+  is the structural validator both those tests and `tests/inspector_goldens.rs`
+  assert the wire against.
 
 ```
-client ──HTTP──> cambra-inspector (this crate) ──> cambra::inspector_model ──> cambra compiler
-     GET /api/snapshot   tiny_http + serde_json         read-only model          compile_program
+client ──HTTP──> cambra --inspect-only ──> inspector_server ──> inspector_model ──> compile_program
+     GET /api/snapshot                  tiny_http + serde_json    read-only model
 ```
 
 ## Directory contents
 
 | Path | What it is |
 |---|---|
-| `Cargo.toml` | Crate manifest. Depends on `cambra` (with `serde`), `serde_json`, `tiny_http`. |
-| `src/lib.rs` | The transport edge: `snapshot_json` (build-then-serialize), and `wire_check`, the structural validator both the crate's tests and `tests/goldens.rs` assert the wire against. |
-| `src/server.rs` | The `tiny_http` server, its routes, and `snapshot_body_pretty` (what `--dump-snapshot` prints). |
-| `src/main.rs` | The `cambra-inspector` binary / CLI (run the server, or `--dump-snapshot`). |
 | `web/src/__fixtures__/` | The golden snapshot corpus the frontend's tests read, blessed by `scripts/regen-fixtures.sh`. The frontend itself lands separately. |
-| `examples/` | Sample CHL programs (`arithmetic.chl`, `list_min.chl`, `polymorphic.chl`, `defer_*.chl`, `type_error.chl`, …). |
+| `scripts/fixtures.manifest` | Which gallery program each committed fixture is dumped from. |
+| `scripts/regen-fixtures.sh` | The re-bless path, and the `ci.sh` drift gate's regenerator. |
+
+The programs are the demo gallery's (`tests/programs/`, tabulated in
+[docs/demo-programs.md](../docs/demo-programs.md)) — the inspector has no
+example corpus of its own.
 
 ## Running it
 
-From the repo root, with `cargo`:
+From the repo root:
 
 ```bash
-cargo run -p cambra-inspector -- path/to/program.chl        # serves on :8080
-cargo run -p cambra-inspector -- program.chl --port 9000    # custom port
-cargo run -p cambra-inspector                               # no arg: a built-in demo program
+cargo run -- tests/programs/polymorphic/program.cambra --inspect-only        # serves on :8080
+cargo run -- program.cambra --inspect-only=9000                              # custom port
 ```
 
-Then open <http://localhost:8080> — the server binds loopback only. Ready-made
-programs live in `examples/`:
-
-```bash
-cargo run -p cambra-inspector -- cambra-inspector/examples/polymorphic.chl
-```
+Then open <http://localhost:8080> — the server binds loopback only.
 
 Routes: `GET /api/snapshot` (the full model — degrades gracefully to source +
 diagnostics on a compile failure) and `GET /api/diagnostics`.
+
+`--inspect-only` compiles the program and does not run it. Its sibling
+`--inspect` runs the program and serves the live runtime dashboard
+(`src/web_inspector.rs`) instead; the two are exclusive.
 
 ### One-shot snapshot dump
 
@@ -97,37 +92,30 @@ diagnostics on a compile failure) and `GET /api/diagnostics`.
 starting the (never-exiting) server**:
 
 ```bash
-cargo run -q -p cambra-inspector -- cambra-inspector/examples/list_min.chl --dump-snapshot
+cargo run -q -- tests/programs/list_min/program.cambra --dump-snapshot
 ```
 
 Use this for inspecting the payload or regenerating the frontend's golden test
 fixtures (see the README in the web frontend's `__fixtures__` directory).
 
 A dump is always the whole payload. `scripts/fixtures.manifest` maps each
-committed fixture to the example program it is dumped from, and a program whose
-payload is too large to commit is asserted structurally in `tests/goldens.rs`
-instead of being pinned as a document.
+committed fixture to the gallery program it is dumped from, and a program whose
+payload is too large to commit is asserted structurally in
+`tests/inspector_goldens.rs` instead of being pinned as a document.
 
 ## Testing
 
-**Backend (Rust):**
-
-```bash
-cargo test -p cambra-inspector          # this crate's tests
-cargo test -p cambra                    # the read-only model + provenance substrate
-```
-
-The model, indices, and query logic are tested in the `cambra` core
-(`src/inspector_model/`); this crate's tests cover the JSON shape and the server
-response bodies.
+**Backend (Rust):** `cargo test -p cambra` — the model and provenance substrate
+(`src/inspector_model/`), the JSON shape and server bodies
+(`src/inspector_server/`), and the golden corpus
+(`tests/inspector_goldens.rs`).
 
 **Frontend (TypeScript):** see `web/README.md`. In short, from <!-- doc-refs-ignore -->
 `web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`.
 
 > ⚠ **Never run `npm run dev`** — it starts a Vite server that does not exit.
-> All of `typecheck` / `test` / `build` are one-shot. The `cambra-inspector`
-> server itself also blocks forever; for scripted inspection use
-> `--dump-snapshot` instead.
+> All of `typecheck` / `test` / `build` are one-shot. `--inspect-only` also
+> blocks forever; for scripted inspection use `--dump-snapshot` instead.
 
 ## Design & background
 

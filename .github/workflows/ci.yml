@@ -135,13 +135,6 @@ jobs:
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy_release
 
-      - name: Clippy (serde feature)
-        # The `serde` feature is default-OFF, so every pass above compiles zero
-        # serde — including the hand-written `Serialize` impls for the inspector
-        # wire types. Without this step that code is compiled by nobody.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
-        run: ./ci.sh clippy_serde
-
       - name: Clippy (lib only)
         # Every pass above uses `--all-targets`, which unifies the *self*
         # dev-dependency's `test-helpers` feature into the lib under test — so
@@ -202,13 +195,6 @@ jobs:
         # does. The env var is read at *runtime*, so this reuses the binaries
         # the step above already built.
         run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
-
-      - name: Inspector
-        # The cambra-inspector crate (lints + tests). Separate from the core
-        # `cargo` checks, which only build the root package. Runs even if earlier
-        # steps failed so all errors surface in one run.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
-        run: ./ci.sh inspector
 
       - name: Fixtures
         # The golden wire fixtures: regenerate into a temp dir and diff against

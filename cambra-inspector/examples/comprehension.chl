@@ -1,8 +1,0 @@
-# List comprehension + filter + aggregate: exercises richer IR
-# (Loop/Aggregate nodes) and record field projection.
-users = [
-    (name="alice", age=30, score=85),
-    (name="bob",   age=17, score=92),
-    (name="carol", age=25, score=78),
-]
-sum([u.score for u in users if u.age >= 18])

@@ -11,25 +11,24 @@ cargo fmt        # Run formatter
 cargo build      # Build the project
 cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inner-loop check, NOT the full gate
 cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
-./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests, all `-p cambra`. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, and the inspector/fixtures gates. ~1/3 the time of the full gate — use this while iterating.
+./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests, all `-p cambra`. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, and the fixtures gate. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh formal   # The Lean model (formal/): `lake build` — which elaborates every theorem and evaluates every #guard — then the differential oracles. Skips loudly with no `lake` on PATH; fails instead under CI.
-./ci.sh --fix    # Authoritative gate: fmt + ALL FOUR clippy passes + doc + formal + tests + inspector + fixtures, auto-formatting first. Must pass before pushing a PR.
+./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + fixtures, auto-formatting first. Must pass before pushing a PR.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
 
 For the tight edit→check loop, prefer `./ci.sh fast` (or a bare `cargo test <name>`) over the full `./ci.sh`; run the full gate before pushing.
 
-CI lints in **four configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; run `./ci.sh` to catch all four.
+CI lints in **three configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; run `./ci.sh` to catch all three.
 
 | Pass | What only it compiles |
 |---|---|
 | `ci_clippy` | debug, all targets — the baseline |
 | `ci_clippy_release` | release: `#[cfg(debug_assertions)]`-gated items referenced by ungated code |
-| `ci_clippy_serde` | the default-OFF `serde` feature — the hand-written wire `Serialize` impls |
-| `ci_clippy_lib` | the library with **no** features: the other three unify the self dev-dependency's `test-helpers` into the lib, so only this one compiles the configuration a consumer builds |
+| `ci_clippy_lib` | the library with **no** features: the other two unify the self dev-dependency's `test-helpers` into the lib, so only this one compiles the configuration a consumer builds |
 
-The pattern is the same in each case: a configuration that nothing compiles is a configuration that rots, and the failure is silent rather than loud — `--all-targets` hides the `test-helpers` gap exactly as a default-off feature hides the serde one.
+The pattern is the same in each case: a configuration that nothing compiles is a configuration that rots, and the failure is silent rather than loud — `--all-targets` hides the `test-helpers` gap the way a default-off feature would hide a gated impl.
 
 ## General Instructions
 
@@ -265,7 +264,7 @@ Engineers in this repo manage and rebase stacked PRs using either `jj` (jujutsu)
 
 This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs when working with standard Git branches. Workflow for creating a new PR in a stack:
 
-> **Before submitting:** run `./ci.sh` and confirm it passes. `gs branch submit` runs no checks of its own, so this is the only gate before GitHub CI sees the branch — and it lints in all four configurations (an un-run release clippy pass is the most common way CI fails after a green local `cargo clippy`).
+> **Before submitting:** run `./ci.sh` and confirm it passes. `gs branch submit` runs no checks of its own, so this is the only gate before GitHub CI sees the branch — and it lints in all three configurations (an un-run release clippy pass is the most common way CI fails after a green local `cargo clippy`).
 
 **git-spice branch creation** (stage changes first, then):
 
@@ -308,7 +307,7 @@ Workflow (validated rebasing the inspector stack onto `dmills/txn-mutability`):
 3. **Checkpoint.** `jj op log --limit 1` — note the op id to `jj op restore` back to if needed.
 4. **Rebase the whole stack in one command:** `jj rebase -s <stack-base-change-id> -d <target-bookmark>`. `-s` moves that commit and *all* descendants (bookmarks + working copy ride along). Conflicts are recorded in-commit; jj reports which commits are conflicted and does not stop.
 5. **Resolve bottom→tip.** `jj edit <change-id>` enters a commit; `jj resolve --list` lists its conflicts; edit files to remove markers (jj uses git-style `<<<<<<<`/`>>>>>>>` plus diff-style `%%%%%%%`/`+++++++` hunks). Run `cargo build` before moving up — resolving a parent auto-propagates and shrinks descendants' conflicts. Aim for each stack commit (each is a PR head) to build green.
-6. **Verify at the tip:** `jj edit <tip-bookmark>` then `./ci.sh` (the same authoritative gate as any push — all four clippy passes + doc + tests).
+6. **Verify at the tip:** `jj edit <tip-bookmark>` then `./ci.sh` (the same authoritative gate as any push — all three clippy passes + doc + tests).
 
 Gotchas:
 

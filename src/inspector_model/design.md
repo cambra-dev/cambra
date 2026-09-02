@@ -2,7 +2,7 @@
 
 `src/inspector_model/` turns a `CompiledProgram` into one read-only payload describing that program:
 its source, its IR at every retained pane, the links between adjacent panes, and its source-level
-name resolution. The `cambra-inspector` crate serves the payload; that crate's web frontend renders
+name resolution. `src/inspector_server` serves the payload; the `cambra-inspector/web` frontend renders
 it.
 
 Nothing in the CCL pipeline reads this module. It is the only consumer of the pane folds'
@@ -17,7 +17,7 @@ compile reads the lowering projection alone.
 | Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
 | Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table and its root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
-| Consumer | the `cambra-inspector` crate, which serves the payload, and that crate's frontend, which renders it |
+| Consumer | `src/inspector_server`, which serves the payload, and the `cambra-inspector/web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
 | `span` | throughout: a byte range in the **CHL source text**, never an offset into a rendered pane. Nothing in the payload addresses a pane's text |
 
@@ -25,7 +25,7 @@ compile reads the lowering projection alone.
 
 ### One payload per program; every lookup is the consumer's
 
-`cambra-inspector` compiles a program once at startup and serves the rendered payload from memory.
+`cambra --inspect-only` compiles a program once at startup and serves the rendered payload from memory.
 Its frontend fetches that payload once and answers every interaction from it — clicking a node,
 hovering a span, following a link from one pane to the next. None of that reaches the compiler or a
 running program; reading a running program is the separate path below.
@@ -265,7 +265,7 @@ reach. The rule above is what a bump means once one does.
 
 The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
 every node id included, so any change re-blesses all of them; its wire validator pins the schema
-number and the pane list as literal lists. Both live in the `cambra-inspector` crate, which owns the
+number and the pane list as literal lists. Both live in the wire validator, which owns the
 fixture corpus.
 
 ## Cost

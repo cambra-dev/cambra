@@ -1,16 +1,13 @@
 [workspace]
-# The root `cambra` package is implicitly a workspace member; `cambra-inspector`
-# is the second member. Splitting serde + the inspector HTTP/frontend into a
-# separate crate is what keeps `cargo build -p cambra` serde-free: serde is an
-# optional, default-off feature here, pulled in only when `cambra-inspector`
-# (or `--features serde`) builds it. See projects/program-inspector/m1-static-plan.md §2.
-members = ["cambra-inspector"]
+# One package. The inspector's Rust half is `src/inspector_server`, a module of
+# this crate; `cambra-inspector/web/` is its TypeScript frontend, a JS project
+# with no Cargo manifest.
 # The root package is edition 2024, whose default resolver is 3, but a workspace
 # table overrides the member's edition default — so leaving this unset or at 2
 # silently downgrades the whole build. 3 is MSRV-aware version selection (it
 # respects `rust-version` when picking a dependency version); the feature
-# unification `ci_clippy_serde` and `ci_clippy_lib` rely on arrived in 2 and is
-# unchanged in 3, so those gates are not what this setting decides.
+# unification `ci_clippy_lib` relies on arrived in 2 and is unchanged in 3, so
+# that gate is not what this setting decides.
 resolver = "3"
 
 [package]
@@ -40,11 +37,6 @@ test-helpers = []
 # Enable when bisecting a miscompile: `cargo test --features deep-typecheck`.
 deep-typecheck = []
 
-# Optional, default-OFF. Enables `Serialize`/`Deserialize` on the inspector wire
-# types, via `#[cfg_attr(feature = "serde", ...)]` at each site.
-# `cambra-inspector` turns this on; plain `cambra` builds compile zero serde.
-serde = ["dep:serde"]
-
 [dev-dependencies]
 # Self dev-dependency so the integration tests (separate crates) can see the
 # `test-helpers`-gated helpers. Cargo unifies this with the library under test.
@@ -70,10 +62,13 @@ intervalsets = "0.1.0-alpha.2"
 itertools = "0.13"
 smol_str = "0.3.6"
 stacker = "0.1"
-# Optional: gated behind the `serde` feature (default off). The inspector wire
-# types derive `Serialize` only when `cambra-inspector` enables it. serde_json
-# (the transport-edge (de)serializer) lives in `cambra-inspector`, not here.
-serde = { version = "1", features = ["derive"], optional = true }
+# The inspector wire types (`src/inspector_model`) derive `Serialize`; the
+# transport (`src/inspector_server`) renders them with `serde_json`. Both are
+# unconditional: measured against a feature gate, the whole serde tree is ~7s of
+# serial compile work that lands off this crate's critical path and costs nothing
+# in wall-clock, while the gate cost a standing clippy configuration.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 debug = "line-tables-only"

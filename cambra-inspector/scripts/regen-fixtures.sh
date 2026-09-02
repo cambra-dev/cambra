@@ -10,9 +10,9 @@
 # so ordinary id churn does not require touching the tests — but a shape change
 # will, by design.
 #
-# The corpus (fixture -> example mapping) lives in fixtures.manifest next to
-# this script — shared with the cargo golden tests (tests/goldens.rs) so the
-# regen path and the tests can never disagree about the corpus. A row is two
+# The corpus (fixture -> program mapping) lives in fixtures.manifest next to
+# this script — shared with the cargo golden tests (tests/inspector_goldens.rs)
+# so the regen path and the tests can never disagree about the corpus. A row is two
 # words and nothing else, so the two parsers have nothing to disagree about.
 #
 # Usage: cambra-inspector/scripts/regen-fixtures.sh [output-dir]
@@ -35,7 +35,7 @@ while read -r name example; do
     echo "regen-fixtures.sh: manifest row '${name}' names no example program" >&2
     exit 1
   fi
-  prog="cambra-inspector/examples/${example}.chl"
+  prog="tests/programs/${example}/program.cambra"
   out="${FIX}/${name}.snapshot.json"
   echo "regen ${out}  <-  ${prog}"
   # `< /dev/null`: the command must not inherit the loop's stdin, or it eats
@@ -47,7 +47,7 @@ while read -r name example; do
   # caller cannot distinguish from a real one that legitimately shrank. Failing
   # atomically means a failed regen leaves the output directory untouched.
   partial="${out}.partial"
-  if cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot < /dev/null > "${partial}"; then
+  if cargo run -q -- "${prog}" --dump-snapshot < /dev/null > "${partial}"; then
     mv "${partial}" "${out}"
   else
     rm -f "${partial}"

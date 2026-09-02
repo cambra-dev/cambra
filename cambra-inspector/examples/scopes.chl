@@ -1,6 +1,0 @@
-# A def with multiple params plus an outer binding: exercises the
-# scopes table and goto-def (uses of p, q, base resolve to their defs).
-base = 100
-def add3(p, q, r):
-  p + q + r + base
-add3(1, 2, 3)

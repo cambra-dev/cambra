@@ -49,11 +49,10 @@ use smol_str::SmolStr;
 /// turn `42` into "line 5, column 12" — is paid only when emitting
 /// diagnostics, and ariadne / LSP / editor jump-to-location all want
 /// offsets natively anyway.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Wire shape (inspector, feature `serde`): `{ "start": N, "end": N }` — byte
-// offsets, exactly what the `/api/snapshot` schema specifies. The field names
-// are already lowercase single words, so no `rename_all` is needed.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+// Wire shape (inspector): `{ "start": N, "end": N }` — byte offsets, exactly
+// what the `/api/snapshot` schema specifies. The field names are already
+// lowercase single words, so no `rename_all` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

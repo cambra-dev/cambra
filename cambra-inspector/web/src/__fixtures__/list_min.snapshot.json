@@ -1,6 +1,6 @@
 {
   "source": {
-    "name": "cambra-inspector/examples/list_min.chl",
+    "name": "tests/programs/list_min/program.cambra",
     "text": "[1, 2, 3, 4]\n"
   },
   "definitions": [],

@@ -1,8 +1,0 @@
-# Mutable accumulator loop (RT-4 letrec shape). The loop body reads the
-# accumulator at two sites (`total + total`), so the induction phase substitutes
-# the read-your-writes value twice per step — the copies (and the step_view
-# scaffolding clones) must carry freshened (unique) NodeIds.
-total := 0
-for i in [1, 2, 3]:
-    total := total + total + i
-total

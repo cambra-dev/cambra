@@ -1,0 +1,4 @@
+base = 100
+def add3(p, q, r):
+  p + q + r + base
+add3(1, 2, 3)

@@ -1,17 +1,30 @@
 # The golden-fixture corpus, one row per line:
-#   <fixture-basename> <example-basename>
+#   <fixture-basename> <gallery-program-name>
 #
-# Single source of truth for which example programs have committed snapshot
-# fixtures (web/src/__fixtures__/<fixture>.snapshot.json). Read by BOTH
+# Single source of truth for which programs have committed snapshot fixtures
+# (web/src/__fixtures__/<fixture>.snapshot.json). Read by BOTH
 # regen-fixtures.sh (the regen/fix path and the ci.sh drift gate) and the cargo
-# golden tests (cambra-inspector/tests/goldens.rs), so the two can never
-# disagree about the corpus. Keep it bounded — every entry adds regen churn.
+# golden tests (tests/inspector_goldens.rs), so the two can never disagree
+# about the corpus. Keep it bounded — every entry adds regen churn.
+#
+# The programs are the demo gallery's (`tests/programs/<name>/program.cambra`,
+# tabulated in docs/demo-programs.md): the inspector has no example corpus of
+# its own, so a program that pins a pane shape is also a program that runs and
+# asserts its own value. Selecting a few of those for fixtures is what this
+# file does.
+#
+# A fixture name is the frontend's import path, so it is held stable across a
+# program rename — which is why the two columns differ for `arithmetic`.
 #
 # Every fixture is the full wire. A fixture is a whole payload document, and a
 # corpus program whose payload is too large to commit whole belongs in
-# goldens.rs as a structural assertion over a fresh dump instead — which is
-# where `txn_multi_read` and `mutation_loop` live.
-arithmetic arithmetic
+# tests/inspector_goldens.rs as a structural assertion over a fresh dump
+# instead — which is where `txn_multi_read` and `mutation_loop` live.
+#
+# A program added for backend coverage alone needs NO row here: ratchet 5 of
+# tests/inspector_goldens.rs already walks every gallery source through the
+# wire validator.
+arithmetic udf_closure
 polymorphic polymorphic
 list_min list_min
 # A deliberate type error -> the degraded (payloadKind: "failed") payload.

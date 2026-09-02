@@ -13,7 +13,7 @@
 //!
 //! No serde and no I/O: the wire types and their builders are `wire.rs`'s, the
 //! shared IR walk is `walk.rs`'s, and the serialization is the
-//! `cambra-inspector` crate's.
+//! `inspector_server` module's.
 
 use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase};

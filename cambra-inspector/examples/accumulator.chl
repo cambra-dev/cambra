@@ -1,5 +1,0 @@
-# A for-accumulator loop: shows the Loop node with a single accumulator.
-acc = 0
-for i in [1, 2, 3, 4, 5]:
-    acc = acc + i
-acc
