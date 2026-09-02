@@ -28,7 +28,7 @@ import { type Diagnostic as CMDiagnostic, linter } from "@codemirror/lint";
 
 import type { Indices } from "./indices";
 import type { OffsetMap } from "./offsets";
-import type { Resolved, Selection, Store } from "./store";
+import { SOURCE_PANE, type Resolved, type Selection, type Store } from "./store";
 import type { RewriteInfo } from "./types";
 
 // The data a hover tooltip renders at a byte offset: the tightest enclosing
@@ -248,7 +248,7 @@ export class SourceView {
       const range = update.state.selection.main;
       const from = offsets.charToByte(range.from);
       const to = offsets.charToByte(range.to);
-      queueMicrotask(() => store.setSelection({ kind: "source", from, to }));
+      queueMicrotask(() => store.setSelection({ kind: "source", from, to }, SOURCE_PANE));
     });
 
     const state = EditorState.create({
@@ -303,9 +303,16 @@ export class SourceView {
     // reader selected at the top of the editor. `sourceSpans` carries the link
     // resolver's traversal order, so the earliest one has to be found rather
     // than read off the front.
-    const focus = highlights.reduce((a, b) => (b.from < a.from ? b : a));
-    this.view.dispatch({
-      effects: [setHighlights.of(highlights), EditorView.scrollIntoView(focus.from, { y: "start" })],
-    });
+    //
+    // Not when the selection was made here: the caret is already where the
+    // reader put it, and scrolling under a drag fights the gesture. A jump —
+    // goto-definition, or a click in another pane — carries a different origin
+    // and does move the editor.
+    const effects: StateEffect<unknown>[] = [setHighlights.of(highlights)];
+    if (resolved.origin !== SOURCE_PANE) {
+      const focus = highlights.reduce((a, b) => (b.from < a.from ? b : a));
+      effects.push(EditorView.scrollIntoView(focus.from, { y: "start" }));
+    }
+    this.view.dispatch({ effects });
   }
 }

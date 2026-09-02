@@ -160,7 +160,10 @@ export class TreeView {
     // affordances stay distinct.
     row.addEventListener("click", (e) => {
       if (e.target === twisty) return;
-      this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: node.nodeId });
+      this.store.setSelection(
+        { kind: "node", paneId: this.paneId, nodeId: node.nodeId },
+        this.paneId,
+      );
     });
 
     // A refinement predicate is not drawn: it rides a type slot, and the type
@@ -287,6 +290,8 @@ export class TreeView {
       if (topmost === null || handle.order < topmost.order) topmost = handle;
     }
 
-    topmost?.row.scrollIntoView({ block: "start" });
+    // Not this pane if the gesture happened here: the reader is looking at the
+    // row they clicked, so scrolling it is the one motion they did not ask for.
+    if (resolved.origin !== this.paneId) topmost?.row.scrollIntoView({ block: "start" });
   }
 }

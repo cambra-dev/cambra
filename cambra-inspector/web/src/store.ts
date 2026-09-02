@@ -29,8 +29,22 @@ export type Selection =
   | { kind: "source"; from: number; to: number }
   | null;
 
+/**
+ * The pane id a selection came from, or `null` when it came from a gesture that
+ * means "go there" rather than "look here".
+ *
+ * A pane does not scroll itself: the reader is already looking at the row they
+ * clicked, and moving it under them is the one motion they did not ask for.
+ * Every other pane scrolls to its topmost highlighted row. `null` opts a
+ * gesture out of the exemption — goto-definition and the operator pane's
+ * reference rows are jumps, so their own pane has to move too.
+ */
+export const SOURCE_PANE = "source";
+
 export interface Resolved {
   selection: Selection;
+  /** Which pane the selection came from; see {@link SOURCE_PANE}. */
+  origin: string | null;
   /** Per-pane highlight sets + the union of source spans (see `links.ts`). */
   result: ResolveResult;
   /**
@@ -45,6 +59,7 @@ export interface Resolved {
 
 const EMPTY_RESOLVED = (selection: Selection): Resolved => ({
   selection,
+  origin: null,
   result: { highlightsByPane: new Map(), sourceSpans: [] },
   primaryByPane: new Map(),
 });
@@ -185,10 +200,16 @@ export class Store {
     return this.resolved;
   }
 
-  /** Replace the selection and re-resolve it across all panes. */
-  setSelection(selection: Selection): void {
+  /**
+   * Replace the selection and re-resolve it across all panes.
+   *
+   * `origin` is the pane the gesture happened in, which that pane reads to
+   * leave its own scroll position alone; omit it for a jump (see
+   * {@link SOURCE_PANE}).
+   */
+  setSelection(selection: Selection, origin: string | null = null): void {
     if (selectionsEqual(selection, this.resolved.selection)) return;
-    this.resolved = this.resolve(selection);
+    this.resolved = this.resolve(selection, origin);
     // Notify every subscriber even if one throws: a single broken view must not
     // starve the others. We do NOT swallow the error — it is surfaced via
     // console.error so the bug stays visible (this is exactly how Bug 1 hid: a
@@ -208,7 +229,7 @@ export class Store {
     return () => this.listeners.delete(fn);
   }
 
-  private resolve(selection: Selection): Resolved {
+  private resolve(selection: Selection, origin: string | null): Resolved {
     if (selection === null) return EMPTY_RESOLVED(null);
 
     const seeds: PaneNode[] = [];
@@ -238,7 +259,7 @@ export class Store {
       }
     }
 
-    return { selection, result: resolveLinks(this.linkGraph, seeds), primaryByPane };
+    return { selection, origin, result: resolveLinks(this.linkGraph, seeds), primaryByPane };
   }
 }
 
