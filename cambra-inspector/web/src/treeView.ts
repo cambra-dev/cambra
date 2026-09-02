@@ -103,12 +103,15 @@ export class TreeView {
   private readonly handles = new Map<number, NodeHandle>();
   private markedRows: HTMLElement[] = [];
   private nextOrder = 0;
+  private noAnchorNotice: HTMLElement | null = null;
+  private readonly root: HTMLElement;
 
   constructor(parent: HTMLElement, store: Store, paneId: string, rootId: number) {
     this.store = store;
     this.paneId = paneId;
     this.nodeById = store.indicesFor(paneId)?.nodeById ?? new Map();
     const root = el("div", "tree-root");
+    this.root = root;
     const rootNode = this.nodeById.get(rootId);
     if (rootNode) root.appendChild(this.renderNode(rootNode, null, 0, null, new Set()));
     parent.appendChild(root);
@@ -251,6 +254,28 @@ export class TreeView {
     row.addEventListener("mouseleave", remove);
   }
 
+  /**
+   * Show or hide the pane's "no direct counterpart" line.
+   *
+   * Lives in the pane body rather than its header: the header is built by
+   * `main.ts` and the view owns nothing in it, and the notice belongs to a
+   * selection rather than to the pane.
+   */
+  private setNoAnchorNotice(show: boolean): void {
+    if (!show) {
+      this.noAnchorNotice?.remove();
+      this.noAnchorNotice = null;
+      return;
+    }
+    if (this.noAnchorNotice) return;
+    const notice = el("div", "no-anchor-notice", "no direct counterpart");
+    notice.title =
+      "Nothing in this pane is the selection itself. Every highlight here is a node the " +
+      "provenance links reached from it — the construct has no single counterpart at this stage.";
+    this.root.prepend(notice);
+    this.noAnchorNotice = notice;
+  }
+
   private expandAncestors(nodeId: number): void {
     const handle = this.handles.get(nodeId);
     if (!handle) return;
@@ -268,8 +293,17 @@ export class TreeView {
     this.markedRows = [];
 
     const highlights = resolved.result.highlightsByPane.get(this.paneId);
-    if (!highlights || highlights.size === 0) return;
+    if (!highlights || highlights.size === 0) {
+      this.setNoAnchorNotice(false);
+      return;
+    }
     const primaries = resolved.primaryByPane.get(this.paneId);
+
+    // A pane can hold no part of the selection itself and still light up
+    // entirely as traces — `ExprStmt` is rewritten away by channelize, so a
+    // click on a statement has no counterpart from `post-channelize` down. Say
+    // so, rather than leaving a pane of amber rows to read as a fault.
+    this.setNoAnchorNotice(!primaries || primaries.size === 0);
 
     // A predicate node is on the wire and in the link graph but draws no row
     // (see `renderNode`), so a highlight set can name nodes this pane has no
