@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { OffsetMap } from "./offsets";
+import { OffsetMap, wordRangeAt } from "./offsets";
 
 describe("OffsetMap", () => {
   // "café\n×2": c a f are ASCII (1 byte), é is 2 bytes (U+00E9), \n is 1,
@@ -76,5 +76,31 @@ describe("OffsetMap", () => {
     expect(astral.charToByte(3)).toBe(5); // 'b' (after 4-byte emoji)
     expect(astral.charToByte(4)).toBe(6); // end
     expect(astral.byteToChar(5)).toBe(3); // 'b'
+  });
+});
+
+describe("wordRangeAt", () => {
+  it("takes the whole token the offset lands in", () => {
+    const t = "        if pool > r:";
+    expect(wordRangeAt(t, 8)).toEqual({ from: 8, to: 10 }); // on the `i`
+    expect(wordRangeAt(t, 9)).toEqual({ from: 8, to: 10 }); // on the `f`
+    expect(wordRangeAt(t, 13)).toEqual({ from: 11, to: 15 }); // inside `pool`
+  });
+
+  it("takes the single character when it is not part of a token", () => {
+    const t = "a + b";
+    expect(wordRangeAt(t, 1)).toEqual({ from: 1, to: 2 }); // the space
+    expect(wordRangeAt(t, 2)).toEqual({ from: 2, to: 3 }); // the `+`
+  });
+
+  it("counts digits and underscores as token characters", () => {
+    expect(wordRangeAt("__arg_0 = 12", 3)).toEqual({ from: 0, to: 7 });
+    expect(wordRangeAt("__arg_0 = 12", 11)).toEqual({ from: 10, to: 12 });
+  });
+
+  it("clamps at both ends of the document", () => {
+    expect(wordRangeAt("xy", -5)).toEqual({ from: 0, to: 2 });
+    expect(wordRangeAt("xy", 2)).toEqual({ from: 2, to: 2 });
+    expect(wordRangeAt("", 0)).toEqual({ from: 0, to: 0 });
   });
 });
