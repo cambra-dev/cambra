@@ -9,16 +9,17 @@
 //   - selection highlight: a StateField that marks the resolved source spans,
 //     distinguishing the primary anchor span from transitively-linked spans
 //
-// A plain source click selects `{ kind: "source", byteOffset }`; the store
-// reseeds every pane's tightest node from that offset, so all panes light up.
-// Squiggles work on the degraded snapshot too (no IR, but diagnostics present).
+// A source selection is `{ kind: "source", from, to }` over source bytes, taken
+// from CodeMirror's own selection: a click leaves a caret (`from === to`) and a
+// drag leaves a range. The store reseeds every pane from it, so all panes light
+// up. Squiggles work on the degraded snapshot too (no IR, but diagnostics
+// present).
 
 import { EditorState, StateEffect, StateField } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
   EditorView,
-  highlightActiveLine,
   hoverTooltip,
   lineNumbers,
   type Tooltip,
@@ -61,11 +62,11 @@ export function hoverPayloadAt(
   };
 }
 
-// The selection a source-side click produces. With `mods.goto` set (Ctrl/Cmd)
-// on a use-site, it is the goto-definition jump (a source selection at the
-// def-site's start); otherwise a plain source selection at the clicked byte.
-// Pure, so the decision is unit-tested without CM geometry; the CM `mousedown`
-// handler calls it. `anchor` may be undefined on a degraded snapshot.
+// The selection a source-side click produces, as a caret at one byte. With
+// `mods.goto` set (Ctrl/Cmd) on a use-site it is the goto-definition jump — a
+// caret at the def-site's start — and otherwise a caret at the clicked byte.
+// Pure, so the decision is unit-tested without CM geometry. `anchor` may be
+// undefined on a degraded snapshot.
 export function resolveSourceClick(
   anchor: Indices | undefined,
   byte: number,
@@ -73,9 +74,9 @@ export function resolveSourceClick(
 ): Selection {
   if (mods.goto && anchor) {
     const def = anchor.definitionAt(byte);
-    if (def) return { kind: "source", byteOffset: def.defSpan.start };
+    if (def) return { kind: "source", from: def.defSpan.start, to: def.defSpan.start };
   }
-  return { kind: "source", byteOffset: byte };
+  return { kind: "source", from: byte, to: byte };
 }
 
 interface HighlightSpan {
@@ -209,25 +210,24 @@ export class SourceView {
       };
     });
 
-    // Source-side click, on the primary (left) button:
-    //   - Ctrl/Cmd-click a use-site -> goto-definition (the IDE/LSP-standard
-    //     gesture); selects the def-site as a source selection so all panes
-    //     follow.
-    //   - plain click -> select the source byte offset (the store reseeds each
-    //     pane's tightest node), without suppressing the editor's own cursor.
+    // Ctrl/Cmd-click a use-site -> goto-definition (the IDE/LSP-standard
+    // gesture), which selects the def-site so all panes follow. Only that
+    // gesture is handled here: a plain click and a drag both land as an
+    // ordinary CodeMirror selection, which `selectionSync` below picks up.
     const interactions = EditorView.domEventHandlers({
       mousedown: (event, view) => {
         if (event.button !== 0) return false;
+        if (!event.ctrlKey && !event.metaKey) return false;
         const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
         if (pos === null) return false;
         const byte = offsets.charToByte(pos);
-        const goto = event.ctrlKey || event.metaKey;
-        const selection = resolveSourceClick(anchor, byte, { goto });
-        store.setSelection(selection);
-        // A goto-def jump landed elsewhere than the clicked byte: suppress CM's
-        // own ctrl/cmd-click handling and consume the event. A plain click lets
-        // the editor place its cursor / select text.
-        if (selection?.kind === "source" && selection.byteOffset !== byte) {
+        const selection = resolveSourceClick(anchor, byte, { goto: true });
+        // Only a jump that actually landed elsewhere is consumed. Consuming it
+        // keeps CodeMirror from placing a caret at the clicked byte, which
+        // would re-enter `selectionSync` and overwrite the jump. A modified
+        // click over a non-use falls through to the ordinary path.
+        if (selection?.kind === "source" && selection.from !== byte) {
+          store.setSelection(selection);
           event.preventDefault();
           return true;
         }
@@ -235,11 +235,26 @@ export class SourceView {
       },
     });
 
+    // CodeMirror owns the selection: it paints the drag and reports the range
+    // even under `editable: false`, so the gesture needs no mouse handling of
+    // its own and keyboard selection (shift+arrow) arrives the same way.
+    //
+    // Deferred through a microtask because `renderSelection` dispatches back
+    // into this view, and CodeMirror refuses a dispatch made while an update is
+    // in progress. The reply carries no selection change, so it does not
+    // re-enter this listener.
+    const selectionSync = EditorView.updateListener.of((update) => {
+      if (!update.selectionSet) return;
+      const range = update.state.selection.main;
+      const from = offsets.charToByte(range.from);
+      const to = offsets.charToByte(range.to);
+      queueMicrotask(() => store.setSelection({ kind: "source", from, to }));
+    });
+
     const state = EditorState.create({
       doc: snapshot.source.text,
       extensions: [
         lineNumbers(),
-        highlightActiveLine(),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         EditorView.lineWrapping,
@@ -247,6 +262,7 @@ export class SourceView {
         diagnosticsLinter,
         hover,
         interactions,
+        selectionSync,
       ],
     });
     this.view = new EditorView({ state, parent });
@@ -263,12 +279,15 @@ export class SourceView {
       return;
     }
 
-    // The primary span(s): the source spans of the per-pane primary anchors.
+    // The primary span(s): the source spans of every pane's anchor nodes.
     const primaryKeys = new Set<string>();
-    for (const [paneId, nodeId] of resolved.primaryByPane) {
-      if (nodeId === null) continue;
-      const span = this.store.indicesFor(paneId)?.nodeById.get(nodeId)?.spans[0];
-      if (span) primaryKeys.add(`${span.start}:${span.end}`);
+    for (const [paneId, nodeIds] of resolved.primaryByPane) {
+      const indices = this.store.indicesFor(paneId);
+      if (!indices) continue;
+      for (const nodeId of nodeIds) {
+        const span = indices.nodeById.get(nodeId)?.spans[0];
+        if (span) primaryKeys.add(`${span.start}:${span.end}`);
+      }
     }
 
     // Call on the OffsetMap object: `byteToChar` reads `this.byteAt`, so a
@@ -280,10 +299,13 @@ export class SourceView {
       primary: primaryKeys.has(`${span.start}:${span.end}`),
     }));
 
-    // Scroll to the first primary span (or the first span if none is primary).
-    const focus = highlights.find((h) => h.primary) ?? highlights[0];
+    // Scroll to the earliest highlighted span, which puts the top of what the
+    // reader selected at the top of the editor. `sourceSpans` carries the link
+    // resolver's traversal order, so the earliest one has to be found rather
+    // than read off the front.
+    const focus = highlights.reduce((a, b) => (b.from < a.from ? b : a));
     this.view.dispatch({
-      effects: [setHighlights.of(highlights), EditorView.scrollIntoView(focus.from, { y: "center" })],
+      effects: [setHighlights.of(highlights), EditorView.scrollIntoView(focus.from, { y: "start" })],
     });
   }
 }

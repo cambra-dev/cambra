@@ -38,6 +38,7 @@ const treePanes = listMin.panes.filter(isIrPane);
 function mountApp(snap: Snapshot): {
   store: Store;
   source: HTMLElement;
+  sourceView: SourceView;
   trees: Map<string, HTMLElement>;
 } {
   const root = document.createElement("div");
@@ -49,7 +50,7 @@ function mountApp(snap: Snapshot): {
   root.appendChild(sourceBody);
   // SourceView is constructed FIRST (as in main.ts) — the ordering that let
   // Bug 1's throw starve every later subscriber.
-  new SourceView(sourceBody, store);
+  const sourceView = new SourceView(sourceBody, store);
 
   const trees = new Map<string, HTMLElement>();
   // The tree panes only. `TreeView` cannot draw a graph, and these tests assert
@@ -61,7 +62,7 @@ function mountApp(snap: Snapshot): {
     trees.set(pane.id, body);
     if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.roots[0]);
   }
-  return { store, source: sourceBody, trees };
+  return { store, source: sourceBody, sourceView, trees };
 }
 
 describe("view integration: cross-pane source<->tree linking", () => {
@@ -90,11 +91,47 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
     // posAtCoords is unusable in jsdom (no layout); drive the store directly,
     // which is the exact code path the bug lived in.
-    store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
+    store.setSelection({ kind: "source", from: lit.spans[0]!.start, to: lit.spans[0]!.start });
 
     for (const [, body] of trees) {
       expect(body.querySelectorAll(".tree-row.selected, .tree-row.linked").length).toBeGreaterThan(0);
     }
+  });
+
+  it("a dragged range in the editor selects every node it covers", async () => {
+    // The real gesture: CodeMirror owns the selection, and `selectionSync`
+    // turns it into a store selection. Dispatching a range is what a drag
+    // leaves behind, and needs no layout — unlike posAtCoords.
+    const { store, source, sourceView } = mountApp(listMin);
+
+    // `[1, 2, 3, 4]` — the three literals at [1,2), [4,5) and [7,8) lie inside
+    // [1,8); the enclosing List [1,12) does not, so it is not named.
+    sourceView.view.dispatch({ selection: { anchor: 1, head: 8 } });
+    await Promise.resolve(); // `selectionSync` defers through a microtask
+
+    const resolved = store.getResolved();
+    expect(resolved.selection).toEqual({ kind: "source", from: 1, to: 8 });
+
+    const pre = irPaneById(listMin, "pre-inference");
+    const names = (label: string): number => theNode(pre, label).nodeId;
+    expect([...resolved.primaryByPane.get("pre-inference")!].sort((a, b) => a - b)).toEqual(
+      [names("Lit(Int(1))"), names("Lit(Int(2))"), names("Lit(Int(3))")].sort((a, b) => a - b),
+    );
+    // Three separate primary spans reach the editor, not one merged blob.
+    expect(source.querySelectorAll(".cm-sel-node").length).toBe(3);
+  });
+
+  it("a caret in the editor selects one node, as a click always did", async () => {
+    const { store, sourceView } = mountApp(listMin);
+    sourceView.view.dispatch({ selection: { anchor: 1, head: 1 } });
+    await Promise.resolve();
+
+    const resolved = store.getResolved();
+    expect(resolved.selection).toEqual({ kind: "source", from: 1, to: 1 });
+    const pre = irPaneById(listMin, "pre-inference");
+    expect([...resolved.primaryByPane.get("pre-inference")!]).toEqual([
+      theNode(pre, "Lit(Int(1))").nodeId,
+    ]);
   });
 
   it("a source selection produces a primary source highlight (.cm-sel-node)", () => {
@@ -102,7 +139,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
     const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))");
 
-    store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
+    store.setSelection({ kind: "source", from: lit.spans[0]!.start, to: lit.spans[0]!.start });
     expect(source.querySelectorAll(".cm-sel-node").length).toBeGreaterThan(0);
   });
 });

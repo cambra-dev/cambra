@@ -18,11 +18,15 @@ import { OffsetMap } from "./offsets";
 import { isIrPane } from "./types";
 import type { PaneEntry, Snapshot, Span } from "./types";
 
-// A click in any pane: a node in a specific pane, a raw source byte offset, or
-// nothing selected.
+// A selection in any pane: a node in a specific pane, a half-open range of
+// source bytes, or nothing selected.
+//
+// A source selection is a range because a click and a drag are one gesture:
+// `from === to` is a caret, which is what a click leaves behind, and `from <
+// to` is a dragged range. There is no separate point variant to keep in step.
 export type Selection =
   | { kind: "node"; paneId: string; nodeId: number }
-  | { kind: "source"; byteOffset: number }
+  | { kind: "source"; from: number; to: number }
   | null;
 
 export interface Resolved {
@@ -30,11 +34,13 @@ export interface Resolved {
   /** Per-pane highlight sets + the union of source spans (see `links.ts`). */
   result: ResolveResult;
   /**
-   * The strong-highlight anchor per pane: the directly-clicked node, or — for
-   * a source click — that pane's tightest enclosing node. `null` for a pane
-   * with no anchor (it shows only transitively-linked highlights).
+   * The strong-highlight anchors per pane: the directly-clicked node, or — for
+   * a source selection — that pane's tightest enclosing node. A set rather
+   * than one node because a selection can name several spans, and each
+   * resolves per pane. Empty for a pane with no anchor of its own (it shows
+   * only transitively-linked highlights).
    */
-  primaryByPane: Map<string, number | null>;
+  primaryByPane: Map<string, Set<number>>;
 }
 
 const EMPTY_RESOLVED = (selection: Selection): Resolved => ({
@@ -206,23 +212,28 @@ export class Store {
     if (selection === null) return EMPTY_RESOLVED(null);
 
     const seeds: PaneNode[] = [];
-    const primaryByPane = new Map<string, number | null>();
-    for (const pane of this.panes) primaryByPane.set(pane.id, null);
+    const primaryByPane = new Map<string, Set<number>>();
+    for (const pane of this.panes) primaryByPane.set(pane.id, new Set());
+    const anchor = (paneId: string, nodeId: number): void => {
+      const set = primaryByPane.get(paneId);
+      if (set) set.add(nodeId);
+      else primaryByPane.set(paneId, new Set([nodeId]));
+    };
 
     if (selection.kind === "node") {
       seeds.push({ paneId: selection.paneId, nodeId: selection.nodeId });
-      primaryByPane.set(selection.paneId, selection.nodeId);
+      anchor(selection.paneId, selection.nodeId);
     } else {
-      // A source click has no node: resolve the byte offset to each pane's
-      // tightest enclosing node, seed them all, and let the graph merge them.
-      // The operator pane has no such index and so takes no seed of its own; the
-      // graph still reaches it through the post-planning window.
+      // A source selection has no node: resolve the byte range to the nodes
+      // each pane draws inside it, seed them all, and let the graph merge them.
+      // The operator pane has no such index and so takes no seed of its own;
+      // the graph still reaches it through the post-planning window.
       for (const pane of this.panes) {
-        const node =
-          this.indicesByPane.get(pane.id)?.tightestNodeAt(selection.byteOffset) ?? null;
-        if (node !== null) {
+        const nodes =
+          this.indicesByPane.get(pane.id)?.nodesInRange(selection.from, selection.to) ?? [];
+        for (const node of nodes) {
           seeds.push({ paneId: pane.id, nodeId: node });
-          primaryByPane.set(pane.id, node);
+          anchor(pane.id, node);
         }
       }
     }
@@ -238,7 +249,7 @@ function selectionsEqual(a: Selection, b: Selection): boolean {
     return a.paneId === b.paneId && a.nodeId === b.nodeId;
   }
   if (a.kind === "source" && b.kind === "source") {
-    return a.byteOffset === b.byteOffset;
+    return a.from === b.from && a.to === b.to;
   }
   return false;
 }

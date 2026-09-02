@@ -158,7 +158,7 @@ describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
     // Identity: the same NodeId is highlighted in both downstream panes.
     expect(result.highlightsByPane.get("post-inference")!.has(lit.nodeId)).toBe(true);
     expect(result.highlightsByPane.get("post-channelize")!.has(lit.nodeId)).toBe(true);
-    expect(primaryByPane.get("pre-inference")).toBe(lit.nodeId);
+    expect([...primaryByPane.get("pre-inference")!]).toEqual([lit.nodeId]);
     // Projects to the literal's source span.
     expect(result.sourceSpans).toContainEqual(lit.spans[0]);
   });
@@ -198,17 +198,17 @@ describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
     const pre = irPaneById(arithmetic, "pre-inference");
     const lit = theNode(pre, "Lit(Int(10))");
 
-    store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
+    store.setSelection({ kind: "source", from: lit.spans[0]!.start, to: lit.spans[0]!.start });
     const { result, primaryByPane } = store.getResolved();
     // Every *tree* pane: the seed is a pane's tightest enclosing node at the
     // offset, which only a tree pane can answer. The operator pane takes no seed
-    // of its own and lights up only where a link reaches it, so it carries no
-    // anchor and is not pinned here.
+    // of its own and lights up only where a link reaches it, so its anchor set
+    // is empty and is not pinned here.
     const trees = store.panes.filter(isIrPane);
     expect(trees.map((p) => p.id)).toEqual(PANE_IDS.filter((id) => id !== "post-conversion"));
     for (const pane of trees) {
       expect(result.highlightsByPane.get(pane.id)!.size).toBeGreaterThan(0);
-      expect(primaryByPane.get(pane.id)).not.toBeNull();
+      expect(primaryByPane.get(pane.id)!.size).toBeGreaterThan(0);
     }
   });
 

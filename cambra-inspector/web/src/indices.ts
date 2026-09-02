@@ -27,6 +27,12 @@ export interface Indices {
   readonly definitions: Definition[];
 
   tightestNodeAt(byteOffset: number): number | null;
+  /**
+   * Every node this pane draws inside the half-open byte range `[from, to)` —
+   * the seed set for a source selection. Order is unspecified; the caller
+   * seeds a set. See the policy note above `nodesInRange`.
+   */
+  nodesInRange(from: number, to: number): number[];
   typesAt(byteOffset: number): string[];
   definitionAt(byteOffset: number): Definition | null;
 }
@@ -90,36 +96,80 @@ export function buildIndices(
     }
   }
 
-  // tightestNodeAt — the D4 tightest-enclosing policy:
-  //   1. from the nodes' spans, take every pair whose span contains the offset;
+  // tightestRowAt / tightestNodeAt — the D4 tightest-enclosing policy, over
+  // the value tree:
+  //   1. from the nodes' spans, take every row whose span contains the offset;
   //   2. pick the smallest extent (end - start);
   //   3. break ties (coincident spans: the `def` case, or monomorphized clones
-  //      sharing an origin span) by value-tree-before-predicate, then by
-  //      greatest depth (innermost in the IR tree).
+  //      sharing an origin span) by greatest depth (innermost in the IR tree).
   //
-  // The predicate half of that tie-break is what a literal needs. Inference
-  // synthesizes a singleton refinement *from* the literal, so the predicate's
-  // nodes inherit the literal's span exactly; without it the deepest-wins rule
-  // would answer a hover on `1` with a node inside `__elem == 1`. A predicate
-  // the author actually wrote has the annotation's span, which is a different
-  // extent, so this only ever fires on the synthesized case.
-  const tightestNodeAt = (byteOffset: number): number | null => {
-    let best: { nodeId: number; extent: number; depth: number; pred: boolean } | null = null;
-    for (const { start, end, nodeId } of spanRows) {
-      if (!spanContains(start, end, byteOffset)) continue;
-      const extent = end - start;
-      const depth = depthById.get(nodeId) ?? -1;
-      const pred = predicateIds.has(nodeId);
-      if (
-        best === null ||
-        extent < best.extent ||
-        (extent === best.extent &&
-          ((best.pred && !pred) || (best.pred === pred && depth > best.depth)))
-      ) {
-        best = { nodeId, extent, depth, pred };
+  // Refinement predicates are excluded outright, as in `typesAt`: the tree
+  // pane draws no row for one, so answering with a predicate node would name a
+  // node the reader cannot see and leave the pane with no anchor at all. That
+  // subsumes the tie-break this used to need — inference synthesizes a
+  // singleton refinement *from* a literal, so the predicate's nodes inherit
+  // the literal's span exactly, and deepest-wins would otherwise answer a
+  // hover on `1` with a node inside `__elem == 1`.
+  // The winning span row, not just its node id: `nodesInRange` needs the row's
+  // extent to tell a border that cuts a node from one that sits on its edge.
+  type SpanRow = { start: number; end: number; nodeId: number };
+  const tightestRowAt = (byteOffset: number): SpanRow | null => {
+    let best: SpanRow | null = null;
+    let bestExtent = Infinity;
+    let bestDepth = -1;
+    for (const row of spanRows) {
+      if (predicateIds.has(row.nodeId)) continue;
+      if (!spanContains(row.start, row.end, byteOffset)) continue;
+      const extent = row.end - row.start;
+      const depth = depthById.get(row.nodeId) ?? -1;
+      if (best === null || extent < bestExtent || (extent === bestExtent && depth > bestDepth)) {
+        best = row;
+        bestExtent = extent;
+        bestDepth = depth;
       }
     }
-    return best ? best.nodeId : null;
+    return best;
+  };
+
+  const tightestNodeAt = (byteOffset: number): number | null =>
+    tightestRowAt(byteOffset)?.nodeId ?? null;
+
+  // nodesInRange — which nodes a source selection names. A selection is a set
+  // of source spans, and *every* node inside it is a seed, because the point of
+  // selecting a region is to trace the provenance of everything in it.
+  //   1. every node whose span lies wholly inside `[from, to)`;
+  //   2. plus, for a border that cuts a node rather than sitting on its edge,
+  //      that node whole — which is what a click at the border would have
+  //      answered;
+  //   3. a caret (`from === to`) is exactly `tightestNodeAt`, so a click and a
+  //      drag are one gesture rather than two policies.
+  //
+  // Containment rather than overlap is what keeps (1) from degenerating: the
+  // pane's root spans the whole program, so an overlap test would answer every
+  // range with the entire tree. Under containment the root is named only by a
+  // selection that really does cover the file.
+  //
+  // (2) asks the *tightest* row at the border and not "does any row straddle
+  // it", for the same reason: the root straddles every interior border, so the
+  // looser test would put the whole tree in every selection. A border is a cut
+  // only when the tightest node there extends past it — `from` with a node
+  // starting earlier, `to` with a node (asked at `to - 1`, since `to` is
+  // exclusive) ending later.
+  const nodesInRange = (from: number, to: number): number[] => {
+    if (from >= to) {
+      const at = tightestNodeAt(from);
+      return at === null ? [] : [at];
+    }
+    const out = new Set<number>();
+    for (const { start, end, nodeId } of spanRows) {
+      if (predicateIds.has(nodeId)) continue;
+      if (from <= start && end <= to) out.add(nodeId);
+    }
+    const head = tightestRowAt(from);
+    if (head !== null && head.start < from) out.add(head.nodeId);
+    const tail = tightestRowAt(to - 1);
+    if (tail !== null && to < tail.end) out.add(tail.nodeId);
+    return [...out];
   };
 
   // typesAt — the monomorphized type-set (R2). Gather every node whose span
@@ -169,6 +219,7 @@ export function buildIndices(
     predicateIds,
     definitions,
     tightestNodeAt,
+    nodesInRange,
     typesAt,
     definitionAt,
   };

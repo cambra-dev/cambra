@@ -44,12 +44,11 @@ const TREE_INDENT = "  ";
  * regardless of what is expanded, so a copy does not depend on click history
  * (`renderSelection` expands ancestors as a side effect of selecting).
  *
- * Refinement-predicate children are walked like any other. `renderNode` gives
- * them rows, so filtering on the `predicate` flag here would silently make the
- * copy disagree with the pane it claims to reproduce. It walks from `root`
- * through the child edges with the same on-path guard `renderNode` uses, so a
- * node reached from several positions appears once per position, exactly as the
- * pane draws it.
+ * Refinement-predicate children are skipped, because `renderNode` draws no row
+ * for one: a copy that carried them would disagree with the pane it claims to
+ * reproduce. It walks from `root` through the child edges with the same on-path
+ * guard `renderNode` uses, so a node reached from several positions appears
+ * once per position, exactly as the pane draws it.
  */
 export function serializeTree(root: number, nodeById: Map<number, IrNode>): string {
   const lines: string[] = [];
@@ -64,10 +63,11 @@ export function serializeTree(root: number, nodeById: Map<number, IrNode>): stri
     lines.push(TREE_INDENT.repeat(depth) + parts.join(" "));
     const childPath = new Set(onPath).add(id);
     // The same derived label `renderNode` draws: a value child's index in
-    // `children`, and nothing for a predicate.
+    // `children`, with the predicates dropped after indexing.
     for (const [i, child] of node.children.entries()) {
+      if (child.predicate) continue;
       if (onPath.has(child.id)) continue;
-      walk(child.id, child.predicate ? null : String(i), depth + 1, childPath);
+      walk(child.id, String(i), depth + 1, childPath);
     }
   };
   walk(root, null, 0, new Set());
@@ -87,6 +87,13 @@ interface NodeHandle {
   row: HTMLElement;
   parentId: number | null;
   expand: () => void;
+  /**
+   * The row's position in render order, assigned as the row is built. It is
+   * what "the topmost highlighted row" means: `handles` is populated
+   * post-order (children before their parent) and a highlight set carries the
+   * link resolver's traversal order, so neither is document order.
+   */
+  order: number;
 }
 
 export class TreeView {
@@ -95,6 +102,7 @@ export class TreeView {
   private readonly nodeById: Map<number, IrNode>;
   private readonly handles = new Map<number, NodeHandle>();
   private markedRows: HTMLElement[] = [];
+  private nextOrder = 0;
 
   constructor(parent: HTMLElement, store: Store, paneId: string, rootId: number) {
     this.store = store;
@@ -122,6 +130,7 @@ export class TreeView {
   ): HTMLElement {
     const container = el("div", "tree-node");
     const row = el("div", "tree-row selectable");
+    const order = this.nextOrder++;
     const hasChildren = node.children.length > 0;
 
     const twisty = el("span", `twisty${hasChildren ? "" : " leaf"}`);
@@ -154,23 +163,27 @@ export class TreeView {
       this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: node.nodeId });
     });
 
-    // The edge label is computed here, not shipped: children arrive in order —
-    // the value children, then the refinement predicates — so a value child's
-    // index in `children` is its positional index. A predicate gets no label. A
-    // number would be its position among the parent's type slots, which is not
-    // where the reader is looking, and the same predicate reached from two
-    // parents would carry two different ones; `predicate` is what marks it.
+    // A refinement predicate is not drawn: it rides a type slot, and the type
+    // column already shows it (`{Int | __elem == 7}`), so a row for its
+    // interior doubles the tree without adding anything the reader is looking
+    // for. It stays on the wire for the links (`IrChild.predicate`).
+    //
+    // The edge label is computed here, not shipped. Children arrive in order —
+    // the value children, then the predicates — so a value child's index in
+    // `children` is its positional index, and dropping the predicates after
+    // indexing leaves those indices alone.
     const childNodes = hasChildren
       ? node.children
-          .map((c, i) => ({ edge: c.predicate ? null : String(i), child: c }))
+          .map((c, i) => ({ edge: String(i), child: c }))
+          .filter(({ child }) => !child.predicate)
           .filter(({ child }) => !onPath.has(child.id))
           .map(({ edge, child }) => ({ edge, node: this.nodeById.get(child.id) }))
-          .filter((c): c is { edge: string | null; node: IrNode } => c.node !== undefined)
+          .filter((c): c is { edge: string; node: IrNode } => c.node !== undefined)
       : [];
     if (childNodes.length === 0) {
       twisty.textContent = "·";
       twisty.classList.add("leaf");
-      this.handles.set(node.nodeId, { row, parentId, expand: () => {} });
+      this.handles.set(node.nodeId, { row, parentId, order, expand: () => {} });
       return container;
     }
 
@@ -199,6 +212,7 @@ export class TreeView {
     this.handles.set(node.nodeId, {
       row,
       parentId,
+      order,
       expand: () => {
         if (!expanded) {
           expanded = true;
@@ -252,22 +266,27 @@ export class TreeView {
 
     const highlights = resolved.result.highlightsByPane.get(this.paneId);
     if (!highlights || highlights.size === 0) return;
-    const primary = resolved.primaryByPane.get(this.paneId) ?? null;
+    const primaries = resolved.primaryByPane.get(this.paneId);
 
+    // A predicate node is on the wire and in the link graph but draws no row
+    // (see `renderNode`), so a highlight set can name nodes this pane has no
+    // handle for. The scroll target is chosen from the rows that do exist —
+    // picking blind would scroll nowhere.
+    //
+    // `topmost` is the drawn row earliest in render order. A wide selection
+    // highlights many rows and the view lands on the first of them, so the
+    // reader starts at the top of what they selected rather than wherever the
+    // resolver happened to reach first.
+    let topmost: NodeHandle | null = null;
     for (const nodeId of highlights) {
       const handle = this.handles.get(nodeId);
       if (!handle) continue;
       this.expandAncestors(nodeId);
-      handle.row.classList.add(nodeId === primary ? "selected" : "linked");
+      handle.row.classList.add(primaries?.has(nodeId) ? "selected" : "linked");
       this.markedRows.push(handle.row);
+      if (topmost === null || handle.order < topmost.order) topmost = handle;
     }
 
-    // Scroll to the primary node if it lives here, else any highlighted node.
-    const scrollTo = primary !== null && this.handles.has(primary)
-      ? primary
-      : highlights.values().next().value;
-    if (scrollTo !== undefined) {
-      this.handles.get(scrollTo)?.row.scrollIntoView({ block: "nearest" });
-    }
+    topmost?.row.scrollIntoView({ block: "start" });
   }
 }

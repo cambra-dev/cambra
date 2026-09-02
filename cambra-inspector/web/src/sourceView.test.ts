@@ -64,12 +64,13 @@ describe("hoverPayloadAt", () => {
 });
 
 describe("resolveSourceClick", () => {
-  it("plain click selects the clicked source byte", () => {
+  it("plain click leaves a caret at the clicked source byte", () => {
     const store = new Store(arithmetic);
     const anchor = anchorOf(store);
     expect(resolveSourceClick(anchor, 22, { goto: false })).toEqual({
       kind: "source",
-      byteOffset: 22,
+      from: 22,
+      to: 22,
     });
   });
 
@@ -79,7 +80,8 @@ describe("resolveSourceClick", () => {
     // Use of `p` at byte 22 -> def-site span starts at byte 13.
     expect(resolveSourceClick(anchor, 22, { goto: true })).toEqual({
       kind: "source",
-      byteOffset: 13,
+      from: 13,
+      to: 13,
     });
   });
 
@@ -90,14 +92,16 @@ describe("resolveSourceClick", () => {
     // A literal is not a use-site, so goto has nothing to resolve.
     expect(resolveSourceClick(anchor, lit.spans[0]!.start, { goto: true })).toEqual({
       kind: "source",
-      byteOffset: lit.spans[0]!.start,
+      from: lit.spans[0]!.start,
+      to: lit.spans[0]!.start,
     });
   });
 
   it("degrades to a plain source selection when there is no anchor", () => {
     expect(resolveSourceClick(undefined, 42, { goto: true })).toEqual({
       kind: "source",
-      byteOffset: 42,
+      from: 42,
+      to: 42,
     });
   });
 });
