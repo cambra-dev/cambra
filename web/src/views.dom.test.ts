@@ -134,6 +134,49 @@ describe("view integration: cross-pane source<->tree linking", () => {
     ]);
   });
 
+  it("the pane a selection came from does not scroll itself", () => {
+    // Every row is in the DOM and jsdom has no layout, so the observable is the
+    // scrollIntoView call rather than a position: the clicked pane must not
+    // make one, and the others must.
+    const { store, trees } = mountApp(listMin);
+    const calls = new Map<string, number>();
+    for (const [id, body] of trees) {
+      calls.set(id, 0);
+      for (const row of body.querySelectorAll(".tree-row")) {
+        (row as HTMLElement).scrollIntoView = () => {
+          calls.set(id, (calls.get(id) ?? 0) + 1);
+        };
+      }
+    }
+
+    const origin = "post-inference";
+    const lit = theNode(irPaneById(listMin, origin), "Lit(Int(1))");
+    store.setSelection({ kind: "node", paneId: origin, nodeId: lit.nodeId }, origin);
+
+    expect(calls.get(origin)).toBe(0);
+    for (const [id, n] of calls) {
+      if (id !== origin) expect(n, `${id} scrolls`).toBeGreaterThan(0);
+    }
+  });
+
+  it("a jump scrolls every pane, including the one it came from", () => {
+    // Goto-definition and the operator pane's reference rows mean "go there",
+    // so they pass no origin and the pane holding the target moves too.
+    const { store, trees } = mountApp(listMin);
+    const target = "post-inference";
+    let scrolled = 0;
+    for (const row of trees.get(target)!.querySelectorAll(".tree-row")) {
+      (row as HTMLElement).scrollIntoView = () => {
+        scrolled += 1;
+      };
+    }
+
+    const lit = theNode(irPaneById(listMin, target), "Lit(Int(1))");
+    store.setSelection({ kind: "node", paneId: target, nodeId: lit.nodeId });
+
+    expect(scrolled).toBeGreaterThan(0);
+  });
+
   it("a source selection produces a primary source highlight (.cm-sel-node)", () => {
     const { store, source } = mountApp(listMin);
     const pre = irPaneById(listMin, "pre-inference");

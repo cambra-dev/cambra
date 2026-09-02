@@ -109,7 +109,10 @@ export class OperatorView {
 
     row.addEventListener("click", (e) => {
       if (e.target === twisty) return;
-      this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: node.nodeId });
+      this.store.setSelection(
+        { kind: "node", paneId: this.paneId, nodeId: node.nodeId },
+        this.paneId,
+      );
     });
 
     if (!hasChildren) {
@@ -172,6 +175,8 @@ export class OperatorView {
     row.appendChild(el("span", "node-label", subscribed ? subscribed.label : "?"));
     row.appendChild(el("span", "node-id", `#${edge.subscribed}`));
     row.addEventListener("click", () => {
+      // A jump to the row this one points at, so no origin: this pane scrolls
+      // to the target like any other.
       this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: edge.subscribed });
     });
     container.appendChild(row);
@@ -211,7 +216,7 @@ export class OperatorView {
       if (topmost === null || handle.order < topmost.order) topmost = handle;
     }
 
-    topmost?.row.scrollIntoView({ block: "start" });
+    if (resolved.origin !== this.paneId) topmost?.row.scrollIntoView({ block: "start" });
   }
 }
 
