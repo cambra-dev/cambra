@@ -121,7 +121,7 @@ describe("nodesInRange: predicate interiors are not seeds", () => {
     node(22, "BinOp(Eq)", { start: 4, end: 5 }, "Bool", [{ id: 23, predicate: false }]),
     node(23, "Lit(Int(1))", { start: 4, end: 5 }, "Int@1"),
   ];
-  const p = buildIndices([20], withPred, []);
+  const p = buildIndices(20, withPred, []);
 
   it("skips them in the containment pass", () => {
     expect(p.nodesInRange(4, 5)).toEqual([21]);
