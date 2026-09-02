@@ -19,9 +19,10 @@
 # Every fixture is the full wire. A fixture is a whole payload document, and a
 # corpus program whose payload is too large to commit whole belongs in
 # tests/inspector_goldens.rs as a structural assertion over a fresh dump
-# instead — which is where `txn_multi_read` and `for_accumulator` live. Those two
-# are the only corpus programs with a store, so their bytes would re-bless on
-# every change to how a store is built.
+# instead — which is where `txn_multi_read`, `for_accumulator` and `inner_join`
+# live. The first two are the only corpus programs with a store, so their bytes
+# would re-bless on every change to how a store is built; a join's payload is
+# ~430KB, several times the largest fixture here.
 #
 # A program added for backend coverage alone needs NO row here: ratchet 5 of
 # tests/inspector_goldens.rs already walks every gallery source through the
