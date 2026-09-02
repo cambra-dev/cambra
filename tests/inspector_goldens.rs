@@ -31,12 +31,13 @@
 //! program added for backend coverage belongs in ratchet 5, which reads every
 //! gallery source and commits nothing.
 //!
-//! Two programs — `txn_multi_read` and `for_accumulator` — are in the corpus
-//! without a committed fixture. Their payloads run to five figures of lines
-//! each, which is a document nobody reads and a re-bless nobody can review, so
-//! what they are here for is asserted structurally over a fresh dump instead:
-//! the dense channelize window, and the `Transact`/`Letrec` rewrite tags that
-//! reach the wire.
+//! Three programs — `txn_multi_read`, `for_accumulator` and `inner_join` — are
+//! in the corpus without a committed fixture. Their payloads run to five figures
+//! of lines each, which is a document nobody reads and a re-bless nobody can
+//! review, so what they are here for is asserted structurally over a fresh dump
+//! instead: the dense channelize window, the `Transact`/`Letrec` rewrite tags
+//! that reach the wire, and the multi-span operator node that only a join
+//! produces.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -132,6 +133,11 @@ fn snapshot_dumps_are_cross_process_deterministic() {
     // above does not reach them.
     assert_dumps_agree("txn_multi_read");
     assert_dumps_agree("for_accumulator");
+    // A hash join mints from keyed lookups, which is the likeliest remaining
+    // home for hash-iteration-ordered minting and is what this test exists to
+    // catch. No fixture: the payload is ~430KB, several times the largest one
+    // committed (see `fixtures.manifest`).
+    assert_dumps_agree("inner_join");
 }
 
 /// Two spawns of one program produce byte-identical dumps.
@@ -162,6 +168,28 @@ fn assert_dumps_agree(example: &str) {
             );
         }
     }
+}
+
+/// A fresh join dump is a structurally-valid payload.
+///
+/// `committed_fixtures_are_structurally_valid` runs `wire_check` over the
+/// committed corpus, and no program in it produces an operator node with more
+/// than one span — so the span-ordering assertion inside `assert_spans` had
+/// never run on a vector it could reject. It shipped mis-ordered spans through
+/// every payload the suite built, and the frontend's mirror of this validator
+/// was what finally rejected one.
+///
+/// Ratchet 5 sweeps this program too, so the assertion is not the only one that
+/// reaches it. This test is what names the shape: `inner_join` is the gallery's
+/// only program whose planner attributes one operator to several source spans,
+/// and a sweep that walks every program reports a validator failure without
+/// saying which program was the one that mattered.
+#[test]
+fn a_join_dump_is_structurally_valid() {
+    let bytes = dump("inner_join");
+    let v: Value = serde_json::from_slice(&bytes).expect("the dump is valid JSON");
+    assert_eq!(v["meta"]["payloadKind"], "program", "inner_join compiles");
+    cambra::inspector_server::wire_check::assert_snapshot_shape(&v);
 }
 
 /// A short single-line rendering of a JSON value for drift messages, truncated
