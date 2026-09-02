@@ -107,6 +107,81 @@ describe("tightestNodeAt (D4 policy)", () => {
   });
 });
 
+describe("nodesInRange: predicate interiors are not seeds", () => {
+  // The real synthesized shape: inference builds `__elem == 1` *from* the
+  // literal, so the predicate's nodes inherit the literal's span exactly. The
+  // tree draws no row for them, so a range over the literal must name the
+  // literal and nothing else.
+  const withPred: IrNode[] = [
+    node(20, "Root", { start: 0, end: 6 }, "Int", [
+      { id: 21, predicate: false },
+      { id: 22, predicate: true },
+    ]),
+    node(21, "Lit(Int(1))", { start: 4, end: 5 }, "Int@1", [{ id: 22, predicate: true }]),
+    node(22, "BinOp(Eq)", { start: 4, end: 5 }, "Bool", [{ id: 23, predicate: false }]),
+    node(23, "Lit(Int(1))", { start: 4, end: 5 }, "Int@1"),
+  ];
+  const p = buildIndices([20], withPred, []);
+
+  it("skips them in the containment pass", () => {
+    expect(p.nodesInRange(4, 5)).toEqual([21]);
+  });
+
+  it("skips them when a border cuts", () => {
+    // Asking at byte 4 must not answer with the predicate interior sharing
+    // that span, and the cut must resolve to a drawn node.
+    expect(p.nodesInRange(3, 5).sort((a, b) => a - b)).toEqual([20, 21]);
+  });
+
+  it("covering everything still names only the drawn nodes", () => {
+    expect(p.nodesInRange(0, 6).sort((a, b) => a - b)).toEqual([20, 21]);
+  });
+});
+
+describe("nodesInRange (source-selection seeds)", () => {
+  it("a caret is exactly tightestNodeAt, so a click and a drag are one gesture", () => {
+    expect(idx.nodesInRange(3, 3)).toEqual([3]);
+    expect(idx.nodesInRange(1, 1)).toEqual([1]);
+  });
+
+  it("names every node wholly inside the range", () => {
+    // [2,5) is Inner exactly, and Leaf [3,4) sits inside it.
+    expect(idx.nodesInRange(2, 5).sort((a, b) => a - b)).toEqual([2, 3]);
+    // Coincident spans both land, as both are drawn rows.
+    expect(idx.nodesInRange(6, 7).sort((a, b) => a - b)).toEqual([4, 5]);
+  });
+
+  it("does not name the root unless the range covers it", () => {
+    // The root [0,10) straddles every interior border. An overlap test would
+    // answer every range with the whole tree; containment does not.
+    expect(idx.nodesInRange(2, 5)).not.toContain(1);
+    expect(idx.nodesInRange(0, 10)).toContain(1);
+  });
+
+  it("names a node its range cuts, whole", () => {
+    // [4,7) starts inside Inner [2,5): the cut node comes in whole, exactly as
+    // a click at byte 4 would have answered it.
+    const cut = idx.nodesInRange(4, 7).sort((a, b) => a - b);
+    expect(cut).toContain(2);
+    expect(cut).toEqual([2, 4, 5]);
+  });
+
+  it("a border sitting on a node edge is not a cut", () => {
+    // `from` on Inner's start and `to` past Leaf's end add nothing of their
+    // own — the whole-containment pass already has them.
+    expect(idx.nodesInRange(2, 5)).not.toContain(1);
+    expect(idx.nodesInRange(3, 4)).toEqual([3]);
+  });
+
+  it("covers the whole document", () => {
+    expect(idx.nodesInRange(0, 10).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("names nothing when the range holds no node and cuts none", () => {
+    expect(idx.nodesInRange(20, 30)).toEqual([]);
+  });
+});
+
 describe("typesAt (monomorphized type set)", () => {
   it("returns the single narrowest type at a point", () => {
     expect(idx.typesAt(3)).toEqual(["Int"]); // leaf

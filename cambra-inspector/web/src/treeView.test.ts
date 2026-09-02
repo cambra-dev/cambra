@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { resolvedTypeTooltip, serializeTree } from "./treeView";
-import { allNodesWithPredicates, fixture, irPaneById } from "./__fixtures__/helpers";
+import { allNodes, fixture, irPaneById } from "./__fixtures__/helpers";
 import type { IrChild, IrNode } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
@@ -89,28 +89,28 @@ describe("serializeTree", () => {
     );
   });
 
-  it("includes refinement-predicate children", () => {
-    // The pane renders predicate subtrees as rows (renderNode walks children
-    // unfiltered), so a serializer that filtered on the `predicate` flag would
-    // silently disagree with the pane it claims to reproduce. A predicate row
-    // carries no position prefix, exactly as the pane draws it.
+  it("omits refinement-predicate children", () => {
+    // `renderNode` draws no row for a predicate — the type column already
+    // shows it — so a serializer that walked into one would disagree with the
+    // pane it claims to reproduce. The literal keeps its own row, and its
+    // synthesized `__elem == 1` interior contributes none.
     const nodes = table(
       node("Lit(Int(1))", "Int@1", 5, [{ id: 6, predicate: true }]),
       node("BinOp(Eq)", "Bool", 6),
     );
-    expect(serializeTree(5, nodes)).toBe("Lit(Int(1)) : Int@1 #5\n  BinOp(Eq) : Bool #6");
+    expect(serializeTree(5, nodes)).toBe("Lit(Int(1)) : Int@1 #5");
   });
 
   it("gives a shared node one row per position that reaches it", () => {
-    // The table holds a shared predicate once; the pane draws it under each
-    // parent that names it, so the copy has to as well.
+    // The table holds a shared node once; the pane draws it under each parent
+    // that names it, so the copy has to as well.
     const nodes = table(
-      node("Root", "Int", 1, [value(2), { id: 3, predicate: true }]),
-      node("Operand", "Int", 2, [{ id: 3, predicate: true }]),
-      node("Pred", "Bool", 3),
+      node("Root", "Int", 1, [value(2), value(3)]),
+      node("Operand", "Int", 2, [value(3)]),
+      node("Shared", "Int", 3),
     );
     expect(serializeTree(1, nodes)).toBe(
-      "Root : Int #1\n  0: Operand : Int #2\n    Pred : Bool #3\n  Pred : Bool #3",
+      "Root : Int #1\n  0: Operand : Int #2\n    0: Shared : Int #3\n  1: Shared : Int #3",
     );
   });
 
@@ -120,8 +120,9 @@ describe("serializeTree", () => {
 
   it("reaches every node of a golden fixture's table, and invents none", () => {
     // Catches a dropped subtree, which the hand-built cases above cannot. Line
-    // count is not the node count — a shared predicate gets a row per position —
-    // so the check is on the id *set* the rows name.
+    // count is not the node count — a shared node gets a row per position that
+    // reaches it — so the check is on the id set the rows name. `allNodes`
+    // skips predicate interiors, which is exactly what the pane draws.
     const snap = fixture(listMinJson);
     const pane = irPaneById(snap, "post-inference");
     const lines = serializeTree(
@@ -131,7 +132,7 @@ describe("serializeTree", () => {
     expect(lines.length).toBeGreaterThan(1);
     const named = new Set(lines.map((l) => Number(l.trim().split("#").pop())));
     expect([...named].sort((a, b) => a - b)).toEqual(
-      allNodesWithPredicates(pane)
+      allNodes(pane)
         .map((n) => n.nodeId)
         .sort((a, b) => a - b),
     );
