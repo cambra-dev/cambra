@@ -36,10 +36,11 @@ See [Running it](../README.md#running-it). No `cargo`? After `npm run build`,
 |---|---|
 | **Hover** an identifier or expression in the source | Tooltip with the tightest enclosing IR node's `label`, its type(s), and `provenance`. A monomorphized definition shows the *set* of specialized types (e.g. `Int \| String`). On a use-site, the tooltip also offers a **"→ jump to definition"** link. |
 | **Left-click** a term in the source | Selects the tightest enclosing IR node — highlights it in the source and reveals + highlights it in the IR tree (expanding ancestors). The source → tree cross-link. |
+| **Drag** across source text | Selects every node the range covers, and traces all of them through every pane at once. A click is the same gesture with an empty range, so there is no modifier to learn. A range edge cutting through a node takes that node whole, as a click there would. |
 | **Ctrl/Cmd-click** a variable use in the source | Goto-definition: jumps + scrolls to the def-site and selects its node in both panels. The IDE/LSP-standard gesture (Ctrl, or ⌘ on macOS); the hover-tooltip link does the same thing for discoverability. |
 | **Click** a node row in the IR tree | Selects the node — highlights its source span in the editor and scrolls to it. The tree → source cross-link. |
 | **Click the ▸ / ▾ twisty** on a tree row | Expands / collapses that subtree (distinct from selecting the row). |
-| **Hover a squiggle** or gutter marker in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
+| **Hover a squiggle** in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
 | **Open the ☰ Panes menu** in the header | A checkbox per pane. Unchecking one hides it and widens the rest; the hidden set persists across reloads. Every pane is listed, Source included — the invariant is that the layout is never empty, so the last visible pane's checkbox is disabled rather than Source being pinned. Panes cannot be reordered. |
 | **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
 
@@ -100,7 +101,7 @@ CI via `./ci.sh web`):
   against the same `diagnosticLines` the pane renders from), and a jsdom
   degraded-render test over `failed.snapshot.json`.
 - `treeView.test.ts` — `resolvedTypeTooltip`, and `serializeTree`: the copy
-  grammar row by row, the two-space indent, the included `where.N` predicate
+  grammar row by row, the two-space indent, the omitted refinement-predicate
   subtrees, and a fixture case pinning one line per rendered node.
 - `clipboard.test.ts` — `copyToClipboard`'s three outcomes: an absent API, a
   successful write, and a refused one.
@@ -194,8 +195,14 @@ expand/collapse in a tree, and come back blank (the views react to selection
     degraded snapshot too** (no panes but diagnostics present), so a type-error
     program still underlines its error.
   - **selection highlight**: a `StateField<DecorationSet>` marking the resolved
-    source spans — the **primary** anchor span strongly, transitively-**linked**
-    spans lightly.
+    source spans — the **primary** anchor spans strongly, transitively-**linked**
+    spans lightly. There is no active-line highlight: CodeMirror's stock one
+    rendered its own base-theme colour next to the span mark, so two similar
+    blues marked different things.
+  - **range selection**: the editor's own selection is the gesture. An
+    `updateListener` on `selectionSet` turns `state.selection.main` into a
+    `{ kind: "source", from, to }` store selection, so a drag needs no mouse
+    handling and shift+arrow works for free.
 - **IR panes** — one collapsible tree per pane (label, type, node id, edge
   labels), **cross-linked across all panes**: clicking a row selects that node
   in its pane; the store resolves it through the **pane link graph** to a

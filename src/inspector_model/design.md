@@ -198,6 +198,11 @@ type slot it rode, or where inside that type it sat, so two occurrences of one p
 are indistinguishable on the wire. That is enough to display a predicate and not enough to do
 anything else with it. Work in this area replaces the shape rather than extending it.
 
+**Shipping one is not drawing one.** The inspector's tree panes render no row for a predicate — a
+node's rendered `type` carries it, and the interiors outnumber the program they annotate — so
+`predicate` is read as the filter the traversals meaning "the program" apply. The wire ships them
+regardless, because the pane links name their ids.
+
 ### Types on the wire
 
 A node's `type` is rendered by `Display for Type`, and `Type`'s `Serialize` impl delegates to that

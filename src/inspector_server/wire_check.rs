@@ -487,7 +487,7 @@ fn assert_spans(v: &Value, at: &str) {
 }
 
 /// Assert one entry of an **IR** pane's node table: the scalar fields, the
-/// retired fields' absence, and `{edge, id, predicate}` children resolving
+/// retired fields' absence, and `{id, predicate}` children resolving
 /// within `ids`.
 fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
     assert!(v["label"].is_string(), "{at}.label is a string");

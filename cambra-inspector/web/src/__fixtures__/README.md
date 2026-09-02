@@ -30,13 +30,15 @@ validator instead of passing silently. There is no top-level `ir`/`spanIndex`
 walk starts from. `kind` is the discriminant for which shape `nodes` holds.
 
 A **tree pane** (`holes`, `typed`) holds expression nodes, in first-visit
-pre-order, and names exactly one root. A child is `{ edge, id, predicate }` — the
-id names an entry of the same table, so a node reached from several places is one
+pre-order, and names exactly one root. A child is `{ id, predicate }` — the id
+names an entry of the same table, so a node reached from several places is one
 entry that several edges name. A refinement predicate riding a type slot is a
-node like any other, reached under a `where.N`-labelled child edge instead of a
-positional index; `predicate: true` on the edge is what distinguishes a subtree
-inside a type from an operand, and the label is for display. Each node carries
-its type as a rendered string in `type` (`"Int"`, `"_"`).
+node like any other, and `predicate: true` is what distinguishes a subtree
+inside a type from an operand. The edge carries no label: the frontend derives a
+value child's position from its index. Predicates stay on the wire because their
+ids are endpoints of the pane links, and the tree pane draws no row for one —
+the node's `type` already shows the predicate. Each node carries its type as a
+rendered string in `type` (`"Int"`, `"_"`).
 
 The **operator pane** (`operators`) holds the dataflow graph, in conversion
 order, and names several roots — a sink per compiled output and a fan input per
