@@ -1,6 +1,6 @@
 //! Golden-corpus tests over the real `cambra --dump-snapshot` CLI.
 //!
-//! The fixture corpus (`cambra-inspector/scripts/fixtures.manifest`, shared with
+//! The fixture corpus (`web/scripts/fixtures.manifest`, shared with
 //! `regen-fixtures.sh`) maps committed frontend fixtures to gallery programs
 //! under `tests/programs/`. These tests spawn the actual `cambra` binary **once
 //! per program, per dump** — a fresh process each time. That is not an
@@ -68,7 +68,7 @@ fn program_path(example: &str) -> String {
 /// comments and blank lines are skipped. Two words and nothing else, so the
 /// shell parser and this one have no grammar to disagree about.
 fn corpus() -> Vec<CorpusEntry> {
-    let path = repo_root().join("cambra-inspector/scripts/fixtures.manifest");
+    let path = repo_root().join("web/scripts/fixtures.manifest");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let entries: Vec<CorpusEntry> = text
@@ -252,14 +252,14 @@ fn first_json_difference(lhs: &Value, rhs: &Value, path: &str) -> Option<(String
 /// names the first drifted JSON path and the fix path is its one command.
 #[test]
 fn committed_fixtures_match_fresh_dumps() {
-    let fixtures_dir = repo_root().join("cambra-inspector/web/src/__fixtures__");
+    let fixtures_dir = repo_root().join("web/src/__fixtures__");
     for entry in corpus() {
         let fixture_path = fixtures_dir.join(format!("{}.snapshot.json", entry.fixture));
         let committed = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
             panic!(
                 "reading committed fixture {} for corpus entry `{}`: {e}. \
                  Every manifest entry must have a committed fixture — run \
-                 cambra-inspector/scripts/regen-fixtures.sh and commit the result.",
+                 web/scripts/regen-fixtures.sh and commit the result.",
                 fixture_path.display(),
                 entry.example
             )
@@ -282,7 +282,7 @@ fn committed_fixtures_match_fresh_dumps() {
                 "fixture drift: {}.snapshot.json differs from a fresh dump of \
                  tests/programs/{}/program.cambra. First difference at {path}:\n  committed: {committed_at}\n  \
                  fresh:     {fresh_at}\nFresh dump preserved at {}. If the wire change is \
-                 intended, re-bless via cambra-inspector/scripts/regen-fixtures.sh and \
+                 intended, re-bless via web/scripts/regen-fixtures.sh and \
                  commit the diff.",
                 entry.fixture,
                 entry.example,
@@ -635,7 +635,7 @@ fn the_recurrence_phases_reach_the_wire() {
 /// because these files are what the frontend actually loads.
 #[test]
 fn committed_fixtures_are_structurally_valid() {
-    let fixtures_dir = repo_root().join("cambra-inspector/web/src/__fixtures__");
+    let fixtures_dir = repo_root().join("web/src/__fixtures__");
     for entry in corpus() {
         let path = fixtures_dir.join(format!("{}.snapshot.json", entry.fixture));
         let text = std::fs::read_to_string(&path)

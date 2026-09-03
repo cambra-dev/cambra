@@ -94,7 +94,7 @@ Pass `--inspect` to run the program and additionally stream the values flowing t
 printf 'hello\nworld\n' | cargo run -- --inspect tests/programs/streaming_echo/program.cambra
 ```
 
-Both default to port 8080 (`--inspect=9090` to change it). Under `--inspect` the process stays alive after the program finishes, so the values it recorded are still there to read; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
+Both default to port 8080 (`--inspect=9090` to change it). Under `--inspect` the process stays alive after the program finishes, so the values it recorded are still there to read; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
 
 ## License
 

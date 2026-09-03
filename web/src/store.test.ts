@@ -1,5 +1,5 @@
 // Store-level tests over **golden `/api/snapshot` fixtures** produced by the
-// real backend (`cambra-inspector <ex>.chl --dump-snapshot`, see
+// real backend (`cambra <program> --dump-snapshot`, see
 // `__fixtures__/README.md`). `Store` is DOM-free, so it constructs and resolves
 // in plain vitest. These cover:
 //   - T1: the B5 hole -> downstream-type stitch (`resolvedTypesFor`);

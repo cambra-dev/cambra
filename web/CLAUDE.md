@@ -9,7 +9,7 @@ corpus in `scripts/fixtures.manifest` — shared by the regen script, the
 `ci_fixtures` byte gate, and `tests/inspector_goldens.rs`. Re-bless via:
 
 ```bash
-cambra-inspector/scripts/regen-fixtures.sh   # from the repo root
+web/scripts/regen-fixtures.sh   # from the repo root
 ```
 
 **Re-bless discipline:** classify every diff into a named, explained class
