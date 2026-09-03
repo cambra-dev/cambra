@@ -17,6 +17,10 @@
   --caret: #d75a2e;
   --err: #c0392b;
   --warn: #b8860b;
+  /* A deleted row's ink. Dimmed rather than struck through, and paired with a
+     glyph and the word, so the flag carries on three channels rather than on
+     colour alone. */
+  --deleted: #8a8a8a;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
@@ -36,6 +40,7 @@
     --caret: #f18b40;
     --err: #ff6b5b;
     --warn: #e0b34a;
+    --deleted: #7d7d7d;
   }
 }
 
@@ -433,6 +438,20 @@ body {
   cursor: pointer;
   text-align: left;
 }
+
+/* The inspect-data link sits beside the goto-def one and reads the same. */
+.cm-hover-inspect {
+  display: block;
+  margin-top: 0.35rem;
+  padding: 0.15rem 0;
+  border: none;
+  background: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--edge);
+  cursor: pointer;
+  text-align: left;
+}
 .cm-hover-gotodef:hover {
   text-decoration: underline;
 }
@@ -502,4 +521,253 @@ body {
 }
 .twisty.clickable {
   cursor: pointer;
+}
+
+/* ---------------------------------------------------------------------------
+   The live values pane
+   --------------------------------------------------------------------------- */
+
+.live-root {
+  /* The pane never scrolls itself, so a replaced row must not slide the content
+     under the reader. */
+  overflow-anchor: auto;
+  padding: 4px 0;
+}
+
+.live-empty {
+  color: var(--fg-muted);
+  padding: 8px 10px;
+  line-height: 1.5;
+}
+
+.live-group {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
+
+.live-group:last-child {
+  border-bottom: none;
+}
+
+.live-group-head {
+  /* Sticky, so scrolling a long row list never leaves the reader unable to say
+     which operator they are looking at. */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-panel);
+  color: var(--fg);
+  font-weight: 600;
+  padding: 2px 10px;
+}
+
+.live-group-meta {
+  color: var(--fg-muted);
+  padding: 0 10px 4px;
+}
+
+.live-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.live-row {
+  display: flex;
+  gap: 6px;
+  padding: 1px 10px;
+  white-space: pre;
+}
+
+.live-row:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.live-key {
+  color: var(--node-id);
+  flex: 0 0 auto;
+}
+
+.live-value {
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+/* Three channels for one bit: the dimming, the glyph, and the word. */
+.live-row.deleted .live-key,
+.live-row.deleted .live-value {
+  color: var(--deleted);
+}
+
+.live-row.deleted .live-value::after {
+  content: " ⊘ deleted";
+  color: var(--deleted);
+}
+
+/* Truncation keeps the tail, so the marker sits at the top of the list, in the
+   list, and is not selectable as a row. */
+.live-dropped {
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* ---------------------------------------------------------------------------
+   Tag chips and the Values pane's menu
+
+   Categorical chip colours. Fill and ink ship as a pair and are never mixed
+   across indices: a shared ink would force every fill into one lightness band,
+   which is what makes a hue-only ring indistinguishable under dichromacy.
+
+   Hues avoid the bands the semantic tokens already own — err/caret 29-86°,
+   node-id/warn, type 155°, edge/sel-here 250-256° — so a chip never reads as an
+   error or a selection. That reserves the whole warm half, and the warm half is
+   what survives colour-vision deficiency, so lightness carries the separation
+   instead of hue. Three of the seven land on Coral Coast's cool family:
+   teal near `--color-lagoon`, ocean near `--color-deep-sea`, slate near
+   `--color-muted`.
+
+   Every fill/ink pair clears WCAG 2.2 SC 1.4.3 at 4.5:1 (the chip's text is
+   11.96px at normal weight, so the large-text 3:1 allowance does not apply);
+   the minimum is 6.19:1. Colour groups and never identifies: the chip carries
+   its label, which is what satisfies SC 1.4.1 at Level A, and is why the
+   modulo wrapping past seven tags is harmless.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --tag-0: #a6f2ef;  --tag-0-ink: #173938;  /* teal    */
+  --tag-1: #b7e9ad;  --tag-1-ink: #1c3c14;  /* green   */
+  --tag-2: #9ddef0;  --tag-2-ink: #173841;  /* ocean   */
+  --tag-3: #c0bcf0;  --tag-3-ink: #322664;  /* violet  */
+  --tag-4: #d5a2df;  --tag-4-ink: #491c53;  /* magenta */
+  --tag-5: #f5c5da;  --tag-5-ink: #54193a;  /* rose    */
+  --tag-6: #b2bcc6;  --tag-6-ink: #2a343e;  /* slate   */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --tag-0: #1b4746;  --tag-0-ink: #8cecea;
+    --tag-1: #1d4214;  --tag-1-ink: #bbf1af;
+    --tag-2: #235664;  --tag-2-ink: #bce8f6;
+    --tag-3: #322564;  --tag-3-ink: #deddf6;
+    --tag-4: #360d3f;  --tag-4-ink: #f0d5f6;
+    --tag-5: #3a0a23;  --tag-5-ink: #f6d5e3;
+    --tag-6: #282f37;  --tag-6-ink: #d5e1ee;
+  }
+}
+
+.live-tag {
+  background: var(--tag-0);
+  color: var(--tag-0-ink);
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 0.92em;
+  white-space: nowrap;
+  /* The chip's own outline. A dark fill sits ~1.1:1 against `--bg-panel`, so
+     without this the shape disappears and only the text remains; derived from
+     the ink so one rule covers every slot and both themes. */
+  border: 1px solid color-mix(in srgb, currentColor 55%, transparent);
+}
+
+.live-tag[data-colour="1"] { background: var(--tag-1); color: var(--tag-1-ink); }
+.live-tag[data-colour="2"] { background: var(--tag-2); color: var(--tag-2-ink); }
+.live-tag[data-colour="3"] { background: var(--tag-3); color: var(--tag-3-ink); }
+.live-tag[data-colour="4"] { background: var(--tag-4); color: var(--tag-4-ink); }
+.live-tag[data-colour="5"] { background: var(--tag-5); color: var(--tag-5-ink); }
+.live-tag[data-colour="6"] { background: var(--tag-6); color: var(--tag-6-ink); }
+
+.live-group-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 10px;
+}
+
+/* The pane's own toolbar, above its rows. */
+.live-menu {
+  position: relative;
+  border-bottom: 1px solid var(--border);
+  padding: 3px 6px;
+}
+
+.live-menu-button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 6px;
+}
+
+.live-menu-button:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.live-menu-panel {
+  position: absolute;
+  top: 100%;
+  left: 6px;
+  z-index: 3;
+  min-width: 220px;
+  max-width: 340px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+}
+
+.live-menu-clear {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  margin-bottom: 4px;
+  padding: 1px 6px;
+  width: 100%;
+}
+
+.live-menu-clear:disabled {
+  color: var(--fg-muted);
+  cursor: default;
+}
+
+.live-menu-item {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  justify-content: space-between;
+  padding: 1px 2px;
+}
+
+.live-menu-label {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+}
+
+.live-menu-count {
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.live-menu-remove {
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 3px;
+}
+
+.live-menu-remove:hover {
+  color: var(--err);
+}
+
+.live-menu-empty {
+  color: var(--fg-muted);
+  padding: 2px 4px;
 }
