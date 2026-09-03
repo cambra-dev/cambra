@@ -32,6 +32,9 @@ import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
+import { LiveStore, connectLive } from "./liveStore";
+import { renderLiveMenu } from "./liveMenu";
+import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
 import { isIrPane } from "./types";
 import type { Diagnostic, Snapshot, Span } from "./types";
@@ -45,6 +48,27 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
 
 // Cambra `Span`s are UTF-8 *byte* offsets; for the diagnostics list we show
 // ariadne-style `line:col` positions computed against the encoded byte stream.
+/**
+ * How an inspect gesture names itself: the construct and the line it sits on,
+ * e.g. `Var(words): L8`.
+ *
+ * The construct rather than the operator, because that is what the reader
+ * pointed at — one gesture becomes several operators, and naming it by any one
+ * of them would name something they never chose.
+ */
+export function tagLabel(store: Store, nodeId: number, lineStarts: number[]): string {
+  const anchorId = store.sourceAnchorPaneId;
+  const node = anchorId ? store.indicesFor(anchorId)?.nodeById.get(nodeId) : undefined;
+  const label = node?.label ?? `#${nodeId}`;
+  const start = node?.spans[0]?.start;
+  if (start === undefined) return label;
+  // The line alone, not `line:col`: two gestures on one line are the same
+  // construct often enough that a column would split one tag into several.
+  let line = 0;
+  for (let i = 0; i < lineStarts.length && (lineStarts[i] ?? 0) <= start; i++) line = i;
+  return `${label}: L${line + 1}`;
+}
+
 export function byteLineStarts(text: string): number[] {
   const enc = new TextEncoder();
   const starts = [0];
@@ -159,7 +183,13 @@ export interface PaneDescriptor {
  * CodeMirror lays out against its panel's size, so the editor is built while
  * its panel is the only one in the row.
  */
-export function describePanes(store: Store): PaneDescriptor[] {
+export function describePanes(
+  store: Store,
+  live?: LiveStore,
+  // Pin the operators a position reaches, and reveal the values pane so the
+  // reader sees the result of the gesture they just made.
+  onInspect?: (nodeId: number, operators: readonly number[]) => void,
+): PaneDescriptor[] {
   const snap = store.snapshot;
   const panes: PaneDescriptor[] = [
     {
@@ -171,7 +201,7 @@ export function describePanes(store: Store): PaneDescriptor[] {
       // source would come back from CodeMirror with the CRs stripped.
       copyText: () => snap.source.text,
       mount: (body) => {
-        const view = new SourceView(body, store);
+        const view = new SourceView(body, store, onInspect);
         // A revealed editor has never measured against a real box, and it does
         // not reliably measure itself: CodeMirror's ResizeObserver path drops a
         // resize within 75ms of a docView update, and a selection made while
@@ -227,6 +257,22 @@ export function describePanes(store: Store): PaneDescriptor[] {
       },
       mount: (body) => {
         if (pane.nodes.length > 0) new TreeView(body, store, pane.id, root);
+      },
+    });
+  }
+  if (live !== undefined) {
+    // Hideable and remembered like any other pane. Pinning reveals it, which
+    // `applyVisibility` already does on a hidden-to-visible transition.
+    panes.push({
+      id: "values",
+      label: "Values",
+      badge: "live",
+      paneClass: "tree",
+      copyText: () => serializeLivePanel(livePanelState(live.get())),
+      mount: (body) => {
+        // The menu first, so it reads as this pane's toolbar above its rows.
+        renderLiveMenu(body, live);
+        new LiveView(body, live);
       },
     });
   }
@@ -292,8 +338,20 @@ function renderPane(panels: HTMLElement, pane: PaneDescriptor): MountedPane {
   return { panel, reveal: pane.mount(body) };
 }
 
-export function renderApp(root: HTMLElement, store: Store): void {
-  const panes = describePanes(store);
+export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): void {
+  // Set once the visibility controller exists, because pinning has to reveal
+  // the pane and the controller is built from the pane list this produces.
+  let reveal: ((paneId: string) => void) | null = null;
+  // Built once: the tag label needs a line number, and scanning the source per
+  // gesture would redo work the diagnostics list already pays for.
+  const lineStarts = byteLineStarts(store.snapshot.source.text);
+  const onInspect = live
+    ? (nodeId: number, operators: readonly number[]) => {
+        live.inspect(tagLabel(store, nodeId, lineStarts), operators);
+        reveal?.("values");
+      }
+    : undefined;
+  const panes = describePanes(store, live, onInspect);
 
   // A storage that throws on access degrades the filter to one session.
   const storage = browserStorage();
@@ -333,6 +391,12 @@ export function renderApp(root: HTMLElement, store: Store): void {
     });
   };
 
+  // Pinning reveals the pane: an affordance that produced no visible result
+  // would read as having done nothing.
+  reveal = (paneId: string) => {
+    visibility.setVisible(paneId, true);
+  };
+
   visibility.subscribe(applyVisibility);
   if (storage) {
     visibility.subscribe(() => saveHiddenPanes(storage, visibility.hiddenIds()));
@@ -349,7 +413,13 @@ async function main(): Promise<void> {
     // Validate the wire contract up front: a drifted backend surfaces as a
     // clear path-naming error here, not a confusing downstream crash.
     const snap = validateSnapshot(await resp.json());
-    renderApp(root, new Store(snap));
+    // The live channel is opened alongside the snapshot, not instead of it, and
+    // its failures never reach this `catch`: a run that ended must degrade the
+    // values pane, where a snapshot that would not load has nothing to show at
+    // all.
+    const live = new LiveStore();
+    connectLive(live);
+    renderApp(root, new Store(snap), live);
   } catch (e) {
     root.replaceChildren(el("div", "fatal", `Failed to load /api/snapshot: ${String(e)}`));
   }
