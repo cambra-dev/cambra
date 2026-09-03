@@ -54,7 +54,7 @@ impl TileOperator for Aggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -194,7 +194,7 @@ impl TileOperator for ExtractAggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -311,7 +311,7 @@ impl TileOperator for MapExtractAggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -443,7 +443,7 @@ impl TileOperator for MapAggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
