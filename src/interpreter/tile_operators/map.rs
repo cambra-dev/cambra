@@ -93,7 +93,7 @@ impl TileOperator for MapResult {
         visit(value("fn", &*self.function));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -533,7 +533,7 @@ impl TileOperator for MapResultToConst {
         visit(value("constant", &*self.constant));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -713,7 +713,7 @@ impl TileOperator for MapResultWithSource {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

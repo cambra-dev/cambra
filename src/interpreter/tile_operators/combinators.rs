@@ -53,7 +53,7 @@ impl TileOperator for Converse {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -307,7 +307,7 @@ impl TileOperator for MapDomain {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -428,7 +428,7 @@ impl TileOperator for Uncurry {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -599,7 +599,7 @@ impl TileOperator for Filter {
         visit(value("predicate", &*self.predicate));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -765,7 +765,7 @@ impl TileOperator for MapFilter {
         visit(value("predicate", &*self.predicate));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -918,7 +918,7 @@ impl TileOperator for Restrict {
         visit(value("predicate", &*self.predicate));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
