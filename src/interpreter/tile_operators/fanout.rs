@@ -233,7 +233,7 @@ impl TileOperator for FanOutBranch {
         }
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -467,7 +467,7 @@ impl TileOperator for Memo {
         node.child("input", self.input.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

@@ -151,7 +151,7 @@ impl TileOperator for MapResult {
             .child("input", self.input.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
@@ -581,7 +581,7 @@ impl TileOperator for MapResultToConst {
             .child("constant", self.constant.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
@@ -765,7 +765,7 @@ impl TileOperator for MapResultWithSource {
         node.child("input", self.input.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

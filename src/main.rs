@@ -8,11 +8,58 @@ use cambra::{
     interpreter::{
         Consumer,
         tile_operators::{FunctionGuard, Tile, TileGuard},
+        value_recorder::{self, SharedRecorder, ValueRecorder},
     },
     pretty_graph::pretty_tile_operator,
     web_inspector::WebInspector,
 };
 use log::debug;
+
+/// Report what the tick recorded, one line per producer that produced anything.
+///
+/// The only reader of the recorder until the live pane's transport lands, and
+/// the way to see the recording end to end: `RUST_LOG=debug cambra --inspect`.
+fn log_recordings(recorder: Option<&SharedRecorder>, tick: u64) {
+    let Some(recorder) = recorder else { return };
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let recorder = recorder.borrow();
+    let mut lines: Vec<String> = recorder
+        .producers()
+        .filter_map(|(node_id, producer_id)| {
+            let (recording, stale) = recorder.latest_non_empty(node_id, producer_id)?;
+            (recording.tick == tick).then(|| {
+                let rows: Vec<String> = recording
+                    .rows
+                    .iter()
+                    .map(|row| match (&row.key, row.deleted) {
+                        (Some(key), true) => format!("{key}: {} (deleted)", row.value),
+                        (Some(key), false) => format!("{key}: {}", row.value),
+                        (None, _) => row.value.clone(),
+                    })
+                    .collect();
+                let node = node_id.map_or_else(|| "-".to_string(), |id| format!("{id:?}"));
+                let dropped = match recording.dropped() {
+                    0 => String::new(),
+                    n => format!(" (+{n} more)"),
+                };
+                format!(
+                    "  {} {node} {}{}{}",
+                    recording.producer,
+                    if stale { "[stale] " } else { "" },
+                    rows.join(", "),
+                    dropped,
+                )
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    lines.sort();
+    debug!("tick {tick} recorded:\n{}", lines.join("\n"));
+}
 
 /// Runs a Cambra program from a source string.
 ///
@@ -30,12 +77,20 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
         *new_data_clone.borrow_mut() = true;
     });
 
+    // Recording is installed for the whole subscribe, which happens inside
+    // `compile_program`: a producer takes its handle when its `ProducerBase` is
+    // built, and there is no traversal of the live graph to hand one out later.
+    let recorder = inspect_port.map(|_| Rc::new(RefCell::new(ValueRecorder::with_defaults())));
+
     let mut ctx = GlobalContext::default();
-    let mut compiled = match compile_program(&mut ctx, code, consumer) {
-        Ok(c) => c,
-        Err(errs) => {
-            eprint_errors(&errs, src_name, code);
-            return Err(());
+    let mut compiled = {
+        let _recording = recorder.clone().map(value_recorder::install);
+        match compile_program(&mut ctx, code, consumer) {
+            Ok(c) => c,
+            Err(errs) => {
+                eprint_errors(&errs, src_name, code);
+                return Err(());
+            }
         }
     };
 
@@ -83,8 +138,12 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
             *new_data.borrow_mut() = false;
 
             debug!("Main calling get");
+            if let Some(recorder) = recorder.as_ref() {
+                recorder.borrow_mut().set_tick(tick);
+            }
             let tile = producer.get(producer.tiling().universal_guard());
             snapshot(tick, Some(producer.as_ref()));
+            log_recordings(recorder.as_ref(), tick);
             tick += 1;
 
             let release_guard = match &tile {
@@ -117,6 +176,9 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
     // loop runs until the process exits.
     if compiled.sinks().next().is_some() {
         loop {
+            if let Some(recorder) = recorder.as_ref() {
+                recorder.borrow_mut().set_tick(tick);
+            }
             ctx.scheduler().check_for_notifications();
             snapshot(tick, None);
             tick += 1;

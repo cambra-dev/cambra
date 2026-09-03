@@ -204,7 +204,7 @@ impl TileOperator for FanIn {
         node
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
@@ -523,7 +523,7 @@ impl TileOperator for ScalarFanIn {
         node
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,

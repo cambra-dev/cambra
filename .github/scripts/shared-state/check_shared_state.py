@@ -95,8 +95,24 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
+    # The subscribe recorder, twice: the `thread_local!` and the cell inside it
+    # each match the ambient-state shape. Necessary because `ProducerBase::new`
+    # runs inside producer constructors, which take no context parameter; what
+    # crosses the cell is the identity of the operator being subscribed,
+    # travelling down to its own producer, never a tile.
+    ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
+    ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
+    # The value recorder. The session that installs it counts twice, for the
+    # same reason the operator-graph recorder does. The handle is shared because
+    # the driver reads one store while every producer writes it, and the producer
+    # graph has no `&self` traversal that would let the driver collect
+    # per-producer buffers instead; what crosses it is a rendered row, never a
+    # tile passed between operators.
+    ("src/interpreter/value_recorder.rs", "ambient mutable state"),
+    ("src/interpreter/value_recorder.rs", "ambient mutable state"),
+    ("src/interpreter/value_recorder.rs", "shared cell of `ValueRecorder`"),
 ]
 
 # Inner types that are legitimate by construction. Matched against the inner

@@ -287,7 +287,7 @@ impl TileOperator for UnionOperator {
         node
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
@@ -515,7 +515,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.0
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,

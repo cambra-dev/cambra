@@ -2950,7 +2950,7 @@ mod variant_ctor_tests {
         fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
             node
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn Consumer>,

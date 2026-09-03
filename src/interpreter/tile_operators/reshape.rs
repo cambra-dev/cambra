@@ -65,7 +65,7 @@ impl TileOperator for PermuteRecordDomain {
         node.child("input", self.input.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -394,7 +394,7 @@ impl TileOperator for FlattenTupleDomain {
         node.child("input", self.input.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

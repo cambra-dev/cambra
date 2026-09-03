@@ -45,7 +45,7 @@ impl TileOperator for Constant {
         node.annotate(format!("{}", self.value))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
@@ -137,7 +137,7 @@ impl TileOperator for ToScalar {
         node.child("input", self.input.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -246,7 +246,7 @@ impl TileOperator for VariantWrap {
             .annotate(format!("tag {}", self.tag))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -442,7 +442,7 @@ impl TileOperator for VariantProject {
             .annotate(format!("arm {}", self.tag))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -617,7 +617,7 @@ mod tests {
         fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
             node
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn Consumer>,

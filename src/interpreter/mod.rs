@@ -17,6 +17,7 @@ pub mod tile_operators;
 pub mod tiling;
 mod types;
 mod unary_op;
+pub mod value_recorder;
 
 pub use binop::*;
 pub use http_server::HttpServerDataSource;

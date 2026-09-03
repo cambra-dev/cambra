@@ -15,6 +15,7 @@
 //! consumers continue to reach items as `tile_operators::X`.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     sync::{Mutex, OnceLock},
 };
@@ -25,6 +26,7 @@ pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, 
 use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::InputEdgeSpec,
+    interpreter::value_recorder::{self, SharedRecorder},
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -93,6 +95,7 @@ pub trait TileOperator {
 
     /// Subscribe to this operator with an intent guard and consumer.
     /// Returns a producer that allows the consumer to get data and release regions.
+    /// Contains generic logic for all operators.
     ///
     /// # Arguments
     /// * `intent_guard` - The region of the operator's extent that the consumer
@@ -104,6 +107,21 @@ pub trait TileOperator {
     /// # Returns
     /// A producer that provides access to the data and allows releasing regions
     fn subscribe(
+        &mut self,
+        intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let _scope = SubscribeScope::enter(self.operator_id());
+        self.subscribe_impl(intent_guard, consumer, scheduler)
+    }
+
+    /// Subscribe to this operator.  Operator-specific logic.
+    ///
+    /// Called by [`subscribe`](Self::subscribe), which names this operator for
+    /// the duration so that every [`ProducerBase`] built here records the
+    /// operator that built it.
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -145,6 +163,49 @@ pub trait TileOperator {
 // operator reads anything another operator computed, so the producer graph still
 // describes the whole dataflow.
 static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLock::new();
+
+// The operator whose `subscribe_impl` is running, if any.
+//
+// `ProducerBase::new` is called from inside producer constructors, which take no
+// context parameter — threading one through would change all 79 of its call
+// sites, which is the cost this scope exists to avoid. The same argument
+// `OperatorBase::new` makes for `ACTIVE_GRAPH`.
+// shared-state-ok: a recorder, mirroring `operator_graph::ACTIVE_GRAPH`. What
+// crosses it is an operator's identity travelling down to its own producer,
+// never a value passed between operators.
+thread_local! {
+    // shared-state-ok: the recorder cell itself, for the reason on the macro
+    // above. The declaration matches the checker's ambient-state shape twice —
+    // once at the macro, once at the `static` — and its upward scan stops at
+    // `thread_local! {`, which is neither a comment nor an attribute, so the
+    // note above does not reach this line.
+    static SUBSCRIBING: Cell<Option<NodeId>> = const { Cell::new(None) };
+}
+
+/// Names the operator being subscribed for as long as it is alive, restoring
+/// the previous one on drop.
+///
+/// Restore rather than clear on exit: 27 of the 50 `subscribe_impl`s subscribe
+/// an input *before* building their own [`ProducerBase`], so the inner scope has
+/// already exited by the time the outer base is constructed. Clearing would
+/// leave all 27 unattributed. The id belongs to the innermost live scope, which
+/// restoring is what maintains.
+///
+/// Panic-safe: an unwind through a subscribe still restores, so the cell is
+/// never left naming a dead scope.
+struct SubscribeScope(Option<NodeId>);
+
+impl SubscribeScope {
+    fn enter(id: Option<NodeId>) -> Self {
+        Self(SUBSCRIBING.with(|cell| cell.replace(id)))
+    }
+}
+
+impl Drop for SubscribeScope {
+    fn drop(&mut self) {
+        SUBSCRIBING.with(|cell| cell.set(self.0));
+    }
+}
 
 /// The concrete type's name with its module path stripped, e.g. `"MapResult"`.
 ///
@@ -248,6 +309,15 @@ pub(crate) use impl_operator_base;
 pub struct ProducerBase {
     /// Instance-unique ID, allocated by [`TileProducer::alloc_id`].
     pub id: usize,
+    /// The operator that built this producer, or `None` when it was built
+    /// outside any [`TileOperator::subscribe`] — a test double constructing a
+    /// producer directly, or an operator carrying no [`OperatorBase`].
+    pub node_id: Option<NodeId>,
+    /// Where [`TileProducer::get`] records what it returned, or `None` when the
+    /// producer was built with no recorder installed.
+    // shared-state-ok: the observation boundary. A producer writes what it has
+    // already returned to its consumer; nothing reads it back into the graph.
+    pub(crate) recorder: Option<SharedRecorder>,
     /// Output tiling for this producer.
     pub tiling: Tiling,
     /// Obsolete region of the tiling
@@ -258,6 +328,8 @@ impl ProducerBase {
     pub(crate) fn new(id: usize, tiling: &Tiling) -> Self {
         Self {
             id,
+            node_id: SUBSCRIBING.with(Cell::get),
+            recorder: value_recorder::installed(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
         }
@@ -303,6 +375,16 @@ pub trait TileProducer {
     /// Return the instance-unique numeric ID assigned at construction.
     fn producer_id(&self) -> usize {
         self.base().id
+    }
+
+    /// The [`NodeId`] of the operator that built this producer, or `None` for a
+    /// producer built outside any [`TileOperator::subscribe`].
+    ///
+    /// One operator can build several producers — a `FanOut` branch is
+    /// subscribed once per branch — so this identifies the operator and not the
+    /// instance. [`producer_id`](Self::producer_id) is the instance.
+    fn operator_id(&self) -> Option<NodeId> {
+        self.base().node_id
     }
 
     /// Allocate the next instance ID for this producer type.
@@ -374,6 +456,15 @@ pub trait TileProducer {
             "{result:?} vs {:?}",
             self.tiling()
         );
+        // After `get_impl` rather than around it: `get_impl` pulls this
+        // producer's inputs, whose own `get` borrows the same recorder, and a
+        // borrow held across that call overlaps the inner one.
+        if let Some(recorder) = self.base().recorder.clone() {
+            let (node_id, producer_id, name) = (self.base().node_id, self.base().id, self.name());
+            recorder
+                .borrow_mut()
+                .record(node_id, producer_id, &name, &result);
+        }
         result
     }
 
@@ -583,5 +674,228 @@ pub(crate) mod test_helpers {
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
             self.released.borrow_mut().push(obsolete_guard);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use super::{
+        Consumer, InspectNode, NodeId, OperatorBase, ProducerBase, Scheduler, Tile, TileGuard,
+        TileOperator, TileProducer, Tiling, VizOptions,
+    };
+    use crate::interpreter::{Extent, operator_graph::value, types::BaseType, types::ColumnValue};
+
+    /// The `(operator, producer)` id pairs a subscribe produced, in construction
+    /// order. Recorded rather than traversed: the producer graph has no `&self`
+    /// walk that yields ids, so each double reports its own pair.
+    type Seen = Rc<RefCell<Vec<(Option<NodeId>, Option<NodeId>)>>>;
+
+    fn int_tiling() -> Tiling {
+        Tiling::Scalar(Extent::Base(BaseType::Int))
+    }
+
+    struct Reporter {
+        base: ProducerBase,
+    }
+
+    impl TileProducer for Reporter {
+        impl_producer_base!();
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            Tile::Scalar(ColumnValue::Ints(vec![]))
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A leaf operator: no input, so its base is built with its own scope live.
+    struct Leaf {
+        base: OperatorBase<Leaf>,
+        seen: Seen,
+    }
+
+    impl TileOperator for Leaf {
+        impl_operator_base!();
+
+        fn subscribe_impl(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let base = ProducerBase::new(Reporter::alloc_id(), &self.base.tiling);
+            self.seen
+                .borrow_mut()
+                .push((self.operator_id(), base.node_id));
+            Box::new(Reporter { base })
+        }
+    }
+
+    /// Subscribes its input *before* building its own base — the ordering 27 of
+    /// the 50 production impls use, and the one that fails if the scope clears on
+    /// exit instead of restoring.
+    struct InputFirst {
+        base: OperatorBase<InputFirst>,
+        input: Box<dyn TileOperator>,
+        seen: Seen,
+    }
+
+    impl TileOperator for InputFirst {
+        impl_operator_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+            node.child("input", self.input.inspect(opts))
+        }
+
+        fn subscribe_impl(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let _input =
+                self.input
+                    .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+            let base = ProducerBase::new(Reporter::alloc_id(), &self.base.tiling);
+            self.seen
+                .borrow_mut()
+                .push((self.operator_id(), base.node_id));
+            Box::new(Reporter { base })
+        }
+    }
+
+    /// Builds its own base *before* subscribing its input — the ordering the
+    /// other 9 use.
+    struct BaseFirst {
+        base: OperatorBase<BaseFirst>,
+        input: Box<dyn TileOperator>,
+        seen: Seen,
+    }
+
+    impl TileOperator for BaseFirst {
+        impl_operator_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+            node.child("input", self.input.inspect(opts))
+        }
+
+        fn subscribe_impl(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let base = ProducerBase::new(Reporter::alloc_id(), &self.base.tiling);
+            self.seen
+                .borrow_mut()
+                .push((self.operator_id(), base.node_id));
+            let _input =
+                self.input
+                    .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+            Box::new(Reporter { base })
+        }
+    }
+
+    fn leaf(seen: &Seen) -> Box<dyn TileOperator> {
+        Box::new(Leaf {
+            base: OperatorBase::new(int_tiling(), &[]),
+            seen: seen.clone(),
+        })
+    }
+
+    /// Every pair reported is `(operator id, producer id)` and the two agree.
+    fn assert_every_producer_names_its_operator(seen: &Seen) {
+        for (operator, producer) in seen.borrow().iter() {
+            assert!(operator.is_some(), "the double carries an OperatorBase");
+            assert_eq!(
+                operator, producer,
+                "a producer must record the operator that built it",
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_producer_records_its_own_operator() {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let mut op = leaf(&seen);
+        let mut sched = Scheduler::new();
+        op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut sched);
+
+        assert_eq!(seen.borrow().len(), 1);
+        assert_every_producer_names_its_operator(&seen);
+    }
+
+    /// The regression this scope exists for: the inner subscribe has already
+    /// exited by the time the outer base is built, so clearing on exit would
+    /// leave the outer producer unattributed.
+    #[test]
+    fn an_operator_that_subscribes_before_building_its_base_is_still_attributed() {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let mut op = InputFirst {
+            base: OperatorBase::new(int_tiling(), &[]),
+            input: leaf(&seen),
+            seen: seen.clone(),
+        };
+        let mut sched = Scheduler::new();
+        op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut sched);
+
+        assert_eq!(seen.borrow().len(), 2, "the leaf and the outer both report");
+        assert_every_producer_names_its_operator(&seen);
+    }
+
+    #[test]
+    fn an_operator_that_builds_its_base_first_is_attributed() {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let mut op = BaseFirst {
+            base: OperatorBase::new(int_tiling(), &[]),
+            input: leaf(&seen),
+            seen: seen.clone(),
+        };
+        let mut sched = Scheduler::new();
+        op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut sched);
+
+        assert_eq!(seen.borrow().len(), 2);
+        assert_every_producer_names_its_operator(&seen);
+    }
+
+    /// Nesting to three levels, so a restored id is distinguished from an id
+    /// that merely happens to be the outermost one.
+    #[test]
+    fn each_level_of_a_nest_records_its_own_operator() {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let inner = Box::new(InputFirst {
+            base: OperatorBase::new(int_tiling(), &[]),
+            input: leaf(&seen),
+            seen: seen.clone(),
+        });
+        let mut op = InputFirst {
+            base: OperatorBase::new(int_tiling(), &[value("input", &*inner)]),
+            input: inner,
+            seen: seen.clone(),
+        };
+        let mut sched = Scheduler::new();
+        op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut sched);
+
+        let reported = seen.borrow();
+        assert_eq!(reported.len(), 3, "leaf, inner, outer");
+        assert_every_producer_names_its_operator(&seen);
+        let ids: Vec<Option<NodeId>> = reported.iter().map(|(op, _)| *op).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "three operators, three distinct ids: {ids:?}"
+        );
+    }
+
+    /// A producer built with no subscribe in progress records nothing. Test
+    /// doubles construct producers directly, and a pass-through double must not
+    /// inherit its parent's identity.
+    #[test]
+    fn a_producer_built_outside_a_subscribe_records_no_operator() {
+        let base = ProducerBase::new(Reporter::alloc_id(), &int_tiling());
+        assert_eq!(base.node_id, None);
     }
 }

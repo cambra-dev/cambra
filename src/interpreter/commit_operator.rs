@@ -830,7 +830,7 @@ impl CommitOperator {
 impl TileOperator for CommitOperator {
     impl_operator_base!();
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1279,7 +1279,7 @@ impl InductionStore {
 impl TileOperator for InductionStore {
     impl_operator_base!();
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1580,7 +1580,7 @@ impl StoreValueStream {
 
 impl TileOperator for StoreValueStream {
     impl_operator_base!();
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1782,7 +1782,7 @@ impl TileOperator for StoreFinalRead {
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("store", self.store_op.inspect(opts))
     }
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1950,7 +1950,7 @@ impl StoreDenseRead {
 
 impl TileOperator for StoreDenseRead {
     impl_operator_base!();
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -2323,7 +2323,7 @@ impl TileOperator for AsOf {
             .child("source", self.source.inspect(opts))
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -2834,7 +2834,7 @@ impl InductionDriver {
 impl TileOperator for InductionDriver {
     impl_operator_base!();
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -3132,7 +3132,7 @@ impl TransactDriver {
 impl TileOperator for TransactDriver {
     impl_operator_base!();
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -3563,7 +3563,7 @@ impl TransactWriter {
 
 impl TileOperator for TransactWriter {
     impl_operator_base!();
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -4165,7 +4165,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -4261,7 +4261,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
@@ -4641,7 +4641,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
@@ -5136,7 +5136,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -5256,7 +5256,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -5372,7 +5372,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
@@ -5648,7 +5648,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -5843,7 +5843,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -5954,7 +5954,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -6105,7 +6105,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
