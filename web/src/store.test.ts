@@ -271,6 +271,28 @@ describe("T2: cross-pane resolution (setSelection -> getResolved)", () => {
     // that matters — the region is the construct, not the range — is above.
   });
 
+  // Every selection kind compares as itself, so repeating a gesture is not a
+  // change. A kind with no arm was equal to nothing, including itself, and
+  // re-resolved on each repeat.
+  it("repeating a selection of any kind is not a change", () => {
+    const store = new Store(arithmetic);
+    const pre = irPaneById(arithmetic, "pre-inference");
+    const nodeId = theNode(pre, "Lit(Int(10))").nodeId;
+    let notified = 0;
+    store.subscribe(() => notified++);
+
+    for (const selection of [
+      { kind: "locate", paneId: "pre-inference", nodeId },
+      { kind: "node", paneId: "pre-inference", nodeId },
+      { kind: "source", from: 0, to: 0 },
+    ] as const) {
+      const before = notified;
+      store.setSelection(selection, "pre-inference");
+      store.setSelection(selection, "pre-inference");
+      expect(notified - before, `${selection.kind} resolved once`).toBe(1);
+    }
+  });
+
   it("clearing the selection empties the resolved state", () => {
     const store = new Store(arithmetic);
     const pre = irPaneById(arithmetic, "pre-inference");
