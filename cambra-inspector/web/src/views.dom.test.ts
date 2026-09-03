@@ -12,13 +12,14 @@
 // bug present this test fails (the source highlight never appears / the loop
 // throws); with the fix it passes.
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { renderApp } from "./main";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
-import { TreeView } from "./treeView";
+import { TreeView, serializeTree } from "./treeView";
 
-import { fixture, paneById, theNode } from "./__fixtures__/helpers";
+import { fixture, paneById, stubLayout, theNode } from "./__fixtures__/helpers";
 import type { Snapshot } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
@@ -54,21 +55,7 @@ function mountApp(snap: Snapshot): {
 }
 
 describe("view integration: cross-pane source<->tree linking", () => {
-  beforeAll(() => {
-    // jsdom does not implement scrollIntoView; CodeMirror + TreeView call it.
-    (Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = () => {};
-
-    // jsdom has no layout, so CodeMirror's async measure pass (fired via
-    // requestAnimationFrame after the test) calls getClientRects on a Range /
-    // Element and throws an uncaught exception. Stub them with empty rects; we
-    // never assert on geometry (we drive selection via the store directly).
-    const emptyRects = () => ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} });
-    const emptyRect = () => ({ top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0, x: 0, y: 0 });
-    (Range.prototype as unknown as { getClientRects: () => unknown }).getClientRects = emptyRects as never;
-    (Range.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = emptyRect as never;
-    (Element.prototype as unknown as { getClientRects: () => unknown }).getClientRects = emptyRects as never;
-    (Element.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = emptyRect as never;
-  });
+  beforeAll(stubLayout);
 
   it("a tree-node selection highlights the source span AND the tree rows", () => {
     const { store, source, trees } = mountApp(listMin);
@@ -138,5 +125,97 @@ describe("pre-inference resolved-type display (Bug 2)", () => {
 
     row!.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
     expect(document.querySelector(".node-resolved-tooltip")).toBeNull();
+  });
+});
+
+// The per-pane copy button, mounted through the real `renderApp` — `mountApp`
+// above hand-rolls the layout and never calls `renderPane`, so it cannot see
+// the button at all. What is asserted here is the *wiring* (which pane hands
+// over which string, and how the outcome is reported); the text each serializer
+// produces is pinned by the pure tests in treeView.test.ts and main.test.ts.
+describe("pane copy button", () => {
+  let writeText: ReturnType<typeof vi.fn>;
+
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  const mount = (): HTMLElement => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    renderApp(root, new Store(listMin));
+    return root;
+  };
+
+  beforeAll(stubLayout);
+
+  beforeEach(() => {
+    // jsdom implements no clipboard at all, so it is installed per test.
+    writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  it("gives every pane a copy button", () => {
+    const root = mount();
+    expect(root.querySelectorAll(".pane-copy").length).toBe(1 + listMin.panes.length);
+  });
+
+  it("copies the source text verbatim from the source pane", () => {
+    const root = mount();
+    root.querySelector<HTMLButtonElement>(".panel.source .pane-copy")!.click();
+
+    // Byte-for-byte, trailing newline included — the editor's own document is
+    // not the source of truth here (CodeMirror normalizes line breaks).
+    expect(writeText).toHaveBeenCalledWith(listMin.source.text);
+  });
+
+  it("copies the serialized tree from a tree pane", () => {
+    const root = mount();
+    // Panes render source-first, then one per pipeline pane in order.
+    const panels = root.querySelectorAll<HTMLElement>(".panel.tree");
+    expect(panels.length).toBe(listMin.panes.length);
+
+    const pane = listMin.panes[1];
+    panels[1].querySelector<HTMLButtonElement>(".pane-copy")!.click();
+    expect(writeText).toHaveBeenCalledWith(
+      serializeTree(pane.root, new Map(pane.nodes.map((n) => [n.nodeId, n]))),
+    );
+  });
+
+  it("reports a successful copy on the button", async () => {
+    const root = mount();
+    const button = root.querySelector<HTMLButtonElement>(".panel.source .pane-copy")!;
+
+    button.click();
+    await flush();
+
+    expect(button.dataset.state).toBe("copied");
+    expect(button.textContent).toBe("Copied");
+  });
+
+  it("reports a refused copy rather than looking like it worked", async () => {
+    writeText.mockRejectedValue(new DOMException("Denied", "NotAllowedError"));
+    const root = mount();
+    const button = root.querySelector<HTMLButtonElement>(".panel.source .pane-copy")!;
+
+    button.click();
+    await flush();
+
+    expect(button.dataset.state).toBe("failed");
+    expect(button.textContent).toBe("Copy failed");
+  });
+
+  it("reports failure when the clipboard API is absent", async () => {
+    // The non-secure-origin case: a port-forwarded http://<lan-ip>:<port>.
+    Reflect.deleteProperty(navigator, "clipboard");
+    const root = mount();
+    const button = root.querySelector<HTMLButtonElement>(".panel.source .pane-copy")!;
+
+    button.click();
+    await flush();
+
+    expect(button.dataset.state).toBe("failed");
   });
 });

@@ -1,6 +1,7 @@
-// Shared test helpers over the golden snapshot fixtures. These walk a payload's
-// pane node tables by *semantic* facts (pane id, node label) rather than raw
-// NodeIds, so they survive id churn in the compiler.
+// Shared test helpers: the golden snapshot fixtures, and the jsdom layout stubs
+// every view test needs. The fixture walks reach a payload's pane node tables by
+// *semantic* facts (pane id, node label) rather than raw NodeIds, so they
+// survive id churn in the compiler.
 
 import type { IrNode, PaneEntry, Snapshot } from "../types";
 import { validateSnapshot } from "../wireValidate";
@@ -81,4 +82,39 @@ export function theNode(pane: PaneEntry, label: string): IrNode {
     throw new Error(`expected exactly one "${label}" in ${pane.id}, found ${matches.length}`);
   }
   return matches[0];
+}
+
+/**
+ * Give jsdom the geometry APIs the views call. Idempotent; jsdom-only tests
+ * call it from a `beforeAll`.
+ *
+ * jsdom implements neither `scrollIntoView` (CodeMirror and TreeView call it)
+ * nor layout, so CodeMirror's measure pass — fired from a requestAnimationFrame
+ * *after* the test body — calls `getClientRects` on a Range or Element and
+ * throws an uncaught exception that fails an unrelated test. The rects are
+ * empty because no test asserts on geometry: selection is driven through the
+ * store directly.
+ */
+export function stubLayout(): void {
+  (Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = () => {};
+
+  const emptyRects = () => ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} });
+  const emptyRect = () => ({
+    top: 0,
+    left: 0,
+    bottom: 0,
+    right: 0,
+    width: 0,
+    height: 0,
+    x: 0,
+    y: 0,
+  });
+  (Range.prototype as unknown as { getClientRects: () => unknown }).getClientRects =
+    emptyRects as never;
+  (Range.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect =
+    emptyRect as never;
+  (Element.prototype as unknown as { getClientRects: () => unknown }).getClientRects =
+    emptyRects as never;
+  (Element.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect =
+    emptyRect as never;
 }

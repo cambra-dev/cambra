@@ -7,13 +7,23 @@
 
 // @vitest-environment jsdom
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { EditorView } from "@codemirror/view";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { byteLineStarts, formatSpan, lineCol, renderApp } from "./main";
+import {
+  byteLineStarts,
+  describePanes,
+  diagnosticLines,
+  formatSpan,
+  lineCol,
+  renderApp,
+  serializeDiagnostics,
+} from "./main";
 import { Store } from "./store";
-import { fixture } from "./__fixtures__/helpers";
+import { fixture, stubLayout } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
+import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
 describe("byteLineStarts / lineCol (byte offsets)", () => {
   it("records the byte offset of each line start (ASCII)", () => {
@@ -51,19 +61,48 @@ describe("formatSpan", () => {
   });
 });
 
+describe("serializeDiagnostics", () => {
+  const starts = byteLineStarts("ab\ncd\n");
+  const diag = (message: string, span: { start: number; end: number } | null) => ({
+    severity: "error",
+    stage: "Infer",
+    message,
+    span,
+    labels: [],
+  });
+
+  it("renders severity · stage, message, and the line:col span", () => {
+    expect(serializeDiagnostics([diag("mismatched types", { start: 0, end: 4 })], starts)).toBe(
+      "error · Infer\nmismatched types\n1:1–2:2",
+    );
+  });
+
+  it("renders 'no span' for a spanless diagnostic", () => {
+    expect(serializeDiagnostics([diag("boom", null)], starts)).toBe("error · Infer\nboom\nno span");
+  });
+
+  it("separates cards with a blank line", () => {
+    const text = serializeDiagnostics([diag("one", null), diag("two", null)], starts);
+    expect(text).toBe("error · Infer\none\nno span\n\nerror · Infer\ntwo\nno span");
+  });
+
+  it("reports the empty case with the text the pane itself shows", () => {
+    // The pane's `.empty` row and this string come from one constant; asserting
+    // both against the same literal is what keeps them from drifting apart.
+    expect(serializeDiagnostics([], starts)).toBe("No diagnostics, but the IR is unavailable.");
+  });
+
+  it("is built from the same lines the pane renders", () => {
+    const d = diag("mismatched types", { start: 0, end: 4 });
+    expect(serializeDiagnostics([d], starts)).toBe(diagnosticLines(d, starts).join("\n"));
+  });
+});
+
 describe("renderApp: degraded snapshot (failed compile)", () => {
   const failed = fixture(failedJson);
 
-  beforeAll(() => {
-    // CodeMirror's SourceView (rendered even in the degraded case) calls these.
-    (Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = () => {};
-    const emptyRects = () => ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} });
-    const emptyRect = () => ({ top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0, x: 0, y: 0 });
-    (Range.prototype as unknown as { getClientRects: () => unknown }).getClientRects = emptyRects as never;
-    (Range.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = emptyRect as never;
-    (Element.prototype as unknown as { getClientRects: () => unknown }).getClientRects = emptyRects as never;
-    (Element.prototype as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = emptyRect as never;
-  });
+  // CodeMirror's SourceView renders even in the degraded case.
+  beforeAll(stubLayout);
 
   it("renders a diagnostics list (with the error message) and no tree panes", () => {
     const root = document.createElement("div");
@@ -82,5 +121,154 @@ describe("renderApp: degraded snapshot (failed compile)", () => {
 
     // No IR tree panes render in the degraded case.
     expect(root.querySelectorAll(".tree-root").length).toBe(0);
+  });
+
+  it("gives both degraded panes a copy button", () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+
+    renderApp(root, new Store(failed));
+
+    // Source and Diagnostics — the copy affordance is not a property of having
+    // an IR tree.
+    expect(root.querySelectorAll(".pane-copy").length).toBe(2);
+    expect(root.querySelector(".pane-copy")?.textContent).toBe("Copy");
+  });
+});
+
+describe("describePanes", () => {
+  const listMin = fixture(listMinJson);
+  const failed = fixture(failedJson);
+
+  it("names the source pane first, then one pane per pipeline pane in order", () => {
+    // Source-first is not cosmetic: it is mounted first, so the CodeMirror
+    // editor lays out against a panel that is briefly the whole row.
+    const store = new Store(listMin);
+    expect(describePanes(store).map((p) => p.id)).toEqual([
+      "source",
+      ...store.panes.map((s) => s.id),
+    ]);
+  });
+
+  it("badges the holes pane and nothing else", () => {
+    const panes = describePanes(new Store(listMin));
+    const badged = panes.filter((p) => p.badge !== undefined);
+    expect(badged.map((p) => p.id)).toEqual(["pre-inference"]);
+    expect(badged[0].badge).toBe("pre-inference (holes)");
+  });
+
+  it("replaces the IR panes with a diagnostics pane on a degraded snapshot", () => {
+    expect(describePanes(new Store(failed)).map((p) => p.id)).toEqual(["source", "diagnostics"]);
+  });
+});
+
+describe("renderApp: pane visibility", () => {
+  const listMin = fixture(listMinJson);
+
+  let root: HTMLElement;
+
+  const panelFor = (id: string): HTMLElement =>
+    root.querySelector(`.panel[data-pane-id="${id}"]`)!;
+  const boxFor = (id: string): HTMLInputElement =>
+    root.querySelector(`.pane-menu-panel input[value="${id}"]`)!;
+  const toggle = (id: string, checked: boolean): void => {
+    const box = boxFor(id);
+    box.checked = checked;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  beforeAll(stubLayout);
+
+  beforeEach(() => {
+    // This environment's `window.localStorage` is a stub with no methods, so
+    // install a working one: renderApp persists the hidden set through it, and
+    // each test starts from an empty store.
+    const entries = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      value: {
+        getItem: (key: string) => entries.get(key) ?? null,
+        setItem: (key: string, value: string) => void entries.set(key, value),
+      },
+      configurable: true,
+    });
+
+    document.body.replaceChildren();
+    root = document.createElement("div");
+    document.body.appendChild(root);
+    renderApp(root, new Store(listMin));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    Reflect.deleteProperty(window, "localStorage");
+  });
+
+  it("tags one panel per descriptor with its pane id", () => {
+    const ids = [...root.querySelectorAll<HTMLElement>(".panel")].map((p) => p.dataset.paneId);
+    expect(ids).toEqual(describePanes(new Store(listMin)).map((p) => p.id));
+  });
+
+  it("hides a pane without unmounting its view", () => {
+    const panel = panelFor("post-inference");
+    expect(panel.querySelector(".tree-root")).not.toBeNull();
+
+    toggle("post-inference", false);
+
+    expect(panel.classList.contains("hidden")).toBe(true);
+    // The view stays: rebuilding it would leak its store subscription and lose
+    // every expand/collapse the user set.
+    expect(panel.querySelector(".tree-root")).not.toBeNull();
+  });
+
+  it("keeps a hidden pane tracking the selection, so revealing it is instant", () => {
+    const panel = panelFor("post-inference");
+    toggle("post-inference", false);
+
+    // Select through a visible pane; the hidden one must follow.
+    root.querySelector<HTMLElement>('.panel[data-pane-id="pre-inference"] .tree-row')!.click();
+
+    expect(panel.querySelectorAll(".tree-row.selected, .tree-row.linked").length).toBeGreaterThan(0);
+  });
+
+  it("shows a hidden pane again", () => {
+    toggle("post-inference", false);
+    toggle("post-inference", true);
+    expect(panelFor("post-inference").classList.contains("hidden")).toBe(false);
+  });
+
+  it("re-measures the CodeMirror editor when the source pane is revealed", () => {
+    // A hidden editor never measured against a real box, and does not reliably
+    // measure itself on reveal.
+    const measure = vi.spyOn(EditorView.prototype, "requestMeasure");
+    toggle("source", false);
+    measure.mockClear();
+
+    toggle("source", true);
+    expect(measure).toHaveBeenCalled();
+  });
+
+  it("moves the last-visible marker off a hidden rightmost pane", () => {
+    const panels = [...root.querySelectorAll<HTMLElement>(".panel")];
+    const last = panels[panels.length - 1];
+    expect(last.classList.contains("last-visible")).toBe(true);
+
+    toggle(last.dataset.paneId!, false);
+
+    expect(last.classList.contains("last-visible")).toBe(false);
+    expect(panels[panels.length - 2].classList.contains("last-visible")).toBe(true);
+  });
+
+  it("persists the hidden set across a re-render", () => {
+    toggle("post-inference", false);
+
+    const next = document.createElement("div");
+    document.body.appendChild(next);
+    renderApp(next, new Store(listMin));
+
+    expect(
+      next.querySelector<HTMLElement>('.panel[data-pane-id="post-inference"]')!.classList.contains(
+        "hidden",
+      ),
+    ).toBe(true);
   });
 });

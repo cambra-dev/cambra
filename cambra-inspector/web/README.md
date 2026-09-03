@@ -40,6 +40,8 @@ See [Running it](../README.md#running-it). No `cargo`? After `npm run build`,
 | **Click** a node row in the IR tree | Selects the node — highlights its source span in the editor and scrolls to it. The tree → source cross-link. |
 | **Click the ▸ / ▾ twisty** on a tree row | Expands / collapses that subtree (distinct from selecting the row). |
 | **Hover a squiggle** or gutter marker in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
+| **Open the ☰ Panes menu** in the header | A checkbox per pane. Unchecking one hides it and widens the rest; the hidden set persists across reloads. Every pane is listed, Source included — the invariant is that the layout is never empty, so the last visible pane's checkbox is disabled rather than Source being pinned. Panes cannot be reordered. |
+| **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
 
 The header shows the program name, the snapshot kind (`post-inference`, or
 `failed` when the program has errors), and a **static (no values)** badge — M1
@@ -94,7 +96,20 @@ CI via `./ci.sh web`):
   set / provenance / goto-def name) and `resolveSourceClick` (plain vs.
   Ctrl/Cmd-click goto-def), which the CodeMirror handlers call directly.
 - `main.test.ts` — the byte-based `byteLineStarts`/`lineCol`/`formatSpan`
-  arithmetic and a jsdom degraded-render test over `failed.snapshot.json`.
+  arithmetic, `serializeDiagnostics` (the Diagnostics pane's copy text, asserted
+  against the same `diagnosticLines` the pane renders from), and a jsdom
+  degraded-render test over `failed.snapshot.json`.
+- `treeView.test.ts` — `resolvedTypeTooltip`, and `serializeTree`: the copy
+  grammar row by row, the two-space indent, the included `where.N` predicate
+  subtrees, and a fixture case pinning one line per rendered node.
+- `clipboard.test.ts` — `copyToClipboard`'s three outcomes: an absent API, a
+  successful write, and a refused one.
+- `paneVisibility.test.ts` — the never-empty floor, hidden-ids ordering,
+  subscriber notification, and the persistence edges: a stale id, a corrupt
+  value, and a storage that throws on read or on write.
+- `paneMenu.dom.test.ts` — open/close, `aria-expanded`, the disabled last box,
+  a scripted toggle that the floor still refuses, and re-sync on an external
+  change.
 - `wireValidate.test.ts` — `validateSnapshot` accepts every real fixture and
   throws (naming the path) on malformed payloads; this is the runtime
   replacement for the old unchecked `as Snapshot` cast.
@@ -133,6 +148,13 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
 - `treeView.ts` — one collapsible IR tree pane, parameterized by `paneId`,
   rendered by walking the pane's node table from `root`, cross-linked to every
   other pane.
+- `clipboard.ts` — the one impure clipboard call, isolated so the serializers
+  that feed it stay DOM-free and directly testable.
+- `paneVisibility.ts` — which panes the layout shows, and the `localStorage`
+  round-trip. DOM-free, and deliberately not in the store: `Store`'s one
+  listener carries a `Resolved`, which is the resolution of a *selection*.
+- `paneMenu.ts` — the header's checkbox dropdown. It reads `PaneVisibility`
+  rather than caching it, so an external change reaches the boxes.
 - `main.ts` — fetch `/api/snapshot`, build the store, render the source pane +
   one tree pane per pane entry.
 
@@ -148,10 +170,18 @@ binary search.
 ## Scope: multi-pane (interactive, snapshot-first)
 
 The view is a **generic, N-pane layout**: a source pane plus one IR tree pane
-per pipeline pane, ordered upstream → downstream. It renders `[source]` then one
-pane per pipeline pane in order, each `flex: 1 1 0` (equal width). The panes come
-from the payload's `panes[]`; adding a pane is a backend payload change, not a
-frontend rewrite.
+per pipeline pane, ordered upstream → downstream — `[source]` then one pane per
+pipeline pane in order, each `flex: 1 1 0` (equal width). The panes come from the
+payload's `panes[]`; adding a pane is a backend payload change, not a frontend
+rewrite. The live wire ships six panes, so the layout is seven panes wide, which
+is what the header's pane filter exists to narrow.
+
+`describePanes` (`main.ts`) names that pane set once — source, then the pipeline
+panes, or a single diagnostics pane on a degraded snapshot — and both the layout
+and the filter menu iterate it. Hiding a pane is `display: none`; the view stays
+mounted, because tearing one down would leak its store subscription, lose every
+expand/collapse in a tree, and come back blank (the views react to selection
+*changes*, and `setSelection` early-returns on an equal one).
 
 - **Source pane** — read-only CodeMirror editor with:
   - **hover tooltips**: hovered position → tightest enclosing IR node → its
