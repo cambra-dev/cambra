@@ -130,8 +130,8 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
                 Type::Base(BaseType::Int),
                 (*gen_pred_at(rng, depth - 1)).clone(),
                 Type::Base(BaseType::Int),
-                // A plain collection, which is what this generator built before the slot
-                // existed: the sum shapes come from `gen_ty`'s `Type::sum_over` arm.
+                // A plain collection: the sum shapes come from `gen_ty`'s
+                // `Type::sum_over` arm.
                 FunKind::Data(None),
             );
             Rc::new(
@@ -252,7 +252,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
         Fragment::Modelled => 5,
     };
     match rng.below(arms) {
-        // A dependent sum, built the one way a sum is ever built: over a candidate listing
+        // A dependent sum, built the one way a sum is ever built: over named candidates
         // (`Type::sum_over`). Generated because nothing else in this sampler reaches
         // `FunKindVar::record_sum`, the witness scope change a kind edge carries, or
         // `TypeKindVar` at all — and those are exactly where a fact recorded on one

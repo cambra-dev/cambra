@@ -1421,7 +1421,7 @@ fn lower_type_application(
         }
         // `List(T)` = `Σ (D: UIntRanges). D ⤇ T` — the sum over every index range.
         // A list literal of extent `k` reaches it as `box(lit)`, whose one-candidate sum
-        // is contained by width because `[0, k)` is a member of that kind. The `box` is
+        // is contained by the kind premise because `[0, k)` is a member of that kind. The `box` is
         // required: a bare `[0, k) ⤇ T` is not below the sum
         // (`Type::list_of`, `src/ccl/design/type-inference.md`, "Only a term builds a sum").
         "List" => {

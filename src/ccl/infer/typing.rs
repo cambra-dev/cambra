@@ -214,6 +214,13 @@ pub(super) trait Typing {
     /// names a binder nothing in the comparison holds. Ambient scope cannot supply it — the
     /// binder is on a *sibling* type, not an ancestor — so the rule that did the cutting is
     /// the only thing that can (`src/ccl/design/type-inference.md`, "The witness context").
+    ///
+    /// **The two binder lists are also a correspondence.** `sup` is a shape written over
+    /// `sup_binders` and `sub` is what instantiates them, so the implementation reads the
+    /// instantiation off the two types and compares under it
+    /// (`src/ccl/design/type-inference.md`, "One rule for the solve and the check"). Passing
+    /// the binders is therefore not only a scope: it is what lets the comparison ask name
+    /// equality instead of relating two spellings nothing has related.
     fn require_sub_under(
         &mut self,
         sub: &Type,
@@ -289,7 +296,7 @@ pub(super) trait Typing {
     /// still a variable here — so without it the demand mints a kind variable of its own,
     /// and the annotation's and the demand's are then two descriptions of one consumption
     /// that never meet: a collection reaching both mints its own index at each
-    /// ([`crate::ccl::ty::FunKindVar::binders_for`]), every arm renames onto both, and the
+    /// ([`crate::ccl::ty::FunKindVar::binder_ids`]), every arm renames onto both, and the
     /// two names arrive at one position with nothing relating them.
     fn apply(
         &mut self,

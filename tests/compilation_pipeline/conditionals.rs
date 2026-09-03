@@ -765,7 +765,7 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 // Both arms of the two-candidate sum. Only the `else` arm was pinned before, which cannot
-// distinguish a rule that reads the candidate list positionally.
+// distinguish a rule that reads the candidates positionally.
 #[case(
     r"
 c: Bool = True

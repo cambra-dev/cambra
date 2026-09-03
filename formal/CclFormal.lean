@@ -8,6 +8,11 @@ import CclFormal.SubtypingIsTransitive
 -- Terms and typing, an independent limb over the same grammar.
 import CclFormal.Term
 import CclFormal.WellTypedTermsAreSafe
+-- What a Σ's witness ranges over, and the order the kind premise draws on it.
+import CclFormal.TypeKind
+import CclFormal.TypeKindIsALattice
+import CclFormal.SigmaIsTheElementwiseReading
+import CclFormal.TypeKindMerge
 -- The compact form: the solver's polar merge, its materialization, and how the
 -- merge's order carries back to the relation above.
 import CclFormal.Merge

@@ -678,11 +678,26 @@ impl InferVar {
         Self::fresh_in(level, &Telescope::empty())
     }
 
-    /// Mint a fresh variable carrying `telescope` as its scope.
+    /// Mint a fresh variable carrying `telescope` as its scope, over a fresh kind.
     pub fn fresh_in(level: Level, telescope: &Telescope) -> Rc<InferVar> {
+        Self::fresh_over(level, telescope, crate::ccl::ty::FunKindVar::fresh())
+    }
+
+    /// Mint a fresh variable over a **given** kind, for a copy of an existing one.
+    ///
+    /// A variable's kind holds the edges relating it to the kinds of the function types
+    /// that reached it, so a copy over a fresh kind is a copy of the bounds with nothing
+    /// left saying they are this variable's. Freshening passes the copy of the original's
+    /// kind ([`crate::ccl::infer::solver::scheme`]), which shares the instantiation's cache
+    /// with the copied bounds and so relates to the same positions the original did.
+    pub fn fresh_over(
+        level: Level,
+        telescope: &Telescope,
+        fun_kind: Rc<crate::ccl::ty::FunKindVar>,
+    ) -> Rc<InferVar> {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
-            fun_kind: crate::ccl::ty::FunKindVar::fresh(),
+            fun_kind,
             level,
             telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),

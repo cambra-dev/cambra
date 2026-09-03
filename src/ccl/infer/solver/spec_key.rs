@@ -121,15 +121,16 @@ pub struct SpecKey {
 struct KeyView {
     /// Leaf contributions (bases, ranges, sources, `Txn`, channel domains).
     atoms: BTreeSet<AtomKey>,
-    /// **Described** witness ranges reaching this position — a `List(𝑇)`'s `UIntRanges`,
-    /// a `Collection(𝑇)`'s `Any`. A *listed* range needs no slot: its candidates are
-    /// types, so they recurse like any other child and land in the fields above.
+    /// The **shape** of each [`TypeKind`](crate::ccl::ty::TypeKind) a binder at this
+    /// position ranges over, its children blanked.
     ///
-    /// A described one names no candidates to recurse into, so without this two sums
-    /// differing only in their range would key alike and share a clone — the
-    /// under-splitting direction, which is the unsound one. Compared as a set, like
-    /// [`refinements`](Self::refinements).
-    described_ranges: Vec<crate::ccl::ty::TypeKind>,
+    /// The children are not blanked away, they are keyed *elsewhere*: a kind's children are
+    /// ordinary types ([`TypeKind::children`](crate::ccl::ty::TypeKind::children)), so they
+    /// recurse into the fields above like any other child. What is left for this slot is
+    /// which kind it was, and nothing else — without it two sums differing only in their
+    /// kind would key alike and share a clone, the under-splitting direction and the unsound
+    /// one. Compared as a set, like [`refinements`](Self::refinements).
+    type_kinds: Vec<crate::ccl::ty::TypeKind>,
     /// Whether a **witness reference** stands at this position.
     ///
     /// The whole of what a reference contributes. A key that recorded *which* binder would
@@ -188,12 +189,12 @@ impl PartialEq for KeyView {
         fn same_refinements(a: &[Refinement], b: &[Refinement]) -> bool {
             a.len() == b.len() && a.iter().all(|w| b.contains(w))
         }
-        fn same_ranges(a: &[crate::ccl::ty::TypeKind], b: &[crate::ccl::ty::TypeKind]) -> bool {
+        fn same_kinds(a: &[crate::ccl::ty::TypeKind], b: &[crate::ccl::ty::TypeKind]) -> bool {
             a.len() == b.len() && a.iter().all(|k| b.contains(k))
         }
         self.atoms == other.atoms
             && self.witness == other.witness
-            && same_ranges(&self.described_ranges, &other.described_ranges)
+            && same_kinds(&self.type_kinds, &other.type_kinds)
             && same_refinements(&self.refinements, &other.refinements)
             && self.fun == other.fun
             && self.rec == other.rec
@@ -211,9 +212,9 @@ impl KeyView {
     fn union(&mut self, other: KeyView) {
         self.atoms.extend(other.atoms);
         self.witness |= other.witness;
-        for k in other.described_ranges {
-            if !self.described_ranges.contains(&k) {
-                self.described_ranges.push(k);
+        for k in other.type_kinds {
+            if !self.type_kinds.contains(&k) {
+                self.type_kinds.push(k);
             }
         }
         for w in other.refinements {
@@ -507,14 +508,19 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // at every instantiation, so the ids are fresh per use and keying on them
             // would split every use while telling us nothing about what the clone
             // compiles to.
+            // **Children key as types, the kind itself as a shape.** One rule for every
+            // kind: a candidate and a key bound's parameter are alike ordinary types, so
+            // both recurse here at this polarity — the same no-flip `compact_go` uses, since
+            // neither is a domain position — and what the kind adds beyond its children is
+            // which kind it is.
             for w in fun_kind.witnesses() {
-                match w.type_kind() {
-                    crate::ccl::ty::TypeKind::Enumerated(candidates) => {
-                        for c in &candidates {
-                            acc.union(key_go(c, pol, subst_acc, ctx));
-                        }
-                    }
-                    described => acc.described_ranges.push(described),
+                let type_kind = w.type_kind();
+                for child in type_kind.children() {
+                    acc.union(key_go(child, pol, subst_acc, ctx));
+                }
+                let shape = type_kind.map_children(|_| Type::Hole);
+                if !acc.type_kinds.contains(&shape) {
+                    acc.type_kinds.push(shape);
                 }
             }
             acc

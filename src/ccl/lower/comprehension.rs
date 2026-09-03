@@ -247,33 +247,56 @@ pub(super) fn lower_list_comp(
             let proj = ctx.tag_machinery(Expr::proj_index(i), gspan, lc);
             ctx.tag_machinery(Expr::apply(vref, proj), gspan, lc)
         };
-        // Only stamp a source that did not already name its domain — otherwise the
-        // id came *from* its annotation and re-stamping would discard it.
-        let source = if source.user_annotation.is_none() {
-            let src_kind = crate::ccl::ty::FunKind::fresh_data();
-            // **A comprehension is a collection built over its generators.** It binds one
-            // position per position of each source, so this is a *built over* relation and
-            // not a bound: a bound would claim the result is another spelling of its source,
-            // pair positions that are not the same position, and give a multi-generator
-            // comprehension the arity of its widest source rather than the sum.
-            //
-            // In **generator order**: the loop nests the applications back to front, and the
-            // outermost binder is the first generator's, so a source goes in front of the
-            // ones already recorded.
-            result_kv.contributes_first(src_kind.clone());
-            source.with_user_annotation(Type::Fun {
-                name: None,
-                fun_kind: src_kind,
-                domain: Box::new(iter_dom.clone().unwrap_or(Type::Hole)),
-                codomain: Box::new(Type::Hole),
-            })
-        } else {
-            source
+        // **A comprehension is a collection built over its generators.** It binds one
+        // position per position of each source, so this is a *built over* relation and not a
+        // bound: a bound would claim the result is another spelling of its source, pair
+        // positions that are not the same position, and give a multi-generator comprehension
+        // the arity of its widest source rather than the sum.
+        //
+        // **Every generator, including one that needs no stamp.** Positions are absolute, so
+        // a generator left out shifts every later one onto the wrong source; a source that
+        // contributes no position has to contribute that, not nothing.
+        //
+        // In **generator order**: the loop nests the applications back to front, and the
+        // outermost binder is the first generator's, so a source goes in front of the ones
+        // already recorded.
+        //
+        // Only a source that did not already name its domain is stamped — otherwise the id
+        // came *from* its annotation and re-stamping would discard it — and such a source
+        // contributes the kind that annotation states.
+        let source = match source.user_annotation.as_ref().and_then(Type::fun_kind) {
+            Some(annotated) => {
+                result_kv.contributes_first(annotated.clone());
+                source
+            }
+            None => {
+                assert!(
+                    source.user_annotation.is_none(),
+                    "a generator source's annotation is a function type, found {:?}",
+                    source.user_annotation
+                );
+                let src_kind = crate::ccl::ty::FunKind::fresh_data();
+                let src_dom = iter_dom.clone().unwrap_or(Type::Hole);
+                result_kv.contributes_first(src_kind.clone());
+                source.with_user_annotation(Type::Fun {
+                    name: None,
+                    fun_kind: src_kind,
+                    domain: Box::new(src_dom),
+                    codomain: Box::new(Type::Hole),
+                })
+            }
         };
         let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
         let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
         body_expr = ctx.tag_machinery(Expr::apply(indexed_source, per_elem), gspan, lc);
     }
+    // One contribution per generator, which is what makes position *i* of the result the
+    // position `source_of` resolves it to.
+    assert_eq!(
+        result_kv.built_over().len(),
+        gen_iter_vars.len(),
+        "a comprehension is built over one kind per generator"
+    );
 
     // ---- Phase 6: Attach restriction ----------
     if let Some(pred_op) = pred_op {

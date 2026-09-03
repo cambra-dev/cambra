@@ -1382,7 +1382,7 @@ f(box([1,2]),box([3,4,5]))"
 /// A `List` parameter under a **domain-preserving** consumer, where the demand's
 /// domain variable rides into the result rather than collapsing under a scalar. This
 /// is the other half of the domain meet: the comprehension's fresh domain variable
-/// meets the annotation's described kind, and the sum is what survives — so the
+/// meets the annotation's `UIntRanges`, and the sum is what survives — so the
 /// result is a `List`, not an arrow over an unresolved domain.
 #[test]
 fn list_param_under_a_domain_preserving_consumer() {
@@ -1654,7 +1654,7 @@ fn test_source_list_comp_element_type() {
 }
 
 /// A `List(_)` annotation is a value-witness Σ (`Σ n:UInt. {i | i < n} ⤇ V`).
-/// Injecting a concrete collection into it tests **membership in the witness kind** —
+/// Injecting a concrete collection into it tests **membership in the witness's type kind** —
 /// does the injecting domain realize the length witness (is it a range)? — which is a
 /// predicate on a shape, not a subtype constraint. When the injecting collection is
 /// *computed* (a comprehension), its domain is an inference variable at emit time and
@@ -1675,10 +1675,10 @@ x",
     assert_eq!(
         ty.without_witness_binders(),
         Type::sum_over(TypeKind::UIntRanges, None, int(),).without_witness_binders(),
-        "the discharged comprehension enters the annotation's own described kind"
+        "the discharged comprehension enters the annotation's own kind"
     );
     // An **exact** annotation binds `x` at the type written, so what comes back is
-    // `List(Int)` itself — the described kind, not the one domain this initializer
+    // `List(Int)` itself — every index range, not the one domain this initializer
     // happens to have. What the discharge decides is whether the initializer may enter
     // it at all; `test_source_comprehension_rejected_by_list_annotation` is the same
     // program over a source, which may not. The narrowing reading is the **bounded**
@@ -4032,7 +4032,7 @@ x = [1, 2] if c else [3, 4]
     // **witness**: the filter is a fact about the domain the witness names, whichever
     // candidate that turns out to be. The candidates stay bare.
     //
-    // Not on the candidates, which is where it used to land. An arm's *own* filter
+    // Not on the candidates. An arm's *own* filter
     // (`box([x for x in xs if q]) if c else …`) refines a candidate as well, and that one
     // was already compiled inside the arm — so in that position the two are the same
     // shape, and no consumer can tell a filter it still owes an operator from one already
@@ -4076,9 +4076,7 @@ def f(a, b, d):
         "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)"
     );
     // And a domain-preserving consumer carries it, exactly as it carries a directly-bound
-    // one. This used to fail — the defect was in *consumption*, not in where the sum was
-    // formed — and it is closed by the consumer naming the witness rather than handing over a
-    // named domain (`src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind").
+    // one, because the consumer names the witness rather than handing over a named domain (`src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind").
     assert_eq!(
         infer_program(&format!(
             r"
@@ -4306,13 +4304,13 @@ x = [1, 2] if c else ["a", "b", "c"]
 }
 
 /// A conditional collection flowing into a `List`-annotated **parameter**. Two shapes
-/// meet in the domain lattice: the annotation contributes the described kind
-/// `UIntRanges`, and the argument contributes the arms' domains.
+/// meet in the domain lattice: the annotation contributes `UIntRanges`, and the argument
+/// contributes the arms' domains.
 ///
 /// A parameter is the route where those domains land as *atoms on one position* rather
 /// than as separate candidates — an un-generalized inference variable that both arms
 /// deposit bounds on. Both domains here are dense prefix ranges, so kind containment holds
-/// and the meet keeps the narrower listed side.
+/// and the meet keeps the narrower side, the named candidates.
 #[test]
 fn conditional_collection_into_a_list_annotated_param() {
     let c = "box([1, 2]) if True else box([1, 2, 3])";
@@ -4355,7 +4353,7 @@ f({filtered})"
 /// candidates' *contents* collapses both programs to one bag — atoms `{[0, 1], [0, 2]}`
 /// with the predicate floating loose — and neither `Σ (𝐷 : [{[0, 2] | 𝑝}, {[0, 1] | 𝑝}]). 𝐷` nor
 /// `Σ (𝐷 : [[0, 2], [0, 1]]). 𝐷` is the answer. So the join must union candidates rather than merge
-/// them; see `src/ccl/design/type-inference.md`, "Where the candidate list comes from".
+/// them; see `src/ccl/design/type-inference.md`, "Where the candidates come from".
 #[test]
 fn a_refinement_belongs_to_one_candidate_not_the_sum() {
     let refined_wider =
@@ -4438,7 +4436,7 @@ fn box_builds_the_singleton_sum_over_its_argument() {
     );
 }
 
-/// The point of `box`: two of them at a join union their candidate lists, so both
+/// The point of `box`: two of them at a join union their candidates, so both
 /// domains survive where the unboxed conditional has no upper bound at all.
 #[test]
 fn two_boxes_at_a_join_keep_both_candidates() {
@@ -4535,8 +4533,9 @@ f(box([1, 2, 3]))"
 }
 
 /// A conditional collection reaching a `List(Int)` parameter: the sum's candidates each
-/// have to be members of the annotation's kind. This is the cross-kind case — a listing
-/// meeting a description — and it is the one the migration is most likely to disturb.
+/// have to be members of the annotation's kind. This is the cross-kind case — named
+/// candidates meeting `UIntRanges` — and it is the one the migration is most likely to
+/// disturb.
 #[test]
 fn a_conditional_collection_flows_into_a_list_param() {
     assert_eq!(
@@ -4635,9 +4634,9 @@ fn a_boxed_conditional_keeps_both_candidates() {
     );
 }
 
-/// A `box`ed conditional collection reaching a collection **annotation**: a listing sum
-/// meeting a described one, which is Σ-width with nothing to enumerate on the demand
-/// side.
+/// A `box`ed conditional collection reaching a collection **annotation**: a sum over named
+/// candidates meeting one over a kind that names none, which is Σ-width with nothing to
+/// enumerate on the demand side.
 #[rstest]
 #[case("List(Int)")]
 #[case("Collection(Int)")]

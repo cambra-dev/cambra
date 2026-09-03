@@ -1,5 +1,8 @@
 import CclFormal.MaterializedMergeIsTheLeastBound
 import CclFormal.WellTypedTermsAreSafe
+import CclFormal.SigmaIsTheElementwiseReading
+import CclFormal.TypeKindIsALattice
+import CclFormal.TypeKindMerge
 
 /-!
 # The axiom gate
@@ -50,6 +53,89 @@ than only in the build log.
 /-- info: 'CclFormal.CompactTy.leastness_failures_eq_nil' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in
 #print axioms CclFormal.CompactTy.leastness_failures_eq_nil
+
+/-- info: 'CclFormal.Admits.mono' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.Admits.mono
+
+/-- info: 'CclFormal.not_admits_of_refuses' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.not_admits_of_refuses
+
+/-- info: 'CclFormal.a_bound_admits_what_equality_refuses' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.a_bound_admits_what_equality_refuses
+
+/-- info: 'CclFormal.ContainedIn.trans' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.ContainedIn.trans
+
+/-! The lattice rows need neither choice: each is two derivations exhibited and one
+inversion, with no case analysis over a quantifier. The two `subtypesOf` rows carry the
+type-order bound as a hypothesis rather than computing it. -/
+
+/-- info: 'CclFormal.lub_candidates_subtypesOf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.lub_candidates_subtypesOf
+
+/-- info: 'CclFormal.glb_candidates_subtypesOf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.glb_candidates_subtypesOf
+
+/-- info: 'CclFormal.lub_candidates_uintRanges_of_not_all' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.lub_candidates_uintRanges_of_not_all
+
+/-- info: 'CclFormal.sigma_below_iff_elementwise' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.sigma_below_iff_elementwise
+
+/-! The one result below needs neither choice: it is two derivations exhibited and one
+refuted, with no case analysis over a quantifier. -/
+
+/-- info: 'CclFormal.swapped_premise_is_unsound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.swapped_premise_is_unsound
+
+/-! The two kind-merge laws need neither choice, for the reason the merge-algebra results
+above do not: the candidate case is two membership lemmas and a propositional commuting, with
+no case analysis that reaches for it. -/
+
+/-- info: 'CclFormal.CompactTypeKind.mergeTypeKind_comm' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.mergeTypeKind_comm
+
+/-- info: 'CclFormal.CompactTypeKind.mergeTypeKind_idem' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.mergeTypeKind_idem
+
+/-- info: 'CclFormal.CompactTypeKind.mergeTypeKind_join_assoc' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.mergeTypeKind_join_assoc
+
+/-- info: 'CclFormal.kind_glb_assoc' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.kind_glb_assoc
+
+/-- info: 'CclFormal.kind_lub_assoc' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.kind_lub_assoc
+
+/-- info: 'CclFormal.CompactTypeKind.joinAll_unionCandidates' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.joinAll_unionCandidates
+
+/-- info: 'CclFormal.CompactTypeKind.denotesAUIntRange_congr' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.denotesAUIntRange_congr
+
+/-- info: 'CclFormal.CompactTypeKind.all_union_range' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.all_union_range
+
+/-- info: 'CclFormal.CompactTypeKind.mem_atoms_congr' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms CclFormal.CompactTypeKind.mem_atoms_congr
 
 /-- info: 'CclFormal.progress' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in

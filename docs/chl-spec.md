@@ -204,13 +204,13 @@ parsing-then-erroring.
 `\` introduces a lambda binder and `->` separates it from the body —
 `\x -> body` (§3.10).
 
-`=>` is the function-type function. It separates a `def`'s parameter list
+`=>` is the function-type arrow. It separates a `def`'s parameter list
 from its return-type annotation — `def f(x: Int) => Int:` (§4.1), which
 type inference checks against the body's value. It is also a general type
 operator inside an expression: `T => U` is a function type, writable in
 any annotation position (§6).
 
-> **Direction.** `->` additionally becomes the pair / map-entry function
+> **Direction.** `->` additionally becomes the pair / map-entry arrow
 > (`a -> b` for a two-tuple, `[k -> v, …]` for a map literal — §2.4,
 > **[Decided]**); the token is lexed today but that *use* is not yet
 > parsed.
@@ -1281,7 +1281,7 @@ function must be definable without referring to its own name.
 > `store: Mut(Map(…), Txn)`. Either way the capability is visible in the
 > types at the binder, not smuggled in.
 
-`=>` is the function-type function, so a `def`'s signature has an equivalent
+`=>` is the function-type arrow, so a `def`'s signature has an equivalent
 binding form: `f: (T => U) = \t -> …` binds `f` to a lambda checked against
 the function type `T => U` (§6), the same type `def f(t: T) => U:` gives it.
 Recommended style annotates both parameters and the return type on top-level

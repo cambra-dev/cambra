@@ -1073,7 +1073,7 @@ today rather than silently mishandled.
 > **Status: value-selecting `Case`s and conditional induction writes both compile.**
 >
 > **Implemented**: scalar / compute ternaries (the C-form), data-collection selection (the gate
-> fan-out, reconciled to the Σ by width), source-less conditional
+> fan-out, reconciled to the Σ by its subtyping rule), source-less conditional
 > feeds, a **conditional element** in a comprehension (`[a if g(x) else b for x in xs]`, fanned out
 > over the source by the element-dependent gate), a comprehension **over a conditional collection**
 > (`[f(x) for x in (xs if c else ys)]`, consumed by opening the sum like any other), a conditional
@@ -1166,12 +1166,11 @@ The value-`Case` positions ride the same union-of-restricts:
 
   A conditional **source** (`[e for x in (xs if c else ys)]`) needs no lowering rule at all: it is
   an ordinary consumption, and the comprehension's result is the sum bound back over the witness
-  it named. A syntactic rewrite that floated the source `Case` out of the map used to stand in for
-  this. It fired only on a literal `Case` source — a let-bound or UDF-parameter conditional fell
-  through — and it existed because the general path could not name the witness consistently across
-  the index term and its collection. With a witness carrying its own binder
-  (type-inference.md, "A binder is minted where a scope needs one")
-  that path works, and the rewrite is gone.
+  it named. What makes that work is the witness carrying its own binder
+  (type-inference.md, "A binder is minted where a scope needs one"), which is what lets the
+  index term and its collection name one witness consistently; a source `Case` therefore needs
+  no floating out of the map, and a let-bound or UDF-parameter conditional works like a literal
+  one.
 - **Bound-then-used values in a loop feed** (`x = 𝑒₁ if 𝑝 else 𝑒₂; o << f(x)`) — *deferred*
   (case-float in the loop-body / feed path, distinct from the comprehension forms above):
   `𝐶[Case{[𝑔ᵢ → 𝑒ᵢ]}] → Case{[𝑔ᵢ → 𝐶[𝑒ᵢ]]}` (sound by purity) then the channel fan-out generalized

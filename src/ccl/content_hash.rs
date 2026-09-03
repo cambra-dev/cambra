@@ -308,7 +308,7 @@ fn hash_type<'a>(
 /// innermost last.
 ///
 /// A witness binder is α-renameable exactly as a term binder is: instantiating a scheme
-/// re-mints it ([`Witness::alpha_convert`](crate::ccl::ty::Witness::alpha_convert)), so its
+/// re-mints it ([`Type::alpha_convert_sum`](crate::ccl::Type::alpha_convert_sum)), so its
 /// `uid` says nothing about content and hashing it would make two α-equivalent sums differ.
 /// An occurrence therefore hashes by **how far out its binder sits**, which is the same rule
 /// this module already applies to a bound term variable.

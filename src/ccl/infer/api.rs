@@ -1424,9 +1424,9 @@ fn collect_type_errors(
                 !matches!(fun_kind, crate::ccl::ty::FunKind::Var(_)),
                 "unresolved FunKind::Var survived coalesce at `{context_sym}`"
             );
-            // **A kind's children are types.** The candidates a listing names, and the
-            // bound a description takes, are ordinary types that inference resolves like
-            // any other, so an unresolved one there is the same defect as in the domain.
+            // **A kind's children are types.** A candidate and a key bound's parameter are
+            // alike ordinary types that inference resolves like any other, so an unresolved
+            // one there is the same defect as in the domain.
             // They are reachable only through the kind, which no other walk enters.
             for w in fun_kind.witnesses() {
                 for t in w.types() {
@@ -1495,7 +1495,7 @@ fn collect_type_errors(
             //
             // The same visited-set pattern lives in
             // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`] and
-            // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both via
+            // [`crate::ccl::lambda_elim`]'s own predicate walk (both via
             // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site
             // doesn't share the helper because it mixes per-node error checks
             // with the refinement walk.
@@ -2423,11 +2423,11 @@ mod tests {
 
     /// `λ (xs: List(Int)) → let ys: List(Int) = xs in ys` — a List-typed value
     /// (the param) ascribed at another List. `xs`'s type is the List Σ, so the
-    /// ascription emits `List Σ <: List Σ` — the Σ **width** edge.
+    /// ascription emits `List Σ <: List Σ` — the **Σ rule** between two sums.
     /// This is an ordinary pattern (re-binding, passing, returning a list), so
-    /// width must be wired.
+    /// that edge must be wired.
     #[test]
-    fn test_infer_list_to_list_ascription_width() {
+    fn test_infer_list_to_list_ascription() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -2442,7 +2442,7 @@ mod tests {
                 Type::list_of(Type::Base(BaseType::Int)),
             )),
         });
-        infer(&mut expr, &mut ctx).expect("list-to-list ascription type-checks via Σ-width");
+        infer(&mut expr, &mut ctx).expect("list-to-list ascription type-checks via the Σ rule");
 
         // The codomain still flows: a List(Int) is not a List(Str).
         let mut ctx = TypeInferenceContext::new();
@@ -2461,14 +2461,14 @@ mod tests {
         });
         assert!(
             infer(&mut bad, &mut ctx).is_err(),
-            "List(Int) must not ascribe at List(Str) — width flows the codomain"
+            "List(Int) must not ascribe at List(Str) — the codomain premise still flows"
         );
     }
 
     /// `λ (xs: List(Int)) → xs` — a **parameter** List annotation. The annotation
     /// bounds `xs`, and with no other demand on it the bound *is* the param type: it
     /// rides the lambda's domain and body type through the compact/coalesce
-    /// round-trip as a described-kind domain, re-forming the identical Σ.
+    /// round-trip with its `UIntRanges` domain inert, re-forming the identical Σ.
     #[test]
     fn test_infer_list_param_annotation_round_trips() {
         let mut ctx = TypeInferenceContext::new();
@@ -2503,7 +2503,7 @@ mod tests {
     /// does not inject into `Σ (D: UIntRanges). D ⤇ Int`
     /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
     /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
-    /// witness kind through `emit_annotation_predicates`. A conflicting element type is
+    /// witness's type kind through `emit_annotation_predicates`. A conflicting element type is
     /// rejected too, and for a different reason — the element types meet inside the body,
     /// with no sum involved.
     #[test]

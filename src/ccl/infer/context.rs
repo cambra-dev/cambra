@@ -540,7 +540,7 @@ impl Typing for InferCtx {
         // the over-restriction live. Worse for collections: a two-way `List`
         // annotation would demand `Σ <: [0,3)⤇V` (consuming the sum *against the value*),
         // a coercion with no sound denotation. One-way leaves a collection annotation
-        // to be met by Σ-*width*, which is the only edge into a sum — a bare `[0,3)⤇V`
+        // to be met by the Σ rule, which is the only edge into a sum — a bare `[0,3)⤇V`
         // does not reach `List(V)` at all without a `box`
         // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
         //
@@ -646,8 +646,9 @@ impl Typing for InferCtx {
         Ok((d, c))
     }
 
-    /// **The live solve relates two references by identity**, never by what they range over
-    /// (`src/ccl/design/type-inference.md`, "A check is α-blind"), so it consults no context
+    /// **A reference relates to another by identity**, never by what they range over
+    /// (`src/ccl/design/type-inference.md`, "One rule for the solve and the check"), so this
+    /// consults no context
     /// and the binders say nothing here. Taken all the same: the rule that cut the parts out
     /// owes them whichever derivation runs, and letting Emit omit them would make the
     /// obligation a property of the caller's mode.

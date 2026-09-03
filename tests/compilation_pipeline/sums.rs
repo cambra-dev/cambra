@@ -123,7 +123,7 @@ f(box([1, 2, 3]))",
 // A filter that admits *every* element. It cannot tell a working restrict from a
 // dropped one by its answer — but it belongs here rather than with the controls,
 // because planning refuses a site that still owes a restrict rather than dropping
-// it, and this owes one like any other. It used to compute 6 by luck.
+// it, and this owes one like any other.
 #[case("x = box([1, 2, 3])\nsum([y for y in x if y > 0])", Value::Int(6))]
 #[case(
     "k: Int = 1\nx = box([1, 2, 3])\nsum([y for y in x if y > k])",

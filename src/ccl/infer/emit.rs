@@ -782,7 +782,7 @@ pub(super) fn emit_cast<C: Typing>(
     //
     // **A sum target's predicate is not re-typed here.** A filter over a conditional
     // source carries its own copy of the conditional inside the predicate, and that copy
-    // names its own witness — the site's and the copy's are reconciled by candidate list
+    // names its own witness — the site's and the copy's are reconciled by candidates
     // in planning (`read_the_arm_instead`), not by identity during inference. Re-running
     // the predicate's rules against the site's recorded types compares the two binders
     // and rejects a tree the pipeline compiles correctly.

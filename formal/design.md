@@ -33,6 +33,8 @@ intent. Until a row says otherwise, a component's only coverage is ordinary Rust
 |---|---|---|---|
 | `constrain_subtype`, concrete pairs | `Subtyping` / `subtypeCheck` | yes | reflexivity, transitivity, decidability |
 | `CompactType::merge` | `merge` | yes, every fold step | commutativity, idempotence, associativity, congruence, lub, uniqueness |
+| `TypeKind::refuses` | `refuses` | yes, on the concrete fragment | a refusal never lands on a member (`not_admits_of_refuses`); the pair the bound arm's equality test refused while admitting it |
+| `CompactTypeKind::merge` | `mergeTypeKind` | yes, every fold step | commutativity, idempotence, associativity at the join; the meet checked exhaustively over a bounded universe |
 | `coalesce_compact` (`CompactType` → `Type`) | `coalesce` | yes, per materialized bound | totality; well-formedness of the result (`coalesce_wellFormed`); the merge materializes to a bound of both operands (`merge_is_a_bound`) and to the least such type (`merge_is_least_type`) |
 | bound recording, sweeping, `extrude` | — | — | — |
 | `traits` (operator obligations) | — | — | — |
@@ -263,15 +265,14 @@ distinct domain" is now the slot's type rather than a predicate proved about it.
 
 Three consequences, each measured:
 
-- **`DataAgree` states the domain edge at both polarities.** A positive merge meets the domains too,
-  so the evidence that two `data` domains disagreed is gone either way; the list slot kept both
-  alternatives at a positive merge and needed the hypothesis only at a negative one. This doubled
-  the unguarded failure counts (4 → 8 and 2 → 4), on the same two surfaces and in both orders.
-- **`merge_is_a_bound`'s sample coverage rose**, 1814 → 1844 of 2048. The class excluded before — a
-  `compute` slot carrying two domain alternatives, which materialized by meeting them — cannot arise
-  over one domain.
-- **`merge_assoc`, `merge_is_least_absorber` and `least_absorber_unique` no longer need
-  `Classical.choice`**, since their proofs became `rw` plus a triple of componentwise facts.
+- **`DataAgree` states the domain edge at both polarities.** A positive merge meets the domains
+  too, so the evidence that two `data` domains disagreed is erased either way, and the hypothesis
+  is needed at both. Unguarded, that is 8 failures on one surface and 4 on the other, in both
+  orders.
+- **`merge_is_a_bound` holds on 1844 of 2048 samples.** A `compute` slot carrying two domain
+  alternatives, which would materialize by meeting them, cannot arise over one domain.
+- **`merge_assoc`, `merge_is_least_absorber` and `least_absorber_unique` need no
+  `Classical.choice`**: their proofs are `rw` plus a triple of componentwise facts.
 
 **What the model does not state.** The Rust reaches `DomainJoinConflict` two ways: the merged domain
 denoting several alternatives, which `funShapes` mirrors through `denotesSeveralDomains`; and the

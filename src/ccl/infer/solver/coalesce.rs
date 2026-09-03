@@ -155,41 +155,12 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
     coalesce_compact_go(&graph.term, true, &[])
 }
 
-/// The binders renamed to the names the domain answers with, position for position.
-///
-/// **The index is named at the domain position.** Several references reach one domain
-/// position — a consumption's arms, and several consumers of one collection, each with
-/// binders of its own — and the position is where they have merged. A kind variable mints a
-/// binder so its edges have a rename target ([`crate::ccl::ty::FunKindVar::binders`]), but a
-/// route that crossed no such edge arrives spelling the index in the scope it left, and
-/// then the function would bind a name its own domain does not say — the body
-/// [`crate::ccl::ty::Type::sum_binding`] rejects.
-///
-/// Only what the domain binds: a name already in `outer` is an enclosing binder the domain
-/// mentions, not this function's index. Declines when the counts disagree, since then
-/// nothing pairs them.
-fn named_by_domain(
-    binders: Vec<crate::ccl::ty::Witness>,
-    domain: &Type,
-    outer: &[crate::ccl::ty::WitnessId],
-) -> Vec<crate::ccl::ty::Witness> {
-    let named = crate::ccl::ty::free_witness_refs(domain, outer);
-    if named.len() != binders.len() {
-        return binders;
-    }
-    binders
-        .into_iter()
-        .zip(named)
-        .map(|(w, id)| w.renamed(id))
-        .collect()
-}
-
 /// A binder as the output spells it: the name its position answers to, over what the
 /// position turned out to range over.
 ///
 /// Materialization is where both can be answered. Every contribution to the position has
 /// arrived, so the kind's children resolve like any other position; and the name is minted
-/// once per position ([`crate::ccl::ty::FunKindVar::binders`]), so every occurrence comes
+/// once per position ([`crate::ccl::ty::FunKindVar::binder_ids`]), so every occurrence comes
 /// back as one name with nothing rewritten. A binder that was already settled is already its
 /// own answer.
 fn settle(
@@ -218,7 +189,7 @@ fn coalesce_type_kind(
         CompactTypeKind::Enumerated(candidates) => {
             // Deduplicated **after** materializing, not before: a kind's candidates are a
             // set, and two that were spelled as distinct variables are one candidate once
-            // the variables answer. Comparing the spellings is what let a two-arm listing
+            // the variables answer. Comparing the spellings is what let a two-candidate kind
             // survive a conditional whose arms turned out to be over one domain.
             let mut out: Vec<Type> = Vec::new();
             for c in candidates {
@@ -228,10 +199,10 @@ fn coalesce_type_kind(
                 }
             }
             // **The candidates are a set, so their order is canonical rather than
-            // arrival's.** A listing that keeps the order its arms were recorded in makes
+            // arrival's.** Candidates kept in the order their arms were recorded makes
             // the type a function of which constraint arrived first: the same conditional
             // materializes as `Σ (σ : [A, B]). …` or `Σ (σ : [B, A]). …`, and `Type`
-            // compares a listing positionally, so those are two types. Sorted by rendering,
+            // compares candidates positionally, so those are two types. Sorted by rendering,
             // the same key planning uses to order a refinement set. Found by
             // `tests/constraint_order_fuzz.rs`.
             out.sort_by_cached_key(|t| t.to_string());
@@ -338,14 +309,13 @@ fn coalesce_compact_go(
             .iter()
             .map(|w| settle(w, !polarity, scope))
             .collect::<Result<Vec<_>, _>>()?;
-        let outer_scope: Vec<crate::ccl::ty::WitnessId> = scope.iter().map(|b| *b.id()).collect();
         let mut inner_scope = scope.to_vec();
         inner_scope.extend(binders.iter().cloned());
         let scope: &[crate::ccl::ty::Witness] = &inner_scope;
-        // Materialize the codomain once (covariant), and each listed candidate
+        // Materialize the codomain once (covariant), and each candidate
         // domain (contravariant), deduplicating at the `Type` level — this catches
         // var-level equalities that the compact-time `CompactType ==` dedup in
-        // `join_witness_kinds` missed (simplify may have merged uids after compaction).
+        // `CompactTypeKind::merge` missed (simplify may have merged uids after compaction).
         let c = coalesce_compact_go(&cf.codomain, polarity, scope)?;
         // The domain, materialized contravariantly. At a `Data` position the atoms are
         // *alternatives* — one candidate each (see `denoted_domains`) — and a
@@ -388,18 +358,18 @@ fn coalesce_compact_go(
             // answer rather than the reason for it, and mis-reported a domain conflict as
             // a kind collision whenever the candidates deduplicated to one.
             KindPin::Conflict => {
-                debug_assert!(
+                assert!(
                     !matches!(&type_kind, crate::ccl::ty::TypeKind::Enumerated(ds) if ds.is_empty()),
-                    "a listing kind reaching materialization has at least one domain"
+                    "a kind naming candidates reaches materialization with at least one"
                 );
                 return Err(CoalesceError::KindConflict {
                     details: format!("a compute function (capability) over {type_kind}"),
                 });
             }
             _ if cf.domains_disagree => {
-                debug_assert!(
+                assert!(
                     !matches!(&type_kind, crate::ccl::ty::TypeKind::Enumerated(ds) if ds.is_empty()),
-                    "a listing kind reaching materialization has at least one domain"
+                    "a kind naming candidates reaches materialization with at least one"
                 );
                 // The **operands** where a merge kept them. A contravariant meet unions a
                 // record's fields, so two domains that disagreed on their key sets leave as
@@ -426,12 +396,12 @@ fn coalesce_compact_go(
             // "unrequired" still had to stay distinct from "required to be a
             // capability" (`KindPin::Unpinned`).
             KindPin::Unpinned | KindPin::Compute => {
-                // A compute function's domain is an ordinary parameter type. A
-                // *described* domain arises only from a sum's body, which is always
-                // `Data`, and `meet_witness_kinds` has no meet for one, so a compute slot never
-                // carries a sum's domain.
+                // A compute function's domain is an ordinary parameter type. A domain that
+                // names no candidates arises only from a sum's body, which is always `Data`,
+                // and `CompactTypeKind::merge` produces one only from another, so a compute
+                // slot never carries a sum's domain.
                 let crate::ccl::ty::TypeKind::Enumerated(domains) = &type_kind else {
-                    unreachable!("a compute function slot carries a described domain kind")
+                    unreachable!("a compute function slot's domain kind names no candidates")
                 };
                 let [sole] = domains.as_slice() else {
                     unreachable!("a compute function slot carries several candidate domains")
@@ -452,21 +422,17 @@ fn coalesce_compact_go(
                 // rather than assumed. A sum materializes from the Σ slot beside this one,
                 // never by reading a second candidate off the domain.
                 let crate::ccl::ty::TypeKind::Enumerated(domains) = &type_kind else {
-                    unreachable!("a data function slot carries a described domain kind")
+                    unreachable!("a data function slot's domain kind names no candidates")
                 };
-                debug_assert_eq!(
-                    domains.len(),
-                    1,
-                    "a data function's domain type_kind lists several candidates: {type_kind}"
-                );
-                // **The index is named at the domain position**, which is where every
-                // reference to it has merged, so the binder takes the name the domain
-                // answers with rather than the other way round
-                // (`src/ccl/design/type-inference.md`, "The index is named at the domain
-                // position"). A kind variable mints a binder for its edges to rename into,
-                // and a route that crossed no such edge arrives spelling the index in the
-                // scope it left; the position is the one place both are in hand.
-                let binders = named_by_domain(binders, &domains[0], &outer_scope);
+                let [_] = domains.as_slice() else {
+                    unreachable!("a data function's domain names several candidates: {type_kind}")
+                };
+                // **A binder's name is the binder's**, minted on the kind variable
+                // ([`crate::ccl::ty::FunKindVar::binder_ids`]) and never read back off the
+                // domain: the domain *refers* to the binder, so taking a name from it inverts
+                // which of the two is the fact. Every occurrence reaching this position is
+                // renamed onto the binder by the correspondence the relating edge draws
+                // (`fun_kind_correspondence`), which is what has to be complete.
                 // **The binders close the function.** They settled above, so the parts
                 // already name them; a plain collection has none and comes back as it is.
                 shapes.push(Type::Fun {
@@ -526,7 +492,7 @@ fn coalesce_compact_go(
             // needs strict scalar consumers (binops, …) to impose concrete
             // bounds so the union is rejected at *their* site; that is deferred
             // past the conditional-collection foundation. Collection arms still join losslessly — that happens in
-            // the `fun` slot above (`join_witness_kinds`), not through atoms.
+            // the `fun` slot above (`CompactFun::merge`), not through atoms.
             let pretty = all
                 .iter()
                 .map(|t| format!("{t}"))
@@ -551,14 +517,14 @@ fn coalesce_compact_go(
     // finally become a type — the same moment its bounds become one.
     //
     // **Membership, not containment.** `𝛼 :: 𝐾` asks whether one domain lies in a kind,
-    // which is [`crate::ccl::ty::TypeKind::admits`]; the Σ-width premise asks whether one
+    // which is [`crate::ccl::ty::TypeKind::refuses`]; the kind premise asks whether one
     // *set* of domains lies in another, and that one draws edges
-    // (`super::constrain::constrain_witness_kinds`). Post-coalesce there is no graph left to
+    // (`super::constrain::constrain_type_kinds`). Post-coalesce there is no graph left to
     // emit into, so this side is the structural answer and can only be that.
     // A position that materializes as a **variable** has not become a type yet, so the
-    // membership edge has no answer here — and no longer needs one: `𝛼 :: 𝐾` is recorded on
+    // membership edge has no answer here, and needs none: `𝛼 :: 𝐾` is recorded on
     // the variable and discharged wherever a type reaches it
-    // (`super::constrain::discharge_kinds`), including at each instantiation of a
+    // (`super::constrain::answer_type_kinds`), including at each instantiation of a
     // generalized definition. Deciding it here would answer for a definition what only its
     // uses can say.
     let undecided = matches!(out.peel_refinements(), Type::Infer(_));
@@ -566,7 +532,7 @@ fn coalesce_compact_go(
         if undecided {
             continue;
         }
-        if !k.admits(&out) {
+        if k.refuses(&out) {
             return Err(CoalesceError::KindMismatch {
                 resolved: Box::new(out),
                 type_kind: k.clone(),
@@ -765,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_described_kind_sigma_round_trips() {
-        // A `List` Σ compacts into the `fun` slot with a *described* domain — the
+    fn coalesce_uintranges_sigma_round_trips() {
+        // A `List` Σ compacts into the `fun` slot with a domain naming no candidates — the
         // kind rides through verbatim, only the codomain compacts — so
         // compact → coalesce re-forms the identical type. Contrast the
         // conditional-collection Σ, whose candidates join the lattice.
@@ -777,9 +743,9 @@ mod tests {
 
     #[test]
     fn coalesce_collection_sigma_round_trips() {
-        // A `Collection` (`TypeKind::Type`) Σ rides the same `Described` domain as the
-        // `List` Σ above — the kind inert, only the codomain compacted — so the ⊤ of
-        // the kind order needs no carrier of its own to survive the round trip.
+        // A `Collection` (`TypeKind::Type`) Σ rides through exactly as the `List` Σ above
+        // does — the kind inert, only the codomain compacted — so the ⊤ of the kind order
+        // needs no carrier of its own to survive the round trip.
         let coll = Type::collection_of(Type::Base(BaseType::Int));
         let t = coalesce_compact(&compact_type(&coll)).unwrap();
         assert_eq!(t, coll);

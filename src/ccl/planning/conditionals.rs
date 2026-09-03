@@ -16,19 +16,14 @@
 //! is done is what lets the two coexist without a `Fun(Data) <: Σ` bridge to relate them
 //! (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
 //!
-//! Only a **listing** witness kind can be realized here: the legs are the candidates, so
-//! there have to be finitely many, named. A described kind (`Collection(𝑇)`, `List(𝑇)`) is
-//! left alone, and ordinary code over one still compiles because inlining and
-//! monomorphization resolve its domain from the concrete producer before op-conversion. A
-//! described Σ that reaches op-conversion with no concrete domain fails there, which is the
-//! correct signal: that is the case needing a runtime witness rather than a static
-//! realization (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-
-// The witness kinds these sets key on can reach a `RefCell` — an undecided kind is a
-// `TypeKind::Var`, whose bounds are a cell — but `Hash`/`Eq` read the binder id and
-// never the kind, so a key's position is fixed at insertion however the kind is later
-// answered. Same reason as the solver's allows on the sets its atoms key.
-#![allow(clippy::mutable_key_type)]
+//! Only a witness over **named candidates** can be realized here: the legs are the
+//! candidates, so there have to be finitely many, named. A witness over `UIntRanges`
+//! (`List(𝑇)`) or the universe (`Collection(𝑇)`) is left alone, and ordinary code over one
+//! still compiles because inlining and monomorphization resolve its domain from the concrete
+//! producer before op-conversion. Such a Σ reaching op-conversion with no concrete domain
+//! fails there, which is the correct signal: that is the case needing a runtime witness
+//! rather than a static realization (`src/ccl/design/collections.md`, "Compiling a
+//! conditional collection").
 
 use std::rc::Rc;
 
@@ -67,7 +62,7 @@ pub(super) fn realize_conditional_collections(
         instantiate_erased_witnesses(expr, &erased, &PredMemo::new());
     }
     // **And every determined sum the erasure did not name.** A consumer of a sum is a sum
-    // over its *own* binder ([`crate::ccl::ty::FunKindVar::binders_for`]), so erasing the
+    // over its *own* binder ([`crate::ccl::ty::FunKindVar::binder_ids`]), so erasing the
     // introduction leaves each consumer downstream still quantifying a witness — over the
     // one candidate the introduction had, which is the same "indeterminacy the term no
     // longer has".
@@ -212,7 +207,7 @@ fn realize_and_unbox(
     // from the rest of planning, so a `box`ed list literal never gets its `iterate`
     // marker and reaches op-conversion bare.
     //
-    // Determined means the kind lists exactly *one* candidate: one possible witness is no
+    // Determined means the kind names exactly *one* candidate: one possible witness is no
     // information, so nothing has to carry it — the same reading [`arm_domain`] takes. A
     // sum with two or more candidates that reaches here was **not** realized by a fan-out
     // above, so its witness is real and has to exist at runtime; erasing it would drop the
@@ -381,11 +376,15 @@ fn read_the_arm_instead(predicate: &Expr, witness: &crate::ccl::ty::Witness, arm
 
 /// Whether `expr` is a conditional collection whose index ranges over `type_kind`.
 ///
-/// By candidate list rather than by binder id, which is the rule a check follows everywhere
-/// (`src/ccl/design/type-inference.md`, "A check is α-blind"): the predicate holds its *own
-/// copy* of the source, and that copy names a different binder than the site's sum.
-/// Comparing resolved, because a candidate spelled as a variable and the same candidate
-/// resolved are one candidate.
+/// By candidates rather than by binder id, because the predicate holds its **own copy** of
+/// the source and that copy names a different binder than the site's sum. Comparing resolved,
+/// because a candidate spelled as a variable and the same candidate resolved are one
+/// candidate.
+///
+/// Subtyping does not do this — it relates two references by identity under a correspondence
+/// (`src/ccl/design/type-inference.md`, "One rule for the solve and the check") — so a copy
+/// whose binder nothing relates to the site's is a naming gap this reads around rather than a
+/// rule it follows.
 fn indexed_by_this_sum(expr: &Expr, type_kind: &crate::ccl::ty::TypeKind) -> bool {
     match expr.ty.peel_refinements().sum() {
         Some([first, ..]) => first.type_kind() == *type_kind,
@@ -536,8 +535,12 @@ fn realize(
         let Some(gate) = combination.iter().map(|c| c.gate.clone()).reduce(|acc, g| {
             Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), g).with_ty(bool_ty.clone())
         }) else {
-            return false;
+            unreachable!("a combination names one arm per witness, so it has a gate")
         };
+        // **A decline, not a defect.** A guard is a user expression and elimination reports
+        // the shapes it has no rule for, so this is the one bail-out below that a program can
+        // reach on its own. The site leaves its sum standing and op-conversion rejects it by
+        // name.
         let Ok(gate_pf) = lambda_elim::run(gate) else {
             return false;
         };
@@ -552,9 +555,12 @@ fn realize(
             // so by this witness's turn every earlier same-kind witness has
             // already replaced its `Case`, and the one this witness read is the
             // first still standing.
-            if !replace_the_conditional(&mut leg, wanted, 0, &choice.arm) {
-                return false;
-            }
+            // `conditional_below` found this witness's `Case` in the site, and the leg is a
+            // copy of the site, so the same walk finds it here.
+            assert!(
+                replace_the_conditional(&mut leg, wanted, 0, &choice.arm),
+                "a leg has the `Case` the site was realized for"
+            );
             // **A filter's predicate holds its own read of the source**, so the conditional is
             // in there too and a leg whose predicate still tests the *whole* conditional is not
             // that leg. Rewritten before the witness is instantiated, because the match that
@@ -594,7 +600,7 @@ fn realize(
         // The gate rides the **leg's** domain, not any one arm's: with a second generator the
         // leg is indexed by a product, and the gate is constant in the element either way.
         let Some(leg_dom) = leg.ty.domain() else {
-            return false;
+            unreachable!("a leg is the site with an arm in place, and the site is a collection")
         };
         let gate_fn = apply_primitive(
             gate_pf,
@@ -621,9 +627,10 @@ fn realize(
             leg.with_ty(leg_ty)
         });
     }
-    if legs.is_empty() {
-        return false;
-    }
+    assert!(
+        !legs.is_empty(),
+        "every combination builds a leg, and there is at least one combination"
+    );
     for w in &witnesses {
         discharged.insert(*w.id());
     }
@@ -688,8 +695,9 @@ fn realize(
 ///
 /// `witness` is the sum this fan-out realizes, absent for a same-domain conditional that
 /// names none. `None` where an arm's domain cannot be read: a multi-candidate arm is a
-/// genuinely nested conditional collection and a described one needs the runtime witness, so
-/// either way the rewrite does not apply and the `Case` is left for op-conversion to reject.
+/// genuinely nested conditional collection, and an arm naming no candidate needs the runtime
+/// witness, so either way the rewrite does not apply and the `Case` is left for
+/// op-conversion to reject.
 fn arm_choices(
     branches: Vec<crate::ccl::Branch>,
     witness: Option<crate::ccl::ty::Witness>,
@@ -755,7 +763,7 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
 /// single candidate, so the candidate is the domain and the binder quantifies nothing.
 ///
 /// Erasing the `box` above is not enough to reach them. A consumer of a sum is a sum over
-/// its *own* binder ([`crate::ccl::ty::FunKindVar::binders_for`]), related to the
+/// its *own* binder ([`crate::ccl::ty::FunKindVar::binder_ids`]), related to the
 /// introduction's by the scope change the edge carried — so erasing the introduction leaves
 /// every consumer downstream still quantifying a witness with one candidate. Determinedness
 /// is a fact about a kind rather than about the term that introduced it, which is what this
@@ -855,8 +863,8 @@ fn witnesses_named_by(ty: &Type) -> Vec<crate::ccl::ty::Witness> {
 /// Matched by **kind**: the site's witness and the value's `Case` are two derivations
 /// of one consumption, and no mint ever needs to agree with another
 /// (`src/ccl/design/type-inference.md`, "A binder is minted where a scope needs one"), so the
-/// binder ids differ and the kind — the candidate list, or the described kind — is the
-/// shared content. Two conditionals over identical candidates are told apart by
+/// binder ids differ and the kind is the shared content. Two conditionals over identical
+/// candidates are told apart by
 /// position: a realized `Case` stops matching, so the walk pairs sites and `Case`s in
 /// order (`two_conditional_sources_compile`).
 fn is_the_conditional(expr: &Expr, wanted: &crate::ccl::ty::Witness) -> bool {
