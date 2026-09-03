@@ -12,13 +12,15 @@ Start there if the question is about the language rather than the checker;
 [The five collection types](#the-five-collection-types) below is the same list with its
 domains.
 
-The type-level machinery is the sum — a data function carrying its Σ binders — and its
-witness kinds, specified in
+The type-level machinery is the sum — a data function carrying its Σ binders — and the
+[`TypeKind`] classifying the types each binder ranges over, specified in
 [type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums). Each
-collection type is a Σ over a witness **kind**, and this document says which kind each one
-picks. "Kind" throughout means the witness kind, never the collection type itself.
+collection type is a Σ whose witness ranges over one **kind**, and this document says which
+kind each one picks. "Kind" throughout means that `TypeKind`, never the collection type
+itself; a witness is a binder, and the kind classifies the types it ranges over rather than
+the binder.
 
-The witness kind tells four of the five apart: `Array(𝑛, 𝑇)` is a bare data function over
+The kind tells four of the five apart: `Array(𝑛, 𝑇)` is a bare data function over
 one range, `List(𝑇)` a Σ over `UIntRanges`, `Collection(𝑇)` a Σ over `Type`. `Set(𝐾)` and
 `Map(𝐾, 𝑉)` share the `SubtypesOf(𝐾)` kind and its key parameter, differing only in a codomain
 that is `unit` for one, so the operation layer has nothing to dispatch on between them.
@@ -56,7 +58,7 @@ With `𝐷` a witness domain and `𝑛` a length:
   ([Compiling a conditional collection](#compiling-a-conditional-collection)).
 
 Each is a sum over the named kind, and every rule they obey is the general Σ
-rule at that kind — entry by a term, width, and consumption
+rule at that kind — entry by a term, subtyping, and consumption
 ([type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums)). Only
 `Array` is not a sum: its domain is one concrete range, so it needs no witness.
 
@@ -73,8 +75,8 @@ a primitive**: there is no structural keyed property, only a per-type choice of 
 `for ... in` surfaces.
 
 Subtyping is the other axis and reads the shape as usual — `box(arr) <: List(𝑇) <:
-Collection(𝑇)`, each edge the ordinary Σ-width rule at that kind
-([type-inference.md, The width rule](type-inference.md#the-width-rule)) — so the two axes do
+Collection(𝑇)`, each edge the ordinary Σ rule at that kind
+([type-inference.md, The Σ rule](type-inference.md#the-σ-rule)) — so the two axes do
 not coincide: a `Set(𝐾)` is structurally a collection of `unit` and iterates `𝐾`.
 
 ## Telling `Set` and `Map` apart [Open]
@@ -86,9 +88,8 @@ the candidate and the questions it has to answer, not a decision.
 The candidate is a **nominal type**: `Set` and `Map`, and only those two, become declared
 type constructors with the `type` strength of
 [chl-spec, Direction: term/type syntax split](../../../docs/chl-spec.md#61-direction-termtype-syntax-split-decided),
-distinct from a structural `=` alias. The other three need nothing, since the witness kind
-already discriminates a bare range `Fun` (`Array`), `UIntRanges` (`List`) and `Type`
-(`Collection`).
+distinct from a structural `=` alias. The other three need nothing, since the kind already
+discriminates a bare range `Fun` (`Array`), `UIntRanges` (`List`) and `Type` (`Collection`).
 
 Three questions have to be answered together, and each has consequences outside this
 document:
@@ -99,7 +100,7 @@ document:
   `Map` known nominal names rather than ordinary library declarations.
 - **Whether `Map(𝐾, 𝑉) <: Collection(𝑉)` holds.** Structurally the edge falls out of the
   existing rule: `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` has a kind contained in `Type`, so widening to
-  `Collection(𝑉)` is ordinary Σ-width. Nominally the edge is what a declared type
+  `Collection(𝑉)` is the ordinary Σ rule. Nominally the edge is what a declared type
   constructor exists to withhold, and reaching `Collection(𝑉)` takes the explicit
   `values(m)`. `Array <: List <: Collection` is untouched either way. The answer decides
   what rejects `sum(m)` — a missing edge, or the iteration element (see
@@ -172,7 +173,7 @@ become the per-type standard-library instances with no semantic change. Everythi
   binds values, and the explicit projection is what makes which one is meant
   visible — matching [chl-spec §6.3](../../../docs/chl-spec.md#63-direction-collection-types-decided).
   What *enforces* that depends on the open subtyping question
-  ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-open)): with the width edge
+  ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-open)): with the Σ edge
   to `Collection(𝑉)` present, `sum(m)` is rejected only once `sum` lowers through
   iteration, because a `Map` yields `(𝐾, 𝑉)` entries and entries cannot be summed; without
   it, `sum(m)` has no edge to take. Until either lands `sum(m)` means `sum(values(m))`.
@@ -244,7 +245,7 @@ The copy is also what lets each consumer's substitution differ: two consumers fi
 conditional instantiate the same witness into two different predicates, which one set of
 legs cannot hold.
 
-Only an **undetermined** witness is copied — a kind listing more than one candidate. A
+Only an **undetermined** witness is copied — a kind naming more than one candidate. A
 determined one has no realization to feed, since the candidate is already its domain and the
 erasure removes the binder where it stands; copying it duplicates the arms and puts a `box`
 inside each consumer, where the erasure reaches the term but not every type that named it. A
@@ -260,7 +261,7 @@ Two conditional generators in one comprehension put two sums over one product do
 not a site within a site. So the legs are the **tuples** of arms, gated by the conjunction
 of their path conditions and indexed by the product of their domains: the same finite-Σ ≡
 gated-union isomorphism, stated for a product of witnesses. It is flat, which is what
-`Expr::collection_union` already is.
+`Expr::copair` already is, flattening a nested copairing into its operands.
 
 Compiling the two one at a time instead leaves a union where a generator reads its
 collection at a projected index (`π₀ ≫ coll`), and a union there is a **fed** copairing,

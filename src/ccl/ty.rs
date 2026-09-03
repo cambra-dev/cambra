@@ -403,7 +403,7 @@ impl FunKind {
 
     /// The Σ binders this kind is **written** over — a concrete `Data` carrying a slot.
     ///
-    /// A consumer's kind variable carries binders too ([`FunKindVar::binders`]), and they
+    /// A consumer's kind variable carries binders too ([`FunKindVar::binder_ids`]), and they
     /// are deliberately not reported here: they are the *scope* each arm's domain is renamed
     /// into, not a name the consumer states. The sum it turns out to be is formed at its
     /// domain position, where the references have merged (`named_by_domain` in
@@ -417,18 +417,31 @@ impl FunKind {
         }
     }
 
-    /// The binders a function of this kind is over — **its own**, one per position.
+    /// The binders a function of this kind **states**, with what each ranges over.
     ///
-    /// A variable's are picked where its arity becomes known and stored there
-    /// ([`FunKindVar::binders`]), so every reader of one kind sees one list. Two *related*
-    /// kinds have **corresponding** binders and not shared ones: what carries a reference
-    /// from one to the other is the substitution the relating edge draws, which is what
-    /// makes a reference correct across a change of context without every context having to
-    /// agree on a name.
+    /// A variable states none. It has binder *identities* once its arity is known
+    /// ([`binder_ids`](Self::binder_ids)), but what they range over is the merge of what
+    /// reached each position, which compaction answers — so a variable that reported a range
+    /// here would be answering a question that is not the kind graph's, and the two answers
+    /// would differ by whatever each walk did instead.
+    ///
+    /// Two *related* kinds have **corresponding** binders and not shared ones: what carries a
+    /// reference from one to the other is the substitution the relating edge draws, which is
+    /// what makes a reference correct across a change of context without every context
+    /// having to agree on a name.
     pub fn named_binders(&self) -> Vec<Witness> {
         match self {
-            FunKind::Var(v) => v.binders(),
+            FunKind::Var(_) => Vec::new(),
             other => other.witnesses().to_vec(),
+        }
+    }
+
+    /// The identities of the binders a function of this kind is over, one per position —
+    /// available whether or not the kind states what they range over.
+    pub fn binder_ids(&self) -> Vec<WitnessId> {
+        match self {
+            FunKind::Var(v) => v.binder_ids(),
+            other => other.witnesses().iter().map(|w| *w.id()).collect(),
         }
     }
 
@@ -461,8 +474,7 @@ impl FunKind {
     ///
     /// A concrete kind is its own answer; a variable's is what its component was pinned to.
     /// There is no second encoding of these states, so no phase can lose a distinction an
-    /// earlier one made by translating between two spellings of the lattice — which is how
-    /// `Data(None)` and `Data(Some(..))` used to arrive at materialization as one point.
+    /// earlier one made by translating between two spellings of the lattice.
     pub fn resolved(&self) -> KindPin {
         match self {
             FunKind::Compute => KindPin::Compute,
@@ -491,21 +503,7 @@ impl FunKind {
 
     /// How many binders a function of this kind is over, where anything has said.
     pub fn arity(&self) -> Option<usize> {
-        match self {
-            FunKind::Var(v) => v.arity(),
-            other => other.point().arity(),
-        }
-    }
-
-    /// The point of the flat lattice this kind denotes. A variable denotes whatever has
-    /// reached it ([`FunKindVar::resolved`]).
-    pub fn point(&self) -> KindPin {
-        match self {
-            FunKind::Compute => KindPin::Compute,
-            FunKind::Data(None) => KindPin::Plain,
-            FunKind::Data(Some(ws)) => KindPin::Sum(ws.len()),
-            FunKind::Var(v) => v.resolved(),
-        }
+        self.resolved().arity()
     }
 
     /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds).
@@ -554,11 +552,30 @@ pub fn fun_kind_vars() -> Vec<Rc<FunKindVar>> {
 ///
 /// Debug-only with the register it reads: nothing outside a diagnostic consults it, and a
 /// release build has no register to render.
+/// Which inference variable owns each kind variable, for the dump — the reverse of
+/// [`crate::ccl::InferVar::fun_kind`].
+#[cfg(debug_assertions)]
+fn kind_var_owners() -> std::collections::HashMap<u32, Vec<String>> {
+    let mut out: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
+    for v in crate::ccl::infer_var::arena_vars() {
+        out.entry(v.fun_kind.uid.0)
+            .or_default()
+            .push(format!("?{}", v.uid.0));
+    }
+    out
+}
+
 #[cfg(debug_assertions)]
 pub fn dump_kind_vars() -> String {
     fun_kind_vars()
         .iter()
-        .map(|v| v.debug_dump())
+        .map(|v| {
+            let owners = kind_var_owners();
+            match owners.get(&v.uid.0) {
+                Some(os) => format!("{} owner={}", v.debug_dump(), os.join(",")),
+                None => format!("{} owner=-", v.debug_dump()),
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -582,13 +599,12 @@ pub enum KindPin {
     Data,
     /// Pinned to a plain collection, [`FunKind::Data`] with no slot.
     Plain,
-    /// Pinned to a sum, [`FunKind::Data`] over these binders.
     /// Pinned to a sum over this many binders.
     ///
     /// The **arity**, not the binders. Whether a function is over binders and how many are
     /// facts about its kind — presence is what makes a sum and a plain arrow unrelatable —
     /// but *which* binder is not: a variable picks its binder names where its arity becomes
-    /// known ([`FunKindVar::binders`]), so naming them here would be a second answer.
+    /// known ([`FunKindVar::binder_ids`]), so naming them here would be a second answer.
     Sum(usize),
     /// Pinned to two kinds at once — read at coalesce
     /// ([`FunKind::resolved`]).
@@ -596,7 +612,10 @@ pub enum KindPin {
 }
 
 impl KindPin {
-    /// The join in the flat semilattice `Unpinned < {Compute, Data} < Conflict`.
+    /// The join in the semilattice bottomed at `Unpinned` and topped by `Conflict`, with
+    /// two chains between them: `Compute` alone, and `Data` below both `Plain` and every
+    /// `Sum(𝑛)`. Points on different chains — and two `Sum`s of unequal arity — join to
+    /// `Conflict`.
     ///
     /// Commutative, associative, and idempotent, which is what makes a
     /// variable's pin independent of the order the pins arrive in: every reader
@@ -618,15 +637,9 @@ impl KindPin {
             // forgotten. One function required to be both is the same contradiction a
             // capability meeting a collection is.
             (Plain, Sum(_)) | (Sum(_), Plain) => Conflict,
-            // **Two sums at one kind are over the index above both**, position by position
-            // ([`index_above`]). Their arities must agree; a kind reached by one sum is over
-            // that sum's index, and a kind reached by several is over an index the several
-            // sit below — which is what makes the answer a function of what reached the
-            // kind rather than of which edge drew first, and what lets an occurrence
-            // spelled with any of them still denote the index it was written for.
-            // Two sums at one kind are one consumption reached twice. Their arities must
-            // agree; a disagreement is a mismatch between the two types, not a state to
-            // reconcile.
+            // **Two sums at one kind are one consumption reached twice.** Their arities
+            // must agree; a disagreement is a mismatch between the two types, not a state
+            // to reconcile.
             (Sum(a), Sum(b)) if a == b => Sum(a),
             (Sum(_), Sum(_)) => Conflict,
         }
@@ -653,34 +666,6 @@ impl KindPin {
     }
 }
 
-/// A kind-inference variable — an unknown [`FunKind`] an elimination mints
-/// and the value flowing in pins.
-///
-/// The two eliminations cannot know a function's kind: applying a value and
-/// destructuring a function are one node for a collection and for a capability
-/// alike ([`Type::pi_eliminated`], [`Type::fun_eliminated`]). Each mints one of
-/// these, and the kind edge pins it to whatever concrete kind the value carries
-/// (`constrain_fun_kind`). Nothing else mints one — no scheme is kind-polymorphic and
-/// lowering stamps every function type it builds — so a variable is **written by
-/// the one value that reaches it**.
-///
-/// Two variables meeting is a **relation**, not a resolution. What the pair
-/// resolves to is not known at that edge, so `constrain_fun_kind` records the edge
-/// and [`FunKindVar::pin`] joins over it at the read. Resolving at the edge
-/// instead — copying each side's pin onto the other — loses a pin that arrives
-/// afterwards, and then which arrow the two coalesce to depends on which
-/// constraint came first. The rule is the one the domain combination follows for
-/// the same reason: a value the fold is still accumulating cannot be read
-/// pairwise (see [`KindPin`]).
-///
-/// Identity (`uid`) is immutable and lives outside the `RefCell`, so
-/// equality/hashing is borrow-free and never inspects the pin (mirroring
-/// [`crate::ccl::InferVar`]). [`Rc`] because the same cell has to be visible
-/// What one binder position has recorded against it: the kinds below and above it, and the
-/// types it must admit.
-///
-/// Two sorts meet here because two of the three relations reach a binder. `𝐾 ⊑ 𝜅` and
-/// `𝜅 ⊑ 𝐾` are the lattice order and are polar. `𝑇 :: 𝜅` is membership, and is not — it says
 /// What a [`FunKindVar`] has recorded — polar bounds, like any other variable's.
 ///
 /// Everything a kind answers is *derived* from these rather than stored: whether it is a
@@ -710,6 +695,14 @@ struct FunKindBounds {
     built_over: Vec<FunKind>,
     /// Kinds recorded **above** it — what it must satisfy.
     upper: Vec<FunKind>,
+    /// The kind this one is a **copy of**, where it was made by instantiating a scheme.
+    ///
+    /// Not a bound, and not a pair of them. Mutual bounds would say the two kinds are equal,
+    /// which recouples the pins that freshening exists to separate — "a pin the definition
+    /// site acquires later must not reach this instantiation" (`freshen_kind_var`). What a
+    /// copy shares is *which binder each position is*, not what the kind resolves to, and a
+    /// bound cannot say the first without saying the second.
+    instantiated_from: Option<Rc<FunKindVar>>,
     /// This kind's binder names, one per position, picked where the arity became known.
     ///
     /// Not an `Option` per slot: a name is picked for every position at once, because the
@@ -734,7 +727,7 @@ fn built_width(sources: &[FunKind]) -> Option<usize> {
 }
 
 /// A kind-inference variable — an unknown [`FunKind`], and **the identity of the binders the
-/// function it kinds is over**: binder *i* is [`binders`](Self::binders)`[i]`, picked where
+/// function it kinds is over**: binder *i* is [`binder_ids`](Self::binder_ids)`[i]`, picked where
 /// the arity becomes known.
 ///
 /// The two eliminations cannot know a function's kind: applying a value and destructuring a
@@ -742,7 +735,7 @@ fn built_width(sources: &[FunKind]) -> Option<usize> {
 /// these, and the kinds that reach it are recorded as bounds.
 ///
 /// Bounds are **not identity**. Two variables related by an edge have *corresponding*
-/// binders, not the same ones — which is the Σ-width reading — and a substitution maps
+/// binders, not the same ones — which is what the Σ rule reads — and a substitution maps
 /// between them, derived once the kind graph is closed and the arities are known.
 ///
 /// Identity (`uid`) is immutable and lives outside the `RefCell`, so equality and hashing are
@@ -752,11 +745,6 @@ pub struct FunKindVar {
     pub uid: FunKindVarId,
     bounds: RefCell<FunKindBounds>,
 }
-
-/// Two sums of different arity related to one function — a mismatch between the two types,
-/// not a state to reconcile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WidthMismatch;
 
 impl FunKindVar {
     /// Allocate a fresh kind variable with nothing recorded.
@@ -817,7 +805,7 @@ impl FunKindVar {
                 .fold(b.stamped.clone().join(over), |acc, k| {
                     let point = match k {
                         FunKind::Var(x) => go(x, seen),
-                        other => other.point(),
+                        other => other.resolved(),
                     };
                     acc.join(point)
                 })
@@ -846,81 +834,18 @@ impl FunKindVar {
         self.resolved().arity()
     }
 
-    /// Which source owns binder `position`, and which of *its* positions that is.
-    fn source_of(&self, position: usize) -> Option<(FunKind, usize)> {
-        let mut offset = 0;
-        for src in self.built_over() {
-            let n = src.arity()?;
-            if position < offset + n {
-                return Some((src, position - offset));
-            }
-            offset += n;
-        }
-        None
-    }
-
-    /// **What the binder at `position` ranges over**: the join of what every fun kind
-    /// related to this one has at that position.
+    /// **The names this kind's binders settle on**, minted once and answered from the kind
+    /// thereafter — so every occurrence of one unsettled binder comes back as one name.
     ///
-    /// This *is* the Σ-width containment, read where it is asked rather than recorded a
-    /// second time — a fun kind below contributes its own binder's range, and one that is
-    /// itself a variable contributes what is below *it*.
-    pub fn binder_kind(&self, position: usize) -> TypeKind {
-        fn go(v: &FunKindVar, position: usize, seen: &mut Vec<FunKindVarId>) -> Option<TypeKind> {
-            if seen.contains(&v.uid) {
-                return None;
-            }
-            seen.push(v.uid);
-            // **A built-over collection's binder is its source's**, so it ranges over
-            // whatever that one does — not over a join of everything at the same numeric
-            // position, and the position itself moves by the source's offset. Asked at every
-            // step of the walk and not only the first: a chain that passes *through* a
-            // built-over fun kind reaches the source only if each hop looks.
-            if let Some((src, at)) = v.source_of(position) {
-                return match &src {
-                    FunKind::Var(x) => go(x, at, seen),
-                    other => other.witnesses().get(at).map(Witness::type_kind),
-                };
-            }
-            let join_at = |ks: &[FunKind], seen: &mut Vec<FunKindVarId>| {
-                ks.iter().fold(None, |acc, k| {
-                    let related = match k {
-                        FunKind::Var(x) => go(x, position, seen),
-                        other => other.witnesses().get(position).map(Witness::type_kind),
-                    };
-                    match (acc, related) {
-                        (Some(a), Some(b)) => Some(TypeKind::join(&a, &b)),
-                        (only, None) | (None, only) => only,
-                    }
-                })
-            };
-            let (lower, upper) = {
-                let b = v.bounds.borrow();
-                (b.lower.clone(), b.upper.clone())
-            };
-            // **What reached this position**, joined: a collection arriving here contributes
-            // its own candidates, and several arriving is a conditional collection over all
-            // of them.
-            //
-            // **The demand above it only where nothing arrived.** An upper bound says what
-            // the position must satisfy, not what it ranges over, so joining it in would
-            // widen a listing to the description a consumer accepts — the narrowing data
-            // domains are invariant to refuse. But a position nothing reached has no other
-            // information, and answering ⊤ there fails that same consumer's containment
-            // check. Same shape, and same reason, as compaction's opposite-polarity
-            // fallback for an under-determined variable.
-            join_at(&lower, seen).or_else(|| join_at(&upper, seen))
-        }
-        go(self, position, &mut Vec::new()).unwrap_or(TypeKind::Type)
-    }
-
-    /// **The name the binder at `position` settles on**, minted once and answered from the
-    /// kind thereafter — so every occurrence of one unsettled binder comes back as one name.
-    pub fn binders(&self) -> Vec<Witness> {
+    /// Identity and nothing else. What a binder *ranges over* is the merge of what reached
+    /// its position, which is `CompactTypeKind::merge`'s question and not the kind graph's
+    /// (`var_binder_kind` in `crate::ccl::infer::solver::compact`). A second answer derived
+    /// here is a second answer, and the two differ by whatever each walk did instead.
+    pub fn binder_ids(self: &Rc<Self>) -> Vec<WitnessId> {
         let Some(arity) = self.arity() else {
             return Vec::new();
         };
-        let ids = {
+        let ids: Vec<crate::ccl::infer_var::WitnessBinderId> = {
             let mut b = self.bounds.borrow_mut();
             if b.settled.len() < arity {
                 b.settled
@@ -928,11 +853,7 @@ impl FunKindVar {
             }
             b.settled[..arity].to_vec()
         };
-        // Released before [`binder_kind`], which reads the bounds itself.
-        ids.into_iter()
-            .enumerate()
-            .map(|(i, id)| Witness::bound_to(id, self.binder_kind(i)))
-            .collect()
+        ids.iter().copied().map(WitnessId).collect()
     }
 
     /// Stamp this kind **data** at construction — a collection whatever slot it turns out
@@ -963,7 +884,7 @@ impl FunKindVar {
                             .collect::<Vec<_>>()
                             .join(",")
                     ),
-                    other => format!("{:?}", other.point()),
+                    other => format!("{:?}", other.resolved()),
                 })
                 .collect::<Vec<_>>()
                 .join(",")
@@ -978,8 +899,12 @@ impl FunKindVar {
             .map(|b| format!("\u{03c3}@{b}"))
             .collect::<Vec<_>>()
             .join(",");
+        let from = match self.instantiated_from() {
+            Some(o) => format!(" from=k{}", o.uid.0),
+            None => String::new(),
+        };
         format!(
-            "k{} stamp={stamped:?} lower=[{}] upper=[{}] over=[{}] arity={:?} binds=[{names}]",
+            "k{} stamp={stamped:?} lower=[{}] upper=[{}] over=[{}] arity={:?} binds=[{names}]{from}",
             self.uid.0,
             f(&lower),
             f(&upper),
@@ -997,6 +922,17 @@ impl FunKindVar {
     /// The kinds recorded **above** this one.
     pub fn upper(&self) -> Vec<FunKind> {
         self.bounds.borrow().upper.clone()
+    }
+
+    /// Record that this kind is a copy of `original` — see
+    /// [`instantiated_from`](FunKindBounds::instantiated_from).
+    pub fn copied_from(&self, original: &Rc<FunKindVar>) {
+        self.bounds.borrow_mut().instantiated_from = Some(Rc::clone(original));
+    }
+
+    /// What this kind is a copy of, where it is one.
+    pub fn instantiated_from(&self) -> Option<Rc<FunKindVar>> {
+        self.bounds.borrow().instantiated_from.clone()
     }
 
     /// What this kind was stamped at construction — the one fact no edge spells
@@ -1020,7 +956,7 @@ fn same_fun_kind(a: &FunKind, b: &FunKind) -> bool {
         (FunKind::Data(Some(x)), FunKind::Data(Some(y))) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| p.id() == q.id())
         }
-        _ => a.point() == b.point(),
+        _ => a.resolved() == b.resolved(),
     }
 }
 
@@ -1331,7 +1267,8 @@ pub enum Type {
     /// consumer opens the sum, and **realization** (`planning::conditionals`), which erases
     /// the Σ and the `box` together after the type system is done. So none reaches
     /// op-conversion — by realization, not by being short-lived. One that does reach it (a
-    /// described witness kind, which cannot be realized) is rejected there by name.
+    /// witness over a kind that names no candidates, which cannot be realized) is rejected
+    /// there by name.
     ///
     /// Named for the *reference*: the witness itself is the [`Witness`] in the function's
     /// slot ([`FunKind::Data`]), classified by a [`TypeKind`].
@@ -1408,10 +1345,11 @@ impl WitnessContext {
 /// A **witness**: a type (a domain) that a dependent sum is summed over, and the binder its
 /// [`Type::WitnessRef`] occurrences name.
 ///
-/// Both halves in one value. The **kind** describes the domains it ranges over — a finite
-/// candidate set ([`TypeKind::Enumerated`]), every index range ([`TypeKind::UIntRanges`]), or
-/// the whole universe ([`TypeKind::Type`]) — which is what keeps Σ subtyping to a single rule
-/// (kind containment plus body subtyping) with no per-witness-flavour cases. The **binder**
+/// Both halves in one value. The **[`TypeKind`]** classifies the types this binder ranges
+/// over — named candidates ([`TypeKind::Enumerated`]), every index range
+/// ([`TypeKind::UIntRanges`]), or the whole universe ([`TypeKind::Type`]) — which is what
+/// keeps Σ subtyping to a single rule (kind containment plus body subtyping) with no case
+/// per kind. The **binder**
 /// is its identity, and it lives here rather than on the sum because a kind travelling
 /// without one is how a witness acquires a second name: a site holding only a kind must
 /// invent a binder to build a sum, and inventing is right only when the witness is new.
@@ -1430,8 +1368,8 @@ impl WitnessContext {
 pub struct Witness {
     id: WitnessId,
     /// What a **settled** binder ranges over. An unsettled one answers from the bounds
-    /// recorded at its position ([`FunKindVar::binder_kind`]), so there is no second copy to
-    /// go stale.
+    /// recorded at its position, which compaction reduces (`var_binder_kind`), so there is no
+    /// second copy to go stale.
     range: Rc<TypeKind>,
 }
 
@@ -1470,35 +1408,36 @@ impl fmt::Debug for Witness {
 /// the sole kind-carrying position in the grammar; since a Σ's witness is a data
 /// function's domain, every type a kind classifies here happens to be a domain. That is
 /// a fact about current usage, not part of the notion — nothing in
-/// [`admits`](TypeKind::admits) is domain-specific.
+/// [`refuses`](TypeKind::refuses) is domain-specific.
 ///
 /// Note the direction: a kind admits many types and a type is admitted by many kinds, so
 /// there is no "kind of a type" to read off. What a type determines is the *minimal* kind
 /// containing it, the singleton [`Enumerated`](TypeKind::Enumerated).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
+    /// Finitely many types, named one by one.
     Enumerated(Vec<Type>),
-    /// Every **`UIntRange`** — the kind that classifies a `List`'s domain. Not a finite
+    /// Every **`UIntRange`**, which is the kind a `List`'s domain has. Not a finite
     /// candidate set (there is one range per length), and not a down-set of any
-    /// single domain either: the down-set of a large range would admit *sparse*
+    /// single range either: the down-set of a large range would admit *sparse*
     /// subsets, whereas membership here is exactly "is a `Type::UIntRange`", i.e. a
     /// dense prefix. That distinction is load-bearing — it is what stops a
     /// *filtered* range `{[0, k) | p}` (a `Refinement`, not a `UIntRange`) passing
     /// as a `List`, which would supply a length witness for a domain that has holes.
     UIntRanges,
-    /// Every domain **below** a type — the kind a `Map(K, V)` is summed over, written
-    /// `SubtypesOf(K)`.
+    /// Every type **below** a given one — the kind a `Map(K, V)`'s witness is summed
+    /// over, written `SubtypesOf(K)`.
     SubtypesOf(Box<Type>),
-    /// **Every** domain — the universe of small types, which is what `Collection(T)`
-    /// is summed over. Not enumerable, so its witness is an opaque domain. Named for
-    /// the standard dependent-type-theory reading (the type of types) rather than for
-    /// a subtyping ⊤: it is the top of the *kind* order, and says nothing about values.
+    /// **Every** type — the kind a `Collection(T)`'s witness is summed over. It names no
+    /// candidates, so nothing reads an extent off it. Named for the standard
+    /// dependent-type-theory reading (the type of types) rather than for a subtyping ⊤:
+    /// it is the top of the *kind* order, and says nothing about values.
     Type,
 }
 
-/// The witness part of a `Σ… ⤇ V` rendering — listed candidates in brackets, a
-/// described kind by name. Brackets rather than braces because braces are the record
-/// type's, and a kind is a list of candidates rather than a record.
+/// The kind part of a `Σ… ⤇ V` rendering — candidates in brackets, every other kind by
+/// name. Brackets rather than braces because braces are the record type's, and candidates
+/// are a sequence rather than a record.
 impl fmt::Display for TypeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1513,32 +1452,7 @@ impl fmt::Display for TypeKind {
     }
 }
 
-impl TypeKind {
-    /// The kind lattice's **⊔** — what a witness ranges over once it may be either of
-    /// these. Two listings union; a description outranks a listing, since it names domains
-    /// no listing can; and the universe absorbs.
-    pub fn join(&self, other: &TypeKind) -> TypeKind {
-        match (self, other) {
-            (TypeKind::Type, _) | (_, TypeKind::Type) => TypeKind::Type,
-            (TypeKind::Enumerated(xs), TypeKind::Enumerated(ys)) => {
-                let mut out = xs.clone();
-                for y in ys {
-                    if !out.contains(y) {
-                        out.push(y.clone());
-                    }
-                }
-                TypeKind::Enumerated(out)
-            }
-            (described, TypeKind::Enumerated(_)) => described.clone(),
-            (TypeKind::Enumerated(_), described) => described.clone(),
-            // Two bounds join to a bound over a type above both, and no operation here
-            // computes one — so unequal bounds answer with the universe, which contains
-            // them and is the only kind that certainly does. Equal ones are one kind.
-            (TypeKind::SubtypesOf(a), TypeKind::SubtypesOf(b)) if a != b => TypeKind::Type,
-            (x, _) => x.clone(),
-        }
-    }
-}
+impl TypeKind {}
 
 impl TypeKind {
     /// The types this kind carries as **children** — every `Type` inside it, which
@@ -1546,13 +1460,13 @@ impl TypeKind {
     ///
     /// A *superset* of an [`Enumerated`](Self::Enumerated) kind's candidates, and the
     /// distinction is not cosmetic. Candidates are the kind's *members*, compared by value
-    /// and placed in the domain lattice. A described kind lists no members but may still
-    /// be **parameterized** by a type that is not one of its domains: a parameter is a
-    /// child to be traversed and never a domain to be matched, and conflating the two
-    /// silently drops such a type from every traversal. [`SubtypesOf`](Self::SubtypesOf) is
-    /// the standing example: its members are the domains below its key type, not the key
-    /// type itself, so the key is a child to be traversed and never a domain to be matched.
-    /// Reading it as a domain would put it in the lattice; skipping it as a child would
+    /// and placed in the type lattice. A kind that names no members may still be
+    /// **parameterized** by a type that is not one of them: a parameter is a child to be
+    /// traversed and never a member to be matched, and conflating the two silently drops
+    /// such a type from every traversal. [`SubtypesOf`](Self::SubtypesOf) is
+    /// the standing example: its members are the types below its key type, not the key
+    /// type itself, so the key is a child to be traversed and never a member to be matched.
+    /// Reading it as a member would put it in the lattice; skipping it as a child would
     /// drop it from substitution, freshening, extrusion and structural comparison.
     pub fn children(&self) -> &[Type] {
         match self {
@@ -1587,58 +1501,67 @@ impl TypeKind {
         }
     }
 
-    /// Whether this kind **admits** `ty` — the membership predicate that gives a
-    /// *described* kind its content.
+    /// Whether this kind **refuses** `ty` — certain non-membership, which is the half of the
+    /// membership question every caller of this needs.
     ///
-    /// Membership and kind subtyping are different questions with different shapes: this
-    /// takes one type and answers about one kind, and it decides for itself. Containment
-    /// takes two kinds, and it draws edges, so it lives with the solver
-    /// (`crate::ccl::infer::solver::constrain`, `constrain_witness_kinds`). They meet in one
-    /// place — a listed kind lies below a *parameterless* description exactly when the
-    /// description admits every candidate — which is why a new kind needs this and a row in
-    /// the order, and nothing else.
+    /// All three ask it to reject: `answer_type_kinds` and `candidate_in_kind` raise
+    /// `NotOfKind`, and `coalesce_compact_go` raises `KindMismatch`. So the dangerous answer
+    /// is the negative one, and a structural test that reports a difference it cannot yet
+    /// distinguish from an unresolved position refuses a program that type-checks. Membership
+    /// is three-valued while a type is partial; this answers only the value a rejection may
+    /// rest on, and abstains — returns `false` — wherever the truth is unknown.
     ///
-    /// Every arm below is the notion's answer for its kind, but containment reaches only the
-    /// ones that *neither absorb, nor list, nor take a parameter*: ⊤ absorbs, a listing
-    /// answers by membership of its own members, and a bound draws the subtyping edge
-    /// instead. So the question reachable from containment today is exactly "is this a dense
-    /// prefix range"; the [`SubtypesOf`](TypeKind::SubtypesOf) arm is reached only by the
-    /// post-coalesce `𝛼 :: 𝐾` discharge, which has no graph to draw into.
+    /// **Abstaining is not the same as admitting.** Nothing reads a `false` here as
+    /// membership, so an abstention costs detection and never correctness. That is why the
+    /// bound's arm can abstain outright: the parameter's real question is subtyping, which
+    /// `constrain_type_kinds` draws as an edge, and no structural test standing in for it can
+    /// be certain in either direction.
     ///
-    /// That this predicate can be *written at all* is what makes kind **variables**
-    /// unnecessary: membership is decidable from the classified type, so the only thing
+    /// Membership and kind containment are different questions with different shapes: this
+    /// takes one type and answers about one kind, and it decides for itself. Containment takes
+    /// two kinds and draws edges, so it lives with the solver
+    /// (`crate::ccl::infer::solver::constrain`, `constrain_type_kinds`). They meet in one
+    /// place — candidates lie below [`UIntRanges`](TypeKind::UIntRanges) exactly when it
+    /// admits every one of them — which is why a new kind needs this and a row in the order,
+    /// and nothing else.
+    ///
+    /// That the membership question can be *asked at all* is what makes type-kind
+    /// **variables** unnecessary: it is decidable from the classified type, so the only thing
     /// inference can be missing is that type. Contrast [`FunKind`], which classifies
-    /// provenance rather than shape and therefore has no such predicate and does need
+    /// provenance rather than shape and therefore has no such question and does need
     /// [`FunKindVar`]. See `src/ccl/design/type-inference.md`, "An unresolved candidate
     /// becomes a kinding edge".
     ///
-    /// Note the asymmetry with a *type*: a kind admits many types, and a type is
-    /// admitted by many kinds. There is no "kind of a type" to read off — only, for a
-    /// given type, the minimal kind containing it (the singleton listing).
-    pub fn admits(&self, ty: &Type) -> bool {
+    /// Note the asymmetry with a *type*: a kind admits many types, and a type is admitted by
+    /// many kinds. There is no "kind of a type" to read off — only, for a given type, the
+    /// minimal kind containing it: that one type as the sole candidate.
+    pub fn refuses(&self, ty: &Type) -> bool {
         match self {
-            // **A variable records the demand instead of answering it.** Membership at an
-            // undecided kind is an edge like any other, and whatever `𝜅` is decided to be
-            // has to admit everything recorded here. Answering `false` would refuse a kind
-            // nothing has chosen yet; answering `true` without recording would forget the
-            // demand. The type is stored as itself: wrapping it in the singleton kind
-            // containing it would put a type inside a candidate list, which is where an
-            // unresolved one becomes reachable by no edge at all.
-            // ⊤: every type.
-            TypeKind::Type => true,
+            // ⊤: every type, so nothing to refuse.
+            TypeKind::Type => false,
             // A dense prefix range, and nothing else. A `Refinement` over one is not a
-            // `UIntRange`, so a filtered collection is not admitted — it would be handed
-            // a length witness for a domain with holes.
-            TypeKind::UIntRanges => matches!(ty, Type::UIntRange(_)),
-            // **Membership here is subtyping**, which no structural test answers and which
-            // belongs to the solver: constraint time draws the edge
-            // (`super::infer::solver::constrain`, `constrain_witness_kinds`) rather than
-            // asking this. What is left is the structural answer, for the one caller with no
-            // graph to draw into — the post-coalesce `𝛼 :: 𝐾` discharge. The identity
-            // instance is settled, so an exact match needs no edge at all, and an undecided
-            // bound admits anything until something fixes it.
-            TypeKind::SubtypesOf(k) => &**k == ty || matches!(&**k, Type::Infer(_) | Type::Hole),
-            TypeKind::Enumerated(domains) => domains.contains(ty),
+            // `UIntRange`, so a filtered collection is refused — it would be handed a length
+            // witness for a domain with holes. An unresolved head is the one thing this
+            // cannot read, and it abstains there.
+            TypeKind::UIntRanges => !matches!(
+                ty,
+                Type::UIntRange(_) | Type::Infer(_) | Type::Hole | Type::SharedHole(_)
+            ),
+            // **Membership here is subtyping**, which belongs to the solver: constraint time
+            // draws the edge (`super::infer::solver::constrain`, `constrain_type_kinds`)
+            // rather than asking this. A caller with no graph to draw into therefore has no
+            // answer, and had one anyway before — an exact match, which refuses every strict
+            // subtype the bound admits.
+            TypeKind::SubtypesOf(_) => false,
+            // A candidate list names its members, so membership is type equality — a
+            // candidate *is* a domain and data domains are invariant, so a refined range is a
+            // different candidate from the range it refines. Equality is certain only once
+            // both sides are: an unresolved position on either can still be filled to match.
+            TypeKind::Enumerated(domains) => {
+                !ty.holds_an_unresolved_position()
+                    && !domains.iter().any(Type::holds_an_unresolved_position)
+                    && !domains.contains(ty)
+            }
         }
     }
 }
@@ -1648,19 +1571,19 @@ impl Type {
     /// witness, riding the function that binds it ([`FunKind::Data`]'s slot), and a domain
     /// that is the reference to it.
     ///
-    /// The single place a kind becomes a Σ witness, so it is where the listing's
-    /// non-emptiness is checked.
+    /// The single place a kind classifies a Σ's witness, so it is where a candidate-naming
+    /// kind is checked for having any.
     pub fn sum_over(type_kind: TypeKind, name: Option<crate::ccl::Name>, codomain: Type) -> Type {
-        // An **empty** listing has no domain the witness could be, so `Σ (𝐷 : []). 𝐷 ⤇ 𝑉` is a
-        // collection type nothing inhabits — and it is not caught downstream: it is
+        // **No candidates** leaves the witness no domain it could be, so `Σ (𝐷 : []). 𝐷 ⤇ 𝑉`
+        // is a collection type nothing inhabits — and it is not caught downstream: it is
         // vacuously contained in every kind (a `∀` over no candidates), so it propagates as
-        // a plausible ⊥ instead of failing. Callers that compute a listing must decide what
+        // a plausible ⊥ instead of failing. Callers that compute candidates must decide what
         // an empty result means before building a sum from it.
-        debug_assert!(
+        assert!(
             !matches!(&type_kind, TypeKind::Enumerated(domains) if domains.is_empty()),
-            "a Σ's listed witness type_kind must name at least one domain"
+            "a Σ's witness type_kind names no domain at all"
         );
-        // **The witness ranges over an index, and the listing is what is recorded below
+        // **The witness ranges over an index, and the candidates are what is recorded below
         // it.** A witness whose range is written directly carries no index to be identified
         // by, so two occurrences of it can be compared only by name — and a name is minted
         // per derivation. Behind a variable, an occurrence denotes the index whatever name
@@ -1683,10 +1606,10 @@ impl Type {
     /// renaming are all choices about *which witness*, made before you get here
     /// ([`Witness::mint`], [`Witness::map_types`], or simply reusing one).
     ///
-    /// **The body must mention its witness.** An function whose domain does not records a
-    /// choice nothing can observe. Asserting it here rather than at the boundaries a sum
-    /// crosses is what makes the shape unconstructible — the substitution that used to
-    /// produce one **opens** the function binding the witness it instantiates
+    /// **The body must mention its witness.** A sum whose body does not records a choice
+    /// nothing can observe. Asserting it here rather than at the boundaries a sum crosses is
+    /// what makes the shape unconstructible: the one substitution that could otherwise
+    /// produce it **opens** the function binding the witness it instantiates
     /// ([`WitnessMapping::Discharge`](crate::ccl::subst::WitnessMapping::Discharge))
     /// instead of walking through it.
     pub fn sum_binding(witness: Witness, body: Type) -> Type {
@@ -1706,7 +1629,7 @@ impl Type {
         };
         // One binder per unification class: two nesting levels can materialize the same
         // root — a chooser reached through two identities — and a binder listed twice
-        // binds nothing the first listing does not.
+        // binds nothing the first occurrence does not.
         let root = *witness.id();
         if let Some(rest) = &slot
             && rest.iter().any(|w| *w.id() == root)
@@ -1747,7 +1670,7 @@ impl Type {
     /// The body at a given candidate — `𝐵[𝑑]`: the **outermost** binder dropped from the
     /// slot and its occurrences replaced throughout.
     ///
-    /// Every Σ rule is stated in terms of this: width is
+    /// Every Σ rule is stated in terms of this: subtyping is
     /// `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁. 𝐵₀[𝑑] <: 𝐵₁[𝑒]` and elimination is `∀ 𝑑 ∈ 𝐾. 𝐵[𝑑] <: 𝑈`
     /// (`src/ccl/design/type-inference.md`, "How a sum flows through the solver").
     pub fn instantiate_sum(&self, candidate: &Type) -> Type {
@@ -1800,7 +1723,7 @@ impl Type {
 impl Witness {
     /// The binder a written sum introduces — the only origination, and it happens where a
     /// sum is *built* ([`Type::sum_over`]) or where a kind variable picks its names
-    /// ([`FunKindVar::binders`]). A binder minted anywhere else is a second name for
+    /// ([`FunKindVar::binder_ids`]). A binder minted anywhere else is a second name for
     /// something that already had one.
     pub(crate) fn mint(type_kind: TypeKind) -> Witness {
         Witness {
@@ -2649,22 +2572,22 @@ impl Type {
     /// The type of a **map**: the dependent sum `Σ (𝜎 : SubtypesOf(key)). 𝜎 ⤇ value`.
     ///
     /// Its domain is whichever set of keys the map turned out to hold, and the kind bounds
-    /// that set rather than listing it — so a map keyed by a refined `Int` satisfies a
-    /// demand for one keyed by `Int`, and not conversely
-    /// ([`TypeKind::SubtypesOf`]). Contrast [`list_of`](Self::list_of), whose kind
-    /// *describes* its domains with no parameter, and a conditional collection, whose kind
-    /// *lists* them.
+    /// that set by a type rather than naming its members — so a map keyed by a refined `Int`
+    /// satisfies a demand for one keyed by `Int`, and not conversely
+    /// ([`TypeKind::SubtypesOf`]). Contrast [`list_of`](Self::list_of), whose
+    /// [`UIntRanges`](TypeKind::UIntRanges) takes no parameter, and a conditional collection,
+    /// whose candidates are named.
     pub fn map_of(key: Type, value: Type) -> Self {
         Type::sum_over(TypeKind::SubtypesOf(Box::new(key)), None, value)
     }
 
     /// The type of a **collection**: the dependent sum `Σ (𝐷: Any). 𝐷 ⤇ elem` — a
-    /// *type*-witness of [`TypeKind::Type`] (the universe of domains). Its domain is an
+    /// *type*-witness of [`TypeKind::Type`] (the universe of types). Its domain is an
     /// unknown, unordered, opaque domain, which is what makes it the ⊤ of the kind
     /// order.
     ///
-    /// `Any` is that ⊤ and **nothing more**: it admits every domain, which is what makes
-    /// width-to-top fall out of the ordinary rule instead of needing a row per kind.
+    /// `Type` is that ⊤ and **nothing more**: it admits every type, which is what makes
+    /// the edge to ⊤ fall out of the ordinary rule instead of needing a row per kind.
     ///
     /// Reaching this type is [`Builtin::Box`](crate::ccl::Builtin)-mediated like every
     /// other subtyping edge into a sum: a bare
@@ -2928,12 +2851,43 @@ impl Type {
         Type::Infer(InferVar::fresh(0))
     }
 
+    /// Does this type hold a position nothing has resolved yet?
+    ///
+    /// What a *rejecting* caller must ask before it reads a structural answer: two types that
+    /// differ today can still be resolved to the same one, so refusing on a difference is
+    /// sound only where nothing is left to resolve. [`TypeKind::refuses`] is the caller.
+    ///
+    /// [`crate::ccl::subst::type_contains_infer`] answers the `Infer` half and is the cheaper
+    /// check where that is all a caller wants; this one is the whole of "unresolved", which is
+    /// what certainty needs — see the transient-variant table on [`Type`].
+    ///
+    /// **A refinement counts as unresolved.** Equality compares a predicate, and the
+    /// predicate's own type slots are not reachable from [`walk_children`](Self::walk_children)
+    /// — reading them needs `crate::ccl::ccl_utils::walk_refined_predicates` and its visited
+    /// set. Answering "unresolved" instead abstains, which costs a refusal this has no
+    /// measured caller for and never costs correctness.
+    pub fn holds_an_unresolved_position(&self) -> bool {
+        if matches!(
+            self,
+            Type::Infer(_)
+                | Type::Hole
+                | Type::SharedHole(_)
+                | Type::BoundedHole(_)
+                | Type::Refinement(..)
+        ) {
+            return true;
+        }
+        let mut unresolved = false;
+        self.walk_children(|child| unresolved |= child.holds_an_unresolved_position());
+        unresolved
+    }
+
     /// Invoke `f` on each direct child [`Type`] of this type.
     ///
     /// "Direct child" means a `Type` reachable through this type's value
-    /// fields — the domain and codomain of a `Fun`, the elements of a
-    /// `Tuple` / `Record`, the payloads of a `Variant`, and the base of a
-    /// `Refinement`.
+    /// fields — the domain and codomain of a `Fun` **and the candidate domains of its Σ
+    /// binder kinds**, the elements of a `Tuple` / `Record`, the payloads of a `Variant`, and
+    /// the base of a `Refinement`.
     ///
     /// Does **not** descend into the refinement *predicate* (which is a
     /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
@@ -3376,6 +3330,8 @@ pub fn free_witness_refs(ty: &Type, in_scope: &[WitnessId]) -> Vec<WitnessId> {
             // "is there a sum somewhere above" is what makes this catch the real error:
             // an occurrence sitting under an *unrelated* sum is still free.
             Type::WitnessRef(w) => {
+                // **Bound iff it names a binder in scope.** A reference is a name, so this
+                // is name membership and nothing else.
                 if !scope.contains(w) && !found.contains(w) {
                     found.push(*w);
                 }
@@ -4222,11 +4178,11 @@ mod tests {
             panic!("a sum exemplar must rebuild into a sum, got {rebuilt}");
         };
         // What a witness ranges over is **answered**, not written: its range is an index
-        // variable and the listing is recorded below it ([`Type::sum_over`]).
+        // variable and the candidates are recorded below it ([`Type::sum_over`]).
         assert_eq!(
             w.type_kind(),
             TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
-            "the witness kind carries over"
+            "the witness's type kind carries over"
         );
         assert!(
             matches!(
@@ -4483,30 +4439,39 @@ mod tests {
         Type::UIntRange(n)
     }
 
-    /// Membership is a predicate on **one** type against **one** kind — the whole of what
-    /// a kind decides for itself. Containment *between* two kinds is built from it and
-    /// lives with the solver, which is where an edge can be drawn
-    /// (`crate::ccl::infer::solver::constrain`, `constrain_witness_kinds`).
+    /// Refusal is a predicate on **one** type against **one** kind — the whole of what a kind
+    /// decides for itself, and only the half a rejection may rest on. Containment *between*
+    /// two kinds is built from membership and lives with the solver, which is where an edge
+    /// can be drawn (`crate::ccl::infer::solver::constrain`, `constrain_type_kinds`).
     #[test]
-    fn a_description_admits_the_domains_it_describes() {
-        assert!(TypeKind::UIntRanges.admits(&rng(3)));
-        assert!(!TypeKind::UIntRanges.admits(&Type::DataSource("s".into())));
-        // A refined range is not a range: a filtered collection must not be admitted and
+    fn a_kind_refuses_only_what_it_can_be_certain_of() {
+        assert!(!TypeKind::UIntRanges.refuses(&rng(3)));
+        assert!(TypeKind::UIntRanges.refuses(&Type::DataSource("s".into())));
+        // A refined range is not a range: a filtered collection must be refused rather than
         // handed a length witness for a domain with holes.
         let refined = Type::refined_one(
             rng(3),
             Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
         );
-        assert!(!TypeKind::UIntRanges.admits(&refined));
-        // `Type` is ⊤ and admits every domain.
-        assert!(TypeKind::Type.admits(&Type::DataSource("s".into())));
-        // A **bound** answers structurally here, which is the answer for a caller with no
-        // graph to draw into (the post-coalesce `𝛼 :: 𝐾` discharge). Constraint time never
-        // asks a bound this question — it draws the subtyping edge, so an unfixed key is
-        // determined by the domains that reach it rather than admitting them all.
-        assert!(TypeKind::SubtypesOf(Box::new(Type::Hole)).admits(&rng(3)));
-        assert!(TypeKind::SubtypesOf(Box::new(rng(3))).admits(&rng(3)));
-        assert!(!TypeKind::SubtypesOf(Box::new(rng(3))).admits(&rng(2)));
+        assert!(TypeKind::UIntRanges.refuses(&refined));
+        // An unresolved head is the one thing the range test cannot read, so it abstains.
+        assert!(!TypeKind::UIntRanges.refuses(&Type::Hole));
+        // `Type` is ⊤ and refuses nothing.
+        assert!(!TypeKind::Type.refuses(&Type::DataSource("s".into())));
+        // **A bound refuses nothing.** Its membership question is subtyping, which constraint
+        // time draws as an edge; standing in for that structurally was certain in neither
+        // direction — an exact match admitted an unfixed key's every domain and refused every
+        // strict subtype a fixed one accepts.
+        assert!(!TypeKind::SubtypesOf(Box::new(Type::Hole)).refuses(&rng(3)));
+        assert!(!TypeKind::SubtypesOf(Box::new(rng(3))).refuses(&rng(3)));
+        assert!(!TypeKind::SubtypesOf(Box::new(rng(3))).refuses(&rng(2)));
+        // Candidates are members, so a concrete type absent from a concrete list is refused.
+        assert!(TypeKind::Enumerated(vec![rng(3)]).refuses(&rng(2)));
+        assert!(!TypeKind::Enumerated(vec![rng(3)]).refuses(&rng(3)));
+        // An unresolved position on either side can still be filled to match, so neither is
+        // refused.
+        assert!(!TypeKind::Enumerated(vec![rng(3)]).refuses(&Type::Hole));
+        assert!(!TypeKind::Enumerated(vec![Type::Hole]).refuses(&rng(2)));
     }
 
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
@@ -5130,7 +5095,7 @@ mod witness_subst_tests {
         );
     }
 
-    /// A candidate listed in a nested sum's **kind** is a type in the *outer* scope, so
+    /// A candidate in a nested sum's **kind** is a type in the *outer* scope, so
     /// it may name the outer witness — and substituting the outer binder rewrites it,
     /// while the inner sum's own body is untouched in the same pass.
     #[test]

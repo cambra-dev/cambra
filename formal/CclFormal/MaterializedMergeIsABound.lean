@@ -479,8 +479,7 @@ def DataAgree (pol : Bool) : CompactTy → CompactTy → Bool
           | some (k₁, d₁, cod₁), some (_, d₂, cod₂) =>
             -- **At both polarities**, because the domain merges contravariantly at both:
             -- a positive merge meets the domains too, so the evidence that two `data`
-            -- domains disagreed is gone either way. The old list slot kept both
-            -- alternatives at a positive merge and did not need the hypothesis there.
+            -- domains disagreed is erased either way.
             (if k₁ == KindMerge.data then equiv d₁ d₂ else true)
               -- Both orders, because the function case reads its hypothesis in
               -- both: a `data` slot needs the domain edge each way.
@@ -1337,7 +1336,7 @@ theorem concrete_fun {as : List Atom} {k : KindMerge} {d cod : CompactTy} {c}
   obtain ⟨⟨-, hwf⟩, -⟩ := hw
   obtain ⟨-, hkf⟩ := hk
   simp only [bne_iff_ne, ne_eq] at hwf
-  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hkf
+  simp only [Bool.or_eq_true, beq_iff_eq] at hkf
   refine ⟨?_, ?_, hkf.1.1⟩
   · simp only [concrete, Bool.and_eq_true]
     exact ⟨hwf.1.2, hkf.1.2⟩

@@ -1,6 +1,8 @@
 import Lean.Data.Json
 import CclFormal.Ty
 import CclFormal.Merge
+import CclFormal.TypeKind
+import CclFormal.TypeKindMerge
 
 /-!
 # The wire codec
@@ -269,6 +271,55 @@ end CompactTy
 
 instance : ToJson CompactTy := ⟨CompactTy.toJson⟩
 instance : FromJson CompactTy := ⟨CompactTy.fromJson?⟩
+
+namespace TypeKind
+
+/-- A Σ binder's kind over `Ty`, tagged the same four ways as its compact form. -/
+def toJson : TypeKind → Json
+  | .everyType => Json.mkObj [("k", "everyType")]
+  | .uintRanges => Json.mkObj [("k", "uintRanges")]
+  | .subtypesOf t => Json.mkObj [("k", "subtypesOf"), ("param", Ty.toJson t)]
+  | .candidates ds =>
+      Json.mkObj [("k", "candidates"), ("ds", Json.arr (ds.map Ty.toJson).toArray)]
+
+def fromJson? (j : Json) : Except String TypeKind := do
+  match ← (← j.getObjVal? "k").getStr? with
+  | "everyType" => return .everyType
+  | "uintRanges" => return .uintRanges
+  | "subtypesOf" => return .subtypesOf (← Ty.fromJson? (← j.getObjVal? "param"))
+  | "candidates" =>
+      return .candidates (← (← (← j.getObjVal? "ds").getArr?).toList.mapM Ty.fromJson?)
+  | k => throw s!"unknown TypeKind: {k}"
+
+end TypeKind
+
+instance : ToJson TypeKind := ⟨TypeKind.toJson⟩
+instance : FromJson TypeKind := ⟨TypeKind.fromJson?⟩
+
+namespace CompactTypeKind
+
+/-- A Σ binder's kind, tagged by which of the four it is. The two that name members carry
+them; the two that state a property carry nothing. -/
+def toJson : CompactTypeKind → Json
+  | .everyType => Json.mkObj [("k", "everyType")]
+  | .uintRanges => Json.mkObj [("k", "uintRanges")]
+  | .subtypesOf t => Json.mkObj [("k", "subtypesOf"), ("param", CompactTy.toJson t)]
+  | .candidates ds =>
+      Json.mkObj [("k", "candidates"), ("ds", Json.arr (ds.map CompactTy.toJson).toArray)]
+
+def fromJson? (j : Json) : Except String CompactTypeKind := do
+  match ← (← j.getObjVal? "k").getStr? with
+  | "everyType" => return .everyType
+  | "uintRanges" => return .uintRanges
+  | "subtypesOf" => return .subtypesOf (← CompactTy.fromJson? (← j.getObjVal? "param"))
+  | "candidates" =>
+      return .candidates (← (← (← j.getObjVal? "ds").getArr?).toList.mapM CompactTy.fromJson?)
+  | k => throw s!"unknown CompactTypeKind: {k}"
+
+end CompactTypeKind
+
+instance : ToJson CompactTypeKind := ⟨CompactTypeKind.toJson⟩
+instance : FromJson CompactTypeKind := ⟨CompactTypeKind.fromJson?⟩
 
 /-- Round-trip smoke checks (`BEq`-compared; `beq ↔ eq` is a later step). -/
 private def roundTrips (t : Ty) : Bool :=

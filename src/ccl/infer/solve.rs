@@ -390,31 +390,25 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 codomain: c2,
             },
         ) => {
-            // Two sums agree iff their binders' type kinds agree pairwise, binder by
-            // binder. Listed domains agree pairwise (in order — a sum's listing order is a
-            // materialization contract); a described type kind agrees only with the same
-            // description, having no children to recurse into.
+            // Two sums agree iff their binders' type kinds agree pairwise, binder by binder
+            // — and one kind agrees with another when it is the same kind and their children
+            // agree in order. A kind's children are ordinary types
+            // ([`crate::ccl::ty::TypeKind::children`]), so this is the same relation the rest
+            // of the walk uses, and the order is a materialization contract.
             let slots_agree = k1.witnesses().len() == k2.witnesses().len()
                 && k1.witnesses().iter().zip(k2.witnesses()).all(|(a, b)| {
-                    use crate::ccl::ty::TypeKind::Enumerated;
                     // **Answered, not as written.** A witness ranges over an index
                     // variable ([`crate::ccl::Type::sum_over`]), so the skeleton a bound
                     // determines is what the variable resolves to; comparing the variables
-                    // reports two spellings of one listing as a disagreement.
-                    match (a.type_kind(), b.type_kind()) {
-                        (Enumerated(xs), Enumerated(ys)) => {
-                            xs.len() == ys.len()
-                                && xs
-                                    .iter()
-                                    .zip(ys.iter())
-                                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
-                        }
-                        // A described kind agrees only with the same description; it has
-                        // no children to recurse into.
-                        (x, y) => {
-                            !matches!(x, Enumerated(_)) && !matches!(y, Enumerated(_)) && x == y
-                        }
-                    }
+                    // reports two spellings of one kind as a disagreement.
+                    let (x, y) = (a.type_kind(), b.type_kind());
+                    let blank = |k: &crate::ccl::ty::TypeKind| k.map_children(|_| Type::Hole);
+                    blank(&x) == blank(&y)
+                        && x.children().len() == y.children().len()
+                        && x.children()
+                            .iter()
+                            .zip(y.children())
+                            .all(|(p, q)| types_agree_modulo_unread(p, q, refinements))
                 });
             slots_agree
                 && n1 == n2
@@ -1576,9 +1570,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // which is what an untagged join of alternatives looks like from a bare position. The
     // use is then left var-laden, and the parameter slot is what downstream reads.
     //
-    // Note the standing gap: the pass that used to stamp such a use from its binder
-    // (a whole-tree predicate re-stamp, retired once substitution stopped discarding
-    // types) is gone, so nothing fills the slot afterwards — if this branch ever fires,
+    // Note the standing gap: nothing stamps such a use from its binder afterwards, so if
+    // this branch ever fires,
     // the use reaches the post-inference wall var-laden and is reported there. It does
     // not fire today: no test in the suite reaches it. Whoever makes it reachable owns
     // giving the use a type at the point of the yield.

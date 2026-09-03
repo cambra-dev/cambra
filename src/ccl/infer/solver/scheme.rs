@@ -217,9 +217,17 @@ fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKind
     // **The binders come across renamed**, after the edges that decide the arity. A
     // position the original has settled is named in the bounds being copied, and the copy
     // binds its own name there.
-    for (from, to) in kv.binders().iter().zip(f.binders()) {
-        cache.witnesses.insert(*from.id(), *to.id());
+    for (from, to) in kv.binder_ids().into_iter().zip(f.binder_ids()) {
+        cache.witnesses.insert(from, to);
     }
+    // **And recorded on the copy**, not only in this walk's cache. The cache rewrites the
+    // references this instantiation carries and is then gone; a reference written in the
+    // original's binder that arrives later has nothing to relate it to, since the copy's
+    // relations are freshened and reach the original nowhere. Recorded as a copy rather than
+    // as bounds: what the two share is which binder each position is, not what the kind
+    // resolves to, and the decoupling above is the whole point of the fresh variable.
+    f.copied_from(kv);
+
     f
 }
 
@@ -337,7 +345,7 @@ pub fn freshen_above(
                 name: name.clone(),
                 fun_kind: match fun_kind {
                     // A sum's binder kinds carry type children — the scheme's quantified
-                    // variables sit in the candidate list — so they freshen like any
+                    // variables sit among the candidates — so they freshen like any
                     // other position. The binders themselves are re-minted just below, by
                     // [`Type::alpha_convert_sum`].
                     FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
@@ -427,9 +435,32 @@ pub fn freshen_above(
             // recorded against that scope. The exception is an operator-scheme
             // instantiation, whose template stands nowhere — it takes the use
             // site's telescope instead (see [`FreshenCache::site_telescope`]).
-            let v = InferVar::fresh_in(
+            // **The copy stands over a copy of the original's kind**, registered in the
+            // same cache as the bounds below. A variable's kind carries the edges to the
+            // kinds of the function types that reached it; over a kind the cache does not
+            // know, the copied bounds arrive spelled in *their* copies' binders with
+            // nothing relating those to the copy's own, and a Σ then materializes
+            // declaring one name and referencing another.
+            //
+            // Minted here and related in [`relate_freshened_kind`] after the bounds are
+            // copied, rather than through [`freshen_kind_var`]: that copies a kind's edges
+            // eagerly, and since an edge is recorded on both ends it would pull this
+            // variable's whole undirected component into every instantiation — kinds no
+            // part of this copy names. The edges this copy owes are the ones to kinds the
+            // instantiation actually copied, which is what the cache holds once the bounds
+            // are done.
+            let fun_kind = match cache.fun_kind_vars.get(&tv.fun_kind.uid) {
+                Some(existing) => Rc::clone(existing),
+                None => {
+                    let f = FunKindVar::fresh();
+                    cache.fun_kind_vars.insert(tv.fun_kind.uid, Rc::clone(&f));
+                    f
+                }
+            };
+            let v = InferVar::fresh_over(
                 new_level,
                 cache.site_telescope.as_ref().unwrap_or(&tv.telescope),
+                fun_kind,
             );
             cache.vars.insert(tv.uid, Rc::clone(&v));
 
@@ -479,8 +510,81 @@ pub fn freshen_above(
                 s.set_upper(new_ups);
                 s.type_kinds = new_kinds;
             }
+            cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind);
             freshen_watches(lim, tv, &v, target, cache);
             Type::Infer(v)
+        }
+    }
+}
+
+impl FreshenCache {
+    /// Relate a freshened variable's kind to the copies of what the original's kind was
+    /// related to.
+    ///
+    /// A variable's kind states which positions its bounds' kinds are: a function-shaped
+    /// bound records an edge between the two, and compaction reads those edges to decide
+    /// that a reference in the bound and the position's binder are one binder
+    /// (`src/ccl/infer/solver/compact.rs`). A copy over a kind with none of those edges
+    /// leaves the copied bounds unrelatable to it, and the Σ it materializes declares one
+    /// binder while its domain references another.
+    ///
+    /// **Run once this variable's bounds are copied**, which is when every kind an edge of
+    /// its can reach is in the cache: an edge on a variable's kind is drawn by a
+    /// function-shaped bound *on that variable*, so its far ends are the kinds of the
+    /// bounds just copied.
+    ///
+    /// **Only edges whose far end this instantiation copied.** A kind not in the cache is
+    /// one no type in this copy names, so an edge to it would relate the copy to a position
+    /// outside itself; a *concrete* kind is shared rather than copied
+    /// ([`freshen_fun_kind`]), so it crosses as itself. Carrying every edge instead pulls
+    /// the whole component across, since an edge is recorded on both ends.
+    pub fn relate_kind_copy(&self, original: &Rc<FunKindVar>, copy: &Rc<FunKindVar>) {
+        let copied = |k: &FunKind| match k {
+            FunKind::Var(v) => self
+                .fun_kind_vars
+                .get(&v.uid)
+                .map(|c| FunKind::Var(Rc::clone(c))),
+            concrete => Some(concrete.clone()),
+        };
+        {
+            // **A kind that cannot bind a position has no correspondence to carry.** The
+            // edges say which position of this kind each related kind's binder is, so a
+            // kind binding nothing relates its copy to nothing, and copying its edges only
+            // re-records the component of a graph no binder is ever read from. A consumer's
+            // kind is included on its stamp rather than its arity: it is a collection by
+            // construction ([`FunKind::fresh_data`]) and its width arrives from the
+            // collections that reach it, so it can bind a position without stating one yet.
+            let binds_a_position = original.arity().is_some()
+                || !original.built_over().is_empty()
+                || original.stamped() == crate::ccl::ty::KindPin::Data;
+            if !binds_a_position {
+                return;
+            }
+            if original.stamped() == crate::ccl::ty::KindPin::Data {
+                copy.stamp_data();
+            }
+            for k in original.lower() {
+                if let Some(c) = copied(&k) {
+                    copy.record(c, true);
+                }
+            }
+            for k in original.upper() {
+                if let Some(c) = copied(&k) {
+                    copy.record(c, false);
+                }
+            }
+            for src in original.built_over().into_iter().rev() {
+                if let Some(c) = copied(&src) {
+                    copy.contributes_first(c);
+                }
+            }
+            // **Which binder each position is, recorded on the copy**, as
+            // [`freshen_kind_var`] does: the cache rewrites the references this
+            // instantiation carries and is then gone, so a reference written in the
+            // original's binder that arrives later has nothing else to relate it to. A copy
+            // relation and not an edge — what the two share is which binder each position
+            // is, not what the kind resolves to.
+            copy.copied_from(original);
         }
     }
 }

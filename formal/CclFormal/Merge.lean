@@ -1365,8 +1365,8 @@ def wellFormed : CompactTy → Bool
       && (match f with
           | none => true
           | some (k, d, cod) =>
-            -- One domain is the slot's *type* now, so well-formedness only asks that it be
-            -- well-formed. It used to ask for a singleton list here.
+            -- One domain is the slot's *type*, so well-formedness only asks that it be
+            -- well-formed.
             (k != .conflict) && wellFormed d && wellFormed cod)
       -- The refinement slot's `none` is the merge identity, and `compact_go` gives it
       -- only to the two contributions that are not values: a hole and a bare

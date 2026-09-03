@@ -256,7 +256,7 @@ pub enum Builtin {
     /// no `𝑇 <: Σ` rule, so a sum is never formed by subsumption and a join can never
     /// produce one the program did not write (`src/ccl/design/type-inference.md`,
     /// "Only a term builds a sum"). What makes `box` useful is not the singleton it builds
-    /// but what two of them do at a join: candidate lists union under Σ-width, so
+    /// but what two of them do at a join: candidates union in the kind lattice, so
     /// `box(xs) if c else box(ys)` keeps *both* alternatives where the unboxed
     /// conditional has no upper bound at all.
     ///

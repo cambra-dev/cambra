@@ -111,45 +111,254 @@ impl AtomKey {
 /// types.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactTypeKind {
-    /// A finite listing of candidate domains, compacted and deduplicated by structural
-    /// [`CompactType`] equality. One candidate is an ordinary collection; two or more is a
-    /// conditional collection.
+    /// Finitely many candidate types, named, compacted and deduplicated by structural
+    /// [`CompactType`] equality. At a Σ's witness one candidate is an ordinary collection
+    /// and two or more is a conditional collection.
     Enumerated(Vec<CompactType>),
-    /// Every domain below a type — a `Map`'s key bound. The parameter compacts, which is
-    /// what lets an unannotated key be determined by the domains that reach it.
+    /// Every type below a given one — a `Map`'s key bound. The parameter compacts, which is
+    /// what lets an unannotated key be determined by the types that reach it.
     SubtypesOf(Box<CompactType>),
-    /// Every `UIntRange` — a `List`'s domain kind. Lists no candidates and takes no
-    /// parameter, so there is nothing under it to compact.
+    /// Every `UIntRange`, the kind a `List`'s domain has. It names no candidates and takes
+    /// no parameter, so there is nothing under it to compact.
     UIntRanges,
-    /// Every domain — the top of the kind order, what a `Collection` is summed over.
+    /// Every type — the top of the kind order, what a `Collection`'s witness is summed
+    /// over.
     Type,
 }
 
 impl CompactTypeKind {
-    /// The kind a position ranges over when two contributions meet there.
+    /// Do these two kinds denote the same set? The [`CompactType::equiv`] of a kind: the same
+    /// comparison, reaching the positions a kind carries.
+    fn equiv(&self, other: &CompactTypeKind) -> bool {
+        use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
+        match (self, other) {
+            (Enumerated(a), Enumerated(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.equiv(y))
+            }
+            (SubtypesOf(a), SubtypesOf(b)) => a.equiv(b),
+            (UIntRanges, UIntRanges) | (Universe, Universe) => true,
+            _ => false,
+        }
+    }
+
+    /// What a binder ranges over when two contributions meet at its position — the kind
+    /// order's **⊔** at a positive position and its **⊓** at a negative one.
     ///
-    /// **A listing answers a description.** A description states a property every candidate
-    /// has (`UIntRanges`, `Type`, a bound); a listing names the candidates themselves, so
-    /// where both reach a position the listing is what it ranges over and the description is
-    /// already discharged by it. Two listings *union*: a conditional's arms are alternatives,
-    /// and the position is over whichever the program picked.
+    /// The order is the one the kind premise draws (`constrain_type_kinds`): `Enumerated`
+    /// names its members, so containment is membership per member; `UIntRanges` and `Type` state a
+    /// property of theirs and name none; `SubtypesOf` names them by a type; and everything
+    /// lies in the universe.
+    ///
+    /// **The polarity is the enclosing function's.** A Σ binder is a property of the function
+    /// and not of its domain, so the kind widens as the function does — `Map(𝐾, 𝑉)`'s
+    /// `SubtypesOf(𝐾)` lies below `Collection(𝑉)`'s `Type` for the same reason the map lies
+    /// below the collection — and the premise is drawn unswapped, unlike the domain's.
+    ///
+    /// **Total**, and every row is the bound of the order this lattice actually has. The two
+    /// meets a key bound takes part in are intersections of a named set with a down-set, so
+    /// each is a named set again — a sublist, needing no kind the grammar lacks. Membership in
+    /// the down-set is decided by [`CompactType::is_below`], the order the merge itself
+    /// induces: sound as subtyping and incomplete, which at a negative position errs toward
+    /// the smaller answer.
+    ///
+    /// Least answers per row, both directions, in
+    /// `formal/CclFormal/TypeKindIsALattice.lean`.
+    ///
+    /// A bound whose parameter names **no shape**, read as the kind it is: one naming no
+    /// members.
+    ///
+    /// Whether a candidate lies below an unresolved parameter is unknown, and a lower bound
+    /// admits only what is certain — so the answer is the empty candidate list, the same answer
+    /// the rows that read a parameter give a conflicted one, and for the same reason. It is not
+    /// the universe: `Type ⊓ UIntRanges` is `UIntRanges`, which claims every range lies below
+    /// the parameter, and a parameter resolving to `Int` has none below it. A meet answering
+    /// above its operand is the defect this file already carries one fix for.
+    ///
+    /// **Not an error.** An unresolved parameter is an ordinary mid-inference state — a
+    /// `Map(𝐾, 𝑉)` whose key type nothing has pinned yet — so rejecting it would reject
+    /// programs. A parameter naming *two* shapes is an error, and it stays reportable: this
+    /// leaves it alone, so a lone bound carrying one still materializes as
+    /// `IncompatibleBounds`, and the rows that read a parameter answer the empty kind without
+    /// re-spelling the kind that holds it.
+    ///
+    /// Applied at the meet only, since no join row reads a parameter: they merge it or fold
+    /// candidates into it, and neither loses anything to an unresolved one.
+    fn resolve_bound_naming_no_shape(self) -> CompactTypeKind {
+        match self {
+            CompactTypeKind::SubtypesOf(k) if k.shapes() == 0 => {
+                CompactTypeKind::Enumerated(Vec::new())
+            }
+            names_a_shape => names_a_shape,
+        }
+    }
+
+    /// The kind merge, for the differential oracle (`tests/differential_oracle.rs`).
+    ///
+    /// Same gate as [`CompactType::merge_bounds`] and for the same reason: the feature adds
+    /// this door rather than widening [`merge`](Self::merge)'s own visibility, so the
+    /// production configuration is the ungated one. The oracle is the only thing that compares
+    /// this operation against the model — the polar merge's oracle cannot, since the model's
+    /// compact form has no Σ binder slot to carry a kind.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn merge_kinds(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
+        Self::merge(pol, a, b)
+    }
+
+    /// **A `SubtypesOf` parameter must name exactly one shape**, and the two rows that decide
+    /// a membership read it. The `SubtypesOf`/`SubtypesOf` row writes [`CompactType::merge`],
+    /// which unions contributions rather than reconciling them, so two incomparable parameters
+    /// leave a position denoting no type ([`CompactType::denotes_a_type`]). Read through
+    /// [`CompactType::is_below`] that position absorbs every candidate, since it contains each
+    /// side's atoms — an answer *above* an operand. The meet row answers the empty kind
+    /// instead, which is what that parameter's down-set is.
+    ///
+    /// **A parameter naming no shape is the other end**, and
+    /// [`resolve_bound_naming_no_shape`](Self::resolve_bound_naming_no_shape) answers it before
+    /// any row dispatches — the merge would otherwise erase it, since an unconstrained position
+    /// is the merge's identity, and a bound is not unconstrained just because nothing has
+    /// pinned its parameter yet.
+    ///
+    /// With both ends answered the meet is a lower bound and associative, checked
+    /// exhaustively rather than proved: `formal/CclFormal/TypeKindMerge.lean` runs all 5832
+    /// triples over 18 kinds at both polarities. `kind_glb_assoc` in
+    /// `formal/CclFormal/TypeKindIsALattice.lean` is why associativity was the thing to check —
+    /// it follows from leastness, so losing it located a defect in this procedure rather than
+    /// in the order. No program in the suite reaches any of the three rows.
     fn merge(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
-        use CompactTypeKind::{Enumerated, SubtypesOf, Type as AnyType, UIntRanges};
+        use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
+        let (a, b) = if pol {
+            (a, b)
+        } else {
+            (
+                a.resolve_bound_naming_no_shape(),
+                b.resolve_bound_naming_no_shape(),
+            )
+        };
         match (a, b) {
-            (Enumerated(mut xs), Enumerated(ys)) => {
+            // The order's top: it absorbs a join and imposes nothing on a meet.
+            (Universe, other) | (other, Universe) => {
+                if pol {
+                    Universe
+                } else {
+                    other
+                }
+            }
+            // Candidates are members, so the two directions are set union and set
+            // intersection. An empty intersection is two collections with no domain in
+            // common — a kind admitting nothing, which is what it is.
+            (Enumerated(xs), Enumerated(ys)) => Enumerated(if pol {
+                let mut out = xs;
                 for y in ys {
-                    if !xs.contains(&y) {
-                        xs.push(y);
+                    if !out.contains(&y) {
+                        out.push(y);
                     }
                 }
-                Enumerated(xs)
+                out
+            } else {
+                xs.into_iter().filter(|x| ys.contains(x)).collect()
+            }),
+            // `UIntRanges` names no members, so a join rises to it only when it admits every
+            // candidate — and to the universe when it does not, since nothing between them
+            // holds both. A meet keeps the candidates it admits.
+            (Enumerated(xs), UIntRanges) | (UIntRanges, Enumerated(xs)) => {
+                if pol {
+                    if xs.iter().all(denotes_a_uint_range) {
+                        UIntRanges
+                    } else {
+                        Universe
+                    }
+                } else {
+                    Enumerated(xs.into_iter().filter(denotes_a_uint_range).collect())
+                }
             }
-            (Enumerated(xs), _) | (_, Enumerated(xs)) => Enumerated(xs),
-            (SubtypesOf(x), SubtypesOf(y)) => SubtypesOf(Box::new(CompactType::merge(pol, *x, *y))),
-            // `Type` is the top of the kind order, so it imposes nothing on the other side.
-            (AnyType, other) | (other, AnyType) => other,
-            (SubtypesOf(x), UIntRanges) | (UIntRanges, SubtypesOf(x)) => SubtypesOf(x),
             (UIntRanges, UIntRanges) => UIntRanges,
+            // Two bounds are ordered by their parameters, so this is the parameter's own
+            // merge at this polarity — the reason the parameter is a [`CompactType`].
+            (SubtypesOf(x), SubtypesOf(y)) => SubtypesOf(Box::new(CompactType::merge(pol, *x, *y))),
+            // **A join with a bound is a bound, not the universe.** Every type below the
+            // parameter is below the parameter joined with the candidates, and so is every
+            // candidate; and nothing smaller is above both, since the only kinds above a
+            // bound are the universe and wider bounds
+            // (`formal/CclFormal/TypeKindIsALattice.lean`, `lub_candidates_subtypesOf`).
+            //
+            // Computable because it needs **joins only**. Nothing here decides whether a
+            // candidate lies below the parameter; the join dominates them however they relate
+            // to it, which is what separates this row from its meet
+            // (`glb_candidates_subtypesOf`, and the arm below).
+            //
+            // **The fold is the compact join; the leastness is about subtyping.** Those are
+            // different orders — the compact one is strictly finer ([`CompactType::merge`]'s
+            // order is on representations, not on types) — so what holds here is what already
+            // holds for the `SubtypesOf`/`SubtypesOf` row above: the fold materializes to the
+            // subtyping join where the operands have one, and coalesce reports it where they
+            // do not (`MaterializedMergeIsABound.lean`).
+            //
+            // **Leastness is the whole reason, and it is not that the universe fails to
+            // compile.** Neither answer realizes today: realization splits a conditional on
+            // `Enumerated` candidates and neither a bound nor the universe has any, so the sum
+            // survives either way and op-conversion rejects it by name. What the least answer
+            // buys is the *type* — `Map(𝐾′, 𝑉)` where the universe gives `Collection(𝑉)` — and
+            // since a kind is covariant with the function it kinds, the second is the
+            // supertype. A consumer demanding a keyed collection accepts the first and rejects
+            // the second.
+            (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) if pol => {
+                SubtypesOf(Box::new(
+                    xs.into_iter()
+                        .fold(*k, |acc, x| CompactType::merge(true, acc, x)),
+                ))
+            }
+            // **A bound and `UIntRanges` have only the universe above them.** Anything above
+            // `UIntRanges` is `UIntRanges` or the universe, so the question is whether a bound
+            // is ever below `UIntRanges` — and it is not, for a reason that holds of every
+            // parameter rather than only of an unrelated one: the types below a parameter
+            // include its *refinements*, and a refined range is not a range. That is the
+            // distinction `UIntRanges` exists to draw, since a filtered range has holes and
+            // admitting it would hand a length witness to a domain that lacks one. So the
+            // universe is the only upper bound there is, and hence the least
+            // (`lub_subtypesOf_uintRanges`).
+            //
+            // Not "no kind spells every range below a type": where the parameter is itself a
+            // range, `UIntRange` subtyping is equality and the ranges below it look
+            // spellable. The refinements are what rule it out.
+            (SubtypesOf(_), UIntRanges) | (UIntRanges, SubtypesOf(_)) if pol => Universe,
+            // **A meet with a bound keeps the candidates below the parameter**
+            // (`glb_candidates_subtypesOf`). Membership is decided by the order this merge
+            // induces ([`CompactType::is_below`]), which is what the lattice at this
+            // representation *has*: sound as subtyping, incomplete, and its incompleteness
+            // drops a candidate rather than keeping one it should not — the safe direction for
+            // a lower bound.
+            (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) => {
+                debug_assert!(
+                    k.shapes() > 0,
+                    "resolve_bound_naming_no_shape left a bound whose parameter names no shape"
+                );
+                // **Nothing certain is nothing named**, whether the uncertainty is the
+                // parameter's or a candidate's. A parameter naming two shapes names no type, so
+                // its down-set is empty; a candidate naming none has unknown membership, and a
+                // lower bound answers "no" where it cannot say. An unresolved candidate is
+                // legitimate and the join keeps it — `coalesce_type_kind` deduplicates
+                // candidates *after* materializing, so two spelled as distinct variables become
+                // one once the variables answer.
+                Enumerated(if k.denotes_a_type() {
+                    xs.into_iter()
+                        .filter(|x| x.denotes_a_type() && x.is_below(&k))
+                        .collect()
+                } else {
+                    Vec::new()
+                })
+            }
+            // **A bound meets `UIntRanges` at the ranges below the parameter, and there is at
+            // most one** (`glb_subtypesOf_uintRanges`): `UIntRange` subtyping is equality, so
+            // the only range below the parameter is the parameter. That is a question about
+            // its shape rather than a subtyping search, which is why this row needs nothing
+            // the join did not already have.
+            (SubtypesOf(k), UIntRanges) | (UIntRanges, SubtypesOf(k)) => {
+                Enumerated(if denotes_a_uint_range(&k) {
+                    vec![*k]
+                } else {
+                    Vec::new()
+                })
+            }
         }
     }
 }
@@ -157,10 +366,10 @@ impl CompactTypeKind {
 /// A binder as compaction carries it: **which** binder, and what it ranges over with the
 /// kind's children in the lattice.
 ///
-/// The children are the reason this is not a [`Witness`](crate::ccl::ty::Witness). A
-/// listing's candidates and a bound's parameter are ordinary types the solver resolves, so
-/// they compact at the position that reached them and materialize with everything else; a
-/// `Witness` would carry them as raw `Type`s straight through to the output.
+/// The children are the reason this is not a [`Witness`](crate::ccl::ty::Witness). Candidates
+/// and a key bound's parameter are alike ordinary types the solver resolves, so they compact
+/// at the position that reached them and materialize with everything else; a `Witness` would
+/// carry them as raw `Type`s straight through to the output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactWitness {
     /// Which binder this is — the whole of its identity.
@@ -300,6 +509,22 @@ impl CompactType {
     }
 }
 
+/// Whether this position denotes a **dense prefix range** and nothing else — the property
+/// `UIntRanges` states of its members ([`crate::ccl::ty::TypeKind::refuses`]).
+///
+/// A refinement disqualifies it, as it does at the type level: a filtered range has holes,
+/// and admitting it would hand a length witness to a domain that lacks one. So does an
+/// unresolved variable, which has not said what it is; a join asking "is every candidate a
+/// range" must not read silence as yes.
+fn denotes_a_uint_range(ct: &CompactType) -> bool {
+    let o = ct.occupied();
+    o.atoms == 1
+        && o.fun.is_none()
+        && !o.others
+        && ct.vars.is_empty()
+        && ct.atoms.iter().all(|a| matches!(a, AtomKey::UIntRange(_)))
+}
+
 /// The domains a compacted **data**-function domain position denotes, as types.
 ///
 /// [`CompactType::merge`] unions atom sets. At a scalar position that is the only
@@ -315,11 +540,11 @@ impl CompactType {
 /// then the atoms really are a collision. Variables do not disqualify it; compaction
 /// has already folded their bounds in.
 ///
-/// This is the single reading of a domain position. Both consumers need it: coalesce
-/// materializes the alternatives as a sum's candidates, and
-/// [`meet_witness_kinds`] tests them for membership in a witness kind. When the two
-/// disagreed — one accepting several atoms, the other only one — a conditional
-/// collection reaching a `List`-annotated parameter was rejected.
+/// This is the single reading of a domain position, and both consumers take it from here:
+/// coalesce materializes the alternatives as a sum's candidates, and [`CompactFun::merge`]
+/// reads them to decide whether two domains had to be combined. Two readings would let one
+/// accept several atoms where the other saw one, and a position is either several domains or
+/// one at both.
 pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
     let o = ct.occupied();
     // A witness atom denotes no domain *set*: it is one domain, the one the witness
@@ -332,8 +557,6 @@ pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
     bare_atoms.then(|| ct.atoms.iter().map(|a| a.to_type()).collect())
 }
 
-/// Whether these **types** denote more than one domain — the [`denotes_several_domains`]
-/// reading, applied after a merge has put both sides in one position.
 /// Whether a contravariant meet of two **data** domains had to combine anything — which is
 /// two domains meeting, not one domain reached twice.
 ///
@@ -362,6 +585,8 @@ fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
     a.refinements != b.refinements || a.atoms != b.atoms || keys(a) != keys(b)
 }
 
+/// Whether these **types** denote more than one domain — [`denoted_domains`]'s reading,
+/// applied after a merge has put both sides in one position.
 fn denotes_several_domains_ty(ds: &[Type]) -> bool {
     let mut seen: Vec<&Type> = Vec::new();
     for d in ds {
@@ -372,48 +597,43 @@ fn denotes_several_domains_ty(ds: &[Type]) -> bool {
     seen.len() > 1
 }
 
-/// The binders a **position** is over, from the kind of the variable it stands at.
-///
-/// A join of collections is over its own index, not over either arm's: the variable holds
-/// both below its kind, so the kind's arity is what they agree on and its positions are what
-/// each arm's binder corresponds to. The lowest-numbered variable answers, so the position
-/// gives one answer however many variables were merged into it.
-///
-/// Identity only. What the position ranges over is the merge of what reached it
-/// ([`merge_binders`]), which is a lattice operation and not a question for the kind graph.
-fn position_binders(vars: &BTreeSet<InferVarId>) -> Option<Vec<crate::ccl::ty::WitnessId>> {
-    let v = vars.iter().min().and_then(crate::ccl::infer_var::lookup)?;
-    let binders = v.fun_kind.binders();
-    (!binders.is_empty()).then(|| binders.iter().map(|w| *w.id()).collect())
-}
-
-/// The binders of a merged position: the position's own identity, over the merge of what
-/// each side said it ranges over.
+/// The binders of a merged position: one of the spellings that arrived, over the merge of
+/// what each side said it ranges over.
 ///
 /// Position `i` against position `i`, because that is what a kind edge relates. A side with
 /// no binders is a plain collection meeting a sum and contributes nothing to range over.
-fn merge_binders(
-    pol: bool,
-    a: &[CompactWitness],
-    b: &[CompactWitness],
-    position: Option<Vec<crate::ccl::ty::WitnessId>>,
-) -> Vec<CompactWitness> {
+///
+/// **The least of the two spellings**, which is the rule the *occurrence* resolution uses
+/// for the same position (`super::coalesce::coalesce_compact_go`), so a merged Σ declares
+/// the binder its own domain references. Answering from anything else names a binder no
+/// occurrence spells: a name is chosen here, and nothing renames the references afterwards.
+/// The choice is a min over the sides rather than a first-wins so that a fold over several
+/// bounds gives one answer whatever order they merge in (`tests/constraint_order_fuzz.rs`).
+///
+/// Two sides are two spellings of one binder, not two binders: they meet at this position
+/// because a kind edge relates them, and which of their names a type keeps is the
+/// α-invariance the comparison model already absorbs.
+///
+/// **Unequal widths align at the front and nothing depends on it.** Two sums related by an
+/// edge are two spellings of one collection and so are over the same number of positions;
+/// two of different width are a `KindPin::Conflict` on the `kind` computed beside this, and
+/// coalesce reports that before it reads a binder. So the surplus positions of the longer
+/// side pass through unmerged rather than being paired with a position that is not theirs.
+fn merge_binders(pol: bool, a: &[CompactWitness], b: &[CompactWitness]) -> Vec<CompactWitness> {
     let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     longer
         .iter()
         .enumerate()
-        .map(|(i, w)| CompactWitness {
-            id: position
-                .as_ref()
-                .and_then(|p| p.get(i))
-                .cloned()
-                .unwrap_or(w.id),
-            type_kind: match shorter.get(i) {
-                Some(other) => {
-                    CompactTypeKind::merge(pol, w.type_kind.clone(), other.type_kind.clone())
-                }
-                None => w.type_kind.clone(),
+        .map(|(i, w)| match shorter.get(i) {
+            Some(other) => CompactWitness {
+                id: w.id.min(other.id),
+                type_kind: CompactTypeKind::merge(
+                    pol,
+                    w.type_kind.clone(),
+                    other.type_kind.clone(),
+                ),
             },
+            None => w.clone(),
         })
         .collect()
 }
@@ -421,12 +641,7 @@ fn merge_binders(
 impl CompactFun {
     /// Merge two function slots. `pol` is the *outer* polarity; the domain merges
     /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
-    fn merge(
-        pol: bool,
-        a: CompactFun,
-        b: CompactFun,
-        position: Option<Vec<crate::ccl::ty::WitnessId>>,
-    ) -> CompactFun {
+    fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
         let name = a.name.clone().or_else(|| b.name.clone());
         let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
         // The domain merges **contravariantly** and as one ordinary position — there is no
@@ -464,14 +679,8 @@ impl CompactFun {
                     .then(|| CombinedDomains::new((*a.domain).clone(), (*b.domain).clone()))
             });
         let kind = a.kind.clone().join(b.kind.clone());
-        // **The binders belong to the position, not to either side.** Two collections
-        // meeting here are a *join*, and what the join is over is the kind of the variable
-        // they met at — which holds both of them below it, so its binders are one per index
-        // and correspond to each side's. Taking one side's instead would answer with
-        // whichever arm happened to arrive first.
-        //
-        // A position with no variable is one type reached once: it keeps its own.
-        let binders = merge_binders(pol, &a.binders, &b.binders, position);
+        let binders = merge_binders(pol, &a.binders, &b.binders);
+
         // A domain disagreement is a fact about the **domains**, so it is recorded beside
         // the kind rather than inside it: the kind still says what the function is, and the
         // flag says the arms are over data that has no common answer.
@@ -668,6 +877,174 @@ impl CompactType {
         Self::merge(pol, lhs, rhs)
     }
 
+    /// How many **shapes** this position names: an atom, a record, a variant, an arrow, a
+    /// history.
+    ///
+    /// [`coalesce_compact_go`](super::coalesce) materializes a position from exactly one of
+    /// them and reports two as `CoalesceError::IncompatibleBounds` at either polarity, because
+    /// the merge unions contributions rather than reconciling them.
+    ///
+    /// **Every witness atom is one shape between them**, not one each. A reference resolves
+    /// against the enclosing scope rather than against its neighbours, so several names at one
+    /// position are one index and the rest are spellings from the routes it arrived by — the
+    /// position materializes as a single `Type::WitnessRef`. Two names *both* in scope is a
+    /// real conflict, and `CoalesceError::WitnessScope` reports it there, where the scope is
+    /// known; counting them here instead would read a re-spelled domain as a conflict.
+    ///
+    /// Two more things that look like a second shape are not. Refinements ride the one shape
+    /// there is, so `{Int | p}` names one; and a disagreeing pair of data domains sits inside
+    /// the arrow, which materializes as a Σ over the operands rather than as an error.
+    fn shapes(&self) -> usize {
+        let CompactType {
+            vars: _,
+            kinds: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements: _,
+            history_slot,
+        } = self;
+        let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
+        atoms.iter().filter(|a| !is_witness(a)).count()
+            + usize::from(atoms.iter().any(|a| is_witness(&a)))
+            + usize::from(rec.is_some())
+            + usize::from(var.is_some())
+            + usize::from(fun.is_some())
+            + usize::from(history_slot.is_some())
+    }
+
+    /// Does this position, or any below it, name two shapes where coalesce admits one?
+    fn conflicted(&self) -> bool {
+        self.shapes() > 1
+            || self.rec.iter().flatten().any(|(_, t)| t.conflicted())
+            || self
+                .var
+                .iter()
+                .flat_map(|v| v.tags.values())
+                .any(Self::conflicted)
+            || self
+                .fun
+                .as_ref()
+                .is_some_and(|f| f.domain.conflicted() || f.codomain.conflicted())
+            || self
+                .history_slot
+                .as_ref()
+                .is_some_and(|(v, d, _)| v.conflicted() || d.conflicted())
+    }
+
+    /// Does this position name a type? Exactly one shape here, and no conflict below.
+    ///
+    /// **Zero shapes is not a type either.** An unconstrained position imposes nothing, which
+    /// is the merge's identity rather than a type — `merge` leaves it untouched at either
+    /// polarity — and coalesce materializes it as an unresolved [`Type::Infer`], or reports
+    /// `UnresolvedInfer` where not even a variable remains.
+    ///
+    /// A *child* may name zero: a record field nothing has constrained materializes as that
+    /// `Infer` and the record is a type all the same. Only a conflict below disqualifies one,
+    /// which is why the recursion asks [`conflicted`](Self::conflicted) and not this.
+    pub(super) fn denotes_a_type(&self) -> bool {
+        self.shapes() == 1 && !self.conflicted()
+    }
+
+    /// Is `self` **below** `other` in the order this merge induces — `self ⊔ other ≡ other`?
+    ///
+    /// Sound as a subtyping test and incomplete: absorption implies the two materialize to
+    /// subtypes (`formal/CclFormal/MaterializedMergeIsABound.lean`, `coalesce_monotone_record`
+    /// and its siblings), while two positions can materialize to one type and absorb neither
+    /// the other — a positive merge accumulates a function slot's domain alternatives rather
+    /// than deciding between them. Incompleteness is the safe direction wherever this decides
+    /// membership at a *negative* position: it answers "no" where the truth is unknown, which
+    /// shrinks a lower bound rather than growing it.
+    ///
+    /// **Both operands must name a type** ([`denotes_a_type`](Self::denotes_a_type)), and each
+    /// way of failing that answers wrongly rather than imprecisely. A position naming two
+    /// shapes contains each side's atoms, so every `self` absorbs into it. A position naming
+    /// none is the merge's identity, so it absorbs into every `other` — this reads it as ⊥,
+    /// which is its denotation at a *positive* position and not at the negative one where a
+    /// meet reads it. Callers establish the precondition; the assertion states it.
+    ///
+    /// Judged by [`equiv`](Self::equiv) and not `==`, because the merge unions `vars`: a
+    /// structural comparison would ask that `self` carry no variable `other` lacks, which is
+    /// a fact about the route each was reached by and not about the types.
+    pub(super) fn is_below(&self, other: &CompactType) -> bool {
+        debug_assert!(
+            self.denotes_a_type() && other.denotes_a_type(),
+            "is_below reads both operands as types at a fixed polarity: a position naming two \
+             shapes absorbs every candidate, and one naming none absorbs into every parameter"
+        );
+        CompactType::merge(true, self.clone(), other.clone()).equiv(other)
+    }
+
+    /// Do these two positions denote the same thing?
+    ///
+    /// `PartialEq` is structural and asks more than denotation does. Three slots are excluded
+    /// and each for its own reason:
+    ///
+    /// * `vars` — by the time the domain lattice reads a position, compaction has folded every
+    ///   variable's bounds into the other slots ([`occupied`](Self::occupied) drops them for
+    ///   the same reason). Which variables were walked to get here is a fact about the route.
+    /// * `kinds` — a kinding constraint is a condition on what the position resolves to, not a
+    ///   part of what it denotes.
+    /// * `combined` on a function slot — the two domains that had no common answer, kept for
+    ///   the diagnostic. `domains_disagree` beside it is the fact; this is the payload.
+    ///
+    /// Everything else compares structurally, which for the set- and map-backed slots is
+    /// already denotational. That leaves the relaxation minimal, and a too-strict equivalence
+    /// only makes [`is_below`](Self::is_below) answer "no" more often.
+    pub(super) fn equiv(&self, other: &CompactType) -> bool {
+        let CompactType {
+            vars: _,
+            kinds: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements,
+            history_slot,
+        } = self;
+        // `atoms` and `refinements` hold no position, so structural equality on those is
+        // already denotational — the first is a `BTreeSet` and the second a set of terms.
+        // Every slot that *does* hold one recurses, or the excluded `vars` would come back
+        // one level down.
+        let keyed = |x: &BTreeMap<FieldKey, CompactType>, y: &BTreeMap<FieldKey, CompactType>| {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| v.equiv(w)))
+        };
+        atoms == &other.atoms
+            && refinements == &other.refinements
+            && match (rec, &other.rec) {
+                (None, None) => true,
+                (Some(x), Some(y)) => keyed(x, y),
+                _ => false,
+            }
+            && match (var, &other.var) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.openness == b.openness && keyed(&a.tags, &b.tags),
+                _ => false,
+            }
+            && match (history_slot, &other.history_slot) {
+                (None, None) => true,
+                (Some((v, d, k)), Some((v2, d2, k2))) => k == k2 && v.equiv(v2) && d.equiv(d2),
+                _ => false,
+            }
+            && match (fun, &other.fun) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.name == b.name
+                        && a.kind == b.kind
+                        && a.domains_disagree == b.domains_disagree
+                        && a.binders.len() == b.binders.len()
+                        && a.binders
+                            .iter()
+                            .zip(&b.binders)
+                            .all(|(x, y)| x.id == y.id && x.type_kind.equiv(&y.type_kind))
+                        && a.domain.equiv(&b.domain)
+                        && a.codomain.equiv(&b.codomain)
+                }
+                _ => false,
+            }
+    }
+
     /// Merge two CompactTypes at the given polarity.
     ///
     /// - `vars`, `atoms`: union (always).
@@ -726,7 +1103,7 @@ impl CompactType {
         };
         let fun = match (lhs.fun, rhs.fun) {
             (None, f) | (f, None) => f,
-            (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b, position_binders(&vars))),
+            (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b)),
         };
         let refinements = match (lhs.refinements, rhs.refinements) {
             // `None` is the identity, exactly as for the shape slots above.
@@ -1129,8 +1506,101 @@ struct CompactState {
     scope: RefinementScope,
 }
 
-/// A witness [`TypeKind`] as a [`CompactTypeKind`]: listed candidates decomposed into the
-/// lattice, a description carried whole. The one conversion, so a kind reaching the
+/// What the binder at `position` of a kind **variable** ranges over, derived here from the
+/// relations the kind graph records.
+///
+/// Compaction is the one place a kind is merged, so this is where a variable's binder is
+/// answered too: it combines with [`CompactTypeKind::merge`], the same lattice a position
+/// meeting another uses, and compacts each concrete witness's kind once at the polarity a
+/// candidate takes. Answering it on [`crate::ccl::ty::FunKindVar`] instead put a second
+/// lattice beside this one, and the two then differ by whatever each did.
+///
+/// Three relations reach a binder and they are not the same relation:
+///
+/// * **Built over** — a comprehension binds one position per position of each generator, so
+///   its arity is their sum and one source *owns* each position. The range is that source's
+///   at its own offset, not a merge of everything at the same numeric position.
+/// * **Below** — a collection that flowed in contributes its own candidates, and several
+///   arriving is a conditional collection over all of them.
+/// * **Above** — a demand says what the position must satisfy rather than what it ranges
+///   over, so it answers only where nothing arrived. Merging it in would widen a position to
+///   whatever a consumer accepts; answering nothing leaves the consumer's own containment
+///   check with no candidates to check. **Read, never continued through**: what a demand
+///   states is a fact about this position, but its own lowers are the *other* collections
+///   reaching that consumer, which are siblings of this one rather than more of it. A demand
+///   that is a variable therefore answers nothing, since a variable states no range.
+///   `a_source_shared_between_two_joins_keeps_the_joins_apart` is the program that rule
+///   keeps apart.
+fn var_binder_kind(
+    k: &Rc<crate::ccl::ty::FunKindVar>,
+    position: usize,
+    pol: bool,
+    subst_acc: &Subst,
+    st: &mut CompactState,
+    seen: &mut Vec<crate::ccl::ty::FunKindVarId>,
+) -> Option<CompactTypeKind> {
+    if seen.contains(&k.uid) {
+        return None;
+    }
+    seen.push(k.uid);
+    let mut offset = 0;
+    for src in k.built_over() {
+        let n = src.arity().unwrap_or(0);
+        if position < offset + n {
+            return kind_at(&src, position - offset, pol, true, subst_acc, st, seen);
+        }
+        offset += n;
+    }
+    // **Which list decides the lattice operation, not where the position sits.** Everything
+    // in `lower` is below this kind, so combining them is a join at either polarity, and
+    // everything in `upper` is above it, so combining those is a meet. Reducing a list at
+    // the *position's* polarity instead intersected the arms of a conditional at every
+    // negative position — two collections below one kind are a conditional over both, so
+    // their candidate sets union, and a negative occurrence of that kind does not turn the
+    // union into the empty kind, which admits no type at all.
+    let merged = |ks: Vec<crate::ccl::ty::FunKind>,
+                  joining: bool,
+                  through: bool,
+                  st: &mut CompactState,
+                  seen: &mut _| {
+        ks.iter()
+            .filter_map(|f| kind_at(f, position, pol, through, subst_acc, st, seen))
+            .reduce(|a, b| CompactTypeKind::merge(joining, a, b))
+    };
+    merged(k.lower(), true, true, st, seen).or_else(|| merged(k.upper(), false, false, st, seen))
+}
+
+/// The same question of one kind, concrete or variable — a concrete kind states its binders,
+/// a variable derives them from the relations it is in ([`var_binder_kind`]), where
+/// `through` permits it.
+fn kind_at(
+    f: &crate::ccl::ty::FunKind,
+    position: usize,
+    pol: bool,
+    through: bool,
+    subst_acc: &Subst,
+    st: &mut CompactState,
+    seen: &mut Vec<crate::ccl::ty::FunKindVarId>,
+) -> Option<CompactTypeKind> {
+    match f {
+        // A variable states no range of its own, so `through` decides whether this asks the
+        // relations it is in. Off — at a demand — it answers nothing rather than the other
+        // collections that reach the consumer (see [`var_binder_kind`], *Above*).
+        crate::ccl::ty::FunKind::Var(v) if through => {
+            var_binder_kind(v, position, pol, subst_acc, st, seen)
+        }
+        crate::ccl::ty::FunKind::Var(_) => None,
+        // A candidate takes the *kind's* polarity: it is a member of the kind's set, and the
+        // set is covariant with the function it kinds.
+        other => other
+            .witnesses()
+            .get(position)
+            .map(|w| compact_type_kind(&w.type_kind(), pol, subst_acc, st)),
+    }
+}
+
+/// A [`TypeKind`] as a [`CompactTypeKind`]: every type it carries decomposed into the
+/// lattice, the kind itself crossing as itself. The one conversion, so a kind reaching the
 /// carrier as a Σ's witness and one reaching it as a *kinding constraint* on a free
 /// witness become the same thing — which is what lets binding read either.
 fn compact_type_kind(
@@ -1140,9 +1610,9 @@ fn compact_type_kind(
     st: &mut CompactState,
 ) -> CompactTypeKind {
     use crate::ccl::ty::TypeKind;
-    // Variant for variant: every type a kind carries — a listing's candidates, a bound's
-    // parameter — is a position, so it compacts like one. A kind that carries no type has
-    // nothing to decompose and crosses as itself.
+    // Variant for variant: every type a kind carries — a candidate, a key bound's parameter
+    // — is a position, so it compacts like one. A kind that carries no type has nothing to
+    // decompose and crosses as itself.
     match type_kind {
         TypeKind::Enumerated(domains) => CompactTypeKind::Enumerated(
             domains
@@ -1158,16 +1628,6 @@ fn compact_type_kind(
     }
 }
 
-/// `acc` extended with the **binder correspondence** this kind states.
-///
-/// A kind variable's binders are the positions on it, and everything recorded below it is a
-/// collection whose binders correspond to those positions one for one. So a reference to an
-/// arm's binder, reaching a consumer, denotes the consumer's — and the map that says so is
-/// derivable here and nowhere earlier: it needs an arity, and an arity is what the bounds
-/// answer once the kind graph is closed.
-///
-/// Composed into the accumulated substitution exactly as a Pi binder's rename is, so every
-/// bound the walk records below this function is already spelled in this kind's binders.
 /// Every kind variable's binder correspondence, one per line. Diagnostic only — the
 /// substitution half of [`crate::ccl::ty::dump_kind_vars`], which shows only the edges.
 #[cfg(debug_assertions)]
@@ -1184,6 +1644,16 @@ pub fn dump_kind_correspondences() -> String {
     out
 }
 
+/// `acc` extended with the **binder correspondence** this kind states.
+///
+/// A kind variable's binders are the positions on it, and everything recorded below it is a
+/// collection whose binders correspond to those positions one for one. So a reference to an
+/// arm's binder, reaching a consumer, denotes the consumer's — and the map that says so is
+/// derivable here and nowhere earlier: it needs an arity, and an arity is what the bounds
+/// answer once the kind graph is closed.
+///
+/// Composed into the accumulated substitution exactly as a Pi binder's rename is, so every
+/// bound the walk records below this function is already spelled in this kind's binders.
 fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> Subst {
     let crate::ccl::ty::FunKind::Var(k) = fun_kind else {
         return acc.clone();
@@ -1195,60 +1665,67 @@ fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> S
     // reference already renamed by an outer hop has to be carried on by this one. Inserting
     // leaves the outer entry pointing at a name this hop has since moved, so a chain
     // resolves to its first hop and the walk answers with an intermediate spelling.
-    let mut hop = Subst::id();
     // A **bound** relates two spellings of one collection, so position *i* is position *i*;
     // a **source** contributes its positions to a stretch of this kind's, so the offset
-    // walks. Both at any depth: a binder corresponds to this kind's whether it reached it
-    // directly or through another variable, and only the ends of such a chain are ever
-    // spelled in a type — the middle is a kind nothing writes.
-    // This kind's own binders, picked once — every rename below targets one of them.
-    let mine = k.binders();
-    // **Both directions.** A bound relates position `i` to position `i` whichever way it was
-    // drawn, so which side a kind was recorded on says nothing about whether its binders
-    // correspond to this one's. (Unlike [`FunKindVar::binder_kind`], where the direction is
-    // the whole point: an upper bound is a *demand*, so it says what a position must satisfy
-    // rather than what reached it.)
-    let mut stack: Vec<(crate::ccl::ty::FunKind, usize)> = k
-        .lower()
-        .into_iter()
-        .chain(k.upper())
-        .map(|l| (l, 0))
-        .collect();
-    let mut offset = 0;
-    for src in k.built_over() {
-        let n = src.arity().unwrap_or(0);
-        stack.push((src, offset));
-        offset += n;
-    }
-    // **One hop.** A correspondence is what the relations *this* kind is in state, and
-    // nothing further: composition across a chain belongs to the walk, which crosses each
-    // kind in turn and composes that kind's own correspondence as it goes.
+    // walks.
     //
-    // Flattening the chain into one map states true things about binders several hops away —
-    // and a binder that far off may be *owned* elsewhere, by a written sum whose occurrences
-    // also sit outside whatever region a caller is rewriting. Renaming it there is a
-    // half-finished α-conversion. Restricting to one hop is what keeps the map applicable
-    // wherever the correspondence holds rather than only at the one position that happens to
-    // scope over every name in it.
-    while let Some((below, at)) = stack.pop() {
-        for (i, w) in below.named_binders().iter().enumerate() {
+    // This kind's own binders, picked once — every rename below targets one of them.
+    let mine = k.binder_ids();
+    // **Downward without limit, upward one hop.** A spelling reaching this position can be
+    // several relations away: a filter over a conditional whose arms are themselves
+    // comprehensions puts the arm's source three hops below the consumer — built over the
+    // join, which holds the arms, each built over its own source — and a reference to that
+    // source arrives at this position spelled in the source's binder. Every hop downward
+    // says the same thing, that what flowed in is this position's index, so following them
+    // to the end is the same statement repeated rather than a new one.
+    //
+    // Closing over the whole *component* is what does not work, and the direction is why:
+    // an edge is recorded on both ends, so expanding upward as well yields `σ_a → σ_b` at
+    // one kind and `σ_b → σ_a` at another, and which applies depends on where the walk
+    // stands. `built_over` and `lower` are both directed away from this kind, so their
+    // closure stays a function onto `mine`. A demand above is read and not continued
+    // through, for the reason [`var_binder_kind`] gives under *Above*: the kinds below a
+    // consumer are the other collections reaching it, siblings of this one rather than more
+    // of it.
+    let push_below = |stack: &mut Vec<(crate::ccl::ty::FunKind, usize, bool)>,
+                      k: &Rc<crate::ccl::ty::FunKindVar>,
+                      at: usize| {
+        for l in k.lower() {
+            stack.push((l, at, true));
+        }
+        let mut offset = at;
+        for src in k.built_over() {
+            let n = src.arity().unwrap_or(0);
+            stack.push((src, offset, true));
+            offset += n;
+        }
+    };
+    let mut stack: Vec<(crate::ccl::ty::FunKind, usize, bool)> =
+        k.upper().into_iter().map(|u| (u, 0, false)).collect();
+    push_below(&mut stack, k, 0);
+    let mut seen: Vec<crate::ccl::ty::FunKindVarId> = vec![k.uid];
+    let mut hop = Subst::id();
+    while let Some((below, at, expand)) = stack.pop() {
+        if let crate::ccl::ty::FunKind::Var(v) = &below
+            && expand
+            && !seen.contains(&v.uid)
+        {
+            seen.push(v.uid);
+            push_below(&mut stack, v, at);
+        }
+        for (i, id) in below.binder_ids().into_iter().enumerate() {
             if at + i >= arity {
                 break;
             }
             let Some(mine) = mine.get(at + i) else {
                 break;
             };
-            if w.id() != mine.id() {
-                hop = hop.extended_witness_rename(w.id(), mine.id());
+            if id != *mine {
+                hop = hop.extended_witness_rename(&id, mine);
             }
         }
     }
-    // **A binder shadows the accumulated substitution below the function that binds it**,
-    // exactly as the Pi binder does on the codomain. An outer entry keyed on one of `mine`
-    // says how this binder is spelled in a kind it corresponds to, which is a fact about the
-    // name outside; below, the name denotes the binder.
-    let ids: Vec<crate::ccl::ty::WitnessId> = mine.iter().map(|w| *w.id()).collect();
-    Subst::then(&acc.shadow_witnesses(&ids), &hop)
+    Subst::then(&acc.shadow_witnesses(&mine), &hop)
 }
 
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
@@ -1372,32 +1849,62 @@ fn compact_go(
             // arrived in. Recovering the list from what landed in the domain instead reads
             // the shape of a position rather than the fact the kind states, and answers a
             // multi-generator comprehension from the arity of its index tuple. Which *name*
-            // each position answers to is settled at materialization, where every reference
-            // to it has merged (`super::coalesce::named_by_domain`).
+            // each position answers to is settled at materialization, where a reference is
+            // resolved against the binders in scope (`super::coalesce::coalesce_compact_go`).
             //
             // Substituted for the same reason the domain is: an enclosing kind's
             // correspondence renames a reference in the body, and the binder it refers to
             // moves with it or the function binds a name its body no longer spells.
             //
-            // **The kind's children compact here**, at the polarity and under the
-            // substitution the walk reached this function with. They are candidate *domains*,
-            // so they take the domain's polarity, and a candidate carrying a refinement needs
-            // the same accumulated discharges the domain does.
-            let binders: Vec<CompactWitness> = fun_kind
-                .named_binders()
-                .iter()
-                .map(|w| {
-                    // The binder keeps what it ranges over; only its **name** moves.
-                    let id = match subst_acc.apply_witnesses(&Type::WitnessRef(*w.id())) {
-                        Type::WitnessRef(x) => x,
-                        _ => *w.id(),
-                    };
-                    CompactWitness {
-                        id,
-                        type_kind: compact_type_kind(&w.type_kind(), !pol, subst_acc, st),
-                    }
-                })
-                .collect();
+            // **The kind's children compact here**, at the kind's own polarity and under the
+            // substitution the walk reached this function with. A candidate is a *member of
+            // the kind's set*, not a type in the domain position: the set is covariant with
+            // the function, as the Σ rule has it (`Map(𝐾, 𝑉)`'s kind lies below
+            // `Collection(𝑉)`'s for the same reason the map lies below the collection), so a
+            // candidate takes the kind's polarity and not the domain's flipped one. A
+            // candidate carrying a refinement still needs the accumulated discharges.
+            // Only the **name** moves under the walk's substitution; what a binder ranges
+            // over is not a name.
+            let moved = |id: crate::ccl::ty::WitnessId| match subst_acc
+                .apply_witnesses(&Type::WitnessRef(id))
+            {
+                Type::WitnessRef(x) => x,
+                _ => id,
+            };
+            let binders: Vec<CompactWitness> = match fun_kind {
+                // **A width claimed is a width ranged.** A variable states no binders of its
+                // own, so both its positions and what each ranges over come from the
+                // relations it is in — and this materializes a sum only where those answer
+                // every position. An arity is pinned by whatever reached the kind, a demand
+                // from *above* among it, and a consumer asking to read something as a
+                // width-`n` sum does not make it one ([`crate::ccl::ty::FunKind::admits_sum`]
+                // declines the same claim for the same reason). Materializing the positions
+                // it does answer would put a binder count in the type that no relation
+                // supports; the alternatives at an unanswered position are the universe,
+                // which types it `Collection(𝑉)` and loses the extent, and an empty
+                // candidate set, which is `Σ (σ : []). σ ⤇ 𝑉` — a type nothing inhabits and
+                // one [`crate::ccl::Type::sum_over`] refuses to build.
+                crate::ccl::ty::FunKind::Var(v) => fun_kind
+                    .binder_ids()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        Some(CompactWitness {
+                            id: moved(id),
+                            type_kind: var_binder_kind(v, i, pol, subst_acc, st, &mut Vec::new())?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default(),
+                stated => stated
+                    .witnesses()
+                    .iter()
+                    .map(|w| CompactWitness {
+                        id: moved(*w.id()),
+                        type_kind: compact_type_kind(&w.type_kind(), pol, subst_acc, st),
+                    })
+                    .collect(),
+            };
             CompactType {
                 fun: Some(CompactFun {
                     // **Compute or data, never which index.** A slot carrying binders is a

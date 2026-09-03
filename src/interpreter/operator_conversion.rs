@@ -465,8 +465,8 @@ impl OpConversionContext {
             // An **unrealized sum**, rejected by name rather than through the catch-all
             // below. Realization erases the sums whose witness is statically enumerable
             // (`src/ccl/planning/conditionals.rs`), so one reaching here ranges over
-            // domains no fan-out could list — a described witness kind, `List(T)` or
-            // `Collection(T)` — and what it needs is the runtime witness
+            // domains no fan-out could name — a `List(T)`'s `UIntRanges` or a
+            // `Collection(T)`'s universe — and what it needs is the runtime witness
             // (`src/ccl/design/collections.md`, "Compiling a conditional collection"). That is an unimplemented
             // capability, so it must not be reported as a compiler bug; `planning::iterate`
             // and `planning::conditionals` both leave such a type standing for this arm.

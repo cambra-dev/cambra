@@ -63,9 +63,6 @@ use super::*;
 /// iteration without an upstream input is [`Builtin::Iterate`].  Any
 /// other input-less term reaching op-conversion (after this pass) is a
 /// planner bug.
-// `WitnessId` hashes on `(spelling, uid, position)`; the `RefCell` a `Pending`
-// reaches through its kind variable is never read to key this set.
-#[allow(clippy::mutable_key_type)]
 pub(crate) fn insert_iterate_markers(
     expr: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -103,9 +100,6 @@ pub(crate) fn insert_iterate_markers(
 /// with the body composed onto it).  Structural recursion covers the
 /// rest of the tree — every iteration site reachable from the program
 /// root is reached.
-// `WitnessId` hashes on `(spelling, uid, position)`; the `RefCell` a `Pending`
-// reaches through its kind variable is never read to key this set.
-#[allow(clippy::mutable_key_type)]
 pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -315,9 +309,6 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
 /// `site` names the consumer whose operand this is — the assert that the site is already a
 /// collection reports it, and which consumer lost a kind is the whole content of that
 /// report. Every caller names its own; there is no unlabelled one.
-// `WitnessId` hashes on `(spelling, uid, position)`; the `RefCell` a `Pending`
-// reaches through its kind variable is never read to key this set.
-#[allow(clippy::mutable_key_type)]
 pub(super) fn wrap_with_iterate(
     expr: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -392,9 +383,10 @@ pub(super) fn wrap_with_iterate(
         if all_witnesses_realized(&domain_ty, discharged) {
             return;
         }
-        // Otherwise nothing materialized this witness — a described kind, needing the
-        // runtime witness — and falling through hands it to `extent_of`, which rejects it
-        // by name rather than dropping the restriction silently.
+        // Otherwise nothing materialized this witness — its kind names no candidate to
+        // realize, so it needs the runtime witness — and falling through hands it to
+        // `extent_of`, which rejects it by name rather than dropping the restriction
+        // silently.
         if !matches!(domain_ty, Type::Refinement(..)) {
             return;
         }
@@ -556,9 +548,6 @@ fn head_of(expr: &Expr) -> &Expr {
 ///
 /// **Every** one, because a domain naming two witnesses is iterable only once both have an
 /// extent — one realized and one not is still a witness short.
-// `WitnessId` hashes on `(spelling, uid, position)`; the `RefCell` a `Pending`
-// reaches through its kind variable is never read to key this set.
-#[allow(clippy::mutable_key_type)]
 fn all_witnesses_realized(
     domain: &Type,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -658,11 +647,9 @@ mod tests {
     /// and must be declined there, because its domain is the witness rather than an
     /// extent.
     ///
-    /// The decline has to be deliberate. It used to happen by accident: `Type::domain`
-    /// answered `None` for a sum, so the site returned early under a comment reading
-    /// "non-function expressions can't be iterated" — about something that *is* a
-    /// function. Now the domain is answered and the witness is what says stop, so this
-    /// pins the reason rather than the symptom.
+    /// The decline has to be deliberate: a sum *is* a function and answers a domain, so
+    /// what says stop is the undetermined witness. This pins that reason rather than the
+    /// symptom, which an early return on a missing domain would also produce.
     #[test]
     fn an_undetermined_witness_is_not_an_iteration_source() {
         let int = Type::Base(BaseType::Int);

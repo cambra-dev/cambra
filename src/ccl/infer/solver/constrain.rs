@@ -214,13 +214,6 @@ pub enum Derivation {
 }
 
 impl Derivation {
-    /// Whether this derivation is the solve, where an edge *records*. Every other one is a
-    /// **check** over a settled tree: it reconciles two spellings and writes nothing, so its
-    /// answers cannot depend on the order the walls run in.
-    pub(super) fn is_live(self) -> bool {
-        self == Derivation::LiveSolve
-    }
-
     /// Whether every binder a reference in this derivation's types names is one the walk can
     /// enter — so a reference Γ does not classify is **free**.
     ///
@@ -347,9 +340,76 @@ pub fn constrain_subtype_under(
     rhs_binders: &[crate::ccl::ty::Witness],
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
+    // **The right side's binders are instantiated by the left.** A caller relating a value
+    // to a shape written over binders — an application's argument against the domain it
+    // lands in — is instantiating those binders, and the instance is the left side. Reading
+    // the instantiation off the two types is what puts both sides in one spelling, so the
+    // reference comparison below is name equality rather than two unrelated names.
+    let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
     cache.under(lhs_binders, rhs_binders, |cache| {
-        constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
+        constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache)
     })
+}
+
+/// The renaming that instantiates `pattern`'s binders from `instance`, by walking the two
+/// together: wherever the pattern names one of `binders`, the instance says what it is.
+///
+/// Structural and partial. A position the two do not share contributes nothing — the
+/// comparison then reports the disagreement it is there to report — and a binder the pattern
+/// never names is left alone, since nothing instantiated it.
+fn witness_instantiation(
+    pattern: &Type,
+    instance: &Type,
+    binders: &[crate::ccl::ty::Witness],
+) -> Subst {
+    fn go(pattern: &Type, instance: &Type, binders: &[crate::ccl::ty::WitnessId], out: &mut Subst) {
+        if let Type::WitnessRef(p) = pattern {
+            if binders.contains(p)
+                && let Type::WitnessRef(i) = instance
+                && p != i
+            {
+                *out = out.extended_witness_rename(p, i);
+            }
+            return;
+        }
+        // One frame per constructor pair, so only positions the two share are visited.
+        match (pattern, instance) {
+            (
+                Type::Fun {
+                    domain: pd,
+                    codomain: pc,
+                    ..
+                },
+                Type::Fun {
+                    domain: id,
+                    codomain: ic,
+                    ..
+                },
+            ) => {
+                go(pd, id, binders, out);
+                go(pc, ic, binders, out);
+            }
+            (Type::Tuple(ps), Type::Tuple(is)) => {
+                for (p, i) in ps.iter().zip(is) {
+                    go(p, i, binders, out);
+                }
+            }
+            (Type::Record(ps), Type::Record(is)) => {
+                for (name, p) in ps {
+                    if let Some((_, i)) = is.iter().find(|(n, _)| n == name) {
+                        go(p, i, binders, out);
+                    }
+                }
+            }
+            (Type::Refinement(pb, _), _) => go(pb, instance, binders, out),
+            (_, Type::Refinement(ib, _)) => go(pattern, ib, binders, out),
+            _ => {}
+        }
+    }
+    let ids: Vec<crate::ccl::ty::WitnessId> = binders.iter().map(|w| *w.id()).collect();
+    let mut out = Subst::id();
+    go(pattern, instance, &ids, &mut out);
+    out
 }
 
 /// Relate two function kinds by **recording the edge**, and nothing else.
@@ -389,7 +449,7 @@ fn constrain_fun_kind(
         // Both concrete: a capability is not a collection, a plain collection is not a sum —
         // entering one is a term — and two sums of different width are two types. Nothing
         // arriving later can change any of that.
-        _ if k0.point() == k1.point() => return Ok(()),
+        _ if k0.resolved() == k1.resolved() => return Ok(()),
         _ => return Err(mismatch()),
     }
     // **A kind required to be two points is rejected at the edge that completed it.** A
@@ -599,18 +659,24 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
     None
 }
 
-/// Discharge `𝛼 :: 𝐾` against everything recorded below `𝛼`.
+/// Answer each type kind recorded on `𝛼` against everything recorded below it.
 ///
-/// A kinding edge is answerable the moment its *type* side is known, and a variable's
-/// lower bounds are where a type arrives at it. So this runs where a lower is recorded and
-/// where a kind is, and asks the same question from both — whichever arrives second is the
-/// one that completes the pair.
+/// A kinding edge is answerable the moment its *type* side is known, and a variable's lower
+/// bounds are where a type arrives at it. So this runs where a lower is recorded and where a
+/// kind is, and asks the same question from both — whichever arrives second is the one that
+/// completes the pair.
 ///
 /// A lower that is itself a variable **inherits** the edge rather than answering it. The
 /// constraint is a conjunction with no polarity of its own (`src/ccl/design/type-inference.md`,
-/// "An unresolved candidate becomes a kinding edge"), so it travels down every path a
-/// type could arrive by, and is answered wherever one does.
-pub(super) fn discharge_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> {
+/// "An unresolved candidate becomes a kinding edge"), so it travels down every path a type
+/// could arrive by, and is answered wherever one does.
+///
+/// **The peel finds the variable; the kind reads the type whole.** Refinements come off to see
+/// whether a lower is a variable, because a kind recorded on `{𝛼 | 𝑝}` is a demand on `𝛼`. The
+/// membership question is a different one and gets the unpeeled type, since a refined type is
+/// not the type it refines (`candidate_in_kind` says the same of a candidate) — one scrutinee
+/// answering both is how a refined range came to pass here and be refused at coalesce.
+pub(super) fn answer_type_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> {
     let (lows, kinds) = {
         let b = v.bounds.borrow();
         (Rc::clone(b.lower()), b.type_kinds.clone())
@@ -627,11 +693,11 @@ pub(super) fn discharge_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> {
                         b.type_kinds.push(k.clone());
                     }
                 }
-                // `admits` decides against a stated kind and records against a variable
-                // one, so both answers are reached the same way.
-                t if !k.admits(t) => {
+                // Only a *certain* non-member is an error: the kind abstains wherever the
+                // type is still open, and this runs while types are arriving.
+                _ if k.refuses(&low.ty) => {
                     return Err(ConstrainError::NotOfKind {
-                        found: t.clone(),
+                        found: low.ty.clone(),
                         type_kind: k.clone(),
                     });
                 }
@@ -642,21 +708,22 @@ pub(super) fn discharge_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> {
     Ok(())
 }
 
-/// The **kind premise** of the Σ rule: is every domain `sub` admits also admitted by `sup`?
+/// The **kind premise** of the Σ rule: is every type `sub` admits also admitted by `sup`?
 ///
-/// A kind denotes a set of domains, and containment is that inclusion — no variance and no
-/// per-flavour case. What differs between kinds is only how each *names* its set, and that
-/// is what decides whether a membership question is answered here or drawn as an edge
-/// ([`domain_in_kind`]).
+/// A type kind is a type of types, and containment holds when every type `sub` classifies
+/// `sup` classifies too — no variance, and no case per pair. What differs between the four is
+/// only how each *states* which types it classifies, and that is
+/// what decides whether a membership question is answered here or drawn as an edge
+/// ([`candidate_in_kind`]).
 ///
 /// **Both sides' fun kinds must state a type kind**, which is why the caller asks
-/// [`FunKind::sum_binders`] rather than reading one off a variable. A fun kind variable
-/// states none: [`crate::ccl::ty::FunKindVar::binder_kind`] derives one from what has
-/// reached the variable so far, and that answer moves as the solve proceeds — it widens as
-/// arms arrive, and *narrows* the moment the first arm displaces the demand-above fallback.
-/// A verdict against it would depend on when the edge was drawn. This is the same reason
-/// [`constrain_fun_kind`] records against a variable instead of deciding.
-fn constrain_witness_kinds(
+/// [`FunKind::sum_binders`] rather than reading one off a variable. A fun kind variable states
+/// none, and deriving one from what has reached the variable so far gives an answer that moves
+/// as the solve proceeds — it widens as arms arrive, and narrows the moment the first arm
+/// displaces a demand from above. A verdict against it would depend on when the edge was
+/// drawn. This is the same reason [`constrain_fun_kind`] records against a variable instead of
+/// deciding.
+fn constrain_type_kinds(
     sub: &TypeKind,
     sup: &TypeKind,
     sl: &Subst,
@@ -670,12 +737,12 @@ fn constrain_witness_kinds(
         rhs: rhs.clone(),
     };
     match (sub, sup) {
-        // ⊤ admits every domain, so nothing is left to ask.
+        // The universe admits every domain, so nothing is left to ask.
         (_, TypeKind::Type) => Ok(()),
-        // A listing names its members, so containment is membership, once per member.
+        // Candidates are members, so containment is membership, once per member.
         (TypeKind::Enumerated(subs), _) => {
             for d in subs {
-                domain_in_kind(d, sup, sl, sr, lhs, rhs, cache)?;
+                candidate_in_kind(d, sup, sl, sr, lhs, rhs, cache)?;
             }
             Ok(())
         }
@@ -684,34 +751,37 @@ fn constrain_witness_kinds(
         // what determines an unannotated `b`.
         (TypeKind::SubtypesOf(a), TypeKind::SubtypesOf(b)) => constrain_go(a, b, sl, sr, cache),
         (TypeKind::UIntRanges, TypeKind::UIntRanges) => Ok(()),
-        // A description names no members to enumerate, so nothing below it is known to lie
-        // in a listing or in a narrower description.
-        _ => Err(mismatch()),
+        // A kind that names no members offers none to place in the kind above it, so nothing
+        // relates it upward: the universe, every `UIntRange`, and every type below a key
+        // type name three incomparable sets, and none of them sits inside a set of named
+        // candidates.
+        (TypeKind::Type | TypeKind::UIntRanges | TypeKind::SubtypesOf(_), _) => Err(mismatch()),
     }
 }
 
-/// Is `d` — one candidate of a listing — a member of `sup`?
+/// Is `d` — one candidate of `sub` — a member of `sup`?
 ///
-/// Three answers, one per way a kind names its set:
+/// One answer per type kind, because how each states which types it classifies is what the
+/// question turns on:
 ///
-/// * A **listing** names its members, so membership is type equality. A candidate *is* a
-///   domain and data domains are invariant ([Data domains are
+/// * [`TypeKind::Enumerated`] names its members, so membership is type equality. A candidate
+///   *is* a domain and data domains are invariant ([Data domains are
 ///   invariant](`src/ccl/design/type-inference.md`)), so a refined range is a different
 ///   candidate from the range it refines, in either direction.
-/// * A **bound** describes its members by a type, so membership is an ordinary subtyping
-///   edge — and the parameter is the one place information can flow *in*, which is what
-///   lets `Map(_, 𝑉)` take its key from the domains that reach it. Deciding this
+/// * [`TypeKind::SubtypesOf`] names its members by a type, so membership is an ordinary
+///   subtyping edge — and the parameter is the one place information can flow *in*, which is
+///   what lets `Map(_, 𝑉)` take its key from the domains that reach it. Deciding this
 ///   structurally instead would answer "an undecided bound admits anything" and the key
 ///   would be determined by nothing.
-/// * A **parameterless description** states a property of its members, which is
-///   [`TypeKind::admits`] — asked on `d` whole, since a refined domain is not the domain it
-///   refines.
+/// * [`TypeKind::UIntRanges`] and [`TypeKind::Type`] state a property of their members and
+///   name none, so membership is structural — [`TypeKind::refuses`], asked on `d` whole,
+///   since a refined type is not the type it refines.
 ///
-/// A candidate that is still a **variable** has no shape for a description to read, so it
-/// takes the kinding edge `𝛼 :: 𝐾` and is answered wherever a type reaches it
-/// ([`discharge_kinds`]).
+/// A candidate that is still a **variable** has no shape to read a property off, so it takes
+/// the kinding edge `𝛼 :: 𝐾` and is answered wherever a type reaches it
+/// ([`answer_type_kinds`]).
 #[allow(clippy::too_many_arguments)]
-fn domain_in_kind(
+fn candidate_in_kind(
     d: &Type,
     sup: &TypeKind,
     sl: &Subst,
@@ -727,68 +797,23 @@ fn domain_in_kind(
             lhs: lhs.clone(),
             rhs: rhs.clone(),
         }),
-        described => match d {
+        TypeKind::UIntRanges | TypeKind::Type => match d {
             Type::Infer(v) => {
                 {
                     let mut b = v.bounds.borrow_mut();
-                    if !b.type_kinds.contains(described) {
-                        b.type_kinds.push(described.clone());
+                    if !b.type_kinds.contains(sup) {
+                        b.type_kinds.push(sup.clone());
                     }
                 }
-                discharge_kinds(v)
+                answer_type_kinds(v)
             }
-            _ if described.admits(d) => Ok(()),
-            _ => Err(ConstrainError::NotOfKind {
+            _ if sup.refuses(d) => Err(ConstrainError::NotOfKind {
                 found: d.clone(),
-                type_kind: described.clone(),
+                type_kind: sup.clone(),
             }),
+            _ => Ok(()),
         },
     }
-}
-
-/// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
-/// both mapping into the constraint's shared ambient frame.
-///
-/// Both are `Subst::id()` for ordinary monomorphic constraints — in which
-/// case every arm below reduces exactly to the substitution-free solver.
-/// Non-identity morphisms are *derived* when constraining two function types
-/// whose codomains mention their binders (the Pi-vs-Pi arm mints the binder
-/// correspondence, recorded on the lhs side) or introduced by a dependent
-/// application's discharge riding a closure step.
-///
-/// Edge-storage convention: bounds are recorded in their **native two-sided
-/// form** (see [`Bound`]) — an upper entry on `V` is `V‹self_subst› <:
-/// ty‹ty_subst›`, a lower entry `ty‹ty_subst› <: V‹self_subst›` — with *no
-/// inversion at record time*. The transitive closure recovers a previously
-/// recorded edge's forward morphism by reading it directly, reconciling the
-/// two entries' holder views via `bridge_holder_gap` and composing forward;
-/// the only inversions anywhere are of renames (lossless).
-/// This is what lets a non-invertible discharge survive crossing a consumer
-/// edge that was recorded before the producer's content arrived.
-/// Do two witness kinds list the same candidates, **resolved**?
-///
-/// What an index *is* is what it ranges over, and a candidate is an ordinary type: a scheme
-/// instantiation spells one as an inference variable, so one binder reaching a check by two
-/// routes carries its kind under two spellings — `[?25]` at one occurrence and `[[0, 2]]` at
-/// another. Comparing the spellings answers that a binder differs from itself.
-///
-/// Deduplicated after resolving, and ordered canonically, for the reason materialization does
-/// both: a listing is a **set**, and two candidates spelled as distinct variables are one
-/// candidate once the variables answer.
-fn same_candidates(a: &TypeKind, b: &TypeKind) -> bool {
-    fn resolved(k: &TypeKind) -> TypeKind {
-        let TypeKind::Enumerated(candidates) = k else {
-            return k.clone();
-        };
-        let mut out: Vec<Type> = candidates
-            .iter()
-            .map(|c| crate::ccl::infer::solve::resolve_var_type(c).unwrap_or_else(|_| c.clone()))
-            .collect();
-        out.sort_by_cached_key(ToString::to_string);
-        out.dedup();
-        TypeKind::Enumerated(out)
-    }
-    resolved(a) == resolved(b)
 }
 
 fn constrain_go(
@@ -902,37 +927,39 @@ fn constrain_go_impl(
             //
             // What each side's fun kind states, so one that has not resolved to a sum
             // states nothing and the edge is the ordinary function rule.
-            // **The Σ-width premise**, per binder position. Asked of the type kinds the two
-            // fun kinds *state* — a variable states none, and a verdict against a derived
-            // type kind would
-            // depend on when the edge was drawn ([`constrain_witness_kinds`]). Live only:
-            // after inference an edge reconciles two spellings of a settled tree and
-            // records nothing, and the witness comparison there is already the α-blind
-            // candidate check (`src/ccl/design/type-inference.md`, "A check is α-blind").
-            if cache.derivation.is_live()
-                && let (Some(w0), Some(w1)) = (k0.sum_binders(), k1.sum_binders())
-            {
+            // **The kind premise**, per binder position, at every derivation. Asked of the
+            // type kinds the two fun kinds *state* — a variable states none, and a verdict
+            // against a derived type kind would depend on when the edge was drawn
+            // ([`constrain_type_kinds`]).
+            //
+            // A check runs the same rule as the solve, because a check that asks a weaker
+            // question is not checking. Containment needs nothing recorded to answer
+            // between two settled kinds: the arms that would record take a variable, and a
+            // settled tree has none. What a check must not do is *decide* a kind, and this
+            // does not — it reads what each side states.
+            if let (Some(w0), Some(w1)) = (k0.sum_binders(), k1.sum_binders()) {
                 for (a, b) in w0.iter().zip(w1.iter()) {
-                    constrain_witness_kinds(
-                        &a.type_kind(),
-                        &b.type_kind(),
-                        sl,
-                        sr,
-                        lhs,
-                        rhs,
-                        cache,
-                    )?;
+                    constrain_type_kinds(&a.type_kind(), &b.type_kind(), sl, sr, lhs, rhs, cache)?;
                 }
             }
             let corresponding;
             let sl = {
-                let (b0, b1) = (k0.named_binders(), k1.named_binders());
+                // **Identities, so a variable-kinded consumer gets a correspondence too.**
+                // The consumer of a sum is a sum ("Consuming a sum: pinning the consumer's
+                // kind"), but its kind is a variable that states no *range* until compaction
+                // derives one — while its binder identities exist from the moment its arity
+                // does. Asking for stated binders here leaves a variable contributing none,
+                // no rename is drawn, and the domain premise then compares an arm's witness
+                // against the consumer's raw domain as though the two were one domain rather
+                // than corresponding binders of two sums.
+                let (b0, b1) = (k0.binder_ids(), k1.binder_ids());
                 if b0.is_empty() || b1.is_empty() {
                     sl
                 } else {
-                    corresponding = b0.iter().zip(b1.iter()).fold(sl.clone(), |acc, (a, b)| {
-                        acc.extended_witness_rename(a.id(), b.id())
-                    });
+                    corresponding = b0
+                        .iter()
+                        .zip(b1.iter())
+                        .fold(sl.clone(), |acc, (a, b)| acc.extended_witness_rename(a, b));
                     &corresponding
                 }
             };
@@ -940,7 +967,7 @@ fn constrain_go_impl(
             // the position. A kind nothing has reached yet is not known to be a collection,
             // and the reverse obligation a variable's domain owes is discharged where every
             // contribution to it meets.
-            let invariant_domains = k0.point().is_data() || k1.point().is_data();
+            let invariant_domains = k0.resolved().is_data() || k1.resolved().is_data();
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
@@ -1055,7 +1082,7 @@ fn constrain_go_impl(
         }
 
         // (Two sums are related by the function arm above and nothing else: the width
-        // premise rides it as [`constrain_witness_kinds`], and there is no arm that enters a
+        // premise rides it as [`constrain_type_kinds`], and there is no arm that enters a
         // sum (a sum is introduced by `box`, a term) or eliminates one (a sum reaches a
         // consumer by pinning its kind variable, never by subsumption) —
         // `src/ccl/design/type-inference.md`, "Subtyping for sums". No arm here dispatches
@@ -1112,13 +1139,13 @@ fn constrain_go_impl(
         // exactly as a Pi binder's does. Reaching here uncorresponded is two domains where
         // one was demanded.
         //
-        // **A check is α-blind** (`src/ccl/design/type-inference.md`, "A check is
-        // α-blind"). After inference an edge reconciles two spellings of a settled tree and
-        // records nothing, and two derivations of one consumption need not have agreed on a
-        // name: a comprehension's result binds its own index and the collection it iterates
-        // binds that collection's, and the two are one index. So a check asks what a name
-        // asks *for* — the candidates the reference ranges over — while the live solve, which
-        // is what makes the choice, asks identity.
+        // **One rule for the solve and the check**
+        // (`src/ccl/design/type-inference.md`, "One rule for the solve and the check").
+        // Two derivations of one consumption need not have
+        // agreed on a name — a comprehension's result binds its own index and the collection
+        // it iterates binds that collection's, and the two are one index — so the
+        // correspondence is what brings them into one spelling, and the comparison is
+        // identity either side of inference.
         (Type::WitnessRef(a), Type::WitnessRef(b)) => {
             let (a, b) = (
                 sl.apply_witnesses(&Type::WitnessRef(*a)),
@@ -1129,22 +1156,19 @@ fn constrain_go_impl(
             };
             // **Each side's own Γ classifies its own reference.** A reference is a name, so
             // what it ranges over is read where it is bound.
-            let same = if cache.derivation.is_live() {
-                a == b
-            } else {
-                a == b
-                    || match (cache.lctx.type_kind_of(a), cache.rctx.type_kind_of(b)) {
-                        (Some(ka), Some(kb)) => same_candidates(&ka, &kb),
-                        // A reference Γ does not classify has no kind to compare. Over a
-                        // whole tree that means it is free, which the escape check reports
-                        // on the type it sits in. Over a **sub-tree** the binder may be in
-                        // the context the cut removed — a Σ-typed lambda's parameter is a
-                        // bare reference bound by the lambda's own type — so the probe has
-                        // no verdict to give and gives none
-                        // ([`Derivation::sees_every_binder`]).
-                        _ => !cache.derivation.sees_every_binder(),
-                    }
-            };
+            // **Two references are one index when they are one name**, at every derivation.
+            // The comparison runs under the correspondence its caller established — the
+            // Fun/Fun arm's rename between two Σs, [`witness_instantiation`]'s where a value
+            // meets a shape written over binders — so both sides arrive in one spelling and
+            // nothing is left for this to reconcile.
+            //
+            // A **sub-tree** probe is the one abstention: a binder its refinements reference
+            // may be held by the context the cut removed, so Γ classifies neither reference
+            // and the probe has no verdict to give ([`Derivation::sees_every_binder`]).
+            let same = a == b
+                || (!cache.derivation.sees_every_binder()
+                    && (cache.lctx.type_kind_of(a).is_none()
+                        || cache.rctx.type_kind_of(b).is_none()));
             if same {
                 Ok(())
             } else {
@@ -1157,11 +1181,11 @@ fn constrain_go_impl(
 
         // **A concrete type meeting a witness constrains every candidate.** The witness
         // is one of its kind's domains and the choice is not the demand's to make, so the
-        // demand must hold whichever it is: one invariant edge per listed candidate.
-        // Invariance is what rejects the silent narrowing — two distinct candidates
-        // cannot both equal the demand — and a singleton listing is the ordinary edge to
-        // its sole domain, with no cardinality read anywhere. A described kind lists
-        // nothing to instantiate at and is a mismatch. A variable is not a concrete
+        // demand must hold whichever it is: one invariant edge per candidate. Invariance
+        // is what rejects the silent narrowing — two distinct candidates cannot both equal
+        // the demand — and a sole candidate is the ordinary edge to its domain, with no
+        // cardinality read anywhere. A kind naming no candidate offers nothing to
+        // instantiate at and is a mismatch. A variable is not a concrete
         // type: it falls through to the variable arms below, and the reference lands in
         // its bounds like any other leaf.
         (Type::WitnessRef(w), other) | (other, Type::WitnessRef(w))
@@ -1174,7 +1198,7 @@ fn constrain_go_impl(
                 &cache.rctx
             };
             // **A candidate that has not resolved carries the demand itself.** It is an
-            // ordinary inference variable sitting in the listing (`[?25]`), so the edges
+            // ordinary inference variable sitting among the candidates (`[?25]`), so the edges
             // below record against it like any other bound, and what the position ends up
             // ranging over has to admit this type. There is nothing to defer and nowhere
             // separate to defer it to.
@@ -1294,6 +1318,14 @@ fn constrain_go_impl(
                 // nobody consults, so nothing here dispatches on what the variable will turn
                 // out to be.
                 if let Some(k) = rhs.fun_kind_of() {
+                    // **Both ends, because the relation is symmetric.** A kind related to
+                    // this one is reachable from either side or from neither: recording only
+                    // here leaves a walk that arrives at the far end unable to get back, and
+                    // two kinds at one position then rename onto their own binders with
+                    // nothing composing the two.
+                    if let FunKind::Var(other) = &k {
+                        other.record(FunKind::Var(Rc::clone(&lv.fun_kind)), true);
+                    }
                     lv.fun_kind.record(k, false);
                 }
                 lows
@@ -1350,12 +1382,16 @@ fn constrain_go_impl(
                 let ups = Rc::clone(s.upper());
                 drop(s);
                 if let Some(k) = lhs.fun_kind_of() {
+                    // Both ends, as above.
+                    if let FunKind::Var(other) = &k {
+                        other.record(FunKind::Var(Rc::clone(&rv.fun_kind)), false);
+                    }
                     rv.fun_kind.record(k, true);
                 }
                 ups
             };
             // The arriving type may be the answer to a kinding edge this variable holds.
-            discharge_kinds(rv)?;
+            answer_type_kinds(rv)?;
             // No join here, and none is needed: a candidate arriving at a variable that
             // already holds others reaches the joining arm above when *its* own outgoing
             // edge is drawn, and a variable's denotation is read from its lower bounds
@@ -1647,7 +1683,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             name: name.clone(),
             // A sum's **candidates** are an invariant position, so they cross a level
             // boundary through two-way proxies rather than the polar one-way
-            // approximation — the same reason a `History` payload does. Σ-width matches
+            // approximation — the same reason a `History` payload does. The kind premise matches
             // candidates *by value*, so neither direction of a candidate's bounds is the
             // "unused" one: a one-way proxy inherits whichever side the polarity picked
             // and silently drops the other, which for a candidate is usually fatal.
@@ -2074,7 +2110,7 @@ mod tests {
     }
 
     /// A factored pairing is a data-function edge, so it inherits domain invariance
-    /// (`src/ccl/design/type-inference.md`, "The width rule"): a refined range and the
+    /// (`src/ccl/design/type-inference.md`, "The Σ rule"): a refined range and the
     /// bare range pair in neither direction — the plain data functions do not relate
     /// either (`a_data_domain_relates_only_to_itself`).
     #[test]
@@ -3116,7 +3152,7 @@ mod tests {
 
     // ----- FunKind edge (`Data` and `Compute` are incomparable) -----------
 
-    // --- Conditional-collection Sigma rules (subtyping: width; consumption:
+    // --- Conditional-collection Sigma rules (subtyping: the Σ rule; consumption:
     //     consume) — see `design/type-inference.md`, "4.6 Data vs compute functions" ---
 
     /// The sum over `domains` — `Σ (𝐷 : [domains]). 𝐷 ⤇ Int`, what materializing a merged
@@ -3131,7 +3167,8 @@ mod tests {
     /// every domain below the refinement is below `Int`. The converse is not a subtype —
     /// a domain below `Int` need not satisfy the refinement.
     ///
-    /// Contrast [`conditional_width_is_subtype`], where the kinds *list* their domains and
+    /// Contrast [`conditional_is_subtype_by_candidate_subset`], where the kinds *list* their
+    /// domains and
     /// containment is a pairing: here nothing is enumerated and the containment is one
     /// covariant edge on the bounds.
     #[test]
@@ -3150,12 +3187,12 @@ mod tests {
     }
 
     /// **A map's key type is inferred from the domains that reach it.** Two boxed
-    /// collections joined by a conditional are a sum over a *listing*; passing that where a
-    /// `Map(?k, V)` is demanded relates the listing to `SubtypesOf(?k)`, and the
+    /// collections joined by a conditional are a sum over named candidates; passing that
+    /// where a `Map(?k, V)` is demanded relates those candidates to `SubtypesOf(?k)`, and the
     /// containment is one edge per candidate — so both domains land below `?k` and the key
     /// is determined by what was joined rather than annotated.
     ///
-    /// The listing/pairing rule cannot do this: it pairs each candidate *invariantly*
+    /// The candidate-pairing rule cannot do this: it pairs each candidate *invariantly*
     /// against one of the other kind's, so an unannotated key would have to equal both
     /// domains at once and nothing would flow into it.
     #[test]
@@ -3168,7 +3205,7 @@ mod tests {
         let joined = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
         let demand = Type::map_of(key, prim(BaseType::Int));
         constrain_subtype(&joined, &demand, &mut ConstrainCache::new())
-            .expect("a listing of domains lies below a bound nothing has fixed");
+            .expect("named domains lie below a bound nothing has fixed");
         let lows = Rc::clone(kv.bounds.borrow().lower());
         let rendered: Vec<String> = lows
             .iter()
@@ -3182,24 +3219,24 @@ mod tests {
         drop(arena);
     }
 
-    /// **A bound is not a listing.** A `SubtypesOf` kind names no domains to pair, so a
-    /// listing does not contain it however wide the bound is — the direction that would
-    /// let a map be read as a conditional collection over an enumerable set of keys.
+    /// **A key bound names no domains to pair.** So no set of candidates contains it however
+    /// wide the bound is — the direction that would let a map be read as a conditional
+    /// collection over an enumerable set of keys.
     #[test]
-    fn a_map_kind_is_contained_in_no_listing() {
+    fn a_map_kind_is_contained_in_no_candidate_set() {
         let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
-        let listed = conditional(vec![Type::UIntRange(2)]);
-        assert!(constrain_subtype(&map, &listed, &mut ConstrainCache::new()).is_err());
+        let named = conditional(vec![Type::UIntRange(2)]);
+        assert!(constrain_subtype(&map, &named, &mut ConstrainCache::new()).is_err());
     }
 
-    /// **A listing lies below a description that admits every candidate.** The premise is
-    /// set containment, so it is asked once per candidate and `Type` — the description that
-    /// admits all of them — is above every kind and below nothing narrower.
+    /// **Candidates lie below a kind that admits every one of them.** The premise is set
+    /// containment, so it is asked once per candidate and `Type` — which admits all of them
+    /// — is above every kind and below nothing narrower.
     #[test]
-    fn a_listing_lies_below_a_description_that_admits_it() {
+    fn candidates_lie_below_a_kind_that_admits_them() {
         let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
         let ranges = sum(TypeKind::UIntRanges);
-        let listed = sum(TypeKind::Enumerated(vec![
+        let named = sum(TypeKind::Enumerated(vec![
             Type::UIntRange(2),
             Type::UIntRange(3),
         ]));
@@ -3207,14 +3244,14 @@ mod tests {
         let universe = sum(TypeKind::Type);
 
         assert!(
-            constrain_subtype(&listed, &ranges, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(&named, &ranges, &mut ConstrainCache::new()).is_ok(),
             "every candidate is a range"
         );
         assert!(
             constrain_subtype(&filtered, &ranges, &mut ConstrainCache::new()).is_err(),
             "a refined range is not a range, so a filtered collection is not a `List`"
         );
-        for k in [&listed, &ranges, &universe] {
+        for k in [&named, &ranges, &universe] {
             assert!(
                 constrain_subtype(k, &universe, &mut ConstrainCache::new()).is_ok(),
                 "{k} <: ⊤"
@@ -3226,8 +3263,8 @@ mod tests {
         );
     }
 
-    /// **An unresolved candidate is not a rejection.** It has no shape for a description to
-    /// read, so it takes the kinding edge and is answered wherever a type reaches it — which
+    /// **An unresolved candidate is not a rejection.** It has no shape to read a property
+    /// off, so it takes the kinding edge and is answered wherever a type reaches it — which
     /// is what lets a generalized definition carry a `List` annotation whose source only its
     /// uses can supply (`test_kinding_constraint_survives_instantiation`).
     #[test]
@@ -3253,9 +3290,9 @@ mod tests {
     }
 
     #[test]
-    fn conditional_width_is_subtype() {
+    fn conditional_is_subtype_by_candidate_subset() {
         // A conditional collection is a Sigma over candidate domains;
-        // width-subtyping is by-value subset — every lhs candidate domain
+        // the kind premise is by-value subset — every lhs candidate domain
         // appears among the rhs candidates. The reverse (rhs has an extra
         // domain the lhs lacks) is not a subtype.
         let sub = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
@@ -3283,19 +3320,19 @@ mod tests {
         assert!(constrain_subtype(&cond, &narrow, &mut ConstrainCache::new()).is_err());
     }
 
-    // --- `UIntRanges`-kind Sigma rules (List): consumption, width ---
+    // --- `UIntRanges`-kind Sigma rules (List): consumption, subtyping ---
 
-    /// **A described range is consumed by the same rule a listing one is.** Naming the
-    /// witness needs no candidates — that is what naming buys over presenting — so
-    /// `List`'s `UIntRanges` and `Collection`'s `Any` reach a consumer through the
-    /// factored arm with nothing to enumerate.
+    /// **A kind naming no candidates is consumed by the same rule candidates are.** Naming
+    /// the witness needs no candidates — that is what naming buys over presenting — so
+    /// `List`'s `UIntRanges` and `Collection`'s `Type` reach a consumer through the factored
+    /// arm with nothing to enumerate.
     ///
     /// Worth its own test because the failure is silent in the other direction: a rule
-    /// written to read candidates first answers `None` for a described kind and falls
-    /// through to a flat mismatch, so a `List(𝑇)` annotation stops being consumable and
-    /// nothing else in the suite says why.
+    /// written to read candidates first answers `None` for `UIntRanges` and falls through to
+    /// a flat mismatch, so a `List(𝑇)` annotation stops being consumable and nothing else in
+    /// the suite says why.
     #[test]
-    fn a_described_collection_pins_a_consumer() {
+    fn a_kind_naming_no_candidates_pins_a_consumer() {
         let int = prim(BaseType::Int);
         for kind in [TypeKind::UIntRanges, TypeKind::Type] {
             let collection = Type::sum_over(kind.clone(), None, int.clone());
@@ -3309,9 +3346,9 @@ mod tests {
         }
     }
 
-    /// The **cross-form** width edge: the unfactored sum `box` builds, below the
+    /// The **cross-form** Σ edge: the unfactored sum `box` builds, below the
     /// factored sum a `List(𝑉)` annotation is. Both spellings of one type, so this is
-    /// ordinary Σ-width read on instantiated bodies — and it is the edge every
+    /// the ordinary Σ rule read on instantiated bodies — and it is the edge every
     /// `List`-annotated parameter depends on.
     #[test]
     fn a_boxed_collection_is_below_a_list_annotation() {
@@ -3324,7 +3361,7 @@ mod tests {
         let list = Type::list_of(int);
         assert!(
             constrain_subtype(&boxed, &list, &mut ConstrainCache::new()).is_ok(),
-            "box(xs) must reach List(V) by width"
+            "box(xs) must reach List(V) by the Σ rule"
         );
     }
 
@@ -3367,21 +3404,62 @@ mod tests {
         ));
     }
 
+    /// **One rule, every derivation.** A check asks what the solve asks, so a rejection is a
+    /// rejection wherever the edge is drawn — the previous version of this test named every
+    /// cache and used one.
     #[test]
-    fn kind_rejection_is_live_in_every_cache() {
-        // There is one mode: a kind mismatch is a rejection wherever the edge is
-        // drawn. The post-inference structural check runs the same cache, so a
-        // capability reaching a collection position is caught there too rather
-        // than being waved through as an elimination artifact.
-        let mut cache = ConstrainCache::new();
-        assert!(matches!(
-            constrain_subtype(
-                &fun(Type::UIntRange(3), prim(BaseType::Int)),
-                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
-                &mut cache,
-            ),
-            Err(ConstrainError::KindMismatch { .. })
-        ));
+    fn a_rejection_holds_at_every_derivation() {
+        for derivation in [
+            Derivation::LiveSolve,
+            Derivation::PostPass,
+            Derivation::SubTree,
+        ] {
+            // A capability where a collection is demanded: the fun-kind rejection.
+            assert!(
+                matches!(
+                    constrain_subtype(
+                        &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                        &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                        &mut ConstrainCache::for_derivation(derivation),
+                    ),
+                    Err(ConstrainError::KindMismatch { .. })
+                ),
+                "a capability reaching a collection position is caught at {derivation:?}"
+            );
+            // **The Σ kind premise, at every derivation.** The universe is not contained in
+            // a key bound, so a collection where a keyed collection is demanded is a
+            // rejection — and it is the only premise that looks at the kinds, the domain edge
+            // being discharged by the binder correspondence.
+            assert!(
+                constrain_subtype(
+                    &Type::collection_of(prim(BaseType::Int)),
+                    &Type::map_of(prim(BaseType::Int), prim(BaseType::Int)),
+                    &mut ConstrainCache::for_derivation(derivation),
+                )
+                .is_err(),
+                "Collection is not below Map at {derivation:?}"
+            );
+            // A candidate dropped is a narrower kind, and narrower is not above.
+            assert!(
+                constrain_subtype(
+                    &conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]),
+                    &conditional(vec![Type::UIntRange(2)]),
+                    &mut ConstrainCache::for_derivation(derivation),
+                )
+                .is_err(),
+                "a sum with an extra candidate is not below one without it at {derivation:?}"
+            );
+            // What must still be accepted: a keyed collection *is* a collection.
+            assert!(
+                constrain_subtype(
+                    &Type::map_of(prim(BaseType::Int), prim(BaseType::Int)),
+                    &Type::collection_of(prim(BaseType::Int)),
+                    &mut ConstrainCache::for_derivation(derivation),
+                )
+                .is_ok(),
+                "Map is below Collection at {derivation:?}"
+            );
+        }
     }
 
     /// A function over a fixed domain and codomain, so a test varies only the

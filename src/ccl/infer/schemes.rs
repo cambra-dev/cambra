@@ -135,7 +135,7 @@ impl OperatorSchemes {
         const BODY_LEVEL: Level = 1;
 
         // Box: ∀δ ε. ((k: δ) ⤇ ε) ⇒ Σ (σ : [δ]). (k: σ) ⤇ ε — the sum over the one
-        // candidate δ, the argument's *domain*. `δ` occurs in the candidate list, which is
+        // candidate δ, the argument's *domain*. `δ` occurs among the candidates, which is
         // an *invariant* position, so the domain is pinned exactly rather than widened on
         // the way in; the element type `ε` is shared by the argument and the sum's
         // codomain, which is what makes the sum a collection over one of its candidates

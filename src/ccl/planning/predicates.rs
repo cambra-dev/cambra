@@ -158,7 +158,8 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 ///
 /// `slot` is the binder telescope `base` is written under — the Σ of the collection this
 /// refinement refines. A predicate over a witness-domained collection is a collection over
-/// that witness (`src/ccl/design/type-inference.md`, "A refinement predicate is a column"),
+/// that witness (`src/ccl/design/type-inference.md`,
+/// "A refinement predicate is a data function"),
 /// and the η-expanded form is where that is said: the binder is the one place a kind is
 /// written, so a predicate left at `Compute` names a witness nothing binds.
 pub(crate) fn fn_of_bare_predicate(

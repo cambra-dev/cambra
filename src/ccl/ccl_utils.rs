@@ -818,7 +818,8 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         // inside it, so a bounded annotation's bound is stripped like any other.
         Type::BoundedHole(t) => Type::BoundedHole(Box::new(strip_refinements(t))),
         Type::Refinement(base, _) => strip_refinements(base),
-        // The **witness kinds are left alone** (they ride the `kind` `fun_like` copies).
+        // The **witnesses' type kinds are left alone** (they ride the `kind` `fun_like`
+        // copies).
         // A sum's candidates are domains, and the Σ rules match them by value, so two
         // sums differing only in a candidate's refinement are different types —
         // `Σ (σ : [{[0,2] | 𝑝}]). …` is the filtered arm and `Σ (σ : [[0,2]]). …` is not.
