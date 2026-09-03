@@ -8,7 +8,7 @@
 // the value typed as `Snapshot`.
 //
 // This is the TS twin of the Rust `assert_snapshot_shape`
-// (`cambra-inspector/src/lib.rs`) — the two languages pin ONE wire contract:
+// (`src/inspector_server/wire_check.rs`) — the two languages pin ONE wire contract:
 // the schema version below; a successful payload ships the pipeline panes in order with
 // their kinds and the adjacent paneLinks windows (dense — self-edges legal,
 // every edge endpoint a live node id in its pane); a degraded

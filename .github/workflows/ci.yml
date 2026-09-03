@@ -99,7 +99,7 @@ jobs:
           /tmp/elan-init -y --default-toolchain "$(cat formal/lean-toolchain)" >/dev/null
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
-      # Node toolchain for the cambra-inspector web frontend (vitest + bundle).
+      # Node toolchain for the web frontend (vitest + bundle).
       # TODO: pin to a SHA to match this repo's action-pinning convention.
       - name: Setup Node
         if: steps.filter.outputs.code == 'true'

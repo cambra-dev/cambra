@@ -1,6 +1,6 @@
 [workspace]
 # One package. The inspector's Rust half is `src/inspector_server`, a module of
-# this crate; `cambra-inspector/web/` is its TypeScript frontend, a JS project
+# this crate; `web/` is its TypeScript frontend, a JS project
 # with no Cargo manifest.
 # The root package is edition 2024, whose default resolver is 3, but a workspace
 # table overrides the member's edition default — so leaving this unset or at 2
