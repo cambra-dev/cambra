@@ -9,6 +9,7 @@ use cambra::{
     interpreter::{
         Consumer,
         tile_operators::{FunctionGuard, Tile, TileGuard},
+        value_recorder::{self, SharedRecorder, ValueRecorder},
     },
     live_program::{LiveProgram, render_unreadable},
     pretty_graph::pretty_tile_operator,
@@ -44,6 +45,7 @@ fn poll_control(
     live: &mut LiveProgram,
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
     new_data: &Rc<RefCell<bool>>,
+    recorder: Option<&SharedRecorder>,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
@@ -56,20 +58,31 @@ fn poll_control(
             )),
             Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
         },
-        ControlRequest::Reload { code } => match live.reload(ctx, code, main_consumer) {
-            Ok(report) => {
-                // The new graph has subscribed but nothing has pulled it, so arm
-                // the driver for one pass.
-                *new_data.borrow_mut() = true;
-                let ReuseTally { kept, bound } = report.reuse;
-                ControlReply::ok(format!(
-                    "reloaded: {kept}/{bound} operators kept\n\n{}{}",
-                    report.diff,
-                    render_unreadable(&report.unreadable),
-                ))
+        ControlRequest::Reload { code } => {
+            // A reload rebuilds the operators it could not keep, and a producer
+            // takes its recorder handle when it is built — so the replacement
+            // records only under a session, exactly as the first compile does.
+            // `diff_against` is left out: it compiles a version to compare and
+            // throws it away.
+            let reloaded = {
+                let _recording = recorder.cloned().map(value_recorder::install);
+                live.reload(ctx, code, main_consumer)
+            };
+            match reloaded {
+                Ok(report) => {
+                    // The new graph has subscribed but nothing has pulled it, so arm
+                    // the driver for one pass.
+                    *new_data.borrow_mut() = true;
+                    let ReuseTally { kept, bound } = report.reuse;
+                    ControlReply::ok(format!(
+                        "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+                        report.diff,
+                        render_unreadable(&report.unreadable),
+                    ))
+                }
+                Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
             }
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
-        },
+        }
     };
     message.answer(reply);
 }
@@ -96,12 +109,20 @@ fn run_program(
         })
     };
 
+    // Recording is installed for the whole subscribe, which happens inside
+    // `compile_program`: a producer takes its handle when its `ProducerBase` is
+    // built, and there is no traversal of the live graph to hand one out later.
+    let recorder = inspect_port.map(|_| Rc::new(RefCell::new(ValueRecorder::with_defaults())));
+
     let mut ctx = GlobalContext::default();
-    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
-        Ok(p) => p,
-        Err(errs) => {
-            eprint_errors(&errs, src_name, code);
-            return Err(());
+    let mut live = {
+        let _recording = recorder.clone().map(value_recorder::install);
+        match LiveProgram::start(&mut ctx, code, &main_consumer) {
+            Ok(p) => p,
+            Err(errs) => {
+                eprint_errors(&errs, src_name, code);
+                return Err(());
+            }
         }
     };
 
@@ -139,6 +160,7 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
+                recorder.as_ref(),
             );
             if *new_data.borrow() {
                 break;
@@ -152,6 +174,9 @@ fn run_program(
             break;
         };
         debug!("Main calling get");
+        if let Some(recorder) = recorder.as_ref() {
+            recorder.borrow_mut().set_tick(tick);
+        }
         let tile = producer.get(producer.tiling().universal_guard());
 
         let release_guard = release_guard_for(&tile);
@@ -175,6 +200,9 @@ fn run_program(
     // loop runs until the process exits.
     if live.program().sinks().next().is_some() {
         loop {
+            if let Some(recorder) = recorder.as_ref() {
+                recorder.borrow_mut().set_tick(tick);
+            }
             ctx.scheduler().check_for_notifications();
             snapshot(&live, inspector.as_ref(), tick);
             tick += 1;
@@ -184,6 +212,7 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
+                recorder.as_ref(),
             );
             if live.done().try_recv().is_ok() {
                 break;
