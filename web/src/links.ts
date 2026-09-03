@@ -33,16 +33,32 @@ export interface PaneInfo {
   spanOf(nodeId: number): Span | null;
 }
 
-/** The full link graph: ordered panes + the dense edges between them. */
+/**
+ * One adjacent pane pair's dense edges, indexed by each endpoint.
+ *
+ * Both directions, because resolution walks both. Built once per pair rather
+ * than scanned per vertex: the walk asks "which edges touch this node" for
+ * every node it dequeues, and answering that by scanning the pair's whole edge
+ * array makes the walk `V·E` — 1.2 s in the `Store` constructor at 3200 nodes
+ * per pane, before the first paint.
+ */
+export interface PaneAdjacency {
+  /** Upstream id -> the downstream ids it reaches. */
+  forward: Map<number, number[]>;
+  /** Downstream id -> the upstream ids that reach it. */
+  backward: Map<number, number[]>;
+}
+
+/** The full link graph: ordered panes + the indexed edges between them. */
 export interface LinkGraph {
   /** Panes in pipeline order (upstream -> downstream). */
   panes: PaneInfo[];
   /**
-   * Dense edges keyed by adjacent pane pair. `edges.get(\`${from}>${to}\`)`
-   * holds `[upstreamId, downstreamId]` pairs for that pair — self-edges
-   * included, so identity is followed as an edge like any other.
+   * Adjacency keyed by adjacent pane pair: `edges.get(\`${from}>${to}\`)` holds
+   * that pair's edges, self-edges included, so identity is followed as an edge
+   * like any other.
    */
-  edges: Map<string, PaneEdge[]>;
+  edges: Map<string, PaneAdjacency>;
 }
 
 export interface ResolveResult {
@@ -59,17 +75,30 @@ function pairKey(from: string, to: string): string {
 /**
  * Build a [`LinkGraph`] from the raw pane list + `paneLinks`. Each entry is
  * keyed by its `(from, to)` ids; the dense edge list (self-edges included) is
- * stored verbatim, so the resolver follows identity and fan-out uniformly.
+ * indexed by both endpoints, so the resolver follows identity and fan-out
+ * uniformly and reads an endpoint's edges without scanning the pair.
  */
 export function buildLinkGraph(
   panes: PaneInfo[],
   paneLinks: { from: string; to: string; edges: PaneEdge[] }[],
 ): LinkGraph {
-  const edges = new Map<string, PaneEdge[]>();
+  const edges = new Map<string, PaneAdjacency>();
   for (const link of paneLinks) {
-    edges.set(pairKey(link.from, link.to), link.edges);
+    const forward = new Map<number, number[]>();
+    const backward = new Map<number, number[]>();
+    for (const [up, down] of link.edges) {
+      push(forward, up, down);
+      push(backward, down, up);
+    }
+    edges.set(pairKey(link.from, link.to), { forward, backward });
   }
   return { panes, edges };
+}
+
+function push(index: Map<number, number[]>, key: number, value: number): void {
+  const at = index.get(key);
+  if (at === undefined) index.set(key, [value]);
+  else at.push(value);
 }
 
 /**
@@ -116,14 +145,16 @@ export function resolveLinks(graph: LinkGraph, seeds: PaneNode[]): ResolveResult
     if (pane + 1 < graph.panes.length) {
       const downId = graph.panes[pane + 1].id;
       const fwd = graph.edges.get(pairKey(graph.panes[pane].id, downId));
-      if (fwd) for (const [up, down] of fwd) if (up === node) enqueue(pane + 1, down);
+      const reached = fwd?.forward.get(node);
+      if (reached) for (const down of reached) enqueue(pane + 1, down);
     }
 
     // Upstream neighbour (pane - 1): reverse edges (self-edges included).
     if (pane - 1 >= 0) {
       const upId = graph.panes[pane - 1].id;
       const back = graph.edges.get(pairKey(upId, graph.panes[pane].id));
-      if (back) for (const [up, down] of back) if (down === node) enqueue(pane - 1, up);
+      const reaching = back?.backward.get(node);
+      if (reaching) for (const up of reaching) enqueue(pane - 1, up);
     }
   }
 

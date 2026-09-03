@@ -183,9 +183,10 @@ export class SourceView {
   constructor(
     parent: HTMLElement,
     store: Store,
-    // Called with the operator nodes a position reaches. Absent when no run is
-    // being inspected, which is what withholds the affordance under
-    // `--inspect-only`.
+    // Called with the operator nodes a position reaches. Optional so a caller
+    // can mount the source pane without the values pane; `main` always supplies
+    // it, because `--inspect-only` holds the socket open and silent rather than
+    // refusing it, and the pane says so itself.
     onInspect?: (nodeId: number, operators: readonly number[]) => void,
   ) {
     this.store = store;

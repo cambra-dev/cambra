@@ -24,19 +24,39 @@ export type LiveGroup = {
    * question the tag answers.
    */
   tags: readonly LiveTag[];
+  /**
+   * The operator's kind, from the static payload — `"ExtractFinal"`,
+   * `"StoreDenseRead"`.
+   *
+   * Separate from a producer's name, and available whether or not the operator
+   * has produced: the frame names a producer only once one has run, so without
+   * this a group that recorded nothing could show nothing but its id.
+   */
+  label: string | undefined;
 } & (
   | {
       kind: "operator";
       nodeId: number;
-      /** Ticks between this entry and the newest one. Zero when it produced this tick. */
-      staleBy: number;
+      /**
+       * What each producer last answered.
+       *
+       * Several, because a `FanOut` branch is subscribed once per branch. Every
+       * fact about an answer — its shape, its counts, its watermark, how far
+       * behind it is — belongs to one of these and not to the operator, so the
+       * pane draws a line per producer rather than one line per node.
+       */
       probes: LiveProbe[];
     }
   | { kind: "source"; nodeId: number; source: LiveSource }
   // Asked for, but nothing has ever arrived for it. Rendered rather than
   // omitted: a group that vanishes is indistinguishable from one never asked
   // for.
-  | { kind: "silent"; nodeId: number }
+  | {
+      kind: "silent";
+      nodeId: number;
+      /** Whether the run has finished, making "produced nothing" final. */
+      ran: boolean;
+    }
 );
 
 /**
@@ -62,12 +82,24 @@ export type LivePanelState =
  * Pure, and takes no `Resolved`: pinning decoupled the pane from the selection,
  * which is what makes this testable with no DOM and no socket.
  */
-export function livePanelState(state: LiveState): LivePanelState {
+export function livePanelState(
+  state: LiveState,
+  /** An operator's kind, from the static payload. */
+  operatorLabel: (nodeId: number) => string | undefined = () => undefined,
+): LivePanelState {
   const tags = state.tags;
-  if (state.status.kind === "lost") return { kind: "lost", clean: state.status.clean, tags };
-  if (tags.length === 0) return { kind: "no-tags" };
+  // A lost socket is a banner over the values, not a replacement for them: the
+  // cache still holds every row, there is no reconnect, and a reader who has
+  // just watched a run wants what it last said rather than an empty pane. It
+  // stands alone only when there is nothing left to stand over.
+  const lost = state.status.kind === "lost" ? state.status : null;
+  if (tags.length === 0) {
+    return lost ? { kind: "lost", clean: lost.clean, tags } : { kind: "no-tags" };
+  }
   const nodes = shownNodes(state);
-  if (nodes.size === 0) return { kind: "all-hidden", tags };
+  if (nodes.size === 0) {
+    return lost ? { kind: "lost", clean: lost.clean, tags } : { kind: "all-hidden", tags };
+  }
   // Nothing has been published, so the program was compiled and not run. Said
   // separately from "asked for but silent": the machine is not in a state that
   // produces data, as against being in it and having produced none.
@@ -83,8 +115,9 @@ export function livePanelState(state: LiveState): LivePanelState {
         nodeId,
         state.nodes.get(nodeId),
         state.sources.get(nodeId),
-        state.tick,
         tagsFor(state, nodeId),
+        operatorLabel(nodeId),
+        state.status,
       ),
     );
   return { kind: "groups", status: state.status, tags, groups };
@@ -94,20 +127,19 @@ function group(
   nodeId: number,
   entry: LiveEntry | undefined,
   source: LiveSource | undefined,
-  tick: number,
   tags: readonly LiveTag[],
+  label: string | undefined,
+  status: LiveStatus,
 ): LiveGroup {
-  if (source !== undefined) return { kind: "source", nodeId, source, tags };
+  if (source !== undefined) return { kind: "source", nodeId, source, tags, label };
   if (entry !== undefined) {
-    return {
-      kind: "operator",
-      nodeId,
-      staleBy: tick - entry.tick,
-      probes: entry.probes,
-      tags,
-    };
+    return { kind: "operator", nodeId, probes: entry.probes, tags, label };
   }
-  return { kind: "silent", nodeId, tags };
+  // An operator with no recording has not been pulled. `get` is where a
+  // recording is taken — that is what makes it non-perturbing — so an operator
+  // whose demand path the run has not exercised has genuinely produced nothing.
+  // Once the run is over that becomes permanent, and the two read differently.
+  return { kind: "silent", nodeId, tags, label, ran: status.kind === "finished" };
 }
 
 /** The pane's plain-text rendering, for the copy button. */
@@ -122,40 +154,24 @@ export function serializeLivePanel(panel: LivePanelState): string {
     case "lost":
       return panel.clean ? "connection closed" : "connection lost";
     case "groups":
-      return panel.groups.map(serializeGroup).join("\n\n");
+      return panel.groups.map((g) => serializeGroup(g, tickOf(panel.status))).join("\n\n");
   }
 }
 
-function serializeGroup(group: LiveGroup): string {
+function serializeGroup(group: LiveGroup, tick: number): string {
   const tags = group.tags.map((t) => `[${t.label}]`).join(" ");
   const prefix = tags === "" ? "" : `${tags} `;
-  switch (group.kind) {
-    case "silent":
-      return `${prefix}#${group.nodeId}\n  no values recorded`;
-    case "source": {
-      const head = `${prefix}#${group.nodeId} ${group.source.name} — retained ${countOf(
-        group.source.rows.length,
-        group.source.total,
-      )}`;
-      return [head, ...group.source.rows.map((r) => `  ${rowText(r)}`)].join("\n");
-    }
-    case "operator":
-      return group.probes
-        .map((p) => {
-          const head = `${prefix}#${group.nodeId} ${p.producer} ${p.shape} — ${countOf(
-            p.rows.length,
-            p.total,
-          )}`;
-          const note = p.note === null ? [] : [`  ${p.note}`];
-          return [head, ...note, ...p.rows.map((r) => `  ${rowText(r)}`)].join("\n");
-        })
-        .join("\n");
-  }
+  const meta = metaText(group);
+  const head = `${prefix}${headText(group)}${meta === null ? "" : ` — ${meta}`}`;
+  return [head, ...bodyLines(group, tick).map(lineText)].join("\n");
 }
 
-function rowText(row: LiveRow): string {
-  const key = row.key === null ? "" : `${row.key}: `;
-  return `${key}${row.value}${row.deleted ? " (deleted)" : ""}`;
+function lineText(line: BodyLine): string {
+  // A producer's own line sits between the group head and the rows it answered,
+  // so the rows indent under it.
+  const indent = line.role === "producer" ? "  " : "    ";
+  const key = line.key === "" ? "" : `${line.key}: `;
+  return `${indent}${key}${line.value}${line.deleted ? " (deleted)" : ""}`;
 }
 
 /**
@@ -169,14 +185,23 @@ export function countOf(shown: number, total: number): string {
 }
 
 /**
- * How a stale entry reads.
+ * How a producer's staleness reads, or `null` when its answer is the current one.
  *
- * A number, not the word: `stale` alone is uncheckable, while a tick difference
- * says how far behind and can be compared against the header's own tick.
+ * Two signals, and the wire carries both per producer. The tick difference is
+ * the one to state where there is one: a number says how far behind and can be
+ * compared against the header's own tick, where the word `stale` alone is
+ * uncheckable. `stale` catches what the difference cannot — a producer pulled
+ * again within this same tick that answered nothing, so its rows are already
+ * not what it holds.
  */
-export function staleText(staleBy: number, tick: number): string | null {
-  if (staleBy <= 0) return null;
-  return `last produced at tick ${tick - staleBy} (now ${tick})`;
+export function staleText(producer: LiveProbe, tick: number): string | null {
+  if (producer.tick < tick) return `last produced at tick ${producer.tick} (now ${tick})`;
+  return producer.stale ? "pulled again this tick and answered nothing" : null;
+}
+
+/** The newest tick, against which a producer's own tick reads as staleness. */
+function tickOf(status: LiveStatus): number {
+  return status.kind === "live" || status.kind === "finished" ? status.tick : 0;
 }
 
 function el(tag: string, className?: string, text?: string): HTMLElement {
@@ -186,9 +211,114 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
   return node;
 }
 
-/** A row's identity within its group, so a replacement frame updates in place. */
-function rowKey(row: LiveRow, index: number): string {
-  return row.key ?? `#${index}`;
+/**
+ * One line of a group's body: a producer's own line, a dropped-rows marker, or
+ * a row.
+ *
+ * One list rather than a loop per kind, because every line is keyed, drawn and
+ * ordered the same way — which is also what makes the order the frame's rather
+ * than the order the handles happened to be created in.
+ */
+interface BodyLine {
+  /**
+   * Identity across frames, so a replacement frame updates the line in place.
+   *
+   * Qualified by the producer that answered it, not by the domain key alone: an
+   * operator builds one producer per `FanOut` branch, and two of them holding a
+   * row at one key are two rows. The role leads, so a producer whose row is
+   * keyed `__dropped` cannot collide with its own marker.
+   */
+  id: string;
+  role: BodyRole;
+  /** The domain key, or empty for a line that sits at no position. */
+  key: string;
+  value: string;
+  /** Whether the tile marks this position deleted. */
+  deleted: boolean;
+  /** Whether the producer that answered this line is behind the newest tick. */
+  stale: boolean;
+}
+
+type BodyRole = "producer" | "dropped" | "row";
+
+const LINE_CLASS: Record<BodyRole, string> = {
+  producer: "live-producer",
+  dropped: "live-row live-dropped",
+  row: "live-row",
+};
+
+/** A group's body, in the order it draws. */
+function bodyLines(group: LiveGroup, tick: number): BodyLine[] {
+  switch (group.kind) {
+    case "silent":
+      return [];
+    case "source":
+      return windowLines("src", group.source.rows, group.source.dropped, false);
+    case "operator":
+      return group.probes.flatMap((producer) => {
+        const stale = staleText(producer, tick);
+        const scope = `p${producer.producerId}`;
+        const head: BodyLine = {
+          id: `producer:${scope}`,
+          role: "producer",
+          key: "",
+          value: producerText(producer, stale),
+          deleted: false,
+          stale: stale !== null,
+        };
+        return [head, ...windowLines(scope, producer.rows, producer.dropped, stale !== null)];
+      });
+  }
+}
+
+/**
+ * A retained window's lines: the dropped-rows marker, then the rows.
+ *
+ * Truncation keeps the tail, so the rows that are missing are the earlier ones
+ * and the marker belongs above the ones that survived, in the list.
+ */
+function windowLines(
+  scope: string,
+  rows: readonly LiveRow[],
+  dropped: number,
+  stale: boolean,
+): BodyLine[] {
+  const marker: BodyLine[] =
+    dropped === 0
+      ? []
+      : [
+          {
+            id: `dropped:${scope}`,
+            role: "dropped",
+            key: "",
+            value: `${dropped} earlier rows not recorded`,
+            deleted: false,
+            stale,
+          },
+        ];
+  const kept = rows.map((row, index) => ({
+    id: `row:${scope}:${row.key ?? `#${index}`}`,
+    role: "row" as const,
+    key: row.key ?? "",
+    value: row.value,
+    deleted: row.deleted,
+    stale,
+  }));
+  return [...marker, ...kept];
+}
+
+/** What one producer answered, as the line above its rows. */
+function producerText(producer: LiveProbe, stale: string | null): string {
+  return [
+    producer.producer,
+    producer.shape,
+    countOf(producer.rows.length, producer.total),
+    producer.watermark,
+    stale,
+    producer.note,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
 }
 
 /** A group's identity, stable across frames. */
@@ -200,7 +330,8 @@ function groupKey(group: LiveGroup): string {
       : `silent:${group.nodeId}`;
 }
 
-interface RowHandle {
+/** One drawn body line, kept so a replacement frame updates its text in place. */
+interface LineHandle {
   row: HTMLElement;
   key: HTMLElement;
   value: HTMLElement;
@@ -212,7 +343,7 @@ interface GroupHandle {
   head: HTMLElement;
   meta: HTMLElement;
   body: HTMLElement;
-  rows: Map<string, RowHandle>;
+  lines: Map<string, LineHandle>;
 }
 
 /**
@@ -225,10 +356,14 @@ export function tagColour(label: string, slots: number): number {
   // FNV-1a, offset basis included: seeding at zero measurably clumps short
   // labels, which is all these are (`Var(words): L8`). `>>> 0` takes the
   // unsigned value rather than folding the negative half onto the positive.
+  //
+  // `Math.imul` rather than `*`: the round's product reaches ~3.6e16, past the
+  // 2^53 a float64 holds exactly, so `*` rounds the low bits away before the
+  // truncation — and those are the bits the next round mixes. Half the rounds
+  // came out wrong, which made this some other hash wearing FNV's name.
   let hash = 0x811c9dc5;
   for (let i = 0; i < label.length; i++) {
-    hash = (hash ^ label.charCodeAt(i)) * 16777619;
-    hash |= 0;
+    hash = Math.imul(hash ^ label.charCodeAt(i), 16777619);
   }
   return (hash >>> 0) % slots;
 }
@@ -256,6 +391,8 @@ export class LiveView {
   private readonly root: HTMLElement;
   private readonly groups = new Map<string, GroupHandle>();
   private pending = 0;
+  /** The lost-connection banner while one is shown, so it is not rebuilt. */
+  private banner: HTMLElement | null = null;
   private readonly unsubscribe: () => void;
 
   constructor(
@@ -263,6 +400,21 @@ export class LiveView {
     private readonly live: {
       get(): LiveState;
       subscribe(fn: (state: LiveState) => void): () => void;
+    },
+    /** An operator's kind, from the static payload. */
+    private readonly operatorLabel: (nodeId: number) => string | undefined = () => undefined,
+    /**
+     * Select the construct a tag names, and the operator a group is.
+     *
+     * Both are ordinary selections through the shared store, so they
+     * cross-highlight every pane exactly as a click in a tree pane does. They
+     * change no tag, so the pane's own contents are unaffected by reading
+     * around in it — this view listens to the live store and not to the
+     * selection, so a selection cannot even re-render it.
+     */
+    private readonly select?: {
+      construct: (anchorId: number) => void;
+      operator: (nodeId: number) => void;
     },
   ) {
     this.root = el("div", "live-root");
@@ -297,7 +449,7 @@ export class LiveView {
   }
 
   private render(): void {
-    const panel = livePanelState(this.live.get());
+    const panel = livePanelState(this.live.get(), this.operatorLabel);
     if (panel.kind !== "groups") {
       this.groups.clear();
       this.root.replaceChildren(el("div", "live-empty", emptyText(panel)));
@@ -317,6 +469,11 @@ export class LiveView {
         this.groups.delete(key);
       }
     }
+    // The banner leads, and the groups are appended after it, so a socket that
+    // drops mid-run says so above the values it last carried rather than
+    // replacing them.
+    this.renderBanner(panel.status);
+
     // Order follows the pinned set's ascending ids, which `livePanelState`
     // already sorted. Re-append rather than diff positions: appending an
     // existing child moves it, and the list is short.
@@ -326,69 +483,107 @@ export class LiveView {
     }
   }
 
+  /** The lost-connection banner, present only while the socket is gone. */
+  private renderBanner(status: LiveStatus): void {
+    if (status.kind !== "lost") {
+      this.banner?.remove();
+      this.banner = null;
+      return;
+    }
+    this.banner ??= el("div", "live-banner");
+    this.banner.textContent = `${
+      status.clean ? "connection closed" : "connection lost"
+    } — these are the last values it carried`;
+    this.root.prepend(this.banner);
+  }
+
   private renderGroup(key: string, group: LiveGroup, status: LiveStatus): void {
     let handle = this.groups.get(key);
     if (handle === undefined) {
       const section = el("section", "live-group");
       const tags = el("div", "live-group-tags");
-      const head = el("div", "live-group-head");
+      const head = el(
+        this.select === undefined ? "div" : "button",
+        "live-group-head",
+      );
+      if (head instanceof HTMLButtonElement) {
+        head.type = "button";
+        head.title = "Select this operator";
+      }
       const meta = el("div", "live-group-meta");
       const body = el("div", "live-rows");
       section.append(tags, head, meta, body);
-      handle = { section, tags, head, meta, body, rows: new Map() };
+      handle = { section, tags, head, meta, body, lines: new Map() };
       this.groups.set(key, handle);
       this.root.appendChild(section);
     }
 
-    const tick = status.kind === "live" || status.kind === "finished" ? status.tick : 0;
     // The tag chips say which construct asked for this operator, which is the
     // question a reader holding several inspections actually has.
     handle.tags.replaceChildren(
       ...group.tags.map((tag) => {
-        const chip = el("span", "live-tag", tag.label);
+        const select = this.select;
+        if (select === undefined) {
+          const chip = el("span", "live-tag", tag.label);
+          chip.dataset["colour"] = String(tagColour(tag.label, TAG_SLOTS));
+          return chip;
+        }
+        const chip = el("button", "live-tag live-tag-button", tag.label) as HTMLButtonElement;
+        chip.type = "button";
         chip.dataset["colour"] = String(tagColour(tag.label, TAG_SLOTS));
+        chip.title = `Select ${tag.label}`;
+        chip.addEventListener("click", (event) => {
+          // The group head is also clickable, so a chip's click must not reach
+          // it and select the operator instead of the construct.
+          event.stopPropagation();
+          select.construct(tag.anchorId);
+        });
         return chip;
       }),
     );
     handle.tags.hidden = group.tags.length === 0;
     handle.head.textContent = headText(group);
-    const meta = metaText(group, tick);
+    if (this.select !== undefined) {
+      const select = this.select;
+      const nodeId = group.nodeId;
+      handle.head.onclick = () => select.operator(nodeId);
+    }
+    const meta = metaText(group);
     handle.meta.textContent = meta ?? "";
     handle.meta.hidden = meta === null;
-    this.renderRows(handle, rowsOf(group), droppedOf(group));
+    this.renderRows(handle, bodyLines(group, tickOf(status)));
   }
 
-  private renderRows(handle: GroupHandle, rows: LiveRow[], dropped: number): void {
+  private renderRows(handle: GroupHandle, lines: BodyLine[]): void {
     const seen = new Set<string>();
-    // Truncation keeps the tail, so the rows that are missing are the earlier
-    // ones and the marker belongs at the top of the list, in the list.
-    if (dropped > 0) {
-      seen.add("__dropped");
-      const marker = this.rowHandle(handle, "__dropped", "live-row live-dropped");
-      marker.key.textContent = "";
-      marker.value.textContent = `${dropped} earlier rows not recorded`;
-    }
-    rows.forEach((row, index) => {
-      const key = rowKey(row, index);
-      seen.add(key);
-      const rowHandle = this.rowHandle(handle, key, "live-row");
-      rowHandle.key.textContent = row.key ?? "";
-      rowHandle.value.textContent = row.value;
+    for (const line of lines) {
+      seen.add(line.id);
+      const row = this.lineHandle(handle, line.id, LINE_CLASS[line.role]);
+      row.key.textContent = line.key;
+      row.value.textContent = line.value;
       // Three channels for one bit, not colour alone: the class carries the
       // dimming, the glyph is visible, and the word is readable.
-      rowHandle.row.classList.toggle("deleted", row.deleted);
-      rowHandle.row.dataset["deleted"] = row.deleted ? "deleted" : "";
-    });
-    for (const [key, row] of handle.rows) {
-      if (!seen.has(key)) {
+      row.row.classList.toggle("deleted", line.deleted);
+      row.row.dataset["deleted"] = line.deleted ? "deleted" : "";
+      // A stale producer's rows are dimmed, and the producer's own line says
+      // how far behind in ticks — the same two channels.
+      row.row.classList.toggle("stale", line.stale);
+      row.row.dataset["stale"] = line.stale ? "stale" : "";
+    }
+    for (const [id, row] of handle.lines) {
+      if (!seen.has(id)) {
         row.row.remove();
-        handle.rows.delete(key);
+        handle.lines.delete(id);
       }
     }
+    // Order follows the frame's, which `bodyLines` already fixed. Re-append
+    // rather than diff positions: appending an existing child moves it, and a
+    // group's body is short.
+    for (const line of lines) handle.body.appendChild(handle.lines.get(line.id)!.row);
   }
 
-  private rowHandle(handle: GroupHandle, key: string, className: string): RowHandle {
-    const existing = handle.rows.get(key);
+  private lineHandle(handle: GroupHandle, id: string, className: string): LineHandle {
+    const existing = handle.lines.get(id);
     if (existing) return existing;
     const row = el("div", className);
     const keyCell = el("span", "live-key");
@@ -396,57 +591,35 @@ export class LiveView {
     row.append(keyCell, valueCell);
     handle.body.appendChild(row);
     const created = { row, key: keyCell, value: valueCell };
-    handle.rows.set(key, created);
+    handle.lines.set(id, created);
     return created;
   }
 }
 
-function rowsOf(group: LiveGroup): LiveRow[] {
-  if (group.kind === "source") return group.source.rows;
-  if (group.kind === "operator") return group.probes.flatMap((p) => p.rows);
-  return [];
-}
-
-function droppedOf(group: LiveGroup): number {
-  if (group.kind === "source") return group.source.dropped;
-  if (group.kind === "operator") {
-    return group.probes.reduce((sum, p) => sum + p.dropped, 0);
-  }
-  return 0;
-}
-
 function headText(group: LiveGroup): string {
-  switch (group.kind) {
-    case "silent":
-      return `#${group.nodeId}`;
-    case "source":
-      return `#${group.nodeId} ${group.source.name}`;
-    case "operator": {
-      const names = group.probes.map((p) => p.producer).join(", ");
-      return `#${group.nodeId} ${names}`;
-    }
-  }
+  if (group.kind === "source") return `#${group.nodeId} ${group.source.name}`;
+  // The operator's kind, from the static payload, so a group that recorded
+  // nothing is still named. A producer's instance name names one answer rather
+  // than the operator, and rides that answer's own line.
+  return group.label === undefined ? `#${group.nodeId}` : `#${group.nodeId} ${group.label}`;
 }
 
-function metaText(group: LiveGroup, tick: number): string | null {
+function metaText(group: LiveGroup): string | null {
   switch (group.kind) {
     case "silent":
-      return "no values recorded";
+      // Not "no values recorded", which reads as a defect. Nothing has pulled
+      // this operator: a recording is taken inside `get`, so an unexercised
+      // demand path has produced nothing. An `ExtractFinal` over a stream that
+      // never terminates is the permanent case, and after the run ends every
+      // silent operator is.
+      return group.ran ? "produced nothing during the run" : "not pulled yet";
     case "source":
       return `retained ${countOf(group.source.rows.length, group.source.total)}`;
-    case "operator": {
-      const first = group.probes[0];
-      if (first === undefined) return null;
-      const shape = group.probes.length === 1 ? first.shape : "several probes";
-      const shown = group.probes.reduce((sum, p) => sum + p.rows.length, 0);
-      const total = group.probes.reduce((sum, p) => sum + p.total, 0);
-      const parts = [shape, countOf(shown, total)];
-      if (first.watermark !== null) parts.push(first.watermark);
-      const stale = staleText(group.staleBy, tick);
-      if (stale !== null) parts.push(stale);
-      if (first.note !== null) parts.push(first.note);
-      return parts.join(" · ");
-    }
+    case "operator":
+      // Nothing an operator's answer says holds for the operator: shape,
+      // counts, watermark and staleness are each one producer's, and a group
+      // that summarised them read the first producer's as the node's.
+      return null;
   }
 }
 

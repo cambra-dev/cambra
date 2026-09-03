@@ -11,7 +11,7 @@ function probe(overrides: Record<string, unknown> = {}) {
   return {
     producerId: 1,
     producer: "MapResultWithSource#1",
-    shape: "SealedFunction",
+    shape: "DataFunction",
     watermark: "True",
     note: null,
     tick: 1,

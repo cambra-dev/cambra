@@ -284,7 +284,7 @@ export interface LiveRow {
 }
 
 // One probe's last reading that carried rows. A probe observes one producer,
-// and an operator can build several producers.
+// and an operator can build several probes.
 export interface LiveProbe {
   producerId: number;
   // The producer's display name, e.g. `"MapResultWithSource#1"`.
