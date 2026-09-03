@@ -207,7 +207,7 @@ impl TileOperator for Lookup {
         }
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

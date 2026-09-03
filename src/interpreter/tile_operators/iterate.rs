@@ -122,7 +122,7 @@ impl TileOperator for IterateExtent {
         });
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
