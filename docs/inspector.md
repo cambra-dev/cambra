@@ -85,11 +85,13 @@ cargo run -- program.cambra --inspect-only=9000                              # c
 Then open <http://localhost:8080> — the server binds loopback only.
 
 Routes: `GET /` (the frontend), `GET /api/snapshot` (the full model — degrades
-gracefully to source + diagnostics on a compile failure), `GET /api/diagnostics`.
+gracefully to source + diagnostics on a compile failure), `GET /api/diagnostics`,
+and `GET /api/live` (a websocket carrying a run's recorded values).
 
-`--inspect-only` compiles the program and does not run it. Its sibling
-`--inspect` runs the program and serves the live runtime dashboard
-(`src/web_inspector.rs`) instead; the two are exclusive.
+`--inspect-only` compiles the program and does not run it, so `/api/live`
+completes its handshake and carries nothing. `--inspect` runs the program and
+publishes to that route each tick. The two are exclusive, and both serve the
+same panes.
 
 ### One-shot snapshot dump
 
