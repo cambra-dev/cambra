@@ -17,13 +17,13 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { TreeView } from "./treeView";
-import { validateSnapshot } from "./wireValidate";
-import { paneById, theNode } from "./__fixtures__/helpers";
+
+import { fixture, paneById, theNode } from "./__fixtures__/helpers";
 import type { Snapshot } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
-const listMin = validateSnapshot(listMinJson);
+const listMin = fixture(listMinJson);
 
 // Mount the full app (source + one tree pane per pane entry) into a fresh
 // container, returning the store and the per-pane tree-pane DOM roots.

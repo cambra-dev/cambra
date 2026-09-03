@@ -11,7 +11,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { byteLineStarts, formatSpan, lineCol, renderApp } from "./main";
 import { Store } from "./store";
-import { validateSnapshot } from "./wireValidate";
+import { fixture } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
 
@@ -52,7 +52,7 @@ describe("formatSpan", () => {
 });
 
 describe("renderApp: degraded snapshot (failed compile)", () => {
-  const failed = validateSnapshot(failedJson);
+  const failed = fixture(failedJson);
 
   beforeAll(() => {
     // CodeMirror's SourceView (rendered even in the degraded case) calls these.
