@@ -598,6 +598,13 @@ impl TileOperator for FanOutBranch {
         }
 
         Box::new(FanOutProducer {
+            // The fan-out's own id rather than a fresh one, so every branch's
+            // producer reads as the same `FanOut#n`. `ValueRecorder` keys on
+            // `(node_id, producer_id)`, and that stays unique here because each
+            // branch is its own operator with its own `NodeId` — the first
+            // component separates them, not the second. Subscribing one branch
+            // twice would land both producers in one slot; nothing does, and
+            // `FanOut::branch` mints a fresh branch per call.
             base: ProducerBase::new(shared_rc.borrow().id, self.tiling()),
             // The producer a subscription hands out holds the fan-out the same
             // way this branch does: a recurrence's producer must not own it

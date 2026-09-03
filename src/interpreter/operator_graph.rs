@@ -509,6 +509,48 @@ pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
     });
 }
 
+/// Each data source's `IterateExtent`s, by the name the source was registered
+/// under.
+///
+/// A source is not a node, so what attaches to a source attaches to the
+/// iterations over its domain: the operators the scheduler wakes when it
+/// produces. Read off each iteration's tiling, whose domain is the extent it
+/// iterates. A source the program iterates nowhere has no entry.
+///
+/// Re-derived per version rather than cached across one, because every compile
+/// mints its operators' ids afresh.
+pub fn source_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, Vec<NodeId>> {
+    use crate::interpreter::tile_operators::{IterateExtent, short_type_name};
+
+    let mut out: std::collections::HashMap<String, Vec<NodeId>> = std::collections::HashMap::new();
+    for node in graph.nodes() {
+        let GraphNode::Operator {
+            id, kind, tiling, ..
+        } = node
+        else {
+            continue;
+        };
+        if *kind != short_type_name::<IterateExtent>() {
+            continue;
+        }
+        let Tiling::DataFunction { domain, .. } = tiling else {
+            debug_assert!(
+                false,
+                "operator graph: IterateExtent {id:?} has tiling {tiling}, but an iteration's \
+                 tiling is a collection over the extent it iterates"
+            );
+            continue;
+        };
+        domain.for_each_source(&mut |source| {
+            let ids = out.entry(source.borrow().get_id().to_string()).or_default();
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        });
+    }
+    out
+}
+
 /// Mint the node for a compiled output field.
 pub(crate) fn record_sink(name: &str) {
     let id = NodeId::fresh();

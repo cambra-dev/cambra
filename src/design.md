@@ -14,7 +14,6 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 | `interpreter/` | Dataflow runtime: the tile producer/consumer operators, tilings, the scheduler, and data sources/sinks. | [design-operators.md](interpreter/design-operators.md), [design-http-server.md](interpreter/design-http-server.md), [CLAUDE.md](interpreter/CLAUDE.md) |
 | `pretty_graph.rs`, `pretty_tree.rs` | Human-readable rendering of the operator graph and AST trees (debug / inspector output). | — |
 | `scalar_ops.rs` | The scalar semantics of the binary operators, as a column kernel. Below both `ccl/` and `interpreter/` so the run-time operator and planning's constant fold run one implementation. | — |
-| `web_inspector.rs` | Live web dashboard served with `--inspect`; renders the CHL AST, lowered CCL, operator graph, and runtime producer state. Static assets in `resources/`. | — |
 | `util.rs` | Cross-cutting helpers. | — |
 | `main.rs`, `lib.rs` | CLI entry point and crate root (module declarations). | — |
 
