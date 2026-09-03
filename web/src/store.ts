@@ -98,6 +98,11 @@ export class Store {
   readonly sourceAnchorPaneId: string | null;
 
   private readonly linkGraph: LinkGraph;
+  // Anchor-pane node -> the operator-pane nodes it reaches. What makes a hover's
+  // "can this be inspected" question a lookup rather than a graph walk.
+  private readonly operatorsByNode: Map<number, number[]>;
+  // The operator pane's id, found by kind so the roster is not spelled twice.
+  private readonly operatorPaneId: string | null;
   // B5: for each holes-kind (pre-inference) pane, a node's downstream-resolved
   // type(s). A holes-pane node carries a hole (`_`/`?N`); inference resolves it
   // on the anchor-pane node it maps to (via the dense paneLinks). Mono fan-out →
@@ -140,6 +145,7 @@ export class Store {
     // and tightest-node queries, which the operator pane has no tree to serve.
     const post = this.panes.find((s) => s.id === "post-inference");
     this.sourceAnchorPaneId = post?.id ?? this.panes.filter(isIrPane).at(-1)?.id ?? null;
+    this.operatorPaneId = this.panes.find((pane) => !isIrPane(pane))?.id ?? null;
 
     // Every pane joins the link graph, the operator pane included: provenance is
     // an id relation over the whole pipeline, and both node shapes carry the id
@@ -164,6 +170,50 @@ export class Store {
     );
 
     this.resolvedTypesByPane = this.buildResolvedTypes();
+    this.operatorsByNode = this.buildOperatorReach();
+  }
+
+  /**
+   * The operator-pane nodes an anchor-pane node reaches, or empty for one that
+   * reaches none.
+   *
+   * Precomputed, not resolved per call. `resolveLinks` is a breadth-first walk
+   * over the pane-link adjacency, and the caller is a hover handler that fires
+   * on every pointer move, so this has to be a lookup. Same construction cost
+   * `buildResolvedTypes` already pays.
+   */
+  operatorsFor(nodeId: number): readonly number[] {
+    return this.operatorsByNode.get(nodeId) ?? [];
+  }
+
+  /** The operator pane's id, or null when the payload ships none. */
+  get liveAnchorPaneId(): string | null {
+    return this.operatorPaneId;
+  }
+
+  private buildOperatorReach(): Map<number, number[]> {
+    const out = new Map<number, number[]>();
+    const anchorId = this.sourceAnchorPaneId;
+    const operatorId = this.operatorPaneId;
+    const anchor = anchorId ? this.indicesByPane.get(anchorId) : undefined;
+    if (!anchorId || !operatorId || !anchor) return out;
+
+    for (const nodeId of anchor.nodeById.keys()) {
+      // A predicate interior is type machinery rather than a value site, and
+      // the positional queries already exclude them, so nothing can select one
+      // to inspect.
+      //
+      // Filtered as a seed only, unlike `buildResolvedTypes`, which filters
+      // both ends. Its hits land in the anchor pane, where predicate interiors
+      // exist; these land in the operator pane, which has none — an operator
+      // is not an expression and carries no refinement, so `indicesByPane`
+      // builds no `Indices` for that pane at all.
+      if (anchor.predicateIds.has(nodeId)) continue;
+      const { highlightsByPane } = resolveLinks(this.linkGraph, [{ paneId: anchorId, nodeId }]);
+      const operators = highlightsByPane.get(operatorId);
+      if (operators && operators.size > 0) out.set(nodeId, [...operators].sort((a, b) => a - b));
+    }
+    return out;
   }
 
   /** The derived indices for a pane (undefined for an unknown id). */

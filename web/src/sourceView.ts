@@ -180,7 +180,14 @@ export class SourceView {
   // undefined on a degraded snapshot (no panes); interactions then degrade.
   private readonly anchor: Indices | undefined;
 
-  constructor(parent: HTMLElement, store: Store) {
+  constructor(
+    parent: HTMLElement,
+    store: Store,
+    // Called with the operator nodes a position reaches. Absent when no run is
+    // being inspected, which is what withholds the affordance under
+    // `--inspect-only`.
+    onInspect?: (nodeId: number, operators: readonly number[]) => void,
+  ) {
     this.store = store;
     const { offsets, snapshot } = store;
     this.anchor = store.sourceAnchorPaneId
@@ -260,6 +267,27 @@ export class SourceView {
               e.preventDefault();
               e.stopPropagation();
               store.setSelection(resolveSourceClick(anchor, byte, { goto: true }));
+            });
+          }
+          // The sibling of goto-def: pin whatever operators this position
+          // reaches, so the values pane shows what flows through them.
+          // Offered only where it means something, the way a jump is offered
+          // only at a use-site.
+          const inspectNode = anchor ? anchor.tightestNodeAt(byte) : null;
+          const operators = inspectNode === null ? [] : store.operatorsFor(inspectNode);
+          if (onInspect && inspectNode !== null && operators.length > 0) {
+            const link = dom.appendChild(document.createElement("button"));
+            link.type = "button";
+            link.className = "cm-hover-inspect";
+            const what =
+              operators.length === 1 ? "this operator" : `these ${operators.length} operators`;
+            link.textContent = `→ inspect data of ${what}`;
+            // mousedown, as above: click never lands, because the pointer
+            // leaving the range tears the tooltip down first.
+            link.addEventListener("mousedown", (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onInspect(inspectNode, operators);
             });
           }
           return { dom };
