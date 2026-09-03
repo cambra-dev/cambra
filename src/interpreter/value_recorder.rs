@@ -310,6 +310,58 @@ impl ValueRecorder {
     }
 }
 
+/// A source's retained window, rendered.
+///
+/// Not a recording: a source has no producer and takes no `get`. Its window is
+/// what has arrived and not yet been released, read through `&self`, so
+/// sampling it moves nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceWindow {
+    /// The `IterateExtent`s over the source's domain, which is what a click on
+    /// the window resolves to: a source is not a node of the operator graph.
+    pub node_ids: Vec<NodeId>,
+    /// The source's registered name, e.g. `"stdin"`.
+    pub name: String,
+    /// The retained keys and their values, truncated to the last `limit`.
+    pub rows: Vec<RecordedRow>,
+    /// Keys the window held, of which `rows` is the last `rows.len()`.
+    pub total: usize,
+}
+
+impl SourceWindow {
+    /// Keys the window held that this does not carry.
+    pub fn dropped(&self) -> usize {
+        self.total.saturating_sub(self.rows.len())
+    }
+}
+
+/// Render the last `limit` of a source's retained window.
+///
+/// `keys` and `values` come from the source's own `retained_keys` and `get`,
+/// both `&self`. Truncation follows the same rule a recording uses: a source
+/// domain is index-ordered, so the last keys are the most recent arrivals.
+pub fn render_source_window(
+    node_ids: Vec<NodeId>,
+    name: &str,
+    keys: &ColumnValue,
+    values: &ColumnValue,
+    limit: usize,
+) -> SourceWindow {
+    let total = keys.len();
+    SourceWindow {
+        node_ids,
+        name: name.to_string(),
+        rows: tail(total, limit)
+            .map(|i| RecordedRow {
+                key: Some(cell(keys, i)),
+                value: cell(values, i),
+                deleted: false,
+            })
+            .collect(),
+        total,
+    }
+}
+
 /// A rendered tile, before it is stamped with tick and sequence.
 struct Rendered {
     shape: &'static str,
@@ -788,6 +840,64 @@ mod tests {
             "a store's rows are its change ticks",
         );
         assert_eq!(recording.watermark.as_deref(), Some("True"));
+    }
+
+    /// The count a publisher compares against to skip an unchanged frame. The
+    /// driver's sink loop polls on a timer and most polls record nothing.
+    #[test]
+    fn the_recorded_count_advances_only_when_something_is_recorded() {
+        let mut recorder = ValueRecorder::with_defaults();
+        assert_eq!(recorder.recorded(), 0);
+        recorder.record(None, 1, "P#1", &Tile::Scalar(strings(&["x"])));
+        assert_eq!(recorder.recorded(), 1);
+        recorder.set_tick(9);
+        assert_eq!(recorder.recorded(), 1, "advancing the tick records nothing");
+        recorder.record(None, 1, "P#1", &collection(&[], &[], &[]));
+        assert_eq!(recorder.recorded(), 2, "an empty tile is still a recording");
+    }
+
+    /// A source window renders keys against values and truncates to the tail,
+    /// the same rule a recording uses: a source domain is index-ordered, so the
+    /// last keys are the most recent arrivals.
+    #[test]
+    fn a_source_window_renders_the_last_keys_and_counts_the_rest() {
+        let keys = uints(&[2, 3, 4]);
+        let values = strings(&["c", "d", "e"]);
+        let window = render_source_window(Vec::new(), "stdin", &keys, &values, 2);
+
+        assert_eq!(window.name, "stdin");
+        assert_eq!(window.total, 3);
+        assert_eq!(window.dropped(), 1);
+        assert_eq!(
+            window.rows,
+            vec![
+                RecordedRow {
+                    key: Some("u3".into()),
+                    value: "\"d\"".into(),
+                    deleted: false
+                },
+                RecordedRow {
+                    key: Some("u4".into()),
+                    value: "\"e\"".into(),
+                    deleted: false
+                },
+            ]
+        );
+    }
+
+    /// A converged source holds nothing: a universal release closes the buffer.
+    #[test]
+    fn an_empty_source_window_carries_no_rows() {
+        let window = render_source_window(
+            Vec::new(),
+            "stdin",
+            &ColumnValue::from_uints(Vec::new()),
+            &strings(&[]),
+            8,
+        );
+        assert_eq!(window.total, 0);
+        assert_eq!(window.dropped(), 0);
+        assert!(window.rows.is_empty());
     }
 
     #[test]

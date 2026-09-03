@@ -23,10 +23,11 @@
 //! it produces is embedded by [`serve`]. It is a JS project rather than a
 //! workspace member because the Rust half of the inspector is this module.
 
+pub mod live;
 mod serve;
 pub mod wire_check;
 
-pub use serve::{serve, snapshot_body_pretty};
+pub use serve::{serve, serve_compiled, snapshot_body_pretty};
 
 use crate::ccl::context::CompiledProgram;
 use crate::inspector_model::InspectedProgram;
