@@ -284,6 +284,18 @@ pub trait DataSourceDomainExtentImpl {
     /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
     fn release(&mut self, producer: &str, obsolete: Predicate);
+
+    /// The domain keys this source still holds, or `None` for a source that
+    /// retains nothing addressable.
+    ///
+    /// `&self`, so reading it moves no data and releases nothing — unlike
+    /// [`TileProducer::get`](crate::interpreter::tile_operators::TileProducer::get),
+    /// which is a consumer taking delivery. `None` and `Some(empty)` are
+    /// different answers: the first says this kind of source has no window, the
+    /// second that its window is currently empty.
+    fn retained_keys(&self) -> Option<ColumnValue> {
+        None
+    }
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {

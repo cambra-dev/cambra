@@ -78,25 +78,23 @@ Run a program:
 cargo run -- tests/programs/filter_and_aggregate/program.cambra
 ```
 
-### Web inspector
+### Inspector
 
-Pass `--inspect` to serve a live dashboard showing the parsed CHL AST, the lowered CCL, the operator graph, and runtime producer state:
+The inspector serves the source alongside one IR tree pane per compiler stage, cross-linked by node→node provenance, with the operator graph as its terminal pane. Two modes, exclusive by construction.
 
-```bash
-cargo run -- --inspect tests/programs/inner_join/program.cambra
-```
-
-The inspector defaults to port 8080 (`--inspect=9090` to change it). After the program finishes, the process stays alive so you can browse `http://localhost:<port>`; Ctrl+C to exit.
-
-### Program inspector
-
-Pass `--inspect-only` to compile a program and serve a read-only view of it — the source alongside one IR tree pane per compiler stage, cross-linked by node→node provenance — without running it:
+Pass `--inspect-only` to compile a program and serve that view without running it:
 
 ```bash
 cargo run -- --inspect-only tests/programs/polymorphic/program.cambra
 ```
 
-Same default port, and exclusive with `--inspect`: one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
+Pass `--inspect` to run the program and additionally stream the values flowing through its operators over `GET /api/live`:
+
+```bash
+printf 'hello\nworld\n' | cargo run -- --inspect tests/programs/streaming_echo/program.cambra
+```
+
+Both default to port 8080 (`--inspect=9090` to change it). Under `--inspect` the process stays alive after the program finishes, so the values it recorded are still there to read; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
 
 ## License
 

@@ -99,63 +99,6 @@ impl InspectNode {
         self.children.push((edge.into(), child));
         self
     }
-
-    /// Serialize this node tree to a JSON string without serde.
-    ///
-    /// DEPRECATED: emits the legacy `web_inspector` dashboard's wire shape (its
-    /// only caller). The program inspector's `/api/snapshot` path
-    /// ([`inspector_server`](crate::inspector_server)) uses the `Serialize` impl
-    /// below instead; this method and `web_inspector` will be removed once the
-    /// program inspector gains the live per-tick pane the old dashboard still
-    /// provides.
-    ///
-    /// Field names mirror the Rust struct fields. `None` guard fields are
-    /// omitted. Children serialize as `{"edge":"...","node":{...}}` pairs,
-    /// preserving edge labels.
-    pub fn to_json(&self) -> String {
-        let ann_strs: Vec<String> = self
-            .annotations
-            .iter()
-            .map(|a| format!("\"{}\"", escape_json(a)))
-            .collect();
-        let children_strs: Vec<String> = self
-            .children
-            .iter()
-            .map(|(edge, child)| {
-                format!(
-                    "{{\"edge\":\"{}\",\"node\":{}}}",
-                    escape_json(edge),
-                    child.to_json()
-                )
-            })
-            .collect();
-
-        let mut json = format!("{{\"label\":\"{}\"", escape_json(&self.label));
-        json.push_str(&format!(",\"annotations\":[{}]", ann_strs.join(",")));
-        if let Some(ref t) = self.tiling {
-            json.push_str(&format!(",\"tiling\":\"{}\"", escape_json(t)));
-        }
-        if let Some(ref g) = self.yield_guard {
-            json.push_str(&format!(",\"yield_guard\":\"{}\"", escape_json(g)));
-        }
-        if let Some(ref g) = self.obsolete_guard {
-            json.push_str(&format!(",\"obsolete_guard\":\"{}\"", escape_json(g)));
-        }
-        if let Some(ref g) = self.intent_guard {
-            json.push_str(&format!(",\"intent_guard\":\"{}\"", escape_json(g)));
-        }
-        json.push_str(&format!(",\"children\":[{}]}}", children_strs.join(",")));
-        json
-    }
-}
-
-/// Escape special characters for embedding in a JSON string.
-fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
 }
 
 impl std::fmt::Display for InspectNode {

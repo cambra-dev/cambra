@@ -72,6 +72,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         "stdin"
     }
 
+    fn retained_keys(&self) -> Option<ColumnValue> {
+        Some(self.buf.retained_keys())
+    }
+
     /// Drains any lines that the background reader thread has buffered.
     ///
     /// Returns `true` if at least one new line (or EOF) was received, which

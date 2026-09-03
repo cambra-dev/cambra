@@ -3,63 +3,19 @@ use std::{thread, time::Duration};
 use cambra::{
     ccl::{
         context::{GlobalContext, compile_program, eprint_errors},
-        symbolic::symbolic,
+        provenance::NodeId,
     },
+    inspector_server::serve_compiled,
     interpreter::{
-        Consumer,
+        Consumer, Scheduler,
+        operator_graph::GraphNode,
         tile_operators::{FunctionGuard, Tile, TileGuard},
-        value_recorder::{self, SharedRecorder, ValueRecorder},
+        value_recorder::{
+            self, DEFAULT_ROWS_PER_RECORDING, SourceWindow, ValueRecorder, render_source_window,
+        },
     },
-    pretty_graph::pretty_tile_operator,
-    web_inspector::WebInspector,
 };
 use log::debug;
-
-/// Report what the tick recorded, one line per producer that produced anything.
-///
-/// The only reader of the recorder until the live pane's transport lands, and
-/// the way to see the recording end to end: `RUST_LOG=debug cambra --inspect`.
-fn log_recordings(recorder: Option<&SharedRecorder>, tick: u64) {
-    let Some(recorder) = recorder else { return };
-    if !log::log_enabled!(log::Level::Debug) {
-        return;
-    }
-    let recorder = recorder.borrow();
-    let mut lines: Vec<String> = recorder
-        .producers()
-        .filter_map(|(node_id, producer_id)| {
-            let (recording, stale) = recorder.latest_non_empty(node_id, producer_id)?;
-            (recording.tick == tick).then(|| {
-                let rows: Vec<String> = recording
-                    .rows
-                    .iter()
-                    .map(|row| match (&row.key, row.deleted) {
-                        (Some(key), true) => format!("{key}: {} (deleted)", row.value),
-                        (Some(key), false) => format!("{key}: {}", row.value),
-                        (None, _) => row.value.clone(),
-                    })
-                    .collect();
-                let node = node_id.map_or_else(|| "-".to_string(), |id| format!("{id:?}"));
-                let dropped = match recording.dropped() {
-                    0 => String::new(),
-                    n => format!(" (+{n} more)"),
-                };
-                format!(
-                    "  {} {node} {}{}{}",
-                    recording.producer,
-                    if stale { "[stale] " } else { "" },
-                    rows.join(", "),
-                    dropped,
-                )
-            })
-        })
-        .collect();
-    if lines.is_empty() {
-        return;
-    }
-    lines.sort();
-    debug!("tick {tick} recorded:\n{}", lines.join("\n"));
-}
 
 /// Runs a Cambra program from a source string.
 ///
@@ -94,37 +50,90 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
         }
     };
 
-    let inspector = inspect_port.map(|port| {
-        // Render every output's operator tree.  The AST shown is the full
-        // join-planned program (shared across all outputs).
-        let op_parts: Vec<String> = compiled
-            .outputs
-            .iter()
-            .map(|o| pretty_tile_operator(o.op.as_ref()))
-            .collect();
-        WebInspector::new(port, symbolic(&compiled.ast), op_parts.join("\n\n"))
-    });
+    // Serve the panes from the same compile that is about to be driven, so a
+    // click in a pane names a node the running graph actually built.
+    let live = match inspect_port {
+        Some(port) => match serve_compiled(&compiled, src_name, port) {
+            Ok(channel) => Some(channel),
+            Err(e) => {
+                eprintln!("error: serving the inspector: {e}");
+                return Err(());
+            }
+        },
+        None => None,
+    };
 
-    // Pull the main producer out of `compiled` so the rest of the outputs can
-    // be borrowed immutably during snapshot() while we drive the producer.
     let mut main_producer = compiled.main_mut().and_then(|o| o.producer.take());
 
-    let snapshot =
-        |tick: u64,
-         main_producer: Option<&dyn cambra::interpreter::tile_operators::TileProducer>| {
-            if let Some(ref insp) = inspector {
-                insp.update_snapshot(tick, |add| {
-                    if let Some(p) = main_producer {
-                        add(p);
-                    }
-                    for output in compiled.sinks() {
-                        if let Some(ref c) = output.sink_consumer {
-                            c.borrow().with_producer(|p| add(p));
-                        }
-                    }
-                });
-            }
+    // Publishing sits between the pull and the release, so a source's retained
+    // window is sampled before anything is dropped from it.
+    //
+    // Only when a producer actually produced. The sink loop below polls on a
+    // 10ms timer and most polls record nothing, so publishing per iteration
+    // would broadcast an unchanged frame a hundred times a second and make
+    // `tick` count timer ticks rather than data. Returns whether it published,
+    // so the caller advances `tick` only over a tick that carried something.
+    let published_through = std::cell::Cell::new(0u64);
+    let publish = |tick: u64, sources: &[SourceWindow]| -> bool {
+        let (Some(live), Some(recorder)) = (live.as_ref(), recorder.as_ref()) else {
+            return false;
         };
+        let recorded = recorder.borrow().recorded();
+        if recorded == published_through.get() {
+            return false;
+        }
+        published_through.set(recorded);
+        live.publish(recorder, sources, tick);
+        true
+    };
+
+    // The last frame, marked `final`, so a reader can tell a finished run from
+    // an idle one. The process parks afterwards, so the socket stays open.
+    let finish = |tick: u64, sources: &[SourceWindow]| {
+        if let (Some(live), Some(recorder)) = (live.as_ref(), recorder.as_ref()) {
+            live.finish(recorder, sources, tick);
+        }
+    };
+
+    // A source's retained window, read on the thread that owns the graph: the
+    // handles are `Rc`, and `retained_keys`/`get` are `&self`, so sampling
+    // releases nothing. Sampled before the release below, so a window still
+    // shows what the tick delivered.
+    //
+    // The scheduler's handles are the sources the program *reads*: a handle is
+    // registered when an `IterateExtent` over the source is subscribed. Every
+    // context registers `stdin` whether or not the program mentions it, so
+    // iterating the context's sources instead would report a window for a
+    // source that is not part of the program.
+    let source_node_ids: std::collections::HashMap<String, NodeId> = compiled
+        .operator_graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            GraphNode::Source { id, name } => Some((name.clone(), *id)),
+            _ => None,
+        })
+        .collect();
+    let sample_sources = |scheduler: &Scheduler| -> Vec<SourceWindow> {
+        if live.is_none() {
+            return Vec::new();
+        }
+        scheduler
+            .sources()
+            .filter_map(|(name, handle)| {
+                let source = handle.borrow();
+                let keys = source.retained_keys()?;
+                let values = source.get(keys.clone());
+                Some(render_source_window(
+                    source_node_ids.get(name).copied(),
+                    name,
+                    &keys,
+                    &values,
+                    DEFAULT_ROWS_PER_RECORDING,
+                ))
+            })
+            .collect()
+    };
 
     let mut tick = 0u64;
 
@@ -141,10 +150,16 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
             if let Some(recorder) = recorder.as_ref() {
                 recorder.borrow_mut().set_tick(tick);
             }
+            // Sampled before the pull, not after. A `Memo` releases its input
+            // from inside `get_impl`, so the release cascade reaches the source
+            // buffer partway through the driver's own `get` — sampling
+            // afterwards reads a buffer the pull already drained. Before it,
+            // the tick's arrivals are present and nothing has taken delivery.
+            let sources = sample_sources(ctx.scheduler());
             let tile = producer.get(producer.tiling().universal_guard());
-            snapshot(tick, Some(producer.as_ref()));
-            log_recordings(recorder.as_ref(), tick);
-            tick += 1;
+            if publish(tick, &sources) {
+                tick += 1;
+            }
 
             let release_guard = match &tile {
                 Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
@@ -180,8 +195,10 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
                 recorder.borrow_mut().set_tick(tick);
             }
             ctx.scheduler().check_for_notifications();
-            snapshot(tick, None);
-            tick += 1;
+            let sources = sample_sources(ctx.scheduler());
+            if publish(tick, &sources) {
+                tick += 1;
+            }
             if compiled.done.try_recv().is_ok() {
                 break;
             }
@@ -191,6 +208,7 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
         }
     }
 
+    finish(tick, &sample_sources(ctx.scheduler()));
     Ok(())
 }
 
@@ -204,12 +222,11 @@ const DEFAULT_INSPECT_PORT: u16 = 8080;
 /// two flags that each mean something: a program is either run or it is not, and
 /// `--inspect-only` is the not.
 enum Mode {
-    /// Run the program. With a port, attach [`WebInspector`]'s live runtime
-    /// dashboard to the run.
+    /// Run the program. With a port, serve its panes and stream the values
+    /// flowing through its operators.
     Run { inspect_port: Option<u16> },
-    /// Compile the program and serve its panes, without running it — the
-    /// read-only program inspector. Answers what the program *is*, so there is
-    /// no execution to attach to.
+    /// Compile the program and serve its panes, without running it. Answers
+    /// what the program is, so no values flow.
     InspectOnly { port: u16 },
     /// Print the `/api/snapshot` payload for the program and exit. The one-shot
     /// form of `InspectOnly`, for the golden-fixture corpus (whose server would

@@ -112,6 +112,22 @@ impl UIntStreamBuffer {
         predicate
     }
 
+    /// The buffered indices, as domain keys.
+    ///
+    /// Everything that has arrived and not yet been dropped, which is what the
+    /// buffer still holds: [`release`](Self::release) advances `start_idx` only
+    /// over a prefix every registered producer has released, so this is the
+    /// union of what the readers still need rather than any one reader's view.
+    /// A converged stream answers empty, because a universal release
+    /// [`close`](Self::close)s the buffer.
+    pub(crate) fn retained_keys(&self) -> ColumnValue {
+        ColumnValue::from_uints(if self.closed || self.start_idx >= self.ready_size {
+            Vec::new()
+        } else {
+            (self.start_idx..self.ready_size).collect()
+        })
+    }
+
     /// The buffered indices, `[start_idx, ready_size)`.
     fn live_window(&self) -> IntervalSet<Value> {
         if self.start_idx >= self.ready_size {
