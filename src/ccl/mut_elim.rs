@@ -50,7 +50,7 @@ use crate::ccl::{
     TypedExprNode,
     ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
-    provenance,
+    provenance::{self, NodeId, RecordingGuard, RewriteLabel},
     subst::Subst,
     symbolic::symbolic,
 };
@@ -58,6 +58,41 @@ use crate::ccl::{
 // ---------------------------------------------------------------------------
 // Phase: For/MutWrite → LetRec
 // ---------------------------------------------------------------------------
+
+/// One accumulator's recurrence slot: its snapshot projection, its seed in the
+/// guard, and its trailing final read.
+const ACCUMULATOR_LABEL: RewriteLabel = "letrec.accumulator";
+
+/// One in-loop feed's tap: the projected view of its field on the decision.
+const FEED_LABEL: RewriteLabel = "letrec.feed";
+
+/// The two nodes one statement occupies: the `ExprStmt` holding it and the
+/// marker that is its effect (`For`, `MutWrite`, `Feed`).
+///
+/// A recording names a single node, and a statement's expansion is about both
+/// of these. [`StmtSite::enter`] names the `ExprStmt` — the outermost node the
+/// expansion replaces — and blames the marker, so the attribution carries the
+/// construct's own span as well as the statement's and either node reaches the
+/// products.
+#[derive(Clone, Copy)]
+pub(crate) struct StmtSite {
+    stmt: NodeId,
+    effect: NodeId,
+}
+
+impl StmtSite {
+    /// Both ids are read before the destructure that moves the statement.
+    fn new(stmt: NodeId, effect: NodeId) -> Self {
+        StmtSite { stmt, effect }
+    }
+
+    /// Open a recording over what this statement became.
+    fn enter(self, label: RewriteLabel, nature: provenance::Nature) -> RecordingGuard {
+        let g = provenance::enter(self.stmt, label, nature);
+        g.blame(&[self.effect]);
+        g
+    }
+}
 
 /// Rewrite every direct-mirror loop in `expr` into a causal `LetRec`.
 /// Trees without `For` nodes pass through untouched. Panics on malformed
@@ -421,7 +456,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
 fn rewrite(mut expr: Expr) -> Expr {
     let stmt_id = expr.node_id();
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
-        let effect_id = effect.node_id();
+        let site = StmtSite::new(stmt_id, effect.node_id());
         if let TypedExprNode::For {
             target,
             iter,
@@ -429,6 +464,14 @@ fn rewrite(mut expr: Expr) -> Expr {
         } = effect.node
         {
             // The recording names the statement: the causal `LetRec` replaces it.
+            // `blame` names the `For` so the products resolve to the loop
+            // keyword's span, not the statement's — [`StmtSite::enter`].
+            //
+            // What this recording adopts is the loop's own scaffolding: the
+            // history binder and its guard, the decision variant, the writer
+            // lambda. A product belonging to one body construct is recorded
+            // against that construct instead, under a nested recording opened
+            // inside this one ([`fold_induction_loop`]).
             //
             // There is deliberately no drop-path test. Whether the whole loop
             // vanishes — no accumulator, no feed, e.g. a transaction-emptied
@@ -436,11 +479,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             // predict it. Predicting it meant re-running `collect_writes` and
             // `body_has_feed` here to guess what `transform_loop` would decide
             // ~140 lines away.
-            //
-            // `blame` names the `For` rather than the `ExprStmt` so the products
-            // resolve to the loop keyword's span, not the statement's.
-            let g = provenance::enter(stmt_id, "letrec.loop", provenance::Nature::Expansion);
-            g.blame(&[effect_id]);
+            let _g = site.enter("letrec.loop", provenance::Nature::Expansion);
             return transform_loop(target, *iter, *loop_body, *body);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
@@ -449,11 +488,10 @@ fn rewrite(mut expr: Expr) -> Expr {
         // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
         if let TypedExprNode::MutWrite { name, value } = effect.node {
             // The shadowing `let` this mints is captured against the statement
-            // node it replaces. The `MutWrite` marker and the `ExprStmt` wrapper
-            // both vanish, but neither is named: both are absent from the output
-            // tree, so the boundary difference reports them.
-            let g = provenance::enter(stmt_id, "letrec.bare_write", provenance::Nature::Machinery);
-            g.blame(&[effect_id]);
+            // node it replaces, with the `MutWrite` blamed. Neither is claimed
+            // dead: both are absent from the output tree, so the boundary
+            // difference reports them.
+            let _g = site.enter("letrec.bare_write", provenance::Nature::Machinery);
             return normalize_bare_write(name, *value, *body);
         }
         // Not a loop/write statement: rebuild and recurse.
@@ -562,6 +600,9 @@ struct FeedSite {
     defer: Name,
     field: String,
     value: Expr,
+    /// The feed statement this tap is recorded against, so the view resolves to
+    /// the `<<` the user wrote rather than to the enclosing loop.
+    site: StmtSite,
     /// The control-flow path under which this feed fires — `true` for a feed on
     /// the loop spine, a conjunction of enclosing guards for a feed inside an
     /// `if`. A conditional feed (`fire != true`) rides the decision as a
@@ -735,8 +776,8 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     // read) or downstream of it (the trailing final read), so these two trees
     // carry every `Mut(V, D)` this loop's mutable variables have.
     let value_tys = mut_var_value_tys([&loop_body, &cont]);
-    // Accumulators in first-write order, with their value types.
-    let mut accs: Vec<(Name, Type)> = Vec::new();
+    // Accumulators in first-write order, with their value types and write sites.
+    let mut accs: Vec<Accumulator> = Vec::new();
     collect_writes(&loop_body, &value_tys, &mut accs);
     if accs.is_empty() {
         // A loop with no accumulator. If its body feeds — a stateless generator,
@@ -802,6 +843,20 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     )
 }
 
+/// One accumulator of an induction loop: the mutable variable, the value type its
+/// recurrence slot carries, and the write statement that made it an accumulator.
+///
+/// The site is what the slot's products are recorded against — the snapshot
+/// projection, the guard's seed, the trailing final read — so each accumulator
+/// of a two-accumulator loop resolves to the line that writes it rather than
+/// both resolving to the loop.
+#[derive(Clone)]
+pub(crate) struct Accumulator {
+    pub name: Name,
+    pub ty: Type,
+    site: StmtSite,
+}
+
 /// An induction loop folded into a single decision-factored history binding,
 /// *without* touching the continuation — the reusable core shared by the
 /// induction path ([`transform_loop`], which wraps it in a nested `LetRec`) and
@@ -828,8 +883,8 @@ pub(crate) struct InductionFold {
     pub domain_ty: Type,
     pub writes_ty: Type,
     pub decision_ty: Type,
-    /// Accumulators in first-write order (index `i` ↦ `writes.i`), value-typed.
-    pub accs: Vec<(Name, Type)>,
+    /// Accumulators in first-write order (index `i` ↦ `writes.i`).
+    pub accs: Vec<Accumulator>,
 }
 
 impl InductionFold {
@@ -838,7 +893,7 @@ impl InductionFold {
     /// applied at `pos`; the transaction phase uses it to resolve a `commits(r)`
     /// decision that reads an induction accumulator at its request position.
     pub(crate) fn acc_view(&self, i: usize) -> Expr {
-        let (_, vty) = &self.accs[i];
+        let vty = &self.accs[i].ty;
         writes_index_view(
             &self.hist,
             &self.hist_ty,
@@ -863,7 +918,7 @@ pub(crate) fn fold_induction_loop(
     loop_body: Expr,
     value_tys: &HashMap<Name, Type>,
 ) -> InductionFold {
-    let mut accs: Vec<(Name, Type)> = Vec::new();
+    let mut accs: Vec<Accumulator> = Vec::new();
     collect_writes(&loop_body, value_tys, &mut accs);
     assert!(
         !accs.is_empty(),
@@ -871,7 +926,7 @@ pub(crate) fn fold_induction_loop(
     );
 
     let (domain_ty, item_ty) = fun_parts(&iter.ty);
-    let acc_tys: Vec<Type> = accs.iter().map(|(_, t)| t.clone()).collect();
+    let acc_tys: Vec<Type> = accs.iter().map(|a| a.ty.clone()).collect();
     // The proposed write set — always a positional tuple, one element even
     // for a single accumulator (the transaction decision convention).
     let writes_ty = Type::Tuple(acc_tys.clone());
@@ -891,8 +946,11 @@ pub(crate) fn fold_induction_loop(
     // destructuring lets): each accumulator reads its snapshot slot
     // `__p ▷ .i`, the loop binder reads the item slot `__p ▷ .k`.
     let mut env: HashMap<Name, Expr> = HashMap::new();
-    for (i, (acc, ty)) in accs.iter().enumerate() {
-        env.insert(acc.clone(), proj_of(&p, &p_ty, i, ty));
+    for (i, acc) in accs.iter().enumerate() {
+        let _g = acc
+            .site
+            .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+        env.insert(acc.name.clone(), proj_of(&p, &p_ty, i, &acc.ty));
     }
     env.insert(
         target.name.clone(),
@@ -908,8 +966,8 @@ pub(crate) fn fold_induction_loop(
     // `Case` still forces a change (see `conditional_decision`).
     let entering: Vec<Expr> = accs
         .iter()
-        .map(|(n, _)| {
-            env.get(n)
+        .map(|a| {
+            env.get(&a.name)
                 .expect("accumulator seeded in the RYW environment")
                 .clone()
         })
@@ -944,7 +1002,16 @@ pub(crate) fn fold_induction_loop(
     // history is a causal reference (see `check_letrec_causal`); the
     // defaults are the accumulators' pre-loop bindings, tupled.
     let writes_view = hist_field_view(&h, &hist_ty, &domain_ty, F_WRITES, &writes_ty, &decision_ty);
-    let mut defaults = Expr::tuple(accs.iter().map(|(n, ty)| tvar(n, ty.clone())).collect());
+    let seeds: Vec<Expr> = accs
+        .iter()
+        .map(|a| {
+            let _g = a
+                .site
+                .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+            tvar(&a.name, a.ty.clone())
+        })
+        .collect();
+    let mut defaults = Expr::tuple(seeds);
     defaults.ty = writes_ty.clone();
     let guard = {
         let mut arg = Expr::tuple(vec![writes_view, tvar(&r, domain_ty.clone()), defaults]);
@@ -961,8 +1028,15 @@ pub(crate) fn fold_induction_loop(
     };
 
     // λ r → let __prev = ⟨guard⟩ in (__prev.0, …, r ▷ iter) ▷ __body
-    let mut snap_elts: Vec<Expr> = (0..accs.len())
-        .map(|i| proj_of(&prev, &writes_ty, i, &acc_tys[i]))
+    let mut snap_elts: Vec<Expr> = accs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let _g = a
+                .site
+                .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+            proj_of(&prev, &writes_ty, i, &acc_tys[i])
+        })
         .collect();
     let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
     item_read.ty = item_ty.clone();
@@ -982,18 +1056,22 @@ pub(crate) fn fold_induction_loop(
     // The read's default is the accumulator's pre-loop binding.
     let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
     let mut renames: Vec<(Name, Name)> = Vec::new();
-    for (i, (acc, vty)) in accs.iter().enumerate() {
+    for (i, acc) in accs.iter().enumerate() {
+        let _g = acc
+            .site
+            .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+        let vty = &acc.ty;
         let view = writes_index_view(&h, &hist_ty, &domain_ty, &writes_ty, &decision_ty, i, vty);
         let view_ty = view.ty.clone();
-        let mut arg = Expr::tuple(vec![view, tvar(acc, vty.clone())]);
+        let mut arg = Expr::tuple(vec![view, tvar(&acc.name, vty.clone())]);
         arg.ty = Type::Tuple(vec![view_ty, vty.clone()]);
         let mut f = Expr::builtin(Builtin::FinalOrDefault);
         f.ty = Type::fun(arg.ty.clone(), vty.clone());
         let mut read = Expr::apply(arg, f);
         read.ty = vty.clone();
 
-        let x_final = Name::fresh(acc.base());
-        renames.push((acc.clone(), x_final.clone()));
+        let x_final = Name::fresh(acc.name.base());
+        renames.push((acc.name.clone(), x_final.clone()));
         reads.push((binding(x_final, vty.clone()), read));
     }
 
@@ -1002,6 +1080,7 @@ pub(crate) fn fold_induction_loop(
     let feed_views = feeds
         .iter()
         .map(|f| {
+            let _g = f.site.enter(FEED_LABEL, provenance::Nature::Expansion);
             let view = hist_field_view(
                 &h,
                 &hist_ty,
@@ -1138,8 +1217,9 @@ pub(crate) fn mut_var_value_tys<'a>(
     out
 }
 
-/// Collect `MutWrite` targets in first-write order with their value types, taken
-/// from `value_tys` — the join inference recorded on the mutable variable's `Mut(V, D)`.
+/// Collect the loop's accumulators in first-write order, each with its value type
+/// taken from `value_tys` — the join inference recorded on the mutable variable's
+/// `Mut(V, D)` — and the write statement its recurrence slot is recorded against.
 ///
 /// A mutable variable with no entry is one no reference types as a `Mut`: either nothing
 /// reads it (only writes mention it, so its value type is unobservable), or the
@@ -1148,17 +1228,40 @@ pub(crate) fn mut_var_value_tys<'a>(
 /// mutable variable takes no refinement from any single contribution, and an unstripped
 /// one would be a refinement acquired by erasure rather than by `cast`
 /// (`src/ccl/design/type-inference.md`, "Refinements on the lattice").
-fn collect_writes(expr: &Expr, value_tys: &HashMap<Name, Type>, out: &mut Vec<(Name, Type)>) {
+fn collect_writes(expr: &Expr, value_tys: &HashMap<Name, Type>, out: &mut Vec<Accumulator>) {
+    collect_writes_in(expr, None, value_tys, out);
+}
+
+/// `stmt` is the `ExprStmt` whose effect `expr` is, when the walk arrived through
+/// one. Post-[`flatten_spine`] every write on a statement chain is a direct
+/// `ExprStmt` effect, so a write reached with `stmt` unset is one in a
+/// hand-built tree; its own node then stands as the whole site.
+fn collect_writes_in(
+    expr: &Expr,
+    stmt: Option<NodeId>,
+    value_tys: &HashMap<Name, Type>,
+    out: &mut Vec<Accumulator>,
+) {
     if let TypedExprNode::MutWrite { name, value } = &expr.node
-        && !out.iter().any(|(n, _)| n == name)
+        && !out.iter().any(|a| a.name == *name)
     {
-        let vty = value_tys
+        let ty = value_tys
             .get(name)
             .cloned()
             .unwrap_or_else(|| strip_refinements(&value.ty));
-        out.push((name.clone(), vty));
+        let write = expr.node_id();
+        out.push(Accumulator {
+            name: name.clone(),
+            ty,
+            site: StmtSite::new(stmt.unwrap_or(write), write),
+        });
     }
-    expr.walk_children(|c| collect_writes(c, value_tys, out));
+    if let TypedExprNode::ExprStmt { expr: effect, body } = &expr.node {
+        collect_writes_in(effect, Some(expr.node_id()), value_tys, out);
+        collect_writes_in(body, None, value_tys, out);
+        return;
+    }
+    expr.walk_children(|c| collect_writes_in(c, None, value_tys, out));
 }
 
 /// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
@@ -1269,12 +1372,13 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
 fn transform_chain(
     expr: Expr,
     env: &mut HashMap<Name, Expr>,
-    accs: &[(Name, Type)],
+    accs: &[Accumulator],
     writes_ty: &Type,
     entering: &[Expr],
     path: &Expr,
     feeds: &mut Vec<FeedSite>,
 ) -> Expr {
+    let stmt_id = expr.node_id();
     match expr.node {
         TypedExprNode::Let {
             binding: b,
@@ -1361,6 +1465,7 @@ fn transform_chain(
             conditional_decision(writing, carry, entering, writes_ty)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
+            let effect_id = effect.node_id();
             match effect.node {
                 // A write advances the read-your-writes environment by *inlining*
                 // the written value (point-free over `__p`), not binding a `let` —
@@ -1393,6 +1498,7 @@ fn transform_chain(
                 // `fire` is the current control-flow path — `true` on the spine, a
                 // guard conjunction inside an `if`.
                 TypedExprNode::Feed { name, value } => {
+                    let site = StmtSite::new(stmt_id, effect_id);
                     let val = Subst::discharge_env_in_place(*value, env);
                     let field = format!("to_{}_{}", name.base(), feeds.len());
                     feeds.push(FeedSite {
@@ -1400,6 +1506,7 @@ fn transform_chain(
                         field,
                         value: val,
                         fire: path.clone(),
+                        site,
                     });
                     transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
                 }
@@ -1445,7 +1552,7 @@ fn transform_chain(
                     .expect("letrec phase: accumulator missing from RYW environment")
                     .clone()
             };
-            let mut writes = Expr::tuple(accs.iter().map(|(n, _)| current(n)).collect());
+            let mut writes = Expr::tuple(accs.iter().map(|a| current(&a.name)).collect());
             writes.ty = writes_ty.clone();
             let mut commit = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
             commit.ty = Type::Base(BaseType::Bool);
@@ -1680,7 +1787,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
         }
         other => panic!(
             "letrec phase: a writer decision is `let* in {{commit, writes}}`, got {}",
-            symbolic(&Expr::preserve(provenance::NodeId::PLACEHOLDER, other).with_ty(decision.ty))
+            symbolic(&Expr::preserve(NodeId::PLACEHOLDER, other).with_ty(decision.ty))
         ),
     }
 }

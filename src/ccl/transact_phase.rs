@@ -1005,19 +1005,19 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // type inference joined for it.
         let value_tys = mut_var_value_tys([&*body, &*cont]);
         let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
-        for (i, (acc, vty)) in fold.accs.iter().enumerate() {
-            if cross_reads.contains(acc) {
+        for (i, acc) in fold.accs.iter().enumerate() {
+            if cross_reads.contains(&acc.name) {
                 let final_var = fold
                     .renames
                     .iter()
-                    .find(|(a, _)| a == acc)
+                    .find(|(a, _)| *a == acc.name)
                     .map(|(_, x)| x.clone())
                     .expect("a folded cross-read accumulator has a final-value rename");
                 out.acc_views.insert(
-                    acc.clone(),
+                    acc.name.clone(),
                     CrossAcc {
                         view: fold.acc_view(i),
-                        value_ty: vty.clone(),
+                        value_ty: acc.ty.clone(),
                         final_var,
                     },
                 );

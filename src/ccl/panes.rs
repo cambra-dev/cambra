@@ -591,6 +591,90 @@ mod tests {
         );
     }
 
+    /// **A loop-body statement reaches its own products, not the loop's.**
+    /// `mut_elim` turns one `For` statement into a recurrence carrying a slot
+    /// per accumulator and a tap per feed. One recording on the loop statement
+    /// claims all of it, which leaves every write and every feed in the body
+    /// with no descendants: the inspector then has nothing to answer with for
+    /// the lines that do the mutating. The nested `letrec.accumulator` and
+    /// `letrec.feed` recordings are what split it.
+    ///
+    /// Disjointness is the other half of the claim. A product belongs to one of
+    /// the three statements, so a recording that widened instead of splitting —
+    /// blaming the body statements on the loop's own recording — passes the
+    /// non-emptiness check and fails here.
+    #[test]
+    fn a_loop_body_statement_reaches_its_own_products() {
+        // Imported here rather than at the module's top: this test is the only
+        // user, and the enclosing module is shared with the pane declarations.
+        use std::collections::HashSet;
+
+        use crate::ccl::TypedExprNode;
+        use indoc::indoc;
+
+        let program = compile_ok(indoc! {"
+            out = defer()
+            total := 0
+            for n in [1, 2, 3]:
+                total := total + n
+                out << total
+            max(out)
+        "});
+        let panes = program.materialize_panes();
+        let pair = panes.pair("post-inference → post-channelize");
+
+        // The three statements of interest, found by the marker each holds:
+        // the loop, the write inside it, and the feed inside it.
+        let mut sites: Vec<(&'static str, NodeId)> = Vec::new();
+        fn find(e: &Expr, sites: &mut Vec<(&'static str, NodeId)>) {
+            if let TypedExprNode::ExprStmt { expr: effect, .. } = &e.node {
+                let kind = match &effect.node {
+                    TypedExprNode::For { .. } => Some("loop"),
+                    TypedExprNode::MutWrite { .. } => Some("write"),
+                    TypedExprNode::Feed { .. } => Some("feed"),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    sites.push((kind, e.node_id()));
+                }
+            }
+            e.walk_children(|c| find(c, sites));
+        }
+        find(&program.post_inference_ir, &mut sites);
+        assert_eq!(
+            sites.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["loop", "write", "feed"],
+            "the fixture is one loop statement holding one write and one feed",
+        );
+
+        let images: Vec<(&str, HashSet<NodeId>)> = sites
+            .iter()
+            .map(|(kind, id)| {
+                let image: HashSet<NodeId> = pair
+                    .map
+                    .downstream(id)
+                    .iter()
+                    .filter(|l| l.id != *id)
+                    .map(|l| l.id)
+                    .collect();
+                assert!(
+                    !image.is_empty(),
+                    "the {kind} statement reaches nothing in `post-channelize`",
+                );
+                (*kind, image)
+            })
+            .collect();
+        for (i, (ka, a)) in images.iter().enumerate() {
+            for (kb, b) in &images[i + 1..] {
+                let shared: Vec<NodeId> = a.intersection(b).copied().collect();
+                assert!(
+                    shared.is_empty(),
+                    "the {ka} and {kb} statements both claim {shared:?}",
+                );
+            }
+        }
+    }
+
     /// **Both of a nested join's conditions reach the map**, as blame edges from
     /// `planning.hash_join`.
     ///
