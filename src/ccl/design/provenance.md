@@ -479,7 +479,8 @@ snapshots: `infer/solve` (`mono.specialize`,
 (`infer.require_trait`), `infer/solver/scheme` (`infer.freshen_predicate`),
 `infer/solver/traits` (`infer.freshen_obligation`), `inline`
 (`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
-`letrec.bare_write`, `letrec.hoist_writer_body`, `letrec.terminalize_write`),
+`letrec.accumulator`, `letrec.feed`, `letrec.bare_write`,
+`letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
 key rebind, key-init stash, carrier, the cross-domain and await-final rules), and
 `channelize` (`channelize.cluster`, `channelize.defer_lift`,
@@ -545,6 +546,15 @@ Three refinements the shapes above do not cover:
   the same node** inside the arm. The two write disjoint sets of rows on one
   parent, which is what two rewrites attributed to one node should look like. A
   recording carries one label and one nature for its whole extent by design.
+- **An expansion whose products belong to several source constructs** — a
+  mutation loop's `LetRec` carries one recurrence slot per accumulator and one
+  tap per feed, and a single recording on the loop statement claims all of them.
+  Open a **nested recording per construct** inside the enclosing one. The inner
+  recording is innermost while it runs, so the mint hook attaches to it and the
+  outer one keeps only what it built itself: `mut_elim` opens
+  `letrec.accumulator` on each write statement and `letrec.feed` on each feed
+  statement inside `letrec.loop`, and the commit-store builder opens one per
+  writer inside `opconv.convert`.
 
 #### Choosing between `Expansion` and `Machinery`
 
