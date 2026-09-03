@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Cambra Playground</title>
+    <style>
+        :root {
+            /* Brand colors, matching src/resources/dashboard.html */
+            --color-abyssal: #10253a;
+            --color-deep-sea: #054350;
+            --color-ocean: #1c88a7;
+            --color-lagoon: #6cc4c8;
+            --color-san-blas: #c5e3db;
+            --color-ember: #d75a2e;
+            --color-coral: #f18840;
+            --color-amber: #f5a337;
+            --color-sand: #fff0d1;
+            --color-dark-grey: #45475a;
+
+            --color-bg-body: var(--color-abyssal);
+            --color-bg-panel: #0d1f30;
+            --color-text-primary: var(--color-sand);
+            --color-text-secondary: var(--color-ember);
+            --color-text-annotation: var(--color-lagoon);
+            --color-text-error: var(--color-amber);
+            --color-button-bg: var(--color-ocean);
+            --color-border-container: var(--color-deep-sea);
+            --color-border-divider: var(--color-dark-grey);
+
+            --color-svg-bg: var(--color-abyssal);
+            --color-node-fill: var(--color-deep-sea);
+            --color-node-border-default: var(--color-dark-grey);
+            --color-node-border-active: var(--color-amber);
+            --color-edge-stroke: var(--color-dark-grey);
+            --color-edge-label-bg: var(--color-abyssal);
+            --color-edge-label-text: var(--color-amber);
+            --color-node-title: var(--color-ember);
+            --color-node-tiling: var(--color-sand);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+            font-size: 13px;
+            background: var(--color-bg-body);
+            color: var(--color-text-primary);
+            margin: 0;
+            padding: 16px;
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 0 0 4px;
+            color: var(--color-text-secondary);
+        }
+
+        .subtitle {
+            color: var(--color-text-annotation);
+            margin-bottom: 14px;
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(360px, 1fr) minmax(360px, 1.3fr);
+            gap: 16px;
+            align-items: start;
+        }
+
+        @media (max-width: 900px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: var(--color-bg-panel);
+            border: 1px solid var(--color-border-container);
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .panel + .panel {
+            margin-top: 16px;
+        }
+
+        .section-title {
+            color: var(--color-text-secondary);
+            font-size: 14px;
+            margin-bottom: 8px;
+            border-bottom: 1px solid var(--color-border-divider);
+            padding-bottom: 4px;
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        select {
+            background: var(--color-bg-body);
+            color: var(--color-text-primary);
+            border: 1px solid var(--color-border-container);
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 12px;
+            padding: 4px 6px;
+        }
+
+        button {
+            background: var(--color-button-bg);
+            color: var(--color-bg-body);
+            border: none;
+            padding: 6px 14px;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        button:active {
+            filter: brightness(0.9);
+        }
+
+        label.auto-run {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            color: var(--color-text-annotation);
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        #src {
+            width: 100%;
+            height: 20rem;
+            background: var(--color-bg-body);
+            color: var(--color-text-primary);
+            border: 1px solid var(--color-border-container);
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 13px;
+            padding: 10px;
+            resize: vertical;
+            tab-size: 4;
+        }
+
+        #status {
+            margin-top: 8px;
+            color: var(--color-text-annotation);
+            min-height: 1.2em;
+        }
+
+        #status.ok {
+            color: var(--color-lagoon);
+        }
+
+        #status.err {
+            color: var(--color-text-error);
+        }
+
+        #error-box {
+            color: var(--color-text-error);
+            white-space: pre-wrap;
+            margin-top: 8px;
+        }
+
+        .pre-content {
+            margin: 0;
+            overflow: auto;
+            max-height: 40vh;
+            white-space: pre-wrap;
+        }
+
+        #producer-container {
+            overflow: auto;
+            max-height: 50vh;
+            border: 1px solid var(--color-border-container);
+            border-radius: 4px;
+        }
+
+        .producer-div {
+            line-height: 0;
+        }
+
+        .none-text {
+            display: block;
+            padding: 8px;
+            color: var(--color-text-annotation);
+        }
+
+        details > summary {
+            cursor: pointer;
+        }
+
+        details + details {
+            margin-top: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Cambra Playground</h1>
+    <div class="subtitle">
+        Compiled to WebAssembly — runs entirely in this tab, no server round-trip.
+        Only non-IO programs converge here (no <code>http_serve</code>/external sources); see the
+        wasm exploration notes for why.
+    </div>
+
+    <div class="layout">
+        <div>
+            <div class="panel">
+                <div class="controls">
+                    <select id="example"></select>
+                    <button id="run">Run now</button>
+                    <label class="auto-run">
+                        <input type="checkbox" id="auto-run" checked />
+                        auto-run (debounced)
+                    </label>
+                </div>
+                <textarea id="src" spellcheck="false"></textarea>
+                <div id="status">not run yet</div>
+            </div>
+            <div class="panel">
+                <div class="section-title">Output</div>
+                <pre id="output" class="pre-content">(none)</pre>
+                <div id="error-box"></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <details open>
+                <summary class="section-title">CCL AST (symbolic)</summary>
+                <pre id="ast" class="pre-content">(none)</pre>
+            </details>
+            <details open>
+                <summary class="section-title">Operator Graph</summary>
+                <pre id="operators" class="pre-content">(none)</pre>
+            </details>
+            <details open>
+                <summary class="section-title">Producer Graph (final tick)</summary>
+                <div id="producer-container"><span class="none-text">none</span></div>
+            </details>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { init_panic_hook, compile_and_run } from "./pkg/cambra.js";
+
+        // ── Example programs, verified to compile & run against the current
+        //    pipeline (some fixtures in tests/programs use syntax the parser
+        //    or operator-conversion pass doesn't yet accept — these four do).
+        const examples = {
+            arithmetic: "x = 2 + 3\ny = x * 4\ny\n",
+            filter_and_aggregate:
+                'users = [\n    (name="alice", age=30, score=85),\n    (name="bob",   age=17, score=92),\n    (name="carol", age=25, score=78),\n    (name="dave",  age=45, score=90),\n]\nsum([u.score for u in users if u.age >= 18])\n',
+            for_accumulator:
+                "acc := 0\nfor i in [1, 2, 3, 4, 5]:\n    acc := acc + i\nacc\n",
+            inner_join:
+                'users = [\n    (id=1, name="alice"),\n    (id=2, name="bob"),\n    (id=3, name="carol"),\n]\n\norders = [\n    (user_id=1, amount=50),\n    (user_id=2, amount=75),\n    (user_id=1, amount=100),\n    (user_id=99, amount=999),\n]\n\n[\n    (customer=u.name, total=o.amount)\n    for u in users\n    for o in orders\n    if u.id == o.user_id\n]\n',
+        };
+
+        const select = document.getElementById("example");
+        const src = document.getElementById("src");
+        const status = document.getElementById("status");
+        const outputEl = document.getElementById("output");
+        const errorEl = document.getElementById("error-box");
+        const astEl = document.getElementById("ast");
+        const operatorsEl = document.getElementById("operators");
+        const producerContainer = document.getElementById("producer-container");
+        const autoRunBox = document.getElementById("auto-run");
+
+        for (const name of Object.keys(examples)) {
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            select.appendChild(opt);
+        }
+        select.addEventListener("change", () => {
+            src.value = examples[select.value];
+            runNow();
+        });
+        select.value = "arithmetic";
+        src.value = examples.arithmetic;
+
+        // Off-side-rule language: Tab must insert indentation, not move focus.
+        src.addEventListener("keydown", (e) => {
+            if (e.key !== "Tab") return;
+            e.preventDefault();
+            const start = src.selectionStart;
+            const end = src.selectionEnd;
+            src.value = src.value.slice(0, start) + "    " + src.value.slice(end);
+            src.selectionStart = src.selectionEnd = start + 4;
+            scheduleRun();
+        });
+
+        // ── Producer-graph SVG rendering, adapted from src/resources/dashboard.html ──
+        function esc(s) {
+            return String(s)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;");
+        }
+
+        function isFanOutRef(label) { return label.startsWith("→ FanOut#"); }
+        function fanOutId(label) {
+            const idx = label.indexOf("FanOut#");
+            return idx >= 0 ? label.slice(idx + 7) : null;
+        }
+
+        const NODE_W = 188;
+        const TILING_LW = 24;
+        const H_GAP = 24;
+        const V_GAP = 56;
+        const PAD = 20;
+
+        function nodeHeight(node) {
+            const n = tilingLines(node.tiling || "").length;
+            return n === 0 ? 34 : 26 + n * 13 + 8;
+        }
+
+        function tilingLines(text) {
+            if (!text) return [];
+            const lines = [];
+            let rem = text;
+            while (rem.length > TILING_LW) {
+                const arrowIdx = rem.lastIndexOf("→", TILING_LW);
+                let bp = arrowIdx > 0 ? arrowIdx + 1 : rem.lastIndexOf(" ", TILING_LW);
+                if (bp <= 0) bp = TILING_LW;
+                lines.push(rem.slice(0, bp).trimEnd());
+                rem = rem.slice(bp).trimStart();
+            }
+            if (rem) lines.push(rem);
+            return lines;
+        }
+
+        function subtreeWidth(node) {
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
+            if (realChildren.length === 0) return NODE_W;
+            const childTotal = realChildren.reduce((sum, c) => sum + subtreeWidth(c.node), 0);
+            const gaps = H_GAP * (realChildren.length - 1);
+            return Math.max(NODE_W, childTotal + gaps);
+        }
+
+        function assignDepths(node, depth) {
+            node._depth = Math.max(node._depth ?? 0, depth);
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
+            for (const c of realChildren) assignDepths(c.node, depth + 1);
+        }
+
+        function pushDown(node, delta) {
+            node._depth += delta;
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
+            for (const c of realChildren) pushDown(c.node, delta);
+        }
+
+        function enforceDepthConstraints(node, fanOutMap) {
+            for (const c of (node.children || [])) {
+                if (isFanOutRef(c.node.label)) {
+                    const fanOut = fanOutMap.get(fanOutId(c.node.label));
+                    if (fanOut && fanOut._depth <= node._depth)
+                        pushDown(fanOut, node._depth - fanOut._depth + 1);
+                }
+            }
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
+            for (const c of realChildren) enforceDepthConstraints(c.node, fanOutMap);
+        }
+
+        function computeYPositions(nodes) {
+            const rowH = new Map();
+            for (const n of nodes)
+                rowH.set(n._depth, Math.max(rowH.get(n._depth) ?? 0, nodeHeight(n)));
+            const maxDepth = Math.max(...nodes.map(n => n._depth));
+            const rowY = [0];
+            for (let d = 0; d < maxDepth; d++)
+                rowY.push(rowY[d] + (rowH.get(d) ?? 34) + V_GAP);
+            for (const n of nodes)
+                n._y = rowY[n._depth];
+        }
+
+        function assignX(node, cx) {
+            node._cx = cx;
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
+            if (realChildren.length === 0) return;
+            const widths = realChildren.map(c => subtreeWidth(c.node));
+            const total = widths.reduce((a, b) => a + b, 0) + H_GAP * (widths.length - 1);
+            let x = cx - total / 2;
+            for (let i = 0; i < realChildren.length; i++) {
+                assignX(realChildren[i].node, x + widths[i] / 2);
+                x += widths[i] + H_GAP;
+            }
+        }
+
+        function collectAll(node, nodes, edges) {
+            nodes.push(node);
+            if (!node.children) return;
+            for (const c of node.children) {
+                if (isFanOutRef(c.node.label)) {
+                    edges.push({ from: node, to: null, fanOutRefId: fanOutId(c.node.label), label: c.edge || "" });
+                } else {
+                    edges.push({ from: node, to: c.node, label: c.edge || "" });
+                    collectAll(c.node, nodes, edges);
+                }
+            }
+        }
+
+        function getCSSVarColor(varName) {
+            return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+        }
+
+        function buildSvgGraph(root) {
+            assignDepths(root, 0);
+            const nodes = [], edges = [];
+            collectAll(root, nodes, edges);
+
+            const fanOutMap = new Map();
+            for (const n of nodes) {
+                const id = fanOutId(n.label);
+                if (id && !isFanOutRef(n.label)) fanOutMap.set(id, n);
+            }
+            enforceDepthConstraints(root, fanOutMap);
+
+            const totalW = subtreeWidth(root);
+            assignX(root, totalW / 2);
+            computeYPositions(nodes);
+
+            for (const e of edges) {
+                if (e.fanOutRefId) e.to = fanOutMap.get(e.fanOutRefId) ?? null;
+            }
+
+            const minX = Math.min(...nodes.map(n => n._cx)) - NODE_W / 2;
+            const maxX = Math.max(...nodes.map(n => n._cx)) + NODE_W / 2;
+            const maxY = Math.max(...nodes.map(n => n._y + nodeHeight(n)));
+            const svgW = maxX - minX + 2 * PAD;
+            const svgH = maxY + 2 * PAD;
+            const ox = PAD - minX;
+            const oy = PAD;
+
+            const colors = {
+                svgBg: getCSSVarColor("--color-svg-bg"),
+                edgeStroke: getCSSVarColor("--color-edge-stroke"),
+                edgeLabelBg: getCSSVarColor("--color-edge-label-bg"),
+                edgeLabelText: getCSSVarColor("--color-edge-label-text"),
+                nodeFill: getCSSVarColor("--color-node-fill"),
+                nodeBorderDefault: getCSSVarColor("--color-node-border-default"),
+                nodeBorderActive: getCSSVarColor("--color-node-border-active"),
+                nodeTitle: getCSSVarColor("--color-node-title"),
+                nodeTiling: getCSSVarColor("--color-node-tiling"),
+                textAnnotation: getCSSVarColor("--color-text-annotation"),
+            };
+
+            let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" `
+                + `style="font-family:'SF Mono',Menlo,Monaco,monospace;display:block;">`;
+            s += `<rect width="${svgW}" height="${svgH}" fill="${colors.svgBg}"/>`;
+
+            for (const e of edges) {
+                if (!e.to) continue;
+                const x1 = e.fanOutRefId ? e.to._cx + ox : e.from._cx + ox;
+                const y1 = e.fanOutRefId ? e.to._y + oy : e.from._y + oy + nodeHeight(e.from);
+                const x2 = e.fanOutRefId ? e.from._cx + ox : e.to._cx + ox;
+                const y2 = e.fanOutRefId ? e.from._y + oy + nodeHeight(e.from) : e.to._y + oy;
+                const cm = (y1 + y2) / 2;
+                s += `<path d="M${x1},${y1} C${x1},${cm} ${x2},${cm} ${x2},${y2}" `
+                    + `fill="none" stroke="${colors.edgeStroke}" stroke-width="1.5"/>`;
+                if (e.label) {
+                    const lx = (x1 + x2) / 2;
+                    const ly = (y1 + y2) / 2;
+                    const fw = e.label.length * 6.5 + 6;
+                    s += `<rect x="${lx - fw / 2}" y="${ly - 8}" width="${fw}" height="13" rx="2" fill="${colors.edgeLabelBg}"/>`;
+                    s += `<text x="${lx}" y="${ly + 3}" text-anchor="middle" `
+                        + `fill="${colors.edgeLabelText}" font-size="10">${esc(e.label)}</text>`;
+                }
+            }
+
+            for (const n of nodes) {
+                const nx = n._cx + ox - NODE_W / 2;
+                const ny = n._y + oy;
+                const cx = n._cx + ox;
+                const yg = n.yield_guard;
+                const borderColor = (yg && yg !== "∅" && yg !== "*") ? colors.nodeBorderActive : colors.nodeBorderDefault;
+                s += `<rect x="${nx}" y="${ny}" width="${NODE_W}" height="${nodeHeight(n)}" rx="5" `
+                    + `fill="${colors.nodeFill}" stroke="${borderColor}" stroke-width="1"/>`;
+
+                const parenIdx = n.label.indexOf("(");
+                const typeName = parenIdx >= 0 ? n.label.slice(0, parenIdx) : n.label;
+                const args = parenIdx >= 0 ? n.label.slice(parenIdx) : "";
+                const annInline = (n.annotations && n.annotations.length > 0) ? " " + n.annotations.join(" ") : "";
+                s += `<text x="${cx}" y="${ny + 18}" text-anchor="middle" font-size="12">`
+                    + `<tspan fill="${colors.nodeTitle}" font-weight="bold">${esc(typeName + (args || ""))}</tspan>`;
+                if (annInline)
+                    s += `<tspan fill="${colors.textAnnotation}" font-size="11">${esc(annInline)}</tspan>`;
+                s += `</text>`;
+
+                const tlines = tilingLines(n.tiling || "");
+                for (let i = 0; i < tlines.length; i++) {
+                    s += `<text x="${cx}" y="${ny + 35 + i * 13}" text-anchor="middle" `
+                        + `fill="${colors.nodeTiling}" font-size="11">${esc(tlines[i])}</text>`;
+                }
+            }
+
+            s += "</svg>";
+            return s;
+        }
+
+        function renderSnapshot(snapshotJson) {
+            if (!snapshotJson) {
+                producerContainer.innerHTML = '<span class="none-text">none</span>';
+                return;
+            }
+            const data = JSON.parse(snapshotJson);
+            const producers = data.producers || [];
+            if (producers.length === 0) {
+                producerContainer.innerHTML = '<span class="none-text">none</span>';
+                return;
+            }
+            producerContainer.innerHTML = producers.map((p, i) => {
+                const label = producers.length > 1
+                    ? `<div class="section-title" style="padding:4px 8px;border-bottom:none;">Producer ${i + 1} (tick ${data.tick})</div>`
+                    : `<div class="section-title" style="padding:4px 8px;border-bottom:none;">tick ${data.tick}</div>`;
+                return label + '<div class="producer-div">' + buildSvgGraph(p) + "</div>";
+            }).join("");
+        }
+
+        // ── Compile/run driver, with a debounced auto-run on every keystroke ──
+        let debounceTimer = null;
+        let runCount = 0;
+
+        function scheduleRun() {
+            if (!autoRunBox.checked) return;
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(runNow, 400);
+        }
+        src.addEventListener("input", scheduleRun);
+
+        async function runNow() {
+            clearTimeout(debounceTimer);
+            const code = src.value;
+            const myRun = ++runCount;
+            status.textContent = "running…";
+            status.className = "";
+            // Yield one frame so the "running…" status paints before the
+            // (synchronous, potentially slow-on-first-call) wasm call blocks
+            // the tab — see the wasm exploration notes on cold-start cost.
+            await new Promise((r) => setTimeout(r, 0));
+            if (myRun !== runCount) return; // superseded by a later run
+
+            const t0 = performance.now();
+            let result;
+            try {
+                result = compile_and_run(code);
+            } catch (e) {
+                status.textContent = "panic (see browser console)";
+                status.className = "err";
+                errorEl.textContent = String(e);
+                return;
+            }
+            const ms = (performance.now() - t0).toFixed(1);
+
+            astEl.textContent = result.ast || "(none)";
+            operatorsEl.textContent = result.operators || "(none)";
+            outputEl.textContent = result.output || "(no output)";
+            renderSnapshot(result.snapshot);
+
+            if (result.error) {
+                status.textContent = `error (${ms}ms)`;
+                status.className = "err";
+                errorEl.textContent = result.error;
+            } else {
+                status.textContent = `ok (${ms}ms)`;
+                status.className = "ok";
+                errorEl.textContent = "";
+            }
+        }
+
+        document.getElementById("run").addEventListener("click", runNow);
+
+        async function main() {
+            await init();
+            init_panic_hook();
+            window.__cambraReady = true;
+            await runNow();
+        }
+        main();
+    </script>
+</body>
+
+</html>

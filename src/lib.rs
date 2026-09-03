@@ -9,3 +9,6 @@ pub mod pretty_graph;
 pub mod pretty_tree;
 pub mod util;
 pub mod web_inspector;
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_api;

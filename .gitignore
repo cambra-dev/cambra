@@ -1,5 +1,9 @@
 /target
 /Cargo.lock
+
+# wasm-bindgen build output (regenerate with `wasm-bindgen --target web`,
+# see www/index.html) — too large to track and rebuilt from src/wasm_api.rs.
+/www/pkg/
 /.claude/*
 !/.claude/skills/
 !/.claude/settings.json

@@ -1,8 +1,6 @@
-use std::{
-    io::BufRead,
-    sync::mpsc::{self, Receiver},
-    thread,
-};
+use std::sync::mpsc::{self, Receiver};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{io::BufRead, thread};
 
 use log::debug;
 use smol_str::SmolStr;
@@ -26,6 +24,7 @@ pub struct StdinDataSource {
 }
 
 impl StdinDataSource {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -50,6 +49,23 @@ impl StdinDataSource {
                 }
             }
         });
+        Self {
+            buf: UIntStreamBuffer::new(),
+            receiver,
+        }
+    }
+
+    /// `wasm32-unknown-unknown` has no OS threads to back a reader, and a
+    /// browser embedding has no process stdin to read in the first place.
+    /// `GlobalContext::new` registers this source unconditionally (so
+    /// `name()` resolves during lowering even for programs that don't use
+    /// it), so this stub must exist without spawning anything: the sender
+    /// end is dropped immediately, so `check_for_new_data` always sees a
+    /// closed, empty channel — a program that actually reads `stdin` here
+    /// blocks forever, same as it would natively with no input piped in.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new() -> Self {
+        let (_sender, receiver) = mpsc::channel();
         Self {
             buf: UIntStreamBuffer::new(),
             receiver,
