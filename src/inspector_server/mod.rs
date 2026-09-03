@@ -19,7 +19,7 @@
 //!
 //! # The frontend is a sibling directory, not a crate
 //!
-//! `cambra-inspector/web/` is the TypeScript frontend and its build; the bundle
+//! `web/` is the TypeScript frontend and its build; the bundle
 //! it produces is embedded by [`serve`]. It is a JS project rather than a
 //! workspace member because the Rust half of the inspector is this module.
 
@@ -48,7 +48,7 @@ pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
 }
 
 /// Pretty-printed [`snapshot_json`] — the byte format of the committed golden
-/// fixtures (`cambra-inspector/web/src/__fixtures__/`).
+/// fixtures (`web/src/__fixtures__/`).
 ///
 /// The binary owns these bytes deliberately: the fixtures are byte-compared by
 /// `ci.sh`'s `ci_fixtures` gate, so their formatter must be pinned by

@@ -27,7 +27,7 @@ highlighting are all computed from indices derived from that one payload.
 
 ## Running the inspector
 
-See [Running it](../README.md#running-it). No `cargo`? After `npm run build`,
+See [Running it](../docs/inspector.md#running-it). No `cargo`? After `npm run build`,
 `npm run dev` proxies `/api` to a running inspector — see [Build](#build).
 
 ## Interactions

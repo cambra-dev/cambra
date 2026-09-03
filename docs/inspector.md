@@ -34,7 +34,7 @@ serves.
   to 11 of program). They stay on the wire because their ids are endpoints of
   the pane links.
 
-See [`web/README.md`](web/README.md) for the full interaction table and the
+See [`web/README.md`](../web/README.md) for the full interaction table and the
 frontend's design.
 
 ## Architecture
@@ -63,7 +63,7 @@ browser ──HTTP──> cambra --inspect-only ──> inspector_server ──>
 
 | Path | What it is |
 |---|---|
-| `web/` | The CodeMirror 6 / TypeScript frontend. **Has its own [README](web/README.md)** — build, tests, module layout, and the byte↔char bridge. |
+| `web/` | The CodeMirror 6 / TypeScript frontend. **Has its own [README](../web/README.md)** — build, tests, module layout, and the byte↔char bridge. |
 | `web/dist/index.html` | The built, self-contained single-file bundle, committed and `include_str!`-embedded by the server (so `cargo build` needs no Node). |
 | `web/src/__fixtures__/` | The golden snapshot corpus the frontend's tests read, blessed by `scripts/regen-fixtures.sh`. |
 | `scripts/fixtures.manifest` | Which gallery program each committed fixture is dumped from. |
@@ -117,7 +117,7 @@ payload is too large to commit is asserted structurally in
 (`src/inspector_server/`), and the golden corpus
 (`tests/inspector_goldens.rs`).
 
-**Frontend (TypeScript):** see [`web/README.md`](web/README.md). In short, from
+**Frontend (TypeScript):** see [`web/README.md`](../web/README.md). In short, from
 `web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`.
 
 > ⚠ **Never run `npm run dev`** — it starts a Vite server that does not exit.
@@ -130,7 +130,7 @@ payload is too large to commit is asserted structurally in
 the binary works without Node. **After changing anything under `web/src/`, rerun
 `npm run build` and commit the regenerated bundle** — `ci.sh web` compares it
 against a fresh build (see the "Committed bundle (R7)" section of
-[`web/README.md`](web/README.md)).
+[`web/README.md`](../web/README.md)).
 
 ## Design & background
 

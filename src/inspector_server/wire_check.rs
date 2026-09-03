@@ -1,5 +1,5 @@
 //! Structural validators for the `/api/snapshot` wire shape — the Rust mirror
-//! of the frontend's `validateSnapshot` (`cambra-inspector/web/src/wireValidate.ts`).
+//! of the frontend's `validateSnapshot` (`web/src/wireValidate.ts`).
 //! Asserting the wire contract in one place lets the transport, the server and
 //! `tests/inspector_goldens.rs` check one contract (the cross-language twin of
 //! the TS validator, since the two cannot literally share code).

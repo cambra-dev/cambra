@@ -105,7 +105,7 @@ ci_web() {
     # dynamic extent — including this subshell. Without the explicit exits a
     # failing `npm run test` would fall through to the build below and the
     # subshell would report the *build's* status, so red tests passed the gate.
-    cd cambra-inspector/web || exit 1
+    cd web || exit 1
     npm ci || exit 1
     npm run typecheck || exit 1
     npm run test || exit 1
@@ -123,7 +123,7 @@ ci_web() {
       built_size="$(wc -c < dist/index.html)"
       echo "ci_web FAILED: vendored dist/index.html differs from a fresh build" >&2
       echo "  sizes: vendored ${vendored_size} bytes vs built ${built_size} bytes" >&2
-      echo "  re-vendor via: (cd cambra-inspector/web && npm run build), then commit dist/index.html" >&2
+      echo "  re-vendor via: (cd web && npm run build), then commit dist/index.html" >&2
       exit 1
     fi
   )
@@ -132,7 +132,7 @@ ci_web() {
 # temp dir through the same script the fix path uses (regen-fixtures.sh, driven
 # by scripts/fixtures.manifest) and fail on any byte difference from the
 # committed copies. The fix on an intended wire change is the script itself:
-#   cambra-inspector/scripts/regen-fixtures.sh   # then commit the diff
+#   web/scripts/regen-fixtures.sh   # then commit the diff
 # (Cross-process dump determinism — the property this gate relies on — is
 # pinned corpus-wide by tests/inspector_goldens.rs under ci_test.)
 ci_fixtures() {
@@ -146,11 +146,11 @@ ci_fixtures() {
     # it — its manifest row is fine, regen just never got there. Checked
     # explicitly (`if !`) rather than via `set -e`: `ci_all` calls this gate on
     # the left of a `||`, which suppresses errexit for this whole subshell.
-    if ! cambra-inspector/scripts/regen-fixtures.sh "${tmp}"; then
+    if ! web/scripts/regen-fixtures.sh "${tmp}"; then
       echo "ci_fixtures FAILED: fixture regeneration failed (see the error above) — a build/regen failure, NOT fixture drift" >&2
       exit 1
     fi
-    fix="cambra-inspector/web/src/__fixtures__"
+    fix="web/src/__fixtures__"
     drifted=0
     for f in "${tmp}"/*.snapshot.json; do
       name="$(basename "${f}")"
@@ -161,8 +161,8 @@ ci_fixtures() {
         regen_size="$(wc -c < "${f}")"
         echo "ci_fixtures FAILED: fixture drift: ${name} (committed ${committed_size} bytes vs regenerated ${regen_size} bytes)" >&2
         diff -u "${fix}/${name}" "${f}" | head -n 12 >&2 || true
-        echo "  re-bless via: cambra-inspector/scripts/regen-fixtures.sh, then commit the diff" >&2
-        echo "  (if web/src/ changed too: cd cambra-inspector/web && npm run build, then commit dist/index.html — ci_web compares it)" >&2
+        echo "  re-bless via: web/scripts/regen-fixtures.sh, then commit the diff" >&2
+        echo "  (if web/src/ changed too: cd web && npm run build, then commit dist/index.html — ci_web compares it)" >&2
         drifted=1
       fi
     done
@@ -171,7 +171,7 @@ ci_fixtures() {
     for committed in "${fix}"/*.snapshot.json; do
       name="$(basename "${committed}")"
       if [[ ! -f "${tmp}/${name}" ]]; then
-        echo "ci_fixtures FAILED: orphan fixture: ${name} is committed but has no row in cambra-inspector/scripts/fixtures.manifest (add the row or delete the fixture)" >&2
+        echo "ci_fixtures FAILED: orphan fixture: ${name} is committed but has no row in web/scripts/fixtures.manifest (add the row or delete the fixture)" >&2
         drifted=1
       fi
     done

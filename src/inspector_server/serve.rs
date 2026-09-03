@@ -16,7 +16,7 @@
 //!   (`{"diagnostics":[]}` on success, structured diagnostics on failure).
 //!   `application/json`.
 //! - `GET /` and `GET /index.html` — the CodeMirror frontend: the built,
-//!   self-contained `cambra-inspector/web/dist/index.html` bundle, which
+//!   self-contained `web/dist/index.html` bundle, which
 //!   fetches `/api/snapshot` and renders the source + IR tree. `text/html`.
 //! - anything else — `404 Not Found`.
 //!
@@ -45,14 +45,14 @@ use crate::interpreter::Consumer;
 use super::{snapshot_json, snapshot_json_pretty};
 
 /// The CodeMirror frontend, embedded at compile time. This is the built,
-/// self-contained single-file bundle (`cambra-inspector/web/dist/index.html`,
+/// self-contained single-file bundle (`web/dist/index.html`,
 /// produced by `npm run build`), committed to the repo so `cargo build` needs
 /// no Node toolchain (R7).
 ///
-/// The path reaches out of `src/` because the frontend is a sibling directory
-/// rather than a workspace member: `cambra-inspector/` holds the TypeScript
-/// project, and this is the one place the Rust build reads from it.
-const INDEX_HTML: &str = include_str!("../../cambra-inspector/web/dist/index.html");
+/// The path reaches out of `src/` because the frontend is a sibling directory:
+/// `web/` holds the TypeScript project, the way `formal/` holds the Lean model,
+/// and this is the one place the Rust build reads from it.
+const INDEX_HTML: &str = include_str!("../../web/dist/index.html");
 
 /// The pre-rendered response bodies for the one static program.
 ///
@@ -231,7 +231,7 @@ fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io:
         if let Err(e) = request.respond(response) {
             // A client that hung up mid-response is routine; the next request is
             // unaffected, so this reports rather than stops.
-            eprintln!("cambra-inspector: responding failed: {e}");
+            eprintln!("cambra: responding failed: {e}");
         }
     }
     Ok(())

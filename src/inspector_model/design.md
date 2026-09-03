@@ -2,7 +2,7 @@
 
 `src/inspector_model/` turns a `CompiledProgram` into one read-only payload describing that program:
 its source, its IR at every retained pane, the links between adjacent panes, and its source-level
-name resolution. `src/inspector_server` serves the payload; the `cambra-inspector/web` frontend renders
+name resolution. `src/inspector_server` serves the payload; the `web` frontend renders
 it.
 
 Nothing in the CCL pipeline reads this module. It is the only consumer of the pane folds'
@@ -17,7 +17,7 @@ compile reads the lowering projection alone.
 | Input | a `CompiledProgram`: the pane trees, the operator graph, the provenance table, the lowering projection, the parsed surface AST, the source text |
 | Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table, and a tree pane's root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
-| Consumer | `src/inspector_server`, which serves the payload, and the `cambra-inspector/web` frontend, which renders it |
+| Consumer | `src/inspector_server`, which serves the payload, and the `web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
 | `span` | throughout: a byte range in the **CHL source text**, never an offset into a rendered pane. Nothing in the payload addresses a pane's text |
 

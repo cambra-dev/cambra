@@ -77,4 +77,4 @@ by design (and `wireValidate.ts` enforces the shape).
 
 A re-bless pins more than the shape, and every diff in one has to be classified
 before it is committed: see
-[The golden fixtures](../../../CLAUDE.md#the-golden-fixtures).
+[The golden fixtures](../../CLAUDE.md#the-golden-fixtures).

@@ -246,7 +246,7 @@ After making code changes, run the formatter before running the code; prefer run
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
-The inspector crate has its own pinned-expectation suite (the golden wire fixtures) with a re-bless procedure; see `cambra-inspector/CLAUDE.md` before touching anything that moves it. Anything that changes `Display for Type`, or that shifts how many `NodeId`s a phase mints, moves the whole corpus.
+The inspector crate has its own pinned-expectation suite (the golden wire fixtures) with a re-bless procedure; see `web/CLAUDE.md` before touching anything that moves it. Anything that changes `Display for Type`, or that shifts how many `NodeId`s a phase mints, moves the whole corpus.
 
 ### Compact instructions
 
