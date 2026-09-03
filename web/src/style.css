@@ -549,6 +549,18 @@ body {
   border-bottom: none;
 }
 
+/* A clickable chip and head are buttons for the keyboard, so they have to be
+   stripped back to reading as text rather than as form controls. */
+.live-tag-button {
+  cursor: pointer;
+  font-family: inherit;
+  line-height: inherit;
+}
+
+.live-tag-button:hover {
+  filter: brightness(1.08);
+}
+
 .live-group-head {
   /* Sticky, so scrolling a long row list never leaves the reader unable to say
      which operator they are looking at. */
@@ -559,6 +571,22 @@ body {
   color: var(--fg);
   font-weight: 600;
   padding: 2px 10px;
+  /* A `<button>` when it is clickable: reset the control's chrome and keep it
+     full width and left-aligned so it still reads as a heading. */
+  border: none;
+  display: block;
+  font-family: inherit;
+  font-size: inherit;
+  text-align: left;
+  width: 100%;
+}
+
+button.live-group-head {
+  cursor: pointer;
+}
+
+button.live-group-head:hover {
+  background: rgba(127, 127, 127, 0.12);
 }
 
 .live-group-meta {

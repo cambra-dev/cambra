@@ -43,8 +43,8 @@ describe("the Values pane menu", () => {
   // The list has to follow the store, not only its own clicks: a gesture made
   // in the source pane must appear here too.
   it("lists a tag made elsewhere, most recent first", () => {
-    live.inspect("Var(a): L1", [1]);
-    live.inspect("Var(b): L2", [2, 3]);
+    live.inspect("Var(a): L1", 1, [1]);
+    live.inspect("Var(b): L2", 2, [2, 3]);
     expect(items(root).map((i) => i.querySelector(".live-tag")?.textContent)).toEqual([
       "Var(b): L2",
       "Var(a): L1",
@@ -54,7 +54,7 @@ describe("the Values pane menu", () => {
   });
 
   it("hides a tag's operators from its checkbox without forgetting it", () => {
-    live.inspect("Var(a): L1", [1]);
+    live.inspect("Var(a): L1", 1, [1]);
     const box = items(root)[0]!.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
     expect(box.checked).toBe(true);
     box.click();
@@ -64,16 +64,16 @@ describe("the Values pane menu", () => {
   });
 
   it("forgets one tag from its ✕", () => {
-    live.inspect("Var(a): L1", [1]);
-    live.inspect("Var(b): L2", [2]);
+    live.inspect("Var(a): L1", 1, [1]);
+    live.inspect("Var(b): L2", 2, [2]);
     items(root)[0]!.querySelector<HTMLButtonElement>(".live-menu-remove")!.click();
     expect(live.get().tags.map((t) => t.label)).toEqual(["Var(a): L1"]);
     expect(items(root).length).toBe(1);
   });
 
   it("clears every tag, empties the list, and closes", () => {
-    live.inspect("Var(a): L1", [1]);
-    live.inspect("Var(b): L2", [2]);
+    live.inspect("Var(a): L1", 1, [1]);
+    live.inspect("Var(b): L2", 2, [2]);
     const button = root.querySelector<HTMLButtonElement>(".live-menu-button")!;
     button.click();
     root.querySelector<HTMLButtonElement>(".live-menu-clear")!.click();
@@ -89,11 +89,11 @@ describe("the Values pane menu", () => {
   // Deterministic so a construct keeps its colour across a session rather than
   // depending on the order gestures were made in.
   it("gives a tag the same colour however it was reached", () => {
-    live.inspect("Var(a): L1", [1]);
+    live.inspect("Var(a): L1", 1, [1]);
     const first = items(root)[0]!.querySelector<HTMLElement>(".live-tag")!.dataset["colour"];
     live.clearTags();
-    live.inspect("Var(zzz): L9", [9]);
-    live.inspect("Var(a): L1", [1]);
+    live.inspect("Var(zzz): L9", 9, [9]);
+    live.inspect("Var(a): L1", 1, [1]);
     const again = items(root)
       .map((i) => i.querySelector<HTMLElement>(".live-tag")!)
       .find((chip) => chip.textContent === "Var(a): L1")!.dataset["colour"];
