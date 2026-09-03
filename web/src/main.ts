@@ -268,11 +268,30 @@ export function describePanes(
       label: "Values",
       badge: "live",
       paneClass: "tree",
-      copyText: () => serializeLivePanel(livePanelState(live.get())),
+      copyText: () =>
+        serializeLivePanel(livePanelState(live.get(), (id) => store.operatorLabel(id))),
       mount: (body) => {
         // The menu first, so it reads as this pane's toolbar above its rows.
         renderLiveMenu(body, live);
-        new LiveView(body, live);
+        // No origin on either selection: the gesture happened in this pane,
+        // which is not one the link graph knows, so every pane should scroll to
+        // what it resolved — the same reason goto-def and the operator pane's
+        // reference rows pass none.
+        new LiveView(body, live, (id) => store.operatorLabel(id), {
+          construct: (anchorId) => {
+            const paneId = store.sourceAnchorPaneId;
+            if (paneId) store.setSelection({ kind: "node", paneId, nodeId: anchorId });
+          },
+          operator: (nodeId) => {
+            // `locate`, not `node`: an operator carries the span of the
+            // construct that produced it, so asking the program about it
+            // answers with that whole construct. This says "go to this
+            // operator" and nothing more, and the operator pane scrolls it to
+            // the top because it is the only row highlighted.
+            const paneId = store.liveAnchorPaneId;
+            if (paneId) store.setSelection({ kind: "locate", paneId, nodeId });
+          },
+        });
       },
     });
   }
@@ -347,7 +366,7 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): vo
   const lineStarts = byteLineStarts(store.snapshot.source.text);
   const onInspect = live
     ? (nodeId: number, operators: readonly number[]) => {
-        live.inspect(tagLabel(store, nodeId, lineStarts), operators);
+        live.inspect(tagLabel(store, nodeId, lineStarts), nodeId, operators);
         reveal?.("values");
       }
     : undefined;

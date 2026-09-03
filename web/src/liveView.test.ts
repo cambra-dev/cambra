@@ -51,17 +51,17 @@ describe("livePanelState", () => {
   });
 
   it("distinguishes a program that was not run from one that recorded nothing", () => {
-    const notRun = state({ status: { kind: "connecting" }, tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }] });
+    const notRun = state({ status: { kind: "connecting" }, tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }] });
     expect(livePanelState(notRun).kind).toBe("not-run");
 
-    const ranButSilent = livePanelState(state({ tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }] }));
+    const ranButSilent = livePanelState(state({ tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }] }));
     expect(ranButSilent.kind).toBe("groups");
     if (ranButSilent.kind !== "groups") return;
     expect(ranButSilent.groups[0]?.kind).toBe("silent");
   });
 
   it("reports a lost connection ahead of anything else", () => {
-    const lost = state({ status: { kind: "lost", clean: false }, tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }] });
+    const lost = state({ status: { kind: "lost", clean: false }, tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }] });
     const panel = livePanelState(lost);
     expect(panel.kind).toBe("lost");
     // The tags ride along, so the menu still lists them while the pane reports
@@ -72,7 +72,7 @@ describe("livePanelState", () => {
   });
 
   it("orders groups by ascending node id, which is upstream first", () => {
-    const panel = livePanelState(state({ tags: [{ id: "t30", label: "T30", nodes: [30], shown: true }, { id: "t10", label: "T10", nodes: [10], shown: true }, { id: "t20", label: "T20", nodes: [20], shown: true }] }));
+    const panel = livePanelState(state({ tags: [{ id: "t30", label: "T30", anchorId: 30, nodes: [30], shown: true }, { id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }, { id: "t20", label: "T20", anchorId: 20, nodes: [20], shown: true }] }));
     expect(panel.kind).toBe("groups");
     if (panel.kind !== "groups") return;
     expect(panel.groups.map((g) => g.nodeId)).toEqual([10, 20, 30]);
@@ -82,7 +82,7 @@ describe("livePanelState", () => {
   // survives as a number the pane can state.
   it("carries how far behind an entry is", () => {
     const panel = livePanelState(
-      state({ tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }], nodes: new Map([[10, { tick: 2, producers: [producer()] }]]) }),
+      state({ tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }], nodes: new Map([[10, { tick: 2, producers: [producer()] }]]) }),
     );
     if (panel.kind !== "groups") throw new Error("expected groups");
     const group = panel.groups[0];
@@ -93,7 +93,7 @@ describe("livePanelState", () => {
 
   it("renders a pinned source as its retained window", () => {
     const panel = livePanelState(
-      state({ tags: [{ id: "t208", label: "T208", nodes: [208], shown: true }], sources: new Map([[208, source]]) }),
+      state({ tags: [{ id: "t208", label: "T208", anchorId: 208, nodes: [208], shown: true }], sources: new Map([[208, source]]) }),
     );
     if (panel.kind !== "groups") throw new Error("expected groups");
     const group = panel.groups[0];
@@ -105,7 +105,7 @@ describe("serializeLivePanel", () => {
   it("states shown-of-total whenever rows were dropped", () => {
     const panel = livePanelState(
       state({
-        tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }],
+        tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }],
         nodes: new Map([
           [10, { tick: 5, producers: [producer({ total: 40, dropped: 39 })] }],
         ]),
@@ -117,7 +117,7 @@ describe("serializeLivePanel", () => {
   it("marks a deleted row in words, not by colour alone", () => {
     const panel = livePanelState(
       state({
-        tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }],
+        tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }],
         nodes: new Map([
           [
             10,
@@ -135,7 +135,7 @@ describe("serializeLivePanel", () => {
   it("carries an unrendered shape's reason instead of pretending it is empty", () => {
     const panel = livePanelState(
       state({
-        tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }],
+        tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }],
         nodes: new Map([
           [10, { tick: 5, producers: [producer({ shape: "Store", rows: [], total: 0, note: "a store is a changelog" })] }],
         ]),

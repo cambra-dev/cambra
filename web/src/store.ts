@@ -27,6 +27,23 @@ import type { PaneEntry, Snapshot, Span } from "./types";
 export type Selection =
   | { kind: "node"; paneId: string; nodeId: number }
   | { kind: "source"; from: number; to: number }
+  /**
+   * One node in one pane, resolved no further.
+   *
+   * A `node` selection asks a question about the program — "where else does
+   * this appear" — and answers it in every pane. This one is navigation: show
+   * me *that* node. The distinction is not a flag on `node`, because the two
+   * gestures want different answers rather than the same answer at two widths.
+   *
+   * It exists because an operator's span is not its own. Conversion attributes
+   * a whole recurrence to the statement that produced it, so
+   * `FanOutBranch`'s span is the entire `for`. A `node` selection on it
+   * therefore derives a region covering the loop, seeds every node inside that
+   * region as a trace, and lights up the pane — while its transitive closure
+   * walks back to the statement and forward to all 46 siblings. Neither is
+   * wrong for a question about the program; both are wrong for "go here".
+   */
+  | { kind: "locate"; paneId: string; nodeId: number }
   | null;
 
 /**
@@ -103,6 +120,8 @@ export class Store {
   private readonly operatorsByNode: Map<number, number[]>;
   // The operator pane's id, found by kind so the roster is not spelled twice.
   private readonly operatorPaneId: string | null;
+  // Operator node -> its kind, for naming one that has produced nothing.
+  private readonly operatorLabels: Map<number, string>;
   // B5: for each holes-kind (pre-inference) pane, a node's downstream-resolved
   // type(s). A holes-pane node carries a hole (`_`/`?N`); inference resolves it
   // on the anchor-pane node it maps to (via the dense paneLinks). Mono fan-out →
@@ -146,6 +165,10 @@ export class Store {
     const post = this.panes.find((s) => s.id === "post-inference");
     this.sourceAnchorPaneId = post?.id ?? this.panes.filter(isIrPane).at(-1)?.id ?? null;
     this.operatorPaneId = this.panes.find((pane) => !isIrPane(pane))?.id ?? null;
+    const operatorPane = this.panes.find((pane) => pane.id === this.operatorPaneId);
+    this.operatorLabels = new Map(
+      (operatorPane?.nodes ?? []).map((node) => [node.nodeId, node.label]),
+    );
 
     // Every pane joins the link graph, the operator pane included: provenance is
     // an id relation over the whole pipeline, and both node shapes carry the id
@@ -189,6 +212,17 @@ export class Store {
   /** The operator pane's id, or null when the payload ships none. */
   get liveAnchorPaneId(): string | null {
     return this.operatorPaneId;
+  }
+
+  /**
+   * An operator's kind, e.g. `"ExtractFinal"`, from the static payload.
+   *
+   * The live frame names a *producer* (`FanOut#1`), and only for an operator
+   * that has produced. This names the operator itself, so a consumer can label
+   * one that has recorded nothing.
+   */
+  operatorLabel(nodeId: number): string | undefined {
+    return this.operatorLabels.get(nodeId);
   }
 
   private buildOperatorReach(): Map<number, number[]> {
@@ -316,6 +350,28 @@ export class Store {
 
   private resolve(selection: Selection, origin: string | null): Resolved {
     if (selection === null) return EMPTY_RESOLVED(null);
+
+    // Navigation, so it resolves nothing: one node, its own pane, no region and
+    // no closure. `pointedAt` is null because the operator's span is the
+    // construct's, and painting that strongly would highlight a whole statement
+    // the reader did not point at.
+    if (selection.kind === "locate") {
+      const only = (): Map<string, Set<number>> => {
+        const byPane = new Map<string, Set<number>>();
+        for (const pane of this.panes) byPane.set(pane.id, new Set());
+        byPane.get(selection.paneId)?.add(selection.nodeId);
+        return byPane;
+      };
+      return {
+        selection,
+        origin,
+        pointedAt: null,
+        // Two maps rather than one shared between the fields: a caller reading
+        // `primaryByPane` must not see a set another field owns.
+        result: { highlightsByPane: only(), sourceSpans: [] },
+        primaryByPane: only(),
+      };
+    }
 
     const anchorPane = this.sourceAnchorPaneId;
     const anchorIdx = anchorPane === null ? undefined : this.indicesByPane.get(anchorPane);

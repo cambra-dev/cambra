@@ -48,6 +48,14 @@ export interface LiveTag {
   id: string;
   /** What the reader sees, e.g. `Var(words): L8`. */
   label: string;
+  /**
+   * The anchor-pane node the gesture was made on.
+   *
+   * Kept so clicking the tag can select the construct it names. The operators
+   * cannot answer that: several of them share one construct, and an operator
+   * carries no position of its own that a source pane could highlight.
+   */
+  anchorId: number;
   /** The operators this gesture pinned. */
   nodes: readonly number[];
   /** Whether its operators are currently drawn. The menu's checkbox. */
@@ -162,10 +170,10 @@ export class LiveStore {
    * next compile, so a remembered tag would point at nodes that no longer
    * exist. Pane visibility carries no ids, which is why that *is* persisted.
    */
-  inspect(label: string, nodes: readonly number[]): void {
+  inspect(label: string, anchorId: number, nodes: readonly number[]): void {
     const id = label;
     const rest = this.state.tags.filter((tag) => tag.id !== id);
-    this.state = { ...this.state, tags: [{ id, label, nodes, shown: true }, ...rest] };
+    this.state = { ...this.state, tags: [{ id, label, anchorId, nodes, shown: true }, ...rest] };
     this.notify();
   }
 

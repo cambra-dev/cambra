@@ -24,6 +24,15 @@ export type LiveGroup = {
    * question the tag answers.
    */
   tags: readonly LiveTag[];
+  /**
+   * The operator's kind, from the static payload — `"ExtractFinal"`,
+   * `"StoreDenseRead"`.
+   *
+   * Separate from a producer's name, and available whether or not the operator
+   * has produced: the frame names a producer only once one has run, so without
+   * this a group that recorded nothing could show nothing but its id.
+   */
+  label: string | undefined;
 } & (
   | {
       kind: "operator";
@@ -36,7 +45,12 @@ export type LiveGroup = {
   // Asked for, but nothing has ever arrived for it. Rendered rather than
   // omitted: a group that vanishes is indistinguishable from one never asked
   // for.
-  | { kind: "silent"; nodeId: number }
+  | {
+      kind: "silent";
+      nodeId: number;
+      /** Whether the run has finished, making "produced nothing" final. */
+      ran: boolean;
+    }
 );
 
 /**
@@ -62,7 +76,11 @@ export type LivePanelState =
  * Pure, and takes no `Resolved`: pinning decoupled the pane from the selection,
  * which is what makes this testable with no DOM and no socket.
  */
-export function livePanelState(state: LiveState): LivePanelState {
+export function livePanelState(
+  state: LiveState,
+  /** An operator's kind, from the static payload. */
+  operatorLabel: (nodeId: number) => string | undefined = () => undefined,
+): LivePanelState {
   const tags = state.tags;
   if (state.status.kind === "lost") return { kind: "lost", clean: state.status.clean, tags };
   if (tags.length === 0) return { kind: "no-tags" };
@@ -85,6 +103,8 @@ export function livePanelState(state: LiveState): LivePanelState {
         state.sources.get(nodeId),
         state.tick,
         tagsFor(state, nodeId),
+        operatorLabel(nodeId),
+        state.status,
       ),
     );
   return { kind: "groups", status: state.status, tags, groups };
@@ -96,8 +116,10 @@ function group(
   source: LiveSource | undefined,
   tick: number,
   tags: readonly LiveTag[],
+  label: string | undefined,
+  status: LiveStatus,
 ): LiveGroup {
-  if (source !== undefined) return { kind: "source", nodeId, source, tags };
+  if (source !== undefined) return { kind: "source", nodeId, source, tags, label };
   if (entry !== undefined) {
     return {
       kind: "operator",
@@ -105,9 +127,14 @@ function group(
       staleBy: tick - entry.tick,
       producers: entry.producers,
       tags,
+      label,
     };
   }
-  return { kind: "silent", nodeId, tags };
+  // An operator with no recording has not been pulled. `get` is where a
+  // recording is taken — that is what makes it non-perturbing — so an operator
+  // whose demand path the run has not exercised has genuinely produced nothing.
+  // Once the run is over that becomes permanent, and the two read differently.
+  return { kind: "silent", nodeId, tags, label, ran: status.kind === "finished" };
 }
 
 /** The pane's plain-text rendering, for the copy button. */
@@ -131,9 +158,11 @@ function serializeGroup(group: LiveGroup): string {
   const prefix = tags === "" ? "" : `${tags} `;
   switch (group.kind) {
     case "silent":
-      return `${prefix}#${group.nodeId}\n  no values recorded`;
+      return `${prefix}${headText(group)}\n  ${
+        group.ran ? "produced nothing during the run" : "not pulled yet"
+      }`;
     case "source": {
-      const head = `${prefix}#${group.nodeId} ${group.source.name} — retained ${countOf(
+      const head = `${prefix}${headText(group)} — retained ${countOf(
         group.source.rows.length,
         group.source.total,
       )}`;
@@ -142,7 +171,9 @@ function serializeGroup(group: LiveGroup): string {
     case "operator":
       return group.producers
         .map((p) => {
-          const head = `${prefix}#${group.nodeId} ${p.producer} ${p.shape} — ${countOf(
+          const head = `${prefix}#${group.nodeId}${
+            group.label === undefined ? "" : ` ${group.label}`
+          } · ${p.producer} ${p.shape} — ${countOf(
             p.rows.length,
             p.total,
           )}`;
@@ -264,6 +295,21 @@ export class LiveView {
       get(): LiveState;
       subscribe(fn: (state: LiveState) => void): () => void;
     },
+    /** An operator's kind, from the static payload. */
+    private readonly operatorLabel: (nodeId: number) => string | undefined = () => undefined,
+    /**
+     * Select the construct a tag names, and the operator a group is.
+     *
+     * Both are ordinary selections through the shared store, so they
+     * cross-highlight every pane exactly as a click in a tree pane does. They
+     * change no tag, so the pane's own contents are unaffected by reading
+     * around in it — this view listens to the live store and not to the
+     * selection, so a selection cannot even re-render it.
+     */
+    private readonly select?: {
+      construct: (anchorId: number) => void;
+      operator: (nodeId: number) => void;
+    },
   ) {
     this.root = el("div", "live-root");
     parent.appendChild(this.root);
@@ -297,7 +343,7 @@ export class LiveView {
   }
 
   private render(): void {
-    const panel = livePanelState(this.live.get());
+    const panel = livePanelState(this.live.get(), this.operatorLabel);
     if (panel.kind !== "groups") {
       this.groups.clear();
       this.root.replaceChildren(el("div", "live-empty", emptyText(panel)));
@@ -331,7 +377,14 @@ export class LiveView {
     if (handle === undefined) {
       const section = el("section", "live-group");
       const tags = el("div", "live-group-tags");
-      const head = el("div", "live-group-head");
+      const head = el(
+        this.select === undefined ? "div" : "button",
+        "live-group-head",
+      );
+      if (head instanceof HTMLButtonElement) {
+        head.type = "button";
+        head.title = "Select this operator";
+      }
       const meta = el("div", "live-group-meta");
       const body = el("div", "live-rows");
       section.append(tags, head, meta, body);
@@ -345,13 +398,32 @@ export class LiveView {
     // question a reader holding several inspections actually has.
     handle.tags.replaceChildren(
       ...group.tags.map((tag) => {
-        const chip = el("span", "live-tag", tag.label);
+        const select = this.select;
+        if (select === undefined) {
+          const chip = el("span", "live-tag", tag.label);
+          chip.dataset["colour"] = String(tagColour(tag.label, TAG_SLOTS));
+          return chip;
+        }
+        const chip = el("button", "live-tag live-tag-button", tag.label) as HTMLButtonElement;
+        chip.type = "button";
         chip.dataset["colour"] = String(tagColour(tag.label, TAG_SLOTS));
+        chip.title = `Select ${tag.label}`;
+        chip.addEventListener("click", (event) => {
+          // The group head is also clickable, so a chip's click must not reach
+          // it and select the operator instead of the construct.
+          event.stopPropagation();
+          select.construct(tag.anchorId);
+        });
         return chip;
       }),
     );
     handle.tags.hidden = group.tags.length === 0;
     handle.head.textContent = headText(group);
+    if (this.select !== undefined) {
+      const select = this.select;
+      const nodeId = group.nodeId;
+      handle.head.onclick = () => select.operator(nodeId);
+    }
     const meta = metaText(group, tick);
     handle.meta.textContent = meta ?? "";
     handle.meta.hidden = meta === null;
@@ -416,14 +488,17 @@ function droppedOf(group: LiveGroup): number {
 }
 
 function headText(group: LiveGroup): string {
+  // The operator's kind always, so a group that recorded nothing is still
+  // named; a producer's instance name is extra, and only exists once one ran.
+  const kind = group.label === undefined ? "" : ` ${group.label}`;
   switch (group.kind) {
     case "silent":
-      return `#${group.nodeId}`;
+      return `#${group.nodeId}${kind}`;
     case "source":
       return `#${group.nodeId} ${group.source.name}`;
     case "operator": {
       const names = group.producers.map((p) => p.producer).join(", ");
-      return `#${group.nodeId} ${names}`;
+      return `#${group.nodeId}${kind} · ${names}`;
     }
   }
 }
@@ -431,7 +506,12 @@ function headText(group: LiveGroup): string {
 function metaText(group: LiveGroup, tick: number): string | null {
   switch (group.kind) {
     case "silent":
-      return "no values recorded";
+      // Not "no values recorded", which reads as a defect. Nothing has pulled
+      // this operator: a recording is taken inside `get`, so an unexercised
+      // demand path has produced nothing. An `ExtractFinal` over a stream that
+      // never terminates is the permanent case, and after the run ends every
+      // silent operator is.
+      return group.ran ? "produced nothing during the run" : "not pulled yet";
     case "source":
       return `retained ${countOf(group.source.rows.length, group.source.total)}`;
     case "operator": {
