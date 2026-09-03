@@ -62,11 +62,32 @@ export function renderLiveMenu(parent: HTMLElement, live: LiveStore): void {
     button.setAttribute("aria-expanded", String(isOpen));
   };
 
+  // The rows the list currently holds, as `id\0label` per tag. Keyed on the tag
+  // set rather than rebuilt per notification: this is subscribed to the live
+  // store, and a wire frame changes no tag. Rebuilding on one detaches whatever
+  // the reader is using — focus falls to the body, and a mousedown whose
+  // element is replaced before mouseup produces no click at all, so the toggle
+  // it was making is dropped. On a program publishing every tick that is the
+  // whole menu.
+  let rendered: string | null = null;
   const sync = (): void => {
     const tags = live.get().tags;
     clear.disabled = tags.length === 0;
     empty.hidden = tags.length > 0;
-    list.replaceChildren(...tags.map((tag) => item(tag, live)));
+
+    const key = tags.map((tag) => `${tag.id}\u0000${tag.label}`).join("\u0001");
+    if (key !== rendered) {
+      rendered = key;
+      list.replaceChildren(...tags.map((tag) => item(tag, live)));
+      return;
+    }
+    // The same rows: reflect visibility in place, so the checkbox the reader is
+    // toggling survives its own change event.
+    const boxes = list.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
+    tags.forEach((tag, i) => {
+      const box = boxes[i];
+      if (box) box.checked = tag.shown;
+    });
   };
 
   button.addEventListener("click", () => open(panel.hidden));

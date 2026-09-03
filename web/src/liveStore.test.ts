@@ -46,17 +46,18 @@ describe("applyFrame", () => {
     const second = applyFrame(first, frame(2, [[10, '"c"']]));
 
     expect(second.nodes.get(10)?.producers[0]?.rows[0]?.value).toBe('"c"');
-    expect(second.nodes.get(10)?.tick).toBe(2);
     expect(second.nodes.get(11)?.producers[0]?.rows[0]?.value).toBe('"b"');
-    expect(second.nodes.get(11)?.tick).toBe(1);
   });
 
-  // Staleness is the gap between the newest tick and the entry's own, so it is
-  // a number the pane can state rather than a flag it has to trust.
-  it("keeps each entry's own tick so staleness is a difference", () => {
+  // Staleness is the gap between the newest tick and the producer's own, so it
+  // is a number the pane can state rather than a flag it has to trust — and it
+  // is the producer's, because one operator's producers can be behind by
+  // different amounts.
+  it("keeps each producer's own tick so staleness is a difference", () => {
     const state = applyFrame(applyFrame(empty, frame(1, [[10, '"a"'], [11, '"b"']])), frame(7, [[10, '"c"']]));
     expect(state.tick).toBe(7);
-    expect(state.tick - (state.nodes.get(11)?.tick ?? 0)).toBe(6);
+    expect(state.tick - (state.nodes.get(11)?.producers[0]?.tick ?? 0)).toBe(6);
+    expect(state.tick - (state.nodes.get(10)?.producers[0]?.tick ?? 0)).toBe(0);
   });
 
   it("reads a final frame as a finished run", () => {
@@ -98,7 +99,7 @@ describe("LiveStore tags", () => {
   });
 
   it("records a gesture as a tag naming its operators", () => {
-    store.inspect("Var(words): L8", [10, 11, 12]);
+    store.inspect("Var(words): L8", 10, [10, 11, 12]);
     const tag = store.get().tags[0];
     expect(tag?.label).toBe("Var(words): L8");
     expect(tag?.nodes).toEqual([10, 11, 12]);
@@ -109,34 +110,34 @@ describe("LiveStore tags", () => {
   // Re-inspecting is the same gesture, not a new one, so it must not stack up
   // duplicate rows in the menu.
   it("re-inspecting one construct re-shows its tag and moves it to the front", () => {
-    store.inspect("Var(a): L1", [1]);
-    store.inspect("Var(b): L2", [2]);
+    store.inspect("Var(a): L1", 1, [1]);
+    store.inspect("Var(b): L2", 2, [2]);
     store.toggleTag("Var(a): L1");
     expect(store.get().tags.find((t) => t.id === "Var(a): L1")?.shown).toBe(false);
 
-    store.inspect("Var(a): L1", [1]);
+    store.inspect("Var(a): L1", 1, [1]);
     expect(store.get().tags.length).toBe(2);
     expect(store.get().tags[0]?.label).toBe("Var(a): L1");
     expect(store.get().tags[0]?.shown).toBe(true);
   });
 
   it("hides a tag's operators without forgetting the tag", () => {
-    store.inspect("Var(a): L1", [1, 2]);
+    store.inspect("Var(a): L1", 1, [1, 2]);
     store.toggleTag("Var(a): L1");
     expect(store.get().tags.length).toBe(1);
     expect(shownNodes(store.get()).size).toBe(0);
   });
 
   it("forgets one tag", () => {
-    store.inspect("Var(a): L1", [1]);
-    store.inspect("Var(b): L2", [2]);
+    store.inspect("Var(a): L1", 1, [1]);
+    store.inspect("Var(b): L2", 2, [2]);
     store.removeTag("Var(a): L1");
     expect(store.get().tags.map((t) => t.label)).toEqual(["Var(b): L2"]);
   });
 
   it("clears every tag at once", () => {
-    store.inspect("Var(a): L1", [1]);
-    store.inspect("Var(b): L2", [2]);
+    store.inspect("Var(a): L1", 1, [1]);
+    store.inspect("Var(b): L2", 2, [2]);
     store.clearTags();
     expect(store.get().tags).toEqual([]);
     expect(shownNodes(store.get()).size).toBe(0);
@@ -145,8 +146,8 @@ describe("LiveStore tags", () => {
   // Two gestures can reach one operator, and a group names both rather than
   // picking one.
   it("reports every shown tag that asked for an operator", () => {
-    store.inspect("Var(a): L1", [7, 8]);
-    store.inspect("Var(b): L2", [8, 9]);
+    store.inspect("Var(a): L1", 7, [7, 8]);
+    store.inspect("Var(b): L2", 8, [8, 9]);
     expect(tagsFor(store.get(), 8).map((t) => t.label)).toEqual([
       "Var(b): L2",
       "Var(a): L1",
@@ -158,10 +159,10 @@ describe("LiveStore tags", () => {
   it("notifies subscribers and stops on unsubscribe", () => {
     const seen: number[] = [];
     const off = store.subscribe((s) => seen.push(s.tags.length));
-    store.inspect("a", [1]);
-    store.inspect("b", [2]);
+    store.inspect("a", 1, [1]);
+    store.inspect("b", 2, [2]);
     off();
-    store.inspect("c", [3]);
+    store.inspect("c", 3, [3]);
     expect(seen).toEqual([1, 2]);
   });
 
@@ -172,7 +173,7 @@ describe("LiveStore tags", () => {
       throw new Error("boom");
     });
     store.subscribe(() => seen.push("second"));
-    store.inspect("a", [1]);
+    store.inspect("a", 1, [1]);
     expect(seen).toEqual(["second"]);
   });
 });

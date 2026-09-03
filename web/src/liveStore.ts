@@ -15,10 +15,14 @@
 import { validateLiveFrame } from "./liveValidate";
 import type { LiveFrame, LiveProducer, LiveSource } from "./types";
 
-/** What one operator last produced, and when. */
+/**
+ * What one operator's producers last answered.
+ *
+ * No tick of its own. A producer carries the tick its rows came from, and an
+ * operator's producers can be behind by different amounts, so staleness is read
+ * off the producer and never off the node.
+ */
 export interface LiveEntry {
-  /** The tick the answer came from, which lags the newest tick when the operator has since produced nothing. */
-  tick: number;
   producers: LiveProducer[];
 }
 
@@ -48,6 +52,14 @@ export interface LiveTag {
   id: string;
   /** What the reader sees, e.g. `Var(words): L8`. */
   label: string;
+  /**
+   * The anchor-pane node the gesture was made on.
+   *
+   * Kept so clicking the tag can select the construct it names. The operators
+   * cannot answer that: several of them share one construct, and an operator
+   * carries no position of its own that a source pane could highlight.
+   */
+  anchorId: number;
   /** The operators this gesture pinned. */
   nodes: readonly number[];
   /** Whether its operators are currently drawn. The menu's checkbox. */
@@ -63,7 +75,7 @@ export interface LiveState {
   sources: Map<number, LiveSource>;
   /** Inspect gestures, most recent first. */
   tags: readonly LiveTag[];
-  /** The newest tick seen, against which an entry's own tick reads as staleness. */
+  /** The newest tick seen, against which a producer's own tick reads as staleness. */
   tick: number;
 }
 
@@ -91,13 +103,13 @@ type Listener = (state: LiveState) => void;
  * several `get`s within the tick to one answer, so a frame's entry for a node
  * *is* the current answer — nothing needs combining, which is what keeps the
  * `Tile::merge` double-count from reappearing on this side. A node absent from
- * the frame keeps its entry and its older tick, which is where staleness comes
- * from.
+ * the frame keeps its entry, whose producers hold the ticks their rows came
+ * from, which is where staleness comes from.
  */
 export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
   const nodes = new Map(state.nodes);
   for (const node of frame.nodes) {
-    nodes.set(node.nodeId, { tick: frame.tick, producers: node.producers });
+    nodes.set(node.nodeId, { producers: node.producers });
   }
   const sources = new Map(state.sources);
   for (const source of frame.sources) {
@@ -162,10 +174,10 @@ export class LiveStore {
    * next compile, so a remembered tag would point at nodes that no longer
    * exist. Pane visibility carries no ids, which is why that *is* persisted.
    */
-  inspect(label: string, nodes: readonly number[]): void {
+  inspect(label: string, anchorId: number, nodes: readonly number[]): void {
     const id = label;
     const rest = this.state.tags.filter((tag) => tag.id !== id);
-    this.state = { ...this.state, tags: [{ id, label, nodes, shown: true }, ...rest] };
+    this.state = { ...this.state, tags: [{ id, label, anchorId, nodes, shown: true }, ...rest] };
     this.notify();
   }
 
