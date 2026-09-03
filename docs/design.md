@@ -65,7 +65,7 @@ In CHL, collections have no inherent ordering. By default, a `for` loop's iterat
 
 Lists do carry an integer *addressing* structure (`xs[i]` is well-defined), but ordering is only observable when program logic depends on it. Similarly, sources have a real *arrival* order, which is the natural ordering when iterating them. 
 
-> **Direction [Sketched].** The target collections model is more nuanced: `Array` and `List` become genuinely ordered, while `Set`, `Map`, and `Collection` stay unordered, with order-dependent operations taking their ordering explicitly as a contextual instance.
+> **Direction [Decided].** The target collections model is more nuanced: `Array` and `List` are genuinely ordered — their domain *is* a range, a sequencing domain totally ordered by construction — while `Set`, `Map`, and `Collection` stay unordered, and an order-dependent operation over them takes its ordering explicitly as a contextual `Ord` instance rather than fabricating one. Ordering is therefore derived from the domain's species, not stored per collection. Design of record: [src/ccl/design/collections.md](../src/ccl/design/collections.md).
 
 ### Comprehensions and generators are the query language
 
@@ -219,7 +219,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Feed channels | Via `defer()` / `http_serve` implemented; `Feed(_)` declarations designed, not yet |
 | Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
-| Collections-as-functions model | Organizing idea decided; encodings **[Sketched]** |
+| Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |
 | `while`, floats, imports, classes, exceptions | Absent (see the spec) |
 

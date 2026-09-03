@@ -120,11 +120,11 @@ pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Typ
     if let TypedExprNode::Cast { value, target } = &mut expr.node {
         let value_dom = value.ty.domain();
         compile_cast_target(target, value_dom, memo);
-        compile_predicates_in_type(&mut expr.ty, memo);
+        compile_predicates_in_type(&mut expr.ty, memo, &[]);
         compile_refinement_predicates(value, memo);
         return;
     }
-    expr.walk_type_slots_mut(|ty| compile_predicates_in_type(ty, memo));
+    expr.walk_type_slots_mut(|ty| compile_predicates_in_type(ty, memo, &[]));
     expr.walk_children_mut(|child| compile_refinement_predicates(child, memo));
 }
 
@@ -140,14 +140,14 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
     {
         if let Type::Refinement(base, refinements) = domain.as_mut() {
             let assert_base = value_dom.unwrap_or_else(|| (**base).clone());
-            compile_refinements(refinements, &assert_base, memo);
-            compile_predicates_in_type(base, memo);
+            compile_refinements(refinements, &assert_base, memo, &[]);
+            compile_predicates_in_type(base, memo, &[]);
         } else {
-            compile_predicates_in_type(domain, memo);
+            compile_predicates_in_type(domain, memo, &[]);
         }
-        compile_predicates_in_type(codomain, memo);
+        compile_predicates_in_type(codomain, memo, &[]);
     } else {
-        compile_predicates_in_type(target, memo);
+        compile_predicates_in_type(target, memo, &[]);
     }
 }
 
@@ -155,24 +155,72 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 /// bare predicate `__elem ▷ p` (the inverse of [`ccl_utils::bare_predicate_of_fn`]).
 /// Fast-pathed when the bare predicate is already that single application;
 /// otherwise η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
-pub(crate) fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
+///
+/// `slot` is the binder telescope `base` is written under — the Σ of the collection this
+/// refinement refines. A predicate over a witness-domained collection is a collection over
+/// that witness (`src/ccl/design/type-inference.md`, "A refinement predicate is a column"),
+/// and the η-expanded form is where that is said: the binder is the one place a kind is
+/// written, so a predicate left at `Compute` names a witness nothing binds.
+pub(crate) fn fn_of_bare_predicate(
+    base: &Type,
+    bare: &Expr,
+    slot: &[crate::ccl::ty::Witness],
+) -> Expr {
     if let TypedExprNode::Apply { argument, function } = &bare.node
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
     {
         return (**function).clone();
     }
-    lambda_elim::run(Expr::lambda(Name::elem(), base.clone(), bare.clone()))
-        .expect("lambda-elim of refinement predicate")
+    let lam = Expr::lambda(Name::elem(), base.clone(), bare.clone());
+    // **A predicate over a witness-domained collection is a collection over that witness** —
+    // the boolean column the runtime `Restrict` evaluates over the extent. `Expr::lambda`
+    // stamps `Compute`, which carries no binder slot, so the witness in `base` would come out
+    // unbound: a reference names no kind, and the binder is the one place a kind is written
+    // (`src/ccl/design/type-inference.md`, "The witness context").
+    let lam = if slot.is_empty() {
+        lam
+    } else {
+        lam.with_ty(Type::Fun {
+            name: None,
+            fun_kind: crate::ccl::ty::FunKind::Data(Some(std::rc::Rc::new(slot.to_vec()))),
+            domain: Box::new(base.clone()),
+            codomain: Box::new(Type::Base(BaseType::Bool)),
+        })
+    };
+    lambda_elim::run(lam).expect("lambda-elim of refinement predicate")
 }
 
-fn compile_predicates_in_type(ty: &mut Type, memo: &PredMemo<Type>) {
+fn compile_predicates_in_type(
+    ty: &mut Type,
+    memo: &PredMemo<Type>,
+    slot: &[crate::ccl::ty::Witness],
+) {
+    let here = ty.sum().unwrap_or(&[]).to_vec();
+    let extended: Vec<crate::ccl::ty::Witness> = if here.is_empty() {
+        slot.to_vec()
+    } else {
+        slot.iter().cloned().chain(here).collect()
+    };
+    let slot = extended.as_slice();
     if let Type::Refinement(base, refinements) = ty {
         let base = base.clone();
-        compile_refinements(refinements, &base, memo);
+        compile_refinements(refinements, &base, memo, slot);
     }
     // Recurse into structural type children (refinement base, function
     // domain/codomain, tuple/record/variant elements).
-    ty.walk_children_mut(|child| compile_predicates_in_type(child, memo));
+    // Not `walk_children_mut`: it descends into a `FunKind`'s witness candidates, and a
+    // predicate typed as a collection over a witness carries the source's candidate types in
+    // its own kind — walking them re-enters the refinements this predicate came out of.
+    // A binder's candidates are compiled where the binder's own type is.
+    match ty {
+        Type::Fun {
+            domain, codomain, ..
+        } => {
+            compile_predicates_in_type(domain, memo, slot);
+            compile_predicates_in_type(codomain, memo, slot);
+        }
+        _ => ty.walk_children_mut(|child| compile_predicates_in_type(child, memo, slot)),
+    }
 }
 
 /// Compile each refinement of a set against the element type it sees in the restrict
@@ -181,7 +229,12 @@ fn compile_predicates_in_type(ty: &mut Type, memo: &PredMemo<Type>) {
 /// application order, so the compiled predicates and the pipeline's types
 /// agree. For a cast target's refinements, `base` is the cast value's domain (the
 /// assertion base — see [`compile_refinement_predicates`]).
-fn compile_refinements(refinements: &mut RefinementSet, base: &Type, memo: &PredMemo<Type>) {
+fn compile_refinements(
+    refinements: &mut RefinementSet,
+    base: &Type,
+    memo: &PredMemo<Type>,
+    slot: &[crate::ccl::ty::Witness],
+) {
     // Indexed by physical position (`application_elem_types`), because the
     // rewrite below walks the set in place and the application order is a
     // *permutation* of the physical one.
@@ -194,7 +247,7 @@ fn compile_refinements(refinements: &mut RefinementSet, base: &Type, memo: &Pred
             // predicate in the single bare form while pinning a point-free core, so
             // the iterate/restrict producers (built from the same `p`) carry a
             // structurally-identical refinement to the cast demand they satisfy.
-            let p = fn_of_bare_predicate(&base_ctx, bare);
+            let p = fn_of_bare_predicate(&base_ctx, bare, slot);
             let mut compiled = ccl_utils::bare_predicate_of_fn(&base_ctx, p);
             // The compiled predicate's own sub-expressions can carry *nested*
             // refinements (a filter over an already-filtered source: the inner
@@ -270,7 +323,9 @@ mod tests {
         let raised = {
             let _scope = PhaseScope::enter(Phase::Planning);
             let _g = provenance::enter(site, "test.raise", provenance::Nature::Machinery);
-            fn_of_bare_predicate(&Type::Base(BaseType::Int), bare)
+            // No witness slot: the base is a scalar, so the raised function is over no
+            // index a Σ named.
+            fn_of_bare_predicate(&Type::Base(BaseType::Int), bare, &[])
         };
         (session.into_table(), raised, pred_ids)
     }

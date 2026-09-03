@@ -1138,16 +1138,25 @@ enum Check {
     Typed,
 }
 
-/// A phase boundary's post-conditions: ids unique, output dumped, tree valid for
-/// the stage.
+/// A phase boundary's post-conditions: ids unique, no witness reference free, output
+/// dumped, tree valid for the stage.
 ///
-/// None of the three is type-enforced, and each fails silently in its own way. A
+/// None of the four is type-enforced, and each fails silently in its own way. A
 /// duplicated id collapses two nodes' provenance into one entry; a tree that
 /// misses its check reaches the next phase to be mis-read there rather than
 /// rejected here. `boundary` names the phase in whichever message fires, and is
 /// the name the panes and the `assert_unique_node_ids` messages already use.
+///
+/// The free-witness check runs before the type check, because it is the sharper report
+/// of the two. A pass rebuilds types from node types — a leg's domain, a consumer's
+/// declared domain following its operand — and a rebuild that takes a `Σ`'s binder slot
+/// from one type and its domain from another binds a name the domain does not say. The
+/// reference is then free, which `typecheck` reports as two `σ`s that render identically
+/// while this names the reference and the node it sits on.
 fn settle(ir: &Expr, boundary: &str, check: Check) -> Result<(), Vec<CompileError>> {
     assert_unique_node_ids(ir, boundary);
+    #[cfg(debug_assertions)]
+    crate::ccl::infer::debug_assert_no_free_witness(ir, boundary);
     debug!("{boundary} CCL:\n{}", symbolic(ir));
     debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
     let outcome = match check {

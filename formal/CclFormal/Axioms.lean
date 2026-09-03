@@ -4,9 +4,12 @@ import CclFormal.WellTypedTermsAreSafe
 /-!
 # The axiom gate
 
-Every headline result depends on `propext`, `Classical.choice`, and `Quot.sound` and on nothing
-else. Those three are Lean's own classical axioms, shipped with the standard library; a fourth name
-in any list below would mean this development had assumed something of its own.
+Every headline result depends on `propext` and `Quot.sound`, most of them on `Classical.choice` as
+well, and on nothing else. Those three are Lean's own classical axioms, shipped with the standard
+library; a fourth name in any list below would mean this development had assumed something of its
+own. The three merge-algebra results need only two of the three: over a one-domain function slot
+their proofs are `rw` plus a triple of componentwise facts, with no case analysis that reaches for
+choice.
 
 `#print axioms` reports the list and `#guard_msgs` compares it to the docstring, so `lake build`
 fails on a mismatch. Without the pairing the report is a build message nobody reads, and an axiom
@@ -20,15 +23,15 @@ than only in the build log.
 #guard_msgs in
 #print axioms CclFormal.subtyping_trans
 
-/-- info: 'CclFormal.CompactTy.merge_assoc' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+/-- info: 'CclFormal.CompactTy.merge_assoc' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms CclFormal.CompactTy.merge_assoc
 
-/-- info: 'CclFormal.CompactTy.merge_is_least_absorber' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+/-- info: 'CclFormal.CompactTy.merge_is_least_absorber' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms CclFormal.CompactTy.merge_is_least_absorber
 
-/-- info: 'CclFormal.CompactTy.least_absorber_unique' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+/-- info: 'CclFormal.CompactTy.least_absorber_unique' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms CclFormal.CompactTy.least_absorber_unique
 

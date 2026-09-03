@@ -357,7 +357,9 @@ fn build_zip_read(
     let zip_arg_ty = Type::Tuple(vec![trigger.ty.clone(), as_of.ty.clone()]);
     let zip_arg =
         Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), as_of])).with_ty(zip_arg_ty.clone());
-    let zip_out = Type::fun(b, pair_ty.clone());
+    // One (request, snapshot) pair per position of the trigger — the trigger again, at
+    // its kind; only the `zip` built-in itself is a capability.
+    let zip_out = Type::fun_like(&trigger.ty, b, pair_ty.clone());
     let zip_fn = Expr::builtin(Builtin::Zip).with_ty(Type::fun(zip_arg_ty, zip_out.clone()));
     let zip = Expr::apply(zip_arg, zip_fn).with_ty(zip_out);
 
@@ -425,7 +427,9 @@ fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, String)> {
 /// `as_of((trigger, source)) : Fun(B, codomain)`.
 fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
     let b = trigger.ty.domain()?;
-    let out = Type::fun(b, codomain);
+    // One sampled value per position of the trigger: the trigger read through the
+    // register, so a collection at the trigger's kind.
+    let out = Type::fun_like(&trigger.ty, b, codomain);
     let arg_ty = Type::Tuple(vec![trigger.ty.clone(), source.ty.clone()]);
     let arg = Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), source.clone()]))
         .with_ty(arg_ty.clone());
@@ -556,7 +560,7 @@ fn mut_var_value_ty(ty: &Type) -> Type {
             // its whole stream and is never a transactional mutable variable target.
             Type::History {
                 value,
-                kind: HistoryKind::Overwrite,
+                history_kind: HistoryKind::Overwrite,
                 ..
             } => Some(value),
             Type::Refinement(inner, _) => under_mut(inner),
@@ -2195,7 +2199,10 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
     let mut tup = Expr::tuple(elts);
     tup.ty = new_item_ty.clone();
     let mut lam = Expr::lambda(x, dom.clone(), tup);
-    lam.ty = Type::fun(dom, new_item_ty.clone());
+    // The extended source is the source: a collection, at whatever kind `source`
+    // states. `Expr::lambda` stamps `Compute`, and the writer source is the one slot
+    // planning asserts is swept.
+    lam.ty = Type::fun_like(&source.ty, dom, new_item_ty.clone());
     (lam, new_item_ty)
 }
 
@@ -2497,11 +2504,15 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
     expr.walk_children(|c| collect_key_inits(c, keys, out));
 }
 
-/// The commit history type of a mutable variable key — `Fun(Txn, V)`. A key's history
+/// The commit history type of a mutable variable key — `Txn ⤇ V`. A key's history
 /// binding has this type; a variable read of the key reduces it with
 /// `final_or_default`.
+///
+/// **A collection**, for the same reason an induction history is one: the engine stores one
+/// value per commit time of the domain, and every read of it is a read at a position — a
+/// `final_or_default` reduction, an `as_of` join. `Type::fun` would declare it a capability.
 fn history_ty(value_ty: &Type) -> Type {
-    Type::fun(Type::Txn, value_ty.clone())
+    Type::data_fun(Type::Txn, value_ty.clone())
 }
 
 /// A [`TypedBinding`] with `name : ty` and no user annotation.
@@ -2603,28 +2614,32 @@ fn per_key_view(
         p.ty = Type::fun(from.clone(), to.clone());
         p
     };
-    let commits_ty = Type::fun(dom.clone(), rec_ty.clone());
+    // The commit log is a collection: one decision record per position of the block's
+    // extent, stored by the engine and read at positions.
+    let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
     let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
     let writes_ty = record_field_ty(&payload_ty, F_WRITES);
 
     // time leg: commits_j ≫ .time : dom ⇒ Txn.
+    // Each leg is the commit log read through a projection, so it is a collection too,
+    // and carries the log's kind.
     let mut time_view = Expr::compose(vec![
         tvar(commits_j, commits_ty.clone()),
         fproj(F_TIME, rec_ty, &Type::Txn),
     ]);
-    time_view.ty = Type::fun(dom.clone(), Type::Txn);
+    time_view.ty = Type::fun_like(&commits_ty, dom.clone(), Type::Txn);
 
     // write leg: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .idx.
     let mut iproj = Expr::proj_index(idx);
     iproj.ty = Type::fun(writes_ty.clone(), value_ty.clone());
     let mut write_view = Expr::compose(vec![
-        tvar(commits_j, commits_ty),
+        tvar(commits_j, commits_ty.clone()),
         fproj(F_DECISION, rec_ty, decision_ty),
         crate::ccl::ccl_utils::commit_project(decision_ty),
         fproj(F_WRITES, &payload_ty, &writes_ty),
         iproj,
     ]);
-    write_view.ty = Type::fun(dom.clone(), value_ty.clone());
+    write_view.ty = Type::fun_like(&commits_ty, dom.clone(), value_ty.clone());
 
     // ⟨time, write⟩ ▷ zip : dom ⇒ {time, write} — the zip inner-joins, so the
     // total `time` leg is narrowed to the committing positions of the `write` leg.
@@ -2637,10 +2652,11 @@ fn per_key_view(
         (F_WRITE.to_string(), write_view),
     ]));
     views.ty = views_rec_ty.clone();
+    let tap_ty = Type::fun_like(&commits_ty, dom.clone(), view_rec_ty.clone());
     let mut zip = Expr::builtin(Builtin::Zip);
-    zip.ty = Type::fun(views_rec_ty, Type::fun(dom.clone(), view_rec_ty.clone()));
+    zip.ty = Type::fun(views_rec_ty, tap_ty.clone());
     let mut tap = Expr::apply(views, zip);
-    tap.ty = Type::fun(dom.clone(), view_rec_ty.clone());
+    tap.ty = tap_ty;
     tap
 }
 
@@ -2817,9 +2833,12 @@ fn plan_store(
         // commits_j = λ r → let t = begin(r) in {time, write_targets, decision}
         let commit_body = let_typed(t, Type::Txn, begin, rec);
         let mut commit_lambda = Expr::lambda(r, dom.clone(), commit_body);
-        commit_lambda.ty = Type::fun(dom.clone(), rec_ty.clone());
+        commit_lambda.ty = Type::data_fun(dom.clone(), rec_ty.clone());
         commit_bindings.push((
-            binding(commits[j].clone(), Type::fun(dom.clone(), rec_ty.clone())),
+            binding(
+                commits[j].clone(),
+                Type::data_fun(dom.clone(), rec_ty.clone()),
+            ),
             commit_lambda,
         ));
 
@@ -2830,16 +2849,20 @@ fn plan_store(
         // recognition maps its ref to the history record's `field` tap. Emitted in
         // feed (source) order across sites.
         let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
+        let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
         for f in feeds {
             let tap_name = Name::fresh(f.field.clone());
-            let tap_ty = Type::fun(dom.clone(), f.value_ty.clone());
+            // The tap is the commit log read through the field, so it is a collection at
+            // the log's kind — and `recognize_txn_group` takes the history record's tap
+            // field type straight off this binding.
+            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), f.value_ty.clone());
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
             let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
             let mut field_proj = Expr::proj_field(f.field.clone());
             field_proj.ty = Type::fun(payload_ty.clone(), f.value_ty.clone());
             let mut tap_expr = Expr::compose(vec![
-                tvar(&commits[j], Type::fun(dom.clone(), rec_ty.clone())),
+                tvar(&commits[j], commits_ty.clone()),
                 dec_proj,
                 vp,
                 field_proj,
@@ -3632,7 +3655,7 @@ mod tests {
             Type::History {
                 value: Box::new(Type::Base(BaseType::Int)),
                 domain: Box::new(Type::Txn),
-                kind: HistoryKind::Overwrite,
+                history_kind: HistoryKind::Overwrite,
             },
             init,
             stmt,

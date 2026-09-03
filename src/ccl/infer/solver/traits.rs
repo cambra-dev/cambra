@@ -1049,8 +1049,10 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                     descend(value, &path, Step::HistoryValue, &mut frontier)
                 }
                 // Leaves: nothing inside to constrain. `Base`/`UIntRange` are concrete,
-                // and the rest are placeholders or nullary carriers.
-                Type::Base(_)
+                // and the rest are placeholders or nullary carriers. A witness reference
+                // names a binder and holds no type.
+                Type::WitnessRef(_)
+                | Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::Hole
                 | Type::SharedHole(_)
@@ -1355,8 +1357,9 @@ pub fn offered_base(ty: &Type) -> Option<&BaseType> {
 /// emission does not.
 ///
 /// So the watch follows the edge, in the direction information flows: down, to the
-/// variables feeding the watched one. This is [`FunKindVar::link`]'s move
-/// (`crate::ccl::ty`) — a kind force propagates along stored links for the same
+/// variables feeding the watched one. This is what a var-var kind edge does
+/// (`constrain_fun_kind`, recorded on both sides) — a kind force propagates along stored
+/// links for the same
 /// reason, and for kinds it is the only mechanism because a force is a flag rather
 /// than a bound.
 ///

@@ -54,7 +54,8 @@ pub mod traits;
 pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type, compact_type_polarity_only};
 pub use constrain::{
-    ConstrainCache, ConstrainError, Derivation, ExtrudeCache, constrain_subtype, extrude,
+    ConstrainCache, ConstrainError, Derivation, ExtrudeCache, constrain_subtype,
+    constrain_subtype_under, extrude,
 };
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
@@ -76,10 +77,19 @@ pub fn type_level(ty: &Type) -> Level {
         // there is to report here.
         Type::BoundedHole(t) => type_level(t),
         Type::Fun {
+            fun_kind,
             domain: d,
             codomain: c,
             ..
-        } => type_level(d).max(type_level(c)),
+        } => fun_kind
+            .witnesses()
+            .iter()
+            .flat_map(|w| w.types())
+            .map(type_level)
+            .max()
+            .unwrap_or(0)
+            .max(type_level(d))
+            .max(type_level(c)),
         Type::Tuple(ts) => ts.iter().map(type_level).max().unwrap_or(0),
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Variant(tags, _) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
@@ -98,6 +108,10 @@ pub fn type_level(ty: &Type) -> Level {
         // instantiation), which reads it directly and is exempted from the
         // `type_level` short-circuit.
         Type::ChanDom(..) => 0,
+        // The witness's type children and the body carry the sum's inference
+        // A witness reference is a leaf (level 0) — naming its binder gives it no
+        // solver content.
+        Type::WitnessRef(_) => 0,
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -122,7 +136,7 @@ pub fn prim(b: BaseType) -> Type {
 pub fn fun(d: Type, c: Type) -> Type {
     Type::Fun {
         name: None,
-        kind: crate::ccl::ty::FunKind::Compute,
+        fun_kind: crate::ccl::ty::FunKind::Compute,
         domain: Box::new(d),
         codomain: Box::new(c),
     }

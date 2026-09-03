@@ -250,6 +250,20 @@ pub enum Builtin {
     // Categorical combinators (introduced by lambda elimination).
     /// `id : A → A` — identity morphism.
     Id,
+    /// `box : ∀𝑎. 𝑎 ⇒ Σ (σ : [𝑎]). σ` — the **only** way into a dependent sum.
+    ///
+    /// Puts a value into the sum whose single candidate is its own type. Subtyping has
+    /// no `𝑇 <: Σ` rule, so a sum is never formed by subsumption and a join can never
+    /// produce one the program did not write (`src/ccl/design/type-inference.md`,
+    /// "Only a term builds a sum"). What makes `box` useful is not the singleton it builds
+    /// but what two of them do at a join: candidate lists union under Σ-width, so
+    /// `box(xs) if c else box(ys)` keeps *both* alternatives where the unboxed
+    /// conditional has no upper bound at all.
+    ///
+    /// The candidate position is **invariant**, so `𝑎` is pinned to the argument's type
+    /// exactly — `box(5)` is `Σ (σ : [5]). σ`, not `Σ (σ : [Int]). σ`. Retaining the
+    /// alternatives rather than joining past them is the whole service.
+    Box,
     /// `curry : ((A, B) → C) → (A → (B → C))`.
     Curry,
     /// `const : A → (B → A)` — lift a value to a constant function.
@@ -605,6 +619,7 @@ impl Builtin {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Id => "id",
+            Self::Box => "box",
             Self::Curry => "curry",
             Self::Const => "const",
             Self::Zip => "zip",

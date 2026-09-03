@@ -121,7 +121,12 @@ pub(super) fn lower_call(
                 gb,
             );
             ctx.tag_predicate(&bare_pred, func.span, "lower.groupby_key_pred");
-            let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
+            let target_ty = refined_data_fun(
+                Type::Hole,
+                bare_pred,
+                Type::Hole,
+                crate::ccl::ty::FunKind::fresh_data(),
+            );
             let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
             // A group-by is a **data function** (a keyed collection): stamp its
             // outer function `Data` by provenance (the `data_fun` annotation is a
@@ -205,6 +210,26 @@ pub(super) fn lower_call(
             let mut_var = ctx.tag_image(Expr::var(name.to_string()), arg.span);
             let await_fn = ctx.tag_image(Expr::builtin(Builtin::AwaitFinal), func.span);
             Ok(Expr::apply(mut_var, await_fn))
+        }
+        // `box(x)` — the only way into a dependent sum
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). Subtyping has
+        // no `𝑇 <: Σ` rule, so this is what a program writes when two collections meet
+        // at a join and it wants both alternatives kept rather than one of them lost.
+        "box" => {
+            if args.len() != 1 {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "`box` takes exactly one argument",
+                ));
+            }
+            let inner = lower_expr(&args[0], ctx)?;
+            // The `Apply` root is tagged by the caller; the operator node it applies is
+            // minted here, so this rule records it. An unrecorded mint is a lineage leak
+            // at the lowering boundary (`src/ccl/design/provenance.md`, "The recorder"),
+            // which is how a type-level-only `box` passed every test while failing to
+            // compile.
+            let op = ctx.tag_machinery(Expr::builtin(Builtin::Box), func.span, "lower.box");
+            Ok(Expr::apply(inner, op))
         }
         "defer" => Ok(Expr::new(TypedExprNode::Defer)),
         name if ctx.sources.contains_key(name) => {

@@ -117,9 +117,19 @@ pub struct FreshenCache {
     /// `FunKindVar` cell, or forcing one contaminates the other into a spurious
     /// `DomainJoinConflict`. Freshening mints one `κ'` per original `κ` (bounds
     /// copied so def-intrinsic forcing survives), consistently within a copy.
-    pub kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
+    pub fun_kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
+    /// Original kind-variable binder → the copy's binder at the same position.
+    ///
+    /// A kind variable's binders are quantified with it: they are the scope its edges
+    /// rename into (`src/ccl/design/type-inference.md`, "A consumer's binders are a scope,
+    /// not a name"), and the references naming them live in the bounds this freshening
+    /// copies. Carrying a reference across without the rename leaves the copy's bounds
+    /// spelling the definition's binder, which nothing below the copy binds — the same
+    /// α-conversion [`Type::alpha_convert_sum`] performs for a written sum and
+    /// [`chan_doms`](Self::chan_doms) for a rigid channel name.
+    pub witnesses: HashMap<crate::ccl::ty::WitnessId, crate::ccl::ty::WitnessId>,
     /// Original trait obligation → its per-instantiation copy, for the same reason
-    /// as [`kind_vars`](Self::kind_vars): a generalized function's operator
+    /// as [`fun_kind_vars`](Self::fun_kind_vars): a generalized function's operator
     /// requirements are quantified along with the variables they constrain, so each
     /// use resolves *its own* copy. `λ 𝑥 → 𝑥 + 1` generalizes to
     /// `∀A O. A ⇒ O requires Addable(A, Int ⇝ O)`; sharing one obligation across uses
@@ -161,10 +171,10 @@ pub enum FreshenLevel {
 /// (cached by `uid` so repeated occurrences of the same `κ` in one copy stay
 /// identified), seeding it with a copy of the original's bounds so any
 /// def-intrinsic forcing is preserved while use-site forcing lands on the fresh
-/// cell — decoupling instantiations (see [`FreshenCache::kind_vars`]).
-fn freshen_kind(kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
-    match kind {
-        FunKind::Compute | FunKind::Data => kind.clone(),
+/// cell — decoupling instantiations (see [`FreshenCache::fun_kind_vars`]).
+fn freshen_fun_kind(fun_kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
+    match fun_kind {
+        FunKind::Compute | FunKind::Data(..) => fun_kind.clone(),
         FunKind::Var(kv) => FunKind::Var(freshen_kind_var(kv, cache)),
     }
 }
@@ -176,12 +186,40 @@ fn freshen_kind(kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
 /// copy identified; the copy decouples *this* instantiation's pin from the
 /// definition's and from every sibling instantiation's.
 fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKindVar> {
-    if let Some(f) = cache.kind_vars.get(&kv.uid) {
+    if let Some(f) = cache.fun_kind_vars.get(&kv.uid) {
         return f.clone();
     }
     let f = FunKindVar::fresh();
-    f.adopt_pin(kv);
-    cache.kind_vars.insert(kv.uid, Rc::clone(&f));
+    // Registered **before** the bounds are carried across: a collection reaches itself
+    // through a recurrence, and the cache is what terminates the walk.
+    cache.fun_kind_vars.insert(kv.uid, Rc::clone(&f));
+    // **Everything the definition recorded comes across; the variable does not.** A pin the
+    // definition site acquires later must not reach this instantiation, which a fresh `uid`
+    // with copied state gives and a shared variable would not.
+    //
+    // All four, because all four are what the definition said: the construction stamp
+    // (`fresh_data`'s `Data`, which no edge spells), the bounds on either side, and what the
+    // collection was built over — a comprehension's instantiation binds one position per
+    // position of its sources exactly as the definition does, and a copy that drops the
+    // relation is a collection of unknown width that defaults to a capability.
+    if kv.stamped() == crate::ccl::ty::KindPin::Data {
+        f.stamp_data();
+    }
+    for k in kv.lower() {
+        f.record(freshen_fun_kind(&k, cache), true);
+    }
+    for k in kv.upper() {
+        f.record(freshen_fun_kind(&k, cache), false);
+    }
+    for src in kv.built_over().into_iter().rev() {
+        f.contributes_first(freshen_fun_kind(&src, cache));
+    }
+    // **The binders come across renamed**, after the edges that decide the arity. A
+    // position the original has settled is named in the bounds being copied, and the copy
+    // binds its own name there.
+    for (from, to) in kv.binders().iter().zip(f.binders()) {
+        cache.witnesses.insert(*from.id(), *to.id());
+    }
     f
 }
 
@@ -244,8 +282,10 @@ pub fn freshen_above(
     // are different questions). A `ChanDom` is exempt outright: it deliberately
     // reports level 0 (its level must not trigger extrusion — see `type_level`),
     // so its quantification is decided by the arm below from its *stored*
-    // introduction level.
-    if !matches!(ty, Type::ChanDom(..)) && freshen_level(ty) <= lim {
+    // introduction level. A `WitnessRef` is exempt for the same reason: it is a name
+    // holding no variable, so its level is 0 whether or not its binder is quantified, and
+    // what decides that is the cache the arm below reads.
+    if !matches!(ty, Type::ChanDom(..) | Type::WitnessRef(_)) && freshen_level(ty) <= lim {
         return ty.clone();
     }
     match ty {
@@ -289,15 +329,37 @@ pub fn freshen_above(
         }
         Type::Fun {
             name,
-            kind,
+            fun_kind,
             domain: d,
             codomain: c,
-        } => Type::Fun {
-            name: name.clone(),
-            kind: freshen_kind(kind, cache),
-            domain: Box::new(freshen_above(lim, d, target, cache)),
-            codomain: Box::new(freshen_above(lim, c, target, cache)),
-        },
+        } => {
+            let out = Type::Fun {
+                name: name.clone(),
+                fun_kind: match fun_kind {
+                    // A sum's binder kinds carry type children — the scheme's quantified
+                    // variables sit in the candidate list — so they freshen like any
+                    // other position. The binders themselves are re-minted just below, by
+                    // [`Type::alpha_convert_sum`].
+                    FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
+                        ws.iter()
+                            .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
+                            .collect(),
+                    ))),
+                    other => freshen_fun_kind(other, cache),
+                },
+                domain: Box::new(freshen_above(lim, d, target, cache)),
+                codomain: Box::new(freshen_above(lim, c, target, cache)),
+            };
+            // A scheme binds its witnesses, so each instantiation owes itself its own —
+            // `box`'s scheme is one sum, and sharing its binders would make every `box`
+            // in a program name the one the scheme was written with, joining two
+            // independent conditional collections onto a single witness.
+            if out.sum().is_some() {
+                out.alpha_convert_sum()
+            } else {
+                out
+            }
+        }
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
                 .map(|t| freshen_above(lim, t, target, cache))
@@ -322,11 +384,20 @@ pub fn freshen_above(
         Type::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => Type::History {
             value: Box::new(freshen_above(lim, value, target, cache)),
             domain: Box::new(freshen_above(lim, domain, target, cache)),
-            kind: *kind,
+            history_kind: *history_kind,
+        },
+        // A witness reference names a binder, not a variable, so what freshening owes it
+        // is the α-conversion its binder got. A written sum's binder is re-minted by
+        // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
+        // re-minted with the variable ([`freshen_kind_var`]), and the cache is what carries
+        // that rename to the references — in this type and in the bounds copied with it.
+        Type::WitnessRef(w) => match cache.witnesses.get(w) {
+            Some(fresh) => Type::WitnessRef(*fresh),
+            None => ty.clone(),
         },
         Type::Refinement(inner, refinements) => Type::refined(
             freshen_above(lim, inner, target, cache),
@@ -364,9 +435,13 @@ pub fn freshen_above(
 
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
-            let (lows, ups) = {
+            let (lows, ups, kinds) = {
                 let s = tv.bounds.borrow();
-                (Rc::clone(s.lower()), Rc::clone(s.upper()))
+                (
+                    Rc::clone(s.lower()),
+                    Rc::clone(s.upper()),
+                    s.type_kinds.clone(),
+                )
             };
             // Freshen the bound's type *and* its edge substitutions' discharge
             // payloads: a payload is a captured argument *term* whose type
@@ -389,10 +464,20 @@ pub fn freshen_above(
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                 })
                 .collect();
+            // Every instantiation gets its own copy of the kinding constraints. A
+            // generalized definition's requirement is part of its scheme, so dropping
+            // it here would make the requirement vanish at each use site — the
+            // constraint would be checked on a variable nothing resolves and never on
+            // the ones that do.
+            let new_kinds: Vec<_> = kinds
+                .iter()
+                .map(|k| k.map_children(|t| freshen_above(lim, t, target, cache)))
+                .collect();
             {
                 let mut s = v.bounds.borrow_mut();
                 s.set_lower(new_lows);
                 s.set_upper(new_ups);
+                s.type_kinds = new_kinds;
             }
             freshen_watches(lim, tv, &v, target, cache);
             Type::Infer(v)
@@ -699,19 +784,19 @@ mod tests {
         // copied), not share the original — otherwise pinning one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
         let kv = FunKindVar::fresh();
-        kv.pin_data(); // a def-intrinsic answer to carry onto each instantiation
+        kv.stamp_data(); // a def-intrinsic answer to carry onto each instantiation
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
         let f = Type::Fun {
             name: None,
-            kind: FunKind::Var(Rc::clone(&kv)),
+            fun_kind: FunKind::Var(Rc::clone(&kv)),
             domain: Box::new(Type::Infer(InferVar::fresh(5))),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let mut cache = FreshenCache::new();
         let fresh = freshen_above(0, &f, FreshenLevel::At(1), &mut cache);
         let Type::Fun {
-            kind: FunKind::Var(kv2),
+            fun_kind: FunKind::Var(kv2),
             ..
         } = fresh
         else {
@@ -722,14 +807,14 @@ mod tests {
             "instantiation must mint a distinct kind var"
         );
         assert_eq!(
-            kv2.pin(),
+            kv2.resolved(),
             KindPin::Data,
             "the definition's pin is copied to the fresh var"
         );
         // Pinning the fresh instantiation must not reach back to the original.
-        kv2.pin_compute();
+        kv2.record(FunKind::Compute, true);
         assert_eq!(
-            kv.pin(),
+            kv.resolved(),
             KindPin::Data,
             "the original var stays decoupled from this instantiation"
         );
@@ -763,7 +848,7 @@ mod tests {
         );
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(refined_domain),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };

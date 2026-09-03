@@ -96,7 +96,8 @@ use smol_str::SmolStr;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
-use super::compact::{AtomKey, KindMerge};
+use super::compact::AtomKey;
+use crate::ccl::ty::KindPin;
 
 /// The identity of a use's instantiation, for deciding which uses may share one
 /// monomorphization specialization: its two directed reads, kept apart (see the
@@ -120,6 +121,22 @@ pub struct SpecKey {
 struct KeyView {
     /// Leaf contributions (bases, ranges, sources, `Txn`, channel domains).
     atoms: BTreeSet<AtomKey>,
+    /// **Described** witness ranges reaching this position — a `List(𝑇)`'s `UIntRanges`,
+    /// a `Collection(𝑇)`'s `Any`. A *listed* range needs no slot: its candidates are
+    /// types, so they recurse like any other child and land in the fields above.
+    ///
+    /// A described one names no candidates to recurse into, so without this two sums
+    /// differing only in their range would key alike and share a clone — the
+    /// under-splitting direction, which is the unsound one. Compared as a set, like
+    /// [`refinements`](Self::refinements).
+    described_ranges: Vec<crate::ccl::ty::TypeKind>,
+    /// Whether a **witness reference** stands at this position.
+    ///
+    /// The whole of what a reference contributes. A key that recorded *which* binder would
+    /// split one specialization in two, since a binder is fresh per instantiation; a key
+    /// that recorded nothing would merge a position that is a binder with one that is an
+    /// ordinary domain.
+    witness: bool,
     /// Refinements at this position, deduplicated by [`Refinement`]'s
     /// type-blind structural equality. Order is insertion order, so equality
     /// compares these as a set.
@@ -131,7 +148,7 @@ struct KeyView {
     ///
     /// The kind belongs in the key because it is what a clone *compiles to*: a
     /// specialization pinned at `⤇` iterates a domain that a `⇒` use does not
-    /// supply. It is read through [`KindMerge::of`], the same resolved-from-bounds
+    /// supply. It is read through [`KindPin::of`], the same resolved-from-bounds
     /// view compaction uses, rather than off the [`FunKind`](crate::ccl::ty::FunKind)
     /// itself — an inferred kind is a variable here, and keying on its *identity*
     /// (fresh per instantiation) would split every use into its own key while
@@ -147,7 +164,7 @@ struct KeyView {
     /// `refinements`, compared structurally. Keeping the name would also make the
     /// key sensitive to the solver's per-site fresh dependent-application binders
     /// (`Name::solver_arg`), which would split every use into its own key.
-    fun: BTreeMap<KindMerge, (Box<KeyView>, Box<KeyView>)>,
+    fun: BTreeMap<KindPin, (Box<KeyView>, Box<KeyView>)>,
     /// Record/tuple fields, unioned. Tuples and records share this representation
     /// keyed by `Index` / `Name`, exactly as `compact_type` normalizes them.
     rec: BTreeMap<FieldKey, KeyView>,
@@ -171,7 +188,12 @@ impl PartialEq for KeyView {
         fn same_refinements(a: &[Refinement], b: &[Refinement]) -> bool {
             a.len() == b.len() && a.iter().all(|w| b.contains(w))
         }
+        fn same_ranges(a: &[crate::ccl::ty::TypeKind], b: &[crate::ccl::ty::TypeKind]) -> bool {
+            a.len() == b.len() && a.iter().all(|k| b.contains(k))
+        }
         self.atoms == other.atoms
+            && self.witness == other.witness
+            && same_ranges(&self.described_ranges, &other.described_ranges)
             && same_refinements(&self.refinements, &other.refinements)
             && self.fun == other.fun
             && self.rec == other.rec
@@ -188,6 +210,12 @@ impl KeyView {
     /// on one side only passes through.
     fn union(&mut self, other: KeyView) {
         self.atoms.extend(other.atoms);
+        self.witness |= other.witness;
+        for k in other.described_ranges {
+            if !self.described_ranges.contains(&k) {
+                self.described_ranges.push(k);
+            }
+        }
         for w in other.refinements {
             if !self.refinements.contains(&w) {
                 self.refinements.push(w);
@@ -221,6 +249,16 @@ impl KeyView {
         }
     }
 
+    /// The marker a **witness reference** contributes: that the position is a binder, with
+    /// no say in which. Its own slot rather than an atom, because there is no anonymous
+    /// binder to build an atom from — anonymity is the absence of one.
+    fn anonymous_witness() -> KeyView {
+        KeyView {
+            witness: true,
+            ..Default::default()
+        }
+    }
+
     fn from_atom(a: AtomKey) -> KeyView {
         KeyView {
             atoms: BTreeSet::from([a]),
@@ -247,12 +285,13 @@ impl fmt::Display for KeyView {
         let mut parts: Vec<String> = self.atoms.iter().map(|a| a.to_type().to_string()).collect();
         for (kind, (d, c)) in &self.fun {
             let arrow = match kind {
-                KindMerge::Data => "⤇",
-                KindMerge::Compute => "⇒",
-                KindMerge::Conflict => "⇒!",
+                KindPin::Data => "⤇",
+                KindPin::Compute => "⇒",
+                KindPin::Conflict => "⇒!",
                 // Never reaches a key (`key_go` resolves it to the capability
                 // default), but `KeyView` renders whatever it is handed.
-                KindMerge::Unknown => "⇒?",
+                KindPin::Unpinned => "⇒?",
+                KindPin::Plain | KindPin::Sum(_) => "⤇",
             };
             parts.push(format!("({d} {arrow} {c})"));
         }
@@ -397,6 +436,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
+        // A witness reference contributes an **anonymous** marker: enough to tell a position
+        // that is a witness from one that is an ordinary domain, and nothing more. Which
+        // binder it is cannot count — a binder is fresh per instantiation, so keying on it
+        // would make two keys for one specialization. Erased on the key rather than
+        // substituted with a sentinel binder, which would be a third case in the id space
+        // that everything else has to know not to mean anything.
+        Type::WitnessRef(_) => KeyView::anonymous_witness(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the
@@ -420,7 +466,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             name,
             domain,
             codomain,
-            kind,
+            fun_kind,
         } => {
             // The domain is contravariant — the flip that makes the dual read
             // follow an argument's *lower* bounds.
@@ -436,7 +482,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             ctx.scope.enter(name.clone());
             let cod = key_go(codomain, pol, &cod_acc, ctx);
             ctx.scope.exit();
-            // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
+            // Resolved through `KindPin::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
             // so keying on it would split every use; its pins are the answer, and
             // reading them here is what compaction does at the same point in the solve.
@@ -446,14 +492,32 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // two would only ever differ before that. Keeping them apart would split
             // a generic use from a concrete compute one over a distinction that does
             // not reach the materialized type.
-            let key_kind = match KindMerge::of(kind) {
-                KindMerge::Unknown => KindMerge::Compute,
+            let key_kind = match fun_kind.resolved() {
+                KindPin::Unpinned => KindPin::Compute,
                 resolved => resolved,
             };
-            KeyView {
+            let mut acc = KeyView {
                 fun: BTreeMap::from([(key_kind, (Box::new(dom), Box::new(cod)))]),
                 ..Default::default()
+            };
+            // A sum contributes its candidates too, each at this polarity — the same
+            // no-flip `compact_go` uses, since a candidate is not a domain position.
+            // The **binders are not part of the key**, for the reason the `fun` slot
+            // does not key on a `FunKind` variable: `box`'s scheme α-converts its sum
+            // at every instantiation, so the ids are fresh per use and keying on them
+            // would split every use while telling us nothing about what the clone
+            // compiles to.
+            for w in fun_kind.witnesses() {
+                match w.type_kind() {
+                    crate::ccl::ty::TypeKind::Enumerated(candidates) => {
+                        for c in &candidates {
+                            acc.union(key_go(c, pol, subst_acc, ctx));
+                        }
+                    }
+                    described => acc.described_ranges.push(described),
+                }
             }
+            acc
         }
         Type::Tuple(ts) => KeyView {
             rec: ts
@@ -489,12 +553,12 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => {
             let value = key_go(value, pol, subst_acc, ctx);
             let domain = key_go(domain, pol, subst_acc, ctx);
             KeyView {
-                history: BTreeMap::from([(*kind, (Box::new(value), Box::new(domain)))]),
+                history: BTreeMap::from([(*history_kind, (Box::new(value), Box::new(domain)))]),
                 ..Default::default()
             }
         }
@@ -762,7 +826,7 @@ mod tests {
     /// a specialization pinned at `⤇` iterates a domain a `⇒` use does not supply — so
     /// a clone keyed on one must not serve a use of the other.
     ///
-    /// The kind reaches the key through `KindMerge::of`, so a concrete function keys by
+    /// The kind reaches the key through `KindPin::of`, so a concrete function keys by
     /// what it *is*. An unresolved `FunKind::Var` resolves from its bounds like any
     /// other position, which is what keeps two uses of one generic binding sharing a
     /// clone instead of splitting on a per-instantiation variable identity.
@@ -777,7 +841,7 @@ mod tests {
         // which keys as the `Compute` default rather than as its own point.
         let unresolved = || Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::fresh_var(),
+            fun_kind: crate::ccl::ty::FunKind::fresh_var(),
             domain: Box::new(int()),
             codomain: Box::new(int()),
         };
@@ -793,7 +857,7 @@ mod tests {
              a concrete compute function rather than splitting off its own"
         );
         // And the merge keeps two concrete kinds apart rather than one shadowing the
-        // other — what keying `fun` by `KindMerge` buys, and why it needs `Ord`.
+        // other — what keying `fun` by `KindPin` buys, and why it needs `Ord`.
         let mut merged = key_go(
             &Type::fun(int(), int()),
             true,
@@ -818,10 +882,10 @@ mod tests {
     /// key alike, or a clone pinned to one would serve a use of the other.
     #[test]
     fn history_kind_is_part_of_the_key() {
-        let history = |kind| Type::History {
+        let history = |history_kind| Type::History {
             value: Box::new(int()),
             domain: Box::new(Type::Txn),
-            kind,
+            history_kind,
         };
         assert_ne!(
             spec_key(&history(HistoryKind::Overwrite)),
@@ -873,7 +937,7 @@ mod refinement_closing_tests {
     fn dep_fun(binder: &str) -> Type {
         Type::Fun {
             name: Some(Name::raw(binder)),
-            kind: FunKind::Data,
+            fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::refined_one(
                 Type::Base(crate::ccl::BaseType::Int),
@@ -912,11 +976,11 @@ mod refinement_closing_tests {
     fn spec_key_keeps_distinct_binders_distinct() {
         let nested = |referenced: &str| Type::Fun {
             name: Some(Name::raw("x")),
-            kind: FunKind::Data,
+            fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Fun {
                 name: Some(Name::raw("y")),
-                kind: FunKind::Data,
+                fun_kind: FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(4)),
                 codomain: Box::new(Type::refined_one(
                     Type::Base(crate::ccl::BaseType::Int),

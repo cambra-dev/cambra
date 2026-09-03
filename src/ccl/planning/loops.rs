@@ -371,7 +371,10 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Const))
     {
         let mut source = Expr::builtin(Builtin::Id);
-        source.ty = Type::fun(site_dom.clone(), site_dom.clone());
+        // The identity on the site's extent, which is the collection of the writer's
+        // positions — the extent is its data, exactly as for the `iterate(p)` this slot
+        // is wrapped in (`ccl_utils::make_iterate`).
+        source.ty = Type::data_fun(site_dom.clone(), site_dom.clone());
         // The writer-body convention is `Fun(Tuple(reads…, item), decision)`;
         // with no reads and the position as the (ignored) item, restamp the
         // const application accordingly — nominal only, const ignores input.
@@ -495,7 +498,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     // field order op-conversion\'s `emit_transact`/`build_commit_store` produce.
     let mut hist_field_tys: Vec<(String, Type)> = key_ty
         .iter()
-        .map(|(n, v)| (n.field_key(), Type::fun(Type::Txn, v.clone())))
+        .map(|(n, v)| (n.field_key(), Type::data_fun(Type::Txn, v.clone())))
         .collect();
     for (_, field, stream_ty) in &taps {
         hist_field_tys.push((field.clone(), stream_ty.clone()));
@@ -513,7 +516,10 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     // history-record projection `__hist.field : Fun(Txn, V)`.
     let mut read_map: HashMap<Name, (String, Type)> = HashMap::new();
     for (n, v) in &key_ty {
-        read_map.insert(n.clone(), (n.field_key(), Type::fun(Type::Txn, v.clone())));
+        read_map.insert(
+            n.clone(),
+            (n.field_key(), Type::data_fun(Type::Txn, v.clone())),
+        );
     }
     for (n, field, stream_ty) in &taps {
         read_map.insert(n.clone(), (field.clone(), stream_ty.clone()));
@@ -690,12 +696,15 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         .map(|(k, vty)| {
             (
                 k.name.field_key(),
-                Type::fun(domain_ty.clone(), vty.clone()),
+                crate::ccl::ccl_utils::history_ty(&domain_ty, vty),
             )
         })
         .collect();
     for (f, vty) in &feed_fields {
-        hist_field_tys.push((f.clone(), Type::fun(domain_ty.clone(), vty.clone())));
+        hist_field_tys.push((
+            f.clone(),
+            crate::ccl::ccl_utils::history_ty(&domain_ty, vty),
+        ));
     }
     let hist_ty = hist_record(hist_field_tys);
 
@@ -790,7 +799,7 @@ fn rewrite_hist_reads(
                     Some(TypedExprNode::Proj(ProjKey::Index(i))),
                 ) if f == F_WRITES => {
                     let field = keys[*i].field_key();
-                    let field_ty = Type::fun(domain_ty.clone(), acc_tys[*i].clone());
+                    let field_ty = crate::ccl::ccl_utils::history_ty(domain_ty, &acc_tys[*i]);
                     Some((hist_field_read(hist, hist_ty, field, field_ty), 4))
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {

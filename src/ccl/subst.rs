@@ -100,6 +100,27 @@ pub enum Mapping {
     Discharge(Box<TypedExpr>),
 }
 
+/// What a substitution does to a **witness** binder — the witness-sort counterpart of
+/// [`Mapping`], and the same two species for the same reason.
+///
+/// A witness binder is substituted exactly as a term binder is: renamed when two scopes are
+/// being related, discharged when a sum is instantiated at one of its candidates. Spelling
+/// them as one enum is what keeps the two from growing separate traversals — the walk that
+/// applies a rename is the walk that applies a discharge.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WitnessMapping {
+    /// `binder ↦ other binder` — a change of scope. Invertible.
+    Rename(crate::ccl::ty::WitnessId),
+    /// `binder ↦ domain` — instantiate the sum at one of its candidates. No inverse.
+    ///
+    /// Discharging a witness **opens** the sum that binds it: the binder leaves the slot,
+    /// because a binder whose occurrences have been answered quantifies nothing. That is
+    /// the witness-sort analogue of opening a Pi
+    /// ([`open_pi_binder`]), and it happens wherever the binding sum is found rather than
+    /// only at the root — a type slot reached from outside may still hold the whole sum.
+    Discharge(Type),
+}
+
 /// Hand-written so that **copying a substitution does not duplicate its terms**
 /// — the one place `TypedExpr`'s freshening `Clone` is deliberately opted out
 /// of, and the reason it can be opted out of exactly here.
@@ -198,6 +219,37 @@ impl Mapping {
     }
 }
 
+/// `domain`, taken from a `Compose`'s head, spelled in the **composition's own**
+/// witness binders.
+///
+/// A composition's domain is its head's domain, so the two types name one index — under
+/// two binders, because a binder is minted where a scope needs one
+/// (`src/ccl/design/type-inference.md`, "A binder is minted where a scope needs one").
+/// The composition's binder is the one every type above the node references, so the
+/// head's spelling is renamed into it and nothing above changes. Position by position:
+/// a Σ's binder slot is ordered by the domain positions it names.
+///
+/// Without it, a discharge that replaces the head with a term bound elsewhere leaves
+/// the node holding a binder from its own type and a domain from the replacement's, and
+/// a `WitnessRef` outside its binder means nothing at all
+/// (`crate::ccl::infer::api::debug_assert_no_free_witness`).
+fn at_own_witnesses(domain: Type, own: &Type, head: &Type) -> Type {
+    let (Some(here), Some(there)) = (own.sum(), head.sum()) else {
+        return domain;
+    };
+    // A length disagreement is not a scope change — the two types are not the same sum
+    // — and is left for whatever comparison follows to report.
+    if here.len() != there.len() {
+        return domain;
+    }
+    let renaming: crate::ccl::ty::WitnessRenaming = there
+        .iter()
+        .zip(here)
+        .map(|(from, to)| (*from.id(), *to.id()))
+        .collect();
+    domain.rename_witnesses(&renaming)
+}
+
 /// A [`Subst`] domain is free names. A [`Name::PiBound`] is a *bound* reference
 /// to an enclosing function, so nothing substitutes for one: the conversions in
 /// this module remove it, at a binder crossing or at an application. The
@@ -214,20 +266,125 @@ fn debug_assert_no_pi_bound(binder: &Name) {
 /// A simultaneous substitution `{binder ↦ mapping, …}`. An absent binder maps
 /// to itself (the identity). The empty map is [`Subst::id`].
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Subst(BTreeMap<Binder, Mapping>);
+pub struct Subst {
+    binders: BTreeMap<Binder, Mapping>,
+    /// Witness binders this substitution renames — the **scope change** between two sums.
+    ///
+    /// A sum's body is written in its own binder's scope, so relating it to anything
+    /// outside means bringing it into that scope, and an edge between two functions records
+    /// the map rather than trying to make the two binders one object. Bounds already carry
+    /// the edge's morphisms, so a reference recorded on a variable arrives already spelled
+    /// in the holder's scope.
+    witnesses: BTreeMap<crate::ccl::ty::WitnessId, WitnessMapping>,
+}
 
 impl Subst {
     /// The identity substitution — a perfect no-op. `apply_*` on it returns the
     /// input structurally unchanged.
     pub fn id() -> Self {
-        Subst(BTreeMap::new())
+        Subst {
+            binders: BTreeMap::new(),
+            witnesses: BTreeMap::new(),
+        }
+    }
+
+    /// A substitution on term binders alone — the ordinary case, no scope change between
+    /// sums.
+    fn of_binders(binders: BTreeMap<Binder, Mapping>) -> Self {
+        Subst {
+            binders,
+            witnesses: BTreeMap::new(),
+        }
+    }
+
+    /// This substitution extended by the witness scope change `[from ↦ to]`.
+    ///
+    /// What an edge between a sum and the function consuming it records: the sum's body names
+    /// its own binder, the function names the one it indexes by, and the two are related by
+    /// this map rather than by being the same object.
+    pub fn extended_witness_rename(
+        &self,
+        from: &crate::ccl::ty::WitnessId,
+        to: &crate::ccl::ty::WitnessId,
+    ) -> Subst {
+        // **A rename maps a name to a name.** What either binder ranges over is written where
+        // it is bound, so there is nothing else for this to carry.
+        let mut out = self.clone();
+        out.witnesses.insert(*from, WitnessMapping::Rename(*to));
+        out
+    }
+
+    /// This substitution extended by the discharge `[binder ↦ candidate]` — a sum
+    /// instantiated at one of the domains its witness ranges over.
+    ///
+    /// The sum binding `binder` is opened by the same application: see
+    /// [`WitnessMapping::Discharge`].
+    pub fn extended_witness_discharge(
+        &self,
+        binder: &crate::ccl::ty::WitnessId,
+        candidate: &Type,
+    ) -> Subst {
+        let mut out = self.clone();
+        out.witnesses
+            .insert(*binder, WitnessMapping::Discharge(candidate.clone()));
+        out
+    }
+
+    /// The discharge `[binder ↦ candidate]` alone.
+    pub fn discharge_witness(binder: &crate::ccl::ty::WitnessId, candidate: &Type) -> Subst {
+        Subst::id().extended_witness_discharge(binder, candidate)
+    }
+
+    /// The rename `[from ↦ to]` on witnesses alone.
+    pub fn rename_witness(
+        from: &crate::ccl::ty::WitnessId,
+        to: &crate::ccl::ty::WitnessId,
+    ) -> Subst {
+        Subst::id().extended_witness_rename(from, to)
+    }
+
+    /// This substitution without its witness half, or `None` if it has none — with the
+    /// pair [`apply_witnesses`](Self::apply_witnesses), for splitting the α-conversion
+    /// (which can be forced now) from the binder half (which cannot).
+    pub fn without_witnesses(&self) -> Option<Subst> {
+        if self.witnesses.is_empty() {
+            return None;
+        }
+        Some(Subst {
+            binders: self.binders.clone(),
+            witnesses: BTreeMap::new(),
+        })
+    }
+
+    /// `ty` with only this substitution's witness renaming applied.
+    pub fn apply_witnesses(&self, ty: &Type) -> Type {
+        if self.witnesses.is_empty() {
+            return ty.clone();
+        }
+        Subst {
+            binders: BTreeMap::new(),
+            witnesses: self.witnesses.clone(),
+        }
+        .apply_type(ty)
+    }
+
+    /// The witness half, rendered `from -> to` per entry. Diagnostic only.
+    pub fn render_witnesses(&self) -> String {
+        self.witnesses
+            .iter()
+            .map(|(from, to)| match to {
+                WitnessMapping::Rename(w) => format!("{from:?} -> {w:?}"),
+                WitnessMapping::Discharge(d) => format!("{from:?} := {d}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Is this the identity? Callers fast-path the common (non-dependent) case
     /// on this so that ordinary code paths are byte-identical to a world
     /// without substitutions.
     pub fn is_id(&self) -> bool {
-        self.0.is_empty()
+        self.binders.is_empty() && self.witnesses.is_empty()
     }
 
     /// A rename `[from ↦ to]` — a bijection on binders, hence invertible.
@@ -236,7 +393,7 @@ impl Subst {
         debug_assert_no_pi_bound(&from);
         let mut m = BTreeMap::new();
         m.insert(from, Mapping::Rename(to.into()));
-        Subst(m)
+        Subst::of_binders(m)
     }
 
     /// A discharge `[binder ↦ term]` — plug `term` in for `binder`. One-way,
@@ -255,12 +412,12 @@ impl Subst {
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
         m.insert(binder, Mapping::Discharge(Box::new(term)));
-        Subst(m)
+        Subst::of_binders(m)
     }
 
     /// The binders this substitution acts on (its source domain).
     pub fn binders(&self) -> impl Iterator<Item = &Binder> {
-        self.0.keys()
+        self.binders.keys()
     }
 
     /// Visit each discharge mapping's captured term mutably (renames have no
@@ -270,7 +427,7 @@ impl Subst {
     /// slot it copies — see `solver::scheme::freshen_subst_payloads`, called from
     /// `freshen_above`'s bound-copying arm.
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
-        for m in self.0.values_mut() {
+        for m in self.binders.values_mut() {
             if let Mapping::Discharge(t) = m {
                 f(t);
             }
@@ -285,11 +442,11 @@ impl Subst {
     /// discharge part but differ in correspondence renames.
     pub fn split_renames(&self) -> (Subst, Subst) {
         let (ren, term): (BTreeMap<_, _>, BTreeMap<_, _>) = self
-            .0
+            .binders
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .partition(|(_, v)| matches!(v, Mapping::Rename(_)));
-        (Subst(ren), Subst(term))
+        (Subst::of_binders(ren), Subst::of_binders(term))
     }
 
     /// Equality up to the terms' *type slots* — same binders, and each pair
@@ -312,11 +469,11 @@ impl Subst {
     /// functions with colliding argument spellings meeting at one position —
     /// the domain-join territory that O1/O4 owns anyway.)
     pub fn eq_modulo_ty_slots(&self, other: &Subst) -> bool {
-        self.0.len() == other.0.len()
+        self.binders.len() == other.binders.len()
             && self
-                .0
+                .binders
                 .iter()
-                .zip(other.0.iter())
+                .zip(other.binders.iter())
                 .all(|((ka, va), (kb, vb))| {
                     ka == kb
                         && match (va, vb) {
@@ -332,7 +489,7 @@ impl Subst {
     /// True if any binder of `self`'s *range* (the replacement terms) contains a
     /// free `name` — i.e. substituting under a binder `name` would capture.
     fn range_mentions(&self, name: &Name) -> bool {
-        self.0.values().any(|m| match m {
+        self.binders.values().any(|m| match m {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
         })
@@ -349,8 +506,22 @@ impl Subst {
         if b.is_id() {
             return a.clone();
         }
-        let mut keys: BTreeSet<Binder> = a.0.keys().cloned().collect();
-        keys.extend(b.0.keys().cloned());
+        let mut witnesses = a.witnesses.clone();
+        for (from, to) in &b.witnesses {
+            witnesses.entry(*from).or_insert_with(|| to.clone());
+        }
+        // Species composes from the input species, exactly as the term half below: a
+        // rename whose target `b` maps again lands wherever `b` sends it, and a discharge
+        // anywhere in the chain makes the composite a discharge.
+        for to in witnesses.values_mut() {
+            if let WitnessMapping::Rename(w) = to
+                && let Some(next) = b.witnesses.get(w)
+            {
+                *to = next.clone();
+            }
+        }
+        let mut keys: BTreeSet<Binder> = a.binders.keys().cloned().collect();
+        keys.extend(b.binders.keys().cloned());
         let mut m = BTreeMap::new();
         for k in keys {
             // Species composes from the INPUT species, never from the shape
@@ -359,13 +530,13 @@ impl Subst {
             // rename whose target `b` discharges) makes the composite a
             // discharge, even if the composed term happens to be a bare
             // variable.
-            let composed = match a.0.get(&k) {
-                Some(Mapping::Rename(to)) => match b.0.get(to) {
+            let composed = match a.binders.get(&k) {
+                Some(Mapping::Rename(to)) => match b.binders.get(to) {
                     Some(mb) => mb.clone(),
                     None => Mapping::Rename(to.clone()),
                 },
                 Some(Mapping::Discharge(t)) => Mapping::Discharge(Box::new(b.apply_expr(t))),
-                None => match b.0.get(&k) {
+                None => match b.binders.get(&k) {
                     Some(mb) => mb.clone(),
                     None => continue,
                 },
@@ -380,16 +551,19 @@ impl Subst {
                 m.insert(k, composed);
             }
         }
-        Subst(m)
+        Subst {
+            binders: m,
+            witnesses,
+        }
     }
 
     /// Extend this substitution with a fresh binder correspondence `k ↦ x`
     /// (the Pi-vs-Pi binder alignment derived in the codomain edge). `k` is a
     /// newly-scoped binder, so this is an insert, not a composition.
     pub fn extended_rename(&self, k: impl Into<Name>, x: impl Into<Name>) -> Subst {
-        let mut m = self.0.clone();
-        m.insert(k.into(), Mapping::Rename(x.into()));
-        Subst(m)
+        let mut out = self.clone();
+        out.binders.insert(k.into(), Mapping::Rename(x.into()));
+        out
     }
 
     /// The **licensed correspondence view** of this substitution: every
@@ -420,7 +594,7 @@ impl Subst {
     /// `type-checker-first-class-dependent-functions`.
     pub fn licensed_correspondence_view(&self) -> Subst {
         let m = self
-            .0
+            .binders
             .iter()
             .map(|(k, v)| {
                 let v = match v {
@@ -433,7 +607,7 @@ impl Subst {
                 (k.clone(), v)
             })
             .collect();
-        Subst(m)
+        Subst::of_binders(m)
     }
 
     /// Invert a **rename** (every entry a [`Mapping::Rename`], distinct
@@ -454,7 +628,7 @@ impl Subst {
     pub fn invert(&self) -> Option<Subst> {
         let mut m = BTreeMap::new();
         let mut seen = BTreeSet::new();
-        for (k, v) in &self.0 {
+        for (k, v) in &self.binders {
             let Mapping::Rename(to) = v else {
                 return None; // a discharge has no inverse
             };
@@ -463,7 +637,7 @@ impl Subst {
             }
             m.insert(to.clone(), Mapping::Rename(k.clone()));
         }
-        Some(Subst(m))
+        Some(Subst::of_binders(m))
     }
 
     /// Apply this substitution to a **term**. Capture-avoiding: it shadows the
@@ -499,7 +673,7 @@ impl Subst {
         // non-dependent application, `x` not occurring in `e`) takes this
         // path, which is what keeps vacuous transport from copying terms or
         // rebuilding predicate terms into fresh `Rc`s.
-        if !self.0.keys().any(|k| is_free(k, e)) {
+        if !self.acts_on(e) {
             let _g = crate::ccl::provenance::enter(
                 e.node_id(),
                 "subst.vacuous",
@@ -508,6 +682,23 @@ impl Subst {
             return e.clone();
         }
         self.apply_expr_inner(e)
+    }
+
+    /// Whether this substitution acts on `e` — the guard both vacuity short-circuits ask.
+    ///
+    /// **Both halves.** The term half acts through a free reference to a substituted
+    /// binder; the witness half acts through a type slot naming a renamed binder, and a
+    /// witness rename has no term half at all. Asking only the binders answers "vacuous"
+    /// for a pure α-conversion, which is how a predicate keeps a spelling of an index its
+    /// own base has since renamed.
+    fn acts_on(&self, e: &TypedExpr) -> bool {
+        if self.binders.keys().any(|k| is_free(k, e)) {
+            return true;
+        }
+        !self.witnesses.is_empty() && {
+            let named = crate::ccl::ccl_utils::free_witnesses(e);
+            self.witnesses.keys().any(|w| named.contains(w))
+        }
     }
 
     fn apply_expr_inner(&self, e: &TypedExpr) -> TypedExpr {
@@ -524,7 +715,7 @@ impl Subst {
             crate::ccl::provenance::Nature::Machinery,
         );
         let node = match &e.node {
-            Var(n) => match self.0.get(n) {
+            Var(n) => match self.binders.get(n) {
                 // The replacement carries its own type/annotation, so return it
                 // wholesale rather than rebuilding `e`.
                 Some(repl) => return repl.as_expr(&e.ty),
@@ -681,7 +872,7 @@ impl Subst {
     /// the in-place mode visit every name occurrence in the tree without a
     /// [`Name`] clone per node.
     fn retarget(&self, name: &Name) -> Option<Name> {
-        match self.0.get(name)? {
+        match self.binders.get(name)? {
             Mapping::Rename(to) => Some(to.clone()),
             Mapping::Discharge(t) => match &t.node {
                 TypedExprNode::Var(n) => Some(n.clone()),
@@ -774,7 +965,7 @@ impl Subst {
             .filter(|(name, _)| live_names.contains(*name))
             .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
             .collect();
-        Subst(live).rewrite_expr(&mut e);
+        Subst::of_binders(live).rewrite_expr(&mut e);
         e
     }
 
@@ -782,7 +973,7 @@ impl Subst {
         // Inert subtree (no substituted binder free in value or type slots):
         // leave it untouched — predicates in particular stay un-rebuilt,
         // mirroring the transport mode's `Rc`-sharing guarantee.
-        if !self.0.keys().any(|k| is_free(k, e)) {
+        if !self.binders.keys().any(|k| is_free(k, e)) {
             return;
         }
         // A mapped `Var` is replaced wholesale (the replacement carries its
@@ -790,7 +981,7 @@ impl Subst {
         // slots. An *unmapped* `Var` falls through: its type slots may still
         // carry the substituted binder in a refinement predicate.
         if let TypedExprNode::Var(n) = &e.node
-            && let Some(repl) = self.0.get(n)
+            && let Some(repl) = self.binders.get(n)
         {
             // Root-carry: the replacement ROOT is built at the occurrence's own
             // id — a *preserve*, so the root inherits the occurrence's
@@ -867,7 +1058,7 @@ impl Subst {
             && let (Some(first), Some(last)) = (elts.first(), elts.last())
             && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
         {
-            e.ty = Type::fun_like(&e.ty, d, c);
+            e.ty = Type::fun_like(&e.ty, at_own_witnesses(d, &e.ty, &first.ty), c);
         }
     }
 
@@ -883,17 +1074,6 @@ impl Subst {
         );
     }
 
-    /// In-place analogue of [`Self::apply_type`]: rewrite the term binders in
-    /// `ty`'s refinement predicates by rebuilding each predicate as a fresh
-    /// `Rc`. `memo` re-points every occurrence that shared one predicate term
-    /// at the same rebuilt term (see [`Self::rewrite_expr`]).
-    pub fn rewrite_type(&self, ty: &mut Type) {
-        if self.is_id() {
-            return;
-        }
-        self.rewrite_type_go(ty, &PredMemo::new());
-    }
-
     fn rewrite_type_go(&self, ty: &mut Type, memo: &PredMemo<Subst>) {
         match ty {
             Type::BoundedHole(t) => self.rewrite_type_go(t, memo),
@@ -903,6 +1083,9 @@ impl Subst {
             | Type::Txn
             | Type::Hole
             | Type::SharedHole(_)
+            // A witness reference is a type-level binder occurrence, never a term
+            // binder the substitution acts on.
+            | Type::WitnessRef(_)
             | Type::Infer(_) => {}
 
             // a nominal channel domain names its defer
@@ -921,20 +1104,32 @@ impl Subst {
 
             Type::Fun {
                 name: None,
+                fun_kind,
                 domain,
                 codomain,
-                ..
             } => {
+                // A witness binder is a *type*-level binder, so a term substitution has
+                // no name to map here — only the kinds' type children need rewriting.
+                for w in fun_kind.witnesses_mut() {
+                    for t in w.types_mut() {
+                        self.rewrite_type_go(t, memo);
+                    }
+                }
                 self.rewrite_type_go(domain, memo);
                 self.rewrite_type_go(codomain, memo);
             }
 
             Type::Fun {
                 name: Some(b),
+                fun_kind,
                 domain,
                 codomain,
-                ..
             } => {
+                for w in fun_kind.witnesses_mut() {
+                    for t in w.types_mut() {
+                        self.rewrite_type_go(t, memo);
+                    }
+                }
                 self.rewrite_type_go(domain, memo);
                 let restricted = self.shadow(b);
                 restricted.assert_no_capture(b);
@@ -953,7 +1148,7 @@ impl Subst {
                 // memo across binder crossings correct — see `PredMemo`.
                 refinements.rewrite_each(|_, r| {
                     memo.rebuild(r, &restricted, |pred| {
-                        if !restricted.0.keys().any(|k| is_free(k, pred)) {
+                        if !restricted.binders.keys().any(|k| is_free(k, pred)) {
                             // Vacuous: no substituted binder occurs free here, so report
                             // no change and keep the origin `Rc` — a predicate this
                             // substitution merely walks past stays shared with its other
@@ -983,6 +1178,7 @@ impl Subst {
             Type::Variant(tags, _) => tags
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
+
         }
     }
 
@@ -1001,7 +1197,7 @@ impl Subst {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
         // is inert there — return the identity so the body is left untouched.
-        if !restricted.0.keys().any(|k| is_free(k, body)) {
+        if !restricted.binders.keys().any(|k| is_free(k, body)) {
             return (binder.clone(), Subst::id());
         }
         restricted.assert_no_capture(binder);
@@ -1035,7 +1231,7 @@ impl Subst {
         // keeps a vacuously-transported refinement pointer-equal to its
         // source, so the `PartialEq` fast path and any downstream identity
         // dedup still see one predicate.
-        if !restricted.0.keys().any(|k| is_free(k, &r.predicate)) {
+        if !restricted.acts_on(&r.predicate) {
             return r.clone();
         }
         // A refinement predicate is a *denotational* term, so a substituted
@@ -1070,7 +1266,7 @@ impl Subst {
         // substitution-descent bugs, backing the end-of-inference
         // `check_scope_valid` debug walk.
         #[cfg(debug_assertions)]
-        for (b, m) in &self.0 {
+        for (b, m) in &self.binders {
             if matches!(m, Mapping::Discharge(_)) {
                 debug_assert!(
                     !is_free(b, &new_pred),
@@ -1086,13 +1282,32 @@ impl Subst {
 
     /// This substitution with `binder` removed from its source domain (the
     /// binder shadows the outer mapping inside its scope).
+    ///
+    /// The witness half rides through untouched: a term binder and a witness binder are
+    /// different sorts, and a `Name` shadows nothing in the other one.
     pub fn shadow(&self, binder: &Name) -> Subst {
-        if !self.0.contains_key(binder) {
+        if !self.binders.contains_key(binder) {
             return self.clone();
         }
-        let mut m = self.0.clone();
-        m.remove(binder);
-        Subst(m)
+        let mut out = self.clone();
+        out.binders.remove(binder);
+        out
+    }
+
+    /// This substitution with `ids` removed from its source domain — the Σ mirror of
+    /// [`Self::shadow`], applied where a function's binders scope over its body.
+    ///
+    /// An outer entry keyed on one of `ids` states how this binder is spelled *outside*, in
+    /// a kind it corresponds to. Below the function that binds it the name denotes the
+    /// binder itself, so carrying the entry on renames occurrences of a bound name to a
+    /// sibling scope's spelling and the function binds a name its own domain no longer says.
+    pub fn shadow_witnesses(&self, ids: &[crate::ccl::ty::WitnessId]) -> Subst {
+        if ids.iter().all(|id| !self.witnesses.contains_key(id)) {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.witnesses.retain(|k, _| !ids.contains(k));
+        out
     }
 
     /// This substitution restricted so it acts on **none** of `binders` — the
@@ -1113,8 +1328,8 @@ impl Subst {
     pub fn shadow_all<'a>(&self, binders: impl IntoIterator<Item = &'a Name>) -> Cow<'_, Subst> {
         let mut out = Cow::Borrowed(self);
         for b in binders {
-            if out.0.contains_key(b) {
-                out.to_mut().0.remove(b);
+            if out.binders.contains_key(b) {
+                out.to_mut().binders.remove(b);
             }
         }
         out
@@ -1143,20 +1358,35 @@ impl Subst {
             | Type::SharedHole(_)
             | Type::Infer(_) => ty.clone(),
 
+            // **A witness reference crosses a scope change here.** The reference names the
+            // binder of the sum it was written under; where this substitution records a
+            // change of that scope, the reference is respelled in the target's — carrying
+            // the target's own handle, so the kind it reports is the target binder's.
+            Type::WitnessRef(w) => match self.witnesses.get(w) {
+                Some(WitnessMapping::Rename(to)) => Type::WitnessRef(*to),
+                Some(WitnessMapping::Discharge(candidate)) => candidate.clone(),
+                None => ty.clone(),
+            },
+
             // rename the named defer binder, mirroring the
             // in-place mode (`rewrite_type_go`).
             Type::ChanDom(name, lvl) => Type::ChanDom(self.handle_target(name), *lvl),
 
             Type::Fun {
                 name: None,
+                fun_kind,
                 domain,
                 codomain,
-                ..
-            } => Type::fun_like(ty, self.apply_type(domain), self.apply_type(codomain)),
+            } => Type::Fun {
+                name: None,
+                fun_kind: self.apply_fun_kind(fun_kind),
+                domain: Box::new(self.apply_type(domain)),
+                codomain: Box::new(self.apply_type(codomain)),
+            },
 
             Type::Fun {
                 name: Some(b),
-                kind,
+                fun_kind,
                 domain,
                 codomain,
             } => {
@@ -1164,7 +1394,7 @@ impl Subst {
                 let (b2, inner) = self.under_binder_ty(b, codomain);
                 Type::Fun {
                     name: Some(b2),
-                    kind: kind.clone(),
+                    fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
                 }
@@ -1199,12 +1429,50 @@ impl Subst {
             Type::History {
                 value,
                 domain,
-                kind,
+                history_kind,
             } => Type::History {
                 value: Box::new(self.apply_type(value)),
                 domain: Box::new(self.apply_type(domain)),
-                kind: *kind,
+                history_kind: *history_kind,
             },
+        }
+    }
+
+    /// `kind` with this substitution applied to each slot witness: the binder itself where
+    /// the substitution renames it, and its kind's children either way — a substitution
+    /// rewrites *predicates*, and a candidate domain's refinement carries them.
+    fn apply_fun_kind(&self, fun_kind: &crate::ccl::ty::FunKind) -> crate::ccl::ty::FunKind {
+        use crate::ccl::ty::FunKind;
+        match fun_kind {
+            // **A discharged binder leaves the slot.** Its occurrences have been answered,
+            // so keeping it would bind nothing the body still mentions — the opening half
+            // of [`WitnessMapping::Discharge`]. A slot emptied this way is a plain data
+            // function, which is what `Data(None)` spells.
+            FunKind::Data(Some(ws)) => {
+                let kept: Vec<crate::ccl::ty::Witness> = ws
+                    .iter()
+                    .filter(|w| {
+                        !matches!(
+                            self.witnesses.get(w.id()),
+                            Some(WitnessMapping::Discharge(_))
+                        )
+                    })
+                    .map(|w| {
+                        // **A rename moves the binder with its references.** It is an
+                        // α-conversion, so leaving the slot alone would bind one name over
+                        // a body that spells another — a sum whose binder its own domain no
+                        // longer says. A *discharge* is the other half and drops the binder
+                        // outright, above.
+                        let w = match self.witnesses.get(w.id()) {
+                            Some(WitnessMapping::Rename(to)) => w.renamed(*to),
+                            _ => w.clone(),
+                        };
+                        w.map_types(|t| self.apply_type(t))
+                    })
+                    .collect();
+                FunKind::Data((!kept.is_empty()).then(|| Rc::new(kept)))
+            }
+            other => other.clone(),
         }
     }
 
@@ -1259,11 +1527,22 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
-        | Type::SharedHole(_) => false,
+        | Type::SharedHole(_)
+        | Type::WitnessRef(_) => false,
         Type::Infer(_) => true,
         Type::Fun {
-            domain, codomain, ..
-        } => type_contains_infer(domain) || type_contains_infer(codomain),
+            fun_kind,
+            domain,
+            codomain,
+            ..
+        } => {
+            fun_kind
+                .witnesses()
+                .iter()
+                .any(|w| w.types().iter().any(type_contains_infer))
+                || type_contains_infer(domain)
+                || type_contains_infer(codomain)
+        }
         Type::History { value, domain, .. } => {
             type_contains_infer(value) || type_contains_infer(domain)
         }
@@ -1316,13 +1595,22 @@ fn collect_type_fv(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        // A witness reference is type-level, never a free term variable.
+        | Type::WitnessRef(_)
         | Type::Infer(_) => {}
         Type::Fun {
             name,
+            fun_kind,
             domain,
             codomain,
-            ..
         } => {
+            // A witness binder binds no *term* variable, so the kinds' free term vars
+            // are collected under the enclosing binders, with nothing subtracted.
+            for w in fun_kind.witnesses() {
+                for t in w.types() {
+                    collect_type_fv(t, bound, visited, out);
+                }
+            }
             collect_type_fv(domain, bound, visited, out);
             // A `Some` name is the Pi binder, bound in the codomain.
             with_binders(bound, name.clone(), |bnd| {
@@ -1623,6 +1911,9 @@ impl<'a> PiWalk<'a> {
                 self.ty(value, depth);
                 self.ty(domain, depth);
             }
+            // A witness reference is a leaf in its own namespace: it neither is
+            // nor crosses a Pi index.
+            Type::WitnessRef(_) => {}
         }
     }
 
@@ -1777,6 +2068,9 @@ pub fn references_enclosing_function(ty: &Type) -> bool {
             Type::History { value, domain, .. } => {
                 ty_scan(value, depth, visited) || ty_scan(domain, depth, visited)
             }
+            // A witness reference is a leaf in its own namespace: it neither is
+            // nor crosses a Pi index.
+            Type::WitnessRef(_) => false,
         }
     }
     fn expr_scan(e: &TypedExpr, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
@@ -2121,7 +2415,7 @@ mod tests {
         // the shadow is what protects it.
         let ty = Type::Fun {
             name: Some(Name::raw("k")),
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::infer()),
             codomain: Box::new(refined(gt(var("i"), var("k")))),
         };
@@ -2222,11 +2516,11 @@ mod tests {
 
         let out = Subst::discharge_env_in_place(compose, &env);
 
-        let Type::Fun { name, kind, .. } = &out.ty else {
+        let Type::Fun { name, fun_kind, .. } = &out.ty else {
             panic!("a `Compose` over function elements types as a function")
         };
         assert_eq!(
-            (name.as_ref().map(Name::base), kind),
+            (name.as_ref().map(Name::base), fun_kind),
             (Some("n"), &crate::ccl::FunKind::Compute),
             "the arrow's species and binder are the composition's, not its \
              elements' — `Type::fun` would have flattened both"
@@ -2255,11 +2549,59 @@ mod tests {
             matches!(
                 &out.ty,
                 Type::Fun {
-                    kind: crate::ccl::FunKind::Data,
+                    fun_kind: crate::ccl::FunKind::Data(..),
                     ..
                 }
             ),
             "a discharge must not downgrade `⤇` to `⇒`; got `{}`",
+            out.ty
+        );
+    }
+
+    /// A `Compose` recomputes its domain from its head, so a discharge that replaces the
+    /// head with a term bound under a different witness must bring that domain into the
+    /// composition's own binder. Left alone, the node carries a binder from its own type
+    /// and a domain from the replacement's, and the reference is free.
+    #[test]
+    fn a_compose_spells_a_discharged_head_s_domain_in_its_own_witness() {
+        use crate::ccl::infer_var::fresh_witness_binder_id;
+        use crate::ccl::ty::{TypeKind, Witness};
+
+        let int_ty = Type::Base(crate::ccl::BaseType::Int);
+        let kind = TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        // A `Σ (σ : [[0, 2], [0, 3]]). (σ ⤇ Int)` and the reference its binder introduces.
+        let sum = || {
+            let w = Witness::bound_to(fresh_witness_binder_id(), kind.clone());
+            let occurrence = Type::WitnessRef(*w.id());
+            (
+                Type::sum_binding(w, Type::data_fun(occurrence.clone(), int_ty.clone())),
+                occurrence,
+            )
+        };
+        // The composition's binder, and the one the replacement was written under.
+        let (own_ty, own) = sum();
+        let (replacement_ty, _) = sum();
+
+        let mut compose = TypedExpr::compose(vec![
+            var("f").with_ty(own_ty.clone()),
+            var("g").with_ty(Type::data_fun(int_ty.clone(), int_ty.clone())),
+        ]);
+        compose.ty = own_ty.clone();
+        let env: HashMap<Name, TypedExpr> =
+            HashMap::from([(Name::raw("f"), var("h").with_ty(replacement_ty))]);
+
+        let out = Subst::discharge_env_in_place(compose, &env);
+
+        assert_eq!(
+            out.ty.domain().as_ref(),
+            Some(&own),
+            "the recomputed domain is spelled in the composition's own binder; got `{}`",
+            out.ty
+        );
+        assert_eq!(
+            out.ty.sum().map(|ws| ws.len()),
+            Some(1),
+            "the binder slot stays the composition's own; got `{}`",
             out.ty
         );
     }

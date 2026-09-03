@@ -152,6 +152,32 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
+
+// A group-by over a literal whose elements share **one singleton type** does not compile.
+// `[1]` and `[1, 1]` both have element type `Int@1`, so the key morphism's codomain — and
+// with it the key domain — is `Int@1`, where `[1, 2]`'s is `Int`.
+//
+// The two spellings meet at the consuming lambda. Inference leaves
+// `λ __iter_record : Int → __iter_record:<Int@1> ▷ ⟨the group-by⟩`: the binder is declared
+// at the *widened* `Int` while its own occurrence keeps `Int@1`. A parameter may drop a
+// refinement — a refined argument flows into an unrefined parameter — but a **data**
+// function's domain is invariant (`src/ccl/design/type-inference.md`, "Data domains are
+// invariant"), so the two do not reconcile and `post-lambda-elim` reports
+// `expected Int, found Int@1`.
+//
+// The consuming lambda is the program's result, so nothing applies it and
+// `specialize_lambda_domain` — which recovers an under-determined contravariant domain from
+// the argument flowing in — never runs on it. Reproduces on `main`; `set` and `map` inherit
+// it through the shared re-keying shape rather than causing it.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("[sum(x) for x in groupby([1], \\x -> x)]")]
+#[case("[sum(x) for x in groupby([1, 1], \\x -> x)]")]
+#[ignore = "a data-function parameter drops the refinement its occurrences keep, and a data \
+            domain is invariant"]
+fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
+    run_pipeline(code);
+}
 // 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]

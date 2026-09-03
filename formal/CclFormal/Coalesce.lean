@@ -111,7 +111,7 @@ measure — `depth` — enough. The folded `Compute` domain is the call
 that needs `merge_depth_le`; the rest are children. -/
 
 theorem depth_cod_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
-    {c : Option (List Predicate)} {k : KindMerge} {ds : List CompactTy} {cod : CompactTy} :
+    {c : Option (List Predicate)} {k : KindMerge} {ds cod : CompactTy} :
     depth cod < depth (CompactTy.mk a r v (some (k, ds, cod)) c) := by
   have h1 : depth cod ≤ optFnDepth (some (k, ds, cod)) := by
     simp only [optFnDepth]
@@ -123,39 +123,19 @@ theorem depth_cod_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy)
   omega
 
 theorem depth_dom_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
-    {c : Option (List Predicate)} {k : KindMerge} {ds : List CompactTy} {cod d : CompactTy}
-      (h : d ∈ ds) :
-    depth d < depth (CompactTy.mk a r v (some (k, ds, cod)) c) := by
-  have h1 : depth d ≤ optFnDepth (some (k, ds, cod)) := by
-    simp only [optFnDepth]
-    exact Nat.le_trans (le_listDepth h) (Nat.le_max_left _ _)
-  have h2 : optFnDepth (some (k, ds, cod))
-      ≤ Nat.max (optMapDepth r) (Nat.max (optMapDepth v) (optFnDepth (some (k, ds, cod)))) :=
-    Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)
-  rw [depth]
-  omega
-
-/-- The folded `Compute` domain: bounded because `merge` does not deepen. -/
-theorem depth_fold_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
-    {c : Option (List Predicate)} {k : KindMerge} {cod d : CompactTy} {rest : List CompactTy}
-      {q : Bool} :
-    depth (meetAll q d rest) < depth (CompactTy.mk a r v (some (k, d :: rest, cod)) c) := by
-  have h0 : depth (meetAll q d rest) ≤ listDepth (d :: rest) := by
-    refine Nat.le_trans (meetAll_depth_le q d rest) ?_
-    rw [listDepth]
-    exact Nat.max_le.mpr ⟨Nat.le_max_left _ _, Nat.le_max_right _ _⟩
-  have h1 : listDepth (d :: rest) ≤ optFnDepth (some (k, d :: rest, cod)) := by
+    {c : Option (List Predicate)} {k : KindMerge} {cod d : CompactTy} :
+    depth d < depth (CompactTy.mk a r v (some (k, d, cod)) c) := by
+  have h1 : depth d ≤ optFnDepth (some (k, d, cod)) := by
     simp only [optFnDepth]
     exact Nat.le_max_left _ _
-  have h2 : optFnDepth (some (k, d :: rest, cod))
-      ≤ Nat.max (optMapDepth r)
-        (Nat.max (optMapDepth v) (optFnDepth (some (k, d :: rest, cod)))) :=
+  have h2 : optFnDepth (some (k, d, cod))
+      ≤ Nat.max (optMapDepth r) (Nat.max (optMapDepth v) (optFnDepth (some (k, d, cod)))) :=
     Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)
   rw [depth]
   omega
 
 theorem depth_recordPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
-    {v : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × List CompactTy × CompactTy)}
+    {v : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} {p : FieldKey × CompactTy} (h : p ∈ m) :
     depth p.2 < depth (CompactTy.mk a (some m) v f c) := by
   have h1 : depth p.2 ≤ optMapDepth (some m) := by
@@ -168,7 +148,7 @@ theorem depth_recordPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy)
   omega
 
 theorem depth_variantPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
-    {r : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × List CompactTy × CompactTy)}
+    {r : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} {p : FieldKey × CompactTy} (h : p ∈ m) :
     depth p.2 < depth (CompactTy.mk a r (some m) f c) := by
   have h1 : depth p.2 ≤ optMapDepth (some m) := by
@@ -184,22 +164,16 @@ theorem depth_variantPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy
 find them without naming the lambda's binder. -/
 
 theorem depth_recordAttach_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
-    {v : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × List CompactTy × CompactTy)}
+    {v : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} (rp : {x : FieldKey × CompactTy // x ∈ m}) :
     depth rp.1.2 < depth (CompactTy.mk a (some m) v f c) :=
   depth_recordPayload_lt rp.2
 
 theorem depth_variantAttach_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
-    {r : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × List CompactTy × CompactTy)}
+    {r : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} (vp : {x : FieldKey × CompactTy // x ∈ m}) :
     depth vp.1.2 < depth (CompactTy.mk a r (some m) f c) :=
   depth_variantPayload_lt vp.2
-
-theorem depth_domAttach_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
-    {c : Option (List Predicate)} {k : KindMerge} {ds : List CompactTy} {cod : CompactTy}
-    (alt : {x : CompactTy // x ∈ ds}) :
-    depth alt.1 < depth (CompactTy.mk a r v (some (k, ds, cod)) c) :=
-  depth_dom_lt alt.2
 
 /-- Build a function type from two materialized halves, unresolved if either is. -/
 def funTy (kind : FunKind) : Option Ty → Option Ty → Option Ty
@@ -285,35 +259,47 @@ def variantShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
 termination_by t => (depth t, 0)
 decreasing_by all_goals (apply Prod.Lex.left; exact depth_variantAttach_lt _)
 
-/-- The function slot's contribution. The resolved kind decides what the domain
-alternatives mean: a `Compute` reading — and an unpinned kind variable, which defaults to it — meets
-them, while a `Data` reading needs exactly one to survive
-materialization. -/
+/-- Whether this position **denotes several domains**: bare atoms, more than one distinct.
+A `data` domain's atoms are alternatives, one candidate each, so several is the domain join.
+Mirrors `denoted_domains` and `denotes_several_domains_ty` (`compact.rs`), including the shape
+they read it on — atoms and nothing else. -/
+def denotesSeveralDomains : CompactTy → Bool
+  | .mk atoms none none none _ => atoms.eraseDups.length > 1
+  | _ => false
+
+/-- The function slot's contribution. The domain is one position, materialized like any other;
+the resolved kind decides only what the function *is*.
+`coalesce_compact_go` (`compact.rs`) is the counterpart.
+
+**A `data` position's atoms are alternatives**, one candidate domain each, so several of them is
+the domain join rejected by name rather than the incompatible-bounds a compute position's would
+give. `denoted_domains` reads them the same way, and on the same shape: bare atoms, nothing else in
+the position.
+
+The Rust also reaches that rejection through `domains_disagree`, a flag `CompactFun::merge` sets
+from the *operands* because the meet erases the evidence — two domains that had no common answer
+leave as one position. There is no slot for it here, so a disagreement whose merged position is not
+several atoms is a verdict this model does not state (`formal/design.md`, "Σ types and `FunKind`
+inference"). -/
 def funShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
   | .mk _ _ _ none _ => pure none
-  | .mk _ _ _ (some (k, ds, cod)) _ => do
+  | .mk _ _ _ (some (k, d, cod)) _ => do
     let c ← coalesce pol cod
     match k with
     | .conflict => .error .conflictedSlot
-    | .data => do
-      let mats ← ds.attach.mapM fun alt => coalesce (!pol) alt.1
-      match mats.eraseDups with
-      | [one] => pure (funTy .data one c)
-      | _ => .error .domainJoin
-    | _ =>
-      match ds with
-      | [] => .error .conflictedSlot
-      | d :: rest => do
-        let dt ← coalesce (!pol) (meetAll (!pol) d rest)
-        pure (funTy .compute dt c)
+    | k =>
+      if k == .data && denotesSeveralDomains d then
+        .error .domainJoin
+      else do
+        let dt ← coalesce (!pol) d
+        pure (funTy (if k == .data then .data else .compute) dt c)
 termination_by t => (depth t, 0)
 decreasing_by
   all_goals
     apply Prod.Lex.left
     first
     | exact depth_cod_lt
-    | exact depth_fold_lt
-    | exact depth_domAttach_lt _
+    | exact depth_dom_lt
 
 end
 

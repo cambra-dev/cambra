@@ -53,7 +53,7 @@ def kindResolved : CompactTy → Bool
       && (match f with
           | none => true
           | some (k, d, cod) =>
-            (k == .data || k == .compute) && kindResolvedAll d && kindResolved cod)
+            (k == .data || k == .compute) && kindResolved d && kindResolved cod)
 termination_by t => (sizeOf t, 0)
 
 /-- All payloads of a map are `kindResolved` (worklist form, as `wellFormedKeys`). -/
@@ -71,19 +71,6 @@ decreasing_by
     omega
   · apply Prod.Lex.right
     simp
-
-/-- Every domain alternative of a slot is `kindResolved`. -/
-def kindResolvedAll : List CompactTy → Bool
-  | [] => true
-  | d :: ds => kindResolved d && kindResolvedAll ds
-termination_by ds => (sizeOf ds, 0)
-decreasing_by
-  · apply Prod.Lex.left
-    simp
-    omega
-  · apply Prod.Lex.left
-    simp
-    omega
 
 end
 
@@ -165,7 +152,7 @@ theorem coalesce_variant_only (pol : Bool) (m : List (FieldKey × CompactTy))
     simp [combine]
     rfl
 
-theorem coalesce_fun_only (pol : Bool) (g : KindMerge × List CompactTy × CompactTy)
+theorem coalesce_fun_only (pol : Bool) (g : KindMerge × CompactTy × CompactTy)
     (c : Option (List Predicate)) :
     coalesce pol (.mk [] none none (some g) c) =
       (do
@@ -423,7 +410,7 @@ slots has no type — which is what lets every case of the
 monotonicity lemma be about a single slot. -/
 theorem coalesce_shape (pol : Bool) {as : List Atom}
     {r v : Option (List (FieldKey × CompactTy))}
-      {f : Option (KindMerge × List CompactTy × CompactTy)}
+      {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} {ty : Ty}
     (h : coalesce pol (.mk as r v f c) = .ok (some ty)) :
     (as ≠ [] ∧ r = none ∧ v = none ∧ f = none) ∨
@@ -489,8 +476,12 @@ def DataAgree (pol : Bool) : CompactTy → CompactTy → Bool
           | some m₁, some m₂ => DataAgreeKeys pol m₁ m₂ (m₁.map Prod.fst)
           | _, _ => true)
       && (match f₁, f₂ with
-          | some (k₁, [d₁], cod₁), some (_, [d₂], cod₂) =>
-            (if pol then true else if k₁ == KindMerge.data then equiv d₁ d₂ else true)
+          | some (k₁, d₁, cod₁), some (_, d₂, cod₂) =>
+            -- **At both polarities**, because the domain merges contravariantly at both:
+            -- a positive merge meets the domains too, so the evidence that two `data`
+            -- domains disagreed is gone either way. The old list slot kept both
+            -- alternatives at a positive merge and did not need the hypothesis there.
+            (if k₁ == KindMerge.data then equiv d₁ d₂ else true)
               -- Both orders, because the function case reads its hypothesis in
               -- both: a `data` slot needs the domain edge each way.
               && DataAgree (!pol) d₁ d₂ && DataAgree (!pol) d₂ d₁
@@ -578,7 +569,7 @@ theorem absorbedBy_variant_absurd {pol : Bool} {as bs : List Atom}
   simp at hvar
 
 theorem absorbedBy_fun_absurd {pol : Bool} {as bs : List Atom}
-    {g : KindMerge × List CompactTy × CompactTy}
+    {g : KindMerge × CompactTy × CompactTy}
     {r v c r' v' c'} (hle : absorbedBy pol (.mk as r v (some g) c) (.mk bs r' v' none c')) : False
       := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
@@ -1115,17 +1106,23 @@ empty tail is that alternative. -/
 
 /-- `coalesce` on a position whose only content is a `data` function slot. -/
 theorem coalesce_fun_data_ok (pol : Bool) {d cod : CompactTy} {c : Option (List Predicate)}
-    {ty : Ty} (h : coalesce pol (.mk [] none none (some (.data, [d], cod)) c) = .ok (some ty)) :
+    {ty : Ty} (h : coalesce pol (.mk [] none none (some (.data, d, cod)) c) = .ok (some ty)) :
     ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
       ty = attachRefinements (.fn none .data dt ct) c := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.data, [d], cod)) c) with e | x <;>
+  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.data, d, cod)) c) with e | x <;>
     rw [coalesce_fun_only, hf] at h
   · cases h
   rcases x with _ | base
   · cases h
   cases h
   rw [funShapes] at hf
-  simp at hf
+  -- A `data` domain denoting several alternatives is the domain join, so it did not
+  -- materialize; the surviving branch is the single-domain one.
+  by_cases hs : denotesSeveralDomains d = true
+  · exfalso
+    revert hf
+    rcases hc : coalesce pol cod with e | oc <;> simp [hs, hc, Bind.bind, Except.bind]
+  simp [hs] at hf
   rcases hc : coalesce pol cod with e | oc
   · simp [hc] at hf
     cases hf
@@ -1150,19 +1147,19 @@ theorem coalesce_fun_data_ok (pol : Bool) {d cod : CompactTy} {c : Option (List 
 /-- `coalesce` on a position whose only content is a `compute` function slot. -/
 theorem coalesce_fun_compute_ok (pol : Bool) {d cod : CompactTy} {c : Option (List Predicate)}
     {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.compute, [d], cod)) c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] none none (some (.compute, d, cod)) c) = .ok (some ty)) :
     ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
       ty = attachRefinements (.fn none .compute dt ct) c := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.compute, [d], cod)) c) with e | x <;>
+  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.compute, d, cod)) c) with e | x <;>
     rw [coalesce_fun_only, hf] at h
   · cases h
   rcases x with _ | base
   · cases h
   cases h
   rw [funShapes] at hf
+  -- A `compute` slot's guard is off whatever the domain denotes: only a `data` reading
+  -- takes several atoms for alternatives.
   simp at hf
-  have hmeet : meetAll (!pol) d [] = d := rfl
-  rw [hmeet] at hf
   rcases hc : coalesce pol cod with e | oc
   · simp [hc] at hf
     cases hf
@@ -1197,37 +1194,17 @@ one, where they meet. -/
 theorem equiv_fun_slot {pol : Bool} {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ cod₂ : CompactTy}
     {ca cb : Option (List Predicate)}
     (hk₁ : k₁ ≠ .conflict) (hk₂ : k₂ ≠ .conflict) (hu₁ : k₁ ≠ .unknown)
-    (hle : absorbedBy pol (.mk [] none none (some (k₁, [d₁], cod₁)) ca)
-                  (.mk [] none none (some (k₂, [d₂], cod₂)) cb)) :
-    k₁ = k₂ ∧ absorbedBy pol cod₁ cod₂ ∧ (if pol then equiv d₁ d₂ = true else absorbedBy true d₁ d₂)
-      := by
+    (hle : absorbedBy pol (.mk [] none none (some (k₁, d₁, cod₁)) ca)
+                  (.mk [] none none (some (k₂, d₂, cod₂)) cb)) :
+    k₁ = k₂ ∧ absorbedBy pol cod₁ cod₂ ∧ absorbedBy (!pol) d₁ d₂ := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
-  obtain ⟨⟨⟨⟨⟨-, -⟩, -⟩, -⟩, ⟨⟨hkind, hsd, -⟩, hcod⟩⟩, -⟩ := hle
-  have hmeet : meetDomains [d₁] [d₂] = some [merge true d₁ d₂] := by simp
-    [meetDomains, subtypeDomains]
+  obtain ⟨⟨⟨⟨⟨-, -⟩, -⟩, -⟩, ⟨⟨hkind, hsd⟩, hcod⟩⟩, -⟩ := hle
   have hkk : k₁ = k₂ := by
-    rcases k₁ <;> rcases k₂ <;> cases pol <;>
-      simp_all [joinKind, mergeFun, meetDomains, subtypeDomains]
+    rcases k₁ <;> rcases k₂ <;> simp_all [joinKind, mergeFun]
   subst hkk
-  have hnc : (joinKind k₁ k₁ == KindMerge.conflict) = false := by
-    rcases k₁ <;> simp_all [joinKind]
-  cases pol
-  · simp only [mergeFun, hnc, Bool.false_eq_true, if_false, hmeet] at hsd hcod
-    refine ⟨rfl, by simpa [absorbedBy] using hcod, ?_⟩
-    obtain ⟨y, hy, heq⟩ := subtypeDomains_iff.mp hsd (merge true d₁ d₂) (by simp)
-    simp only [List.mem_singleton] at hy
-    subst hy
-    simpa [absorbedBy] using heq
-  · simp only [mergeFun, hnc, if_true] at hsd hcod
-    refine ⟨rfl, by simpa [absorbedBy] using hcod, ?_⟩
-    simp only [if_true]
-    obtain ⟨y, hy, heq⟩ :=
-      subtypeDomains_iff.mp hsd d₁
-        (by simp only [unionDomains]; exact List.mem_append_left _ (by simp))
-    simp only [List.mem_singleton] at hy
-    subst hy
-    exact heq
+  simp only [mergeFun] at hsd hcod
+  exact ⟨rfl, by simpa [absorbedBy] using hcod, by simpa [absorbedBy] using hsd⟩
 
 /-- A function edge from its parts: the domain is contravariant, and invariant when
 both sides are `data`, because a collection's domain is its data. -/
@@ -1249,10 +1226,10 @@ excludes is the one `Ty` gives no
 bound for. -/
 theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ cod₂ : CompactTy}
     {ca cb : Option (List Predicate)} {ta tb : Ty}
-    (hwa : wellFormed (.mk [] none none (some (k₁, [d₁], cod₁)) ca) = true)
-    (hwb : wellFormed (.mk [] none none (some (k₂, [d₂], cod₂)) cb) = true)
+    (hwa : wellFormed (.mk [] none none (some (k₁, d₁, cod₁)) ca) = true)
+    (hwb : wellFormed (.mk [] none none (some (k₂, d₂, cod₂)) cb) = true)
     (hk₁ : k₁ = .data ∨ k₁ = .compute) (hk₂ : k₂ = .data ∨ k₂ = .compute)
-    (hagree : pol = false → k₁ = .data → equiv d₁ d₂ = true)
+    (hagree : k₁ = .data → equiv d₁ d₂ = true)
     (ihd : ∀ (x y : CompactTy) (tx ty' : Ty), ((x = d₁ ∧ y = d₂) ∨ (x = d₂ ∧ y = d₁)) →
       absorbedBy (!pol) x y → coalesce (!pol) x = .ok (some tx) →
       coalesce (!pol) y = .ok (some ty') →
@@ -1260,10 +1237,10 @@ theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ co
     (ihc : ∀ (tx ty' : Ty), absorbedBy pol cod₁ cod₂ →
       coalesce pol cod₁ = .ok (some tx) → coalesce pol cod₂ = .ok (some ty') →
       (if pol then subtypeCheck tx ty' else subtypeCheck ty' tx) = true)
-    (hle : absorbedBy pol (.mk [] none none (some (k₁, [d₁], cod₁)) ca)
-                  (.mk [] none none (some (k₂, [d₂], cod₂)) cb))
-    (ha : coalesce pol (.mk [] none none (some (k₁, [d₁], cod₁)) ca) = .ok (some ta))
-    (hb : coalesce pol (.mk [] none none (some (k₂, [d₂], cod₂)) cb) = .ok (some tb)) :
+    (hle : absorbedBy pol (.mk [] none none (some (k₁, d₁, cod₁)) ca)
+                  (.mk [] none none (some (k₂, d₂, cod₂)) cb))
+    (ha : coalesce pol (.mk [] none none (some (k₁, d₁, cod₁)) ca) = .ok (some ta))
+    (hb : coalesce pol (.mk [] none none (some (k₂, d₂, cod₂)) cb) = .ok (some tb)) :
     (if pol then subtypeCheck ta tb else subtypeCheck tb ta) = true := by
   rw [wellFormed.eq_def] at hwa hwb
   simp only [Bool.and_eq_true] at hwa hwb
@@ -1277,11 +1254,7 @@ theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ co
     simp only [Bool.and_eq_true] at hle
     exact hle.2
   -- The two domains agree whenever the kind demands invariance.
-  have heqd : k₁ = .data → equiv d₁ d₂ = true := by
-    intro hkd
-    cases pol
-    · exact hagree rfl hkd
-    · simpa using hdom
+  have heqd : k₁ = .data → equiv d₁ d₂ = true := hagree
   rcases ca with _ | p
   · exact absurd hwa.2 (by simp)
   rcases cb with _ | q
@@ -1321,8 +1294,7 @@ theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ co
         (fun x hx => by
           simp only [mergeRefinements, refinementsEquiv_iff] at hrefinements
           exact hrefinements.1 x (List.mem_append_left _ hx))
-    · have hd := ihd d₁ d₂ dt₁ dt₂ (Or.inl ⟨rfl, rfl⟩)
-        (absorbedBy_of_equiv _ (by simpa using hdom) hwd₂) hd₁ hd₂
+    · have hd := ihd d₁ d₂ dt₁ dt₂ (Or.inl ⟨rfl, rfl⟩) hdom hd₁ hd₂
       simp only [if_true, Bool.not_true, Bool.false_eq_true, if_false] at hd hcc ⊢
       exact subtypeCheck_attachRefinements (hnr _ _ _) (hnr _ _ _)
         (subtypeCheck_fn .compute hd (fun h => absurd h (by simp)) hcc)
@@ -1352,11 +1324,11 @@ theorem concrete_variant_keys {as : List Atom} {ma : List (FieldKey × CompactTy
   simp only [Bool.and_eq_true] at hw hk
   exact ⟨hw.1.1.2.1, hk.1.2⟩
 
-/-- `concrete`, projected onto a function slot: `wellFormed` forces one domain and a kind
-that is not `conflict`, and `kindResolved` forces one that is not `unknown`. -/
-theorem concrete_fun {as : List Atom} {k : KindMerge} {ds : List CompactTy} {cod : CompactTy} {c}
-    (h : concrete (.mk as none none (some (k, ds, cod)) c) = true) :
-    ∃ d, ds = [d] ∧ concrete d = true ∧ concrete cod = true ∧ (k = .data ∨ k = .compute) := by
+/-- `concrete`, projected onto a function slot. One domain is the slot's type now, so this only
+splits the two invariants: `wellFormed` rules out `conflict`, `kindResolved` rules out `unknown`. -/
+theorem concrete_fun {as : List Atom} {k : KindMerge} {d cod : CompactTy} {c}
+    (h : concrete (.mk as none none (some (k, d, cod)) c) = true) :
+    concrete d = true ∧ concrete cod = true ∧ (k = .data ∨ k = .compute) := by
   simp only [concrete, Bool.and_eq_true] at h
   obtain ⟨hw, hk⟩ := h
   rw [wellFormed.eq_def] at hw
@@ -1364,17 +1336,13 @@ theorem concrete_fun {as : List Atom} {k : KindMerge} {ds : List CompactTy} {cod
   simp only [Bool.and_eq_true] at hw hk
   obtain ⟨⟨-, hwf⟩, -⟩ := hw
   obtain ⟨-, hkf⟩ := hk
-  rcases ds with _ | ⟨d, rest⟩
-  · simp at hwf
-  rcases rest with _ | ⟨_, _⟩
-  · simp only [bne_iff_ne, ne_eq] at hwf
-    simp only [Bool.and_eq_true, kindResolvedAll, Bool.or_eq_true, beq_iff_eq] at hkf
-    refine ⟨d, rfl, ?_, ?_, hkf.1.1⟩
-    · simp only [concrete, Bool.and_eq_true]
-      exact ⟨hwf.1.2, hkf.1.2.1⟩
-    · simp only [concrete, Bool.and_eq_true]
-      exact ⟨hwf.2, hkf.2⟩
-  · simp at hwf
+  simp only [bne_iff_ne, ne_eq] at hwf
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hkf
+  refine ⟨?_, ?_, hkf.1.1⟩
+  · simp only [concrete, Bool.and_eq_true]
+    exact ⟨hwf.1.2, hkf.1.2⟩
+  · simp only [concrete, Bool.and_eq_true]
+    exact ⟨hwf.2, hkf.2⟩
 
 /-! ## The lemma, assembled
 
@@ -1462,10 +1430,10 @@ theorem coalesce_monotone : ∀ (n : Nat) (pol : Bool) (a b : CompactTy), sizeOf
     · exact absurd hle (fun h => absorbedBy_fun_absurd h)
     · exact absurd hle (fun h => absorbedBy_fun_absurd h)
     · exact absurd hle (fun h => absorbedBy_fun_absurd h)
-    · obtain ⟨k₁, ds₁, cod₁⟩ := ga
-      obtain ⟨k₂, ds₂, cod₂⟩ := gb
-      obtain ⟨d₁, rfl, hgd₁, hgc₁, hk₁⟩ := concrete_fun hga
-      obtain ⟨d₂, rfl, hgd₂, hgc₂, hk₂⟩ := concrete_fun hgb
+    · obtain ⟨k₁, d₁, cod₁⟩ := ga
+      obtain ⟨k₂, d₂, cod₂⟩ := gb
+      obtain ⟨hgd₁, hgc₁, hk₁⟩ := concrete_fun hga
+      obtain ⟨hgd₂, hgc₂, hk₂⟩ := concrete_fun hgb
       simp only [DataAgree, Bool.and_eq_true] at hagree
       obtain ⟨-, ⟨⟨hkind, hdd⟩, hddrev⟩, hdc⟩ := hagree
       have ihd : ∀ (x y : CompactTy) (tx ty' : Ty), ((x = d₁ ∧ y = d₂) ∨ (x = d₂ ∧ y = d₁)) →
@@ -1481,9 +1449,10 @@ theorem coalesce_monotone : ∀ (n : Nat) (pol : Bool) (a b : CompactTy), sizeOf
           (if pol then subtypeCheck tx ty' else subtypeCheck ty' tx) = true := by
         intro tx ty' hlec hcx hcy
         exact ih pol cod₁ cod₂ (by simp at hfuel; omega) hgc₁ hgc₂ hdc hlec tx ty' hcx hcy
-      have hagr : pol = false → k₁ = KindMerge.data → equiv d₁ d₂ = true := by
-        intro hp hkd
-        subst hp
+      -- `DataAgree` states the domain edge at both polarities now, so the hypothesis is
+      -- read straight off it.
+      have hagr : k₁ = KindMerge.data → equiv d₁ d₂ = true := by
+        intro hkd
         subst hkd
         simpa using hkind
       simp only [concrete, Bool.and_eq_true] at hga hgb
@@ -1625,7 +1594,7 @@ private def funs : List CompactTy :=
     , .mk [] (some [(.name "a", intPosition)]) none none (some [])
     , .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some [])
     ]
-  kinds.flatMap fun k => doms.map fun d => .mk [] none none (some (k, [d], intPosition)) (some [])
+  kinds.flatMap fun k => doms.map fun d => .mk [] none none (some (k, d, intPosition)) (some [])
 
 private def sample : List CompactTy := leaves ++ funs
 
@@ -1737,10 +1706,12 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
 
 -- What `merge_is_a_bound` proves, against what the sample checks: of the kind-resolved
 -- pairs, these are the ones whose merge stays concrete and whose data domains did
--- not move, so the theorem applies to them. The rest are a merge that left the
--- input shape — a `compute` slot carrying two domain alternatives, which
--- materializes by meeting them — or a data domain the merge moved.
-#guard (provedCovered).length == 1814
+-- not move, so the theorem applies to them. The rest are a data domain the merge moved.
+--
+-- 1844 of 2048, up from 1814 when a slot held a list of domain alternatives: the class
+-- excluded then — a `compute` slot carrying two alternatives, which materialized by
+-- meeting them — cannot arise over one domain.
+#guard (provedCovered).length == 1844
 #guard (provedCovered.filter fun (pol, a, b) => !MergeIsBoundAt pol a b).isEmpty
 
 #guard (cases wellFormed).length == 2888
@@ -1751,26 +1722,28 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
 -- (`MaterializedMergeIsTheLeastBound.lean`) — a theorem over the same sample, not a measurement.
 #guard guardedFailures.isEmpty
 
--- Unguarded, one phenomenon survives, on two surfaces and in both orders: a
--- negative merge of two `data` slots whose domains disagree. A disagreement is
+-- Unguarded, one phenomenon survives, on two surfaces, in both orders and at **both
+-- polarities**: a merge of two `data` slots whose domains disagree. Both polarities because
+-- the domain merges contravariantly at both — a positive merge meets the domains rather
+-- than accumulating them, which is what doubled these counts from 4 and 2. A disagreement is
 -- caught loudly exactly when the domains' join is undefined — two distinct atoms
 -- give a two-atom position `coalesce` rejects, so nothing materializes and the
 -- statement is vacuous — and silently whenever the join exists: record keys
 -- intersect, variant tags unite, refinement sets intersect. So the boundary is the
 -- domains' agreement, which is what `coalesce_monotone_fun` assumes, and not the shape of a
 -- domain.
-#guard (failures concrete).length == 4
-#guard (monotoneFailures concrete).length == 2
+#guard (failures concrete).length == 8
+#guard (monotoneFailures concrete).length == 4
 #guard !MergeIsBoundAt false
-  (.mk [] none none (some (.data, [.mk [.prim .int] none none none (some [])], intPosition))
+  (.mk [] none none (some (.data, .mk [.prim .int] none none none (some []), intPosition))
     (some []))
   (.mk [] none none
-    (some (.data, [.mk [.prim .int] none none none (some [.elem])], intPosition)) (some []))
+    (some (.data, .mk [.prim .int] none none none (some [.elem]), intPosition)) (some []))
 #guard MergeIsBoundGuarded false
-  (.mk [] none none (some (.data, [.mk [.prim .int] none none none (some [])], intPosition))
+  (.mk [] none none (some (.data, .mk [.prim .int] none none none (some []), intPosition))
     (some []))
   (.mk [] none none
-    (some (.data, [.mk [.prim .int] none none none (some [.elem])], intPosition)) (some []))
+    (some (.data, .mk [.prim .int] none none none (some [.elem]), intPosition)) (some []))
 
 -- Neither a duplicate key nor a content-bearing position without a refinement slot is
 -- `wellFormed`, and each breaks soundness. A duplicate is invisible to `equiv`, which
@@ -1790,28 +1763,28 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
 -- the capability default, and the merge that pins it to `data` contradicts that
 -- default, so the operand's own type is not what the merge combined.
 #guard !MergeIsBoundAt true
-  (.mk [] none none (some (.data, [intPosition], intPosition)) (some []))
-  (.mk [] none none (some (.unknown, [intPosition], intPosition)) (some []))
+  (.mk [] none none (some (.data, intPosition, intPosition)) (some []))
+  (.mk [] none none (some (.unknown, intPosition, intPosition)) (some []))
 
 -- The guard is what excludes the shape `Ty` gives no bound: a data function's
 -- domain is invariant, so nothing is below both of these, and no merge result
 -- could be. The Σ over both domains is the type that would be, which the Σ work adds.
 #guard !MergeIsBoundAt false
   (.mk [] none none
-    (some (.data, [.mk [] (some [(.name "a", intPosition)]) none none (some [])], intPosition))
+    (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []), intPosition))
     (some []))
   (.mk [] none none
     (some (.data,
-      [.mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some [])],
+      .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []),
         intPosition))
     (some []))
 #guard MergeIsBoundGuarded false
   (.mk [] none none
-    (some (.data, [.mk [] (some [(.name "a", intPosition)]) none none (some [])], intPosition))
+    (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []), intPosition))
     (some []))
   (.mk [] none none
     (some (.data,
-      [.mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some [])],
+      .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []),
         intPosition))
     (some []))
 
