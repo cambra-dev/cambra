@@ -87,6 +87,18 @@ impl Scheduler {
         Self::default()
     }
 
+    /// Every registered source, by name.
+    ///
+    /// The scheduler already holds these to poll them; a reader of a source's
+    /// retained window needs the same handles and has nowhere else to get them.
+    pub fn sources(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> + '_ {
+        self.source_handles
+            .iter()
+            .map(|(name, (handle, _))| (name.as_str(), handle))
+    }
+
     /// Register `consumer` to be notified when `handle` has new data.
     ///
     /// The registration is **weak**, and the subscriber that made it owns the

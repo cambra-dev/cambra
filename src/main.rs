@@ -3,36 +3,22 @@ use std::{cell::RefCell, rc::Rc, thread, time::Duration};
 use cambra::{
     ccl::{
         context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
-        symbolic::symbolic,
+        provenance::NodeId,
     },
     control_port::{ControlPort, ControlReply, ControlRequest},
+    inspector_server::serve_compiled,
     interpreter::{
-        Consumer,
+        Consumer, Scheduler,
+        operator_graph::GraphNode,
         tile_operators::{FunctionGuard, Tile, TileGuard},
-        value_recorder::{self, SharedRecorder, ValueRecorder},
+        value_recorder::{
+            self, DEFAULT_ROWS_PER_RECORDING, SharedRecorder, SourceWindow, ValueRecorder,
+            render_source_window,
+        },
     },
     live_program::{LiveProgram, render_unreadable},
-    pretty_graph::pretty_tile_operator,
-    web_inspector::WebInspector,
 };
 use log::debug;
-
-/// Render the running program's producers into the inspector's snapshot.
-fn snapshot(live: &LiveProgram, inspector: Option<&WebInspector>, tick: u64) {
-    let Some(inspector) = inspector else { return };
-    inspector.update_snapshot(tick, |add| {
-        // The `main` producer is held out of the compiled outputs for the
-        // driver, so it is read off the program rather than found among them.
-        if let Some(p) = live.main_producer() {
-            add(p);
-        }
-        for output in live.program().sinks() {
-            if let Some(c) = &output.sink_consumer {
-                c.borrow().with_producer(|p| add(p));
-            }
-        }
-    });
-}
 
 /// Service at most one pending control request.
 ///
@@ -126,23 +112,98 @@ fn run_program(
         }
     };
 
-    let inspector = inspect_port.map(|port| {
-        // Render every output's operator tree.  The AST shown is the full
-        // join-planned program (shared across all outputs).
-        let op_parts: Vec<String> = live
-            .program()
-            .outputs
-            .iter()
-            .map(|o| pretty_tile_operator(o.op.as_ref()))
-            .collect();
-        WebInspector::new(port, symbolic(&live.program().ast), op_parts.join("\n\n"))
-    });
+    // Serve the panes from the same compile that is about to be driven, so a
+    // click in a pane names a node the running graph actually built.
+    //
+    // Named `frames` rather than `live`: `live` is the running program here.
+    let frames = match inspect_port {
+        Some(port) => match serve_compiled(live.program(), src_name, port) {
+            Ok(channel) => Some(channel),
+            Err(e) => {
+                eprintln!("error: serving the inspector: {e}");
+                return Err(());
+            }
+        },
+        None => None,
+    };
+
     let control = match control_port.map(ControlPort::new).transpose() {
         Ok(control) => control,
         Err(e) => {
             eprintln!("error: could not start the control port: {e}");
             return Err(());
         }
+    };
+
+    // Publishing sits between the pull and the release, so a source's retained
+    // window is sampled before anything is dropped from it.
+    //
+    // Only when a producer actually produced. The sink loop below polls on a
+    // 10ms timer and most polls record nothing, so publishing per iteration
+    // would broadcast an unchanged frame a hundred times a second and make
+    // `tick` count timer ticks rather than data. Returns whether it published,
+    // so the caller advances `tick` only over a tick that carried something.
+    let published_through = std::cell::Cell::new(0u64);
+    let publish = |tick: u64, sources: &[SourceWindow]| -> bool {
+        let (Some(frames), Some(recorder)) = (frames.as_ref(), recorder.as_ref()) else {
+            return false;
+        };
+        let recorded = recorder.borrow().recorded();
+        if recorded == published_through.get() {
+            return false;
+        }
+        published_through.set(recorded);
+        frames.publish(recorder, sources, tick);
+        true
+    };
+
+    // The last frame, marked `final`, so a reader can tell a finished run from
+    // an idle one. The process parks afterwards, so the socket stays open.
+    let finish = |tick: u64, sources: &[SourceWindow]| {
+        if let (Some(frames), Some(recorder)) = (frames.as_ref(), recorder.as_ref()) {
+            frames.finish(recorder, sources, tick);
+        }
+    };
+
+    // A source's retained window, read on the thread that owns the graph: the
+    // handles are `Rc`, and `retained_keys`/`get` are `&self`, so sampling
+    // releases nothing. Sampled before the release below, so a window still
+    // shows what the tick delivered.
+    //
+    // The scheduler's handles are the sources the program *reads*: a handle is
+    // registered when an `IterateExtent` over the source is subscribed. Every
+    // context registers `stdin` whether or not the program mentions it, so
+    // iterating the context's sources instead would report a window for a
+    // source that is not part of the program.
+    let source_node_ids: std::collections::HashMap<String, NodeId> = live
+        .program()
+        .operator_graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            GraphNode::Source { id, name } => Some((name.clone(), *id)),
+            _ => None,
+        })
+        .collect();
+    let sample_sources = |scheduler: &Scheduler| -> Vec<SourceWindow> {
+        if frames.is_none() {
+            return Vec::new();
+        }
+        scheduler
+            .sources()
+            .filter_map(|(name, handle)| {
+                let source = handle.borrow();
+                let keys = source.retained_keys()?;
+                let values = source.get(keys.clone());
+                Some(render_source_window(
+                    source_node_ids.get(name).copied(),
+                    name,
+                    &keys,
+                    &values,
+                    DEFAULT_ROWS_PER_RECORDING,
+                ))
+            })
+            .collect()
     };
 
     let mut tick = 0u64;
@@ -177,14 +238,21 @@ fn run_program(
         if let Some(recorder) = recorder.as_ref() {
             recorder.borrow_mut().set_tick(tick);
         }
+        // Sampled before the pull, not after. A `Memo` releases its input from
+        // inside `get_impl`, so the release cascade reaches the source buffer
+        // partway through the driver's own `get` — sampling afterwards reads a
+        // buffer the pull already drained. Before it, the tick's arrivals are
+        // present and nothing has taken delivery.
+        let sources = sample_sources(ctx.scheduler());
         let tile = producer.get(producer.tiling().universal_guard());
+        if publish(tick, &sources) {
+            tick += 1;
+        }
 
         let release_guard = release_guard_for(&tile);
         debug!("Main releasing with {release_guard:?}");
         let done = release_guard.is_universal();
         producer.release(release_guard);
-        snapshot(&live, inspector.as_ref(), tick);
-        tick += 1;
         // Producers can return empty tiles, but still have more data.
         let is_empty = tile_is_empty(&tile);
         if !is_empty || done {
@@ -204,8 +272,10 @@ fn run_program(
                 recorder.borrow_mut().set_tick(tick);
             }
             ctx.scheduler().check_for_notifications();
-            snapshot(&live, inspector.as_ref(), tick);
-            tick += 1;
+            let sources = sample_sources(ctx.scheduler());
+            if publish(tick, &sources) {
+                tick += 1;
+            }
             poll_control(
                 control.as_ref(),
                 &mut ctx,
@@ -223,6 +293,7 @@ fn run_program(
         }
     }
 
+    finish(tick, &sample_sources(ctx.scheduler()));
     Ok(())
 }
 
@@ -272,9 +343,9 @@ const DEFAULT_CONTROL_PORT: u16 = 8081;
 /// two flags that each mean something: a program is either run or it is not, and
 /// `--inspect-only` is the not.
 enum Mode {
-    /// Run the program. With an inspect port, attach [`WebInspector`]'s live
-    /// runtime dashboard to the run; with a control port, accept `/diff` and
-    /// `/reload` against the running program.
+    /// Run the program. With an inspect port, serve its panes and stream the
+    /// values flowing through its operators; with a control port, accept
+    /// `/diff` and `/reload` against the running program.
     Run {
         inspect_port: Option<u16>,
         control_port: Option<u16>,

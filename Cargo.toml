@@ -70,6 +70,7 @@ stacker = "0.1"
 # in wall-clock, while the gate cost a standing clippy configuration.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [profile.release]
 debug = "line-tables-only"

@@ -369,6 +369,18 @@ pub trait DataSourceDomainExtentImpl {
     /// has none: a source that silently kept the record would replay its history
     /// into the version after next.
     fn retire_producer(&mut self, producer: &str);
+
+    /// The domain keys this source still holds, or `None` for a source that
+    /// retains nothing addressable.
+    ///
+    /// `&self`, so reading it moves no data and releases nothing — unlike
+    /// [`TileProducer::get`](crate::interpreter::tile_operators::TileProducer::get),
+    /// which is a consumer taking delivery. `None` and `Some(empty)` are
+    /// different answers: the first says this kind of source has no window, the
+    /// second that its window is currently empty.
+    fn retained_keys(&self) -> Option<ColumnValue> {
+        None
+    }
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {
