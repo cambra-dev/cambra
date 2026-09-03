@@ -301,6 +301,24 @@ fn hash_type<'a>(
     free: FreeVars<'_>,
     state: &mut DefaultHasher,
 ) {
+    hash_type_in(ty, env, &mut Vec::new(), free, state)
+}
+
+/// [`hash_type`] under a witness scope — `wenv` lists the Σ binders `ty` sits inside,
+/// innermost last.
+///
+/// A witness binder is α-renameable exactly as a term binder is: instantiating a scheme
+/// re-mints it ([`Witness::alpha_convert`](crate::ccl::ty::Witness::alpha_convert)), so its
+/// `uid` says nothing about content and hashing it would make two α-equivalent sums differ.
+/// An occurrence therefore hashes by **how far out its binder sits**, which is the same rule
+/// this module already applies to a bound term variable.
+fn hash_type_in<'a>(
+    ty: &'a Type,
+    env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
+    free: FreeVars<'_>,
+    state: &mut DefaultHasher,
+) {
     use Type as T;
     std::mem::discriminant(ty).hash(state);
     match ty {
@@ -322,7 +340,7 @@ fn hash_type<'a>(
         // A bounded annotation's ceiling is content, not an identity: `x <: Int`
         // and `x <: Str` state different obligations. The discriminant separates
         // it from a plain `Hole`.
-        T::BoundedHole(bound) => hash_type(bound, env, free, state),
+        T::BoundedHole(bound) => hash_type_in(bound, env, wenv, free, state),
         // The kind is content: a data function's domain *is* its data and its
         // joins have to be lossless, so `A ⇒ B` and `A ⤇ B` are not the same
         // computation. A `FunKind::Var`'s `uid` is a per-compilation identity
@@ -332,15 +350,37 @@ fn hash_type<'a>(
         T::Fun {
             domain,
             codomain,
-            kind,
+            fun_kind,
             name: _,
         } => {
-            std::mem::discriminant(kind).hash(state);
-            if let FunKind::Var(v) = kind {
-                std::mem::discriminant(&v.pin()).hash(state);
+            std::mem::discriminant(fun_kind).hash(state);
+            if let FunKind::Var(v) = fun_kind {
+                std::mem::discriminant(&v.resolved()).hash(state);
             }
-            hash_type(domain, env, free, state);
-            hash_type(codomain, env, free, state);
+            // The Σ slot is content, not decoration: `Σ (σ: 𝐾). σ ⤇ 𝑉` and `𝐷 ⤇ 𝑉` are
+            // distinct types, and the kind's discriminant alone cannot separate them —
+            // both are `Data`. The arity and each binder's kind are hashed; the binder
+            // *ids* are not, and instead scope the domain and codomain below.
+            let ws = fun_kind.witnesses();
+            ws.len().hash(state);
+            for w in ws {
+                std::mem::discriminant(&w.type_kind()).hash(state);
+                for c in w.children() {
+                    hash_type_in(c, env, wenv, free, state);
+                }
+                wenv.push(*w.id());
+            }
+            hash_type_in(domain, env, wenv, free, state);
+            hash_type_in(codomain, env, wenv, free, state);
+            wenv.truncate(wenv.len() - ws.len());
+        }
+        // Positional, innermost-first — the α rule stated at `hash_type_in`. A free
+        // occurrence (no binder in scope) contributes only its discriminant, matching how a
+        // free term variable is handled: its identity is not this subterm's content.
+        T::WitnessRef(w) => {
+            if let Some(depth) = wenv.iter().rev().position(|b| b == w) {
+                depth.hash(state);
+            }
         }
         T::Tuple(tys) => {
             tys.len().hash(state);
@@ -360,7 +400,7 @@ fn hash_type<'a>(
         // predicate hashes sort before they fold — the canonicalization
         // `hash_rel` applies to its AC nodes.
         T::Refinement(base, refinements) => {
-            hash_type(base, env, free, state);
+            hash_type_in(base, env, wenv, free, state);
             let mut predicates: Vec<u64> = refinements
                 .iter()
                 .map(|r| hash_rel(&r.predicate, env, free))
@@ -371,11 +411,11 @@ fn hash_type<'a>(
         T::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => {
-            kind.hash(state);
-            hash_type(value, env, free, state);
-            hash_type(domain, env, free, state);
+            history_kind.hash(state);
+            hash_type_in(value, env, wenv, free, state);
+            hash_type_in(domain, env, wenv, free, state);
         }
     }
 }
@@ -485,6 +525,9 @@ fn hash_payload<'a>(
 ) {
     use TypedExprNode as N;
     match &e.node {
+        // `Realize` wraps the value it realizes and adds no content of its own beyond the
+        // discriminant hashed by the caller.
+        N::Realize(v) => hash_payload(v, env, free, fold, h),
         N::Lit(Lit::Int(n)) => n.hash(h),
         N::Lit(Lit::String(s)) => s.hash(h),
         N::Lit(Lit::Bool(b)) => b.hash(h),
@@ -837,7 +880,7 @@ mod tests {
         let unpinned = || {
             typed(Type::Fun {
                 name: None,
-                kind: FunKind::fresh_var(),
+                fun_kind: FunKind::fresh_var(),
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
             })
@@ -850,18 +893,18 @@ mod tests {
         // What a variable was pinned to *is* content, and it is the one part of
         // a `FunKindVar` that a program determines rather than allocation order.
         let pinned = |data: bool| {
-            let kind = FunKind::fresh_var();
-            let FunKind::Var(v) = &kind else {
+            let fun_kind = FunKind::fresh_var();
+            let FunKind::Var(v) = &fun_kind else {
                 unreachable!()
             };
             if data {
-                v.pin_data()
+                v.stamp_data()
             } else {
-                v.pin_compute()
+                v.record(FunKind::Compute, true)
             }
             typed(Type::Fun {
                 name: None,
-                kind,
+                fun_kind,
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
             })

@@ -221,9 +221,11 @@ partial def toJson : CompactTy → Json
          ("var", match varT with | none => Json.null | some m => mapJson m),
          ("fn", match fn with
                 | none => Json.null
-                | some (k, ds, cod) =>
+                | some (k, d, cod) =>
                     Json.mkObj [("kind", Lean.toJson k.toWire),
-                      ("doms", Json.arr (ds.map toJson).toArray),
+                      -- One domain, not a list: the slot holds one position
+                      -- (`compact.rs`, `CompactFun::domain`).
+                      ("dom", toJson d),
                       ("cod", toJson cod)]),
          ("refinements", match refinements with
                     | none => Json.null
@@ -239,9 +241,9 @@ partial def fromJson? (j : Json) : Except String CompactTy := do
     | Json.null => pure none
     | f => do
       let k ← KindMerge.fromWire (← (← f.getObjVal? "kind").getStr?)
-      let ds ← (← (← f.getObjVal? "doms").getArr?).toList.mapM fromJson?
+      let d ← fromJson? (← f.getObjVal? "dom")
       let cod ← fromJson? (← f.getObjVal? "cod")
-      pure (some (k, ds, cod))
+      pure (some (k, d, cod))
   let refinements ← match ← j.getObjVal? "refinements" with
     | Json.null => pure none
     | c => some <$> Lean.fromJson? c
@@ -296,14 +298,14 @@ private def cRoundTrips (t : CompactTy) : Bool :=
 #guard !CompactTy.equiv (.mk [] none none none none) (.mk [] none none none (some []))
 #guard cRoundTrips (.mk [.prim .int, .txn, .uintRange 3, .source "s"] none none none
   (some [.binop "eq" .elem (.litInt 1)]))
--- Every slot at once, including a `null` ("two or more") domain and a conflicted kind.
+-- Every slot at once, including a conflicted kind, whose domain rides along like any other.
 #guard cRoundTrips (.mk [.prim .bool]
   (some [(.idx 0, .mk [.prim .int] none none none (some []))])
   (some [(.name "tag", .mk [] none none none none)])
-  (some (.conflict, [], .mk [.prim .string] none none none (some []))) (some []))
+  (some (.conflict, .mk [] none none none none, .mk [.prim .string] none none none (some [])))
+  (some []))
 #guard cRoundTrips (.mk [] none none
-  (some (.unknown, [.mk [.prim .int] none none none (some []),
-      .mk [.prim .bool] none none none (some [])],
+  (some (.unknown, .mk [.prim .int, .prim .bool] none none none (some []),
     .mk [] (some []) none none none)) (some []))
 
 end CclFormal

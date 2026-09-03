@@ -242,7 +242,7 @@ inductive CompactTy where
   | mk (atoms : List Atom)
        (recF : Option (List (FieldKey × CompactTy)))
        (varT : Option (List (FieldKey × CompactTy)))
-       (fn : Option (KindMerge × List CompactTy × CompactTy))
+       (fn : Option (KindMerge × CompactTy × CompactTy))
        (refinements : Option (List Predicate))
 deriving Repr
 
@@ -288,34 +288,10 @@ def equiv : CompactTy → CompactTy → Bool
       && (match f1, f2 with
           | none, none => true
           | some (k1, d1, c1), some (k2, d2, c2) =>
-            k1 == k2
-              && (subtypeDomains d2 d1 && subtypeDomains d1 d2)
-              && equiv c1 c2
+            k1 == k2 && equiv d1 d2 && equiv c1 c2
           | _, _ => false)
       && refinementsEquiv c1 c2
 termination_by a b => (sizeOf a + sizeOf b, 0)
-
-/-- Whether `m` holds an `equiv` partner for `d`. Structural in `m` so the
-termination measure can see each element. -/
-def anyEquiv (d : CompactTy) : List CompactTy → Bool
-  | [] => false
-  | y :: ys => equiv d y || anyEquiv d ys
-termination_by m => (sizeOf d + sizeOf m, 0)
-decreasing_by all_goals (apply Prod.Lex.left; simp; omega)
-
-/-- Containment of one alternative list in another, over a **worklist** — the
-shape every keyed predicate here repeats: the recursion decreases on a list of things still to check
-rather than on the structure they are checked against, because a `lookup` result is not a subterm of
-the map. The domain alternatives compare as a **set**: `union_domains` deduplicates them, and their
-only readers are a `Data` slot's refusal to have more than one and a `Compute` slot's commutative
-meet-fold at coalesce, so their order carries no information. This is the one place `equiv` is
-deliberately coarser than `CompactFun`'s derived
-`PartialEq`, which compares the `Vec` positionally. -/
-def subtypeDomains (m2 : List CompactTy) : List CompactTy → Bool
-  | [] => true
-  | d :: ds => anyEquiv d m2 && subtypeDomains m2 ds
-termination_by ds => (sizeOf m2 + sizeOf ds, ds.length)
-decreasing_by all_goals (apply Prod.Lex.left; simp; omega)
 
 /-- Keyed containment over a key worklist: every key in `ks` resolves in both
 maps to `equiv` payloads. Driven by `lookup` on **both** sides (not the peeled entry), so a shadowed
@@ -350,53 +326,6 @@ place `equiv` is deliberately coarser than `CompactFun`'s derived `PartialEq`, w
 coalesce, so their order carries no information. That the order is unobservable downstream is what
 `tests/constraint_order_fuzz.rs` checks, by comparing coalesced outcomes across arrival
 orders. -/
-
-/-- Set equality on the alternatives, the shape `equiv`'s fn clause checks. -/
-def domainsEquiv (a b : List CompactTy) : Bool := subtypeDomains b a && subtypeDomains a b
-
-theorem anyEquiv_iff {d : CompactTy} {m : List CompactTy} :
-    anyEquiv d m = true ↔ ∃ y ∈ m, equiv d y = true := by
-  induction m with
-  | nil => simp [anyEquiv]
-  | cons y ys ih =>
-    rw [anyEquiv, Bool.or_eq_true, ih]
-    constructor
-    · rintro (h | ⟨z, hz, hzy⟩)
-      · exact ⟨y, by simp, h⟩
-      · exact ⟨z, by simp [hz], hzy⟩
-    · rintro ⟨z, hz, hzy⟩
-      rcases List.mem_cons.mp hz with h | h
-      · exact Or.inl (h ▸ hzy)
-      · exact Or.inr ⟨z, h, hzy⟩
-
-theorem subtypeDomains_iff {m2 ds : List CompactTy} :
-    subtypeDomains m2 ds = true ↔ ∀ x ∈ ds, ∃ y ∈ m2, equiv x y = true := by
-  induction ds with
-  | nil => simp [subtypeDomains]
-  | cons d ds ih =>
-    rw [subtypeDomains, Bool.and_eq_true, ih, anyEquiv_iff]
-    constructor
-    · rintro ⟨hd, htl⟩ x hx
-      rcases List.mem_cons.mp hx with h | h
-      · exact h ▸ hd
-      · exact htl x h
-    · intro h
-      exact ⟨h d (by simp), fun x hx => h x (by simp [hx])⟩
-
-/-- `domainsEquiv` and the pair of containments its `Bool` unfolds to — the shape a
-proof gets after `simp only [Bool.and_eq_true]` splits `equiv`'s clause. -/
-theorem domainsEquiv_iff_and {a b : List CompactTy} :
-    domainsEquiv a b = true ↔ subtypeDomains b a = true ∧ subtypeDomains a b = true := by
-  rw [domainsEquiv, Bool.and_eq_true]
-
-theorem domainsEquiv_iff {a b : List CompactTy} :
-    domainsEquiv a b = true ↔
-      (∀ x ∈ a, ∃ y ∈ b, equiv x y = true) ∧ ∀ y ∈ b, ∃ x ∈ a, equiv y x = true := by
-  rw [domainsEquiv, Bool.and_eq_true, subtypeDomains_iff, subtypeDomains_iff]
-
-theorem domainsEquiv_symm {a b : List CompactTy} (h : domainsEquiv a b = true) : domainsEquiv b a =
-    true :=
-  domainsEquiv_iff.mpr (domainsEquiv_iff.mp h).symm
 
 /-! ## The merge -/
 
@@ -468,59 +397,25 @@ decreasing_by
   · simp
     omega
 
-/-- The contravariant domain meet: defined when each side has **one distinct
-alternative**, and undefined otherwise — `compact.rs` flags the latter at coalesce. Only ever used
-at a negative position, where `merge`'s polarity flip makes the inner merge positive.
-
-"One distinct alternative" rather than "one alternative" because `DomainSet` deduplicates, so on the
-lists it produces the two conditions agree — and only the first is invisible to `domainsEquiv`,
-which cannot tell `[x]` from `[x, x]`. Testing
-the length instead would make the merge fail to be a congruence. -/
-def meetDomains : List CompactTy → List CompactTy → Option (List CompactTy)
-  | x :: xs, y :: ys =>
-    if subtypeDomains [x] xs && subtypeDomains [y] ys then some [merge true x y] else none
-  | _, _ => none
-termination_by a b => sizeOf a + sizeOf b
-decreasing_by all_goals (simp; omega)
-
-/-- Mirror of `union_domains`: the alternatives of both sides, deduplicated by
-`equiv` — the same equality `contains` uses. Never a meet: a `Data` domain *is* the
-data, and whether the slot reads as data is not known here. -/
-def unionDomains (a b : List CompactTy) : List CompactTy :=
-  a ++ b.filter (fun d => !anyEquiv d a)
-
 /-- Mirror of `CompactFun::merge` (see module docs for the `Option CompactTy`
 domain encoding and the dropped binder/diagnostic payloads).
 
-The kinds join in the [`KindMerge`] semilattice, the same operation at both polarities. The domains
-are then combined by *polarity alone*: a positive join accumulates the alternatives and a negative
-merge takes the contravariant meet. Neither reads the kind, which is what makes the operation
-associative — the kind a slot ends at is not known until the last bound has merged, so a domain rule
-selected from it would let association decide the outcome. `compact.rs` defers the kind's own rule
-to `coalesce_compact_go`.
+The kinds join in the [`KindMerge`] semilattice and the domain merges **contravariantly**, as one
+ordinary position: there is no domain lattice to consult, because a `fun` slot holds one domain.
+What was a join or meet of candidate sets is the same `merge` every other position gets, and a
+candidate set lives one level up, on the witness a Σ binds (`compact.rs`, `CompactFun::domain`).
 
-The dedup gate on the accumulated alternatives is `equiv` — the same equality `union_domains`'
-`contains` uses — which is what keeps the whole algebra
-quotient-compatible. -/
+Nothing reads the kind, which is what makes the operation associative — the kind a slot ends at is
+not known until the last bound has merged, so a domain rule selected from it would let association
+decide the outcome. `compact.rs` defers the kind's own rule to `coalesce_compact_go`.
+
+A conflicted kind keeps its domain rather than dropping it: `CompactFun::merge` computes the domain
+before the kinds join and stores it either way, so there is no payload for the model to drop. -/
 def mergeFun (pol : Bool) :
-    KindMerge × List CompactTy × CompactTy → KindMerge × List CompactTy × CompactTy → KindMerge ×
-      List CompactTy × CompactTy
+    KindMerge × CompactTy × CompactTy → KindMerge × CompactTy × CompactTy → KindMerge ×
+      CompactTy × CompactTy
   | (k1, d1, c1), (k2, d2, c2) =>
-    let cod := merge pol c1 c2
-    let k := joinKind k1 k2
-    if k == .conflict then
-      -- A conflicted slot's payload is diagnostic; coalesce reports rather than
-      -- reads it, so the model drops it.
-      (.conflict, [], cod)
-    else if pol then
-      -- The alternatives accumulate. What several of them *mean* is the resolved
-      -- kind's question, answered at coalesce.
-      (k, unionDomains d1 d2, cod)
-    else
-      -- Negative: the contravariant meet.
-      match meetDomains d1 d2 with
-      | some ds => (k, ds, cod)
-      | none => (.conflict, [], cod)
+    (joinKind k1 k2, merge (!pol) d1 d2, merge pol c1 c2)
 termination_by a b => sizeOf a + sizeOf b
 decreasing_by all_goals (simp; omega)
 
@@ -635,17 +530,13 @@ theorem equiv_refl : (t : CompactTy) → equiv t t = true
         simp [hmap m hm]
     · rcases f with _ | ⟨k, d, cod⟩
       · rfl
-      · have hszc : sizeOf cod < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c) := by
+      · have hszd : sizeOf d < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c) := by
           simp
           omega
-        have hd : subtypeDomains d d = true := by
-          refine subtypeDomains_iff.mpr fun x hx => ⟨x, hx, ?_⟩
-          have hszx : sizeOf x < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c) := by
-            have := List.sizeOf_lt_of_mem hx
-            simp
-            omega
-          exact equiv_refl x
-        simp [hd, equiv_refl cod]
+        have hszc : sizeOf cod < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c) := by
+          simp
+          omega
+        simp [equiv_refl d, equiv_refl cod]
     · exact refinementsEquiv_refl c
 termination_by t => sizeOf t
 decreasing_by all_goals omega
@@ -715,10 +606,14 @@ theorem equiv_symm : (a b : CompactTy) → equiv a b = true → equiv b a = true
               sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
           simp
           omega
-        refine ⟨⟨?_, ?_⟩, equiv_symm cod1 cod2 hcod⟩
+        have hszd : sizeOf d2 + sizeOf d1 <
+            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2) +
+              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+          simp
+          omega
+        refine ⟨⟨?_, equiv_symm d1 d2 hd⟩, equiv_symm cod1 cod2 hcod⟩
         · simp at hk
           simp [hk]
-        · exact domainsEquiv_iff_and.mp (domainsEquiv_symm (domainsEquiv_iff_and.mpr hd))
 termination_by a b => sizeOf a + sizeOf b
 decreasing_by all_goals omega
 
@@ -798,32 +693,14 @@ theorem equiv_trans : (a b c : CompactTy) → equiv a b = true → equiv b c = t
             sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
         simp
         omega
-      refine ⟨⟨?_, ?_⟩, equiv_trans cod1 cod2 cod3 habcod hbccod⟩
+      have hszd : sizeOf d1 + sizeOf d3 <
+          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
+            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
+        simp
+        omega
+      refine ⟨⟨?_, equiv_trans d1 d2 d3 habd hbcd⟩, equiv_trans cod1 cod2 cod3 habcod hbccod⟩
       · simp at habk hbck
         simp [habk, hbck]
-      · obtain ⟨hab1, hab2⟩ := domainsEquiv_iff.mp (domainsEquiv_iff_and.mpr habd)
-        obtain ⟨hbc1, hbc2⟩ := domainsEquiv_iff.mp (domainsEquiv_iff_and.mpr hbcd)
-        refine domainsEquiv_iff_and.mp (domainsEquiv_iff.mpr ⟨fun x hx => ?_, fun z hz => ?_⟩)
-        · obtain ⟨y, hy, hxy⟩ := hab1 x hx
-          obtain ⟨w, hw, hyw⟩ := hbc1 y hy
-          have hszd : sizeOf x + sizeOf w <
-              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-                sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
-            have h1 := List.sizeOf_lt_of_mem hx
-            have h2 := List.sizeOf_lt_of_mem hw
-            simp
-            omega
-          exact ⟨w, hw, equiv_trans x y w hxy hyw⟩
-        · obtain ⟨y, hy, hzy⟩ := hbc2 z hz
-          obtain ⟨x, hx, hyx⟩ := hab2 y hy
-          have hszd : sizeOf z + sizeOf x <
-              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-                sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
-            have h1 := List.sizeOf_lt_of_mem hx
-            have h2 := List.sizeOf_lt_of_mem hz
-            simp
-            omega
-          exact ⟨x, hx, equiv_trans z y x hzy hyx⟩
 termination_by a _ c => sizeOf a + sizeOf c
 decreasing_by all_goals omega
 
@@ -833,215 +710,6 @@ decreasing_by all_goals omega
 
 `meetDomains` is defined on a singleton pair and nowhere else, so every proof about
 a negative merge splits on that once, here, rather than over nine list shapes. -/
-
-/-- One distinct alternative: non-empty, with everything `equiv` to a member. The
-property `meetDomains` is defined on, and `domainsEquiv`-invariant (`oneDistinct_congr`). -/
-def OneDistinct (l : List CompactTy) : Prop := ∃ x, x ∈ l ∧ ∀ z ∈ l, equiv z x = true
-
-/-- `meetDomains`, read off its definition: the payload is built from the two lists'
-*heads*, so the swapped call and a congruent call name the same representatives. -/
-theorem meetDomains_eq_some {a b ds : List CompactTy} (h : meetDomains a b = some ds) :
-    ∃ x xs y ys, a = x :: xs ∧ b = y :: ys
-      ∧ (subtypeDomains [x] xs && subtypeDomains [y] ys) = true ∧ ds = [merge true x y] := by
-  rcases a with _ | ⟨x, xs⟩
-  · exact absurd h (by simp [meetDomains])
-  · rcases b with _ | ⟨y, ys⟩
-    · exact absurd h (by simp [meetDomains])
-    · rw [meetDomains] at h
-      split at h
-      · rename_i hgate
-        cases h
-        exact ⟨x, xs, y, ys, rfl, rfl, hgate, rfl⟩
-      · exact absurd h (by simp)
-
-theorem meetDomains_of_gate {x y : CompactTy} {xs ys : List CompactTy}
-    (h : (subtypeDomains [x] xs && subtypeDomains [y] ys) = true) :
-    meetDomains (x :: xs) (y :: ys) = some [merge true x y] := by
-  rw [meetDomains, if_pos h]
-
-/-- A single alternative on each side: what `wellFormed` gives an input bound. -/
-theorem meetDomains_single (x y : CompactTy) : meetDomains [x] [y] = some [merge true x y] :=
-  meetDomains_of_gate (by simp [subtypeDomains])
-
-/-- Under the gate, the head is a representative of the whole list. -/
-theorem all_equiv_head {x : CompactTy} {xs : List CompactTy} (h : subtypeDomains [x] xs = true) :
-    ∀ z ∈ x :: xs, equiv z x = true := by
-  intro z hz
-  rcases List.mem_cons.mp hz with h' | h'
-  · exact h' ▸ equiv_refl x
-  · obtain ⟨w, hw, hzw⟩ := (subtypeDomains_iff.mp h) z h'
-    exact (List.mem_singleton.mp hw) ▸ hzw
-
-theorem oneDistinct_cons {x : CompactTy} {xs : List CompactTy} (h : subtypeDomains [x] xs = true) :
-    OneDistinct (x :: xs) := ⟨x, by simp, all_equiv_head h⟩
-
-theorem gate_of_oneDistinct {x : CompactTy} {xs : List CompactTy} (h : OneDistinct (x :: xs)) :
-    subtypeDomains [x] xs = true := by
-  obtain ⟨u, _, hall⟩ := h
-  refine subtypeDomains_iff.mpr fun z hz => ⟨x, by simp, ?_⟩
-  exact equiv_trans _ _ _ (hall z (by simp [hz])) (equiv_symm _ _ (hall x (by simp)))
-
-theorem oneDistinct_of_meetDoms {a b ds : List CompactTy} (h : meetDomains a b = some ds) :
-    OneDistinct a ∧ OneDistinct b := by
-  obtain ⟨x, xs, y, ys, ha, hb, hgate, _⟩ := meetDomains_eq_some h
-  rw [Bool.and_eq_true] at hgate
-  exact ⟨ha ▸ oneDistinct_cons hgate.1, hb ▸ oneDistinct_cons hgate.2⟩
-
-theorem meetDomains_isSome_of {a b : List CompactTy} (ha : OneDistinct a) (hb : OneDistinct b) :
-    ∃ ds, meetDomains a b = some ds := by
-  rcases a with _ | ⟨x, xs⟩
-  · exact absurd ha (by simp [OneDistinct])
-  · rcases b with _ | ⟨y, ys⟩
-    · exact absurd hb (by simp [OneDistinct])
-    · exact ⟨_, meetDomains_of_gate (by
-        rw [Bool.and_eq_true]
-        exact ⟨gate_of_oneDistinct ha, gate_of_oneDistinct hb⟩)⟩
-
-/-- The property is `domainsEquiv`-invariant, which is what keeps the negative arm a
-congruence: `domainsEquiv` cannot tell `[x]` from `[x, x]`, and neither can this. -/
-theorem oneDistinct_congr {a a' : List CompactTy} (h : domainsEquiv a a' = true)
-    (ha : OneDistinct a) :
-    OneDistinct a' := by
-  obtain ⟨x, hx, hax⟩ := ha
-  obtain ⟨h1, h2⟩ := domainsEquiv_iff.mp h
-  obtain ⟨x', hx', hxx'⟩ := h1 x hx
-  refine ⟨x', hx', fun z hz => ?_⟩
-  obtain ⟨w, hw, hzw⟩ := h2 z hz
-  exact equiv_trans _ _ _ hzw (equiv_trans _ _ _ (hax w hw) hxx')
-
-theorem meetDomains_none_of_left {a b : List CompactTy} (h : ¬OneDistinct a) : meetDomains a b =
-    none := by
-  rcases hm : meetDomains a b with _ | ds
-  · rfl
-  · exact absurd (oneDistinct_of_meetDoms hm).1 h
-
-theorem meetDomains_none_of_right {a b : List CompactTy} (h : ¬OneDistinct b) : meetDomains a b =
-    none := by
-  rcases hm : meetDomains a b with _ | ds
-  · rfl
-  · exact absurd (oneDistinct_of_meetDoms hm).2 h
-
-/-- A singleton always has one distinct alternative — the shape the inner meet
-leaves for the outer one. -/
-theorem oneDistinct_single (x : CompactTy) : OneDistinct [x] := ⟨x, by simp, by simp [equiv_refl]⟩
-
-theorem meetDomains_none_comm {a b : List CompactTy} (h : meetDomains a b = none) :
-    meetDomains b a = none := by
-  rcases hm : meetDomains b a with _ | ds
-  · rfl
-  · obtain ⟨hb, ha⟩ := oneDistinct_of_meetDoms hm
-    obtain ⟨ds', hds'⟩ := meetDomains_isSome_of ha hb
-    rw [hds'] at h
-    exact absurd h (by simp)
-
-theorem domainsEquiv_singleton {x y : CompactTy} (h : equiv x y = true) : domainsEquiv [x] [y] =
-    true :=
-  domainsEquiv_iff.mpr
-    ⟨fun _ hx => ⟨y, by simp, by simpa [List.mem_singleton.mp hx] using h⟩,
-     fun _ hy => ⟨x, by simp, by simpa [List.mem_singleton.mp hy] using equiv_symm _ _ h⟩⟩
-
-theorem domainsEquiv_refl (a : List CompactTy) : domainsEquiv a a = true :=
-  domainsEquiv_iff.mpr ⟨fun x hx => ⟨x, hx, equiv_refl x⟩, fun y hy => ⟨y, hy, equiv_refl y⟩⟩
-
-theorem domainsEquiv_trans {a b c : List CompactTy} (hab : domainsEquiv a b = true)
-    (hbc : domainsEquiv b c = true) : domainsEquiv a c = true := by
-  obtain ⟨hab1, hab2⟩ := domainsEquiv_iff.mp hab
-  obtain ⟨hbc1, hbc2⟩ := domainsEquiv_iff.mp hbc
-  refine domainsEquiv_iff.mpr ⟨fun x hx => ?_, fun z hz => ?_⟩
-  · obtain ⟨y, hy, hxy⟩ := hab1 x hx
-    obtain ⟨w, hw, hyw⟩ := hbc1 y hy
-    exact ⟨w, hw, equiv_trans _ _ _ hxy hyw⟩
-  · obtain ⟨y, hy, hzy⟩ := hbc2 z hz
-    obtain ⟨x, hx, hyx⟩ := hab2 y hy
-    exact ⟨x, hx, equiv_trans _ _ _ hzy hyx⟩
-
-/-- The union holds nothing new. -/
-theorem mem_unionDoms {a b : List CompactTy} {x : CompactTy} (h : x ∈ unionDomains a b) :
-    x ∈ a ∨ x ∈ b := by
-  rcases List.mem_append.mp h with h | h
-  · exact Or.inl h
-  · exact Or.inr (List.mem_filter.mp h).1
-
-/-- …and loses nothing: the dedup only drops an alternative that already has a
-partner. -/
-theorem unionDomains_covers {a b : List CompactTy} {x : CompactTy} (h : x ∈ a ∨ x ∈ b) :
-    ∃ y ∈ unionDomains a b, equiv x y = true := by
-  rcases h with h | h
-  · exact ⟨x, List.mem_append.mpr (Or.inl h), equiv_refl x⟩
-  · rcases hk : anyEquiv x a with _ | _
-    · exact ⟨x, List.mem_append.mpr (Or.inr (List.mem_filter.mpr ⟨h, by simp [hk]⟩)),
-        equiv_refl x⟩
-    · obtain ⟨y, hy, hxy⟩ := anyEquiv_iff.mp hk
-      exact ⟨y, List.mem_append.mpr (Or.inl hy), hxy⟩
-
-/-- Cover a member of any of three lists, through either nesting. -/
-theorem unionDomains_coversR {a b c : List CompactTy} {x : CompactTy} (h : x ∈ a ∨ x ∈ b ∨ x ∈ c) :
-    ∃ y ∈ unionDomains a (unionDomains b c), equiv x y = true := by
-  rcases h with h | h
-  · exact unionDomains_covers (Or.inl h)
-  · obtain ⟨z, hz, hxz⟩ := unionDomains_covers (a := b) (b := c) h
-    obtain ⟨w, hw, hzw⟩ := unionDomains_covers (a := a) (b := unionDomains b c) (Or.inr hz)
-    exact ⟨w, hw, equiv_trans _ _ _ hxz hzw⟩
-
-theorem unionDomains_coversL {a b c : List CompactTy} {x : CompactTy} (h : x ∈ a ∨ x ∈ b ∨ x ∈ c) :
-    ∃ y ∈ unionDomains (unionDomains a b) c, equiv x y = true := by
-  rcases h with h | h
-  · obtain ⟨z, hz, hxz⟩ := unionDomains_covers (a := a) (b := b) (Or.inl h)
-    obtain ⟨w, hw, hzw⟩ := unionDomains_covers (a := unionDomains a b) (b := c) (Or.inl hz)
-    exact ⟨w, hw, equiv_trans _ _ _ hxz hzw⟩
-  · rcases h with h | h
-    · obtain ⟨z, hz, hxz⟩ := unionDomains_covers (a := a) (b := b) (Or.inr h)
-      obtain ⟨w, hw, hzw⟩ := unionDomains_covers (a := unionDomains a b) (b := c) (Or.inl hz)
-      exact ⟨w, hw, equiv_trans _ _ _ hxz hzw⟩
-    · exact unionDomains_covers (Or.inr h)
-
-theorem mem_unionDomsL {a b c : List CompactTy} {x : CompactTy}
-    (h : x ∈ unionDomains (unionDomains a b) c) :
-    x ∈ a ∨ x ∈ b ∨ x ∈ c := by
-  rcases mem_unionDoms h with h | h
-  · exact (mem_unionDoms h).imp id Or.inl
-  · exact Or.inr (Or.inr h)
-
-theorem mem_unionDomsR {a b c : List CompactTy} {x : CompactTy}
-    (h : x ∈ unionDomains a (unionDomains b c)) :
-    x ∈ a ∨ x ∈ b ∨ x ∈ c := by
-  rcases mem_unionDoms h with h | h
-  · exact Or.inl h
-  · exact Or.inr (mem_unionDoms h)
-
-theorem unionDomains_comm (a b : List CompactTy) : domainsEquiv (unionDomains a b)
-    (unionDomains b a) = true :=
-  domainsEquiv_iff.mpr
-    ⟨fun _ hx => unionDomains_covers (mem_unionDoms hx).symm,
-     fun _ hy => unionDomains_covers (mem_unionDoms hy).symm⟩
-
-theorem unionDomains_idem (a : List CompactTy) : domainsEquiv (unionDomains a a) a = true :=
-  domainsEquiv_iff.mpr
-    ⟨fun x hx => ⟨x, (mem_unionDoms hx).elim id id, equiv_refl x⟩,
-     fun _ hy => unionDomains_covers (Or.inl hy)⟩
-
-theorem unionDomains_assoc (a b c : List CompactTy) :
-    domainsEquiv (unionDomains (unionDomains a b) c) (unionDomains a (unionDomains b c)) = true :=
-  domainsEquiv_iff.mpr
-    ⟨fun _ hx => unionDomains_coversR (mem_unionDomsL hx),
-     fun _ hy => unionDomains_coversL (mem_unionDomsR hy)⟩
-
-theorem unionDomains_congr_left {a a' : List CompactTy} (b : List CompactTy)
-    (h : domainsEquiv a a' = true) :
-    domainsEquiv (unionDomains a b) (unionDomains a' b) = true := by
-  obtain ⟨h1, h2⟩ := domainsEquiv_iff.mp h
-  refine domainsEquiv_iff.mpr ⟨fun x hx => ?_, fun y hy => ?_⟩
-  · rcases mem_unionDoms hx with hm | hm
-    · obtain ⟨x', hx', hxx'⟩ := h1 x hm
-      obtain ⟨z, hz, hx'z⟩ := unionDomains_covers (a := a') (b := b) (Or.inl hx')
-      exact ⟨z, hz, equiv_trans _ _ _ hxx' hx'z⟩
-    · exact unionDomains_covers (Or.inr hm)
-  · rcases mem_unionDoms hy with hm | hm
-    · obtain ⟨y', hy', hyy'⟩ := h2 y hm
-      obtain ⟨z, hz, hy'z⟩ := unionDomains_covers (a := a) (b := b) (Or.inl hy')
-      exact ⟨z, hz, equiv_trans _ _ _ hyy' hy'z⟩
-    · exact unionDomains_covers (Or.inr hm)
-
 
 /-! ## Pointwise readings of the merged maps -/
 
@@ -1137,7 +805,7 @@ slots merge. What a slot *holds* is the polarity's question; that
 it is populated at all is not. -/
 theorem merge_slots (pol : Bool) (a1 a2 : List Atom)
     (r1 r2 v1 v2 : Option (List (FieldKey × CompactTy)))
-    (f1 f2 : Option (KindMerge × List CompactTy × CompactTy)) (c1 c2 : Option (List Predicate)) :
+    (f1 f2 : Option (KindMerge × CompactTy × CompactTy)) (c1 c2 : Option (List Predicate)) :
     ∃ r v f, merge pol (.mk a1 r1 v1 f1 c1) (.mk a2 r2 v2 f2 c2)
         = .mk (a1 ++ a2) r v f (mergeRefinements pol c1 c2) ∧
       (r = none ↔ r1 = none ∧ r2 = none) ∧ (v = none ↔ v1 = none ∧ v2 = none) ∧
@@ -1169,18 +837,18 @@ theorem subtypeKeys_self (m : List (FieldKey × CompactTy)) : subtypeKeys m m (m
 
 /-- The function-slot equivalence, as a `Prop` (the shape `equiv`'s fn clause
 checks, lifted off the Bool so case analyses stay readable). -/
-def FunEquiv : KindMerge × List CompactTy × CompactTy → KindMerge × List CompactTy × CompactTy →
+def FunEquiv : KindMerge × CompactTy × CompactTy → KindMerge × CompactTy × CompactTy →
     Prop
   | (k1, d1, c1), (k2, d2, c2) =>
     k1 = k2
-      ∧ domainsEquiv d1 d2 = true
+      ∧ equiv d1 d2 = true
       ∧ equiv c1 c2 = true
 
 /-- `FunEquiv` is exactly `equiv`'s fn clause. -/
-theorem funClause_of_funEquiv {s1 s2 : KindMerge × List CompactTy × CompactTy}
+theorem funClause_of_funEquiv {s1 s2 : KindMerge × CompactTy × CompactTy}
     (h : FunEquiv s1 s2) :
     (s1.1 == s2.1
-      && domainsEquiv s1.2.1 s2.2.1
+      && equiv s1.2.1 s2.2.1
       && equiv s1.2.2 s2.2.2) = true := by
   obtain ⟨k1, d1, c1⟩ := s1
   obtain ⟨k2, d2, c2⟩ := s2
@@ -1301,16 +969,16 @@ theorem merge_comm (pol : Bool) : (a b : CompactTy) → equiv (merge pol a b) (m
         · simpa [unionMap] using hunion true m1 m2 hpay
     · rcases f1 with _ | ⟨k1, d1, cod1⟩ <;> rcases f2 with _ | ⟨k2, d2, cod2⟩
       · rfl
-      · simpa [domainsEquiv] using funClause_of_funEquiv (s1 := (k2, d2, cod2)) (s2 := (k2, d2, cod2))
-          ⟨rfl, domainsEquiv_refl d2, equiv_refl cod2⟩
-      · simpa [domainsEquiv] using funClause_of_funEquiv (s1 := (k1, d1, cod1)) (s2 := (k1, d1, cod1))
-          ⟨rfl, domainsEquiv_refl d1, equiv_refl cod1⟩
+      · simpa using funClause_of_funEquiv (s1 := (k2, d2, cod2)) (s2 := (k2, d2, cod2))
+          ⟨rfl, equiv_refl d2, equiv_refl cod2⟩
+      · simpa using funClause_of_funEquiv (s1 := (k1, d1, cod1)) (s2 := (k1, d1, cod1))
+          ⟨rfl, equiv_refl d1, equiv_refl cod1⟩
       · have hsz : sizeOf (k1, d1, cod1) + sizeOf (k2, d2, cod2) <
             sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
               sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2) := by
           simp
           omega
-        simpa [domainsEquiv] using funClause_of_funEquiv
+        simpa using funClause_of_funEquiv
           (mergeFun_comm pol (k1, d1, cod1) (k2, d2, cod2))
     · exact mergeRefinements_comm pol c1 c2
 termination_by a b => (sizeOf a + sizeOf b, 1)
@@ -1319,44 +987,18 @@ decreasing_by all_goals
   | (apply Prod.Lex.left; simp; omega)
   | (apply Prod.Lex.right; simp; omega)
 
-theorem mergeFun_comm (pol : Bool) : (s1 s2 : KindMerge × List CompactTy × CompactTy) →
+theorem mergeFun_comm (pol : Bool) : (s1 s2 : KindMerge × CompactTy × CompactTy) →
     FunEquiv (mergeFun pol s1 s2) (mergeFun pol s2 s1)
   | (k1, d1, c1), (k2, d2, c2) => by
+    have hszd : sizeOf d1 + sizeOf d2 < sizeOf (k1, d1, c1) + sizeOf (k2, d2, c2) := by
+      simp
+      omega
     have hszc : sizeOf c1 + sizeOf c2 < sizeOf (k1, d1, c1) + sizeOf (k2, d2, c2) := by
       simp
       omega
-    have hcod : equiv (merge pol c1 c2) (merge pol c2 c1) = true := merge_comm pol c1 c2
-    rw [mergeFun.eq_def, mergeFun.eq_def]
-    simp only [joinKind_comm k2 k1]
-    rcases hk : joinKind k1 k2 == KindMerge.conflict with _ | _ <;>
-      simp only [Bool.false_eq_true, reduceIte]
-    case true => exact ⟨rfl, domainsEquiv_refl [], hcod⟩
-    cases pol
-    · -- Negative: the contravariant meet, defined only on singletons; every other
-      -- shape conflicts on both sides.
-      simp only [Bool.false_eq_true, reduceIte]
-      rcases hm : meetDomains d1 d2 with _ | ds
-      · rw [meetDomains_none_comm hm]
-        exact ⟨rfl, domainsEquiv_refl [], hcod⟩
-      · obtain ⟨x, xs, y, ys, ha, hb, hgate, hds⟩ := meetDomains_eq_some hm
-        rw [Bool.and_eq_true] at hgate
-        -- The swapped call meets the same two heads, with the gate mirrored.
-        have hswap : meetDomains d2 d1 = some [merge true y x] := by
-          rw [ha, hb]
-          exact meetDomains_of_gate (by rw [Bool.and_eq_true]; exact ⟨hgate.2, hgate.1⟩)
-        -- The bound stays in terms of the parameters, which is the form the
-        -- termination measure is stated over; only the goal is rewritten.
-        have hszd : sizeOf x + sizeOf y < sizeOf (k1, d1, c1) + sizeOf (k2, d2, c2) := by
-          rw [ha, hb]
-          simp
-          omega
-        rw [hswap, hds]
-        exact ⟨rfl, domainsEquiv_singleton (merge_comm true x y), hcod⟩
-    · -- Positive: the alternatives are a set, and the union of two sets is
-      -- symmetric up to `equiv`.
-      simp only [reduceIte]
-      exact ⟨rfl, unionDomains_comm d1 d2, hcod⟩
-termination_by s1 s2 => (sizeOf s1 + sizeOf s2, 0)
+    rw [mergeFun, mergeFun]
+    exact ⟨joinKind_comm k1 k2, merge_comm (!pol) d1 d2, merge_comm pol c1 c2⟩
+termination_by a b => (sizeOf a + sizeOf b, 0)
 decreasing_by all_goals
   first
   | (apply Prod.Lex.left; omega)
@@ -1389,13 +1031,9 @@ def mapDepth : List (FieldKey × CompactTy) → Nat
   | [] => 0
   | (_, w) :: rest => Nat.max (depth w) (mapDepth rest)
 
-def optFnDepth : Option (KindMerge × List CompactTy × CompactTy) → Nat
+def optFnDepth : Option (KindMerge × CompactTy × CompactTy) → Nat
   | none => 0
-  | some (_, ds, cod) => Nat.max (listDepth ds) (depth cod)
-
-def listDepth : List CompactTy → Nat
-  | [] => 0
-  | d :: ds => Nat.max (depth d) (listDepth ds)
+  | some (_, d, cod) => Nat.max (depth d) (depth cod)
 
 end
 
@@ -1426,24 +1064,6 @@ theorem mapDepth_le {m : List (FieldKey × CompactTy)} {b : Nat}
     rcases hd with ⟨k, w⟩
     rw [mapDepth]
     exact Nat.max_le.mpr ⟨h (k, w) (by simp), ih fun p hp => h p (by simp [hp])⟩
-
-theorem le_listDepth {l : List CompactTy} {x : CompactTy} (h : x ∈ l) : depth x ≤ listDepth l := by
-  induction l with
-  | nil => exact absurd h (by simp)
-  | cons hd tl ih =>
-    rw [listDepth]
-    rcases List.mem_cons.mp h with h' | h'
-    · rw [h']
-      exact Nat.le_max_left _ _
-    · exact Nat.le_trans (ih h') (Nat.le_max_right _ _)
-
-theorem listDepth_le {l : List CompactTy} {b : Nat} (h : ∀ x ∈ l, depth x ≤ b) :
-    listDepth l ≤ b := by
-  induction l with
-  | nil => simp [listDepth]
-  | cons hd tl ih =>
-    rw [listDepth]
-    exact Nat.max_le.mpr ⟨h hd (by simp), ih fun x hx => h x (by simp [hx])⟩
 
 /-- A resolved key names a real binding. Over an arbitrary key type, since the
 model looks keys up in `Ty`-valued and `CompactTy`-valued maps alike. -/
@@ -1501,28 +1121,22 @@ theorem mem_unionMapGo {pol : Bool} {m1 m2 : List (FieldKey × CompactTy)} {p : 
       exact ⟨v', List.mem_cons.mpr (Or.inr hv'), hrest⟩
 
 /-- The codomain is merged whatever else the slots do. -/
-theorem mergeFun_cod (pol : Bool) (s1 s2 : KindMerge × List CompactTy × CompactTy) :
+theorem mergeFun_cod (pol : Bool) (s1 s2 : KindMerge × CompactTy × CompactTy) :
     (mergeFun pol s1 s2).2.2 = merge pol s1.2.2 s2.2.2 := by
   obtain ⟨k1, d1, c1⟩ := s1
   obtain ⟨k2, d2, c2⟩ := s2
-  rw [mergeFun.eq_def]
-  dsimp only
-  split
-  · rfl
-  · split
-    · rfl
-    · split <;> rfl
+  rw [mergeFun]
 
-/-- A slot whose kinds join to a conflict merges to the conflicted slot, at
-either polarity and whatever the domains hold. -/
-theorem mergeFun_of_conflict (pol : Bool) (s1 s2 : KindMerge × List CompactTy × CompactTy)
+/-- A slot whose kinds join to a conflict merges to the conflicted slot, at either polarity. Its
+domain is merged like any other, since `CompactFun::merge` computes the domain before the kinds
+join. -/
+theorem mergeFun_of_conflict (pol : Bool) (s1 s2 : KindMerge × CompactTy × CompactTy)
     (h : joinKind s1.1 s2.1 = .conflict) :
-    mergeFun pol s1 s2 = (.conflict, [], merge pol s1.2.2 s2.2.2) := by
+    mergeFun pol s1 s2
+      = (.conflict, merge (!pol) s1.2.1 s2.2.1, merge pol s1.2.2 s2.2.2) := by
   obtain ⟨k1, d1, c1⟩ := s1
   obtain ⟨k2, d2, c2⟩ := s2
-  rw [mergeFun.eq_def]
-  simp only [h]
-  rfl
+  rw [mergeFun, h]
 
 /-! ### `merge` does not deepen a position
 
@@ -1562,60 +1176,19 @@ theorem unionMap_depth_le {pol : Bool} {m1 m2 : List (FieldKey × CompactTy)} {b
           Nat.le_trans (le_mapDepth (p := (p.1, w)) hw) h2⟩)
   · exact Nat.le_trans (le_mapDepth (List.mem_filter.mp hp).1) h2
 
-theorem mergeFun_depth_le {pol : Bool} {k1 k2 : KindMerge} {d1 d2 : List CompactTy}
-    {c1 c2 : CompactTy}
-    (hdom : ∀ x y, depth x ≤ listDepth d1 → depth y ≤ listDepth d2 →
-      depth (merge true x y) ≤ Nat.max (depth x) (depth y))
+theorem mergeFun_depth_le {pol : Bool} {k1 k2 : KindMerge} {d1 d2 c1 c2 : CompactTy}
+    (hdom : depth (merge (!pol) d1 d2) ≤ Nat.max (depth d1) (depth d2))
     (hcod : depth (merge pol c1 c2) ≤ Nat.max (depth c1) (depth c2)) :
     optFnDepth (some (mergeFun pol (k1, d1, c1) (k2, d2, c2)))
       ≤ Nat.max (optFnDepth (some (k1, d1, c1))) (optFnDepth (some (k2, d2, c2))) := by
-  have hb1 : listDepth d1 ≤ Nat.max (optFnDepth (some (k1, d1, c1)))
-      (optFnDepth (some (k2, d2, c2))) := by
-    rw [optFnDepth]
-    exact Nat.le_trans (Nat.le_max_left _ _) (Nat.le_max_left _ _)
-  have hb2 : listDepth d2 ≤ Nat.max (optFnDepth (some (k1, d1, c1)))
-      (optFnDepth (some (k2, d2, c2))) := by
-    show listDepth d2 ≤ _
-    exact Nat.le_trans (Nat.le_trans (Nat.le_max_left _ (depth c2)) (Nat.le_max_right _ _))
-      (Nat.le_refl _)
-  have hcb : depth (merge pol c1 c2) ≤ Nat.max (optFnDepth (some (k1, d1, c1)))
-      (optFnDepth (some (k2, d2, c2))) := by
-    refine Nat.le_trans hcod (Nat.max_le.mpr ⟨?_, ?_⟩)
-    · rw [optFnDepth]
-      exact Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_left _ _)
-    · exact Nat.le_trans (Nat.le_max_right (listDepth d2) _) (Nat.le_max_right _ _)
-  -- Every alternative the merge keeps comes from one side, or is a meet of one
-  -- from each; the codomain is a merge of the two codomains.
-  have hds : listDepth (mergeFun pol (k1, d1, c1) (k2, d2, c2)).2.1
-      ≤ Nat.max (optFnDepth (some (k1, d1, c1))) (optFnDepth (some (k2, d2, c2))) := by
-    rw [mergeFun.eq_def]
-    dsimp only
-    split
-    · simp [listDepth]
-    · split
-      · refine listDepth_le fun x hx => ?_
-        rcases mem_unionDoms hx with h | h
-        · exact Nat.le_trans (le_listDepth h) hb1
-        · exact Nat.le_trans (le_listDepth h) hb2
-      · rcases hm : meetDomains d1 d2 with _ | ds
-        · simp [listDepth]
-        · obtain ⟨x, xs, y, ys, ha1, ha2, _, hds⟩ := meetDomains_eq_some hm
-          rw [hds]
-          refine listDepth_le fun z hz => ?_
-          rw [List.mem_singleton.mp hz]
-          exact Nat.le_trans
-            (hdom x y (le_listDepth (ha1 ▸ by simp)) (le_listDepth (ha2 ▸ by simp)))
-            (Nat.max_le.mpr
-              ⟨Nat.le_trans (le_listDepth (ha1 ▸ by simp)) hb1,
-               Nat.le_trans (le_listDepth (ha2 ▸ by simp)) hb2⟩)
-  have hc : depth (mergeFun pol (k1, d1, c1) (k2, d2, c2)).2.2
-      ≤ Nat.max (optFnDepth (some (k1, d1, c1))) (optFnDepth (some (k2, d2, c2))) := by
-    rw [mergeFun_cod]
-    exact hcb
-  rcases hs : mergeFun pol (k1, d1, c1) (k2, d2, c2) with ⟨k, ds, cod⟩
-  rw [optFnDepth]
-  rw [hs] at hds hc
-  exact Nat.max_le.mpr ⟨hds, hc⟩
+  rw [mergeFun, optFnDepth, optFnDepth, optFnDepth]
+  refine Nat.max_le.mpr ⟨?_, ?_⟩
+  · refine Nat.le_trans hdom (Nat.max_le.mpr ⟨?_, ?_⟩)
+    · exact Nat.le_trans (Nat.le_max_left _ _) (Nat.le_max_left _ _)
+    · exact Nat.le_trans (Nat.le_max_left _ _) (Nat.le_max_right _ _)
+  · refine Nat.le_trans hcod (Nat.max_le.mpr ⟨?_, ?_⟩)
+    · exact Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_left _ _)
+    · exact Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)
 
 theorem succ_max_le (A B : Nat) : 1 + Nat.max A B ≤ Nat.max (1 + A) (1 + B) := by
   simp only [Nat.max_def]
@@ -1623,7 +1196,7 @@ theorem succ_max_le (A B : Nat) : 1 + Nat.max A B ≤ Nat.max (1 + A) (1 + B) :=
 
 /-- A position is one deeper than its deepest component. -/
 theorem depth_mk_le {a1 : List Atom} {r v : Option (List (FieldKey × CompactTy))}
-    {f : Option (KindMerge × List CompactTy × CompactTy)} {c : Option (List Predicate)} {bnd : Nat}
+    {f : Option (KindMerge × CompactTy × CompactTy)} {c : Option (List Predicate)} {bnd : Nat}
     (hr : optMapDepth r ≤ bnd) (hv : optMapDepth v ≤ bnd) (hf : optFnDepth f ≤ bnd) :
     depth (CompactTy.mk a1 r v f c) ≤ 1 + bnd := by
   rw [depth]
@@ -1664,10 +1237,11 @@ theorem merge_depth_le_bounded : ∀ (n : Nat) (pol : Bool) (a b : CompactTy),
         rw [depth] at hb
         omega
       exact ih pol x y (Nat.le_trans hx hA) (Nat.le_trans hy hB)
+    -- The domain merges **contravariantly**, so the child bound is needed at `!pol` too.
     have hchild' : ∀ x y : CompactTy,
         depth x ≤ Nat.max (optMapDepth r1) (Nat.max (optMapDepth v1) (optFnDepth f1)) →
         depth y ≤ Nat.max (optMapDepth r2) (Nat.max (optMapDepth v2) (optFnDepth f2)) →
-        depth (merge true x y) ≤ Nat.max (depth x) (depth y) := by
+        depth (merge (!pol) x y) ≤ Nat.max (depth x) (depth y) := by
       intro x y hx hy
       have hA : Nat.max (optMapDepth r1) (Nat.max (optMapDepth v1) (optFnDepth f1)) ≤ n := by
         rw [depth] at ha
@@ -1675,7 +1249,7 @@ theorem merge_depth_le_bounded : ∀ (n : Nat) (pol : Bool) (a b : CompactTy),
       have hB : Nat.max (optMapDepth r2) (Nat.max (optMapDepth v2) (optFnDepth f2)) ≤ n := by
         rw [depth] at hb
         omega
-      exact ih true x y (Nat.le_trans hx hA) (Nat.le_trans hy hB)
+      exact ih (!pol) x y (Nat.le_trans hx hA) (Nat.le_trans hy hB)
     -- The three components, each bounded by the deeper input's deepest component.
     have hB1 := Nat.le_max_left
       (Nat.max (optMapDepth r1) (Nat.max (optMapDepth v1) (optFnDepth f1)))
@@ -1736,13 +1310,12 @@ theorem merge_depth_le_bounded : ∀ (n : Nat) (pol : Bool) (a b : CompactTy),
             Nat.le_trans (Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)) hB1
           have hin2 : optFnDepth (some (k2, d2, cod2)) ≤ _ :=
             Nat.le_trans (Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)) hB2
-          have hdom : ∀ x y, depth x ≤ listDepth d1 → depth y ≤ listDepth d2 →
-              depth (merge true x y) ≤ Nat.max (depth x) (depth y) := fun x y hx hy =>
-            hchild' x y
-              (Nat.le_trans hx (Nat.le_trans (Nat.le_max_left _ _)
-                (Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _))))
-              (Nat.le_trans hy (Nat.le_trans (Nat.le_max_left _ _)
-                (Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _))))
+          have hdom : depth (merge (!pol) d1 d2) ≤ Nat.max (depth d1) (depth d2) :=
+            hchild' d1 d2
+              (Nat.le_trans (Nat.le_max_left _ _)
+                (Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)))
+              (Nat.le_trans (Nat.le_max_left _ _)
+                (Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)))
           have hcodb : depth (merge pol cod1 cod2) ≤ Nat.max (depth cod1) (depth cod2) :=
             hchild cod1 cod2
               (Nat.le_trans (Nat.le_max_right _ _)
@@ -1759,31 +1332,6 @@ theorem merge_depth_le (pol : Bool) (a b : CompactTy) :
     depth (merge pol a b) ≤ Nat.max (depth a) (depth b) :=
   merge_depth_le_bounded (Nat.max (depth a) (depth b)) pol a b
     (Nat.le_max_left _ _) (Nat.le_max_right _ _)
-
-/-- The meet of a slot's alternatives, folded left as `coalesce_compact_go` folds
-them. Named rather than written as `List.foldl` so the depth bound below states a
-term the termination checker sees unchanged. -/
-def meetAll (pol : Bool) : CompactTy → List CompactTy → CompactTy
-  | acc, [] => acc
-  | acc, x :: xs => meetAll pol (merge pol acc x) xs
-
-/-- Folding the meet over a slot's alternatives stays within their depth — the
-bound `coalesce` needs for the one recursive call no subterm ordering reaches. -/
-theorem meetAll_depth_le (pol : Bool) : (d : CompactTy) → (rest : List CompactTy) →
-    depth (meetAll pol d rest) ≤ Nat.max (depth d) (listDepth rest)
-  | d, [] => by
-    rw [meetAll, listDepth]
-    exact Nat.le_max_left _ _
-  | d, x :: xs => by
-    rw [meetAll]
-    refine Nat.le_trans (meetAll_depth_le pol (merge pol d x) xs) ?_
-    refine Nat.max_le.mpr ⟨Nat.le_trans (merge_depth_le pol d x) ?_, ?_⟩
-    · rw [listDepth]
-      exact Nat.max_le.mpr
-        ⟨Nat.le_max_left _ _,
-         Nat.le_trans (Nat.le_max_left _ _) (Nat.le_max_right _ _)⟩
-    · rw [listDepth]
-      exact Nat.le_trans (Nat.le_max_right _ _) (Nat.le_max_right _ _)
 
 /-! ## Well-formedness of input bounds
 
@@ -1817,11 +1365,9 @@ def wellFormed : CompactTy → Bool
       && (match f with
           | none => true
           | some (k, d, cod) =>
-            (k != .conflict)
-              && (match d with
-                  | [x] => wellFormed x
-                  | _ => false)
-              && wellFormed cod)
+            -- One domain is the slot's *type* now, so well-formedness only asks that it be
+            -- well-formed. It used to ask for a singleton list here.
+            (k != .conflict) && wellFormed d && wellFormed cod)
       -- The refinement slot's `none` is the merge identity, and `compact_go` gives it
       -- only to the two contributions that are not values: a hole and a bare
       -- variable, neither of which carries content. A position with content and
@@ -1967,36 +1513,22 @@ theorem merge_idem (pol : Bool) : (a : CompactTy) → wellFormed a = true → eq
               rcases m.lookup k with _ | v <;> rfl)
     · rcases f1 with _ | ⟨k1, d1, cod1⟩
       · rfl
-      · rcases d1 with _ | ⟨x, xs⟩
-        · simp at hwfn
-        · rcases xs with _ | ⟨x2, xs2⟩
-          case cons => simp at hwfn
-          simp only [Bool.and_eq_true, bne_iff_ne, ne_eq] at hwfn
-          obtain ⟨⟨hk1, hwx⟩, hwcod⟩ := hwfn
-          have hszx : sizeOf x < sizeOf (CompactTy.mk a1 r1 v1 (some (k1, [x], cod1)) c1) := by
-            simp
-            omega
-          have hszc : sizeOf cod1 <
-              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, [x], cod1)) c1) := by
-            simp
-            omega
-          have hx : equiv (merge (!pol) x x) x = true := merge_idem (!pol) x hwx
-          have hcod : equiv (merge pol cod1 cod1) cod1 = true := merge_idem pol cod1 hwcod
-          dsimp only
-          rw [mergeFun.eq_def]
-          -- The kind is idempotent and `wellFormed` rules out a conflict, so the slot's
-          -- kind survives untouched and only the domain and codomain recurse.
-          simp only [joinKind_idem k1, beq_iff_eq, if_neg hk1]
-          cases pol
-          · simp only [Bool.false_eq_true, reduceIte, meetDomains_single]
-            simpa [domainsEquiv] using funClause_of_funEquiv
-              (s1 := (k1, [merge true x x], merge false cod1 cod1))
-              (s2 := (k1, [x], cod1))
-              ⟨rfl, domainsEquiv_singleton (by simpa using hx), hcod⟩
-          · simp only [reduceIte]
-            simpa [domainsEquiv] using funClause_of_funEquiv
-              (s1 := (k1, unionDomains [x] [x], merge true cod1 cod1))
-              (s2 := (k1, [x], cod1)) ⟨rfl, unionDomains_idem [x], hcod⟩
+      · simp only [Bool.and_eq_true, bne_iff_ne, ne_eq] at hwfn
+        obtain ⟨⟨_, hwd⟩, hwcod⟩ := hwfn
+        have hszd : sizeOf d1 < sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+          simp
+          omega
+        have hszc : sizeOf cod1 <
+            sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+          simp
+          omega
+        have hd : equiv (merge (!pol) d1 d1) d1 = true := merge_idem (!pol) d1 hwd
+        have hcod : equiv (merge pol cod1 cod1) cod1 = true := merge_idem pol cod1 hwcod
+        dsimp only
+        rw [mergeFun]
+        simpa [joinKind_idem] using funClause_of_funEquiv
+          (s1 := (k1, merge (!pol) d1 d1, merge pol cod1 cod1))
+          (s2 := (k1, d1, cod1)) ⟨rfl, hd, hcod⟩
     · exact mergeRefinements_idem pol c1
 termination_by a => sizeOf a
 decreasing_by all_goals (simp; omega)
@@ -2020,9 +1552,9 @@ theorem equiv_congr_bool {x x' : CompactTy} (h : equiv x x' = true) (y : Compact
   · exact equiv_trans x x' y h hg
 
 /-- `FunEquiv` is reflexive. -/
-theorem funEquiv_refl (s : KindMerge × List CompactTy × CompactTy) : FunEquiv s s := by
+theorem funEquiv_refl (s : KindMerge × CompactTy × CompactTy) : FunEquiv s s := by
   obtain ⟨k, d, c⟩ := s
-  exact ⟨rfl, domainsEquiv_refl d, equiv_refl c⟩
+  exact ⟨rfl, equiv_refl d, equiv_refl c⟩
 
 mutual
 
@@ -2243,7 +1775,7 @@ theorem merge_congr_left (pol : Bool) :
         | skip
       · rcases fb with _ | sb
         · rfl
-        · simpa [domainsEquiv] using funClause_of_funEquiv (funEquiv_refl sb)
+        · simpa using funClause_of_funEquiv (funEquiv_refl sb)
       · rcases fb with _ | sb
         · simpa using hf
         · obtain ⟨k1, d1, cod1⟩ := s1
@@ -2257,9 +1789,8 @@ theorem merge_congr_left (pol : Bool) :
                 sizeOf (CompactTy.mk b1 rb vb (some sb) cb) := by
             simp
             omega
-          have hde : FunEquiv (k1, d1, cod1) (k1', d1', cod1') :=
-            ⟨hk', domainsEquiv_iff_and.mpr hd, hcod⟩
-          simpa [domainsEquiv] using funClause_of_funEquiv
+          have hde : FunEquiv (k1, d1, cod1) (k1', d1', cod1') := ⟨hk', hd, hcod⟩
+          simpa using funClause_of_funEquiv
             (mergeFun_congr_left pol (k1, d1, cod1) (k1', d1', cod1') sb hde)
     · exact mergeRefinements_congr_left pol cb hcl
 termination_by a a' b => (sizeOf a + sizeOf a' + sizeOf b, 1)
@@ -2270,76 +1801,21 @@ decreasing_by all_goals
   | (apply Prod.Lex.right; simp; omega)
 
 theorem mergeFun_congr_left (pol : Bool) :
-    (s1 s1' sb : KindMerge × List CompactTy × CompactTy) → FunEquiv s1 s1' →
+    (s1 s1' sb : KindMerge × CompactTy × CompactTy) → FunEquiv s1 s1' →
       FunEquiv (mergeFun pol s1 sb) (mergeFun pol s1' sb)
   | (k1, d1, c1), (k1', d1', c1'), (kb, db, cb) => by
     intro ⟨hk, hd, hc⟩
     subst hk
+    have hszd : sizeOf d1 + sizeOf d1' + sizeOf db <
+        sizeOf (k1, d1, c1) + sizeOf (k1, d1', c1') + sizeOf (kb, db, cb) := by
+      simp
+      omega
     have hszc : sizeOf c1 + sizeOf c1' + sizeOf cb <
         sizeOf (k1, d1, c1) + sizeOf (k1, d1', c1') + sizeOf (kb, db, cb) := by
       simp
       omega
-    have hcod : equiv (merge pol c1 cb) (merge pol c1' cb) = true :=
-      merge_congr_left pol c1 c1' cb hc
-    -- The domain recursion, hoisted so its size bound sits beside its call: the
-    -- alternatives are members of the slots, which is what bounds them.
-    have hdom : ∀ x x' y, x ∈ d1 → x' ∈ d1' → y ∈ db → equiv x x' = true →
-        equiv (merge true x y) (merge true x' y) = true := by
-      intro x x' y hx hx' hy hxx'
-      have h1 := List.sizeOf_lt_of_mem hx
-      have h2 := List.sizeOf_lt_of_mem hx'
-      have h3 := List.sizeOf_lt_of_mem hy
-      have hszd : sizeOf x + sizeOf x' + sizeOf y <
-          sizeOf (k1, d1, c1) + sizeOf (k1, d1', c1') + sizeOf (kb, db, cb) := by
-        simp
-        omega
-      exact merge_congr_left true x x' y hxx'
-    rw [mergeFun.eq_def, mergeFun.eq_def]
-    simp only
-    -- The kinds are equal, so both sides join to the same kind and only the
-    -- domain and codomain are left to compare.
-    rcases hkc : joinKind k1 kb == KindMerge.conflict with _ | _ <;>
-      simp only [Bool.false_eq_true, reduceIte]
-    case true => exact ⟨rfl, domainsEquiv_refl [], hcod⟩
-    cases pol
-    · -- Negative: the meet. `OneDistinct` is `domainsEquiv`-invariant, so the two sides
-      -- are defined together, and their heads are `equiv`-related.
-      simp only [Bool.false_eq_true, reduceIte]
-      rcases hm : meetDomains d1 db with _ | ds
-      · have hm' : meetDomains d1' db = none := by
-          rcases hm' : meetDomains d1' db with _ | ds'
-          · rfl
-          · obtain ⟨ha', hb⟩ := oneDistinct_of_meetDoms hm'
-            obtain ⟨ds'', hds''⟩ :=
-              meetDomains_isSome_of (oneDistinct_congr (domainsEquiv_symm hd) ha') hb
-            rw [hds''] at hm
-            exact absurd hm (by simp)
-        rw [hm']
-        exact ⟨rfl, domainsEquiv_refl [], hcod⟩
-      · obtain ⟨x, xs, y, ys, ha, hb, hgate, hds⟩ := meetDomains_eq_some hm
-        rw [Bool.and_eq_true] at hgate
-        obtain ⟨hoa, hob⟩ := oneDistinct_of_meetDoms hm
-        obtain ⟨ds', hds'⟩ := meetDomains_isSome_of (oneDistinct_congr hd hoa) hob
-        obtain ⟨x', xs', y', ys', ha', hb', hgate', hds2⟩ := meetDomains_eq_some hds'
-        rw [Bool.and_eq_true] at hgate'
-        -- The two heads are `equiv`: each is the sole distinct alternative of its
-        -- side, and the sides are `domainsEquiv`.
-        have hxx' : equiv x x' = true := by
-          obtain ⟨h1, _⟩ := domainsEquiv_iff.mp hd
-          obtain ⟨w, hw, hxw⟩ := h1 x (by rw [ha]; simp)
-          exact equiv_trans _ _ _ hxw (all_equiv_head hgate'.1 w (ha' ▸ hw))
-        -- The base's head is literally the same on both sides.
-        have hyy' : y = y' := by
-          rw [hb] at hb'
-          exact (List.cons.injEq .. ▸ hb').1
-        rw [hds', hds, hds2, hyy']
-        exact ⟨rfl,
-          domainsEquiv_singleton
-            (hdom x x' y' (ha ▸ by simp) (ha' ▸ by simp) (hb' ▸ by simp) hxx'),
-          hcod⟩
-    · -- Positive: the union is a congruence because its dedup gate is `equiv`.
-      simp only [reduceIte]
-      exact ⟨rfl, unionDomains_congr_left db hd, hcod⟩
+    rw [mergeFun, mergeFun]
+    exact ⟨rfl, merge_congr_left (!pol) d1 d1' db hd, merge_congr_left pol c1 c1' cb hc⟩
 termination_by s1 s1' sb => (sizeOf s1 + sizeOf s1' + sizeOf sb, 0)
 decreasing_by all_goals
   first
@@ -2375,36 +1851,13 @@ accepted `data` function in another, whose domain was the meet of two of the thr
 defers that choice to `coalesce_compact_go`, where the kind is resolved
 (`undetermined_kinds_join_without_deciding_the_domain_rule` pins the exhibit). -/
 
-/-- A negative merge whose domain meet is undefined is the conflicted slot — the
-same shape a conflicted kind produces. -/
-theorem mergeFun_neg_none (s1 s2 : KindMerge × List CompactTy × CompactTy)
-    (h : meetDomains s1.2.1 s2.2.1 = none) :
-    mergeFun false s1 s2 = (.conflict, [], merge false s1.2.2 s2.2.2) := by
+/-- A merged slot's kind is the kinds' join. Nothing else can force a conflict: the domain
+merges like any other position, so it has no verdict of its own to contribute. -/
+theorem mergeFun_kind (pol : Bool) (s1 s2 : KindMerge × CompactTy × CompactTy) :
+    (mergeFun pol s1 s2).1 = joinKind s1.1 s2.1 := by
   obtain ⟨k1, d1, c1⟩ := s1
   obtain ⟨k2, d2, c2⟩ := s2
-  rw [mergeFun.eq_def]
-  dsimp only
-  split
-  · rfl
-  · simp only [Bool.false_eq_true, reduceIte]
-    rw [h]
-
-/-- A merged slot's kind is the kinds' join, or a conflict the domains forced
-(the negative meet has no single domain to take). -/
-theorem mergeFun_kind (pol : Bool) (s1 s2 : KindMerge × List CompactTy × CompactTy) :
-    (mergeFun pol s1 s2).1 = joinKind s1.1 s2.1 ∨ (mergeFun pol s1 s2).1 = .conflict := by
-  obtain ⟨k1, d1, c1⟩ := s1
-  obtain ⟨k2, d2, c2⟩ := s2
-  rw [mergeFun.eq_def]
-  dsimp only
-  split
-  · rename_i hc
-    exact Or.inr rfl
-  · split
-    · exact Or.inl rfl
-    · split
-      · exact Or.inl rfl
-      · exact Or.inr rfl
+  rw [mergeFun]
 
 /-- `joinKind` is absorbed by a conflict on either side. -/
 theorem joinKind_conflict_left (k : KindMerge) : joinKind .conflict k = .conflict := by
@@ -2532,7 +1985,7 @@ theorem merge_assoc (pol : Bool) :
     · rcases f1 with _ | s1 <;> rcases f2 with _ | s2 <;> rcases f3 with _ | s3 <;>
         first
         | rfl
-        | (simpa [domainsEquiv] using funClause_of_funEquiv (funEquiv_refl _))
+        | (simpa using funClause_of_funEquiv (funEquiv_refl _))
         | skip
       obtain ⟨k1, d1, cod1⟩ := s1
       obtain ⟨k2, d2, cod2⟩ := s2
@@ -2543,7 +1996,7 @@ theorem merge_assoc (pol : Bool) :
             sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
         simp
         omega
-      simpa [domainsEquiv] using funClause_of_funEquiv
+      simpa using funClause_of_funEquiv
         (mergeFun_assoc pol (k1, d1, cod1) (k2, d2, cod2) (k3, d3, cod3))
     · exact mergeRefinements_assoc pol c1 c2 c3
 termination_by a b c => (sizeOf a + sizeOf b + sizeOf c, 1)
@@ -2554,144 +2007,19 @@ decreasing_by all_goals
   | (apply Prod.Lex.right; simp; omega)
 
 theorem mergeFun_assoc (pol : Bool) :
-    (s1 s2 s3 : KindMerge × List CompactTy × CompactTy) →
+    (s1 s2 s3 : KindMerge × CompactTy × CompactTy) →
       FunEquiv (mergeFun pol (mergeFun pol s1 s2) s3) (mergeFun pol s1 (mergeFun pol s2 s3))
   | (k1, d1, c1), (k2, d2, c2), (k3, d3, c3) => by
+    have hszd : sizeOf d1 + sizeOf d2 + sizeOf d3 <
+        sizeOf (k1, d1, c1) + sizeOf (k2, d2, c2) + sizeOf (k3, d3, c3) := by
+      simp
+      omega
     have hszc : sizeOf c1 + sizeOf c2 + sizeOf c3 <
         sizeOf (k1, d1, c1) + sizeOf (k2, d2, c2) + sizeOf (k3, d3, c3) := by
       simp
       omega
-    have hcod : equiv (merge pol (merge pol c1 c2) c3) (merge pol c1 (merge pol c2 c3)) = true :=
-      merge_assoc pol c1 c2 c3
-    -- The domain recursion, hoisted so its size bound sits beside its call.
-    have hassoc : ∀ x y z, x ∈ d1 → y ∈ d2 → z ∈ d3 →
-        equiv (merge true (merge true x y) z) (merge true x (merge true y z)) = true := by
-      intro x y z hx hy hz
-      have h1 := List.sizeOf_lt_of_mem hx
-      have h2 := List.sizeOf_lt_of_mem hy
-      have h3 := List.sizeOf_lt_of_mem hz
-      have hszd : sizeOf x + sizeOf y + sizeOf z <
-          sizeOf (k1, d1, c1) + sizeOf (k2, d2, c2) + sizeOf (k3, d3, c3) := by
-        simp
-        omega
-      exact merge_assoc true x y z
-    have hK : joinKind (joinKind k1 k2) k3 = joinKind k1 (joinKind k2 k3) :=
-      joinKind_assoc k1 k2 k3
-    rcases hk : joinKind (joinKind k1 k2) k3 with _ | _ | _ | _
-    -- The three kinds join to a conflict: absorbing, so whichever pairwise join
-    -- the association takes first, both outer slots are the conflicted one.
-    case conflict =>
-      have hl : mergeFun pol (mergeFun pol (k1, d1, c1) (k2, d2, c2)) (k3, d3, c3) =
-          (.conflict, [], merge pol (merge pol c1 c2) c3) := by
-        have := mergeFun_of_conflict pol (mergeFun pol (k1, d1, c1) (k2, d2, c2)) (k3, d3, c3)
-          (by
-            rcases mergeFun_kind pol (k1, d1, c1) (k2, d2, c2) with h | h
-            · simpa only [h] using hk
-            · simpa only [h] using joinKind_conflict_left k3)
-        rw [this, mergeFun_cod]
-      have hr : mergeFun pol (k1, d1, c1) (mergeFun pol (k2, d2, c2) (k3, d3, c3)) =
-          (.conflict, [], merge pol c1 (merge pol c2 c3)) := by
-        have := mergeFun_of_conflict pol (k1, d1, c1) (mergeFun pol (k2, d2, c2) (k3, d3, c3))
-          (by
-            rcases mergeFun_kind pol (k2, d2, c2) (k3, d3, c3) with h | h
-            · simpa only [h] using hK.symm.trans hk
-            · simpa only [h] using joinKind_conflict_right k1)
-        rw [this, mergeFun_cod]
-      rw [hl, hr]
-      exact ⟨rfl, domainsEquiv_refl [], hcod⟩
-    all_goals
-      -- No conflict anywhere: a conflicted pairwise join would absorb into `hk`,
-      -- so both inner merges carry the joined kind and both sides reduce.
-      have h12 : (joinKind k1 k2 == KindMerge.conflict) = false := by
-        rcases h : joinKind k1 k2 with _ | _ | _ | _
-        case conflict =>
-          rw [h, joinKind_conflict_left] at hk
-          simp at hk
-        all_goals rfl
-      have h23 : (joinKind k2 k3 == KindMerge.conflict) = false := by
-        rcases h : joinKind k2 k3 with _ | _ | _ | _
-        case conflict =>
-          rw [hK, h, joinKind_conflict_right] at hk
-          simp at hk
-        all_goals rfl
-      have hkl : (joinKind (joinKind k1 k2) k3 == KindMerge.conflict) = false := by
-        rw [hk]; rfl
-      have hkr : (joinKind k1 (joinKind k2 k3) == KindMerge.conflict) = false := by
-        rw [← hK, hk]; rfl
-      cases pol
-      · -- Negative: nested contravariant meets. Both nestings are defined exactly
-        -- when all three slots have one distinct alternative, and otherwise both
-        -- conflict — whichever slot is the culprit.
-        by_cases hd1 : OneDistinct d1
-        · by_cases hd2 : OneDistinct d2
-          · by_cases hd3 : OneDistinct d3
-            · obtain ⟨_, h12s⟩ := meetDomains_isSome_of hd1 hd2
-              obtain ⟨x, xs, y, ys, ha1, ha2, _, hds12⟩ := meetDomains_eq_some h12s
-              obtain ⟨_, h23s⟩ := meetDomains_isSome_of hd2 hd3
-              obtain ⟨y', ys', z, zs, ha2', ha3, _, hds23⟩ := meetDomains_eq_some h23s
-              -- Both decompositions of `d2` are the same cons, so they name one head.
-              have hy : y = y' := by
-                rw [ha2] at ha2'
-                exact (List.cons.injEq .. ▸ ha2').1
-              -- Reduce each inner slot first, so the outer kind test is a `joinKind`
-              -- the kind facts decide.
-              have hil : mergeFun false (k1, d1, c1) (k2, d2, c2)
-                  = (joinKind k1 k2, [merge true x y], merge false c1 c2) := by
-                rw [mergeFun.eq_def]
-                simp only [h12, Bool.false_eq_true, reduceIte, h12s, hds12]
-              have hir : mergeFun false (k2, d2, c2) (k3, d3, c3)
-                  = (joinKind k2 k3, [merge true y z], merge false c2 c3) := by
-                rw [mergeFun.eq_def]
-                simp only [h23, Bool.false_eq_true, reduceIte, h23s, hds23, ← hy]
-              rw [hil, hir, mergeFun.eq_def, mergeFun.eq_def]
-              simp only [hkl, hkr, Bool.false_eq_true, reduceIte]
-              rw [show meetDomains [merge true x y] d3
-                    = some [merge true (merge true x y) z] from by
-                  rw [ha3]
-                  exact meetDomains_of_gate (by
-                    rw [Bool.and_eq_true]
-                    exact ⟨by simp [subtypeDomains], gate_of_oneDistinct (ha3 ▸ hd3)⟩),
-                show meetDomains d1 [merge true y z]
-                    = some [merge true x (merge true y z)] from by
-                  rw [ha1]
-                  exact meetDomains_of_gate (by
-                    rw [Bool.and_eq_true]
-                    exact ⟨gate_of_oneDistinct (ha1 ▸ hd1), by simp [subtypeDomains]⟩)]
-              exact ⟨by rw [hK],
-                domainsEquiv_singleton
-                  (hassoc x y z (ha1 ▸ by simp) (ha2 ▸ by simp) (ha3 ▸ by simp)),
-                hcod⟩
-            · -- `d3` has no single alternative: the left's outer meet is undefined,
-              -- and the right's inner one is.
-              rw [mergeFun_neg_none (k2, d2, c2) (k3, d3, c3) (meetDomains_none_of_right hd3),
-                mergeFun_of_conflict false (k1, d1, c1)
-                  (KindMerge.conflict, [], merge false c2 c3)
-                  (by simpa using joinKind_conflict_right k1),
-                mergeFun_neg_none _ (k3, d3, c3) (meetDomains_none_of_right hd3)]
-              refine ⟨rfl, domainsEquiv_refl [], ?_⟩
-              simpa [mergeFun_cod] using hcod
-          · -- `d2` fails on both sides: as the right argument of one inner meet and
-            -- the left argument of the other.
-            rw [mergeFun_neg_none (k1, d1, c1) (k2, d2, c2) (meetDomains_none_of_right hd2),
-              mergeFun_neg_none (k2, d2, c2) (k3, d3, c3) (meetDomains_none_of_left hd2),
-              mergeFun_of_conflict false (KindMerge.conflict, [], merge false c1 c2) (k3, d3, c3)
-                (by simpa using joinKind_conflict_left k3),
-              mergeFun_of_conflict false (k1, d1, c1)
-                (KindMerge.conflict, [], merge false c2 c3)
-                (by simpa using joinKind_conflict_right k1)]
-            refine ⟨rfl, domainsEquiv_refl [], ?_⟩
-            simpa [mergeFun_cod] using hcod
-        · -- `d1` fails: the left's inner meet is undefined, the right's outer one is.
-          rw [mergeFun_neg_none (k1, d1, c1) (k2, d2, c2) (meetDomains_none_of_left hd1),
-            mergeFun_of_conflict false (KindMerge.conflict, [], merge false c1 c2) (k3, d3, c3)
-              (by simpa using joinKind_conflict_left k3),
-            mergeFun_neg_none (k1, d1, c1) _ (meetDomains_none_of_left hd1)]
-          refine ⟨rfl, domainsEquiv_refl [], ?_⟩
-          simpa [mergeFun_cod] using hcod
-      · -- Positive: the alternatives are a set, and set union is associative.
-        simp only [mergeFun.eq_def, h12, h23, hkl, hkr,
-          Bool.false_eq_true, reduceIte, if_true]
-        exact ⟨by rw [hK], unionDomains_assoc d1 d2 d3, hcod⟩
+    rw [mergeFun, mergeFun, mergeFun, mergeFun]
+    exact ⟨joinKind_assoc k1 k2 k3, merge_assoc (!pol) d1 d2 d3, merge_assoc pol c1 c2 c3⟩
 termination_by s1 s2 s3 => (sizeOf s1 + sizeOf s2 + sizeOf s3, 0)
 decreasing_by all_goals
   first

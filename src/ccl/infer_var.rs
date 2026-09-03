@@ -12,7 +12,12 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::ccl::{Type, subst};
+// Both users are debug-only — the record-time closure check and its gap set — so a
+// release build has none and an ungated import is an unused one there.
+#[cfg(any(debug_assertions, test))]
+use std::collections::BTreeSet;
+
+use crate::ccl::{Name, Type, subst};
 
 /// A unique identifier for an inference type variable.
 ///
@@ -29,6 +34,36 @@ impl fmt::Display for InferVarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// Identity of a **Σ's own binder** — what its [`crate::ccl::Type::WitnessRef`]
+/// occurrences point back at.
+///
+/// A binder needs an identity for the same reason a Pi binder has a `Name`: when a pass
+/// decomposes a Σ-typed term, the witness occurrences scatter across the pieces, and
+/// *which binder they belong to* has to survive that. Anonymity can only express it by
+/// nesting position, which does not survive a term being taken apart.
+///
+/// Globally unique, and preserved by every copy — the same Barendregt discipline
+/// `uniquify` gives term binders, and what makes derived structural equality still work
+/// for two types descending from one derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WitnessBinderId(pub(crate) u32);
+
+impl fmt::Display for WitnessBinderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl WitnessBinderId {}
+
+/// Global counter for [`WitnessBinderId`] allocation.
+static WITNESS_BINDER_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a fresh, globally-unique [`WitnessBinderId`] — one per Σ built.
+pub fn fresh_witness_binder_id() -> WitnessBinderId {
+    WitnessBinderId(WITNESS_BINDER_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Global counter for [`InferVarId`] allocation.
@@ -92,6 +127,18 @@ pub struct Bound {
 }
 
 impl Bound {
+    /// `ty` with the **witness** half of `s` already applied, and `s` with that half
+    /// removed — a bound is stored in its own scope with the morphism alongside, but a
+    /// change of *witness* scope is a pure α-conversion with nothing to wait for, so
+    /// suspending it only lets the reference reach a position still spelled in the scope
+    /// it left. The binder half stays suspended: a discharge's term is not known yet.
+    fn force_witnesses(ty: &Type, s: &subst::Subst) -> (Type, subst::Subst) {
+        match s.without_witnesses() {
+            Some(rest) => (s.apply_witnesses(ty), rest),
+            None => (ty.clone(), s.clone()),
+        }
+    }
+
     /// A concrete bound with identity morphisms on both sides — the ordinary,
     /// non-dependent case. Behaviourally a bare `Type` until a non-identity
     /// substitution rides the edge.
@@ -107,6 +154,7 @@ impl Bound {
     /// identity) — e.g. the dependent application's `result‹[x ↦ arg]›` lower
     /// edge.
     pub fn with_subst(ty: Type, ty_subst: subst::Subst) -> Self {
+        let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
         Bound {
             self_subst: subst::Subst::id(),
             ty,
@@ -116,6 +164,7 @@ impl Bound {
 
     /// A fully general two-sided edge.
     pub fn edge(self_subst: subst::Subst, ty: Type, ty_subst: subst::Subst) -> Self {
+        let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
         Bound {
             self_subst,
             ty,
@@ -125,7 +174,7 @@ impl Bound {
 
     /// The morphism that renders this entry's content in its holder's
     /// context — what the coalesce walk composes onto its accumulator, and
-    /// what [`materialize`](Self::materialize) applies for a direct read.
+    /// what a direct read applies.
     ///
     /// `ty_subst` applies to the content directly. The holder-side
     /// `self_subst` is transported by inversion where it is invertible; a
@@ -155,7 +204,7 @@ impl Bound {
                     // Binders the inversion does NOT transport (the term part,
                     // plus a non-injective rename remainder) must be absent
                     // from the content (post-discharge context).
-                    let transported: std::collections::BTreeSet<_> = if inv.is_id() {
+                    let transported: BTreeSet<_> = if inv.is_id() {
                         Default::default()
                     } else {
                         ren.binders().collect()
@@ -178,6 +227,7 @@ impl Bound {
 
     /// The bound type expressed in the holder's context — see
     /// [`render_subst`](Self::render_subst).
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn materialize(&self) -> Type {
         self.render_subst().apply_type(&self.ty)
     }
@@ -212,6 +262,22 @@ impl Bound {
 pub struct InferBounds {
     lower: Rc<Vec<Bound>>,
     upper: Rc<Vec<Bound>>,
+    /// **Kinding** constraints — `α :: 𝐾`, the kinds whatever this variable resolves
+    /// to must inhabit.
+    ///
+    /// A third kind of constraint rather than a bound, because it is not a relation to
+    /// a type: no `T` satisfies "`α <: T` iff `α` is a range". It is what a
+    /// [`TypeKind`](crate::ccl::ty::TypeKind) membership predicate needs and cannot get
+    /// while the variable has no shape, so it is recorded here and read once the
+    /// variable's position resolves.
+    ///
+    /// Unlike `lower`/`upper` these carry **no polarity of their own** — a kinding
+    /// constraint asserts what the variable must resolve to, which is one fact wherever
+    /// the variable occurs — so merging two variables' constraints is a plain conjunction
+    /// and extrusion carries them at both polarities. They do reach negative positions: an
+    /// annotation is a demand, so `r: List(Int) = box(…)` records `UIntRanges` on the
+    /// domain variable there.
+    pub type_kinds: Vec<crate::ccl::ty::TypeKind>,
 }
 
 thread_local! {
@@ -229,6 +295,7 @@ impl Default for InferBounds {
         NO_BOUNDS.with(|empty| InferBounds {
             lower: Rc::clone(empty),
             upper: Rc::clone(empty),
+            type_kinds: Vec::new(),
         })
     }
 }
@@ -296,14 +363,14 @@ impl InferBounds {
 /// A persistent cons list: extending shares the tail, so every variable
 /// minted under one scope holds the same nodes and entering a binder costs
 /// one allocation, not a copy per variable. Entries are binder
-/// [`Name`](crate::ccl::Name)s — uniquified, so membership is a name lookup;
+/// [`Name`](Name)s — uniquified, so membership is a name lookup;
 /// a shadowing binder is a separate entry with a distinct uid and shadows
 /// nothing here.
 #[derive(Clone, Default)]
 pub struct Telescope(Option<Rc<TelescopeNode>>);
 
 struct TelescopeNode {
-    binder: crate::ccl::Name,
+    binder: Name,
     parent: Telescope,
 }
 
@@ -315,7 +382,7 @@ impl Telescope {
     }
 
     /// This scope with `binder` entered — the innermost entry of the result.
-    pub fn extended(&self, binder: crate::ccl::Name) -> Self {
+    pub fn extended(&self, binder: Name) -> Self {
         Telescope(Some(Rc::new(TelescopeNode {
             binder,
             parent: self.clone(),
@@ -323,7 +390,7 @@ impl Telescope {
     }
 
     /// Whether `name` is a binder in this scope.
-    pub fn contains(&self, name: &crate::ccl::Name) -> bool {
+    pub fn contains(&self, name: &Name) -> bool {
         let mut cur = &self.0;
         while let Some(node) = cur {
             if node.binder == *name {
@@ -335,7 +402,7 @@ impl Telescope {
     }
 
     /// The binders, innermost first.
-    pub fn iter(&self) -> impl Iterator<Item = &crate::ccl::Name> {
+    pub fn iter(&self) -> impl Iterator<Item = &Name> {
         let mut cur = &self.0;
         std::iter::from_fn(move || {
             let node = cur.as_ref()?;
@@ -363,7 +430,7 @@ pub(crate) trait TelescopeWalk {
     fn telescope_mut(&mut self) -> &mut Telescope;
 
     /// Run `f` with `binder` entered, restoring the scope on the way out.
-    fn under_binder<R>(&mut self, binder: &crate::ccl::Name, f: impl FnOnce(&mut Self) -> R) -> R
+    fn under_binder<R>(&mut self, binder: &Name, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized,
     {
@@ -386,10 +453,7 @@ pub(crate) trait TelescopeWalk {
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
 #[cfg(any(debug_assertions, test))]
-pub(crate) fn bound_scope_gaps(
-    telescope: &Telescope,
-    bound: &Bound,
-) -> std::collections::BTreeSet<crate::ccl::Name> {
+pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
     subst::scope_gaps(&bound.ty, |n| {
         telescope.contains(n)
             || bound.ty_subst.binders().any(|b| b == n)
@@ -503,6 +567,18 @@ pub struct InferVar {
     pub telescope: Telescope,
     /// Mutable lower/upper bound lists.
     pub bounds: RefCell<InferBounds>,
+    /// **The kind of the function this variable may turn out to be.**
+    ///
+    /// A variable can stand for a function, and a function has a kind — so it carries one,
+    /// created with it and recorded on wherever a function-shaped bound lands here. Nothing
+    /// decides whether the variable *is* a function: a kind no function reached stays
+    /// unpinned and no reader consults it, which is what keeps this from being a dispatch on
+    /// a fact the recording site does not have.
+    ///
+    /// It is what gives a *join* of collections a kind. Two conditional arms flowing in are
+    /// two sums recorded below this one variable's kind, so the position they meet at is over
+    /// one binder — its own — rather than over two binders with nothing to relate them.
+    pub fun_kind: Rc<crate::ccl::ty::FunKindVar>,
     /// Trait obligations this variable is an operand of, with the position it
     /// occupies in each. Every lower bound recorded here is delivered to them by
     /// `notify_lower` (`src/ccl/infer/solver/traits.rs`), which is how an operator's
@@ -540,6 +616,8 @@ thread_local! {
 /// fresh capture buffer, so an accidental nested inference run trips loudly in
 /// debug builds.
 pub(crate) fn arena_enter() {
+    // The merge-name memo clears at the *next* run's entry rather than at exit:
+    // planning reads participants after inference tears the arena down.
     ACTIVE_ARENA.with(|slot| {
         let mut slot = slot.borrow_mut();
         debug_assert!(
@@ -568,6 +646,21 @@ pub(crate) fn arena_vars() -> Vec<Rc<InferVar>> {
     ACTIVE_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default())
 }
 
+/// The variable this run minted under `uid`, if the arena still holds it.
+///
+/// For a caller holding an id rather than the `Rc` — a compact position records which
+/// variables stood at it, and materializing one back needs the variable itself, with the
+/// level and telescope that decide whether generalization quantifies it.
+pub(crate) fn lookup(uid: &InferVarId) -> Option<Rc<InferVar>> {
+    ACTIVE_ARENA.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .iter()
+            .find(|v| v.uid == *uid)
+            .map(Rc::clone)
+    })
+}
+
 impl InferVar {
     /// Mint a fresh, unconstrained inference variable at `level`.
     ///
@@ -589,6 +682,7 @@ impl InferVar {
     pub fn fresh_in(level: Level, telescope: &Telescope) -> Rc<InferVar> {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
+            fun_kind: crate::ccl::ty::FunKindVar::fresh(),
             level,
             telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),
@@ -673,7 +767,7 @@ mod tests {
     /// rather than copying it.
     #[test]
     fn telescope_membership_and_sharing() {
-        use crate::ccl::Name;
+        use Name;
         let outer = Telescope::empty().extended(Name::raw("k"));
         let inner = outer.extended(Name::raw("n"));
         assert!(inner.contains(&Name::raw("k")));

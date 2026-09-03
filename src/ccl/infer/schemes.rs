@@ -96,6 +96,12 @@ pub struct OperatorSchemes {
     /// is required because both vars are shared across positions, which
     /// `normalize_annotation` (one fresh var per `Hole`) can't express.
     final_or_default: PolyScheme,
+    /// `∀𝑑 𝑣. (𝑑 ⤇ 𝑣) ⇒ Σ (σ : [𝑑]). σ ⤇ 𝑣` — [`Builtin::Box`], the way into a sum.
+    /// Inline-built because `𝑑` is shared between the parameter's domain and the sum's
+    /// single candidate — a position inside a [`TypeKind`] rather than a type position
+    /// `normalize_annotation` would reach — and `𝑣` between the parameter's codomain and
+    /// the sum's.
+    box_intro: PolyScheme,
     /// `∀ι ν. ((ι → ν), ι, ν) → ν` — the history value at the predecessor
     /// of the given position, or the default at the first position (the
     /// letrec guard accessor, [`Builtin::GetPrevSeq`]). Inline-built for
@@ -128,6 +134,44 @@ impl OperatorSchemes {
         const SCHEME_LEVEL: Level = 0;
         const BODY_LEVEL: Level = 1;
 
+        // Box: ∀δ ε. ((k: δ) ⤇ ε) ⇒ Σ (σ : [δ]). (k: σ) ⤇ ε — the sum over the one
+        // candidate δ, the argument's *domain*. `δ` occurs in the candidate list, which is
+        // an *invariant* position, so the domain is pinned exactly rather than widened on
+        // the way in; the element type `ε` is shared by the argument and the sum's
+        // codomain, which is what makes the sum a collection over one of its candidates
+        // rather than a value of one of them.
+        //
+        // The parameter is a **data function**, so boxing anything else is a type error at
+        // the call rather than a sum nothing can consume
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
+        //
+        // **Both functions name their element binder, and name it the same.** A dependent
+        // collection's element type mentions the index — `groupby` produces
+        // `(__gb_k: Int) ⤇ ({[0, 2] | … == __gb_k} ⤇ Int)` — so the argument's binder
+        // corresponds to `k` on the way in, and `ε` comes back mentioning `k`. The sum's
+        // body declares it on the witness domain, which is what the binder meant: it ranges
+        // over elements of whichever domain the witness picked. A body written `σ ⤇ ε`
+        // would leave `k` free, which the escape check reports as an out-of-scope binder.
+        let delta = fresh_var(BODY_LEVEL);
+        let epsilon = fresh_var(BODY_LEVEL);
+        let elem = crate::ccl::Name::from("__box_k");
+        let box_intro = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(
+                Type::Fun {
+                    name: Some(elem.clone()),
+                    fun_kind: crate::ccl::FunKind::Data(None),
+                    domain: Box::new(delta.clone()),
+                    codomain: Box::new(epsilon.clone()),
+                },
+                Type::sum_over(
+                    crate::ccl::ty::TypeKind::Enumerated(vec![delta]),
+                    Some(elem),
+                    epsilon,
+                ),
+            ),
+        );
+
         // BoolLogic: Bool → Bool → Bool
         let bool_logic = PolyScheme::mono(fun(
             prim(BaseType::Bool),
@@ -146,12 +190,14 @@ impl OperatorSchemes {
         // Sum: ∀α. (α ⤇ Int) → Int. The full operator type: consumes a
         // **collection** (a data function whose domain α is unconstrained) and
         // folds its Int codomain to an Int. Inline-built so α gets its own
-        // fresh var even though it's unconstrained.
+        // fresh var even though it's unconstrained. The parameter function is a
+        // consumer: data by construction, polymorphic in the slot, so a plain
+        // collection and a sum satisfy it alike ([`Type::consumer_fun`]).
         let alpha = fresh_var(BODY_LEVEL);
         let aggregate_sum = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                Type::data_fun(alpha.clone(), prim(BaseType::Int)),
+                Type::consumer_fun(alpha.clone(), prim(BaseType::Int)),
                 prim(BaseType::Int),
             ),
         );
@@ -162,7 +208,7 @@ impl OperatorSchemes {
         let gamma = fresh_var(BODY_LEVEL);
         let aggregate_max = PolyScheme::poly(
             SCHEME_LEVEL,
-            fun(Type::data_fun(alpha, gamma.clone()), gamma),
+            fun(Type::consumer_fun(alpha, gamma.clone()), gamma),
         );
 
         // FinalOrDefault: ∀α β. ((α ⤇ β), β) → β. The first field is a
@@ -222,13 +268,14 @@ impl OperatorSchemes {
                 Type::History {
                     value: Box::new(nu.clone()),
                     domain: Box::new(Type::Txn),
-                    kind: HistoryKind::Overwrite,
+                    history_kind: HistoryKind::Overwrite,
                 },
                 nu,
             ),
         );
 
         Self {
+            box_intro,
             bool_logic,
             concat,
             not_op,
@@ -310,6 +357,7 @@ impl OperatorSchemes {
     /// (or polymorphic only in independent vars).
     pub(super) fn builtin(&self, b: Builtin) -> Option<&PolyScheme> {
         match b {
+            Builtin::Box => Some(&self.box_intro),
             Builtin::FinalOrDefault => Some(&self.final_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             Builtin::GetPrevTxn => Some(&self.get_prev_txn),

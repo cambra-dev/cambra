@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::{FunKind, FunKindVar};
+use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
     BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet,
     Type,
@@ -94,6 +94,16 @@ pub enum ConstrainError {
         /// The function demanded at the position.
         rhs: Type,
     },
+    /// A type met a kind that does not admit it — the `𝑇 :: 𝐾` edge failing. Raised
+    /// where the type side becomes known, which is the first moment the question has an
+    /// answer: a `List(Int)` annotation demands `UIntRanges`, and a data source's domain
+    /// is not a range.
+    NotOfKind {
+        /// The type that arrived.
+        found: Type,
+        /// The type kind the position requires it to inhabit.
+        type_kind: TypeKind,
+    },
     /// Two collections over domains that are not the same domain met at one
     /// position. A data domain is invariant (see
     /// `src/ccl/design/type-inference.md`, "Data domains are invariant"), so
@@ -106,6 +116,24 @@ pub enum ConstrainError {
         lhs: Type,
         /// The domain demanded at the position.
         rhs: Type,
+    },
+    /// Collections over distinct domains met as **lower bounds** of one variable — the
+    /// arms of a conditional flowing into one join.
+    ///
+    /// Distinct from [`DataDomainMismatch`](Self::DataDomainMismatch), which is a *demand*:
+    /// there `rhs` is the domain a declaration or parameter requires and `lhs` is what was
+    /// supplied, so "expected/found" is the sentence. Lower bounds are peers — no arm
+    /// required anything of another — and reporting them as a demand picks one arbitrarily
+    /// and calls it the requirement.
+    ///
+    /// The same fact reached at coalesce, when no edge forced the question first, is
+    /// [`super::coalesce::CoalesceError::DomainJoinConflict`]. Both convert to one
+    /// [`InferError`](crate::ccl::infer::InferError), so which phase noticed does not
+    /// change what the user reads — it depends on an arm count and a domain shape, neither
+    /// of which is visible in the source.
+    DomainJoinConflict {
+        /// The domains that have no common answer.
+        domains: Vec<Type>,
     },
     /// An operand's type ruled out the last instance of a trait an operator
     /// requires — `1 > "a"`, or `\x -> x + 1` applied to a string.
@@ -150,6 +178,18 @@ pub struct ConstrainCache {
     /// and they do not have the same answer in all three
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
     derivation: Derivation,
+    /// **Γ for each side of the judgment** — what the witnesses in scope range over
+    /// (`src/ccl/design/type-inference.md`, "The witness context").
+    ///
+    /// Two of them because the sides are two types with their own binders: a reference in
+    /// `lhs` is classified by the Σs of `lhs`. Carried here rather than as parameters for the
+    /// reason `compact_go` carries its refinement scope on the walk's state — the descent is
+    /// already threading this, and every arm that does not bind pays nothing.
+    ///
+    /// **Swapped wherever the descent swaps the sides.** The domain edge relates `d1` to
+    /// `d0`, so the contexts trade places with the substitutions.
+    lctx: crate::ccl::ty::WitnessContext,
+    rctx: crate::ccl::ty::WitnessContext,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -174,6 +214,29 @@ pub enum Derivation {
 }
 
 impl Derivation {
+    /// Whether this derivation is the solve, where an edge *records*. Every other one is a
+    /// **check** over a settled tree: it reconciles two spellings and writes nothing, so its
+    /// answers cannot depend on the order the walls run in.
+    pub(super) fn is_live(self) -> bool {
+        self == Derivation::LiveSolve
+    }
+
+    /// Whether every binder a reference in this derivation's types names is one the walk can
+    /// enter — so a reference Γ does not classify is **free**.
+    ///
+    /// True over a self-contained tree, where free is a malformed type and the escape check
+    /// reports it. A sub-tree probe cannot say it, and a refinement predicate is not the
+    /// case that shows why: a predicate's type does bind the witnesses it names. **A
+    /// Σ-typed lambda's parameter** is the case. Its type is a bare `WitnessRef`, and the
+    /// sum that binds it rides the *lambda's* type rather than the parameter's
+    /// (`crate::ccl::infer::debug_assert_no_free_witness`), so a cut anywhere inside the
+    /// body leaves the index unclassifiable while the enclosing walk classifies it. The
+    /// probe has no verdict to give there and gives none; the whole-tree walls decide. Same
+    /// excuse, and the same reason, as [`enforces_closure`](Self::enforces_closure).
+    pub(crate) fn sees_every_binder(self) -> bool {
+        self != Derivation::SubTree
+    }
+
     /// Whether bounds recorded through this derivation must close against the
     /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
     /// Every derivation over a self-contained tree does. Only a sub-tree probe
@@ -204,6 +267,8 @@ impl ConstrainCache {
         Self {
             edges: HashMap::new(),
             derivation,
+            lctx: crate::ccl::ty::WitnessContext::default(),
+            rctx: crate::ccl::ty::WitnessContext::default(),
         }
     }
 
@@ -213,6 +278,39 @@ impl ConstrainCache {
     /// than recursing forever.
     fn edge_bridges(&mut self, lhs: Type, rhs: Type) -> &mut Vec<(Subst, Subst)> {
         self.edges.entry((lhs, rhs)).or_default()
+    }
+
+    /// Start both sides' Γ from `ctx` — for a caller that knows what encloses the types it
+    /// is relating, which an edge drawn between parts of a tree does and this cache cannot.
+    pub fn seed_context(&mut self, ctx: &crate::ccl::ty::WitnessContext) {
+        self.lctx = ctx.clone();
+        self.rctx = ctx.clone();
+    }
+
+    /// Run `f` under each side's Γ extended by that side's binders — the judgment made
+    /// inside a Σ is made under what the Σ binds.
+    fn under<R>(
+        &mut self,
+        lhs: &[crate::ccl::ty::Witness],
+        rhs: &[crate::ccl::ty::Witness],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let (l, r) = (self.lctx.clone(), self.rctx.clone());
+        self.lctx = l.extended(lhs);
+        self.rctx = r.extended(rhs);
+        let out = f(self);
+        self.lctx = l;
+        self.rctx = r;
+        out
+    }
+
+    /// Run `f` with the two sides traded, for a descent that relates them the other way
+    /// round — the contravariant domain edge, which already swaps the substitutions.
+    fn swapped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        std::mem::swap(&mut self.lctx, &mut self.rctx);
+        let out = f(self);
+        std::mem::swap(&mut self.lctx, &mut self.rctx);
+        out
     }
 }
 
@@ -236,70 +334,84 @@ pub fn constrain_subtype(
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
 }
 
-/// Constrain the kind edge `k0 <: k1` over the two **incomparable** points
-/// `Data` and `Compute`.
+/// [`constrain_subtype`], with both sides judged **under `binders`**.
 ///
-/// The kinds carry no order, so subtyping on them is *equality*: a function's kind
-/// is a property of what the value is, and neither reading is a weaker version
-/// of the other. A capability is not a collection with the rows forgotten (it has
-/// no rows), and a collection is not a capability that happens to be enumerable
-/// (its domain is invariant, so it does not obey the contravariant domain rule a
-/// capability does). Either mismatch is therefore a failure, `Err(())`, which the
-/// caller raises as [`ConstrainError::KindMismatch`] with the full function types
-/// for the diagnostic.
+/// For an edge drawn between parts of a type the caller has already taken apart: a function's
+/// domain compared on its own is a reference stripped of the Σ that classifies it, so the
+/// caller that still holds the function says what binds it
+/// (`src/ccl/design/type-inference.md`, "The witness context").
+pub fn constrain_subtype_under(
+    lhs: &Type,
+    rhs: &Type,
+    lhs_binders: &[crate::ccl::ty::Witness],
+    rhs_binders: &[crate::ccl::ty::Witness],
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    cache.under(lhs_binders, rhs_binders, |cache| {
+        constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
+    })
+}
+
+/// Relate two function kinds by **recording the edge**, and nothing else.
 ///
-/// A variable edge *pins* rather than bounds: a concrete kind on either side of
-/// an edge fixes the variable to it ([`FunKindVar::pin_compute`] /
-/// [`FunKindVar::pin_data`]). A var pinned to *both* points is the conflict —
-/// surfaced at coalesce, never here.
+/// Whether the two are compatible, how many binders each is over, and what those binders
+/// range over are all read off the bounds once the kind graph is closed — not decided here,
+/// where a kind may not have been reached yet. The binder correspondence between them is
+/// derived then too, for the same reason: its positions do not exist until an arity does.
 ///
-/// On success, reports whether the two domains relate **invariantly**, which is
-/// what the caller needs next and what neither side alone reliably spells: one
-/// may be a `FunKind::Var` this edge pinned a moment ago. Deciding it here rather
-/// than at the caller also keeps it with the case analysis that settled it — a
-/// caller-side "is either side `Data`?" happens to agree today only because a var
-/// reaches `Data` only from a concrete `Data` on the other end.
-fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<bool, ()> {
-    use FunKind::*;
+/// A concrete pair is the one thing settled at the edge, since neither side can learn
+/// anything later: two kinds that denote different points of the lattice have no common
+/// function, whichever side is which.
+fn constrain_fun_kind(
+    k0: &FunKind,
+    k1: &FunKind,
+    lhs: &Type,
+    rhs: &Type,
+) -> Result<(), ConstrainError> {
+    let mismatch = || ConstrainError::KindMismatch {
+        lhs: lhs.clone(),
+        rhs: rhs.clone(),
+    };
     match (k0, k1) {
-        // Reflexivity is the whole of the concrete relation.
-        (Data, Data) => Ok(true),
-        (Compute, Compute) => Ok(false),
-        // Either mismatch is a rejection: a capability supplied where a
-        // collection is demanded, or a collection where a capability is.
-        (Compute, Data) | (Data, Compute) => Err(()),
-        // A concrete kind at either end pins the variable to it, so the edge is
-        // that kind however the two sides were spelled.
-        (Compute, Var(v)) | (Var(v), Compute) => {
-            v.pin_compute();
-            Ok(false)
+        // **Two variables meeting are one kind**, so the edge is recorded on both: the
+        // lattice is flat, an edge fixes a variable rather than bounding it, and which side
+        // a fact arrived on says nothing about which variable it is about
+        // (`src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's
+        // kind"). Recording one side leaves the other reading nothing, so a pin that
+        // reaches either end after the edge is drawn never crosses it.
+        (FunKind::Var(v0), FunKind::Var(v1)) => {
+            v0.record(k1.clone(), false);
+            v1.record(k0.clone(), true);
         }
-        (Data, Var(v)) | (Var(v), Data) => {
-            v.pin_data();
-            Ok(true)
+        (FunKind::Var(v), other) | (other, FunKind::Var(v)) => {
+            v.record(other.clone(), matches!(k1, FunKind::Var(_)));
         }
-        // The edge **relates** the two kinds; it does not resolve them. What the
-        // pair resolves to is not known here, so recording the edge and joining
-        // over it at the read ([`FunKindVar::pin`]) is what makes the answer a
-        // function of the whole constraint set rather than of its order. Copying
-        // each side's pin onto the other instead would answer from the pins that
-        // happen to have arrived, and drop every one that arrives later: `a—b`
-        // recorded while both are unpinned, then `a` pinned, would leave `b`
-        // unpinned, while the other order pinned both — the two coalescing to
-        // different arrows. Deferring the join to the read is the same rule the
-        // domain combination follows, and for the same reason: a value the fold is
-        // still accumulating cannot be read pairwise
-        // ([`super::compact::KindMerge`]).
-        //
-        // Still not a *data* edge (`Ok(false)`): whether the domains must join
-        // losslessly is a question about what the edge demands, and this edge
-        // demands nothing of either kind. Two `Data`-pinned variables therefore
-        // reach the lossless-domain rule through their pins, not through here.
-        (Var(a), Var(b)) => {
-            FunKindVar::relate(a, b);
-            Ok(false)
-        }
+        // Both concrete: a capability is not a collection, a plain collection is not a sum —
+        // entering one is a term — and two sums of different width are two types. Nothing
+        // arriving later can change any of that.
+        _ if k0.point() == k1.point() => return Ok(()),
+        _ => return Err(mismatch()),
     }
+    // **A kind required to be two points is rejected at the edge that completed it.** A
+    // consumer is minted pinned `Data` ([`FunKind::fresh_data`]), so a capability reaching
+    // one is this rejection — the same one a concrete pair is, reported where both sides can
+    // still be named rather than left for coalesce, which reaches a conflicted variable only
+    // where some position happens to materialize from it.
+    //
+    // **However many variables lie between the two ends.** [`FunKindVar::resolved`] folds the
+    // whole component, so one contribution settles nothing and a variable in the middle
+    // hides nothing: the question this asks is the same question at every edge. What the
+    // arms above must not do is *copy* one side's point onto the other — that answers from
+    // the points that happen to have arrived and drops every one that arrives later, which
+    // is why the edge is recorded and the join taken at the read.
+    //
+    // Reading it here is sound because `Conflict` **absorbs** in [`KindPin::join`] and
+    // contributions are only ever appended, so a component that has reached it can never
+    // leave, and the first edge to observe it is the one that completed it.
+    if k0.resolved() == KindPin::Conflict || k1.resolved() == KindPin::Conflict {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -446,6 +558,194 @@ fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
     }
 }
 
+/// Two lower bounds that are **collections over distinct domains**, if the set contains
+/// any such pair.
+///
+/// Their join is a sum, and a sum is entered by a term — so with no subtyping edge into one, there
+/// is no type above both, and the author has to say which arms are boxed. Reported here
+/// rather than left to the pointwise fallback because that fallback relates each
+/// collection to the consumer separately, which is the silent narrowing a lossless data
+/// join rules out, and which does not terminate.
+fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
+    let mut seen: Vec<Type> = Vec::new();
+    for low in lows {
+        let Type::Fun {
+            fun_kind: FunKind::Data(..),
+            domain,
+            ..
+        } = &low.ty
+        else {
+            continue;
+        };
+        // A **witness-indexed** collection joins losslessly — its sum keeps every
+        // domain — so it is not a party to this conflict. A domain that is not yet a
+        // concrete type is not one either: invariance between variable-involving
+        // domains is decided at materialization, in the compact domain lattice
+        // (`src/ccl/design/type-inference.md`, "Materialization").
+        if low.ty.sum().is_some() {
+            continue;
+        }
+        let d = low.ty_subst.apply_type(domain);
+        if matches!(d, Type::WitnessRef(_) | Type::Infer(_)) {
+            continue;
+        }
+        if let Some(prev) = seen.iter().find(|p| **p != d) {
+            return Some((prev.clone(), d));
+        }
+        if !seen.contains(&d) {
+            seen.push(d);
+        }
+    }
+    None
+}
+
+/// Discharge `𝛼 :: 𝐾` against everything recorded below `𝛼`.
+///
+/// A kinding edge is answerable the moment its *type* side is known, and a variable's
+/// lower bounds are where a type arrives at it. So this runs where a lower is recorded and
+/// where a kind is, and asks the same question from both — whichever arrives second is the
+/// one that completes the pair.
+///
+/// A lower that is itself a variable **inherits** the edge rather than answering it. The
+/// constraint is a conjunction with no polarity of its own (`src/ccl/design/type-inference.md`,
+/// "An unresolved candidate becomes a kinding edge"), so it travels down every path a
+/// type could arrive by, and is answered wherever one does.
+pub(super) fn discharge_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> {
+    let (lows, kinds) = {
+        let b = v.bounds.borrow();
+        (Rc::clone(b.lower()), b.type_kinds.clone())
+    };
+    if kinds.is_empty() || lows.is_empty() {
+        return Ok(());
+    }
+    for k in &kinds {
+        for low in lows.iter() {
+            match low.ty.peel_refinements() {
+                Type::Infer(w) => {
+                    let mut b = w.bounds.borrow_mut();
+                    if !b.type_kinds.contains(k) {
+                        b.type_kinds.push(k.clone());
+                    }
+                }
+                // `admits` decides against a stated kind and records against a variable
+                // one, so both answers are reached the same way.
+                t if !k.admits(t) => {
+                    return Err(ConstrainError::NotOfKind {
+                        found: t.clone(),
+                        type_kind: k.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The **kind premise** of the Σ rule: is every domain `sub` admits also admitted by `sup`?
+///
+/// A kind denotes a set of domains, and containment is that inclusion — no variance and no
+/// per-flavour case. What differs between kinds is only how each *names* its set, and that
+/// is what decides whether a membership question is answered here or drawn as an edge
+/// ([`domain_in_kind`]).
+///
+/// **Both sides' fun kinds must state a type kind**, which is why the caller asks
+/// [`FunKind::sum_binders`] rather than reading one off a variable. A fun kind variable
+/// states none: [`crate::ccl::ty::FunKindVar::binder_kind`] derives one from what has
+/// reached the variable so far, and that answer moves as the solve proceeds — it widens as
+/// arms arrive, and *narrows* the moment the first arm displaces the demand-above fallback.
+/// A verdict against it would depend on when the edge was drawn. This is the same reason
+/// [`constrain_fun_kind`] records against a variable instead of deciding.
+fn constrain_witness_kinds(
+    sub: &TypeKind,
+    sup: &TypeKind,
+    sl: &Subst,
+    sr: &Subst,
+    lhs: &Type,
+    rhs: &Type,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    let mismatch = || ConstrainError::Mismatch {
+        lhs: lhs.clone(),
+        rhs: rhs.clone(),
+    };
+    match (sub, sup) {
+        // ⊤ admits every domain, so nothing is left to ask.
+        (_, TypeKind::Type) => Ok(()),
+        // A listing names its members, so containment is membership, once per member.
+        (TypeKind::Enumerated(subs), _) => {
+            for d in subs {
+                domain_in_kind(d, sup, sl, sr, lhs, rhs, cache)?;
+            }
+            Ok(())
+        }
+        // **Two bounds are ordered by their bounds.** Every domain below `a` is below `b`
+        // exactly when `a <: b`, which is one ordinary covariant edge — and the edge is
+        // what determines an unannotated `b`.
+        (TypeKind::SubtypesOf(a), TypeKind::SubtypesOf(b)) => constrain_go(a, b, sl, sr, cache),
+        (TypeKind::UIntRanges, TypeKind::UIntRanges) => Ok(()),
+        // A description names no members to enumerate, so nothing below it is known to lie
+        // in a listing or in a narrower description.
+        _ => Err(mismatch()),
+    }
+}
+
+/// Is `d` — one candidate of a listing — a member of `sup`?
+///
+/// Three answers, one per way a kind names its set:
+///
+/// * A **listing** names its members, so membership is type equality. A candidate *is* a
+///   domain and data domains are invariant ([Data domains are
+///   invariant](`src/ccl/design/type-inference.md`)), so a refined range is a different
+///   candidate from the range it refines, in either direction.
+/// * A **bound** describes its members by a type, so membership is an ordinary subtyping
+///   edge — and the parameter is the one place information can flow *in*, which is what
+///   lets `Map(_, 𝑉)` take its key from the domains that reach it. Deciding this
+///   structurally instead would answer "an undecided bound admits anything" and the key
+///   would be determined by nothing.
+/// * A **parameterless description** states a property of its members, which is
+///   [`TypeKind::admits`] — asked on `d` whole, since a refined domain is not the domain it
+///   refines.
+///
+/// A candidate that is still a **variable** has no shape for a description to read, so it
+/// takes the kinding edge `𝛼 :: 𝐾` and is answered wherever a type reaches it
+/// ([`discharge_kinds`]).
+#[allow(clippy::too_many_arguments)]
+fn domain_in_kind(
+    d: &Type,
+    sup: &TypeKind,
+    sl: &Subst,
+    sr: &Subst,
+    lhs: &Type,
+    rhs: &Type,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    match sup {
+        TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache),
+        TypeKind::Enumerated(sups) if sups.contains(d) => Ok(()),
+        TypeKind::Enumerated(_) => Err(ConstrainError::Mismatch {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        }),
+        described => match d {
+            Type::Infer(v) => {
+                {
+                    let mut b = v.bounds.borrow_mut();
+                    if !b.type_kinds.contains(described) {
+                        b.type_kinds.push(described.clone());
+                    }
+                }
+                discharge_kinds(v)
+            }
+            _ if described.admits(d) => Ok(()),
+            _ => Err(ConstrainError::NotOfKind {
+                found: d.clone(),
+                type_kind: described.clone(),
+            }),
+        },
+    }
+}
+
 /// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
 /// both mapping into the constraint's shared ambient frame.
 ///
@@ -465,6 +765,32 @@ fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
 /// the only inversions anywhere are of renames (lossless).
 /// This is what lets a non-invertible discharge survive crossing a consumer
 /// edge that was recorded before the producer's content arrived.
+/// Do two witness kinds list the same candidates, **resolved**?
+///
+/// What an index *is* is what it ranges over, and a candidate is an ordinary type: a scheme
+/// instantiation spells one as an inference variable, so one binder reaching a check by two
+/// routes carries its kind under two spellings — `[?25]` at one occurrence and `[[0, 2]]` at
+/// another. Comparing the spellings answers that a binder differs from itself.
+///
+/// Deduplicated after resolving, and ordered canonically, for the reason materialization does
+/// both: a listing is a **set**, and two candidates spelled as distinct variables are one
+/// candidate once the variables answer.
+fn same_candidates(a: &TypeKind, b: &TypeKind) -> bool {
+    fn resolved(k: &TypeKind) -> TypeKind {
+        let TypeKind::Enumerated(candidates) = k else {
+            return k.clone();
+        };
+        let mut out: Vec<Type> = candidates
+            .iter()
+            .map(|c| crate::ccl::infer::solve::resolve_var_type(c).unwrap_or_else(|_| c.clone()))
+            .collect();
+        out.sort_by_cached_key(ToString::to_string);
+        out.dedup();
+        TypeKind::Enumerated(out)
+    }
+    resolved(a) == resolved(b)
+}
+
 fn constrain_go(
     lhs: &Type,
     rhs: &Type,
@@ -546,27 +872,75 @@ fn constrain_go_impl(
         (
             Type::Fun {
                 name: n0,
-                kind: k0,
+                fun_kind: k0,
                 domain: d0,
                 codomain: c0,
             },
             Type::Fun {
                 name: n1,
-                kind: k1,
+                fun_kind: k1,
                 domain: d1,
                 codomain: c1,
             },
         ) => {
-            // The kind edge (see `constrain_kind`). `Data` and `Compute` are
-            // incomparable, so the edge is an equation: a concrete mismatch
-            // either way is the rejection, and a `FunKind` var is pinned here or
-            // peered and resolved at coalesce.
-            let Ok(invariant_domains) = constrain_kind(k0, k1) else {
-                return Err(ConstrainError::KindMismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                });
+            // The kind edge (see [`constrain_fun_kind`]): recorded, not answered. What the two
+            // kinds turn out to be, and how their binders correspond, is read once the kind
+            // graph is closed.
+            constrain_fun_kind(k0, k1, lhs, rhs)?;
+            // **Binders correspond by position across this edge.** A sum's binders are its
+            // kind's positions, so position `i` of one side is position `i` of the other,
+            // and the edge carries that correspondence in its own substitution — the Σ
+            // analog of the Pi binder rename below. Unlike a Pi binder a Σ binder scopes
+            // over the *domain* as well, so it is in hand before the domain edge, not only
+            // the codomain one.
+            //
+            // [`FunKind::named_binders`], not `bound_witnesses`: every bound this edge goes
+            // on to record carries the rename, and a bound outlives the walk that drew it.
+            // A position answers with the one name it settles to, so what lands in the
+            // graph is an ordinary binder — nothing that has to be reconciled later, and
+            // nothing naming a kind variable a freshening could copy out from under it.
+            //
+            // What each side's fun kind states, so one that has not resolved to a sum
+            // states nothing and the edge is the ordinary function rule.
+            // **The Σ-width premise**, per binder position. Asked of the type kinds the two
+            // fun kinds *state* — a variable states none, and a verdict against a derived
+            // type kind would
+            // depend on when the edge was drawn ([`constrain_witness_kinds`]). Live only:
+            // after inference an edge reconciles two spellings of a settled tree and
+            // records nothing, and the witness comparison there is already the α-blind
+            // candidate check (`src/ccl/design/type-inference.md`, "A check is α-blind").
+            if cache.derivation.is_live()
+                && let (Some(w0), Some(w1)) = (k0.sum_binders(), k1.sum_binders())
+            {
+                for (a, b) in w0.iter().zip(w1.iter()) {
+                    constrain_witness_kinds(
+                        &a.type_kind(),
+                        &b.type_kind(),
+                        sl,
+                        sr,
+                        lhs,
+                        rhs,
+                        cache,
+                    )?;
+                }
+            }
+            let corresponding;
+            let sl = {
+                let (b0, b1) = (k0.named_binders(), k1.named_binders());
+                if b0.is_empty() || b1.is_empty() {
+                    sl
+                } else {
+                    corresponding = b0.iter().zip(b1.iter()).fold(sl.clone(), |acc, (a, b)| {
+                        acc.extended_witness_rename(a.id(), b.id())
+                    });
+                    &corresponding
+                }
             };
+            // **Invariance is a property of the data-domain position**, so it is asked of
+            // the position. A kind nothing has reached yet is not known to be a collection,
+            // and the reverse obligation a variable's domain owes is discharged where every
+            // contribution to it meets.
+            let invariant_domains = k0.point().is_data() || k1.point().is_data();
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
@@ -631,42 +1005,62 @@ fn constrain_go_impl(
             // parameter, nothing can enumerate it, and accepting more inputs than
             // demanded only under-promises. A **data** domain is *invariant* — it is
             // the loop bound op-conversion emits and it reappears in every
-            // eliminator's result, so narrowing or widening it changes which rows the
+            // consumer's result, so narrowing or widening it changes which rows the
             // consumer reads (`src/ccl/design/type-inference.md`, "Data domains are
-            // invariant"). Invariance is spelled the only order-independent way it
-            // can be, as both edges; anything conditional on *when* the edge fires
-            // would make typing depend on constraint order.
+            // invariant").
             //
-            // Emitting both directions does not preempt a domain join. Two domains
-            // meeting at one variable is a join like any other, and the join of two
-            // data functions is a Σ over the candidate domains — at a domain position
-            // exactly as at a `Case` result. Until Σ is representable that join has
-            // no answer, which is the error below; the same fact reaches coalesce as
-            // `CoalesceError::DomainJoinConflict` when no edge forces it earlier.
+            // Between concrete domains the invariance is an equation — both edges. A
+            // domain edge with a variable on either side records its bound in the
+            // native direction and asserts no equation: n arm domains reaching one
+            // consumer's domain variable satisfy the invariant without being equal
+            // to each other, and the reverse obligation is discharged at
+            // materialization, where every contribution to the variable meets in
+            // the compact domain lattice (`src/ccl/design/type-inference.md`,
+            // "Materialization"). Whether a side is a variable is a property of the
+            // edge, not of when it fires, so both spellings stay order-independent.
             //
             // The kind edge above reports which rule its two sides call for, so
             // this asks one question rather than inspecting both spellings — a var
             // it just pinned to `Data` counts as a collection here like any other.
-            if invariant_domains {
-                if constrain_go(d1, d0, sr, sl, cache).is_err()
-                    || constrain_go(d0, d1, sl, sr, cache).is_err()
-                {
-                    return Err(ConstrainError::DataDomainMismatch {
-                        lhs: (**d0).clone(),
-                        rhs: (**d1).clone(),
-                    });
+            // **The body is judged under what this function binds.** Both the domain and the
+            // codomain sit inside a Σ's binders, so Γ gains them for the descent and loses
+            // them on the way out (`src/ccl/design/type-inference.md`, "The witness
+            // context").
+            let (b0, b1) = (k0.named_binders(), k1.named_binders());
+            cache.under(&b0, &b1, |cache| {
+                if invariant_domains {
+                    // Swapped with the substitutions: this edge relates the sides the other
+                    // way round, and a reference in `d1` is classified by `d1`'s binders.
+                    let ok = cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache).is_ok())
+                        && (matches!(**d0, Type::Infer(_))
+                            || matches!(**d1, Type::Infer(_))
+                            || constrain_go(d0, d1, sl, sr, cache).is_ok());
+                    if !ok {
+                        return Err(ConstrainError::DataDomainMismatch {
+                            lhs: (**d0).clone(),
+                            rhs: (**d1).clone(),
+                        });
+                    }
+                } else {
+                    cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache))?;
                 }
-            } else {
-                constrain_go(d1, d0, sr, sl, cache)?;
-            }
-            constrain_go(
-                c0_opened.as_ref().map_or(&**c0, |c| c),
-                c1_opened.as_ref().map_or(&**c1, |c| c),
-                &cod_sl,
-                sr,
-                cache,
-            )
+                constrain_go(
+                    c0_opened.as_ref().map_or(&**c0, |c| c),
+                    c1_opened.as_ref().map_or(&**c1, |c| c),
+                    &cod_sl,
+                    sr,
+                    cache,
+                )
+            })
         }
+
+        // (Two sums are related by the function arm above and nothing else: the width
+        // premise rides it as [`constrain_witness_kinds`], and there is no arm that enters a
+        // sum (a sum is introduced by `box`, a term) or eliminates one (a sum reaches a
+        // consumer by pinning its kind variable, never by subsumption) —
+        // `src/ccl/design/type-inference.md`, "Subtyping for sums". No arm here dispatches
+        // on the kind, which is why a new kind needs no new arm: containment is the only
+        // kind-dependent question, and it is asked in one place.)
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
         // subtype, so every position rhs requires must exist in lhs.
@@ -707,6 +1101,98 @@ fn constrain_go_impl(
             Ok(())
         }
 
+        // **A reference denotes a runtime choice, so two of them relate by identity.**
+        // `σ` means "whichever domain `σ` turned out to be", and two binders are two
+        // independent choices — so one is below the other only when they are the same
+        // binder. Comparing their *kinds* instead would make two collections over the same
+        // candidates interchangeable when the program picked differently.
+        //
+        // Two sums therefore have *corresponding* binders, never identical ones, and the
+        // correspondence rides this edge's substitutions ([`Subst::apply_witnesses`])
+        // exactly as a Pi binder's does. Reaching here uncorresponded is two domains where
+        // one was demanded.
+        //
+        // **A check is α-blind** (`src/ccl/design/type-inference.md`, "A check is
+        // α-blind"). After inference an edge reconciles two spellings of a settled tree and
+        // records nothing, and two derivations of one consumption need not have agreed on a
+        // name: a comprehension's result binds its own index and the collection it iterates
+        // binds that collection's, and the two are one index. So a check asks what a name
+        // asks *for* — the candidates the reference ranges over — while the live solve, which
+        // is what makes the choice, asks identity.
+        (Type::WitnessRef(a), Type::WitnessRef(b)) => {
+            let (a, b) = (
+                sl.apply_witnesses(&Type::WitnessRef(*a)),
+                sr.apply_witnesses(&Type::WitnessRef(*b)),
+            );
+            let (Type::WitnessRef(a), Type::WitnessRef(b)) = (&a, &b) else {
+                unreachable!("a witness renaming maps a reference to a reference")
+            };
+            // **Each side's own Γ classifies its own reference.** A reference is a name, so
+            // what it ranges over is read where it is bound.
+            let same = if cache.derivation.is_live() {
+                a == b
+            } else {
+                a == b
+                    || match (cache.lctx.type_kind_of(a), cache.rctx.type_kind_of(b)) {
+                        (Some(ka), Some(kb)) => same_candidates(&ka, &kb),
+                        // A reference Γ does not classify has no kind to compare. Over a
+                        // whole tree that means it is free, which the escape check reports
+                        // on the type it sits in. Over a **sub-tree** the binder may be in
+                        // the context the cut removed — a Σ-typed lambda's parameter is a
+                        // bare reference bound by the lambda's own type — so the probe has
+                        // no verdict to give and gives none
+                        // ([`Derivation::sees_every_binder`]).
+                        _ => !cache.derivation.sees_every_binder(),
+                    }
+            };
+            if same {
+                Ok(())
+            } else {
+                Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                })
+            }
+        }
+
+        // **A concrete type meeting a witness constrains every candidate.** The witness
+        // is one of its kind's domains and the choice is not the demand's to make, so the
+        // demand must hold whichever it is: one invariant edge per listed candidate.
+        // Invariance is what rejects the silent narrowing — two distinct candidates
+        // cannot both equal the demand — and a singleton listing is the ordinary edge to
+        // its sole domain, with no cardinality read anywhere. A described kind lists
+        // nothing to instantiate at and is a mismatch. A variable is not a concrete
+        // type: it falls through to the variable arms below, and the reference lands in
+        // its bounds like any other leaf.
+        (Type::WitnessRef(w), other) | (other, Type::WitnessRef(w))
+            if !matches!(other, Type::Infer(_)) =>
+        {
+            // Whichever side the reference came from is the Γ that classifies it.
+            let gamma = if matches!(lhs, Type::WitnessRef(_)) {
+                &cache.lctx
+            } else {
+                &cache.rctx
+            };
+            // **A candidate that has not resolved carries the demand itself.** It is an
+            // ordinary inference variable sitting in the listing (`[?25]`), so the edges
+            // below record against it like any other bound, and what the position ends up
+            // ranging over has to admit this type. There is nothing to defer and nowhere
+            // separate to defer it to.
+            let Some(TypeKind::Enumerated(candidates)) = gamma.type_kind_of(w) else {
+                return Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                });
+            };
+            for c in &candidates {
+                constrain_go(c, other, sl, sr, cache)?;
+                constrain_go(other, c, sr, sl, cache)?;
+            }
+            Ok(())
+        }
+
+        // Variant: width-subtyping is the dual. lhs's tags must all appear
+        // in rhs (with a payload subtype check). Payload depth is covariant.
         // Variant: width-subtyping is the dual of records — lhs's tags must all
         // appear in rhs, each with a payload subtype check. Payload depth is
         // covariant.
@@ -764,12 +1250,12 @@ fn constrain_go_impl(
             Type::History {
                 value: v0,
                 domain: d0,
-                kind: k0,
+                history_kind: k0,
             },
             Type::History {
                 value: v1,
                 domain: d1,
-                kind: k1,
+                history_kind: k1,
             },
         ) if k0 == k1 => {
             constrain_go(v0, v1, &Subst::id(), &Subst::id(), cache)?;
@@ -801,8 +1287,33 @@ fn constrain_go_impl(
                 crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.derivation);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
-                Rc::clone(s.lower())
+                let lows = Rc::clone(s.lower());
+                drop(s);
+                // **A function-shaped bound carries a kind, so it lands on this variable's.**
+                // Unconditional: a variable no function reaches keeps an unpinned kind
+                // nobody consults, so nothing here dispatches on what the variable will turn
+                // out to be.
+                if let Some(k) = rhs.fun_kind_of() {
+                    lv.fun_kind.record(k, false);
+                }
+                lows
             };
+            // **No join here.** A variable's lower bounds are joined where every other
+            // join is: at compaction, off these same bounds. Assembling one here as well
+            // would compute it twice, by two rules, and — because this arm runs again on
+            // every arriving upper edge — recompute it, which is what made the joined
+            // sum's binder need an identity stable under recomputation.
+            // A declined join over **collection** lower bounds is a type error, not a
+            // reason to fall back. Relating two collections over distinct domains to one
+            // consumer pointwise is exactly what the join exists to prevent — the
+            // consumer's domain would have to lie below both — and the transitive closure
+            // does not terminate on it. Now that only sums join, this is the case `box`
+            // is there to resolve: box each arm, and the arms join as sums.
+            if let Some(domains) = distinct_data_domains(&lows) {
+                return Err(ConstrainError::DomainJoinConflict {
+                    domains: vec![domains.0, domains.1],
+                });
+            }
             // A var-var edge carries the watch downward (see `link_watches`); the
             // closure below only re-offers `lv`'s lowers to `rhs` when the levels let
             // this arm run, which is precisely what a `let` RHS breaks.
@@ -836,8 +1347,22 @@ fn constrain_go_impl(
                 crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.derivation);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
-                Rc::clone(s.upper())
+                let ups = Rc::clone(s.upper());
+                drop(s);
+                if let Some(k) = lhs.fun_kind_of() {
+                    rv.fun_kind.record(k, true);
+                }
+                ups
             };
+            // The arriving type may be the answer to a kinding edge this variable holds.
+            discharge_kinds(rv)?;
+            // No join here, and none is needed: a candidate arriving at a variable that
+            // already holds others reaches the joining arm above when *its* own outgoing
+            // edge is drawn, and a variable's denotation is read from its lower bounds
+            // whenever that happens. Joining here as well would mean re-deriving a join
+            // per arriving candidate, and the pointwise closure this arm performs is
+            // exactly right for the edge it draws.
+            //
             // Deliver the contribution to any trait obligation this variable is an
             // operand of. This arm is the *only* hook site needed: an operand type
             // reaches an obligation as a lower bound, and the closure below plus its
@@ -902,14 +1427,14 @@ fn constrain_go_impl(
             Type::History {
                 value,
                 domain,
-                kind: HistoryKind::Append,
+                history_kind: HistoryKind::Append,
             },
             _,
         ) => {
             let chan = Type::Fun {
                 name: None,
                 // A feed's read view is a collection stream: a data function.
-                kind: FunKind::Data,
+                fun_kind: FunKind::Data(None),
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -926,13 +1451,13 @@ fn constrain_go_impl(
             Type::History {
                 value,
                 domain,
-                kind: HistoryKind::Append,
+                history_kind: HistoryKind::Append,
             },
         ) => {
             let chan = Type::Fun {
                 name: None,
                 // A feed's read view is a collection stream: a data function.
-                kind: FunKind::Data,
+                fun_kind: FunKind::Data(None),
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -946,7 +1471,7 @@ fn constrain_go_impl(
         (
             _,
             Type::History {
-                kind: HistoryKind::Append,
+                history_kind: HistoryKind::Append,
                 ..
             },
         ) => Err(ConstrainError::NotAFeed {
@@ -1115,12 +1640,25 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::SharedHole(_) => ty.clone(),
         Type::Fun {
             name,
-            kind,
+            fun_kind,
             domain: d,
             codomain: c,
         } => Type::Fun {
             name: name.clone(),
-            kind: kind.clone(),
+            // A sum's **candidates** are an invariant position, so they cross a level
+            // boundary through two-way proxies rather than the polar one-way
+            // approximation — the same reason a `History` payload does. Σ-width matches
+            // candidates *by value*, so neither direction of a candidate's bounds is the
+            // "unused" one: a one-way proxy inherits whichever side the polarity picked
+            // and silently drops the other, which for a candidate is usually fatal.
+            fun_kind: match fun_kind {
+                FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
+                    ws.iter()
+                        .map(|w| w.map_types(|t| extrude_invariant(t, target_level, cache)))
+                        .collect(),
+                ))),
+                other => other.clone(),
+            },
             domain: Box::new(extrude(d, !pol, target_level, cache)),
             codomain: Box::new(extrude(c, pol, target_level, cache)),
         },
@@ -1144,17 +1682,18 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         Type::Refinement(inner, r) => {
             Type::refined(extrude(inner, pol, target_level, cache), r.clone())
         }
+        Type::WitnessRef(_) => ty.clone(),
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
         Type::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => Type::History {
             value: Box::new(extrude_invariant(value, target_level, cache)),
             domain: Box::new(extrude_invariant(domain, target_level, cache)),
-            kind: *kind,
+            history_kind: *history_kind,
         },
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&(tv.uid, pol)) {
@@ -1167,6 +1706,22 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             let nvs = InferVar::fresh_in(target_level, &tv.telescope);
             cache.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
+            // Kinding constraints ride along at **both** polarities, unlike the bounds
+            // below. The proxy stands in for the original wherever the outer scope reads
+            // it, and "must inhabit 𝐾" is a property of what that resolves to, not of a
+            // direction of flow — a one-sided copy would let a scope boundary launder
+            // the constraint away. The kind's own type children extrude with it: a
+            // parameterized kind carries types like any other position.
+            {
+                let carried: Vec<_> = tv
+                    .bounds
+                    .borrow()
+                    .type_kinds
+                    .iter()
+                    .map(|k| k.map_children(|t| extrude(t, pol, target_level, cache)))
+                    .collect();
+                nvs.bounds.borrow_mut().type_kinds = carried;
+            }
 
             // Each branch snapshots only the list it does *not* push to — the
             // positive one seeds from `lower` and writes `upper`, the negative
@@ -1241,9 +1796,9 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             //    two-way proxy under both keys — reuse it wholesale.
             //  * A prior *polar* extrusion (`extrude` above) minted a proxy
             //    under a single key with only *one* bound link. Reusing that
-            //    proxy naively — as this branch used to — would hand the
-            //    invariant position a one-way proxy, silently dropping the
-            //    other bound direction across the level boundary. Instead,
+            //    proxy naively would hand the invariant position a one-way
+            //    proxy, silently dropping the other bound direction across the
+            //    level boundary. Instead,
             //    reuse the proxy (it is the same original variable) but add the
             //    link the polar extrusion omitted, upgrading it to two-way.
             let cached_pos = cache.get(&(tv.uid, true)).cloned();
@@ -1338,7 +1893,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
 
 #[cfg(test)]
 mod tests {
-    use crate::ccl::ty::{FunKindVar, KindPin};
+    use crate::ccl::ty::FunKindVar;
     use std::rc::Rc;
 
     use smol_str::SmolStr;
@@ -1417,6 +1972,41 @@ mod tests {
         let _ = constrain_subtype(&escaped, &v, &mut cache);
     }
 
+    /// Two references to one index, spelled under different binders, at a cut where Γ
+    /// classifies only one of them.
+    ///
+    /// The shape is a comprehension over a conditional collection: the collection is
+    /// `Σ (σ_coll : 𝐾). (σ_coll ⤇ Int)` and the index reaching it is the enclosing
+    /// Σ-typed lambda's parameter, a bare reference the *lambda's* type binds. A cut inside
+    /// the body classifies the collection's binder and not the parameter's, so a probe that
+    /// read the pair as free rejected every such program — 80 tests, all of them
+    /// well-typed at every whole-tree wall.
+    #[test]
+    fn a_sub_tree_probe_abstains_where_only_one_reference_is_classified() {
+        use crate::ccl::infer_var::fresh_witness_binder_id;
+        use crate::ccl::ty::{TypeKind, Witness, WitnessContext};
+
+        let kind = TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let collection = Witness::bound_to(fresh_witness_binder_id(), kind.clone());
+        let parameter = Witness::bound_to(fresh_witness_binder_id(), kind);
+        let (classified, unclassified) = (
+            Type::WitnessRef(*collection.id()),
+            Type::WitnessRef(*parameter.id()),
+        );
+        // Γ holds the collection's binder, the one the cut kept.
+        let gamma = WitnessContext::default().extended(std::slice::from_ref(&collection));
+
+        let mut probe = ConstrainCache::for_derivation(Derivation::SubTree);
+        probe.seed_context(&gamma);
+        constrain_subtype(&unclassified, &classified, &mut probe)
+            .expect("a sub-tree probe gives no verdict on a reference its context binds");
+
+        let mut whole = ConstrainCache::for_derivation(Derivation::PostPass);
+        whole.seed_context(&gamma);
+        constrain_subtype(&unclassified, &classified, &mut whole)
+            .expect_err("over a whole tree an unclassified reference is free");
+    }
+
     /// A sub-tree probe records the same bound without complaint: its refinements
     /// reference binders the context it was cut from holds, and no walk of the
     /// sub-tree can enter them.
@@ -1449,6 +2039,72 @@ mod tests {
         ]);
         let mut cache = ConstrainCache::new();
         let _ = constrain_subtype(&dup, &dup.clone(), &mut cache);
+    }
+
+    /// A kinding constraint must cross a scope boundary with its variable. `extrude`
+    /// mints a proxy at the target level and copies the variable's constraint state
+    /// onto it; a kinding constraint is part of that state, and unlike a bound it is
+    /// not polar, so both polarities carry it.
+    ///
+    /// Losing it here is a silent *acceptance* — the constraint would survive only on a
+    /// variable the outer scope no longer reads — which is the same failure mode
+    /// `test_kinding_constraint_survives_instantiation` pins for the freshening
+    /// boundary.
+    #[test]
+    fn extrusion_carries_a_kinding_constraint_at_both_polarities() {
+        for pol in [true, false] {
+            let inner = InferVar::fresh(2);
+            inner
+                .bounds
+                .borrow_mut()
+                .type_kinds
+                .push(TypeKind::UIntRanges);
+            let mut cache = ExtrudeCache::new();
+            let out = extrude(&Type::Infer(Rc::clone(&inner)), pol, 0, &mut cache);
+            let Type::Infer(proxy) = out else {
+                panic!("extruding a variable yields a variable, got {out:?}");
+            };
+            assert_eq!(proxy.level, 0, "proxy sits at the target level");
+            assert_eq!(
+                proxy.bounds.borrow().type_kinds,
+                vec![TypeKind::UIntRanges],
+                "pol={pol}: the proxy must inhabit the same kind"
+            );
+        }
+    }
+
+    /// A factored pairing is a data-function edge, so it inherits domain invariance
+    /// (`src/ccl/design/type-inference.md`, "The width rule"): a refined range and the
+    /// bare range pair in neither direction — the plain data functions do not relate
+    /// either (`a_data_domain_relates_only_to_itself`).
+    #[test]
+    fn sigma_width_pairs_factored_domains_invariantly() {
+        let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
+        let refined_range = refined(Type::UIntRange(3), 7);
+
+        let bare = sum(TypeKind::Enumerated(vec![Type::UIntRange(3)]));
+        let filtered = sum(TypeKind::Enumerated(vec![refined_range.clone()]));
+        let wider = sum(TypeKind::Enumerated(vec![
+            Type::UIntRange(3),
+            refined_range.clone(),
+        ]));
+
+        assert!(
+            constrain_subtype(&bare, &wider, &mut ConstrainCache::new()).is_ok(),
+            "a candidate subset widens"
+        );
+        assert!(
+            constrain_subtype(&wider, &bare, &mut ConstrainCache::new()).is_err(),
+            "and not conversely"
+        );
+        assert!(
+            constrain_subtype(&bare, &filtered, &mut ConstrainCache::new()).is_err(),
+            "a refined candidate is a different candidate"
+        );
+        assert!(
+            constrain_subtype(&filtered, &bare, &mut ConstrainCache::new()).is_err(),
+            "in either direction"
+        );
     }
 
     #[test]
@@ -1911,7 +2567,7 @@ mod tests {
         Type::History {
             value: Box::new(value),
             domain: Box::new(domain),
-            kind: HistoryKind::Append,
+            history_kind: HistoryKind::Append,
         }
     }
 
@@ -2122,17 +2778,15 @@ mod tests {
         Type::History {
             value: Box::new(value),
             domain: Box::new(domain),
-            kind: HistoryKind::Overwrite,
+            history_kind: HistoryKind::Overwrite,
         }
     }
 
-    // The deref arm these two tests covered is gone: a mutable variable mention that denotes
-    // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so
-    // `Mut(V) <: V` is no longer a subtyping fact and there is nothing to assert here.
-    // The property they protected — `cnt + 1` yields `Int` rather than leaving a `Mut`
-    // on an inference variable — is now pinned where it is decided:
-    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/type_check.rs`,
-    // and the `mutability` integration suite end to end.
+    // There is no deref arm to test: a mutable variable mention that denotes its value is
+    // dereffed by the rule that emits it (`emit::emit_value_read`), so `Mut(V) <: V` is not
+    // a subtyping fact. That `cnt + 1` yields `Int` rather than leaving a `Mut` on an
+    // inference variable is pinned where it is decided,
+    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/type_check.rs`.
 
     #[test]
     fn mut_meets_mut_invariantly() {
@@ -2460,7 +3114,221 @@ mod tests {
         drop(arena);
     }
 
-    // ----- FunKind edge (the two kinds are incomparable) -----------
+    // ----- FunKind edge (`Data` and `Compute` are incomparable) -----------
+
+    // --- Conditional-collection Sigma rules (subtyping: width; consumption:
+    //     consume) — see `design/type-inference.md`, "4.6 Data vs compute functions" ---
+
+    /// The sum over `domains` — `Σ (𝐷 : [domains]). 𝐷 ⤇ Int`, what materializing a merged
+    /// domain's type kind produces.
+    fn conditional(domains: Vec<Type>) -> Type {
+        Type::sum_over(TypeKind::Enumerated(domains), None, prim(BaseType::Int))
+    }
+
+    /// **A map's key bounds its domains, so the type kinds order by the bound.**
+    /// `SubtypesOf` is the first type kind with a parameter, and this is what the parameter buys: a demand
+    /// for a map keyed by `Int` is satisfied by one keyed by a *refined* `Int`, because
+    /// every domain below the refinement is below `Int`. The converse is not a subtype —
+    /// a domain below `Int` need not satisfy the refinement.
+    ///
+    /// Contrast [`conditional_width_is_subtype`], where the kinds *list* their domains and
+    /// containment is a pairing: here nothing is enumerated and the containment is one
+    /// covariant edge on the bounds.
+    #[test]
+    fn a_map_orders_by_its_key_bound() {
+        let string = || prim(BaseType::String);
+        let narrow = Type::map_of(refined(prim(BaseType::Int), 7), string());
+        let wide = Type::map_of(prim(BaseType::Int), string());
+        assert!(
+            constrain_subtype(&narrow, &wide, &mut ConstrainCache::new()).is_ok(),
+            "a map keyed by a refined Int satisfies a demand for one keyed by Int"
+        );
+        assert!(
+            constrain_subtype(&wide, &narrow, &mut ConstrainCache::new()).is_err(),
+            "and not conversely"
+        );
+    }
+
+    /// **A map's key type is inferred from the domains that reach it.** Two boxed
+    /// collections joined by a conditional are a sum over a *listing*; passing that where a
+    /// `Map(?k, V)` is demanded relates the listing to `SubtypesOf(?k)`, and the
+    /// containment is one edge per candidate — so both domains land below `?k` and the key
+    /// is determined by what was joined rather than annotated.
+    ///
+    /// The listing/pairing rule cannot do this: it pairs each candidate *invariantly*
+    /// against one of the other kind's, so an unannotated key would have to equal both
+    /// domains at once and nothing would flow into it.
+    #[test]
+    fn a_map_key_is_inferred_from_the_domains_that_reach_it() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let key = fresh_var(0);
+        let Type::Infer(kv) = key.clone() else {
+            unreachable!("fresh_var is an inference variable")
+        };
+        let joined = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let demand = Type::map_of(key, prim(BaseType::Int));
+        constrain_subtype(&joined, &demand, &mut ConstrainCache::new())
+            .expect("a listing of domains lies below a bound nothing has fixed");
+        let lows = Rc::clone(kv.bounds.borrow().lower());
+        let rendered: Vec<String> = lows
+            .iter()
+            .map(|b| format!("{}", b.materialize()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec!["[0, 1]".to_string(), "[0, 2]".to_string()],
+            "both joined domains lie below the key"
+        );
+        drop(arena);
+    }
+
+    /// **A bound is not a listing.** A `SubtypesOf` kind names no domains to pair, so a
+    /// listing does not contain it however wide the bound is — the direction that would
+    /// let a map be read as a conditional collection over an enumerable set of keys.
+    #[test]
+    fn a_map_kind_is_contained_in_no_listing() {
+        let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
+        let listed = conditional(vec![Type::UIntRange(2)]);
+        assert!(constrain_subtype(&map, &listed, &mut ConstrainCache::new()).is_err());
+    }
+
+    /// **A listing lies below a description that admits every candidate.** The premise is
+    /// set containment, so it is asked once per candidate and `Type` — the description that
+    /// admits all of them — is above every kind and below nothing narrower.
+    #[test]
+    fn a_listing_lies_below_a_description_that_admits_it() {
+        let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
+        let ranges = sum(TypeKind::UIntRanges);
+        let listed = sum(TypeKind::Enumerated(vec![
+            Type::UIntRange(2),
+            Type::UIntRange(3),
+        ]));
+        let filtered = sum(TypeKind::Enumerated(vec![refined(Type::UIntRange(3), 7)]));
+        let universe = sum(TypeKind::Type);
+
+        assert!(
+            constrain_subtype(&listed, &ranges, &mut ConstrainCache::new()).is_ok(),
+            "every candidate is a range"
+        );
+        assert!(
+            constrain_subtype(&filtered, &ranges, &mut ConstrainCache::new()).is_err(),
+            "a refined range is not a range, so a filtered collection is not a `List`"
+        );
+        for k in [&listed, &ranges, &universe] {
+            assert!(
+                constrain_subtype(k, &universe, &mut ConstrainCache::new()).is_ok(),
+                "{k} <: ⊤"
+            );
+        }
+        assert!(
+            constrain_subtype(&universe, &ranges, &mut ConstrainCache::new()).is_err(),
+            "⊤ is below nothing narrower"
+        );
+    }
+
+    /// **An unresolved candidate is not a rejection.** It has no shape for a description to
+    /// read, so it takes the kinding edge and is answered wherever a type reaches it — which
+    /// is what lets a generalized definition carry a `List` annotation whose source only its
+    /// uses can supply (`test_kinding_constraint_survives_instantiation`).
+    #[test]
+    fn an_unresolved_candidate_takes_the_kinding_edge() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
+        let d = fresh_var(0);
+        let Type::Infer(v) = d.clone() else {
+            unreachable!("fresh_var is an inference variable")
+        };
+        constrain_subtype(
+            &sum(TypeKind::Enumerated(vec![d])),
+            &sum(TypeKind::UIntRanges),
+            &mut ConstrainCache::new(),
+        )
+        .expect("an unresolved candidate defers rather than rejecting");
+        assert_eq!(
+            v.bounds.borrow().type_kinds,
+            vec![TypeKind::UIntRanges],
+            "the demand rides the candidate until it resolves"
+        );
+        drop(arena);
+    }
+
+    #[test]
+    fn conditional_width_is_subtype() {
+        // A conditional collection is a Sigma over candidate domains;
+        // width-subtyping is by-value subset — every lhs candidate domain
+        // appears among the rhs candidates. The reverse (rhs has an extra
+        // domain the lhs lacks) is not a subtype.
+        let sub = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let sup = conditional(vec![
+            Type::UIntRange(2),
+            Type::UIntRange(3),
+            Type::UIntRange(4),
+        ]);
+        assert!(constrain_subtype(&sub, &sup, &mut ConstrainCache::new()).is_ok());
+        assert!(constrain_subtype(&sup, &sub, &mut ConstrainCache::new()).is_err());
+    }
+
+    #[test]
+    fn conditional_consumed_as_fun() {
+        // A conditional collection reaching a consumer pins the consumer's kind
+        // variable; a *fresh* domain var accumulates the witness (the `sum` /
+        // comprehension case).
+        let cond = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let consumer = Type::consumer_fun(fresh_var(0), prim(BaseType::Int));
+        assert!(constrain_subtype(&cond, &consumer, &mut ConstrainCache::new()).is_ok());
+        // A consumer demanding a *concrete narrower* domain fails: the concrete type
+        // meets the witness at every candidate, and `[0, 3)` is not `[0, 2)` — the
+        // conditional collection never silently narrows to a single domain.
+        let narrow = Type::consumer_fun(Type::UIntRange(2), prim(BaseType::Int));
+        assert!(constrain_subtype(&cond, &narrow, &mut ConstrainCache::new()).is_err());
+    }
+
+    // --- `UIntRanges`-kind Sigma rules (List): consumption, width ---
+
+    /// **A described range is consumed by the same rule a listing one is.** Naming the
+    /// witness needs no candidates — that is what naming buys over presenting — so
+    /// `List`'s `UIntRanges` and `Collection`'s `Any` reach a consumer through the
+    /// factored arm with nothing to enumerate.
+    ///
+    /// Worth its own test because the failure is silent in the other direction: a rule
+    /// written to read candidates first answers `None` for a described kind and falls
+    /// through to a flat mismatch, so a `List(𝑇)` annotation stops being consumable and
+    /// nothing else in the suite says why.
+    #[test]
+    fn a_described_collection_pins_a_consumer() {
+        let int = prim(BaseType::Int);
+        for kind in [TypeKind::UIntRanges, TypeKind::Type] {
+            let collection = Type::sum_over(kind.clone(), None, int.clone());
+            // A consumer with a fresh domain variable: the common case (`sum`, a
+            // comprehension). Its domain accumulates the witness.
+            let consumer = Type::consumer_fun(fresh_var(0), int.clone());
+            assert!(
+                constrain_subtype(&collection, &consumer, &mut ConstrainCache::new()).is_ok(),
+                "a {kind} collection must be consumable: {collection}"
+            );
+        }
+    }
+
+    /// The **cross-form** width edge: the unfactored sum `box` builds, below the
+    /// factored sum a `List(𝑉)` annotation is. Both spellings of one type, so this is
+    /// ordinary Σ-width read on instantiated bodies — and it is the edge every
+    /// `List`-annotated parameter depends on.
+    #[test]
+    fn a_boxed_collection_is_below_a_list_annotation() {
+        let int = prim(BaseType::Int);
+        let boxed = Type::sum_over(
+            TypeKind::Enumerated(vec![Type::UIntRange(2)]),
+            None,
+            int.clone(),
+        );
+        let list = Type::list_of(int);
+        assert!(
+            constrain_subtype(&boxed, &list, &mut ConstrainCache::new()).is_ok(),
+            "box(xs) must reach List(V) by width"
+        );
+    }
+
+    // ----- FunKind edge (the `Compute <: Data` rejection) -----------
 
     fn data_fun(d: Type, c: Type) -> Type {
         Type::data_fun(d, c)
@@ -2517,11 +3385,11 @@ mod tests {
     }
 
     /// A function over a fixed domain and codomain, so a test varies only the
-    /// kind — which is the only thing `constrain_kind` reads.
-    fn kind_fun(kind: FunKind) -> Type {
+    /// kind — which is the only thing `constrain_fun_kind` reads.
+    fn fun_at(fun_kind: FunKind) -> Type {
         Type::Fun {
             name: None,
-            kind,
+            fun_kind,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
         }
@@ -2535,27 +3403,27 @@ mod tests {
         let mut cache = ConstrainCache::new();
         // Pin `a` to compute, leaving `b` unpinned.
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
-            &kind_fun(FunKind::Compute),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Compute),
             &mut cache,
         )
         .expect("a var meeting Compute records the pin");
-        assert_eq!(a.pin(), KindPin::Compute);
-        assert_eq!(b.pin(), KindPin::Unpinned);
+        assert_eq!(a.resolved(), KindPin::Compute);
+        assert_eq!(b.resolved(), KindPin::Unpinned);
 
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&b))),
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Var(Rc::clone(&b))),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
             &mut cache,
         )
         .expect("a var-var kind edge is never a rejection");
         assert_eq!(
-            b.pin(),
+            b.resolved(),
             KindPin::Compute,
             "the unpinned side reads the other's pin"
         );
         assert_eq!(
-            a.pin(),
+            a.resolved(),
             KindPin::Compute,
             "and the pinned side is unchanged"
         );
@@ -2569,25 +3437,27 @@ mod tests {
         let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
         // The edge first, both sides unpinned — nothing to carry.
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
-            &kind_fun(FunKind::Var(Rc::clone(&b))),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Var(Rc::clone(&b))),
             &mut ConstrainCache::new(),
         )
         .expect("a var-var kind edge is never a rejection");
-        assert_eq!(a.pin(), KindPin::Unpinned);
-        assert_eq!(b.pin(), KindPin::Unpinned);
+        assert_eq!(a.resolved(), KindPin::Unpinned);
+        assert_eq!(b.resolved(), KindPin::Unpinned);
 
         // Then a concrete kind reaches `a` only.
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
-            &kind_fun(FunKind::Data),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Data(None)),
             &mut ConstrainCache::new(),
         )
         .expect("a var meeting Data records the pin");
-        assert_eq!(a.pin(), KindPin::Data);
+        // `Data(None)` is a *plain* collection, one of the three concrete kinds — the pin
+        // records which, not merely that it is not a capability.
+        assert_eq!(a.resolved(), KindPin::Plain);
         assert_eq!(
-            b.pin(),
-            KindPin::Data,
+            b.resolved(),
+            KindPin::Plain,
             "the far side of the edge reads a pin that arrived after it"
         );
     }
@@ -2603,59 +3473,97 @@ mod tests {
         );
         for (x, y) in [(&a, &b), (&b, &c)] {
             constrain_subtype(
-                &kind_fun(FunKind::Var(Rc::clone(x))),
-                &kind_fun(FunKind::Var(Rc::clone(y))),
+                &fun_at(FunKind::Var(Rc::clone(x))),
+                &fun_at(FunKind::Var(Rc::clone(y))),
                 &mut ConstrainCache::new(),
             )
             .expect("a var-var kind edge is never a rejection");
         }
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
-            &kind_fun(FunKind::Data),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Data(None)),
             &mut ConstrainCache::new(),
         )
         .unwrap();
         assert_eq!(
-            c.pin(),
-            KindPin::Data,
+            c.resolved(),
+            KindPin::Plain,
             "two edges away, and still one answer"
         );
-        assert_eq!(b.pin(), KindPin::Data);
-        assert_eq!(a.pin(), KindPin::Data);
+        assert_eq!(b.resolved(), KindPin::Plain);
+        assert_eq!(a.resolved(), KindPin::Plain);
+    }
+
+    /// **A plain collection and a sum do not merge.** Neither is below the other, so one
+    /// function required to be both holds two fun kinds at once — the same contradiction a
+    /// capability meeting a collection is, and read at the same place.
+    #[test]
+    fn a_plain_collection_and_a_sum_do_not_merge() {
+        let v = FunKindVar::fresh();
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &fun_at(FunKind::Data(None)),
+            &fun_at(FunKind::Var(Rc::clone(&v))),
+            &mut cache,
+        )
+        .expect("a plain collection pins the var plain");
+        assert_eq!(v.resolved(), KindPin::Plain);
+
+        let sum = Type::sum_over(
+            TypeKind::Enumerated(vec![Type::UIntRange(3)]),
+            None,
+            prim(BaseType::Int),
+        );
+        let _ = constrain_subtype(&sum, &fun_at(FunKind::Var(Rc::clone(&v))), &mut cache);
+        assert_eq!(
+            v.resolved(),
+            KindPin::Conflict,
+            "a sum reaching a variable already pinned to a plain collection is the conflict"
+        );
     }
 
     /// Pinning either end of a related pair to a different point is the conflict,
     /// read from every member — the pins are joined, never arbitrated.
     #[test]
     fn a_var_var_kind_edge_between_disagreeing_pins_conflicts_from_either_end() {
+        // The pin crosses the edge, so the *second* concrete kind meets a component that
+        // already holds the first — and a concrete kind settles the variable it meets, so
+        // the contradiction is reported at that edge rather than carried to coalesce.
         let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
-            &kind_fun(FunKind::Var(Rc::clone(&b))),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Var(Rc::clone(&b))),
             &mut ConstrainCache::new(),
         )
-        .unwrap();
+        .expect("a var-var kind edge is never a rejection");
         constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&a))),
-            &kind_fun(FunKind::Compute),
+            &fun_at(FunKind::Var(Rc::clone(&a))),
+            &fun_at(FunKind::Compute),
             &mut ConstrainCache::new(),
         )
-        .unwrap();
-        constrain_subtype(
-            &kind_fun(FunKind::Var(Rc::clone(&b))),
-            &kind_fun(FunKind::Data),
-            &mut ConstrainCache::new(),
-        )
-        .unwrap();
-        assert_eq!(a.pin(), KindPin::Conflict);
-        assert_eq!(b.pin(), KindPin::Conflict);
+        .expect("nothing else has reached the component yet");
+        assert!(
+            matches!(
+                constrain_subtype(
+                    &fun_at(FunKind::Var(Rc::clone(&b))),
+                    &fun_at(FunKind::Data(None)),
+                    &mut ConstrainCache::new(),
+                ),
+                Err(ConstrainError::KindMismatch { .. })
+            ),
+            "a collection demanded of a component pinned compute, read from the far end"
+        );
+        assert_eq!(a.resolved(), KindPin::Conflict);
+        assert_eq!(b.resolved(), KindPin::Conflict);
     }
 
     #[test]
     fn a_var_var_kind_edge_between_disagreeing_pins_is_a_conflict() {
-        // Absorption, not arbitration: holding both points is `Conflict`, exactly
-        // as on a concrete edge, and coalesce reports it.
-        let fun_over = kind_fun;
+        // Absorption, not arbitration: holding both points is `Conflict`, exactly as on a
+        // concrete edge — and it is the edge that *completes* the conflict that reports it,
+        // whichever kind of edge that is. A variable between the two ends hides nothing:
+        // `resolved` folds the whole component.
+        let fun_over = fun_at;
         let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
         let mut cache = ConstrainCache::new();
         constrain_subtype(
@@ -2666,18 +3574,24 @@ mod tests {
         .unwrap();
         constrain_subtype(
             &fun_over(FunKind::Var(Rc::clone(&b))),
-            &fun_over(FunKind::Data),
+            &fun_over(FunKind::Data(None)),
             &mut cache,
         )
         .unwrap();
-        constrain_subtype(
-            &fun_over(FunKind::Var(Rc::clone(&a))),
-            &fun_over(FunKind::Var(Rc::clone(&b))),
-            &mut cache,
-        )
-        .expect("the edge records the join; the rejection is coalesce's");
-        assert_eq!(a.pin(), KindPin::Conflict);
-        assert_eq!(b.pin(), KindPin::Conflict);
+        assert!(
+            matches!(
+                constrain_subtype(
+                    &fun_over(FunKind::Var(Rc::clone(&a))),
+                    &fun_over(FunKind::Var(Rc::clone(&b))),
+                    &mut cache,
+                ),
+                Err(ConstrainError::KindMismatch { .. })
+            ),
+            "relating a compute-pinned kind to a data-pinned one is the same rejection a \
+             concrete pair is"
+        );
+        assert_eq!(a.resolved(), KindPin::Conflict);
+        assert_eq!(b.resolved(), KindPin::Conflict);
     }
 
     #[test]
@@ -2688,7 +3602,7 @@ mod tests {
         let v = FunKindVar::fresh();
         let var_fun = Type::Fun {
             name: None,
-            kind: FunKind::Var(Rc::clone(&v)),
+            fun_kind: FunKind::Var(Rc::clone(&v)),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
         };
@@ -2700,9 +3614,9 @@ mod tests {
         )
         .expect("a var meeting Data records the pin, never an eager rejection");
         assert_eq!(
-            v.pin(),
-            KindPin::Data,
-            "pinned to data, and no compute function met this var"
+            v.resolved(),
+            KindPin::Plain,
+            "pinned to a plain collection, and no compute function met this var"
         );
     }
 }

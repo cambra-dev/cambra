@@ -534,6 +534,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
             vec![]
         }
         N::Apply { function, argument } => vec![function, argument],
+        N::Realize(value) => vec![value],
         N::Cast { value, target } => {
             let mut children = vec![&**value];
             children.extend(cast_target_predicates(target));
@@ -2682,7 +2683,7 @@ mod tests {
             value: Box::new(int(1)),
             target: Type::Fun {
                 name: None,
-                kind: FunKind::Compute,
+                fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Refinement(
                     Box::new(Type::Base(BaseType::Int)),
                     RefinementSet::one(Refinement {

@@ -7,8 +7,8 @@ use std::rc::Rc;
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::{
     BaseType, BinOpKind, Branch, Builtin, Expr, F_FIRE_SUFFIX, F_WRITES, FieldKey, Lit, LogicKind,
-    Name, PredicateId, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind, V_ABORT,
-    V_COMMIT,
+    Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind,
+    V_ABORT, V_COMMIT,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -97,6 +97,23 @@ pub fn decision_variant_ty(payload_ty: Type) -> Type {
         (FieldKey::Name(V_COMMIT.into()), payload_ty),
         (FieldKey::Name(V_ABORT.into()), Type::Base(BaseType::Unit)),
     ])
+}
+
+/// The type of a **history**: the total function `𝐷 ⤇ 𝑉` a mutable variable, a feed
+/// channel, or a commit log denotes over its sequencing domain (`mutability.md`,
+/// "The model: histories and causal recursion").
+///
+/// A collection, and so [`crate::ccl::ty::FunKind::Data`]: the engine stores one value per
+/// position of the domain — an induction store's changelog, a commit log — and every read is
+/// a read at a position (`get_prev_seq`, `get_prev_txn`, `final_or_default`, an `AsOf` join).
+/// A view of a history is a history too, but it is built by *carrying* the head's kind
+/// through the compose ([`Type::fun_like`]) rather than by restating this.
+///
+/// One history has several spellings — the binding, the record field holding it, the
+/// tuple slot a causal accessor reads it from — and they have to agree, so they all say
+/// this rather than each reaching for [`Type::fun`].
+pub fn history_ty(domain_ty: &Type, value_ty: &Type) -> Type {
+    Type::data_fun(domain_ty.clone(), value_ty.clone())
 }
 
 /// The `commit` payload record type of a decision variant `` {`commit{𝑃} | `abort} ``
@@ -293,11 +310,37 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
                     "iteration/restrict marker leaked into a refinement predicate: {}",
                     crate::ccl::symbolic::symbolic(&r.predicate)
                 );
+                debug_assert!(
+                    !expr_needs_iteration(&r.predicate),
+                    "a source that must be *iterated* reached a refinement predicate: {}\n\
+                     A predicate looks its collection up at an index; it never sweeps one, and \
+                     it may carry no `iterate`/`restrict` to sweep with. Realizing a conditional \
+                     source inside a predicate produces exactly this — a gated union whose legs \
+                     need the markers the assertion above forbids — and op-conversion then \
+                     compiles one leg and silently answers from the wrong arm. The predicate has \
+                     to name a *plain* collection: under leg i the conditional is `arm i`, so \
+                     substitute it.",
+                    crate::ccl::symbolic::symbolic(&r.predicate)
+                );
             }
         }
         ty.walk_children(go);
     }
     go(ty);
+}
+
+/// Whether `e` contains a collection that op-conversion could only compile by **iterating**
+/// it — a realized conditional (`Realize`) or a union of collections.
+///
+/// The complement of [`debug_assert_no_iteration_markers_in_type`]'s own check, and the half
+/// it could not see. That one catches a marker that *leaked in*; this catches a term that
+/// would *need* one. Both say the same thing about a predicate — it is denotational — and
+/// only together do they close the gap, since a term needing iteration and carrying no
+/// marker passes the first check and miscompiles.
+#[cfg(debug_assertions)]
+fn expr_needs_iteration(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Realize(_) | TypedExprNode::Copair(_))
+        || e.fold_children(false, |acc, c| acc || expr_needs_iteration(c))
 }
 
 /// Whether `e` applies `b` as its function (`Apply { function: Builtin(b) }`).
@@ -403,13 +446,13 @@ pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     let c_ty = elts[elts.len() - 1].ty.codomain().unwrap().clone();
     // Not `fun_like`: only the *kind* comes from the head. A Pi binder belongs to
     // the morphism that binds it, and the chain's codomain is the last morphism's.
-    let kind = match &elts[0].ty {
-        Type::Fun { kind, .. } => kind.clone(),
+    let fun_kind = match &elts[0].ty {
+        Type::Fun { fun_kind, .. } => fun_kind.clone(),
         _ => crate::ccl::ty::FunKind::Compute,
     };
     Expr::compose(elts).with_ty(Type::Fun {
         name: None,
-        kind,
+        fun_kind,
         domain: Box::new(d_ty),
         codomain: Box::new(c_ty),
     })
@@ -467,9 +510,9 @@ pub fn make_iterate(predicate: Expr) -> Expr {
         .expect("iterate predicate must have a function type")
         .clone();
     let refined = refine_with(domain, &predicate);
-    // A **data** function, by the audit rule *a function is data iff it denotes a
-    // collection*: `iterate(p)` is the identity on the extent, so the extent
-    // *is* its data. This is what makes the kind decide whether iterating is
+    // A **data** function, because it denotes a collection: `iterate(p)` is the
+    // identity on the extent, so the extent is its data. This is what makes the
+    // kind decide whether iterating is
     // acceptable at all — every chain led by an iteration source inherits `Data`
     // from here (`typed_compose`), so a site whose value-producer is a mere
     // capability is a kind error rather than something a later stamp papers over.
@@ -523,7 +566,10 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         .domain()
         .expect("restrict upstream must have a function type D ⇒ T");
     debug_assert!(
-        strip_refinements(&upstream_dom) == strip_refinements(&domain),
+        {
+            let (u, d) = (strip_refinements(&upstream_dom), strip_refinements(&domain));
+            u == d || (matches!(u, Type::WitnessRef(_)) && matches!(d, Type::WitnessRef(_)))
+        },
         "restrict upstream domain {upstream_dom} must match predicate domain {domain}",
     );
     // `{d : D | p(d)} ⇒ T` — refinement on the domain, value preserved.
@@ -668,9 +714,13 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// TODO remove this constraint once we get rid of the special-casing correlated
 /// refinement code in lambda_elim.
 pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
+    // Through [`Type::domain`], not by matching `Type::Fun` here: a collection indexed by a
+    // witness spells the function inside a `Σ` binder, and `Type::fun_like` — which is what
+    // builds these targets — re-closes that binder. Matching the outer constructor rejects
+    // the shape the paired constructor just produced.
     assert!(
-        matches!(&target_ty, Type::Fun { domain: d, .. } if matches!(d.as_ref(), Type::Refinement(..))),
-        "make_cast target_ty must be Fun(Refinement(_, _), _), got {target_ty}"
+        matches!(target_ty.domain(), Some(Type::Refinement(..))),
+        "make_cast target_ty must denote a function with a refined domain, got {target_ty}"
     );
     Expr::cast(value, target_ty)
 }
@@ -690,13 +740,14 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 /// unifies against may contribute more, and a caller reattaching "the cast's
 /// refinement" wants all of what the target demands.
 pub fn cast_target_refinement(target: &Type) -> Option<RefinementSet> {
-    let Type::Fun { domain, .. } = target else {
+    // [`Type::domain`] for the same reason [`make_cast`] uses it: the target may be a
+    // witness-indexed collection, whose function sits under a `Σ` binder. This has to agree
+    // with `make_cast` on which targets carry a refinement, since one asserts what the
+    // other reads.
+    let Type::Refinement(_, refinements) = target.domain()? else {
         return None;
     };
-    let Type::Refinement(_, refinements) = domain.as_ref() else {
-        return None;
-    };
-    Some(refinements.clone())
+    Some(refinements)
 }
 
 /// Build a function type whose domain is `base_domain` wrapped in a fresh
@@ -710,11 +761,30 @@ pub fn cast_target_refinement(target: &Type) -> Option<RefinementSet> {
 ///
 /// `base_domain` and `codomain` are typically `Type::Hole` at lowering time;
 /// inference fills them in by unifying against the value being cast.
-pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
-    Type::data_fun(
-        Type::refined_one(base_domain, Refinement::born(Rc::new(predicate))),
-        codomain,
-    )
+pub fn refined_data_fun(
+    base_domain: Type,
+    predicate: Expr,
+    codomain: Type,
+    fun_kind: crate::ccl::ty::FunKind,
+) -> Type {
+    // A kind **variable**, not a concrete `Data(None)`: the value being re-viewed may be a
+    // sum (a filtered conditional collection), and the cast target must relate to a plain
+    // collection and a sum alike (`src/ccl/design/type-inference.md`, "Consuming a sum:
+    // pinning the consumer's kind").
+    //
+    // The caller supplies it so that a re-view can share the kind of the thing it re-views.
+    // Minting one here instead left a filtered comprehension's target unrelated to its own
+    // source, so nothing ever told it whether it was a sum and materialization decided from
+    // the domain.
+    Type::Fun {
+        name: None,
+        fun_kind,
+        domain: Box::new(Type::refined_one(
+            base_domain,
+            Refinement::born(Rc::new(predicate)),
+        )),
+        codomain: Box::new(codomain),
+    }
 }
 
 /// A structural copy of `ty` with every [`Type::Refinement`] layer removed,
@@ -748,6 +818,13 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         // inside it, so a bounded annotation's bound is stripped like any other.
         Type::BoundedHole(t) => Type::BoundedHole(Box::new(strip_refinements(t))),
         Type::Refinement(base, _) => strip_refinements(base),
+        // The **witness kinds are left alone** (they ride the `kind` `fun_like` copies).
+        // A sum's candidates are domains, and the Σ rules match them by value, so two
+        // sums differing only in a candidate's refinement are different types —
+        // `Σ (σ : [{[0,2] | 𝑝}]). …` is the filtered arm and `Σ (σ : [[0,2]]). …` is not.
+        // Erasing there would make them compare equal, which is the opposite of what a
+        // comparison up to refinements is for: it drops a distinction rather than an
+        // incidental spelling.
         Type::Fun {
             domain, codomain, ..
         } => Type::fun_like(ty, strip_refinements(domain), strip_refinements(codomain)),
@@ -766,11 +843,11 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         Type::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => Type::History {
             value: Box::new(strip_refinements(value)),
             domain: Box::new(strip_refinements(domain)),
-            kind: *kind,
+            history_kind: *history_kind,
         },
         Type::Base(_)
         | Type::UIntRange(_)
@@ -779,6 +856,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn => ty.clone(),
     }
 }
@@ -882,13 +960,33 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 /// target and the node type that planning's compile-once relies on.
 /// `value_ty: None` computes the canonical *target* (born refinements alone);
 /// `Some` computes the canonical node *type* (value's domain refinements ∪ born).
+///
+/// A cast re-views its value **at the target**, so the data-vs-capability answer comes from
+/// `born` — `emit_cast` reads it there, and a view rebuilt from a neighbour's type states
+/// whatever that neighbour was. A predicate's chain is a capability (`base ⇒ Bool`), so a
+/// collection cast collapsing inside one is where the two part company. Only that answer
+/// travels: the binder slot is named at each type's own domain position
+/// (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"), so a view keeps
+/// the slot it has.
 pub(crate) fn canonical_cast_ty(born: &Type, value_ty: Option<&Type>, view: Type) -> Type {
+    let at_born_answer = |mut t: Type| {
+        if let (Some(b), Type::Fun { fun_kind, .. }) = (born.fun_kind(), &mut t)
+            && b.resolved().is_data() != fun_kind.resolved().is_data()
+        {
+            *fun_kind = if b.resolved().is_data() {
+                crate::ccl::ty::FunKind::Data(None)
+            } else {
+                crate::ccl::ty::FunKind::Compute
+            };
+        }
+        t
+    };
     let born_refinements = match born.domain() {
         Some(d) => d.refinements().to_vec(),
-        None => return view,
+        None => return at_born_answer(view),
     };
     let Some(view_dom) = view.domain() else {
-        return view;
+        return at_born_answer(view);
     };
     // The term-determined refinement set: value's domain refinements (type position
     // only) ∪ born refinements.
@@ -905,40 +1003,16 @@ pub(crate) fn canonical_cast_ty(born: &Type, value_ty: Option<&Type>, view: Type
             .iter()
             .all(|r| canon_refinements.contains(r));
     if same {
-        return view;
+        return at_born_answer(view);
     }
     let cod = view
         .codomain()
         .expect("a type with a domain has a codomain");
-    Type::fun_like(
+    at_born_answer(Type::fun_like(
         &view,
         Type::refined(view_dom.peel_refinements().clone(), canon_refinements),
         cod,
-    )
-}
-
-/// Carry a re-typed node's [`FunKind`](crate::ccl::ty::FunKind) onto its `target`,
-/// when that node is a [`TypedExprNode::Cast`].
-///
-/// A cast's `target` states the refinements the cast asserts, and those are the cast's
-/// own — a rewrite must not overwrite them with a type derived from the
-/// surrounding term. The `FunKind` is different: nothing asserts it
-/// independently, `emit_cast` reads it off `target` to type the node, and so the
-/// two copies have to agree or the node contradicts itself.
-///
-/// The caller is a rewrite that hands a node over to one of its own
-/// sub-expressions (`simplify`'s collapse rules). Such a rewrite writes the
-/// position's type onto the survivor, and where the survivor is a cast that
-/// re-kinds it — `⟨id, const 𝑥⟩ ≫ apply` collapsing to a `𝑥` that is a collection
-/// standing in a morphism position. Only the kind moves; the refinements stay the
-/// cast's.
-pub(crate) fn sync_cast_target_kind(expr: &mut Expr) {
-    if matches!(expr.node, TypedExprNode::Cast { .. }) {
-        let ty = expr.ty.clone();
-        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
-            *target = target.with_kind_of(&ty);
-        }
-    }
+    ))
 }
 
 /// Wrap `base` in a fresh `Type::Refinement` whose bare predicate filters the
@@ -1060,6 +1134,111 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
 /// shadowing rules.
 pub fn is_free(name: &Name, expr: &Expr) -> bool {
     count_free(name, expr) > 0
+}
+
+/// Which witnesses `expr`'s type slots name — the witness analog of [`is_free`], for the
+/// whole subtree in one traversal.
+///
+/// Every occurrence is free: a witness is bound by a Σ, which is a type, so nothing in a
+/// *term* binds one. A type slot that carries its own Σ is handled inside
+/// [`crate::ccl::ty::free_witness_refs`], which excludes what that Σ binds.
+pub fn free_witnesses(expr: &Expr) -> BTreeSet<crate::ccl::ty::WitnessId> {
+    fn go(e: &Expr, out: &mut BTreeSet<crate::ccl::ty::WitnessId>) {
+        e.walk_type_slots(|ty| out.extend(crate::ccl::ty::free_witness_refs(ty, &[])));
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = BTreeSet::new();
+    go(expr, &mut out);
+    out
+}
+
+/// Type every read of the refinement binder **from the base**, at the path it reads.
+///
+/// `__elem` ranges over the base, so a read of it at path `p` has the type the base has at
+/// `p` and carries no information of its own. Coalesce resolves the predicate's slots against
+/// a graph that does not contain the `Σ` the refinement rides, so it answers them from the
+/// names its own route carried — a second answer to a question the base has already
+/// answered. This installs the base's, which is the only one that can be right.
+///
+/// **A projection's own function type is `base(p) ⇒ base(p ++ [k])`**, so it is rebuilt from
+/// the same two ends rather than left holding the spelling the read no longer has.
+///
+/// **The base's shape, the slot's refinements.** The binder's slot is deliberately bare where
+/// the base carries refinements, and what a read has narrowing it is its own business — a
+/// nested filter's inner predicate sees the outer refinement and the base does not carry it
+/// yet. So only the part that says *which index* is taken from the base.
+pub(crate) fn type_element_reads_from_base(pred: &mut Expr, base: &Type) {
+    /// `expr`'s own path if it reads the element, retyping every read at or below it.
+    fn go(expr: &mut Expr, base: &Type) -> Option<Vec<ProjKey>> {
+        match &mut expr.node {
+            TypedExprNode::Var(n) if n.is_elem() => {
+                if let Some(t) = base_at(base, &[]) {
+                    take_index_from(&mut expr.ty, t);
+                }
+                return Some(Vec::new());
+            }
+            TypedExprNode::Apply { function, argument }
+                if matches!(&function.node, TypedExprNode::Proj(_)) =>
+            {
+                let mut path = go(argument, base)?;
+                let TypedExprNode::Proj(key) = &function.node else {
+                    unreachable!("guarded by the match arm")
+                };
+                let from = base_at(base, &path).cloned();
+                path.push(key.clone());
+                let to = base_at(base, &path).cloned();
+                // Both ends or neither: a path the base does not have is a read of something
+                // the base is not, and half-retyping it would leave the node disagreeing
+                // with its own function slot.
+                if let (Some(from), Some(to)) = (from, to) {
+                    take_index_from(&mut expr.ty, &to);
+                    let mut fn_from = argument.ty.clone();
+                    take_index_from(&mut fn_from, &from);
+                    function.ty = Type::fun(fn_from, expr.ty.clone());
+                }
+                return Some(path);
+            }
+            _ => {}
+        }
+        // The `&mut` walk yields a scope and then the run of children it covers, so this
+        // pairs them: a binder of the same name makes the occurrences below it a different
+        // variable, and its whole run is skipped. Local to this frame, so a nested read
+        // keeps its own answer.
+        let mut shadowed = false;
+        crate::ccl::scope::for_each_scoped_item_mut(expr, &mut |item| match item {
+            crate::ccl::scope::ScopedItemMut::Scope(names) => {
+                shadowed = names.iter().any(|n| n.is_elem());
+            }
+            crate::ccl::scope::ScopedItemMut::Child(child) if !shadowed => {
+                go(child, base);
+            }
+            _ => {}
+        });
+        None
+    }
+    go(pred, base);
+}
+
+/// Re-base `slot` on `from`'s shape, keeping `slot`'s own refinements.
+fn take_index_from(slot: &mut Type, from: &Type) {
+    let refinements = slot.refinements().iter().cloned().collect();
+    *slot = Type::refined(from.peel_refinements().clone(), refinements);
+}
+
+/// The base at a projection path — the type a read of the element at that path has.
+///
+/// Through refinements: a projection reads a *position*, and a restriction on the product
+/// says nothing about which index that position names.
+fn base_at<'a>(base: &'a Type, path: &[ProjKey]) -> Option<&'a Type> {
+    let mut ty = base;
+    for key in path {
+        ty = match (ty.peel_refinements(), key) {
+            (Type::Tuple(ts), ProjKey::Index(i)) => ts.get(*i)?,
+            (Type::Record(fs), ProjKey::Field(n)) => &fs.iter().find(|(k, _)| k == n)?.1,
+            _ => return None,
+        };
+    }
+    Some(ty)
 }
 
 /// Which of `candidates` occur free in `expr`, in **one** traversal.
@@ -1695,4 +1874,89 @@ where
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::ty::TypeKind;
+
+    /// **A realized conditional inside a predicate is caught at the planning wall.**
+    ///
+    /// A predicate looks its collection up at an index; it never sweeps one, and it may
+    /// carry no `iterate`/`restrict` to sweep with. Realizing a conditional source inside a
+    /// predicate produces exactly the forbidden thing — a gated union whose legs need those
+    /// markers — and the marker check alone cannot see it, because the union arrives with
+    /// *no* markers at all. Without this the failure is a wrong arm at runtime, four passes
+    /// downstream.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must be *iterated* reached a refinement predicate")]
+    fn a_source_needing_iteration_in_a_predicate_is_caught() {
+        let arm = |n| {
+            Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(Type::data_fun(
+                Type::UIntRange(n),
+                Type::Base(BaseType::Int),
+            ))
+        };
+        let realized = Expr::new(TypedExprNode::Realize(Box::new(
+            Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
+                Type::UIntRange(2),
+                Type::Base(BaseType::Int),
+            )),
+        )))
+        .with_ty(Type::data_fun(
+            Type::UIntRange(2),
+            Type::Base(BaseType::Int),
+        ));
+        let ty = Type::refined_one(Type::UIntRange(2), Refinement::born(Rc::new(realized)));
+        debug_assert_no_iteration_markers_in_type(&ty);
+    }
+
+    /// `{[0, 2] | __elem}` — a refined range. The predicate's content is irrelevant
+    /// here; only that the two sides carry *different* ones.
+    fn refined(base: Type, tag: &str) -> Type {
+        Type::refined_one(base, Refinement::born(Rc::new(Expr::var(Name::from(tag)))))
+    }
+
+    /// A Σ's candidates are **domains**, matched by value, so two sums differing only
+    /// in a candidate's refinement are different types — one is the filtered arm and
+    /// the other is not. Erasing there would collapse that distinction, which is a
+    /// stronger claim than "these two spellings of one predicate are the same".
+    #[test]
+    fn strip_refinements_keeps_a_sum_s_candidates_distinct() {
+        let int = Type::Base(BaseType::Int);
+        let filtered = Type::sum_over(
+            TypeKind::Enumerated(vec![refined(Type::UIntRange(3), "p")]),
+            None,
+            int.clone(),
+        );
+        let bare = Type::sum_over(TypeKind::Enumerated(vec![Type::UIntRange(3)]), None, int);
+        assert_ne!(strip_refinements(&filtered), strip_refinements(&bare));
+        assert_eq!(strip_refinements(&filtered), filtered);
+    }
+
+    /// A composition's fun kind comes from the element whose domain it inherits — the first.
+    /// Composing an element map onto a collection does not stop it being one, and
+    /// `Type::fun`'s hardcoded `Compute` was discarding the fun kind at every point-free
+    /// rebuild, which is exactly what [`Type::fun_like`] exists to prevent.
+    #[test]
+    fn typed_compose_keeps_the_chain_s_kind() {
+        let int = Type::Base(BaseType::Int);
+        let coll =
+            Expr::var(Name::from("xs")).with_ty(Type::data_fun(Type::UIntRange(2), int.clone()));
+        let map = Expr::var(Name::from("f")).with_ty(Type::fun(int.clone(), int.clone()));
+        let composed = typed_compose(vec![coll, map]);
+        assert!(
+            matches!(
+                &composed.ty,
+                Type::Fun {
+                    fun_kind: crate::ccl::ty::FunKind::Data(..),
+                    ..
+                }
+            ),
+            "a collection composed with an element map is still a collection, got {}",
+            composed.ty
+        );
+    }
 }

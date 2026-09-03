@@ -53,8 +53,8 @@ fn mut_param_history_type(
         Some(Ok((value, is_txn))) => Some(Ok((
             Type::History {
                 value: Box::new(value),
-                domain: Box::new(Type::Hole),
-                kind: crate::ccl::HistoryKind::Overwrite,
+                domain: Box::new(if is_txn { Type::Txn } else { Type::Hole }),
+                history_kind: crate::ccl::HistoryKind::Overwrite,
             },
             is_txn,
         ))),
@@ -110,7 +110,7 @@ fn feed_param_history_type(
     Some(lower_type_expr(value, ctx).map(|t| Type::History {
         value: Box::new(t),
         domain: Box::new(Type::Hole),
-        kind: crate::ccl::HistoryKind::Append,
+        history_kind: crate::ccl::HistoryKind::Append,
     }))
 }
 

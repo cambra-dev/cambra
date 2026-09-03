@@ -4,7 +4,7 @@
 use super::*;
 use crate::{
     ccl::{
-        BinOpKind, Branch, Expr, LogicKind, Name, Type, TypedExprNode,
+        BinOpKind, Expr, LogicKind, Name, Type, TypedExprNode,
         ccl_utils::{
             flatten_trailing_value_case, make_cast, refined_data_fun, synthesize_arm_predicate,
         },
@@ -157,37 +157,6 @@ pub(super) fn lower_list_comp(
         }
     };
 
-    // ---- Phase 4.5: Float a value-`Case` source out of the comprehension --------
-    // `[e for x in (xs if c else ys)]` — a comprehension over a *conditional
-    // collection* — lowers with a value-`Case` source. Iterating it directly
-    // would bind the index variable to *both* choice domains (as the read index
-    // and the result domain), which inference rejects as an untagged-sum
-    // collision. Because the guards do not reference the comprehension variable,
-    // the `Case` floats out soundly: `[e for x in Case{gᵢ→srcᵢ}]` ⟹
-    // `Case{gᵢ → [e for x in srcᵢ]}` — each arm an ordinary map over a concrete
-    // collection, the enclosing `Case` a value-`Case` over collections (compiled by
-    // the gate fan-out). Single generator, no comprehension
-    // filter; a nested conditional source floats per arm by recursion. (A
-    // multi-generator or filtered comprehension over a conditional source is a
-    // follow-up — it falls through to the direct path.)
-    if single_gen
-        && pred_op.is_none()
-        && matches!(
-            &gen_sources[0].node,
-            TypedExprNode::Case { scrutinee: None, branches }
-                if branches.iter().all(|b| b.pattern.is_none())
-        )
-    {
-        let source = gen_sources.pop().expect("single generator has one source");
-        return Ok(float_comp_source_case(
-            source,
-            &gen_iter_vars[0],
-            &body,
-            comp.element.span,
-            ctx,
-        ));
-    }
-
     // ---- Phase 4.6: Fan out a value-`Case` *element* into filtered maps ----------
     // `[a if g(x) else b for x in xs]` — a comprehension whose *element* is a
     // per-element conditional — lowers with a value-`Case` body. The `Case`
@@ -250,6 +219,18 @@ pub(super) fn lower_list_comp(
             .and_then(named_data_domain)
             .unwrap_or_else(|| ctx.fresh_shared_hole())
     });
+    // **The result is a collection built over its sources.** Each generator's source gets
+    // a kind of its own and the result records that it is built over it: a comprehension
+    // binds one index position per index position of each source, which is a
+    // concatenation and not a join. One variable shared across the generators says
+    // something else — that they are one kind — which conflates two sources into one
+    // index, and leaves the second index to be recovered from the shape of the domain
+    // tuple by whatever walks it.
+    let result_kind = crate::ccl::ty::FunKind::fresh_data();
+    let crate::ccl::ty::FunKind::Var(result_kv) = &result_kind else {
+        unreachable!("fresh_data is a kind variable")
+    };
+    let result_kv = Rc::clone(result_kv);
     let lc = "lower.comprehension";
     let mut body_expr: Expr = body;
     for (i, (iter_var, source)) in gen_iter_vars
@@ -268,11 +249,26 @@ pub(super) fn lower_list_comp(
         };
         // Only stamp a source that did not already name its domain — otherwise the
         // id came *from* its annotation and re-stamping would discard it.
-        let source = match &iter_dom {
-            Some(d) if source.user_annotation.is_none() => {
-                source.with_user_annotation(Type::data_fun(d.clone(), Type::Hole))
-            }
-            _ => source,
+        let source = if source.user_annotation.is_none() {
+            let src_kind = crate::ccl::ty::FunKind::fresh_data();
+            // **A comprehension is a collection built over its generators.** It binds one
+            // position per position of each source, so this is a *built over* relation and
+            // not a bound: a bound would claim the result is another spelling of its source,
+            // pair positions that are not the same position, and give a multi-generator
+            // comprehension the arity of its widest source rather than the sum.
+            //
+            // In **generator order**: the loop nests the applications back to front, and the
+            // outermost binder is the first generator's, so a source goes in front of the
+            // ones already recorded.
+            result_kv.contributes_first(src_kind.clone());
+            source.with_user_annotation(Type::Fun {
+                name: None,
+                fun_kind: src_kind,
+                domain: Box::new(iter_dom.clone().unwrap_or(Type::Hole)),
+                codomain: Box::new(Type::Hole),
+            })
+        } else {
+            source
         };
         let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
         let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
@@ -315,13 +311,17 @@ pub(super) fn lower_list_comp(
         // is — one that survives into elimination, where the point-free form of
         // the collection inherits the lambda's kind and reads as a capability.
         let unrefined_lambda = ctx.tag_machinery(
-            Expr::lambda(outer_var, Type::Hole, body_expr)
-                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
+            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+                name: None,
+                fun_kind: result_kind.clone(),
+                domain: Box::new(Type::Hole),
+                codomain: Box::new(Type::Hole),
+            }),
             element_span,
             lc,
         );
         ctx.tag_predicate(&pred_expr, element_span, "lower.comp_filter_pred");
-        let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole);
+        let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind.clone());
         Ok(ctx.tag_machinery(make_cast(unrefined_lambda, target_ty), element_span, lc))
     } else {
         // A comprehension is a **data collection** (a map over its source's
@@ -332,8 +332,12 @@ pub(super) fn lower_list_comp(
         // filtered branch above stamps its own lambda the same way, under a cast
         // whose `refined_data_fun` target then refines the domain.)
         Ok(ctx.tag_machinery(
-            Expr::lambda(outer_var, Type::Hole, body_expr)
-                .with_user_annotation(Type::data_fun(iter_dom.unwrap_or(Type::Hole), Type::Hole)),
+            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+                name: None,
+                fun_kind: result_kind,
+                domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
+                codomain: Box::new(Type::Hole),
+            }),
             comp.element.span,
             lc,
         ))
@@ -351,67 +355,6 @@ fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
     use crate::ccl::provenance::copy_frame;
     let _frame = copy_frame(label);
     origin.clone()
-}
-
-/// Float a value-`Case` *source* out of a single-generator comprehension:
-/// `[e for x in Case{gᵢ→srcᵢ}]` ⟹ `Case{gᵢ → [e for x in srcᵢ]}`. Sound because
-/// the guards do not reference the comprehension variable `x`. Recurses so a
-/// nested conditional source flattens per arm; a concrete (non-`Case`) source
-/// builds the ordinary map chain `λ __idx → __idx ▷ src ▷ (λ x → body)`.
-fn float_comp_source_case(
-    source: Expr,
-    iter_var: &str,
-    body: &Expr,
-    span: Span,
-    ctx: &mut LoweringContext,
-) -> Expr {
-    let is_value_case = matches!(
-        &source.node,
-        TypedExprNode::Case { scrutinee: None, branches }
-            if branches.iter().all(|b| b.pattern.is_none())
-    );
-    if is_value_case {
-        let TypedExprNode::Case { branches, .. } = source.node else {
-            unreachable!("guarded by is_value_case")
-        };
-        let floated = branches
-            .into_iter()
-            .map(|b| Branch {
-                pattern: b.pattern,
-                guard: b.guard,
-                // The arm body *is* this arm's source collection; float into it.
-                body: float_comp_source_case(b.body, iter_var, body, span, ctx),
-            })
-            .collect();
-        // The rebuilt `Case` is the floated encoding of the rule, not an image of
-        // anything the user wrote.
-        return ctx.tag_machinery(
-            Expr::new(TypedExprNode::Case {
-                scrutinee: None,
-                branches: floated,
-            }),
-            span,
-            "lower.comp_source_case",
-        );
-    }
-    // Concrete source: `source ≫ (λ x → body)` — a `Compose`, *not* the apply
-    // chain Phase 5 builds. The compose form is equivalent (a map applies the
-    // body to each element) and is the shape the gate fan-out downstream reads.
-    //
-    // Stamped `Data` here, by the site that knows: a floated arm is a map over
-    // its own source, so it is a collection. That is what lets two such arms of
-    // a conditional source join as collections rather than colliding as
-    // capabilities whose index domains would meet — and saying it on the node
-    // lowering mints is what keeps it from being decided by whoever consumes it.
-    let body = fan_out_copy(body, "lower.comp_source_case_body");
-    let cs = "lower.comp_source_case";
-    let elem_map = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body), span, cs);
-    ctx.tag_machinery(
-        Expr::compose(vec![source, elem_map])
-            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
-        span,
-        cs,
-    )
 }
 
 /// Fan out a single-generator comprehension whose *element* is a value-`Case`
@@ -477,7 +420,12 @@ fn fan_out_element_case(
             // record its interior, and `collect_tree_ids` now enumerates it.
             // Sweep it (`design/provenance.md`, "Walking the ids", crossing 1).
             ctx.tag_predicate(&gate_on_source, span, "lower.comp_arm_gate_pred");
-            let target = refined_data_fun(Type::Hole, gate_on_source, Type::Hole);
+            let target = refined_data_fun(
+                Type::Hole,
+                gate_on_source,
+                Type::Hole,
+                crate::ccl::ty::FunKind::fresh_data(),
+            );
             ctx.tag_machinery(make_cast(elem_map, target), span, ec)
         })
         .collect();

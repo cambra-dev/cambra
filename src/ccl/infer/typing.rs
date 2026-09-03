@@ -207,11 +207,34 @@ pub(super) trait Typing {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError>;
 
-    /// Relate an applied argument to the function's parameter domain.
+    /// Relate two **parts** taken out of two types, each judged under the binders of the
+    /// type it came from.
+    ///
+    /// A part cut out of a function leaves its Σ behind, and a witness reference in it then
+    /// names a binder nothing in the comparison holds. Ambient scope cannot supply it — the
+    /// binder is on a *sibling* type, not an ancestor — so the rule that did the cutting is
+    /// the only thing that can (`src/ccl/design/type-inference.md`, "The witness context").
+    fn require_sub_under(
+        &mut self,
+        sub: &Type,
+        sub_binders: &[crate::ccl::ty::Witness],
+        sup: &Type,
+        sup_binders: &[crate::ccl::ty::Witness],
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError>;
+
+    /// Relate an applied argument to the domain of the function it is applied to.
     ///
     /// One-way in both Emit and Check: the sound subtyping rule `arg <: domain`
     /// (the argument must fit the parameter, so a *refined* argument may flow
     /// into an unrefined parameter — dropping a restriction is admissible).
+    ///
+    /// **Takes the function, not its domain.** The domain is what the edge relates
+    /// against, but a domain lifted out of its function is a reference stripped of the Σ
+    /// that classifies it, so Check supplies the function's binders alongside it
+    /// ([`Typing::require_sub_under`]). Passing a bare domain is a caller bug and
+    /// asserted against: a domain that is not a function reads as one whose shape is
+    /// unresolved, which is a case this method legitimately passes over.
     ///
     /// This is half of the one-way Apply story; the other half is the shape
     /// edge `fn_ty <: domain ⇒ codomain` ([`Typing::as_function`]). Neither
@@ -243,7 +266,7 @@ pub(super) trait Typing {
     fn constrain_argument(
         &mut self,
         arg: &Type,
-        domain: &Type,
+        function: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError>;
 
@@ -260,11 +283,20 @@ pub(super) trait Typing {
     /// `result` under a suspended discharge that fires at coalesce. Check
     /// destructures the already-resolved function and re-runs the discharge on
     /// its concrete codomain, so its reconstruction matches the recorded type.
+    ///
+    /// `kind` is the function node's **declared** kind, where lowering put one on its
+    /// annotation. An elimination cannot read a kind off the value — the node's type is
+    /// still a variable here — so without it the demand mints a kind variable of its own,
+    /// and the annotation's and the demand's are then two descriptions of one consumption
+    /// that never meet: a collection reaching both mints its own index at each
+    /// ([`crate::ccl::ty::FunKindVar::binders_for`]), every arm renames onto both, and the
+    /// two names arrive at one position with nothing relating them.
     fn apply(
         &mut self,
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
+        kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
 }

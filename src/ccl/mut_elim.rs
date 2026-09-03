@@ -78,7 +78,7 @@ pub fn run(expr: Expr) -> Expr {
     let mut out = rewrite(expr);
     // The rewrite turns every mutable read/write into an ordinary recurrence
     // read/commit at the mutable variable's *value* type, but the transient history
-    // `Type::History { kind: Overwrite }` wrappers that rode the accumulator's
+    // `Type::History { history_kind: Overwrite }` wrappers that rode the accumulator's
     // binding and any surviving reference (e.g. a trailing read the recurrence
     // re-points to the extracted final value) are stale afterward. Erase them
     // so no history reaches the strict `typecheck` (mirroring how
@@ -127,7 +127,7 @@ fn contains_mut_type(expr: &Expr) -> bool {
         matches!(
             ty,
             Type::History {
-                kind: HistoryKind::Overwrite,
+                history_kind: HistoryKind::Overwrite,
                 ..
             }
         ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
@@ -145,7 +145,7 @@ fn contains_mut_type(expr: &Expr) -> bool {
 fn erase_mut_in_type(ty: &mut Type) {
     if let Type::History {
         value,
-        kind: HistoryKind::Overwrite,
+        history_kind: HistoryKind::Overwrite,
         ..
     } = ty
     {
@@ -756,7 +756,7 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
             // loop-source destructuring.
             Type::History {
                 value,
-                kind: HistoryKind::Overwrite,
+                history_kind: HistoryKind::Overwrite,
                 ..
             } => t = value,
             _ => break,
@@ -820,7 +820,7 @@ fn writes_index_view(
     let mut iproj = Expr::proj_index(i);
     iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
     let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, wproj, iproj]);
-    comp.ty = Type::fun(domain_ty.clone(), vty.clone());
+    comp.ty = Type::fun_like(hist_ty, domain_ty.clone(), vty.clone());
     comp
 }
 
@@ -850,7 +850,7 @@ fn hist_field_view(
     let mut proj = Expr::proj_field(field);
     proj.ty = Type::fun(payload_ty, field_ty.clone());
     let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, proj]);
-    comp.ty = Type::fun(domain_ty.clone(), field_ty.clone());
+    comp.ty = Type::fun_like(hist_ty, domain_ty.clone(), field_ty.clone());
     comp
 }
 
@@ -1151,7 +1151,10 @@ pub(crate) fn fold_induction_loop(
     // it by construction — no separate reconstruction of the `to_<feed>`/`__fire`
     // field set (which would have to re-derive the same gate condition).
     let decision_ty = chain.ty.clone();
-    let hist_ty = Type::fun(domain_ty.clone(), decision_ty.clone());
+    // The recurrence binds the loop's history, so it is a collection — and a `Type::fun`
+    // here rode down into everything lambda elimination mints out of the position binder,
+    // the loop's own iteration source among them.
+    let hist_ty = crate::ccl::ccl_utils::history_ty(&domain_ty, &decision_ty);
 
     // The opaque writer body: `λ __p → ⟨chain⟩ ending in the decision`.
     let mut body_lam = Expr::lambda(p, p_ty.clone(), chain);
@@ -1167,7 +1170,7 @@ pub(crate) fn fold_induction_loop(
     let guard = {
         let mut arg = Expr::tuple(vec![writes_view, tvar(&r, domain_ty.clone()), defaults]);
         arg.ty = Type::Tuple(vec![
-            Type::fun(domain_ty.clone(), writes_ty.clone()),
+            crate::ccl::ccl_utils::history_ty(&domain_ty, &writes_ty),
             domain_ty.clone(),
             writes_ty.clone(),
         ]);
@@ -1277,7 +1280,10 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
         lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
         let mut map = Expr::compose(vec![iter.clone(), lambda]);
-        map.ty = Type::fun(domain_ty.clone(), value_ty);
+        // Mapping a value function over the loop's source: the chain is a read of `iter`, so
+        // it is whatever `iter` is. `Type::fun` would declare `Compute` and the channel this
+        // becomes is a collection — its every use says so.
+        map.ty = Type::fun_like(&iter.ty, domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
         feed.ty = Type::Base(BaseType::Unit);
         // As above: `expr_stmt` carries the continuation's type itself.
@@ -1947,7 +1953,7 @@ mod tests {
             matches!(
                 ty,
                 Type::History {
-                    kind: HistoryKind::Overwrite,
+                    history_kind: HistoryKind::Overwrite,
                     ..
                 }
             ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
@@ -2040,7 +2046,7 @@ mod tests {
             Type::History {
                 value: Box::new(int.clone()),
                 domain: Box::new(Type::Hole),
-                kind: HistoryKind::Overwrite,
+                history_kind: HistoryKind::Overwrite,
             },
             init,
             stmt,

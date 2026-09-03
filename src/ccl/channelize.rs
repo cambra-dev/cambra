@@ -135,7 +135,7 @@ fn has_type_residue(ty: &Type) -> bool {
         | Type::Infer(_)
         | Type::ChanDom(..)
         | Type::History {
-            kind: HistoryKind::Append,
+            history_kind: HistoryKind::Append,
             ..
         } => true,
         _ => {
@@ -353,7 +353,7 @@ fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
     // carry, which for a specialization clone differs from the term binder name.
     let inner_chan_dom =
         handle_chan_dom(&inner_binding.ty).or_else(|| handle_chan_dom(&inner_be.ty));
-    // Keep the inner defer's recorded handle type (`feed(ChanDom(F) ⇒ V)`) — the
+    // Keep the inner defer's recorded handle type (`feed(ChanDom(F) ⤇ V)`) — the
     // lifted binding must carry it so cluster discovery keys the channel by the
     // domain name consumer types reference, not by the term name. (`Hole` on an
     // untyped tree, harmlessly.)
@@ -539,12 +539,20 @@ struct ChannelizeCtx {
     /// `x <<= y` records `x ↦ ChanDom(y)`); [`close_chan_domains`] resolves
     /// those before the substitution.
     resolved_domains: Vec<(Name, Type)>,
+    /// Each channelized defer's **binder slot**, keyed the same way as
+    /// [`Self::resolved_domains`]. A channel over a conditional source is a collection over
+    /// that source's witness — `Σ (σ : 𝐾). σ ⤇ 𝑉` — and only the assembled channel's own
+    /// type says so: a witness reference carries no kind, so the slot cannot be
+    /// reconstructed from the substituted domain. An alias records none and erases
+    /// unbound, as it did before.
+    channel_kinds: Vec<(Name, crate::ccl::ty::FunKind)>,
 }
 
 impl ChannelizeCtx {
     fn new() -> Self {
         Self {
             resolved_domains: Vec::new(),
+            channel_kinds: Vec::new(),
         }
     }
 }
@@ -591,25 +599,27 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // strict post-channelize `typecheck` in `compile_program` backstops the
     // invariant.
     let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
-    erase_chan_domains(&mut rewritten, &mut map);
+    let kinds: HashMap<Name, crate::ccl::ty::FunKind> =
+        std::mem::take(&mut ctx.channel_kinds).into_iter().collect();
+    erase_chan_domains(&mut rewritten, &mut map, &kinds);
     #[cfg(debug_assertions)]
     assert_no_type_residue(&rewritten);
     Ok(rewritten)
 }
 
 /// The channel-domain name (and its inference level) carried by a feed
-/// handle's recorded type — `feed(ChanDom(n) ⇒ V)`, through refinements.
+/// handle's recorded type — `feed(ChanDom(n) ⤇ V)`, through refinements.
 /// This is the name consumer types actually reference. For a specialization
 /// clone it differs from the term binder name (channel identity is
 /// per-instantiation, freshened at `specialize_use`), so channel recording
 /// and lift-alias entries key on it, never on the term name.
 fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::History {
             domain,
-            kind: HistoryKind::Append,
+            history_kind: HistoryKind::Append,
             ..
-        } => match peel_refinements(domain) {
+        } => match domain.peel_refinements() {
             Type::ChanDom(n, l) => Some((n.clone(), *l)),
             _ => None,
         },
@@ -622,11 +632,11 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
 /// is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`), the read's
 /// handle domain (a `ChanDom` closed later by [`close_chan_domains`]).
 fn channel_domain_of(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
             domain,
-            kind: HistoryKind::Append,
+            history_kind: HistoryKind::Append,
             ..
         } => Some((**domain).clone()),
         _ => None,
@@ -694,32 +704,43 @@ fn subst_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 /// bare stream `Fun(domain, value)` and substitute every `ChanDom` via
 /// [`subst_chan_domains_in_type`] — the feed-side analog of
 /// `mut_elim::erase_mut_in_type`.
-fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
+fn erase_chan_domains_in_type(
+    ty: &mut Type,
+    map: &HashMap<Name, Type>,
+    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+) {
     if let Type::History {
         value,
         domain,
-        kind: HistoryKind::Append,
+        history_kind: HistoryKind::Append,
     } = ty
     {
+        // The handle names its channel, and the channel's assembled type is what says
+        // whether the stream binds a witness. Read it before the domain is substituted:
+        // afterwards the domain is a bare reference, and a reference carries no kind.
+        let fun_kind = match domain.peel_refinements() {
+            Type::ChanDom(n, _) => kinds.get(n).cloned(),
+            _ => None,
+        };
         let domain = std::mem::replace(domain.as_mut(), Type::Hole);
         let value = std::mem::replace(value.as_mut(), Type::Hole);
         *ty = Type::Fun {
             name: None,
             // A feed channel is a collection stream: erase History → a data function.
-            kind: crate::ccl::ty::FunKind::Data,
+            fun_kind: fun_kind.unwrap_or(crate::ccl::ty::FunKind::Data(None)),
             domain: Box::new(domain),
             codomain: Box::new(value),
         };
-        return erase_chan_domains_in_type(ty, map);
+        return erase_chan_domains_in_type(ty, map, kinds);
     }
     if let Type::ChanDom(name, _) = ty {
         if let Some(dom) = map.get(name) {
             *ty = dom.clone();
-            erase_chan_domains_in_type(ty, map);
+            erase_chan_domains_in_type(ty, map, kinds);
         }
         return;
     }
-    ty.walk_children_mut(|t| erase_chan_domains_in_type(t, map));
+    ty.walk_children_mut(|t| erase_chan_domains_in_type(t, map, kinds));
 }
 
 /// whole-tree erasure — node types, user annotations, and
@@ -734,7 +755,11 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 /// subtree is erased, discharge `[name ↦ bound]` into every map value, so any
 /// substitution *above* the binder injects the closed form the strict checker
 /// derives. Still derivation-free — a discharge transport, not re-inference.
-fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
+fn erase_chan_domains(
+    expr: &mut Expr,
+    map: &mut HashMap<Name, Type>,
+    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+) {
     // Erase this node's binder-declared type slots — both the declared type and
     // the annotation, since a handle can ride either. Deliberately *not*
     // `walk_type_slots_mut` (which `mut_elim::erase_mut` uses): the slots here are
@@ -746,9 +771,9 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
     // that child — never in scope at this binder — so erasing binders before the
     // child recursion sees the same substitutions the old inline order did.
     expr.walk_binders_mut(|b| {
-        erase_chan_domains_in_type(&mut b.ty, map);
+        erase_chan_domains_in_type(&mut b.ty, map, kinds);
         if let Some(ann) = &mut b.user_annotation {
-            erase_chan_domains_in_type(ann, map);
+            erase_chan_domains_in_type(ann, map, kinds);
         }
     });
     if let TypedExprNode::Let {
@@ -757,8 +782,8 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
         body,
     } = &mut expr.node
     {
-        erase_chan_domains(bound_expr, map);
-        erase_chan_domains(body, map);
+        erase_chan_domains(bound_expr, map, kinds);
+        erase_chan_domains(body, map, kinds);
         // §6.2 Let-closing on the substitution content (see fn docs).
         // A discharge template is not a tree node: it is cloned again at every
         // read, and that read is where the sibling is minted.
@@ -768,11 +793,11 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
             *dom = discharge.apply_type(dom);
         }
     } else {
-        expr.walk_children_mut(|c| erase_chan_domains(c, map));
+        expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds));
     }
-    erase_chan_domains_in_type(&mut expr.ty, map);
+    erase_chan_domains_in_type(&mut expr.ty, map, kinds);
     if let Some(ann) = &mut expr.user_annotation {
-        erase_chan_domains_in_type(ann, map);
+        erase_chan_domains_in_type(ann, map, kinds);
     }
 }
 
@@ -784,11 +809,11 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
 /// a read prefix (a nested generator's inner channel block) types at
 /// construction instead of leaving a `Hole` for a re-derivation pass.
 fn fun_codomain(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { codomain, .. } => Some((**codomain).clone()),
         Type::History {
             value,
-            kind: HistoryKind::Append,
+            history_kind: HistoryKind::Append,
             ..
         } => Some((**value).clone()),
         _ => None,
@@ -798,11 +823,11 @@ fn fun_codomain(ty: &Type) -> Option<Type> {
 /// The domain of `ty` viewed as a function, peeling outer refinements.
 /// See [`fun_codomain`] for the feed-history stream view.
 fn fun_domain(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
             domain,
-            kind: HistoryKind::Append,
+            history_kind: HistoryKind::Append,
             ..
         } => Some((**domain).clone()),
         _ => None,
@@ -929,6 +954,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             value: Box::new(drop_expr_stmts(*value)),
             target,
         },
+        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(drop_expr_stmts(*value))),
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
             left: Box::new(drop_expr_stmts(*left)),
             op,
@@ -1075,7 +1101,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(function)?;
             assert_no_defer_residue(argument)
         }
-        TypedExprNode::Cast { value, .. } => assert_no_defer_residue(value),
+        TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
+            assert_no_defer_residue(value)
+        }
         TypedExprNode::Begin { body } => assert_no_defer_residue(body),
         TypedExprNode::BinOp { left, right, .. } => {
             assert_no_defer_residue(left)?;
@@ -1447,6 +1475,9 @@ fn channelize_cluster(
             // still holding its `ChanDom` surfaces at the debug residue
             // assert / strict wall.
             if let Some(dom) = channel_domain_of(&ch.ty) {
+                if let Some(k) = ch.ty.fun_kind() {
+                    ctx.channel_kinds.push((key.clone(), k.clone()));
+                }
                 ctx.resolved_domains.push((key, dom));
             }
         }
@@ -1774,7 +1805,9 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(function, bound, out);
                 rec(argument, bound, out);
             }
-            TypedExprNode::Cast { value, .. } => rec(value, bound, out),
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
+                rec(value, bound, out)
+            }
             TypedExprNode::Begin { body } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
@@ -1911,7 +1944,7 @@ fn copair_type(feeds: &[Expr]) -> Type {
     let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
     let mut cod: Option<Type> = None;
     for (i, f) in feeds.iter().enumerate() {
-        match peel_refinements(&f.ty) {
+        match f.ty.peel_refinements() {
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -1977,15 +2010,6 @@ fn join_refinements(a: &Type, b: &Type) -> Type {
     )
 }
 
-/// Peel outer `Refinement` wrappers off a type, returning the underlying type.
-fn peel_refinements(ty: &Type) -> &Type {
-    let mut t = ty;
-    while let Type::Refinement(inner, _) = t {
-        t = inner;
-    }
-    t
-}
-
 /// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`.
 /// With nominal channel domains every element is concrete-modulo-`ChanDom` at
 /// construction (the feed-history stream view of [`fun_domain`] /
@@ -1995,8 +2019,12 @@ fn peel_refinements(ty: &Type) -> &Type {
 fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
     let d = elts.first().and_then(|e| fun_domain(&e.ty));
     let c = elts.last().and_then(|e| fun_codomain(&e.ty));
+    // `fun_like`, not `Type::fun`: the chain is the head read through the rest, so it is a
+    // collection exactly when the head is. The head here is routinely a feed handle that
+    // `erase_chan_domains` has not yet turned into a `Type::Fun`, which `fun_like` reads as
+    // the stream it states.
     let ty = match (d, c) {
-        (Some(d), Some(c)) => Type::fun(d, c),
+        (Some(d), Some(c)) => Type::fun_like(&elts[0].ty, d, c),
         _ => Type::Hole,
     };
     Expr::compose(elts).with_ty(ty)
@@ -2077,7 +2105,12 @@ fn extract_for_defer_impl(
             let lifted = if in_inner_scope || is_collection {
                 value
             } else {
+                // The channel is a collection — inference says so on the handle, and every
+                // read of it is `⤇`. `Expr::lambda` declares `Compute`, so the wrap has to
+                // restate what the thing being wrapped is.
+                let vty = value.ty.clone();
                 Expr::lambda("__unused", Type::Base(BaseType::Unit), value)
+                    .with_ty(Type::data_fun(Type::Base(BaseType::Unit), vty))
             };
             feeds.push(lifted);
             // The `Feed` wrapper's id is reused onto this `Lit(Unit)` replacement
@@ -2290,6 +2323,14 @@ fn extract_for_defer_impl(
                 }
             }
         }
+        // `realize` wraps a pure value exactly as `cast` does; recurse and keep `target`.
+        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(extract_for_defer(
+            *value,
+            defer_name,
+            feeds,
+            define,
+            in_inner_scope,
+        )?)),
         // `cast` wraps a pure value; recurse into it and keep `target`.
         TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
             value: Box::new(extract_for_defer(
@@ -2559,7 +2600,16 @@ fn extract_for_defer_impl(
                 return Err(DeferError::NestedDefinition);
             }
             for v in local_feeds {
-                feeds.push(Expr::lambda(&param.name, param.ty.clone(), v));
+                // The channel contribution is this lambda with the fed value for its body, so
+                // it is the same collection-or-capability the lambda was — `Expr::lambda`
+                // stamps `Compute`, so the incoming kind is carried back on.
+                let wrapped = Expr::lambda(&param.name, param.ty.clone(), v);
+                let wrapped_ty = Type::fun_like(
+                    &ty,
+                    param.ty.clone(),
+                    wrapped.ty.codomain().expect("a lambda is a function"),
+                );
+                feeds.push(wrapped.with_ty(wrapped_ty));
             }
             TypedExprNode::Lambda {
                 param,
@@ -2651,7 +2701,13 @@ fn extract_for_defer_impl(
                         Type::refined_one(unit_ty.clone(), Refinement::born(Rc::new(pred)))
                     };
                     for v in branch_feeds {
-                        feeds.push(Expr::lambda("__unused", refined.clone(), v.clone()));
+                        // The channel is a collection, exactly as at the unconditional
+                        // const-wrap above; `Expr::lambda` stamps `Compute`, so restate it.
+                        let vty = v.ty.clone();
+                        feeds.push(
+                            Expr::lambda("__unused", refined.clone(), v.clone())
+                                .with_ty(Type::data_fun(refined.clone(), vty)),
+                        );
                     }
                 }
                 // Fall through: the residual value in every arm is now feed-free
@@ -2980,7 +3036,7 @@ mod tests {
         let refinement = Refinement::born(Rc::new(pred));
         let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
         });

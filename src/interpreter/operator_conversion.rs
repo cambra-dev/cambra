@@ -462,6 +462,18 @@ impl OpConversionContext {
             // source's. `transact_phase` emits `Mut(V, Txn)` stores, so this is a
             // live path — a transactional store's history domain converts here.
             Type::Txn => Ok(Extent::Base(BaseType::UInt)),
+            // An **unrealized sum**, rejected by name rather than through the catch-all
+            // below. Realization erases the sums whose witness is statically enumerable
+            // (`src/ccl/planning/conditionals.rs`), so one reaching here ranges over
+            // domains no fan-out could list — a described witness kind, `List(T)` or
+            // `Collection(T)` — and what it needs is the runtime witness
+            // (`src/ccl/design/collections.md`, "Compiling a conditional collection"). That is an unimplemented
+            // capability, so it must not be reported as a compiler bug; `planning::iterate`
+            // and `planning::conditionals` both leave such a type standing for this arm.
+            Type::WitnessRef(_) => Err(ConversionError::Unsupported(format!(
+                "a collection whose domain is not statically known ({ty}) has no extent: \
+                 the runtime witness is not implemented"
+            ))),
             other => Err(ConversionError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent; \
                  this is a compiler bug — type inference should have resolved \
@@ -943,6 +955,12 @@ fn convert_impl_inner(
         // specialized join chain — by op-conversion time the cast is
         // value-level inert.
         TypedExprNode::Cast { value, .. } => convert_impl(value, input, ctx),
+
+        // `realize` is likewise inert here, and for a sharper reason: its job was to let
+        // the *type* above it stay unchanged while the value below became the executable
+        // form. Op-conversion wants the executable form, so the wrapper is dropped and the
+        // value compiled — its own type, not the asserted one, is what extents read from.
+        TypedExprNode::Realize(value) => convert_impl(value, input, ctx),
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
@@ -2232,10 +2250,16 @@ fn union_operand_ops(
         //
         // That is a **disjoint join**, and only a disjoint join: a flat merge
         // reassembles one domain, which is not what a copairing denotes. A fed
-        // `Copair` would have to keep its arms tagged apart, and nothing builds one
-        // today — no program reaches here (`Builtin::Copair` requires a `++` inside a
-        // lambda over the parameter, which fails upstream at the post-elim
-        // typecheck). Rather than compile it as the operation it is not, say so.
+        // copairing would instead have to demultiplex the input stream by tag, feed
+        // each arm the rows carrying its own, and re-tag the outputs; no operator does
+        // that. Programs reach here — a union-domained collection read at a projected
+        // index, which is what a `++` generator beside a second generator lowers to
+        // (`tests/compilation_pipeline/scalars_collections.rs`,
+        // `a_union_generator_beside_a_second_generator`). So this names the missing
+        // capability rather than compiling the operation as the one it is not. The
+        // `Apply(Tuple, Copair)` form is the one nothing builds: it requires a `++`
+        // inside a lambda over the parameter, which fails upstream at the post-elim
+        // typecheck.
         Some(inp) => {
             if shape == UnionShape::Copair {
                 return Err(ConversionError::Unsupported(

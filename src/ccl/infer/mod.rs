@@ -78,7 +78,7 @@ mod check;
 mod context;
 mod emit;
 mod schemes;
-mod solve;
+pub(crate) mod solve;
 pub mod solver;
 mod typing;
 
@@ -87,6 +87,8 @@ mod typing;
 // pass: feed reads type concretely via their rigid `ChanDom` channel domains,
 // which `crate::ccl::channelize` erases by substitution — no post-channelize
 // re-typing.)
+#[cfg(debug_assertions)]
+pub use api::debug_assert_no_free_witness;
 pub use api::*;
 pub use check::check;
 pub use schemes::OperatorSchemes;
@@ -188,6 +190,7 @@ fn blame_node_for_place(
             Type::Tuple(elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
+            Type::WitnessRef(_) => false,
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -302,15 +305,33 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             accepted: accepted.into_iter().map(Type::Base).collect(),
             at: ctx_label.to_string(),
         },
+        // Reported with the same `ctx` a coalesce-time kinding failure uses: the two
+        // differ only in when the type side became known.
+        ConstrainError::NotOfKind { found, type_kind } => InferError::TypeMismatch {
+            found: Box::new(coalesce_for_error(&found)),
+            expected: Some(Box::new(Type::sum_over(type_kind, None, Type::Hole))),
+            ctx: "collection annotation".to_string(),
+        },
+        // A **demand**: `rhs` is the domain a declaration or parameter requires and `lhs`
+        // is what was supplied, so this is the ordinary expected/found sentence. No `box`
+        // advice — nothing is being joined here, and boxing the value would change what it
+        // is rather than reconcile two arms. No `ctx_label` either: the report's span
+        // underlines the expression already, so rendering it again says the same thing
+        // twice, once in source and once in CCL.
         ConstrainError::DataDomainMismatch { lhs, rhs } => InferError::TypeMismatch {
-            ctx: format!(
-                "collection domain conflict at {ctx_label} (a collection's domain is \
-                 its data, so a join may not narrow it — two collections over distinct \
-                 domains have no common data-function type, and their lossless join is \
-                 a dependent sum over the candidate domains)"
-            ),
+            ctx: "collection domain (a collection's domain is its data, so it is \
+                  invariant — a collection over one domain does not stand in for a \
+                  collection over another)"
+                .to_string(),
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
+        },
+        // A **join**, and the same fact the coalesce-time face reports. Converted to the
+        // same `InferError` so the message follows the situation rather than which phase
+        // noticed it.
+        ConstrainError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
+            domains: domains.iter().map(coalesce_for_error).collect(),
+            origin: ctx_label.to_string(),
         },
     }
 }
@@ -329,6 +350,20 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             origin: ctx_label.to_string(),
             context: vec![],
         },
+        // A kinding failure *is* an annotation mismatch: the user wrote a collection
+        // kind and the value's domain does not inhabit it. Reported with the same
+        // `ctx` a constraint-time collection mismatch uses, because the two differ
+        // only in when the shape became known.
+        // The *kind* is the demand, rendered as the sum it classifies — the form the
+        // annotation was written as — and the resolved domain is what failed it.
+        CoalesceError::KindMismatch {
+            resolved,
+            type_kind,
+        } => InferError::TypeMismatch {
+            found: resolved,
+            expected: Some(Box::new(Type::sum_over(type_kind, None, Type::Hole))),
+            ctx: "collection annotation".to_string(),
+        },
         CoalesceError::UnresolvedPartial { kind, details } => InferError::UnresolvedPartial {
             kind: format!("{:?} ({})", kind, details),
             at: ctx_label.to_string(),
@@ -337,10 +372,16 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             "recursive type at {}: {} (residual μ-types are forbidden)",
             ctx_label, details
         )),
-        CoalesceError::DomainJoinConflict { details } => InferError::Unsupported(format!(
-            "collection domain conflict at {}: {} \
-             (a collection's domain is its data, so a join may not narrow it)",
-            ctx_label, details
+        CoalesceError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
+            domains,
+            origin: ctx_label.to_string(),
+        },
+        // The same violation `check_scope_valid` reports post-inference, caught where it is
+        // made: a materialized type carrying a witness reference no binder covers. A
+        // compiler bug in whatever built the position, like `KindConflict` below.
+        CoalesceError::WitnessScope { details } => InferError::Unsupported(format!(
+            "a witness reference escaped its binder at {ctx_label}: {details} (a \
+             `WitnessRef` denotes \"whichever domain\", so outside its sum it denotes nothing)"
         )),
         CoalesceError::KindConflict { details } => InferError::Unsupported(format!(
             "one function was required to be both a compute function ⇒ and a data collection ⤇ \
@@ -564,6 +605,13 @@ pub(crate) fn run(
             return Err(scope_errors);
         }
     }
+    // The witness counterpart of the scope check above, and here rather than only at the
+    // pipeline's stage boundaries because *this* is where the close happens: a witness
+    // that materialization left with no binder is a defect of the pass that just ran, and
+    // a caller who only infers (a type-level test, a REPL) is exactly as entitled to catch
+    // it as one who goes on to compile.
+    #[cfg(debug_assertions)]
+    debug_assert_no_free_witness(expr, "post-inference");
     Ok(expr.ty.clone())
 }
 

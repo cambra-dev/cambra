@@ -12,7 +12,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Expr, Level, Name, Refinement, RefinementSet, Type, TypedExpr, TypedExprNode,
+    BaseType, Expr, Level, Name, Refinement, RefinementSet, Type, TypedBinding, TypedExpr,
+    TypedExprNode,
 };
 
 use super::emit::{
@@ -67,6 +68,13 @@ pub(super) struct CheckCtx {
     /// reason [`Typing::raise`] attributes at the raise site.
     errors: Vec<LocatedInferError>,
     pred_memo: TermMemo,
+    /// **Γ — what the witnesses in scope range over** at the current position
+    /// (`src/ccl/design/type-inference.md`, "The witness context").
+    ///
+    /// A reference is a name, so an edge this walk draws is judged under the binders of the
+    /// functions enclosing it. Extended where the walk enters a Σ-typed function's body,
+    /// which is the only construct that binds one.
+    witness_ctx: crate::ccl::ty::WitnessContext,
     /// The node whose rule is running, maintained by [`check_node`] exactly as
     /// `emit_node` maintains Emit's. Seeded with the tree's root at
     /// construction, so a rule always has a node to blame.
@@ -92,6 +100,7 @@ impl CheckCtx {
             level: 0,
             errors: Vec::new(),
             pred_memo: Default::default(),
+            witness_ctx: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
             derivation,
@@ -247,6 +256,7 @@ impl Typing for CheckCtx {
         // closure invariant like the live solve, a sub-tree probe cannot (the
         // binders its refinements reference are held by the context it was cut from).
         let mut cache = ConstrainCache::for_derivation(self.derivation);
+        cache.seed_context(&self.witness_ctx);
         if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
@@ -334,27 +344,35 @@ impl Typing for CheckCtx {
         while let Some(value) = peeled.mut_value_type() {
             peeled = value.peel_refinements();
         }
-        if let Type::Fun {
-            domain: d,
-            codomain: c,
-            ..
-        } = peeled
-        {
-            return Ok(((**d).clone(), (**c).clone()));
+        match peeled {
+            // A sum destructures like the function it is: the consumer's domain is a name
+            // for whichever domain the witness picked — the sum's own domain, which its
+            // slot binds — paired with the shared element type. One arm serves both
+            // because the slot rides the kind, so Check and Emit agree at the wall about
+            // what a consumed collection destructures to.
+            Type::Fun {
+                domain: d,
+                codomain: c,
+                ..
+            } => Ok(((**d).clone(), (**c).clone())),
+            // A `Feed` history reads as its whole stream `domain ⇒ value` — a
+            // defer's channel — so it destructures directly to (domain, value).
+            Type::History {
+                domain,
+                value,
+                history_kind: crate::ccl::HistoryKind::Append,
+            } => Ok(((**domain).clone(), (**value).clone())),
+            _ => {
+                let located = self.raise(InferError::ExpectedFunction {
+                    found: t.clone(),
+                    at: at(),
+                });
+                self.errors.push(located);
+                // Continue with throwaways so the rest of the rule still runs
+                // (Check accumulates every error rather than failing fast).
+                Ok((self.fresh(), self.fresh()))
+            }
         }
-        // A feed channel reads as its whole stream `domain ⇒ value`, so it
-        // destructures as that function type.
-        if let Some((domain, value)) = peeled.as_feed() {
-            return Ok((domain.clone(), value.clone()));
-        }
-        let located = self.raise(InferError::ExpectedFunction {
-            found: t.clone(),
-            at: at(),
-        });
-        self.errors.push(located);
-        // Continue with throwaways so the rest of the rule still runs (Check
-        // accumulates every error rather than failing fast).
-        Ok((self.fresh(), self.fresh()))
     }
 
     fn provide_function(
@@ -367,17 +385,62 @@ impl Typing for CheckCtx {
         self.as_function(t, at)
     }
 
+    fn require_sub_under(
+        &mut self,
+        sub: &Type,
+        sub_binders: &[crate::ccl::ty::Witness],
+        sup: &Type,
+        sup_binders: &[crate::ccl::ty::Witness],
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError> {
+        let mut cache = ConstrainCache::for_derivation(self.derivation);
+        cache.seed_context(&self.witness_ctx);
+        if let Err(e) = crate::ccl::infer::solver::constrain_subtype_under(
+            sub,
+            sup,
+            sub_binders,
+            sup_binders,
+            &mut cache,
+        ) {
+            let located = self.raise(map_constrain_err(e, &at()));
+            self.errors.push(located);
+        }
+        Ok(())
+    }
+
     fn constrain_argument(
         &mut self,
         arg: &Type,
-        domain: &Type,
+        function: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
         // Sound one-way only: a refined argument may flow into an unrefined
         // parameter (dropping a restriction is admissible). Emit's reverse
         // direction (domain coalescing) is not the sound subtyping rule and so
         // does not apply to the post-inference check.
-        self.require_sub(arg, domain, at)
+        //
+        // **The function, not its domain.** A domain taken out of its function is a
+        // reference stripped of the Σ that classifies it, and nothing downstream can say
+        // what it ranges over. Passing the function keeps its binders in Γ for the edge
+        // (`src/ccl/design/type-inference.md`, "The witness context").
+        let Some(domain) = function.peel_refinements().domain() else {
+            // An unresolved function has no domain to relate against; the shape edge
+            // ([`Typing::as_function`]) is what reports that. Asserted rather than passed
+            // over silently, because a caller handing this its *domain* lands in exactly
+            // this arm and its argument then goes unchecked.
+            assert!(
+                matches!(
+                    function.peel_refinements(),
+                    Type::Hole | Type::Infer(_) | Type::BoundedHole(_)
+                ),
+                "constrain_argument takes the applied function, got {function}"
+            );
+            return Ok(());
+        };
+        // The **domain** is what the function's binders classify. The argument is written
+        // where the application is, and what binds it there is the ambient context.
+        let binders = function.peel_refinements().sum().unwrap_or(&[]).to_vec();
+        self.require_sub_under(arg, &[], &domain, &binders, at)
     }
 
     fn apply(
@@ -385,10 +448,11 @@ impl Typing for CheckCtx {
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
+        _kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {
-        let (domain, codomain) = self.as_function(fn_ty, at)?;
-        self.constrain_argument(arg_ty, &domain, at)?;
+        let (_domain, codomain) = self.as_function(fn_ty, at)?;
+        self.constrain_argument(arg_ty, fn_ty, at)?;
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
@@ -433,7 +497,20 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
     // One stack frame per node over the whole tree, sized for the union
     // of `check_node_rule`'s arms, so a deep tree can outrun a test thread's stack.
     // Same guard, and same reason, as `lambda_elim`'s recursion entries.
+    // **A node whose type is a sum binds those witnesses over the subtree that produces
+    // it**, so Γ gains them for this node's rule and loses them on the way out
+    // (`src/ccl/design/type-inference.md`, "The witness context"). Not a lambda-only rule:
+    // by the walls that run after lambda elimination the collection is point-free, and the
+    // Σ rides an `Apply` or a `Compose` instead.
+    let binders = expr.ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+    let outer = (!binders.is_empty()).then(|| {
+        let inner = ctx.witness_ctx.extended(&binders);
+        std::mem::replace(&mut ctx.witness_ctx, inner)
+    });
     let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || check_node_rule(expr, ctx));
+    if let Some(outer) = outer {
+        ctx.witness_ctx = outer;
+    }
     ctx.current_node = prev;
     out
 }
@@ -480,6 +557,14 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        // **The assertion is trusted**, which is the whole difference from `Cast`. The
+        // relation it claims — a gated tagged union realizing a sum — is one no typing rule
+        // can check, so re-deriving from the value would only rediscover that they differ.
+        // The child is still walked: it is an ordinary term and its own subtree must check.
+        TypedExprNode::Realize(value) => {
+            ctx.subexpr(value)?;
+            expr.ty.clone()
+        }
 
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
@@ -586,9 +671,96 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // to catch: every merge point in the pipeline — a `Case`'s arms, a list's
         // elements, a mutable variable's seed and writes, a channel's contributions — joins,
         // and the wall is what holds them to it.
+        // **Both sides are closed**, so the comparison is made in the empty witness
+        // context. A rule that reads a part out of a child's sum binds it again in the type
+        // it builds — a Σ-headed chain is a Σ, a predicate over a witness-domained
+        // collection is a collection over that witness — so neither side names an index its
+        // own type does not bind.
         ctx.require_sub(&ty, &expr.ty, &|| format!("type of {label}"))?;
     }
     Ok(ty)
+}
+
+/// Type every refinement predicate the tree carries, as the function it denotes.
+///
+/// A predicate is a term, and the walk above cannot reach it: it hangs off a `Type`, so a
+/// wall comparing types compares it whole and never asks whether it type-checks. That is
+/// the gap two defects on this branch travelled through — a projection inside a predicate
+/// naming a witness the enclosing type does not.
+///
+/// Checked in the form it denotes and the form planning will compile, `λ __elem : base →
+/// predicate` ([`crate::ccl::planning::predicates::fn_of_bare_predicate`]), because a bare
+/// predicate is open in `__elem` and would report an unbound variable on its own.
+fn check_predicates(
+    expr: &Expr,
+    ctx: &mut CheckCtx,
+    visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+) {
+    fn in_type(
+        ty: &Type,
+        ctx: &mut CheckCtx,
+        visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+    ) {
+        // **A Σ binds its witnesses over everything below it**, the predicate on its domain
+        // included, so Γ gains them here and loses them on the way out. This walk reaches a
+        // predicate through types rather than through the tree, so nothing else has put
+        // them there (`src/ccl/design/type-inference.md`, "The witness context").
+        let binders = ty.sum().unwrap_or(&[]).to_vec();
+        let outer = (!binders.is_empty()).then(|| {
+            let inner = ctx.witness_ctx.extended(&binders);
+            std::mem::replace(&mut ctx.witness_ctx, inner)
+        });
+        in_type_go(ty, ctx, visited);
+        if let Some(outer) = outer {
+            ctx.witness_ctx = outer;
+        }
+    }
+    fn in_type_go(
+        ty: &Type,
+        ctx: &mut CheckCtx,
+        visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+    ) {
+        if let Type::Refinement(base, refinements) = ty {
+            for r in refinements {
+                if !visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                    continue;
+                }
+                // **The scratch lambda never enters a tree, so it consumes no identity.**
+                // It exists only to give the predicate the binder it is open in — a bare
+                // predicate would report `__elem` unbound — and is dropped when the check
+                // returns. Minting it would put a birth with no recording open into the
+                // record a phase scope is auditing, and cloning its body the ordinary way
+                // would put a copy there too: `TypedExpr`'s `Clone` freshens. A check
+                // reads, and must not perturb the record it may be reporting on
+                // ([`TypedExpr::throwaway`]).
+                let body = r.predicate.as_ref().clone_preserving_ids();
+                let bound_ty = Type::fun((**base).clone(), body.ty.clone());
+                let mut bound = Expr::throwaway(TypedExprNode::Lambda {
+                    param: TypedBinding {
+                        name: Name::elem(),
+                        ty: (**base).clone(),
+                        user_annotation: None,
+                    },
+                    body: Box::new(body),
+                })
+                .with_ty(bound_ty);
+                let before = ctx.errors.len();
+                if let Err(e) = check_node(&mut bound, ctx) {
+                    ctx.errors.push(e);
+                }
+                if ctx.errors.len() > before && std::env::var_os("CCL_BAD").is_some() {
+                    eprintln!(
+                        "BADPRED base={base}\n  {}",
+                        crate::ccl::symbolic::symbolic_typed(&r.predicate)
+                    );
+                }
+                check_predicates(&r.predicate, ctx, visited);
+            }
+        }
+        ty.walk_children(|child| in_type(child, ctx, visited));
+    }
+    expr.walk_type_slots(|ty| in_type(ty, ctx, visited));
+    expr.walk_children(|child| check_predicates(child, ctx, visited));
 }
 
 /// Run the post-inference structural type-check over `expr`.
@@ -628,6 +800,7 @@ pub fn check(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>>
     if let Err(e) = check_node(&mut cloned, &mut ctx) {
         ctx.errors.push(e);
     }
+    check_predicates(&cloned, &mut ctx, &mut Default::default());
     if ctx.errors.is_empty() {
         Ok(())
     } else {

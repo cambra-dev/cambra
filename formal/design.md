@@ -252,6 +252,35 @@ a domain flips the polarity and the subtyping edge together, and a `data` domain
 closing that case needs the bound carried on the other side as well. One induction proves all four
 cells, and leastness alone would not close the function case.
 
+### The fn slot holds one domain
+
+`CompactFun` holds **one** domain, merged contravariantly like any other position, plus a
+`domains_disagree` flag and the operand pair a merge had to combine. A candidate set lives one level
+up, on the witness a Σ binds. The model followed: the slot's `List CompactTy` became a `CompactTy`,
+which retired `unionDomains`, `meetDomains`, `anyEquiv`, `subtypeDomains`, `domainsEquiv`,
+`OneDistinct`, `meetAll` and their theorems — `OneDistinct` in particular, since "at most one
+distinct domain" is now the slot's type rather than a predicate proved about it.
+
+Three consequences, each measured:
+
+- **`DataAgree` states the domain edge at both polarities.** A positive merge meets the domains too,
+  so the evidence that two `data` domains disagreed is gone either way; the list slot kept both
+  alternatives at a positive merge and needed the hypothesis only at a negative one. This doubled
+  the unguarded failure counts (4 → 8 and 2 → 4), on the same two surfaces and in both orders.
+- **`merge_is_a_bound`'s sample coverage rose**, 1814 → 1844 of 2048. The class excluded before — a
+  `compute` slot carrying two domain alternatives, which materialized by meeting them — cannot arise
+  over one domain.
+- **`merge_assoc`, `merge_is_least_absorber` and `least_absorber_unique` no longer need
+  `Classical.choice`**, since their proofs became `rw` plus a triple of componentwise facts.
+
+**What the model does not state.** The Rust reaches `DomainJoinConflict` two ways: the merged domain
+denoting several alternatives, which `funShapes` mirrors through `denotesSeveralDomains`; and the
+`domains_disagree` flag, which `CompactFun::merge` sets from the *operands* because the meet erases
+the evidence. There is no slot for the flag here, so a disagreement whose merged position is not
+several atoms is a verdict this model does not give. The coalesce differential reports 0 mismatches
+over 4000 bounds, so the sampler does not reach it; closing it means a fourth component on the fn
+slot and a model of `data_domains_disagree`.
+
 **A disagreement is caught loudly exactly when the domains' join is undefined, and silently whenever
 it exists.** Two distinct atoms join to a two-atom position `coalesce` rejects, so nothing
 materializes and the statement is vacuous; record keys intersect, variant tags unite, and refinement

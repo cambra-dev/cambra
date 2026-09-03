@@ -72,7 +72,7 @@ pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
         && !matches!(
             def.ty,
             Type::Fun {
-                kind: crate::ccl::ty::FunKind::Data,
+                fun_kind: crate::ccl::ty::FunKind::Data(..),
                 ..
             }
         )
@@ -262,7 +262,7 @@ impl InferCtx {
             // extends the telescope for the variables minted there.
             Type::Fun {
                 name,
-                kind,
+                fun_kind,
                 domain: d,
                 codomain: c,
             } => {
@@ -272,7 +272,20 @@ impl InferCtx {
                 };
                 Type::Fun {
                     name: name.clone(),
-                    kind: kind.clone(),
+                    // The witness binders riding the function normalize like the domain:
+                    // their types are annotation content at the enclosing scope.
+                    fun_kind: match fun_kind {
+                        crate::ccl::ty::FunKind::Data(Some(ws)) => {
+                            crate::ccl::ty::FunKind::Data(Some(Rc::new(
+                                ws.iter()
+                                    .map(|w| {
+                                        w.map_types(|t| self.normalize_annotation_in(t, telescope))
+                                    })
+                                    .collect(),
+                            )))
+                        }
+                        other => other.clone(),
+                    },
                     domain: Box::new(self.normalize_annotation_in(d, telescope)),
                     codomain: Box::new(self.normalize_annotation_in(c, &cod_telescope)),
                 }
@@ -299,17 +312,18 @@ impl InferCtx {
             Type::History {
                 value,
                 domain,
-                kind,
+                history_kind,
             } => Type::History {
                 value: Box::new(self.normalize_annotation_in(value, telescope)),
                 domain: Box::new(self.normalize_annotation_in(domain, telescope)),
-                kind: *kind,
+                history_kind: *history_kind,
             },
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
+            | Type::WitnessRef(_)
             | Type::Txn
             | Type::Infer(_) => ty.clone(),
         }
@@ -516,13 +530,19 @@ impl Typing for InferCtx {
         // **One-way**: `inferred <: ann`. An ascription `x: T = e` needs exactly
         // that — the value must be usable where `T` is expected — and nothing more.
         //
-        // The reverse direction (`ann <: inferred`) additionally rejected a value
-        // whose inferred type is a *strict subtype* of its annotation, which is a
-        // sound widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`,
-        // or a variant inferred as `{A}` annotated at the wider `{A | B}`. It was
-        // kept for eager conflict detection, and was harmless only while every
-        // source annotation was a `Type::Base` leaf, where the two directions
-        // coincide. They no longer do.
+        // The reverse edge (`ann <: inferred`) additionally rejects a value whose
+        // inferred type is a *strict subtype* of its annotation, which is a sound
+        // widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`, a
+        // variant inferred as `{A}` annotated at the wider `{A | B}`, or `[0,3)⤇V`
+        // ascribed at `List(V)`. It was harmless only while every source annotation
+        // was a `Type::Base` leaf, where the two directions coincide; singleton
+        // literals and source-reachable collection/`UIntRange` annotations both make
+        // the over-restriction live. Worse for collections: a two-way `List`
+        // annotation would demand `Σ <: [0,3)⤇V` (consuming the sum *against the value*),
+        // a coercion with no sound denotation. One-way leaves a collection annotation
+        // to be met by Σ-*width*, which is the only edge into a sum — a bare `[0,3)⤇V`
+        // does not reach `List(V)` at all without a `box`
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
         //
         // Information still flows *from* the annotation, so "annotation wins" is
         // preserved: against a `Hole`-based annotation (`channelize`'s filter-feed
@@ -530,6 +550,11 @@ impl Typing for InferCtx {
         // annotation's refinement of an inferred variable, and the refinement rule
         // flows that deficit onto it rather than rejecting. What changes is *when* a
         // genuine conflict surfaces: at coalesce rather than immediately.
+        //
+        // This is for *ascriptions* only. A lambda **parameter** annotation is
+        // not reconciled here at all: `emit_lambda` binds the param directly at
+        // its annotation (bidirectional checking mode), so a conflicting body use
+        // fails at the use site rather than through any annotation edge.
         // An unnamed annotation function over a *named* inferred one adopts the
         // inferred Pi binder before normalizing — the same preservation
         // `emit_cast` performs on a cast value's binder, for the same reason: a
@@ -621,12 +646,35 @@ impl Typing for InferCtx {
         Ok((d, c))
     }
 
+    /// **The live solve relates two references by identity**, never by what they range over
+    /// (`src/ccl/design/type-inference.md`, "A check is α-blind"), so it consults no context
+    /// and the binders say nothing here. Taken all the same: the rule that cut the parts out
+    /// owes them whichever derivation runs, and letting Emit omit them would make the
+    /// obligation a property of the caller's mode.
+    fn require_sub_under(
+        &mut self,
+        sub: &Type,
+        _sub_binders: &[crate::ccl::ty::Witness],
+        sup: &Type,
+        _sup_binders: &[crate::ccl::ty::Witness],
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError> {
+        self.require_sub(sub, sup, at)
+    }
+
     fn constrain_argument(
         &mut self,
         arg: &Type,
-        domain: &Type,
+        function: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
+        // The expected Pi this rule minted, so its domain is the variable the edge lands
+        // on. Emit needs no binders with it: a witness reaches a variable through the
+        // constraint graph rather than through the judgment, which is why this impl's
+        // `require_sub_under` ignores its binder lists.
+        let Some(domain) = function.peel_refinements().domain() else {
+            unreachable!("constrain_argument takes the applied function, got {function}")
+        };
         // One-way: the sound subtyping rule `arg <: domain` (the argument must fit
         // the parameter). The contravariant domain var's shape — the record/tuple
         // actually flowing in — is recovered structurally in `coalesce_node` (its
@@ -634,7 +682,7 @@ impl Typing for InferCtx {
         // just as the `Compose` arm rebuilds a non-leading projection's domain from
         // the preceding morphism's codomain), rather than pre-deposited here by a
         // reverse `domain <: arg`. See the trait-method docs.
-        self.require_sub(arg, domain, at)
+        self.require_sub(arg, &domain, at)
     }
 
     fn apply(
@@ -642,6 +690,7 @@ impl Typing for InferCtx {
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
+        kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {
         // Expect a *named* Pi `(x: d) ⇒ result`, so the codomain edge derives the
@@ -662,9 +711,16 @@ impl Typing for InferCtx {
         let x = Name::solver_arg();
         let d = self.fresh();
         let result = self.fresh();
-        let expected = Type::pi_eliminated(&x, d.clone(), result.clone());
+        // **The demand adopts the kind the node declared**, where there is one. Minting a
+        // second variable describes one consumption twice; see [`Typing::apply`].
+        let expected = match kind {
+            Some(k @ crate::ccl::ty::FunKind::Var(_)) => {
+                Type::pi_kinded(x.clone(), d.clone(), result.clone(), k.clone())
+            }
+            _ => Type::pi_eliminated(&x, d.clone(), result.clone()),
+        };
         self.require_sub(fn_ty, &expected, at)?;
-        self.constrain_argument(arg_ty, &d, at)?;
+        self.constrain_argument(arg_ty, &expected, at)?;
         // The application's type is `result` with the binder discharged to the
         // argument. The discharge rides a fresh var's lower edge and fires at
         // coalesce, composing with the correspondence rename `[k ↦ x]` to the
@@ -737,7 +793,7 @@ mod tests {
             k.clone(),
             Type::Base(crate::ccl::BaseType::Int),
             Type::infer(),
-            crate::ccl::FunKind::Data,
+            crate::ccl::FunKind::Data(None),
         );
         let ann = Type::data_fun(Type::Base(crate::ccl::BaseType::Int), Type::Hole);
         let bound = ctx

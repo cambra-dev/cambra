@@ -44,7 +44,7 @@ use smol_str::SmolStr;
 
 mod type_gen;
 
-use cambra::ccl::infer::solver::compact::{AtomKey, CompactType, KindMerge, compact_type};
+use cambra::ccl::infer::solver::compact::{AtomKey, CompactType, KindPin, compact_type};
 use cambra::ccl::infer::solver::{
     CoalesceError, CompactGraph, ConstrainCache, coalesce_compact, constrain_subtype,
 };
@@ -52,7 +52,7 @@ use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, Lit, Name, Openness, ProjKey, Refinement,
     Type, TypedExpr, TypedExprNode, ccl_utils,
 };
-use type_gen::{Rng, edit, env_or, gen_leaf, gen_pred, gen_ty, maybe_kind_var};
+use type_gen::{Fragment, Rng, edit, env_or, gen_leaf, gen_pred, gen_ty, maybe_kind_var};
 
 /// `__elem == <name>` — the dependent-refinement predicate shape, aimed at
 /// a specific Pi binder.
@@ -71,7 +71,10 @@ fn dep_pred(name: &str) -> Rc<TypedExpr> {
 /// nested Pi correspondence or a refinement two constructors down.
 fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
     if rng.chance(1, 8) {
-        return (gen_ty(rng, depth), gen_ty(rng, depth));
+        return (
+            gen_ty(rng, depth, Fragment::Modelled),
+            gen_ty(rng, depth, Fragment::Modelled),
+        );
     }
     if depth == 0 || rng.chance(1, 3) {
         let l = gen_leaf(rng);
@@ -85,14 +88,14 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
     match rng.below(5) {
         0 => {
             let kl = if rng.chance(1, 2) {
-                FunKind::Data
+                FunKind::Data(None)
             } else {
                 FunKind::Compute
             };
             let kr = if rng.chance(1, 6) {
                 match kl {
-                    FunKind::Data => FunKind::Compute,
-                    _ => FunKind::Data,
+                    FunKind::Data(..) => FunKind::Compute,
+                    _ => FunKind::Data(None),
                 }
             } else {
                 kl.clone()
@@ -120,7 +123,7 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
             }
             let fun = |n: Option<&str>, k: FunKind, d: Type, c: Type| Type::Fun {
                 name: n.map(Name::raw),
-                kind: k,
+                fun_kind: k,
                 domain: Box::new(d),
                 codomain: Box::new(c),
             };
@@ -346,7 +349,7 @@ fn close_all(ty: &Type) -> Type {
     match ty {
         Type::Fun {
             name,
-            kind,
+            fun_kind,
             domain,
             codomain,
         } => {
@@ -358,7 +361,7 @@ fn close_all(ty: &Type) -> Type {
             };
             Type::Fun {
                 name: name.clone(),
-                kind: kind.clone(),
+                fun_kind: fun_kind.clone(),
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
             }
@@ -388,7 +391,7 @@ fn ty_json(t: &Type) -> Option<String> {
         Type::Txn => r#"{"k":"txn"}"#.to_string(),
         Type::Fun {
             name,
-            kind,
+            fun_kind,
             domain,
             codomain,
         } => {
@@ -397,10 +400,12 @@ fn ty_json(t: &Type) -> Option<String> {
                 Some(Name::Raw(s)) => format!(r#""{s}""#),
                 Some(_) => return None,
             };
-            let kind = match kind {
+            let kind = match fun_kind {
                 FunKind::Compute => "compute",
-                FunKind::Data => "data",
-                FunKind::Var(_) => return None,
+                FunKind::Data(None) => "data",
+                // A slot carrying binders is a dependent sum, and the model's `Ty` has no
+                // sum — so it is outside the concrete fragment, like a kind variable.
+                FunKind::Data(Some(_)) | FunKind::Var(_) => return None,
             };
             format!(
                 r#"{{"k":"fn","binder":{binder},"kind":"{kind}","dom":{},"cod":{}}}"#,
@@ -504,7 +509,9 @@ fn atom_json(a: &AtomKey) -> Option<String> {
         AtomKey::UIntRange(n) => format!(r#"{{"k":"uintRange","n":{n}}}"#),
         AtomKey::Source(s) => format!(r#"{{"k":"source","s":"{s}"}}"#),
         AtomKey::Txn => r#"{"k":"txn"}"#.to_string(),
-        AtomKey::ChanDom(..) => return None,
+        // A witness reference is a name for whichever domain a Σ picked, and the model
+        // has no witness — outside the fragment for the same reason `ChanDom` is.
+        AtomKey::ChanDom(..) | AtomKey::Witness(..) => return None,
     })
 }
 
@@ -545,23 +552,33 @@ fn cty_json(ct: &CompactType) -> Option<String> {
     let fun = match &ct.fun {
         None => "null".to_string(),
         Some(cf) => {
+            // A function over binders is a dependent sum, which `CompactTy` has no slot
+            // for — outside the concrete fragment, like a `history_slot`.
+            if !cf.binders.is_empty() {
+                return None;
+            }
             let kind = match cf.kind {
-                KindMerge::Data => "data",
-                KindMerge::Compute => "compute",
-                KindMerge::Conflict => "conflict",
-                KindMerge::Unknown => "unknown",
+                // `Data` and `Plain` are one wire value: the model has no
+                // plain-versus-sum axis, so "pinned to data" is all it can say.
+                KindPin::Data | KindPin::Plain => "data",
+                KindPin::Compute => "compute",
+                KindPin::Conflict => "conflict",
+                KindPin::Unpinned => "unknown",
+                KindPin::Sum(_) => return None,
             };
-            // A conflicted slot's alternatives are diagnostic — coalesce prints
-            // them and reads nothing — and `widest` picks between equal-length
-            // lists by arrival order, so the model drops the payload rather than
-            // mirror an order-dependent choice.
-            let doms: Option<Vec<String>> = match cf.kind {
-                KindMerge::Conflict => Some(Vec::new()),
-                _ => cf.domains.iter().map(cty_json).collect(),
-            };
+            // **One domain, because that is all the slot now states.** The model keeps the
+            // alternatives as a list; this solver joins them into one position and keeps
+            // only `combined`, the pair that *first* had no common answer — inherited
+            // across later merges, so it is a diagnostic snapshot and not the current
+            // alternatives. There is nothing here to reconstruct the list from.
+            //
+            // `domains_disagree` is not the model's `conflict` either: it says the arms are
+            // over data with no common answer, which coalesce decides, and
+            // `differential_coalesce_vs_lean_model` is what compares that decision.
+            //
             format!(
-                r#"{{"kind":"{kind}","doms":[{}],"cod":{}}}"#,
-                doms?.join(","),
+                r#"{{"kind":"{kind}","dom":{},"cod":{}}}"#,
+                cty_json(&cf.domain)?,
                 cty_json(&cf.codomain)?
             )
         }
@@ -592,7 +609,7 @@ fn gen_bound(rng: &mut Rng) -> CompactType {
     if rng.chance(1, 10) {
         return compact_type(&Type::Hole).term;
     }
-    let ty = gen_ty(rng, 3);
+    let ty = gen_ty(rng, 3, Fragment::Modelled);
     compact_type(&maybe_kind_var(rng, ty)).term
 }
 
@@ -604,12 +621,12 @@ fn strip_binders(t: &Type) -> Type {
     match t {
         Type::Fun {
             name: _,
-            kind,
+            fun_kind,
             domain,
             codomain,
         } => Type::Fun {
             name: None,
-            kind: kind.clone(),
+            fun_kind: fun_kind.clone(),
             domain: Box::new(strip_binders(domain)),
             codomain: Box::new(strip_binders(codomain)),
         },
@@ -649,6 +666,14 @@ fn coalesce_outcome(r: &Result<Type, CoalesceError>) -> Option<String> {
                 CoalesceError::RecursiveType { .. } => "RecursiveType",
                 CoalesceError::DomainJoinConflict { .. } => "DomainJoinConflict",
                 CoalesceError::KindConflict { .. } => "KindConflict",
+                // Two rejections the model has no counterpart for: a kind edge whose two
+                // sides state incomparable kinds, and a witness whose binder is not in
+                // scope where the reference materialized. Neither is reachable from the
+                // fragment this oracle serializes — a sum leaves it at `ty_json` — so
+                // report no verdict rather than inventing a wire name.
+                CoalesceError::KindMismatch { .. } | CoalesceError::WitnessScope { .. } => {
+                    return None;
+                }
             };
             Some(format!(r#"{{"k":"err","kind":"{kind}"}}"#))
         }
@@ -795,12 +820,12 @@ fn differential_concrete_subtype_vs_lean_model() {
     while cases.len() < n {
         let (lhs, rhs) = match rng.below(8) {
             0 => {
-                let t = gen_ty(&mut rng, 3);
+                let t = gen_ty(&mut rng, 3, Fragment::Modelled);
                 (t.clone(), t)
             }
             1 | 2 => {
-                let t = gen_ty(&mut rng, 3);
-                let e = edit(&mut rng, &t);
+                let t = gen_ty(&mut rng, 3, Fragment::Modelled);
+                let e = edit(&mut rng, &t, Fragment::Modelled);
                 (t, e)
             }
             _ => gen_pair(&mut rng, 3),
