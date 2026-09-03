@@ -213,3 +213,88 @@ export interface Snapshot {
   panes: PaneEntry[];
   paneLinks: PaneLink[];
 }
+
+// ---------------------------------------------------------------------------
+// The live wire — `/api/live`
+// ---------------------------------------------------------------------------
+//
+// A frame is whole state, not an append. Each one carries every producer that
+// produced during its tick, and replaces the frame before it; the server has
+// already collapsed each producer's several `get`s within the tick to one
+// answer (`ValueRecorder::latest_non_empty`). The frontend keeps a per-node
+// cache so a newly pinned operator answers from the last frame rather than
+// waiting for the next one, which on a converged program never comes.
+
+// One row of a recorded tile or a source's retained window.
+export interface LiveRow {
+  // The domain key this row sits at, or `null` for a shape whose positions are
+  // implicit (a `Scalar` has no domain).
+  key: string | null;
+  // The value, already rendered by the backend through `Display for Value`.
+  value: string;
+  // Whether the tile marks this position deleted. Carried rather than filtered:
+  // a `Restrict` marks a row while the `Memo` below it has compacted the same
+  // row away, so dropping the flag makes two producers look alike where they
+  // differ.
+  deleted: boolean;
+}
+
+// One producer's answer for a tick. An operator can have several, because a
+// `FanOut` branch is subscribed once per branch.
+export interface LiveProducer {
+  producerId: number;
+  // The producer's display name, e.g. `"MapResultWithSource#1"`.
+  producer: string;
+  // The tile's variant name, e.g. `"SealedFunction"`.
+  shape: string;
+  // The tile's `domain_predicate`, rendered: `False`, then `LessThanEq(uN)`,
+  // then `True`. `null` for a shape carrying no such region.
+  watermark: string | null;
+  // Why this answer carries no rows, for a shape the backend does not render.
+  note: string | null;
+  // The tick this answer came from, which is not the frame's tick when the
+  // producer has since produced nothing.
+  tick: number;
+  seq: number;
+  // Whether a newer answer for this producer carried nothing.
+  stale: boolean;
+  // Rows the tile held, of which `rows` is the last `rows.length`.
+  total: number;
+  dropped: number;
+  rows: LiveRow[];
+}
+
+// Every producer built by one operator. Nodes arrive in ascending `nodeId`,
+// which is construction order, so upstream sorts first.
+export interface LiveNode {
+  nodeId: number;
+  producers: LiveProducer[];
+}
+
+// A data source's retained window: what has arrived and not yet been released
+// by every reader. Not a recording — a source has no producer and takes no
+// `get`, so this is read through `&self` and sampling it releases nothing.
+export interface LiveSource {
+  // The source's own node in the operator graph, which is what a click on it
+  // resolves to. `null` when the graph carries no node for it.
+  nodeId: number | null;
+  // The registered name, e.g. `"stdin"`.
+  name: string;
+  total: number;
+  dropped: number;
+  rows: LiveRow[];
+}
+
+export interface LiveFrame {
+  // The driver tick this frame reports. Advances only over a tick that recorded
+  // something, so it counts data rather than loop iterations.
+  tick: number;
+  // Frames published so far, so a client can tell it is behind.
+  published: number;
+  // Whether the run is over and this frame is the last. A reader that never
+  // sees one and then loses the socket was disconnected; a reader holding one
+  // knows the quiet is the end rather than a pause.
+  final: boolean;
+  nodes: LiveNode[];
+  sources: LiveSource[];
+}
