@@ -1728,6 +1728,18 @@ pub(crate) fn enter(named_id: NodeId, label: RewriteLabel, nature: Nature) -> Re
     })
 }
 
+/// The expression the innermost open recording names, if any.
+///
+/// Operator conversion opens one recording per expression node, so during
+/// conversion this is the expression whose operators are being built. An
+/// operator that must attribute itself to source without holding a `NodeId` of
+/// its own reads it here rather than threading one through its constructor.
+///
+/// `None` outside any recording, and for a `copy_frame`, which names no node.
+pub(crate) fn currently_named() -> Option<NodeId> {
+    RECORDING_STACK.with(|s| s.borrow().last().and_then(|r| r.named))
+}
+
 /// Open a recording over the conversion of one expression node, for the whole
 /// extent of that node's conversion including its children.
 ///

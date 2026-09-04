@@ -27,9 +27,52 @@ impl IterateExtent {
             domain: extent.clone(),
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
-        Self {
-            base: OperatorBase::new(tiling, &[]),
-            extent,
+        let base = OperatorBase::new(tiling, &[]);
+        // An `IterateExtent` over a source domain is what the scheduler wakes
+        // when that source produces, so it reads the source as surely as the
+        // `MapResultWithSource` above it does. It holds no operator, so the
+        // edge cannot come from a field the way every other input does; state it
+        // here, against the same expression the operator itself is rowed to.
+        Self::record_source_reads(&extent, base.id);
+        Self { base, extent }
+    }
+
+    /// Record this operator as a reader of every source its extent iterates.
+    ///
+    /// Mirrors [`add_all_source_handles`](Self::add_all_source_handles), which
+    /// walks the same compound shapes to register the runtime wakeups. A source
+    /// reached twice through one extent is one read, not two: the edge says that
+    /// this operator reads that source, and it says it once.
+    fn record_source_reads(extent: &Extent, reader: NodeId) {
+        let Some(expr) = crate::ccl::provenance::currently_named() else {
+            return;
+        };
+        let mut seen: Vec<String> = Vec::new();
+        Self::each_source(extent, &mut |name| {
+            if seen.iter().any(|s| s == name) {
+                return;
+            }
+            seen.push(name.to_string());
+            crate::interpreter::operator_graph::record_source_read(name, expr, Some(reader));
+        });
+    }
+
+    /// Every registered source this extent iterates, in extent order.
+    fn each_source(extent: &Extent, f: &mut impl FnMut(&str)) {
+        match extent {
+            Extent::DataSourceDomain(source) => f(source.borrow().get_id()),
+            Extent::Record(fields) => {
+                for field in fields.values() {
+                    Self::each_source(field, f);
+                }
+            }
+            Extent::Union(arms) => {
+                for arm in arms.values() {
+                    Self::each_source(arm, f);
+                }
+            }
+            Extent::Restricted { base, .. } => Self::each_source(base, f),
+            Extent::Base(_) | Extent::Function { .. } | Extent::UIntRange(_) => {}
         }
     }
 

@@ -4264,7 +4264,14 @@
             "nature": "machinery",
             "label": "opconv.convert"
           },
-          "inputs": []
+          "inputs": [
+            {
+              "role": "source",
+              "kind": "share",
+              "deferred": false,
+              "subscribed": 429
+            }
+          ]
         },
         {
           "label": "MapResultWithSource",
@@ -4436,7 +4443,14 @@
             "nature": "machinery",
             "label": "opconv.convert"
           },
-          "inputs": []
+          "inputs": [
+            {
+              "role": "source",
+              "kind": "share",
+              "deferred": false,
+              "subscribed": 429
+            }
+          ]
         },
         {
           "label": "MapResultWithSource",
@@ -5535,8 +5549,16 @@
           411
         ],
         [
+          292,
+          429
+        ],
+        [
           343,
           418
+        ],
+        [
+          343,
+          429
         ]
       ]
     }
