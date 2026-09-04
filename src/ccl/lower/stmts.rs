@@ -1,16 +1,19 @@
 //! Statement-block lowering: `Let` chains, `if`/`else`, the `http_serve`
 //! tuple-assign wiring, and mutation-loop dispatch.
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
+use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use super::*;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::interpreter::DataSink;
 use crate::{
     ccl::{BaseType, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
         Spanned, Stmt as ChlStmt, TypeAnnotation,
     },
-    interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
 
 /// Top-level statement-iteration with per-statement error recovery.
@@ -510,6 +513,21 @@ pub(super) fn lower_middle_stmt(
         //   <body>
         // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
         // in general.
+        // A target with no sockets cannot serve. The construct is rejected here,
+        // where it names a source position, rather than at a bind that would
+        // fail at run time — a program that cannot run on this host should not
+        // compile on it.
+        #[cfg(target_arch = "wasm32")]
+        ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
+            let _ = (target, is_top_level);
+            Err(LoweringError::unsupported(
+                value.span,
+                "http_serve is unavailable in this host: it is a TCP listener, \
+                 and this build has no sockets. A host channel is the way data \
+                 crosses the program boundary here.",
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
             if !is_top_level {
                 return Err(LoweringError::unsupported(
@@ -531,12 +549,13 @@ pub(super) fn lower_middle_stmt(
             // Share one tiny_http::Server per port across all http_serve routes.
             if let std::collections::hash_map::Entry::Vacant(e) = ctx.shared_servers.entry(port_u16)
             {
-                let server = SharedHttpServer::new(port_u16).map_err(|e| {
-                    LoweringError::unsupported(
-                        value.span,
-                        format!("http_serve: failed to bind port {port_u16}: {e}"),
-                    )
-                })?;
+                let server = crate::interpreter::http_server::SharedHttpServer::new(port_u16)
+                    .map_err(|e| {
+                        LoweringError::unsupported(
+                            value.span,
+                            format!("http_serve: failed to bind port {port_u16}: {e}"),
+                        )
+                    })?;
                 e.insert(Arc::new(server));
             }
             let server = ctx.shared_servers[&port_u16].clone();
@@ -549,7 +568,7 @@ pub(super) fn lower_middle_stmt(
                     ),
                 ));
             }
-            let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
+            let source_obj = Rc::new(RefCell::new(crate::interpreter::HttpServerDataSource::new(
                 &server,
                 method.clone(),
                 path.clone(),

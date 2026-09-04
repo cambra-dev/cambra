@@ -33,8 +33,7 @@ use std::rc::Rc;
 use crate::ccl::channels::{ChannelDecl, ChannelError, Channels};
 use crate::ccl::context::{CompileError, CompiledProgram, GlobalContext, compile_program};
 use crate::ccl::provenance::NodeId;
-use crate::inspector_model::render_frame;
-use crate::inspector_server::snapshot_json;
+use crate::inspector_model::{render_frame, snapshot_json};
 use crate::interpreter::operator_graph::GraphNode;
 use crate::interpreter::value_recorder::{
     DEFAULT_ROWS_PER_RECORDING, SourceWindow, ValueRecorder, render_source_window,

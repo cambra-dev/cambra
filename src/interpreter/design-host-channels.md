@@ -135,6 +135,32 @@ were not merged in one step because `main.rs` also runs a pure program's `main` 
 convergence, which is a blocking run-to-completion shape rather than a tick, and unifying them means
 `Host` handing that producer back. The `TODO` sits on the loop.
 
+## The WebAssembly build
+
+`ci.sh wasm` type-checks the library for `wasm32-unknown-unknown`. What it gates is that nothing has
+re-entered the wasm build through an unguarded `use` — the module itself is produced by
+`wasm-bindgen`, which is not a dependency of this repo.
+
+Two crates are scoped to non-wasm targets in `Cargo.toml`: `tiny_http` (the inspector's server and
+`http_serve`'s listener) and `tungstenite` (the live-values websocket). `tungstenite` cannot even be
+*built* for wasm — it pulls `rand` and then `getrandom`, which refuses `wasm32-unknown-unknown`
+unless a backend is chosen at link time.
+
+They are scoped by target rather than behind a Cargo feature deliberately. A feature adds a standing
+configuration every clippy pass has to cover, and it would let a native build turn the server off,
+which nothing wants. A target table is not a build variant: it says these crates do not exist on
+that platform, which is the fact.
+
+`http_serve` is therefore a lowering error on wasm, where it names a source position, rather than a
+bind that fails once the page has already loaded the module. **That arm is compile-checked by
+`ci_wasm` and its message is exercised by no test** — a test for it would have to be gated to a
+target the suite does not build, which is a test that cannot run.
+
+`src/wasm_api.rs` is a thin wrapper over `Host`: every method converts JSON to and from the values
+the embedding API already takes and adds nothing else. There is no run loop in it — the page owns
+the clock — so a caller drives `tick` from whatever timer it likes and can stop without the module
+holding a thread.
+
 ## Replay
 
 Keys are minted from arrival order and nothing else, so a fresh source fed the same rows in the same

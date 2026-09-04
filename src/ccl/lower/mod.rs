@@ -72,11 +72,12 @@
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
 //! - [`http`] — `http_serve` recognition predicates.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
-    sync::Arc,
 };
 
 use crate::{
@@ -88,7 +89,7 @@ use crate::{
         Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt,
         VariantPayload as ChlVariantPayload,
     },
-    interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},
+    interpreter::{DataSink, DataSourceDomainExtentImpl},
 };
 
 mod comprehension;
@@ -299,7 +300,8 @@ pub struct LoweringContext {
     ///
     /// `pub(super)` so the statement submodule's `http_serve` wiring can create
     /// and reuse the per-port server.
-    pub(super) shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) shared_servers: HashMap<u16, Arc<crate::interpreter::http_server::SharedHttpServer>>,
 
     /// Monotonic counter for minting unique synthetic names during lowering.
     /// Globally unique across nested scopes so inner binders cannot capture

@@ -54,7 +54,6 @@ ariadne = "0.4"
 indoc = "1.0"
 log = "0.4.29"
 env_logger = "0.11.9"
-tiny_http = "0.12"
 bit-set = "0.8.0"
 bit-vec = "0.8.0"
 intervalsets = "0.1.0-alpha.2"
@@ -69,7 +68,31 @@ stacker = "0.1"
 # in wall-clock, while the gate cost a standing clippy configuration.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The socket half of the crate. `tiny_http` is the inspector's HTTP server and
+# `http_serve`'s listener; `tungstenite` is the live-values websocket. Neither
+# can exist on a target with no sockets, and `tungstenite` cannot even be
+# *built* for one — it pulls `rand` and then `getrandom`, which refuses
+# `wasm32-unknown-unknown` without a backend chosen at link time.
+#
+# Scoped by target rather than by a Cargo feature deliberately. A feature adds a
+# standing configuration every clippy pass has to cover (`Cargo.toml`'s serde
+# note records the same decision), and it lets a native build turn the server
+# off, which nothing wants. A target table is not a build variant: it says these
+# crates do not exist on that platform, which is the fact.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tiny_http = "0.12"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+serde-wasm-bindgen = "0.6"
+
+[lib]
+# `cdylib` is the WebAssembly module; `rlib` keeps the binary and the test
+# crates linking against the same library.
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 debug = "line-tables-only"

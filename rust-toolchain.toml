@@ -1,3 +1,7 @@
 [toolchain]
 channel = "1.97.0"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
+# The inspector's demo host is a WebAssembly module, and `ci.sh wasm` checks the
+# library against it. Listed here so the target arrives with the toolchain
+# rather than as a step someone has to be told about.
+targets = ["wasm32-unknown-unknown"]

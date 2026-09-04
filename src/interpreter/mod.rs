@@ -7,6 +7,9 @@ mod binop;
 pub mod commit_operator;
 mod host_sink;
 mod host_source;
+// `http_serve`'s listener. A target with no sockets cannot serve, and
+// lowering rejects the construct there rather than binding.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod http_server;
 pub mod operator_conversion;
 pub mod operator_graph;
@@ -24,6 +27,7 @@ pub mod value_recorder;
 pub use binop::*;
 pub use host_sink::*;
 pub use host_source::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub use http_server::HttpServerDataSource;
 pub use scheduler::*;
 pub use stdio::*;
