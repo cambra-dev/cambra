@@ -68,6 +68,7 @@ fn validate_begin_context(context: &Spanned<ChlExpr>) -> Result<(), LoweringErro
 /// commit-record site keyed on the enclosing loop.
 pub(super) fn lower_with_block(
     with_stmt: &Spanned<ChlStmt>,
+    outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let ChlStmt::With {
@@ -80,7 +81,7 @@ pub(super) fn lower_with_block(
     };
     reject_txn_handle(binding, with_stmt.span)?;
     validate_begin_context(context)?;
-    lower_tx_block(body, with_stmt.span, ctx)
+    lower_tx_block(body, outer_bindings, with_stmt.span, ctx)
 }
 
 /// Lower a standalone `with begin(): <block>` (anywhere a statement can appear)
@@ -91,9 +92,10 @@ pub(super) fn lower_with_block(
 pub(super) fn lower_standalone_transaction(
     with_stmt: &Spanned<ChlStmt>,
     continuation: Expr,
+    outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let block = lower_with_block(with_stmt, ctx)?;
+    let block = lower_with_block(with_stmt, outer_bindings, ctx)?;
     let iter_var = ctx.fresh_txn_item();
     // A singleton source `[unit]`: one element → exactly one transaction. The
     // item is never read (the block reads only stores). The `Begin` sits as an
@@ -130,6 +132,7 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
 /// decision. Runs with `in_tx_body = true` (bare mutable variable reads are snapshots).
 fn lower_tx_block(
     stmts: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -140,7 +143,7 @@ fn lower_tx_block(
         ));
     }
     ctx.in_tx_body = true;
-    let result = lower_tx_block_inner(stmts, span, ctx);
+    let result = lower_tx_block_inner(stmts, outer_bindings, span, ctx);
     ctx.in_tx_body = false;
     let block = result?;
     // A transaction must *do* something observable: either write a transactional
@@ -181,6 +184,7 @@ fn contains_feed(e: &Expr) -> bool {
 /// list is empty (the block's own statement spans win when present).
 fn lower_tx_block_inner(
     stmts: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
     fallback_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -205,13 +209,14 @@ fn lower_tx_block_inner(
             // per-transaction local `let`).
             ChlStmt::MutAssign { target, value, .. } => {
                 let name = extract_name_target(target, "mutable assignment")?;
-                let val = lower_expr(value, ctx)?;
+                let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `balance += value` — the compound-write shorthand, likewise a write.
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
-                let val = lower_aug_binop(&name, *op, lower_expr(value, ctx)?, stmt.span, ctx)?;
+                let rhs = lower_assigned_value(value, &[], outer_bindings, ctx)?;
+                let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
                 write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `x = value` — a plain immutable binding: a per-transaction local
@@ -229,7 +234,7 @@ fn lower_tx_block_inner(
                         ),
                     ));
                 }
-                let val = lower_expr(value, ctx)?;
+                let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
             }
             // `if cond: <writes>` — a conditional (deny) write. The no-else
@@ -238,7 +243,7 @@ fn lower_tx_block_inner(
                 branches,
                 else_body,
             } => {
-                let case = lower_tx_if(branches, else_body.as_deref(), ctx)?;
+                let case = lower_tx_if(branches, else_body.as_deref(), outer_bindings, ctx)?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `out << e` inside the block — a per-commit feed. Its value reads
@@ -299,6 +304,7 @@ fn write_or_let(
 fn lower_tx_if(
     branches: &[IfBranch],
     else_body: Option<&[Spanned<ChlStmt>]>,
+    outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // `if`/`elif`/`else` inside a block lowers to the general first-match `Case`
@@ -309,7 +315,7 @@ fn lower_tx_if(
     let mut out_branches = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
         let guard = lower_expr(&branch.cond, ctx)?;
-        let body = lower_tx_block_inner(&branch.body, branch.cond.span, ctx)?;
+        let body = lower_tx_block_inner(&branch.body, outer_bindings, branch.cond.span, ctx)?;
         out_branches.push(Branch {
             pattern: None,
             guard,
@@ -321,7 +327,7 @@ fn lower_tx_if(
     // the guard statement.
     let guard_span = branches[0].cond.span;
     let else_expr = match else_body {
-        Some(stmts) => lower_tx_block_inner(stmts, guard_span, ctx)?,
+        Some(stmts) => lower_tx_block_inner(stmts, outer_bindings, guard_span, ctx)?,
         None => ctx.tag_machinery(Expr::lit(Lit::Unit), guard_span, "lower.txn_deny"),
     };
     out_branches.push(Branch {

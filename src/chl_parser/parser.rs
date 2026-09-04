@@ -161,7 +161,7 @@ type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 /// 13. `*`, `//`
 /// 14. unary `-`
 /// 15. postfix: call `f(...)`, subscript `x[...]`, attribute `x.name` / `x.0`
-/// 16. atom: literal, name, parenthesised, list, dict/record, comprehension
+/// 16. atom: literal, name, parenthesised, list, record, brace type, comprehension
 fn expression<'src, I>() -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
@@ -1267,11 +1267,23 @@ where
         // right of an assignment, whose value is the block's own
         // (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`"). The block's
         // `Dedent` ends the statement, so this form takes no `stmt_terminator`
-        // and cannot ride `simple_stmt`. It is tried before `simple_stmt`, which
-        // reparses the target when the right-hand side turns out to be an
-        // ordinary expression.
-        let block_value =
-            choice((if_stmt.clone(), match_stmt.clone())).map(|stmt: Spanned<Stmt>| {
+        // and cannot ride `simple_stmt`, which is why the two are separate
+        // alternatives rather than one production over both right-hand sides.
+        //
+        // Ordering costs a second parse of the target. `block_assign` is tried
+        // first and `.clone()` on a chumsky combinator copies the parser without
+        // memoizing, so every statement whose right-hand side is not a block —
+        // each ordinary assignment, and each expression statement — parses its
+        // leading `bare_tuple` twice, once here and once in `simple_stmt`. Error
+        // quality is unaffected: the furthest-progress alternative wins.
+        // The block opened a layout level of its own for its `elif`/`else`
+        // chain (`lexer.rs`, `Level::Pending`), and that level closes with a
+        // `Dedent` no block inside the chain claims. Consuming it here ends the
+        // statement, and it is what a chain written at the statement's own
+        // column fails on: that spelling leaves the `Dedent` unmatched.
+        let block_value = choice((if_stmt.clone(), match_stmt.clone()))
+            .then_ignore(just(Token::Dedent))
+            .map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
                 Spanned::new(span, Expr::Block(Box::new(stmt)))
             });
@@ -1364,8 +1376,6 @@ enum AssignTail {
     None,
 }
 
-/// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
-///
 /// What follows an assignment target, over parsers for the right-hand side and
 /// for an annotation's type.
 ///
@@ -1556,6 +1566,8 @@ where
         .collect::<Vec<_>>()
 }
 
+/// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
+///
 /// CHL binding patterns are bare names and (possibly-nested) tuples of
 /// patterns. We parse the LHS as a full expression so the regular grammar
 /// (with its error recovery) handles it, then narrow to the binding-pattern
@@ -1680,7 +1692,7 @@ mod tests {
     #[test]
     fn brace_group_is_colon_free() {
         // A colon-free brace list is a `BraceGroup` (tuple-type syntax `{T, U}`),
-        // distinct from a record (`{x: 1}`) and a dict (`{"k": v}`).
+        // distinct from a record (`{x: 1}`).
         let Expr::BraceGroup(elts) = parse_e("{Int, Bool}").node else {
             panic!(
                 "expected a BraceGroup, got {:?}",
@@ -1839,7 +1851,7 @@ mod tests {
     #[test]
     fn mixed_brace_entries_are_an_error() {
         // A brace literal mixing `key: value` entries with bare expressions is
-        // neither a record/dict nor a tuple type.
+        // neither a record nor a tuple type.
         let result = parse_expression("{a: 1, b}");
         assert!(
             !result.errors.is_empty(),
@@ -2320,6 +2332,25 @@ mod tests {
         }
     }
 
+    /// A chain at the statement's own column ends the assignment rather than
+    /// continuing its block, so the `else` is left with no `if` to attach to.
+    /// The block right-hand side's own level is what makes the two spellings
+    /// different token streams (`lexer.rs`, `Level::Pending`).
+    #[test]
+    fn a_chain_at_the_statement_column_is_rejected() {
+        let result = parse_module(indoc! {"
+            x = if c:
+                1
+            else:
+                2
+            x
+        "});
+        assert!(
+            !result.errors.is_empty(),
+            "expected the statement-column chain to be rejected"
+        );
+    }
+
     /// `x = if c: … else: …` and `x = match v: …` — a block statement on the
     /// right of an assignment, wrapped in the same [`Expr::Block`] the one-line
     /// form uses.
@@ -2327,9 +2358,9 @@ mod tests {
     fn block_statement_on_the_right_of_an_assignment() {
         let m = parse_m(indoc! {"
             x = if c:
-                1
-            else:
-                2
+                    1
+                else:
+                    2
             x
         "});
         let Stmt::Assign { value, .. } = &m.body[0].node else {
@@ -2356,9 +2387,9 @@ mod tests {
         for op in ["=", ": Int =", ":=", ": Int :=", "+=", "<<="] {
             let src = formatdoc! {"
                 x {op} if c:
-                    1
-                else:
-                    2
+                        1
+                    else:
+                        2
                 x"};
             let result = parse_module(&src);
             assert!(

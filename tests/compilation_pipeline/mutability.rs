@@ -1654,3 +1654,310 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
         "`Feed` takes one type argument: `Feed(T)`",
     );
 }
+
+// A write inside a block right-hand side is a write like any other: the
+// mutability phases put it back on the statement spine by pushing the binding
+// into the branches, so the block right-hand side and the statement `if`
+// spelling of the same conditional agree. The cases cover the two write
+// operators, `if` and `match`, and the three positions a block right-hand side
+// sits in: a for-loop body, the top level, and a `with begin():` block.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                0
+            else:
+                0
+        yield t
+    acc"}, Value::Int(5))]
+// The branch's value reads the write, so the two must be ordered: the write is
+// lifted onto the branch's spine ahead of the value it binds.
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                acc
+            else:
+                0
+        yield t
+    acc"}, Value::Int(5))]
+// Both arms write, so neither is the carry: the writer decision commits at
+// every position and the values differ per path.
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                0
+            else:
+                acc += 100
+                0
+        yield t
+    acc"}, Value::Int(105))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc := i
+                0
+            else:
+                0
+        yield t
+    acc"}, Value::Int(3))]
+#[case(indoc! {"
+    acc := 0
+    t = if True:
+            acc += 1
+            0
+        else:
+            0
+    acc"}, Value::Int(1))]
+#[case(indoc! {"
+    acc := 0
+    t = match `some(3):
+            case `some(n):
+                acc += n
+                0
+            case `none:
+                0
+    acc"}, Value::Int(3))]
+fn test_block_right_hand_side_write_accumulates(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A transactional write inside a block right-hand side commits with the rest
+/// of its block. `transact_phase` runs before the letrec phase and walks the
+/// block itself, so the same normalization runs ahead of it.
+///
+/// `r = 10` does not pass the guard, so nothing is written that round;
+/// `r = 20` writes `80` then reads it back for the `- 1`; `r = 30` writes `49`
+/// and then `48`.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn test_transactional_write_inside_a_block_right_hand_side() {
+    check_scalar(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            for r in [10, 20, 30]:
+                with begin():
+                    step = if r > 15:
+                            pool := pool - r
+                            1
+                        else:
+                            0
+                    pool := pool - step
+            await_final(pool)"},
+        Value::Int(48),
+    );
+}
+
+/// The statement `if` spelling of the first case above, which the block
+/// right-hand side agrees with.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_statement_if_accumulates() {
+    check_scalar(
+        indoc! {"
+            acc := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    acc += i
+                yield 0
+            acc"},
+        Value::Int(5),
+    );
+}
+
+/// A mutable variable the block itself declares is written normally: the
+/// declaration and every write share the block's scope, so the advance reaches
+/// every read of it. The block's value is the accumulator's.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    t = if True:
+            s := 0
+            for i in [1, 2]:
+                s += i
+            s
+        else:
+            0
+    t"})]
+#[case(indoc! {"
+    acc := 0
+    for j in [1]:
+        t = if True:
+                s := 0
+                for i in [1, 2]:
+                    s += i
+                s
+            else:
+                0
+        yield t
+    3"})]
+fn test_block_right_hand_side_writes_its_own_mutable(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
+}
+
+// A write inside a statement `if` outside a for-loop body carries past the
+// conditional. There is no recurrence to hold it there, so the continuation is
+// pushed into the branches instead and each write's advance scopes over it.
+// Inside a loop body the same shape is the recurrence's, and is left alone —
+// the last case is that one, unchanged.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    if True:
+        acc += 1
+    else:
+        acc += 0
+    acc"}, Value::Int(1))]
+#[case(indoc! {"
+    acc := 0
+    if False:
+        acc += 1
+    else:
+        acc += 7
+    acc"}, Value::Int(7))]
+#[case(indoc! {"
+    def f(c: Bool) => Int:
+        acc := 0
+        if c:
+            acc += 4
+        else:
+            acc += 9
+        acc
+    f(True)"}, Value::Int(4))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        if i > 1:
+            acc += i
+        yield 0
+    acc"}, Value::Int(5))]
+fn test_statement_if_write_carries_past_the_conditional(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+// A conditional nested inside a block right-hand side's branch. The inner one
+// normalizes first, which leaves its writes on the branches of a `Case` standing
+// where a statement stood, so the enclosing binding pushes only if
+// `spine_writes_mut` follows a `Case`'s branches as well as a spine. Every path
+// through the outer branch writes, and the continuation lands on each of them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// A statement `if` inside the branch.
+#[case(indoc! {"
+    acc := 0
+    x = if True:
+            if True:
+                acc += 2
+            else:
+                acc += 0
+            1
+        else:
+            0
+    acc + x"}, Value::Int(3))]
+// A block right-hand side inside the branch.
+#[case(indoc! {"
+    acc := 0
+    x = if True:
+            y = if True:
+                    acc += 2
+                    1
+                else:
+                    0
+            y
+        else:
+            0
+    acc + x"}, Value::Int(3))]
+// The nested block right-hand side's value is computed with, so its terminal is
+// not the branch's.
+#[case(indoc! {"
+    acc := 0
+    x = if True:
+            y = if True:
+                    acc += 2
+                    1
+                else:
+                    0
+            y + 10
+        else:
+            0
+    acc + x"}, Value::Int(13))]
+// The branch the scrutinee does not take is the nesting one.
+#[case(indoc! {"
+    acc := 1
+    x = if False:
+            0
+        else:
+            y = if True:
+                    acc += 5
+                    2
+                else:
+                    0
+            y
+    acc + x"}, Value::Int(8))]
+fn test_nested_conditional_write_carries_out_of_a_block_right_hand_side(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+// A branch's value reads what that branch wrote — the write is sequenced ahead
+// of the terminal on the branch's own spine, so the read-your-writes
+// environment `transform_chain` threads already carries it
+// (`docs/chl-spec.md`, "4.3 Assignment forms").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += i
+                acc
+            else:
+                0
+        yield t
+    acc"}, Value::Int(5))]
+#[case(indoc! {"
+    acc := 10
+    t = if True:
+            acc += 5
+            acc
+        else:
+            0
+    t"}, Value::Int(15))]
+fn test_a_branch_value_reads_what_the_branch_wrote(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A `match` arm that computes over a name bound outside the `match` reaches
+/// operator conversion as a bare `BinOp`. The program below writes nothing, so
+/// the bound is below the mutability layer rather than in it: every `match`
+/// shape a write reaches ends up with a computed arm, which is why the writing
+/// cases above are `if` only.
+#[test]
+#[ignore = "a `match` arm computing over an outer name is not point-free by \
+            operator conversion; no write is involved"]
+fn test_match_arm_computing_over_an_outer_name() {
+    check_scalar(
+        indoc! {"
+            base = 3
+            t = match `some(3):
+                    case `some(n):
+                        base + n
+                    case `none:
+                        base + 0
+            t"},
+        Value::Int(6),
+    );
+}

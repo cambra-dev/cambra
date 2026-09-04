@@ -111,5 +111,5 @@ use super::common::expect_compile_error;
 #[test]
 fn storefront_currently_blocked_in_the_front_end() {
     expect_compile_error(include_str!("v0.cambra"), "found '->'");
-    expect_compile_error(include_str!("v1.cambra"), "inconsistent indentation");
+    expect_compile_error(include_str!("v1.cambra"), "found '->'");
 }

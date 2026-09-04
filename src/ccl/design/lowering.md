@@ -149,18 +149,6 @@ and the one-line `match` ([chl-spec.md](../../../docs/chl-spec.md#the-one-line-f
 `lower_final_stmt`, so a block right-hand side lowers to the `Case` its
 tail-position and ternary counterparts already produce and adds no IR node.
 
-`lower_assigned_value` is what carries the enclosing scope into a block
-right-hand side. The names bound above the assignment are what a `for` inside
-one of the block's branches consults to tell a loop-carried accumulator from a
-branch-local (`find_mutation_loop_vars`), and `lower_expr` has no scope to pass.
-
-Three positions reach the block through `lower_expr` and so drop that scope: a
-one-line `match`, and a block right-hand side inside a loop body or a `with
-begin():` block, each of which lowers an assignment's value itself. None admits
-a `for` in the branch — a one-line arm body is a single expression, and a
-nested `for` is rejected in both enclosing blocks — so the dropped scope is
-unobservable.
-
 ## Variants and match
 
 Surface variants ([chl-spec.md](../../../docs/chl-spec.md#315-variant-constructors) §3.15, [§4.10](../../../docs/chl-spec.md#410-match--tag-dispatch)) add **no IR node**. Both halves already existed for the conditionals stack: `match` is the surface for a concept the IR already had.

@@ -154,9 +154,9 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 1
         x = if a == 1:
-            100
-        else:
-            200
+                100
+            else:
+                200
         x"},
     Value::Int(100)
 )]
@@ -166,11 +166,11 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 5
         x = if a > 10:
-            1
-        elif a > 3:
-            2
-        else:
-            3
+                1
+            elif a > 3:
+                2
+            else:
+                3
         x"},
     Value::Int(2)
 )]
@@ -179,10 +179,10 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 4
         x = if a > 3:
-            d = a * 2
-            d + 1
-        else:
-            0
+                d = a * 2
+                d + 1
+            else:
+                0
         x"},
     Value::Int(9)
 )]
@@ -192,14 +192,36 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         a: Int = 2
         x = if a == 2:
-            10
-        else:
-            20
+                10
+            else:
+                20
         x + 5"},
     Value::Int(15)
 )]
 fn test_block_if_as_an_assigned_value(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// The block belongs to the statement, so `elif` and `else` return to the
+// statement's column. The `if` keyword sits further right, after the target and
+// the `=`, and that column is not an indentation level — aligning the chain to
+// it is a lex error. `docs/chl-spec.md`, "4.3 Assignment forms" spells the
+// accepted form, and this pins it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_block_if_chain_aligns_with_the_statement() {
+    check_scalar(
+        indoc! {r#"
+            score = 95
+            label = if score > 90:
+                    "high"
+                elif score > 50:
+                    "mid"
+                else:
+                    "low"
+            label"#},
+        Value::String("high".into()),
+    );
 }
 
 // The off-path arm is **not evaluated**: a guard-protected partial expression

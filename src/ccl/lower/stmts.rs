@@ -295,9 +295,15 @@ pub(super) fn lower_final_stmt(
                 if !acc_names.is_empty() || for_body_has_with(for_body) {
                     let unit =
                         ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.loop_unit");
-                    return lower_generator_or_mutation_loop(
-                        target, iter, for_body, &acc_names, unit, last.span, ctx,
-                    );
+                    let site = ForSite {
+                        target,
+                        iter,
+                        body_stmts: for_body,
+                        acc_names: &acc_names,
+                        outer_bindings: &scope,
+                        for_span: last.span,
+                    };
+                    return lower_generator_or_mutation_loop(&site, unit, ctx);
                 }
                 // Mirror `lower_middle_stmt`'s remaining mutation guards before
                 // the hidden-writer fallback below — the final-position path must
@@ -341,16 +347,15 @@ pub(super) fn lower_final_stmt(
                 if !for_body_has_feed(for_body) && for_body_terminal_is_bare_effect(for_body) {
                     let unit =
                         ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.loop_unit");
-                    return lower_direct_mirror_loop(
+                    let site = ForSite {
                         target,
                         iter,
-                        for_body,
-                        &[],
-                        unit,
-                        None,
-                        last.span,
-                        ctx,
-                    );
+                        body_stmts: for_body,
+                        acc_names: &[],
+                        outer_bindings: &scope,
+                        for_span: last.span,
+                    };
+                    return lower_direct_mirror_loop(&site, unit, None, ctx);
                 }
             }
             lower_generator_for(target, iter, for_body, &scope, last.span, ctx)
@@ -396,7 +401,9 @@ pub(super) fn lower_final_stmt(
         // value reads it inside a `with begin():` block that feeds it out).
         ChlStmt::With { .. } => {
             let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.txn_unit");
-            lower_standalone_transaction(last, unit, ctx)
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            lower_standalone_transaction(last, unit, &scope, ctx)
         }
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
@@ -411,25 +418,47 @@ pub(super) fn lower_final_stmt(
 /// Lower the right-hand side of an assignment.
 ///
 /// A [`ChlExpr::Block`] right-hand side — `x = if c: … else: …`, `x = match v:
-/// …` — is the block statement it wraps, lowered in the scope the assignment
-/// sits in. Those names are what a `for` inside one of the block's branches
-/// consults to tell a loop-carried accumulator from a branch-local
-/// ([`find_mutation_loop_vars`]); reaching the block through [`lower_expr`]
-/// would lose them, and the loop would be read as a generator.
-///
-/// A loop body and a `with begin():` block lower an assignment's value with
-/// [`lower_expr`] instead, and so drop the scope. Neither admits a nested
-/// `for`, so nothing there depends on it.
-fn lower_assigned_value(
+/// …` — is the block statement it wraps, lowered by [`lower_block_value`] in
+/// the scope the assignment sits in. Every position that assigns carries that
+/// scope: a statement block through `preceding` and `outer_bindings`, a
+/// for-loop body and a `with begin():` block through the names bound above the
+/// loop or the transaction.
+pub(super) fn lower_assigned_value(
     value: &Spanned<ChlExpr>,
     preceding: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &value.node {
-        ChlExpr::Block(stmt) => lower_final_stmt(stmt, preceding, outer_bindings, ctx),
+        ChlExpr::Block(stmt) => lower_block_value(stmt, preceding, outer_bindings, ctx),
         _ => lower_expr(value, ctx),
     }
+}
+
+/// Lower a block statement standing in value position — the sole entry point
+/// for a [`ChlExpr::Block`].
+///
+/// The scope decides what a name in the block means: `x := e` is a write when
+/// `x` is bound above the block and an introduction when it is not
+/// ([`lower_middle_stmt`]), and a `for` inside a branch reads the same scope to
+/// tell a loop-carried accumulator from a branch-local
+/// ([`find_mutation_loop_vars`]). `preceding` and `outer_bindings` are that
+/// scope.
+///
+/// A write inside one of the block's branches is off the statement spine the
+/// mutability phases read, and is put back on it by
+/// [`push_bindings_into_writing_cases`](crate::ccl::mut_elim::push_bindings_into_writing_cases).
+pub(super) fn lower_block_value(
+    stmt: &Spanned<ChlStmt>,
+    preceding: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    debug_assert!(
+        matches!(stmt.node, ChlStmt::If { .. } | ChlStmt::Match { .. }),
+        "Expr::Block wraps an `if` or a `match`; the parser builds no other block value"
+    );
+    lower_final_stmt(stmt, preceding, outer_bindings, ctx)
 }
 
 /// Lower a single statement in the middle of a block.
@@ -716,9 +745,15 @@ pub(super) fn lower_middle_stmt(
                 // feeds/yields) — take the direct-mirror `For` path; the unified
                 // phases (src/ccl/design/mutability.md) build the recurrence,
                 // strip each `Begin` into a commit site, and hoist feeds.
-                return lower_generator_or_mutation_loop(
-                    target, iter, for_body, &acc_names, body, stmt.span, ctx,
-                );
+                let site = ForSite {
+                    target,
+                    iter,
+                    body_stmts: for_body,
+                    acc_names: &acc_names,
+                    outer_bindings: &scope,
+                    for_span: stmt.span,
+                };
+                return lower_generator_or_mutation_loop(&site, body, ctx);
             }
             // Top-level scan found nothing, but a *nested* `if` or
             // `for` may still mutate an outer-scope variable — we
@@ -763,16 +798,15 @@ pub(super) fn lower_middle_stmt(
             // *`Compose`*, a stateless map that cannot thread the accumulator,
             // so a hidden writer must take the `For` path, not that one.)
             if !for_body_has_yield(for_body) && !for_body_has_feed(for_body) {
-                return lower_direct_mirror_loop(
+                let site = ForSite {
                     target,
                     iter,
-                    for_body,
-                    &[],
-                    body,
-                    None,
-                    stmt.span,
-                    ctx,
-                );
+                    body_stmts: for_body,
+                    acc_names: &[],
+                    outer_bindings: &scope,
+                    for_span: stmt.span,
+                };
+                return lower_direct_mirror_loop(&site, body, None, ctx);
             }
 
             // A feed/yield loop with no accumulator is a side-effecting
@@ -787,7 +821,11 @@ pub(super) fn lower_middle_stmt(
         // A standalone `with begin():` transaction — one commit over a
         // synthesized singleton source, which `transact_phase` folds into the commit
         // store holding the mutable variables it touches (see src/ccl/design/mutability.md).
-        ChlStmt::With { .. } => lower_standalone_transaction(stmt, body, ctx),
+        ChlStmt::With { .. } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            lower_standalone_transaction(stmt, body, &scope, ctx)
+        }
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(body),
@@ -1893,9 +1931,9 @@ x";
     #[case(
         indoc! {"
             x = if c:
-                1
-            else:
-                2
+                    1
+                else:
+                    2
             x"},
         indoc! {"
             let x = { c → 1; true → 2 }
@@ -1905,11 +1943,11 @@ x";
     #[case(
         indoc! {"
             x = if a:
-                1
-            elif b:
-                2
-            else:
-                3
+                    1
+                elif b:
+                    2
+                else:
+                    3
             x"},
         indoc! {"
             let x = { a → 1; b → 2; true → 3 }
@@ -1919,10 +1957,10 @@ x";
     #[case(
         indoc! {"
             x = if c:
-                a = 1
-                a + 1
-            else:
-                2
+                    a = 1
+                    a + 1
+                else:
+                    2
             x"},
         indoc! {"
             let x = { c → let a = 1
@@ -1984,9 +2022,9 @@ x";
         assert_eq!(
             lower(indoc! {"
                 x = if c:
-                    1
-                else:
-                    2
+                        1
+                    else:
+                        2
                 x"}),
             lower(indoc! {"
                 x = 1 if c else 2
@@ -1995,19 +2033,19 @@ x";
     }
 
     /// A `for` inside a branch of a block right-hand side sees the names bound
-    /// above the assignment, so a write to one of them reads as the
-    /// loop-carried accumulator it is rather than as a branch-local.
-    /// `lower_assigned_value` is what carries that scope in.
+    /// above the assignment, so `acc += i` reads as a write to the accumulator
+    /// rather than as a `+=` to a non-mutable. Without the scope the loop
+    /// rejects `acc` as not a mutable variable.
     #[test]
     fn test_block_right_hand_side_sees_the_enclosing_scope() {
         let stmts = parse_module(indoc! {"
             acc := 0
             x = if c:
-                for i in [1, 2]:
-                    acc += i
-                acc
-            else:
-                0
+                    for i in [1, 2]:
+                        acc += i
+                    acc
+                else:
+                    0
             x"});
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
             .into_result()
@@ -2019,13 +2057,37 @@ x";
         );
     }
 
+    /// A mutable variable a block right-hand side declares itself is written
+    /// normally: the declaration and every write share the block's scope, so
+    /// the advance reaches every read of it.
+    #[test]
+    fn test_block_right_hand_side_writes_its_own_mutable() {
+        let stmts = parse_module(indoc! {"
+            x = if c:
+                    s := 0
+                    for i in [1, 2]:
+                        s += i
+                    s
+                else:
+                    0
+            x"});
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
+        let rendered = symbolic(&ccl);
+        assert!(
+            rendered.contains("s :="),
+            "the loop writes the block-local accumulator, got: {rendered}"
+        );
+    }
+
     /// A bare `if` has no value on the false path, in an assignment as anywhere
     /// else that requires one.
     #[test]
     fn test_block_right_hand_side_without_else_rejected() {
         let stmts = parse_module(indoc! {"
             x = if c:
-                1
+                    1
             x"});
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message, .. } = &err;
