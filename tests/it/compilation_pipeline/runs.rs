@@ -177,6 +177,42 @@ fn two_runs_of_a_module_have_their_own_sinks() {
     );
 }
 
+/// Two runs of a module reading a source each read all of it: the context holds the source
+/// once, and each run's read is a reader of its own, so the elements 1, 2, 3 total 6 in both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn two_runs_of_a_module_each_read_all_of_its_source() {
+    use cambra::ccl::{BaseType, Type};
+    use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
+    use cambra::interpreter::{Extent, Predicate, TestDataSource};
+    let mut ctx = GlobalContext::default();
+    let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+        "nums",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(1)),
+        (Value::UInt(1), Value::Int(2)),
+        (Value::UInt(2), Value::Int(3)),
+    ]);
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    ctx.register_source(source);
+    let program = program(
+        indoc! {"
+            run total as a
+            run total as b
+            a::sum + 10 * b::sum
+        "},
+        &[("total", "pub sum = sum([x for x in nums()])\n")],
+    );
+    let (_, result) = run_program_with_ctx(&mut ctx, &program);
+    assert_eq!(
+        scalar_tile_to_column_value(result).as_single().unwrap(),
+        Value::Int(66)
+    );
+}
+
 /// A run's own runs run with it, at run paths under its own.
 #[rstest]
 #[timeout(Duration::from_secs(10))]

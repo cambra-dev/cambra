@@ -15,6 +15,11 @@ use crate::interpreter::{
 
 /// Buffers and tracks lines available on stdin.
 ///
+/// One source per context holds the process's stdin, and every reader of
+/// `stdin()` in that context subscribes to it: two reads in one program, or two
+/// runs of a module that reads it, each receive every line as producers of the
+/// one buffer.
+///
 /// Lines are read by a background thread so that `check_for_new_data` never
 /// blocks — it simply drains whatever the reader thread has buffered so far.
 pub struct StdinDataSource {
