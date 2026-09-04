@@ -698,6 +698,12 @@ pub enum Phase {
 /// cannot tell the sharing apart from the collision — which is why the main-tree
 /// walk stays `Rc`-blind and this one does not.
 ///
+/// Coverage is [`TypedExpr::walk_type_slots`]', which is what reaches a predicate
+/// riding a binder's **annotation** and nothing else. `f: (Int => {Int where _ ==
+/// 9}) = …` is that shape, and it is live at the `post-lowering` boundary: the
+/// annotation holds the only occurrence until inference consumes it, so a walk
+/// over node types alone enumerates none of the predicate's ids there.
+///
 /// Both walks run at every boundary, from [`assert_unique_node_ids`].
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     use crate::ccl::ty::Type;
@@ -724,13 +730,7 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         });
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        from_ty(&e.ty, acc);
-        if let Some(a) = &e.user_annotation {
-            from_ty(a, acc);
-        }
-        if let crate::ccl::TypedExprNode::Cast { target, .. } = &e.node {
-            from_ty(target, acc);
-        }
+        e.walk_type_slots(|t| from_ty(t, acc));
         e.walk_children(|c| from_expr_ty(c, acc));
     }
     let mut terms: HashMap<usize, HashSet<NodeId>> = HashMap::new();
@@ -780,7 +780,6 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 /// Explanation and uniqueness are two questions with two answers; see
 /// `design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
-    use crate::ccl::TypedExprNode;
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut HashSet<NodeId>) {
@@ -791,29 +790,14 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
         acc.insert(e.node_id());
-        from_ty(&e.ty, acc);
-        if let Some(ann) = &e.user_annotation {
-            from_ty(ann, acc);
-        }
-        // A `Cast`'s target is a type slot `walk_children` skips, and it is where
-        // lowering parks the predicate it just built.
-        if let TypedExprNode::Cast { target, .. } = &e.node {
-            from_ty(target, acc);
-        }
-        // A binder's declared type and its annotation are type slots too. This
-        // walk and `TypedExpr::walk_type_slots` enumerate the same domain, and
-        // must: the rewriting passes reach predicates through `walk_type_slots`,
-        // so anything it covers and this does not is a predicate a pass may
-        // rebuild while the fold has never enumerated the original — which reads
-        // as `DanglingParent` against an id the input pane demonstrably holds.
+        // Delegating to `walk_type_slots` is what keeps the two in step, and they
+        // must be: the rewriting passes reach predicates through that walk, so a
+        // slot it covers and this does not is a predicate a pass may rebuild while
+        // the fold has never enumerated the original — which reads as
+        // `DanglingParent` against an id the input pane demonstrably holds.
         // `f: (Int => {Int where _ == 9}) = …` is the shape: the predicate rides
         // the `let` binder's annotation and nothing else.
-        e.walk_binders(|b| {
-            from_ty(&b.ty, acc);
-            if let Some(ann) = &b.user_annotation {
-                from_ty(ann, acc);
-            }
-        });
+        e.walk_type_slots(|t| from_ty(t, acc));
         e.walk_children(|c| from_expr(c, acc));
     }
 

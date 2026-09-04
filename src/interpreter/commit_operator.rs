@@ -1375,18 +1375,24 @@ impl TileProducer for InductionStoreProducer {
         let body_tile = self
             .body_producer
             .get(self.body_producer.tiling().universal_guard());
-        // Consume the body's decisions **in contiguous order** from `processed`,
-        // stopping at the first position it has not decided. Tick 0 is the
-        // seeded init, so iteration `pos` occupies tick `pos + 1`; the decision
-        // gates commit (append the change) vs carry (`step(_, None)` — the value
-        // inherits from tick 0 / the latest earlier change). The driver emits one
-        // position per pull, so this normally steps once; consuming a run costs
-        // nothing extra and keeps the store's rule independent of that rate.
+        // Consume the body's decisions **in ascending position order** from
+        // `processed`, stopping at the first position it has not decided. Tick 0 is
+        // the seeded init and the iteration at position `pos` occupies tick
+        // `pos + 1`, so `processed` — the engine's watermark — is a *lower bound* on
+        // the next position rather than the position itself: a restricted loop
+        // source skips the extent positions its filter excluded, and those ticks are
+        // never occupied. The decision gates commit (append the change) vs carry
+        // (`step(_, None)` — the value inherits from tick 0 / the latest earlier
+        // change). The driver emits one position per pull, so this normally steps
+        // once; consuming a run costs nothing extra and keeps the store's rule
+        // independent of that rate.
         let started_at = self.processed();
-        while let Some((commit, writes, tap_fired)) =
-            body_decision_at(&body_tile, self.processed(), &self.tap_fields)
-        {
-            let pos = self.processed();
+        while let Some(pos) = next_decided_position(&body_tile, self.processed()) {
+            let Some((commit, writes, tap_fired)) =
+                body_decision_at(&body_tile, pos, &self.tap_fields)
+            else {
+                break;
+            };
             let write_set: Option<HashMap<Value, Value>> = if commit {
                 debug_assert_eq!(
                     writes.len(),
@@ -1435,7 +1441,7 @@ impl TileProducer for InductionStoreProducer {
             debug_assert_eq!(
                 self.processed(),
                 pos + 1,
-                "a step at iteration {pos} advances the decided count to {}",
+                "a step at position {pos} advances the watermark to its tick {}",
                 pos + 1
             );
         }
@@ -1462,16 +1468,15 @@ impl TileProducer for InductionStoreProducer {
         // extent is decided.
         let done = body_tile.is_terminal();
         // Reading a terminal body stream as "the whole extent is decided" rests on
-        // that stream being **gapless**. The loop above stops at the first undecided
-        // position, so a terminal stream with a hole at `processed` and decisions past
-        // it would close the frontier an iteration short and drop them without a
-        // sound. The driver emits contiguously (and asserts its source's gaplessness),
-        // so this holds by construction — asserted here because it is here that it is
-        // relied on.
+        // the loop above having consumed all of it. It stops at the first position it
+        // cannot decode as a decision, so a terminal stream with an undecodable row
+        // and decisions past it would close the frontier early and drop them without
+        // a sound.
         debug_assert!(
-            !done || !decides_beyond(&body_tile, self.processed()),
-            "induction store: the body's decision stream is terminal with a hole at \
-             position {} and decisions past it",
+            !done || next_decided_position(&body_tile, self.processed()).is_none(),
+            "induction store: the body's decision stream is terminal but still decides \
+             position {:?}, at or past the watermark {}",
+            next_decided_position(&body_tile, self.processed()),
             self.processed()
         );
         self.render_store(done)
@@ -2569,37 +2574,44 @@ impl TileProducer for AsOfProducer {
 }
 
 /// One emitted body-input row: the snapshot the decision reads, the source item
-/// it is for, and that item's index.
+/// it is for, that item's index, and the domain position the row occupies.
 ///
 /// The index is what makes a release interpretable on the transaction side (it
-/// says *which* item a reclaimed row belongs to). On the induction side it is
-/// the emit position itself, kept for uniformity — the window is a row or two,
-/// so the duplication costs nothing and having one row type is what lets both
-/// drivers share the rendering below.
+/// says *which* item a reclaimed row belongs to). It is distinct from `position`
+/// there — a retried item occupies several attempt positions — and equal to it
+/// on the induction side, where a position *is* its source position.
 struct DriverRow {
     snapshot: Vec<Value>,
     item: Value,
     item_index: usize,
+    /// The row's absolute domain position, which the body's decision is looked
+    /// up by ([`body_decision_at`]). Ascending across the window, and on the
+    /// induction side not necessarily contiguous: a restricted loop source
+    /// delivers a subset of its extent's positions and the recurrence runs over
+    /// exactly those.
+    position: usize,
 }
 
 /// The live window of emitted `(read…, item)` rows, and the body-input tile it
 /// renders.
 ///
-/// Both drivers own one. What differs between them is *which* row to emit next —
-/// the induction driver takes it from the store's decided frontier, the
-/// transaction driver from its acked item cursor — not how a window of rows
-/// becomes the body's input, how positions stay absolute across compaction, or
-/// what a release reclaims. Those are here, once.
+/// Both drivers own one. What differs between them is *which* position to emit
+/// next — the induction driver takes it from its source's delivered positions,
+/// the transaction driver counts attempts — not how a window of rows becomes the
+/// body's input, how positions stay absolute across compaction, or what a release
+/// reclaims. Those are here, once.
 ///
-/// Positions are **absolute**: `rows[i]` is position `base + i`, and released
+/// Positions are **absolute and ascending**, each carried on its row: released
 /// rows compact off the front without renumbering the rest, because the body
-/// looks a decision up by domain *value* ([`body_decision_at`]).
+/// looks a decision up by domain *value* ([`body_decision_at`]). They need not be
+/// contiguous — a restricted induction source has positions its extent does not.
 struct DriverWindow {
     read_extents: Vec<Extent>,
     item_extent: Extent,
-    /// Absolute position of `rows[0]`; released rows are compacted away, so the
-    /// retained window stays bounded on a long-running loop.
-    base: usize,
+    /// One past the highest position ever pushed — the transaction driver's next
+    /// attempt position. Held across compaction, so a window emptied by a release
+    /// still knows where it is.
+    next_position: usize,
     rows: Vec<DriverRow>,
     /// Highest absolute position a consumer has released. The body fans this
     /// input through a `Memo` that pulls it several times per round, so an
@@ -2613,37 +2625,44 @@ impl DriverWindow {
         Self {
             read_extents,
             item_extent,
-            base: 0,
+            next_position: 0,
             rows: Vec::new(),
             release_cursor: PrefixReleaseCursor::default(),
         }
     }
 
-    /// The next absolute position to emit at — one past the window's end.
+    /// One past the highest position pushed — the next position of a driver whose
+    /// positions are contiguous.
     fn next_position(&self) -> usize {
-        self.base + self.rows.len()
+        self.next_position
     }
 
-    /// Append a row, returning the absolute position it landed at.
-    fn push(&mut self, snapshot: Vec<Value>, item: Value, item_index: usize) -> usize {
+    /// Append a row at absolute position `position`.
+    fn push(&mut self, snapshot: Vec<Value>, item: Value, item_index: usize, position: usize) {
         debug_assert_eq!(
             snapshot.len(),
             self.read_extents.len(),
             "a body-input row carries one snapshot value per read key"
         );
-        let pos = self.next_position();
+        debug_assert!(
+            position >= self.next_position,
+            "body-input positions ascend: pushing {position} at or below the highest \
+             already pushed ({})",
+            self.next_position
+        );
         self.rows.push(DriverRow {
             snapshot,
             item,
             item_index,
+            position,
         });
-        pos
+        self.next_position = position + 1;
     }
 
     /// The newest live row with its absolute position, or `None` when the window
     /// is empty.
     fn newest(&self) -> Option<(usize, &DriverRow)> {
-        self.rows.last().map(|r| (self.next_position() - 1, r))
+        self.rows.last().map(|r| (r.position, r))
     }
 
     /// Reclaim the prefix a release covers, keeping the survivors' positions
@@ -2655,13 +2674,10 @@ impl DriverWindow {
         let drop_through = match extent {
             ReleasedExtent::Nothing => return extent,
             ReleasedExtent::All => self.rows.len(),
-            ReleasedExtent::Through(w) if w >= self.base => {
-                (w + 1 - self.base).min(self.rows.len())
-            }
-            ReleasedExtent::Through(_) => return extent,
+            // Positions ascend, so the released ones are a prefix of the window.
+            ReleasedExtent::Through(w) => self.rows.partition_point(|r| r.position <= w),
         };
         self.rows.drain(..drop_through);
-        self.base += drop_through;
         extent
     }
 
@@ -2690,7 +2706,7 @@ impl DriverWindow {
             Tile::Scalar(ColumnValue::from_values(column, ext))
         });
         Tile::SealedFunction {
-            domain: ColumnValue::from_uints((self.base..self.next_position()).collect()),
+            domain: ColumnValue::from_uints(self.rows.iter().map(|r| r.position).collect()),
             codomain: Box::new(Tile::Record(fields)),
             domain_predicate: if done {
                 Predicate::True
@@ -2820,6 +2836,7 @@ impl TileOperator for InductionDriver {
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
             window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone()),
+            emitted_through: None,
             source_released_through: None,
             source_fully_released: false,
         })
@@ -2843,6 +2860,12 @@ struct InductionDriverProducer {
     /// producer's own output, not recurrence state: a row is never read back to
     /// compute a later one.
     window: DriverWindow,
+    /// Highest source position emitted, or `None` before the first. This is the
+    /// item cursor, and it is not recoverable from the window (a release compacts
+    /// emitted rows away) nor from the store's frontier (a *tick* cursor, which
+    /// only counts iterations — a restricted source's positions are sparser than
+    /// its ticks).
+    emitted_through: Option<usize>,
     /// Highest source position released back upstream. The driver never re-reads
     /// a position it has emitted, so that prefix is reclaimable; a co-iterated
     /// reader keeps its own positions live through the source's cross-producer
@@ -2872,24 +2895,23 @@ impl TileProducer for InductionDriverProducer {
         // An async source's domain arrives unordered, so drive by absolute
         // position rather than by the codomain's column order.
         let by_pos: HashMap<usize, Value> = decode_source_positioned(&src).into_iter().collect();
-        // Invariant: an induction source domain has **no interior hole** — a finite
-        // list `[0, N)` or an async `DataSource`'s UInt domain only ever gaps at the
-        // *trailing* end (positions not yet arrived). Both of this driver's rules rest
-        // on it: it stops at the first missing position and resumes when that one
-        // arrives, so a permanent interior hole would stall forever; and `done` below
-        // reads "the next position is absent" as "there is no next", which a hole
-        // would turn into a loop that ends early and drops the rest in silence. The
-        // arrived set is a suffix rather than a prefix from 0 — the consumed prefix is released
-        // below, so a later pull sees a shifted window (e.g. `{5, 6, 7}`) — so the
-        // check is that the sorted positions run contiguously from whatever base is
-        // retained.
+        // Invariant: an induction source delivers its positions in **ascending
+        // order** — a position at or below one already emitted never arrives later.
+        // The driver takes the smallest delivered position above its cursor and
+        // never looks back, so a late arrival below the cursor would be dropped in
+        // silence. A position at or below the cursor is still legitimate *here*: the
+        // release below is what removes the consumed prefix, and the source is free
+        // to honour it a pull late. The domain need not be contiguous — a restricted
+        // source (`for l in [x for x in xs if p(x)]`) delivers a subset of its
+        // extent's positions and the recurrence runs over exactly those.
         debug_assert!(
-            !source_complete || {
-                let mut ks: Vec<usize> = by_pos.keys().copied().collect();
-                ks.sort_unstable();
-                ks.windows(2).all(|w| w[1] == w[0] + 1)
-            },
-            "induction source domain has an interior gap: {:?}",
+            by_pos.keys().all(|&p| {
+                self.emitted_through.is_none_or(|e| p > e)
+                    || self.source_released_through.is_some_and(|r| p <= r)
+            }),
+            "induction source delivered a position at or below the emitted cursor {:?} \
+             that was never released: {:?}",
+            self.emitted_through,
             {
                 let mut ks: Vec<usize> = by_pos.keys().copied().collect();
                 ks.sort_unstable();
@@ -2900,26 +2922,42 @@ impl TileProducer for InductionDriverProducer {
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
 
-        // Emit the frontier's position, if the source has delivered it. At most
+        // Emit the next iterated position, if the source has delivered it. At most
         // one position per pull: the cyclic `FanOut` serves this store tile from
         // a snapshot taken before the traversal began, so a position decided
         // *during* this pull is not visible until the next one. That is the
         // one-step-per-pull cycle driver every cyclic operator here runs on.
         //
-        // The store's decided frontier *is* the next position to iterate, so it
-        // is also the item cursor: unlike the transaction driver, this one keeps
-        // no cursor of its own.
+        // Two cursors, because the store counts *ticks* while the source delivers
+        // *positions*, and a restricted source has fewer of the former than its
+        // extent has of the latter. The frontier is the tick cursor: tick 0 seeds
+        // the accumulators and the iteration at position `p` occupies tick `p + 1`,
+        // so a frontier equal to `tick_cursor` says every emitted position has been
+        // decided and the next may go. `emitted_through` is the item cursor, and the
+        // next position to iterate is the smallest delivered position above it —
+        // the frontier itself for a contiguous source, and for a restricted one the
+        // next position that survived the filter.
         let frontier = store_frontier(&store);
-        let mut next = self.window.next_position();
+        let next_delivered = |after: Option<usize>| -> Option<usize> {
+            by_pos
+                .keys()
+                .copied()
+                .filter(|&p| after.is_none_or(|e| p > e))
+                .min()
+        };
+        let tick_cursor = self.emitted_through.map_or(0, |p| p + 1);
         if let Some(frontier) = frontier {
             debug_assert!(
-                frontier <= next,
-                "the store decided position {frontier} but the driver has only emitted through \
-                 {next} — a decision cannot precede the input it decides"
+                frontier <= tick_cursor,
+                "the store decided through tick {frontier} but the driver has only emitted \
+                 through tick {tick_cursor} — a decision cannot precede the input it decides"
             );
-            if frontier == next
-                && let Some(item) = by_pos.get(&frontier)
+            if frontier == tick_cursor
+                && let Some(pos) = next_delivered(self.emitted_through)
             {
+                // The previous accumulator is that key's value as of the frontier:
+                // the tick the predecessor iteration's decision occupies, whichever
+                // position ran there.
                 let prev: Vec<Value> = self
                     .read_keys
                     .iter()
@@ -2929,8 +2967,8 @@ impl TileProducer for InductionDriverProducer {
                         )
                     })
                     .collect();
-                self.window.push(prev, item.clone(), frontier);
-                next += 1;
+                self.window.push(prev, by_pos[&pos].clone(), pos, pos);
+                self.emitted_through = Some(pos);
             }
         }
 
@@ -2948,18 +2986,23 @@ impl TileProducer for InductionDriverProducer {
         }
         // Reclaim the source prefix this driver has consumed. It only ever reads
         // the position it is about to emit and never re-reads an earlier one.
-        if next > 0 && !self.source_released_through.is_some_and(|r| r + 1 >= next) {
+        if let Some(through) = self.emitted_through
+            && !self.source_released_through.is_some_and(|r| r >= through)
+        {
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(next - 1)),
+                    Predicate::LessThanEq(Value::UInt(through)),
                 )));
-            self.source_released_through = Some(next - 1);
+            self.source_released_through = Some(through);
         }
         // Every position of a complete source has been emitted: the body input
         // is final, and that terminality propagates through the body's decision
-        // stream to close the store's frontier. A terminal source's domain is
-        // gapless, so "the next position is absent" means "there is no next".
-        let done = source_complete && !by_pos.contains_key(&next);
+        // stream to close the store's frontier. Positions arrive in ascending
+        // order, so "no delivered position above the cursor" means "there is no
+        // next" — the question a restricted source needs asked, since the position
+        // one past the cursor may simply not be in its domain.
+        let pending = next_delivered(self.emitted_through);
+        let done = source_complete && pending.is_none();
         // Re-arm while the cycle still has work only it can trigger: a position
         // has arrived that is not yet emitted. That is the whole condition — it
         // is *not* "a row is awaiting its decision", because a row emitted this
@@ -2975,8 +3018,8 @@ impl TileProducer for InductionDriverProducer {
         // self-contained and always decides on the pull (unlike a transaction
         // body, which can read a still-converging broadcast), so the store never
         // leaves a position undecided — asserted there, where the store's
-        // contiguous consume-from-`processed` loop makes it checkable.
-        if !done && by_pos.contains_key(&next) {
+        // consume-in-ascending-order loop makes it checkable.
+        if !done && pending.is_some() {
             self.wakeups.request(self.consumer.clone());
         }
         if done && !self.source_fully_released {
@@ -3219,7 +3262,11 @@ impl TileProducer for TransactDriverProducer {
                 .iter()
                 .map(|o| o.clone().unwrap_or_else(|| item.clone()))
                 .collect();
-            self.window.push(snap_in, item, self.current);
+            // An attempt occupies the next contiguous position: a retried item
+            // takes a fresh one, which is why `item_index` and the position are
+            // separate here.
+            self.window
+                .push(snap_in, item, self.current, self.window.next_position());
             self.latest_emit = Some((self.current, frontier));
         }
         self.debug_assert_window_invariants();
@@ -3326,13 +3373,22 @@ fn newest_body_position(tile: &Tile) -> Option<usize> {
         .max()
 }
 
-/// Whether `tile` decides any position strictly after `pos` — the hole a consumer
-/// that stops at the first undecided position would silently truncate on.
-fn decides_beyond(tile: &Tile, pos: usize) -> bool {
+/// The lowest position `tile` decides at or after `pos`, or `None` when it decides
+/// none.
+///
+/// The induction store consumes decisions in ascending position order rather than
+/// at consecutive positions: a restricted loop source iterates a subset of its
+/// extent, so the position after `p` in the decision stream need not be `p + 1`.
+fn next_decided_position(tile: &Tile, pos: usize) -> Option<usize> {
     let Tile::SealedFunction { domain, .. } = tile else {
-        return false;
+        return None;
     };
-    (0..domain.len()).any(|i| matches!(domain.index_at(i), Value::UInt(p) if p > pos))
+    (0..domain.len())
+        .filter_map(|i| match domain.index_at(i) {
+            Value::UInt(p) if p >= pos => Some(p),
+            _ => None,
+        })
+        .min()
 }
 
 /// Extract a writer body's grant/deny *decision* at position `pos` of its input.

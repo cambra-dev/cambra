@@ -66,6 +66,14 @@ carry-forward, so channels never close a causal cycle — see [merge laws](#the-
 | `with begin():` transaction | `Txn`, an anonymous total order issued by the runtime | `get_prev_txn` |
 | `while` loop *(future)* | a prefix of `Nat` bounded by the running condition | `get_prev_seq` over a self-ceiling domain |
 
+A **product** loop source is unsupported. A comprehension across two sources
+(`[e for x in xs for y in ys]`, join or not) is keyed by `(𝑖, 𝑗)`, and the induction recurrence is
+sequenced by `UInt` position throughout: the driver pairs items with `UInt` domain keys, the commit
+engine's ticks are positions, and the dense read folds tick `𝑝 + 1` at each. Supporting one means
+giving the recurrence a sequencing order over `(𝑖, 𝑗)`. Op-conversion rejects such a source until
+it has one, because the driver's decode drops a non-`UInt` key instead of failing on it, so an
+unguarded product domain is a loop that runs zero times.
+
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
 inferred, always spelled at the introduction). What the **introduction** site fixes is not that
 domain but the constraint that it must sit *outside* the context that would sequence the mutable variable.

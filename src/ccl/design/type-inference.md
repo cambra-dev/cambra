@@ -636,12 +636,8 @@ A walk over the slot set must still cover it, because the passes that use
 slot the walk misses is a slot the check cannot report on.
 
 The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
-stamps a distinct marker into every directly-carried `Type` in the AST and pins
-which ones the walk reaches. One is deliberately excluded — `Transact`'s `domain` —
-because that node is born by `plan_loops` after every pass on the walk, so covering
-it would newly expose the sequencing extent to planning's predicate compilation.
-That is a behavioural change in the recurrence engine, and the test pins the
-exclusion so it stays a decision rather than drift.
+stamps a distinct marker into every directly-carried `Type` in the AST and pins that
+the walk reaches all of them.
 
 #### The memo key is the predicate *and the conditions it was rebuilt under*
 

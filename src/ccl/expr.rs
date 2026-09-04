@@ -1801,10 +1801,10 @@ impl TypedExpr {
     }
 
     /// Invoke `f` on every [`Type`] slot this node carries **directly**: its own
-    /// `ty`, its `user_annotation`, a [`TypedExprNode::Cast`]'s `target`, and — for
-    /// every binder it introduces ([`walk_binders`](Self::walk_binders)) — both
-    /// that binder's `ty` **and** its `user_annotation`. Does not recurse into
-    /// child expressions.
+    /// `ty`, its `user_annotation`, a [`TypedExprNode::Cast`]'s `target`, a
+    /// [`TypedExprNode::Transact`]'s `domain`, and — for every binder it introduces
+    /// ([`walk_binders`](Self::walk_binders)) — both that binder's `ty` **and** its
+    /// `user_annotation`. Does not recurse into child expressions.
     ///
     /// This is the single source of truth for "which type slots a node carries",
     /// and it exists because those slots are **independent** values: a refinement
@@ -1825,15 +1825,18 @@ impl TypedExpr {
     /// binder annotation to reach, and a walk that visits only `b.ty` misses every
     /// predicate riding one.
     ///
-    /// **Coverage is exact for every variant except
-    /// [`TypedExprNode::Transact`]**, whose `domain` — the sequencing extent, or
-    /// `Txn` — is the one directly-carried `Type` this does not visit. `Transact`
-    /// is born by `planning::plan_loops`, *after* every pass that uses this walk,
-    /// so no caller can observe the omission today; covering it would newly expose
-    /// the domain to `planning::compile_refinement_predicates`, which runs later.
-    /// That is a real behavioural change in the recurrence engine and wants its
-    /// own change rather than riding along here. The exhaustiveness this claims is
-    /// checked, not asserted: `walk_type_slots_covers_every_carried_type_slot`.
+    /// **Coverage is exact — every variant, no exceptions**, including a
+    /// [`TypedExprNode::Transact`]'s `domain`. A `Transact` is born by
+    /// `planning::plan_loops` and its sequencing domain is the extent of the source
+    /// it iterates, refinements and all, so a `mut` accumulator over a filtered
+    /// collection carries that filter's predicate there as well as on every other
+    /// slot the same extent reaches. `planning::compile_refinement_predicates`
+    /// rewrites predicates through this walk, and the post-planning `typecheck`
+    /// compares refinements by structural equality, so a domain this walk skipped
+    /// would hold the bare predicate while its siblings hold the compiled one and
+    /// the carrier's own type would contradict its `domain`. The exhaustiveness
+    /// this claims is checked, not asserted:
+    /// `walk_type_slots_covers_every_carried_type_slot`.
     ///
     /// Callers that also need slots reachable *through* a type (a `Fun` domain, a
     /// refinement predicate's own type slots) compose this with
@@ -1846,6 +1849,9 @@ impl TypedExpr {
         }
         if let TypedExprNode::Cast { target, .. } = &self.node {
             f(target);
+        }
+        if let TypedExprNode::Transact { domain, .. } = &self.node {
+            f(domain);
         }
         self.walk_binders(|b| {
             f(&b.ty);
@@ -1865,6 +1871,9 @@ impl TypedExpr {
         }
         if let TypedExprNode::Cast { target, .. } = &mut self.node {
             f(target);
+        }
+        if let TypedExprNode::Transact { domain, .. } = &mut self.node {
+            f(domain);
         }
         self.walk_binders_mut(|b| {
             f(&mut b.ty);
@@ -2154,8 +2163,7 @@ mod tests {
     /// The full inventory of directly-carried `Type`s in the AST: `TypedExpr.ty`,
     /// `TypedExpr.user_annotation`, `TypedBinding.ty`, `TypedBinding.user_annotation`,
     /// `TypedExprNode::Cast.target`, and `TypedExprNode::Transact.domain`. The walk
-    /// covers the first five; `Transact.domain` is excluded for the reason on
-    /// `walk_type_slots`, and this pins that exclusion so it cannot become silent.
+    /// covers all six.
     #[test]
     fn walk_type_slots_covers_every_carried_type_slot() {
         fn marker(name: &str) -> Type {
@@ -2195,19 +2203,15 @@ mod tests {
         cast.ty = marker("node_ty");
         assert_eq!(reached(&cast), vec!["cast_target", "node_ty"]);
 
-        // `Transact.domain` is the one directly-carried `Type` deliberately not
-        // covered. Asserted so the exclusion stays a decision rather than drift:
-        // if this starts failing, the walk grew to cover it and the doc must too.
+        // A `Transact` carries its sequencing domain beyond its own type, and that
+        // domain holds the iterated source's refinements — the predicates
+        // `planning::compile_refinement_predicates` rewrites through this walk.
         let mut txn = TypedExpr::new(TypedExprNode::Transact {
             keys: Vec::new(),
             writers: Vec::new(),
             domain: marker("transact_domain"),
         });
         txn.ty = marker("node_ty");
-        assert_eq!(
-            reached(&txn),
-            vec!["node_ty"],
-            "`Transact.domain` is excluded on purpose; see `walk_type_slots`"
-        );
+        assert_eq!(reached(&txn), vec!["node_ty", "transact_domain"]);
     }
 }

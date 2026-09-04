@@ -306,16 +306,13 @@ fn is_builtin_applied(e: &Expr, b: Builtin) -> bool {
     matches!(&e.node, TypedExprNode::Apply { function, .. } if is_builtin(function, b))
 }
 
-/// Debug-only invariant walk over a whole expression tree: every node's type
-/// (and a `Cast`'s target) is checked marker-free by
+/// Debug-only invariant walk over a whole expression tree: every type slot a node
+/// carries ([`Expr::walk_type_slots`]) is checked marker-free by
 /// [`debug_assert_no_iteration_markers_in_type`]. Called at the planning→
 /// op-conversion boundary to catch a marker that leaked into a predicate.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_no_iteration_markers(expr: &Expr) {
-    debug_assert_no_iteration_markers_in_type(&expr.ty);
-    if let TypedExprNode::Cast { target, .. } = &expr.node {
-        debug_assert_no_iteration_markers_in_type(target);
-    }
+    expr.walk_type_slots(debug_assert_no_iteration_markers_in_type);
     expr.walk_children(debug_assert_no_iteration_markers);
 }
 
