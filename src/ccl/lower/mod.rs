@@ -97,6 +97,8 @@ mod functions;
 mod http;
 mod loops;
 mod stmts;
+
+pub use stmts::lower_type_expr;
 mod transactions;
 
 // Pull every submodule's `pub(super)` helpers into the `lower` namespace so

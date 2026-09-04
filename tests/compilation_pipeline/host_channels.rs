@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::Type;
+use cambra::ccl::channels::ChannelDecl;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, FunctionGuard, HostSink, HostSource, Tile, TileGuard,
@@ -302,4 +303,88 @@ fn a_declared_sink_the_program_never_feeds_is_rejected() {
         message.contains("cart_view"),
         "the rejection names the unfed sink; got: {message}"
     );
+}
+
+/// The whole wiring from declarations: four channels named and typed in CHL,
+/// registered in one call, and a program that reads three and feeds the fourth.
+///
+/// This is the shape a host uses. Nothing here builds a `Type` or an `Extent`
+/// by hand — the row types are the text a program would write in an annotation.
+#[test]
+fn a_program_wires_to_channels_the_host_declared() {
+    let code = indoc! {r#"
+        btc_updates = [u for u in price_updates() if u.ticker == "BTC-USD"]
+        btc_changes = [c for c in cart_changes() if c.ticker == "BTC-USD"]
+
+        btc_px: Mut(Int, Txn) := 0
+        btc_qty: Mut(Int, Txn) := 0
+
+        for u in btc_updates:
+            with begin():
+                btc_px := u.price
+        for c in btc_changes:
+            with begin():
+                btc_qty := c.qty
+
+        for req in view_requests():
+            with begin():
+                cart_view << (qty=btc_qty, price=btc_px, total=btc_qty * btc_px)
+    "#};
+
+    let decls = [
+        ChannelDecl::source("price_updates", "{ticker: String, price: Int}"),
+        ChannelDecl::source("cart_changes", "{ticker: String, qty: Int}"),
+        ChannelDecl::source("view_requests", "Bool"),
+        ChannelDecl::sink("cart_view", "{qty: Int, price: Int, total: Int}"),
+    ];
+
+    let mut ctx = GlobalContext::default();
+    let channels = ctx
+        .register_channels(&decls)
+        .expect("the declarations are well formed");
+    let prices = channels
+        .source("price_updates")
+        .expect("a declared source has a handle")
+        .clone();
+    let changes = channels
+        .source("cart_changes")
+        .expect("a declared source has a handle")
+        .clone();
+    let requests = channels
+        .source("view_requests")
+        .expect("a declared source has a handle")
+        .clone();
+    let view = channels
+        .sink("cart_view")
+        .expect("a declared sink has a handle")
+        .clone();
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let _compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+
+    let cart_row = |ticker: &str, qty: i64| {
+        Value::Record(
+            [
+                ("ticker".to_string(), Value::String(ticker.into())),
+                ("qty".to_string(), Value::Int(qty)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+
+    prices.borrow_mut().push([price_row("BTC-USD", 81_692)]);
+    changes.borrow_mut().push([cart_row("BTC-USD", 2)]);
+    ctx.scheduler().check_for_notifications();
+    requests.borrow_mut().push([Value::Bool(true)]);
+    ctx.scheduler().check_for_notifications();
+
+    let rows = view.drain();
+    assert_eq!(rows.len(), 1, "one view request serves one row");
+    let Value::Record(row) = &rows[0] else {
+        panic!("the sink carries a record row, got {:?}", rows[0]);
+    };
+    assert_eq!(row["qty"], Value::Int(2));
+    assert_eq!(row["price"], Value::Int(81_692));
+    assert_eq!(row["total"], Value::Int(163_384));
 }

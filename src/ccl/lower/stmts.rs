@@ -1186,7 +1186,7 @@ pub(super) fn lower_type_annotation(
 /// - The empty group `{}` — the unit type, `Unit`.
 /// - A function type `T => U` — a [`Type::Fun`] compute function
 ///   (`docs/chl-spec.md`, "6. Types (informal sketch)").
-pub(super) fn lower_type_expr(
+pub fn lower_type_expr(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
