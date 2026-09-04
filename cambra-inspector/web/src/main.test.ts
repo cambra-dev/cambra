@@ -123,6 +123,20 @@ describe("renderApp: degraded snapshot (failed compile)", () => {
     expect(root.querySelectorAll(".tree-root").length).toBe(0);
   });
 
+  it("marks the diagnostic's source span the moment the view mounts", () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+
+    renderApp(root, new Store(failed));
+
+    // No timer, no await: the squiggles are in the DOM as `renderApp` returns.
+    // A debounced re-lint would leave the mark absent here and dispatch into
+    // the view later, after the caller has dropped it.
+    const marks = root.querySelectorAll(".panel.source .cm-lintRange-error");
+    expect(marks.length).toBe(failed.diagnostics.length);
+    expect(marks[0].textContent).toBe(failed.source.text.slice(0, 7));
+  });
+
   it("gives both degraded panes a copy button", () => {
     const root = document.createElement("div");
     document.body.appendChild(root);

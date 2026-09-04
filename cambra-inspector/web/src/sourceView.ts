@@ -5,7 +5,7 @@
 //   - hover tooltips: hovered pos -> tightest IR node -> label/type(s)/provenance
 //     (anchored on the post-inference pane, which carries resolved types)
 //   - goto-definition: Ctrl/Cmd-click a use-site -> jump the selection to its def
-//   - diagnostic squiggles: the `lint` facet, driven by `diagnostics[]`
+//   - diagnostic squiggles: `diagnostics[]`, set on the view once at mount
 //   - selection highlight: a StateField that marks the resolved source spans,
 //     distinguishing the primary anchor span from transitively-linked spans
 //
@@ -23,7 +23,7 @@ import {
   lineNumbers,
   type Tooltip,
 } from "@codemirror/view";
-import { type Diagnostic as CMDiagnostic, linter } from "@codemirror/lint";
+import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lint";
 
 import type { Indices } from "./indices";
 import type { OffsetMap } from "./offsets";
@@ -130,24 +130,24 @@ export class SourceView {
       : undefined;
     const anchor = this.anchor;
 
-    // Diagnostic squiggles via the lint facet. A static source: we return the
-    // snapshot's diagnostics regardless of doc state (the doc never changes).
-    const diagnosticsLinter = linter(() => {
-      const out: CMDiagnostic[] = [];
-      for (const d of snapshot.diagnostics) {
-        if (!d.span) continue;
-        const from = offsets.byteToChar(d.span.start);
-        const to = offsets.byteToChar(d.span.end);
-        out.push({
-          from,
-          to: to > from ? to : from + 1,
-          severity: d.severity === "error" ? "error" : "warning",
-          message: d.message,
-          source: d.stage,
-        });
-      }
-      return out;
-    });
+    // Diagnostic squiggles. The snapshot's diagnostics are fixed and the
+    // document is read-only, so they are computed here and set on the view
+    // below. `linter()` is the usual route and does not fit a constant source:
+    // it re-lints on a 750 ms debounce, so the squiggles arrive that late and
+    // its timer dispatches into the view after the caller has dropped it.
+    const diagnostics: CMDiagnostic[] = [];
+    for (const d of snapshot.diagnostics) {
+      if (!d.span) continue;
+      const from = offsets.byteToChar(d.span.start);
+      const to = offsets.byteToChar(d.span.end);
+      diagnostics.push({
+        from,
+        to: to > from ? to : from + 1,
+        severity: d.severity === "error" ? "error" : "warning",
+        message: d.message,
+        source: d.stage,
+      });
+    }
 
     // Hover tooltip: hovered pos -> tightest node -> label / type set / prov,
     // over the post-inference pane.
@@ -244,12 +244,14 @@ export class SourceView {
         EditorView.editable.of(false),
         EditorView.lineWrapping,
         highlightField,
-        diagnosticsLinter,
         hover,
         interactions,
       ],
     });
     this.view = new EditorView({ state, parent });
+    // `setDiagnostics` installs the lint state field alongside the diagnostics,
+    // so this one synchronous dispatch is the whole squiggle mechanism.
+    this.view.dispatch(setDiagnostics(this.view.state, diagnostics));
 
     // Re-highlight the resolved source spans whenever the selection changes.
     store.subscribe((resolved) => this.renderSelection(resolved));
