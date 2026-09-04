@@ -223,6 +223,65 @@ pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_subs
     }
 }
 
+/// Run a host-channel program by spawning the `cambra` binary, feeding it JSON
+/// lines on stdin, and asserting that each substring appears in its stdout.
+///
+/// The channel-driven counterpart of [`expect_stdin_program`]. Such a program is
+/// driven by its host, and the binary is the host: an in-process test can push
+/// rows directly (see `tests/programs/asset_cart/mod.rs`), but only a subprocess
+/// exercises the declaration file, the JSON codec and the drive loop as a
+/// program on a path actually meets them.
+///
+/// `source_file` names the source within the program's directory, because a
+/// channel program may carry several versions beside one `channels.json`.
+pub fn expect_channel_program(
+    program_name: &str,
+    source_file: &str,
+    stdin_input: &str,
+    expected_substrings: &[&str],
+) {
+    let cambra = env!("CARGO_BIN_EXE_cambra");
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let program_path = format!("{manifest}/tests/programs/{program_name}/{source_file}");
+
+    let mut child = Command::new(cambra)
+        .arg(&program_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn cambra subprocess: {e}"));
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("subprocess has no stdin handle (Stdio::piped() should guarantee one)");
+        stdin
+            .write_all(stdin_input.as_bytes())
+            .expect("failed to write to subprocess stdin");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for cambra subprocess");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "cambra subprocess exited with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+
+    for expected in expected_substrings {
+        assert!(
+            stdout.contains(expected),
+            "expected stdout to contain {expected:?}\nfull stdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline + canonical-form rendering
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 | `interpreter/` | Dataflow runtime: the tile producer/consumer operators, tilings, the scheduler, and data sources/sinks. | [design-operators.md](interpreter/design-operators.md), [design-http-server.md](interpreter/design-http-server.md), [design-host-channels.md](interpreter/design-host-channels.md), [CLAUDE.md](interpreter/CLAUDE.md) |
 | `pretty_graph.rs`, `pretty_tree.rs` | Human-readable rendering of the operator graph and AST trees (debug / inspector output). | — |
 | `util.rs` | Cross-cutting helpers. | — |
+| `host_driver.rs` | The terminal host for a program that reads host channels: JSON rows in on stdin, JSON rows out on stdout. | [interpreter/design-host-channels.md](interpreter/design-host-channels.md) |
 | `main.rs`, `lib.rs` | CLI entry point and crate root (module declarations). | — |
 
 ## Operational semantics

@@ -7,6 +7,7 @@ use cambra::{
         provenance::NodeId,
     },
     control_port::{ControlPort, ControlReply, ControlRequest},
+    host_driver::{self, StdinLines},
     inspector_server::serve_compiled,
     interpreter::{
         Consumer, Scheduler,
@@ -103,10 +104,17 @@ fn run_program(
     let recorder = inspect_port.map(|_| Rc::new(RefCell::new(ValueRecorder::with_defaults())));
 
     let mut ctx = GlobalContext::default();
-    if let Err(e) = ctx.register_channels(channels) {
-        eprintln!("error: {e}");
-        return Err(());
-    }
+    let host_channels = match ctx.register_channels(channels) {
+        Ok(registered) => registered,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(());
+        }
+    };
+    // A program with declared channels is driven from stdin for the length of
+    // the run; one without never reads a line, so the reader thread is not
+    // started and `stdin()` keeps its own.
+    let mut input = (!channels.is_empty()).then(StdinLines::new);
     let mut live = {
         let _recording = recorder.clone().map(value_recorder::install);
         match LiveProgram::start(&mut ctx, code, &main_consumer) {
@@ -273,9 +281,27 @@ fn run_program(
     // completion.  Long-lived servers (e.g. http_serve) never signal, so this
     // loop runs until the process exits.
     if live.program().sinks().next().is_some() {
+        let mut out = std::io::stdout();
+        /// Ticks with no sink output after end of input before the run stops.
+        /// At the loop's 10 ms cadence this is a fifth of a second, which is
+        /// far more than the tick or two a reader lags its writer by.
+        const QUIET_TICKS: u32 = 20;
+        let mut quiet_ticks = 0u32;
+        let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         loop {
             if let Some(recorder) = recorder.as_ref() {
                 recorder.borrow_mut().set_tick(tick);
+            }
+            // One line per tick, not the whole backlog: a line is one host
+            // event, and a program's answer to it depends on what has already
+            // committed. Draining three lines into one tick commits them
+            // together, so a view request that follows a price in the input
+            // reads the value from before it.
+            if let Some(input) = input.as_mut() {
+                pending.extend(input.take());
+                if let Some(line) = pending.pop_front() {
+                    host_driver::push_line(&host_channels, &line);
+                }
             }
             ctx.scheduler().check_for_notifications();
             let sources = sample_sources(ctx.scheduler());
@@ -290,8 +316,31 @@ fn run_program(
                 &new_data,
                 recorder.as_ref(),
             );
+            let produced_this_tick = match host_driver::write_sink_rows(&host_channels, &mut out) {
+                Ok(produced) => produced,
+                Err(e) => {
+                    eprintln!("cambra: writing sink rows: {e}");
+                    break;
+                }
+            };
             if live.done().try_recv().is_ok() {
                 break;
+            }
+            // End of input ends the run for a channel-driven program, but not
+            // at once: the rows that arrived last still have to reach the sinks,
+            // and a reader fires a tick or more after the write it reads. So the
+            // loop drains until the program has been quiet for QUIET_TICKS
+            // rather than stopping the moment stdin closes. A program reading a
+            // socket has no end of input and keeps running.
+            if input.as_ref().is_some_and(StdinLines::is_closed) && pending.is_empty() {
+                if produced_this_tick {
+                    quiet_ticks = 0;
+                } else {
+                    quiet_ticks += 1;
+                    if quiet_ticks >= QUIET_TICKS {
+                        break;
+                    }
+                }
             }
             // TODO we shouldn't need to sleep here; we should come up with a better interface
             // for check_for_notifications
