@@ -189,10 +189,12 @@ expand/collapse in a tree, and come back blank (the views react to selection
     **post-inference** pane (the one carrying resolved types).
   - **goto-definition** on **Ctrl/Cmd-click** a use-site (or the hover-tooltip
     link): selects the def-site as a source selection so every pane follows.
-  - **diagnostic squiggles** via the `@codemirror/lint` `linter` facet — gutter
-    markers + hover messages mapped from `diagnostics[]`. **These render in the
-    degraded snapshot too** (no panes but diagnostics present), so a type-error
-    program still underlines its error.
+  - **diagnostic squiggles** — gutter markers + hover messages mapped from
+    `diagnostics[]`, set on the view with `@codemirror/lint`'s `setDiagnostics`
+    as it mounts. The document is read-only and the diagnostics are fixed, so
+    nothing re-lints. **These render in the degraded snapshot too** (no panes
+    but diagnostics present), so a type-error program still underlines its
+    error.
   - **selection highlight**: a `StateField<DecorationSet>` marking the resolved
     source spans — the **primary** anchor span strongly, transitively-**linked**
     spans lightly.
