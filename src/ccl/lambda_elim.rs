@@ -552,7 +552,12 @@ fn build_scrutinee_case_cform(
         )))
         .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
+        // `elim_lambda` abstracts the binder and leaves the walk to its caller.
+        // An arm not mentioning its payload binder takes a `const` rule, which
+        // lifts the body whole, and operator conversion refuses a `BinOp` or a
+        // nested `Lambda` inside a lifted value.
         let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
+        let arm_fn = elim_lambdas(ctx, arm_fn)?;
         arms.push(arm_compose(
             vec![scrut_stream.clone(), vp, arm_fn],
             driver_dom.clone(),
@@ -968,12 +973,8 @@ fn elim_lambda_impl(
             // `param` occurs only in the refinement (the group-by shape): the value
             // is closed, so it lifts under `const` and the dependence rides the
             // refinement, materialized as a `Restrict` at the iteration boundary.
-            let inner_pf = elim_lambdas(ctx, *value)?;
-            let cast_val = Expr::new(TypedExprNode::Cast {
-                value: Box::new(inner_pf),
-                target,
-            })
-            .with_ty(body_ty.clone());
+            let cast_val =
+                Expr::new(TypedExprNode::Cast { value, target }).with_ty(body_ty.clone());
             let const_fn = Expr::builtin(Builtin::Const)
                 .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
             return Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi));
