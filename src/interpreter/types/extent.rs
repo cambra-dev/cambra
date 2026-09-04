@@ -250,7 +250,14 @@ impl Restriction {
 ///
 /// Receives a full [`Tile`] so the implementation can apply its own
 /// domain/codomain extraction and deduplication logic.
-pub trait DataSink: Send + Sync {
+///
+/// No `Send`/`Sync` bound: the runtime is single-threaded, and every sink is
+/// driven from the thread that owns the operator graph. The HTTP sink hands
+/// work to a dispatcher thread and carries its own `Mutex` to do so, which is a
+/// property of that sink rather than of the trait — requiring it of every
+/// implementation would put a lock inside sinks that never leave one thread,
+/// and would rule out a host sink on a platform with no threads at all.
+pub trait DataSink {
     /// Dispatch any not-yet-sent responses contained in `tile`.
     fn process(&self, tile: &Tile);
 }

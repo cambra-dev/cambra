@@ -283,7 +283,7 @@ pub enum Endpoints {
 /// it serves.
 #[derive(Clone)]
 pub struct LoweredRoute {
-    pub(super) sink: Arc<dyn DataSink>,
+    pub(super) sink: Rc<dyn DataSink>,
     pub(super) port: u16,
     pub(super) method: String,
     pub(super) path: String,
@@ -318,7 +318,18 @@ pub struct LoweringContext {
     ///
     /// `pub(super)` so the statement submodule can inspect it when deciding
     /// whether to wrap the program tail in the sink-binding `Record`.
-    pub(super) sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+    pub(super) sink_bindings: HashMap<String, Rc<dyn DataSink>>,
+
+    /// Names of sinks the host declared before lowering, in declaration order.
+    ///
+    /// A sink discovered during lowering brings its own binding: `http_serve`
+    /// emits `let responses = Defer in …` and registers the sink under that
+    /// name. A host-declared sink has no statement to hang a binding on, so
+    /// lowering wraps the whole program in one `Defer` binding per name —
+    /// making `cart_view << …` a feed to a bound channel exactly as a response
+    /// feed is. Kept as an ordered list because the wrap order is part of the
+    /// tree and a `HashMap` would vary it per run.
+    pub(super) host_sinks: Vec<String>,
 
     /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
     /// that use the same port.  Created lazily on the first `http_serve` for a port
@@ -543,8 +554,24 @@ impl LoweringContext {
     /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
     /// binding name so that the scheduler can subscribe an
     /// `HttpServerSinkConsumer` to it after operator conversion.
-    pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
+    pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Rc<dyn DataSink>) {
         self.sink_bindings.insert(name.into(), sink);
+    }
+
+    /// Declare a host sink named `name`, so the program may feed it.
+    ///
+    /// Unlike [`register_sink_binding`](Self::register_sink_binding), which
+    /// records a sink for a binding lowering is about to emit, this also asks
+    /// lowering to emit the binding: the name becomes a `Defer` channel wrapped
+    /// around the whole program.
+    ///
+    /// Re-declaring a name replaces the sink bound to it.
+    pub fn declare_host_sink(&mut self, name: impl Into<String>, sink: Rc<dyn DataSink>) {
+        let name = name.into();
+        if !self.host_sinks.contains(&name) {
+            self.host_sinks.push(name.clone());
+        }
+        self.sink_bindings.insert(name, sink);
     }
 
     /// Drain all sink bindings accumulated for this compilation.
@@ -553,7 +580,7 @@ impl LoweringContext {
     /// (e.g. from `http_serve`).  Call after `lower_stmts` returns and pass
     /// each entry to [`GlobalContext`](crate::ccl::context::GlobalContext) so
     /// it can extract the corresponding expressions and subscribe them.
-    pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
+    pub fn take_sink_bindings(&mut self) -> HashMap<String, Rc<dyn DataSink>> {
         std::mem::take(&mut self.sink_bindings)
     }
 

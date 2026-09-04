@@ -4,8 +4,7 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::chl_parser;
 use crate::chl_parser::parser::ParseError;
@@ -31,7 +30,7 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, HostSink, Scheduler, StdinDataSource,
         http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
@@ -395,6 +394,11 @@ pub struct SourceSinkRegistry {
     http_routes: HashMap<String, HttpRoute>,
     /// One listener per bound TCP port.
     shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+    /// Every sink a host declared, by the name the program feeds. Held here
+    /// rather than only in the lowering context because a compile seeds a fresh
+    /// one: a declaration the host made once has to reach every version, the
+    /// way a registered source does.
+    host_sinks: HashMap<String, Rc<dyn DataSink>>,
 }
 
 impl SourceSinkRegistry {
@@ -518,6 +522,9 @@ impl SourceSinkRegistry {
                 .map(|(n, r)| (n.clone(), r.route.clone())),
             self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
         );
+        for (name, sink) in &self.host_sinks {
+            lowering.declare_host_sink(name.clone(), sink.clone());
+        }
         lowering
     }
 
@@ -724,6 +731,20 @@ impl GlobalContext {
         let name = source.borrow().get_id().to_string();
         self.lowering.register_source(name.clone(), source.clone());
         self.sources_and_sinks.sources.insert(name, source);
+    }
+
+    /// Pre-declare a host sink so the program may feed it by name.
+    ///
+    /// The counterpart of [`register_source`](Self::register_source) for the
+    /// egress direction: lowering binds the name to a deferred channel wrapped
+    /// around the whole program, and every tile fed to it reaches `sink`.
+    ///
+    /// A declared sink the program never feeds is rejected at lowering, as any
+    /// unfed sink is — a channel nothing writes has no operator to subscribe.
+    pub fn declare_host_sink(&mut self, sink: Rc<HostSink>) {
+        let name = sink.name().to_string();
+        self.lowering.declare_host_sink(name.clone(), sink.clone());
+        self.sources_and_sinks.host_sinks.insert(name, sink);
     }
 }
 
@@ -1562,7 +1583,7 @@ struct Frontend {
     panes: BTreeMap<Phase, Expr>,
     /// Sink bindings discovered during lowering. Drained before the sources,
     /// which is the order [`LoweringContext`] requires.
-    sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+    sink_bindings: HashMap<String, Rc<dyn DataSink>>,
     /// Every lowered node's `SourceAttribution`, the base every later fold
     /// bottoms out in and the source release `InferError` diagnostics resolve
     /// against one-hop.

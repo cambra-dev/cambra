@@ -23,6 +23,8 @@ use log::debug;
 use smol_str::SmolStr;
 use tiny_http::{Header, Response, Server};
 
+use std::rc::Rc;
+
 use crate::ccl::Type;
 use crate::interpreter::{
     BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent, Value,
@@ -415,13 +417,23 @@ fn respond_not_found(request: tiny_http::Request) {
     }
 }
 
-impl DataSink for HttpServerSharedState {
+/// A route's response sink: a single-threaded handle over the server state the
+/// dispatcher thread shares.
+struct ResponseSink(Arc<HttpServerSharedState>);
+
+impl DataSink for ResponseSink {
+    fn process(&self, tile: &Tile) {
+        self.0.dispatch(tile);
+    }
+}
+
+impl HttpServerSharedState {
     /// Dispatch HTTP responses for all live `(UInt index, String body)` entries in `tile`.
     ///
     /// Collects `(request, body)` pairs from the pending map while holding the
     /// lock, then releases the lock and sends each response outside of it so that
     /// HTTP I/O does not block other threads waiting on the pending map.
-    fn process(&self, tile: &Tile) {
+    fn dispatch(&self, tile: &Tile) {
         let Tile::SealedFunction {
             domain,
             codomain,
@@ -516,8 +528,13 @@ impl HttpServerDataSource {
     }
 
     /// Return the [`DataSink`] that dispatches HTTP responses for this source.
-    pub fn sink(&self) -> Arc<dyn DataSink> {
-        self.shared.clone()
+    ///
+    /// The handle is single-threaded, like every sink handle; the state behind
+    /// it is the `Arc` the dispatcher thread also holds. The two are separate
+    /// because only this sink shares anything across a thread — see
+    /// [`DataSink`] on why the trait carries no `Send`/`Sync` bound.
+    pub fn sink(&self) -> Rc<dyn DataSink> {
+        Rc::new(ResponseSink(self.shared.clone()))
     }
 
     /// Accept a new request: store its body in the buffer and its handle in shared state.

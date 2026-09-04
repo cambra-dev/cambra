@@ -98,6 +98,30 @@ pub(super) fn lower_stmts_recovering(
             }
         });
 
+    // A host-declared sink has no statement of its own, so its channel is bound
+    // here: `let <name> = Defer in <program>`, outermost, so the name is in
+    // scope for every feed in the program. Reversed because each wrap becomes
+    // the new outermost binding, and the declaration order is what the host
+    // sees.
+    let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
+    let body = ctx
+        .host_sinks
+        .clone()
+        .into_iter()
+        .rev()
+        .fold(body, |acc, name| {
+            let channel = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Defer),
+                program_span,
+                "lower.host_sink",
+            );
+            ctx.tag_machinery(
+                Expr::let_bind(name, channel, acc),
+                program_span,
+                "lower.host_sink",
+            )
+        });
+
     if ctx.sink_bindings.is_empty() {
         return Some(body);
     }
@@ -106,7 +130,6 @@ pub(super) fn lower_stmts_recovering(
     // determinism — HashMap iteration is unordered). The node, its output `Var`s,
     // and the tail `ExprStmt` are program-owned plumbing with no owning
     // statement; they carry the whole-program span.
-    let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
     let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
     sink_names.sort();
     let outs = sink_names
@@ -563,12 +586,12 @@ pub(super) fn lower_middle_stmt(
             // off. A route it does not hold is opened, whether this is the
             // program's first version or a replacement — a version that adds an
             // endpoint serves it as soon as the swap completes.
-            let sink: Arc<dyn DataSink> = match ctx.http_routes.get(&source_name) {
+            let sink: Rc<dyn DataSink> = match ctx.http_routes.get(&source_name) {
                 Some(existing) => existing.sink.clone(),
                 None if ctx.endpoints == Endpoints::Inherited => {
                     let source_obj = Rc::new(RefCell::new(UnopenedRoute::new(source_name.clone())));
                     ctx.sources.insert(source_name.clone(), source_obj);
-                    Arc::new(UnopenedRouteSink)
+                    Rc::new(UnopenedRouteSink)
                 }
                 None => {
                     // Share one tiny_http::Server per port across all http_serve routes.
@@ -590,7 +613,7 @@ pub(super) fn lower_middle_stmt(
                         path.clone(),
                         source_name.clone(),
                     )));
-                    let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
+                    let sink: Rc<dyn DataSink> = source_obj.borrow().sink();
                     ctx.sources.insert(source_name.clone(), source_obj);
                     ctx.http_routes.insert(
                         source_name.clone(),

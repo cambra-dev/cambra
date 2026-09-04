@@ -82,7 +82,7 @@ pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
     /// The sink that dispatches responses.
-    sink: Arc<dyn DataSink>,
+    sink: Rc<dyn DataSink>,
     /// Fired once when this sink receives a terminal tile.  `None` after it fires.
     done: Option<DoneNotifier>,
 }
@@ -95,7 +95,7 @@ impl SinkConsumer {
     /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] and then
     /// notifies once, which is the only way this consumer sees the notifications
     /// `subscribe` itself raised.
-    pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
+    pub fn new(sink: Rc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
         (
             Self {

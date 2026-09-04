@@ -12,8 +12,8 @@ use std::rc::Rc;
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, FunctionGuard, HostSource, Tile, TileGuard, Value,
-    tile_operators::TileProducer,
+    BaseType, ColumnValue, Consumer, Extent, FunctionGuard, HostSink, HostSource, Tile, TileGuard,
+    Value, tile_operators::TileProducer,
 };
 use indoc::indoc;
 
@@ -211,5 +211,95 @@ fn a_host_source_window_holds_what_has_not_been_released() {
     assert!(
         window(&mut ctx).is_empty(),
         "a row every producer has released leaves the window"
+    );
+}
+
+/// A program feeding a host sink, driven the way a host drives it: push rows,
+/// let the scheduler settle, drain what arrived.
+///
+/// The sink carries the value the program computed, as a value. Nothing is
+/// rendered to a string on the way out, which is what separates a host channel
+/// from an HTTP response — and why the demo program needs no `str` builtin.
+#[test]
+fn a_host_sink_carries_the_rows_the_program_fed_it() {
+    let code = indoc! {r#"
+        btc_updates = [u for u in price_updates() if u.ticker == "BTC-USD"]
+        btc_px: Mut(Int, Txn) := 0
+        for u in btc_updates:
+            with begin():
+                btc_px := u.price
+        for req in view_requests():
+            with begin():
+                cart_view << btc_px * 2
+    "#};
+
+    let (row_type, row_extent) = price_row_type();
+    let updates = Rc::new(RefCell::new(HostSource::new(
+        "price_updates",
+        row_type,
+        row_extent,
+    )));
+    let requests = Rc::new(RefCell::new(HostSource::new(
+        "view_requests",
+        Type::Base(BaseType::Bool),
+        Extent::Base(BaseType::Bool),
+    )));
+    let view = Rc::new(HostSink::new("cart_view"));
+
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(updates.clone());
+    ctx.register_source(requests.clone());
+    ctx.declare_host_sink(view.clone());
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let _compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+
+    let mut served = Vec::new();
+    for price in [100i64, 300, 700] {
+        updates.borrow_mut().push([price_row("BTC-USD", price)]);
+        ctx.scheduler().check_for_notifications();
+        requests.borrow_mut().push([Value::Bool(true)]);
+        ctx.scheduler().check_for_notifications();
+        served.extend(view.drain());
+    }
+
+    assert_eq!(
+        served,
+        vec![Value::Int(200), Value::Int(600), Value::Int(1400)]
+    );
+}
+
+/// A sink the host declares and the program never feeds is rejected, as any
+/// unfed sink is.
+#[test]
+fn a_declared_sink_the_program_never_feeds_is_rejected() {
+    let code = "[u.price for u in price_updates()]";
+    let (row_type, row_extent) = price_row_type();
+    let updates = Rc::new(RefCell::new(HostSource::new(
+        "price_updates",
+        row_type,
+        row_extent,
+    )));
+
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(updates);
+    ctx.declare_host_sink(Rc::new(HostSink::new("cart_view")));
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compile_program(&mut ctx, code, consumer).map(|_| ())
+    }));
+    let message = match outcome {
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default(),
+        Ok(Ok(())) => panic!("a declared sink with no feed compiled"),
+        Ok(Err(errors)) => format!("{errors:?}"),
+    };
+    assert!(
+        message.contains("cart_view"),
+        "the rejection names the unfed sink; got: {message}"
     );
 }
