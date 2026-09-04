@@ -388,3 +388,42 @@ fn a_program_wires_to_channels_the_host_declared() {
     assert_eq!(row["price"], Value::Int(81_692));
     assert_eq!(row["total"], Value::Int(163_384));
 }
+
+/// Every source a program reads reports a window, so the inspector's live frame
+/// can show the stream moving.
+///
+/// A source that answers `None` is saying it has no addressable window at all,
+/// which is a different claim from an empty one — and the claim the frame
+/// renders as no window rather than an empty one.
+#[test]
+fn every_source_kind_a_program_reads_reports_a_window() {
+    use cambra::interpreter::{DataSourceDomainExtentImpl, HttpServerDataSource, StdinDataSource};
+
+    let host = HostSource::new(
+        "ticks",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    );
+    assert!(
+        host.retained_keys().is_some(),
+        "a host source holds its rows for the reader"
+    );
+    assert!(
+        StdinDataSource::new().retained_keys().is_some(),
+        "a stdin source holds its lines for the reader"
+    );
+
+    let port = cambra::interpreter::http_server::reserve_test_port();
+    let server = cambra::interpreter::http_server::SharedHttpServer::new(port)
+        .expect("a reserved port binds");
+    let route = HttpServerDataSource::new(
+        &server,
+        "GET".to_string(),
+        "/cart".to_string(),
+        "requests".to_string(),
+    );
+    assert!(
+        route.retained_keys().is_some(),
+        "an HTTP route holds its in-flight requests for the reader"
+    );
+}

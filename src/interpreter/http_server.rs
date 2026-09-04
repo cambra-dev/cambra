@@ -436,6 +436,16 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         }
     }
 
+    /// The requests still in flight, which is what the inspector renders as the
+    /// route's live tail.
+    ///
+    /// The buffer has always been able to answer this; not delegating to it left
+    /// `--inspect` on an HTTP program reporting no window at all, which reads as
+    /// "this source holds nothing" rather than "nobody asked it".
+    fn retained_keys(&self) -> Option<ColumnValue> {
+        Some(self.buf.retained_keys())
+    }
+
     fn output_value_extent(&self) -> Extent {
         Extent::Base(BaseType::String)
     }
