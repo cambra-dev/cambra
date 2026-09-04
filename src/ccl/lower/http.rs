@@ -2,11 +2,13 @@
 //! `requests, responses = http_serve(port, method, path)` shape and extracting
 //! its tuple targets and string-literal arguments.
 //!
-//! The actual wiring (creating the [`HttpServerDataSource`], registering the
+//! The actual wiring (creating the HTTP data source, registering the
 //! sink, and emitting the `Source`/`Defer` `Let` pair) lives inline in
 //! [`lower_middle_stmt`](super::lower_middle_stmt); these helpers only classify
 //! and destructure the statement.
 
+// `LoweringError`, for the extractors below. Only the socket build has them.
+#[cfg(not(target_arch = "wasm32"))]
 use super::*;
 use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Lit as ChlLit, Spanned};
 
@@ -38,6 +40,10 @@ pub(super) fn is_http_serve_tuple_assign(
 }
 
 /// Extract `(requests_var, responses_var)` from a 2-element name tuple target.
+///
+/// Only the socket build reaches this: lowering rejects `http_serve` outright
+/// where there are no sockets, before it looks at the target.
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn extract_http_serve_names(
     target: &Spanned<AssignTarget>,
 ) -> Result<(String, String), LoweringError> {
@@ -58,6 +64,9 @@ pub(super) fn extract_http_serve_names(
 }
 
 /// Extract `(port, method, path)` string literals from the `http_serve(...)` call.
+///
+/// Socket builds only, for the reason on [`extract_http_serve_names`].
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn extract_http_serve_args(
     value: &Spanned<ChlExpr>,
 ) -> Result<(String, String, String), LoweringError> {

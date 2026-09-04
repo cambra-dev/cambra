@@ -27,39 +27,8 @@ pub mod live;
 mod serve;
 pub mod wire_check;
 
+pub use crate::inspector_model::{snapshot_json, snapshot_json_pretty};
 pub use serve::{serve, serve_compiled, snapshot_body_pretty};
-
-use crate::ccl::context::CompiledProgram;
-use crate::inspector_model::InspectedProgram;
-
-/// Build the `/api/snapshot` payload for a compiled program and serialize it to
-/// a JSON string.
-///
-/// This is the build-then-serialize entry [`serve`] calls per
-/// request. `name` becomes the payload's `source.name` (the program's display
-/// name). Serialization is infallible for this payload (it is plain data — no
-/// maps with non-string keys, no custom errors), so a failure is a bug; we
-/// surface it via `expect` rather than leaking a `serde_json::Error` into the
-/// signature the server wants.
-pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
-    let inspected = InspectedProgram::new(compiled);
-    let payload = inspected.build_payload(name);
-    serde_json::to_string(&payload).expect("snapshot payload serializes")
-}
-
-/// Pretty-printed [`snapshot_json`] — the byte format of the committed golden
-/// fixtures (`web/src/__fixtures__/`).
-///
-/// The binary owns these bytes deliberately: the fixtures are byte-compared by
-/// `ci.sh`'s `ci_fixtures` gate, so their formatter must be pinned by
-/// Cargo.lock, not an external tool. Piping through `python3 -m json.tool` made
-/// the corpus a function of the local Python version, and of `FORCE_COLOR` —
-/// either silently rewrites every fixture and the gate reads it as drift.
-pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str) -> String {
-    let inspected = InspectedProgram::new(compiled);
-    let payload = inspected.build_payload(name);
-    serde_json::to_string_pretty(&payload).expect("snapshot payload serializes")
-}
 
 #[cfg(test)]
 mod tests {

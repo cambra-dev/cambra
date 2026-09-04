@@ -14,6 +14,7 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 | `interpreter/` | Dataflow runtime: the tile producer/consumer operators, tilings, the scheduler, and data sources/sinks. | [design-operators.md](interpreter/design-operators.md), [design-http-server.md](interpreter/design-http-server.md), [design-host-channels.md](interpreter/design-host-channels.md), [CLAUDE.md](interpreter/CLAUDE.md) |
 | `pretty_graph.rs`, `pretty_tree.rs` | Human-readable rendering of the operator graph and AST trees (debug / inspector output). | — |
 | `util.rs` | Cross-cutting helpers. | — |
+| `wasm_api.rs` | The WebAssembly host's view of a program: a `wasm-bindgen` wrapper over `embed::Host` that converts rows to and from JSON. | [interpreter/design-host-channels.md](interpreter/design-host-channels.md) |
 | `embed.rs` | The embedding API: compile a program against declared channels, push rows, tick, read sinks, render a live frame. No clock of its own. | [interpreter/design-host-channels.md](interpreter/design-host-channels.md) |
 | `host_driver.rs` | The terminal host for a program that reads host channels: JSON rows in on stdin, JSON rows out on stdout. | [interpreter/design-host-channels.md](interpreter/design-host-channels.md) |
 | `main.rs`, `lib.rs` | CLI entry point and crate root (module declarations). | — |

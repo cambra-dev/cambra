@@ -73,11 +73,15 @@
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
 //! - [`http`] — `http_serve` recognition predicates.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::interpreter::http_server::SharedHttpServer;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
-    sync::Arc,
 };
 
 use crate::{
@@ -89,10 +93,7 @@ use crate::{
         Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
         VariantPayload as ChlVariantPayload,
     },
-    interpreter::{
-        DataSink, DataSourceDomainExtentImpl,
-        http_server::{SharedHttpServer, UnopenedRoute, UnopenedRouteSink},
-    },
+    interpreter::{DataSink, DataSourceDomainExtentImpl},
 };
 
 mod comprehension;
@@ -284,6 +285,9 @@ pub enum Endpoints {
 /// One `http_serve` route as lowering knows it: its reply sink and the address
 /// it serves.
 #[derive(Clone)]
+// A wasm build carries the type through `adopt_sources_and_sinks`' signature but
+// opens no route, so nothing reads these there.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct LoweredRoute {
     pub(super) sink: Rc<dyn DataSink>,
     pub(super) port: u16,
@@ -340,6 +344,7 @@ pub struct LoweringContext {
     ///
     /// `pub(super)` so the statement submodule's `http_serve` wiring can create
     /// and reuse the per-port server.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
 
     /// Every `http_serve` route this context knows: those seeded from the
@@ -514,8 +519,19 @@ impl LoweringContext {
     /// until the next pass replaced this context, which is a compilation later
     /// than the pass that stopped serving it. Lowering is finished by the time
     /// this is called, so nothing looks a port up afterwards.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_servers(&mut self) -> impl Iterator<Item = (u16, Arc<SharedHttpServer>)> + use<> {
         std::mem::take(&mut self.shared_servers).into_iter()
+    }
+
+    /// Seed this context with the listeners a program already holds.
+    ///
+    /// Separate from [`adopt_sources_and_sinks`](Self::adopt_sources_and_sinks)
+    /// because a listener is a socket: a wasm build has none to carry, and the
+    /// field itself is not compiled there.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn adopt_servers(&mut self, servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>) {
+        self.shared_servers.extend(servers);
     }
 
     /// Answer against the endpoints this context already holds, opening none.
@@ -532,11 +548,9 @@ impl LoweringContext {
         &mut self,
         sources: impl IntoIterator<Item = (String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>)>,
         routes: impl IntoIterator<Item = (String, LoweredRoute)>,
-        servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>,
     ) {
         self.sources.extend(sources);
         self.http_routes.extend(routes);
-        self.shared_servers.extend(servers);
     }
 
     /// Drain all sources accumulated for this compilation.

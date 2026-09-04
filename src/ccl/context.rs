@@ -4,7 +4,14 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::ccl::lower::LoweredRoute;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::interpreter::http_server::SharedHttpServer;
 
 use crate::chl_parser;
 use crate::chl_parser::parser::ParseError;
@@ -18,7 +25,7 @@ use crate::{
             check_pre_channelize, infer, typecheck,
         },
         inline, lambda_elim,
-        lower::{LoweredRoute, LoweringContext, LoweringError, lower_stmts},
+        lower::{LoweringContext, LoweringError, lower_stmts},
         mut_elim,
         panes::gate_leaks,
         planning,
@@ -31,7 +38,6 @@ use crate::{
     },
     interpreter::{
         Consumer, DataSink, DataSourceDomainExtentImpl, HostSink, Scheduler, StdinDataSource,
-        http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
@@ -370,6 +376,7 @@ pub use crate::interpreter::operator_conversion::{ReuseTally, StateConflict, Unr
 
 /// One open `http_serve` route: what lowering binds it by, plus the listener
 /// needed to stop serving it.
+#[cfg(not(target_arch = "wasm32"))]
 struct HttpRoute {
     route: LoweredRoute,
     server: Arc<SharedHttpServer>,
@@ -391,8 +398,10 @@ pub struct SourceSinkRegistry {
     /// Every open `http_serve` route, by the route's source name. Keyed by route
     /// rather than by response-binding name, which a new version may spell
     /// differently.
+    #[cfg(not(target_arch = "wasm32"))]
     http_routes: HashMap<String, HttpRoute>,
     /// One listener per bound TCP port.
+    #[cfg(not(target_arch = "wasm32"))]
     shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
     /// Every sink a host declared, by the name the program feeds. Held here
     /// rather than only in the lowering context because a compile seeds a fresh
@@ -414,7 +423,9 @@ impl SourceSinkRegistry {
                 .registered_sources()
                 .map(|(n, s)| (n.to_string(), s.clone())),
         );
+        #[cfg(not(target_arch = "wasm32"))]
         self.shared_servers.extend(lowering.take_servers());
+        #[cfg(not(target_arch = "wasm32"))]
         for (name, route) in lowering.registered_routes() {
             // A route is only ever registered alongside the listener it was
             // opened on, and `take_servers` above has just moved every listener
@@ -452,6 +463,7 @@ impl SourceSinkRegistry {
     /// version's operators reach it through the inheritance they are offered to
     /// the next compilation in
     /// ([`DataSourceDomainExtentImpl::answer_in_flight`](crate::interpreter::DataSourceDomainExtentImpl::answer_in_flight)).
+    #[cfg(not(target_arch = "wasm32"))]
     fn retire_routes_absent_from(
         &mut self,
         still_bound: &HashSet<String>,
@@ -498,6 +510,7 @@ impl SourceSinkRegistry {
     /// Public for the caller of [`compile_to_opening`](Self::compile_to_opening)
     /// whose version is then refused: the ports that compile took are ones no
     /// route binds.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn release_unrouted_ports(&mut self) {
         let routed: HashSet<u16> = self.http_routes.values().map(|r| r.route.port).collect();
         self.shared_servers.retain(|port, _| {
@@ -509,6 +522,24 @@ impl SourceSinkRegistry {
         });
     }
 
+    /// No routes exist on a target with no sockets, so a version that stops
+    /// naming one retires nothing. Present rather than gated at the call site so
+    /// that `live_program.rs` — where a reload's order is written down — reads
+    /// the same on both targets.
+    #[cfg(target_arch = "wasm32")]
+    fn retire_routes_absent_from(
+        &mut self,
+        _still_bound: &HashSet<String>,
+        _scheduler: &mut Scheduler,
+    ) {
+    }
+
+    /// No listeners exist on a target with no sockets. See
+    /// [`retire_routes_absent_from`](Self::retire_routes_absent_from) for why
+    /// this is a no-op rather than an absence.
+    #[cfg(target_arch = "wasm32")]
+    pub fn release_unrouted_ports(&mut self) {}
+
     /// A [`LoweringContext`] holding everything this registry does.
     ///
     /// Every compilation starts from one of these, so a `http_serve` naming a
@@ -517,11 +548,22 @@ impl SourceSinkRegistry {
         let mut lowering = LoweringContext::default();
         lowering.adopt_sources_and_sinks(
             self.sources.iter().map(|(n, s)| (n.clone(), s.clone())),
-            self.http_routes
-                .iter()
-                .map(|(n, r)| (n.clone(), r.route.clone())),
-            self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.http_routes
+                        .iter()
+                        .map(|(n, r)| (n.clone(), r.route.clone()))
+                        .collect::<Vec<_>>()
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Vec::new()
+                }
+            },
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        lowering.adopt_servers(self.shared_servers.iter().map(|(p, s)| (*p, s.clone())));
         for (name, sink) in &self.host_sinks {
             lowering.declare_host_sink(name.clone(), sink.clone());
         }
@@ -571,6 +613,7 @@ impl SourceSinkRegistry {
         // succeeded, so a half-lowered pass leaves no listener owned by a context
         // about to be dropped — dropping one closes its socket asynchronously,
         // and the compile that installs the version would then race to rebind it.
+        #[cfg(not(target_arch = "wasm32"))]
         self.shared_servers.extend(std::mem::take(
             &mut scratch.sources_and_sinks.shared_servers,
         ));

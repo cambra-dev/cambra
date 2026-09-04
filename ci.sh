@@ -178,6 +178,20 @@ ci_fixtures() {
     exit "${drifted}"
   )
 }
+# The WebAssembly build: type-check the library for a target with no sockets and
+# no threads. A check rather than a build — the module itself is produced by
+# `wasm-bindgen`, which is not a dependency of this repo — so what it gates is
+# that nothing has re-entered the wasm build through an unguarded `use`.
+#
+# Skipped (not failed) when the target is not installed, so the Rust-only local
+# path still works; install it with `rustup target add wasm32-unknown-unknown`.
+ci_wasm() {
+  if ! rustup target list --installed 2> /dev/null | grep -qx wasm32-unknown-unknown; then
+    echo "ci_wasm: wasm32-unknown-unknown not installed; skipping" >&2
+    return 0
+  fi
+  cargo check -p cambra --target wasm32-unknown-unknown --lib
+}
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
 # Validate intra-repo doc references so they can't silently rot: Markdown
 # links/anchors (doc -> doc) and `<name>.md` citations in Rust comments
@@ -306,6 +320,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_web || failed="${failed} web"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_wasm || failed="${failed} wasm"
   if [[ -n "${failed}" ]]; then
     echo "ci.sh FAILED:${failed}" >&2
     exit 1
