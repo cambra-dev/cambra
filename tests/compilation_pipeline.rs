@@ -32,6 +32,8 @@ mod conditionals;
 mod feeds_cases;
 #[path = "compilation_pipeline/generators_udf_poly.rs"]
 mod generators_udf_poly;
+#[path = "compilation_pipeline/host_channels.rs"]
+mod host_channels;
 #[path = "compilation_pipeline/joins_aggregates_groupby.rs"]
 mod joins_aggregates_groupby;
 #[path = "compilation_pipeline/misc.rs"]
