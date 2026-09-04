@@ -176,12 +176,13 @@ describe("describePanes", () => {
     const roster = describePanes(store);
     expect(roster[roster.length - 1].id).toBe(operatorPanes[0].id);
 
-    // The descriptor mounts a real view, not an empty body. Which nodes that
-    // view draws is `operatorView.dom.test.ts`'.
+    // The descriptor mounts a real view, not an empty body. What that view draws
+    // is `operatorView.dom.test.ts`'s to assert, against a layout it controls;
+    // the roster's own claim is that the mount happened and put a graph there.
     const body = document.createElement("div");
     document.body.appendChild(body);
     roster[roster.length - 1].mount(body);
-    expect(body.querySelector(".tree-root")).not.toBeNull();
+    expect(body.querySelectorAll(".graph-canvas").length).toBe(1);
   });
 
   it("badges the holes pane and the operator pane", () => {

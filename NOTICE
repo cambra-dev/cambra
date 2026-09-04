@@ -1,2 +1,16 @@
 Cambra
 Copyright 2026 Cambra, Inc.
+
+This product includes third-party software.
+
+elkjs
+Copyright (c) 2017 Kiel University and others
+Licensed under the Eclipse Public License 2.0, with a secondary licence under
+the GNU General Public License 3.0 or later.
+  Licence: https://www.eclipse.org/legal/epl-2.0/
+  Source:  https://github.com/kieler/elkjs
+
+elkjs is the layered layout the inspector's operator pane draws with. It is
+distributed in object form inside web/dist/index.html, which is committed in
+this repository and embedded in the cambra binary, and that file carries this
+notice as its leading comment.
