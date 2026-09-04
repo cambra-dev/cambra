@@ -3677,3 +3677,132 @@ fn guarded_induction_write_in_a_match_arm_is_rejected() {
         "is written under an `if` or a `match` arm inside",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cost of a live multi-store read
+// ---------------------------------------------------------------------------
+
+/// A program with `stores` transactional slots, each written from its own
+/// filtered stream, and one read-only block reading the first `read` of them.
+///
+/// Only the reader's width changes across a run at fixed `stores`, so the
+/// writers, the filters and the source are held constant and the measurement
+/// attributes to the read alone.
+fn multi_store_program(stores: usize, read: usize) -> String {
+    let mut program = String::new();
+    for i in 0..stores {
+        program.push_str(&format!(
+            "u{i} = [u for u in ticks() if u.ticker == \"T{i}\"]\n"
+        ));
+    }
+    for i in 0..stores {
+        program.push_str(&format!("px{i}: Mut(Int, Txn) := 0\n"));
+    }
+    for i in 0..stores {
+        program.push_str(&format!(
+            "for u in u{i}:\n    with begin():\n        px{i} := u.price\n"
+        ));
+    }
+    let fields: Vec<String> = (0..read).map(|i| format!("f{i}=px{i}")).collect();
+    program.push_str(&format!(
+        "for req in view_requests():\n    with begin():\n        view << ({})\n",
+        fields.join(", ")
+    ));
+    program
+}
+
+/// Push `rows` price rows through `multi_store_program`, one at a time, and
+/// return the wall time.
+fn time_multi_store_read(stores: usize, read: usize, rows: usize) -> std::time::Duration {
+    use cambra::ccl::channels::ChannelDecl;
+    use cambra::interpreter::Value;
+
+    let sink_type = format!(
+        "{{{}}}",
+        (0..read)
+            .map(|i| format!("f{i}: Int"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let decls = [
+        ChannelDecl::source("ticks", "{ticker: String, price: Int}"),
+        ChannelDecl::source("view_requests", "Bool"),
+        ChannelDecl::sink("view", sink_type),
+    ];
+    let mut ctx = GlobalContext::default();
+    let channels = ctx
+        .register_channels(&decls)
+        .expect("the declarations are well formed");
+    let ticks = channels
+        .source("ticks")
+        .expect("'ticks' is a declared source")
+        .clone();
+
+    let program = multi_store_program(stores, read);
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    compile_program(&mut ctx, &program, consumer).unwrap_or_render("<perf>", &program);
+
+    let row = |i: usize| {
+        Value::Record(
+            [
+                (
+                    "ticker".to_string(),
+                    Value::String(format!("T{}", i % stores).into()),
+                ),
+                ("price".to_string(), Value::Int(100 + i as i64)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+
+    let start = std::time::Instant::now();
+    for i in 0..rows {
+        ticks.borrow_mut().push([row(i)]);
+        ctx.scheduler().check_for_notifications();
+    }
+    start.elapsed()
+}
+
+/// What a live read of several transactional stores in one block costs, as the
+/// number read grows.
+///
+/// Run it with `cargo test --release -- --ignored --nocapture
+/// as_of_read_cost`. Ignored because it is a measurement, not a threshold: the
+/// numbers are machine-dependent and only their shape is the finding.
+///
+/// The four rows at four stores are the controlled comparison — the program is
+/// identical but for how many slots the reader names — and on the machine this
+/// was written on they run 1.2 ms, 15 ms, 73 ms and 223 ms per four rows. The
+/// two rows beyond vary the store count with the width and are there to show
+/// the trend continuing, not to isolate anything.
+///
+/// The consequence for a program: a served view over `n` slots is not `n` cheap
+/// reads. The demo cart (`tests/programs/asset_cart/`) splits its reader one per
+/// ticker because of it.
+#[test]
+#[ignore = "a measurement, not a threshold — run with --release --ignored --nocapture"]
+fn as_of_read_cost_grows_in_the_number_of_stores_one_block_reads() {
+    const ROWS: usize = 4;
+    for (stores, read) in [(4, 1), (4, 2), (4, 3), (4, 4), (5, 5), (6, 6)] {
+        let elapsed = time_multi_store_read(stores, read, ROWS);
+        eprintln!("[as-of-read] {stores} stores, block reads {read}: {ROWS} rows in {elapsed:?}");
+    }
+}
+
+/// A read of one store stays cheap however many stores the program holds, which
+/// is what makes the width the thing that costs rather than the store count.
+///
+/// Unignored because it is a bound rather than a measurement: four rows through
+/// a four-store program whose reader names one slot completes well inside a
+/// second on any machine, while the same program reading four is already
+/// hundreds of milliseconds and climbing.
+#[test]
+fn a_narrow_read_is_cheap_however_many_stores_exist() {
+    let elapsed = time_multi_store_read(6, 1, 8);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "eight rows through a six-store program with a one-slot reader took {elapsed:?}; \
+         a narrow read should not pay for stores it does not name"
+    );
+}

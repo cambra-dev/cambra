@@ -16,6 +16,7 @@ mod common;
 mod serving;
 
 mod arithmetic;
+mod asset_cart;
 mod defer_generators;
 mod defer_lift;
 mod discount_contract;

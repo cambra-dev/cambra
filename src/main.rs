@@ -1,7 +1,8 @@
-use std::{cell::RefCell, rc::Rc, thread, time::Duration};
+use std::{cell::RefCell, path::Path, rc::Rc, thread, time::Duration};
 
 use cambra::{
     ccl::{
+        channels::{ChannelDecl, ChannelFile},
         context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
         provenance::NodeId,
     },
@@ -84,6 +85,7 @@ fn run_program(
     code: &str,
     inspect_port: Option<u16>,
     control_port: Option<u16>,
+    channels: &[ChannelDecl],
 ) -> Result<(), ()> {
     let new_data = Rc::new(RefCell::new(false));
     let flag = new_data.clone();
@@ -101,6 +103,10 @@ fn run_program(
     let recorder = inspect_port.map(|_| Rc::new(RefCell::new(ValueRecorder::with_defaults())));
 
     let mut ctx = GlobalContext::default();
+    if let Err(e) = ctx.register_channels(channels) {
+        eprintln!("error: {e}");
+        return Err(());
+    }
     let mut live = {
         let _recording = recorder.clone().map(value_recorder::install);
         match LiveProgram::start(&mut ctx, code, &main_consumer) {
@@ -417,15 +423,28 @@ fn main() {
 
     let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
 
+    // A program that calls a host source does not say what that source is, so
+    // the declarations travel beside it. Reading them here rather than behind a
+    // flag is what lets such a program be run, inspected and dumped from a path
+    // like any other — including by the golden sweep, which spawns this binary.
+    let channels = match ChannelFile::beside(Path::new(&input_file)) {
+        Ok(Some(file)) => file.channels,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     match mode {
         Mode::DumpSnapshot => {
             println!(
                 "{}",
-                cambra::inspector_server::snapshot_body_pretty(&code, &input_file)
+                cambra::inspector_server::snapshot_body_pretty(&code, &input_file, &channels)
             );
         }
         Mode::InspectOnly { port } => {
-            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port) {
+            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port, &channels) {
                 eprintln!("error: serving the inspector: {e}");
                 std::process::exit(1);
             }
@@ -434,7 +453,7 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            if run_program(&input_file, &code, inspect_port, control_port).is_err() {
+            if run_program(&input_file, &code, inspect_port, control_port, &channels).is_err() {
                 std::process::exit(1);
             }
 
@@ -457,6 +476,6 @@ mod tests {
 
     #[test]
     fn test_run_program() {
-        run_program("<test>", "x = 1; x", None, None).unwrap();
+        run_program("<test>", "x = 1; x", None, None, &[]).unwrap();
     }
 }
