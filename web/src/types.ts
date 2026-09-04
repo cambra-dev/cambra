@@ -98,6 +98,12 @@ export type OperatorEdgeRole =
   | { kind: "positional"; index: number }
   | { kind: "storeKey"; key: string };
 
+// Whether a role is the named field `name`. The shape matters: a store key that
+// renders as `fan` is not the fan edge.
+export function isNamedRole(role: OperatorEdgeRole, name: string): boolean {
+  return role.kind === "named" && role.name === name;
+}
+
 // How a role reads in a row label.
 export function roleLabel(role: OperatorEdgeRole): string {
   switch (role.kind) {
@@ -112,17 +118,20 @@ export function roleLabel(role: OperatorEdgeRole): string {
 
 // One input edge of an operator node.
 //
-// A *construction* edge — which operator holds which, and how. Runtime dataflow
-// follows a different relation, and nothing here asserts the two coincide.
+// A subscription: the consumer holds this operator and calls `get` on it. What
+// an operator holds and what it subscribes are the same set, stated from its
+// fields, with one exception — a source is not an operator, so a read of one is
+// recorded rather than subscribed.
 export interface OperatorEdge {
   // What names this input at its consumer.
   role: OperatorEdgeRole;
   // "value" for an exclusively owned input, "share" for one several consumers
   // may reach.
   //
-  // The value edges form a forest, which is what lets a renderer walk them as a
-  // child relation with no cycle guard; the share edges are the
-  // cross-references. A cycle is a "value" edge with `deferred` set.
+  // The value edges form a forest, so a renderer may walk them as a child
+  // relation with no cycle guard; the share edges are the cross-references. A
+  // cycle is a "value" edge with `deferred` set, which is what `isBackEdge`
+  // tests and what dropping leaves the graph acyclic.
   kind: string;
   // Whether the edge was wired after its consumer was constructed. An attribute
   // of when, not of ownership.

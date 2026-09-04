@@ -352,7 +352,7 @@ describe("pane copy button", () => {
 
     const text = serializeOperatorGraph(pane);
     expect(writeText).toHaveBeenCalledWith(text);
-    // The indented forest, not an empty string. This graph is all value edges,
+    // The serialized graph, not an empty string. This graph is all value edges,
     // so its line count is exactly its node count; indentation carries the
     // child relation. (Reference rows are pinned in operatorView.dom.test.ts.)
     expect(text.split("\n").length).toBe(pane.nodes.length);

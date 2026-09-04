@@ -62,9 +62,16 @@ to the browser — hijacking it would also remove copy/inspect and is unreliable
 - **`vite-plugin-singlefile`** — inlines all JS and CSS into one
   `dist/index.html` with zero external requests (no CDN, no external fonts), so
   the page is offline-capable and embeddable.
+- **elkjs** — the layered layout the operator pane draws with. It is
+  EPL-2.0 / GPL-3.0-or-later against this repository's Apache-2.0, and it is
+  confined to `src/graph/`, which carries the notice. `src/graph/layout.ts`
+  states the contract with no reference to it, so replacing the engine replaces
+  `src/graph/elk.ts` alone.
 
 The IR tree is plain DOM (not a CodeMirror instance); only the source editor is
-CodeMirror.
+CodeMirror. The operator pane is plain DOM too: absolutely positioned nodes over
+one SVG sheet of edges, so a node inherits the same tokens every other pane uses
+and can hold live content.
 
 ## Build
 
@@ -149,6 +156,16 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
 - `treeView.ts` — one collapsible IR tree pane, parameterized by `paneId`,
   rendered by walking the pane's node table from `root`, cross-linked to every
   other pane.
+- `operatorView.ts` — the operator pane, drawing the subscription graph. Nodes
+  are boxes, edges run producer to consumer, and the feedback edges are withheld
+  from the layout and bowed out as back edges.
+- `graph/model.ts` — what that pane draws, derived from the wire. A
+  `FanOutBranch` and a single-consumer `Constant` are suppressed, the first onto
+  the edge that replaced it and the second into the operator that reads it.
+  Every suppressed id stays addressable: `viewItem` answers which element draws
+  it, because a pane link may name any node on the wire.
+- `graph/layout.ts`, `graph/elk.ts` — the layout contract and its one
+  implementation, kept apart for the licence reason above.
 - `clipboard.ts` — the one impure clipboard call, isolated so the serializers
   that feed it stay DOM-free and directly testable.
 - `paneVisibility.ts` — which panes the layout shows, and the `localStorage`
