@@ -401,7 +401,7 @@ thread_local! {
 #[derive(Default)]
 struct Boundaries {
     /// The expressions that read each registered source, in first-read order.
-    source_reads: Vec<(String, Vec<NodeId>)>,
+    source_reads: Vec<(String, Vec<SourceRead>)>,
     /// Each read source's node, once [`materialize_sources`] has minted it.
     sources: Vec<(String, NodeId)>,
     /// Each compiled output field's node.
@@ -410,6 +410,19 @@ struct Boundaries {
     /// by [`record_kept_operators`]. One fan-out reaches several bindings, and a
     /// second row for one id is a defect the table asserts on.
     rowed_kept: std::collections::HashSet<NodeId>,
+}
+
+/// One expression that reads a registered source.
+///
+/// A `Source(name)` expression **denotes** the read: the source is what the
+/// program wrote there. An `IterateExtent` over the source's domain also reads
+/// it, because the scheduler wakes that operator when the source produces. The
+/// expression it is rowed against is planning's iteration marker or a store's
+/// recurrence read, neither of which writes a source. Every read mints the
+/// source node; only a denoting read attributes it.
+struct SourceRead {
+    expr: NodeId,
+    denotes: bool,
 }
 
 /// RAII installer for the per-compile boundary record.
@@ -574,20 +587,57 @@ pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
     });
 }
 
-/// Note that the expression `expr` reads the source registered under `name`.
+/// Note that the expression `expr` denotes a read of the source registered under
+/// `name` — a `Source(name)` node, which is where the program names it.
 ///
 /// The node itself is minted later, by [`materialize_sources`]: its row names
-/// every site that reads it, and a row's parents are fixed when its recording
-/// closes.
+/// every expression that denotes it, and a row's parents are fixed when its
+/// recording closes.
 pub(crate) fn record_source_read(name: &str, expr: NodeId) {
+    record_read(name, Some(expr), true);
+}
+
+/// Note that an operator built while `expr`'s recording was open iterates the
+/// domain of the source registered under `name`.
+///
+/// A read like any other, and it mints the source node like any other, but it
+/// does not attribute that node: see [`SourceRead`].
+///
+/// `expr` is `None` when no recording named a node, which inside a compile is a
+/// defect — the edge the caller is about to state would resolve to a node
+/// nothing minted.
+pub(crate) fn record_source_iteration(name: &str, expr: Option<NodeId>) {
+    record_read(name, expr, false);
+}
+
+fn record_read(name: &str, expr: Option<NodeId>, denotes: bool) {
     BOUNDARIES.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(boundaries) = slot.as_mut() else {
             return;
         };
-        match boundaries.source_reads.iter_mut().find(|(n, _)| n == name) {
-            Some((_, reads)) => reads.push(expr),
-            None => boundaries.source_reads.push((name.to_string(), vec![expr])),
+        let Some(expr) = expr else {
+            debug_assert!(
+                false,
+                "operator graph: a read of {name:?} was recorded with no expression to \
+                 attribute it to, so the source node it needs is never minted"
+            );
+            return;
+        };
+        if boundaries.source_reads.iter().all(|(n, _)| n != name) {
+            boundaries.source_reads.push((name.to_string(), Vec::new()));
+        }
+        let reads = &mut boundaries
+            .source_reads
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .expect("the entry was just ensured")
+            .1;
+        // One expression reading a source twice is one read site. Denoting wins
+        // over not, whichever site reached it first.
+        match reads.iter_mut().find(|r| r.expr == expr) {
+            Some(existing) => existing.denotes |= denotes,
+            None => reads.push(SourceRead { expr, denotes }),
         }
     });
 }
@@ -595,10 +645,19 @@ pub(crate) fn record_source_read(name: &str, expr: NodeId) {
 /// Mint one node per registered source that something read.
 ///
 /// Must run inside the conversion phase scope, since each node needs a provenance
-/// row like any other node of the pane. Each row names every read site: the first
-/// through the recording, the rest through
+/// row like any other node of the pane. Each row names every expression that
+/// denotes the source: the first through the recording, the rest through
 /// [`RecordingGuard::also_consumes`](crate::ccl::provenance::RecordingGuard::also_consumes),
 /// which is what a node consumed from several places is for.
+///
+/// Only the reads that denote the source become parents ([`SourceRead`]). A
+/// node's attribution is the union of its parents' spans, and a source node
+/// answers where the program names the source. An iteration read would widen
+/// that answer to a span where no source is written, so it mints the node
+/// without attributing it.
+///
+/// A source nothing denotes is anchored on its first read rather than left
+/// without a row.
 pub(crate) fn materialize_sources() {
     let pending = BOUNDARIES.with(|slot| {
         slot.borrow_mut()
@@ -607,17 +666,22 @@ pub(crate) fn materialize_sources() {
             .unwrap_or_default()
     });
     for (name, reads) in pending {
-        let Some(first) = reads.first() else {
+        let mut attributing: Vec<NodeId> =
+            reads.iter().filter(|r| r.denotes).map(|r| r.expr).collect();
+        if attributing.is_empty() {
+            attributing.extend(reads.first().map(|r| r.expr));
+        }
+        let Some((&named, extras)) = attributing.split_first() else {
             continue;
         };
         let id = {
             let guard = crate::ccl::provenance::enter(
-                *first,
+                named,
                 "opconv.source",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            for extra in &reads[1..] {
-                guard.also_consumes(*extra);
+            for &extra in extras {
+                guard.also_consumes(extra);
             }
             let id = NodeId::fresh();
             crate::ccl::provenance::on_mint(id);
@@ -640,4 +704,96 @@ pub(crate) fn record_sink(name: &str) {
             boundaries.sinks.push((name.to_string(), id));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::context::Phase;
+    use crate::ccl::provenance::{PhaseScope, TableSession};
+
+    /// The id of the one source node `materialize_sources` minted.
+    fn only_source(graph: &OperatorGraph) -> NodeId {
+        let ids: Vec<NodeId> = graph
+            .nodes()
+            .iter()
+            .filter_map(|n| match n {
+                GraphNode::Source { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 1, "one registered source, one node");
+        ids[0]
+    }
+
+    /// A source node's parents are the expressions that *denote* the read.
+    ///
+    /// A node's attribution is the union of its parents' spans, and a source
+    /// node answers where the program names the source — so an iteration read
+    /// mints the node and is not a parent of it. Conversion also reaches the
+    /// iteration first, so taking parents in arrival order would name the node
+    /// after planning's marker on top of widening it.
+    #[test]
+    fn a_source_node_is_attributed_to_the_expressions_that_denote_it() {
+        let iterated = NodeId::fresh();
+        let denoting = NodeId::fresh();
+
+        let table = TableSession::install();
+        let graph = {
+            let _scope = PhaseScope::enter(Phase::Convert);
+            let session = BoundarySession::install();
+            record_source_iteration("stdin", Some(iterated));
+            record_source_read("stdin", denoting);
+            materialize_sources();
+            session.into_graph(&[])
+        };
+        let table = table.into_table();
+
+        assert_eq!(
+            table.parents(only_source(&graph)),
+            &[denoting],
+            "the iteration read mints the node; only the denoting read attributes it"
+        );
+    }
+
+    /// A source nothing denotes is anchored on a read that only iterates it,
+    /// rather than left with no row at all.
+    #[test]
+    fn a_source_only_iterated_is_anchored_on_the_iteration() {
+        let iterated = NodeId::fresh();
+
+        let table = TableSession::install();
+        let graph = {
+            let _scope = PhaseScope::enter(Phase::Convert);
+            let session = BoundarySession::install();
+            record_source_iteration("stdin", Some(iterated));
+            materialize_sources();
+            session.into_graph(&[])
+        };
+        let table = table.into_table();
+
+        assert_eq!(table.parents(only_source(&graph)), &[iterated]);
+    }
+
+    /// One expression reading a source twice is one read site, so the node's row
+    /// names it once. A duplicate parent is an edge the provenance map draws
+    /// twice for one relationship, and denoting wins over not whichever site
+    /// reached the source first.
+    #[test]
+    fn one_expression_reading_a_source_twice_is_one_parent() {
+        let expr = NodeId::fresh();
+
+        let table = TableSession::install();
+        let graph = {
+            let _scope = PhaseScope::enter(Phase::Convert);
+            let session = BoundarySession::install();
+            record_source_iteration("stdin", Some(expr));
+            record_source_read("stdin", expr);
+            materialize_sources();
+            session.into_graph(&[])
+        };
+        let table = table.into_table();
+
+        assert_eq!(table.parents(only_source(&graph)), &[expr]);
+    }
 }
