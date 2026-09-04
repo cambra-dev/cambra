@@ -10,7 +10,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
+
+use serde::{Deserialize, Serialize};
 
 use crate::ccl::Type;
 use crate::ccl::context::GlobalContext;
@@ -19,7 +22,8 @@ use crate::chl_parser;
 use crate::interpreter::{Extent, HostSink, HostSource, operator_conversion::ground_extent_of};
 
 /// Which way rows cross a channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ChannelKind {
     /// The host pushes rows in; the program calls the name.
     Source,
@@ -28,14 +32,53 @@ pub enum ChannelKind {
 }
 
 /// One channel a host declares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelDecl {
     /// The name the program uses.
     pub name: String,
     /// Which way rows cross.
     pub kind: ChannelKind,
     /// The type of one row, as a CHL type expression (`{ticker: String, price: Int}`).
+    #[serde(rename = "type")]
     pub row_type: String,
+}
+
+/// A channel declaration file: what a program needs wired to it, beside the
+/// program.
+///
+/// A program calling `price_updates()` does not say what that is, because a
+/// source is registered by the host rather than written in the program. The
+/// file is how a driver — the `cambra` binary, or the golden sweep — knows what
+/// to register before compiling, so a program that reads host channels can be
+/// compiled from a path like any other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelFile {
+    /// The channels to register.
+    pub channels: Vec<ChannelDecl>,
+}
+
+impl ChannelFile {
+    /// Read declarations from JSON.
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        serde_json::from_str(text).map_err(|e| e.to_string())
+    }
+
+    /// The declarations a program at `program` expects, from `channels.json`
+    /// beside it, or `None` where the program declares no channels.
+    pub fn beside(program: &Path) -> Result<Option<Self>, String> {
+        let path = match program.parent() {
+            Some(dir) => dir.join("channels.json"),
+            None => return Ok(None),
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::from_json(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
 }
 
 impl ChannelDecl {

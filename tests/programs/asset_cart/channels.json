@@ -1,0 +1,10 @@
+{
+  "channels": [
+    { "name": "price_updates", "kind": "source", "type": "{ticker: String, price: Int}" },
+    { "name": "cart_changes", "kind": "source", "type": "{ticker: String, qty: Int}" },
+    { "name": "view_requests", "kind": "source", "type": "Bool" },
+    { "name": "btc_line", "kind": "sink", "type": "{qty: Int, price: Int, total: Int}" },
+    { "name": "eth_line", "kind": "sink", "type": "{qty: Int, price: Int, total: Int}" },
+    { "name": "sol_line", "kind": "sink", "type": "{qty: Int, price: Int, total: Int}" }
+  ]
+}

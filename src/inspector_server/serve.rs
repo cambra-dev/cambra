@@ -37,6 +37,7 @@
 
 use std::{io, thread};
 
+use crate::ccl::channels::ChannelDecl;
 use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
@@ -67,8 +68,15 @@ struct Bodies {
 /// disagree. On compile failure the snapshot body is the degraded form (see the
 /// module docs) and the diagnostics body carries the same structured array.
 /// The compile cost is paid once at startup, not per request.
-fn build_bodies(code: &str, name: &str) -> Bodies {
+fn build_bodies(code: &str, name: &str, channels: &[ChannelDecl]) -> Bodies {
     let mut ctx = GlobalContext::default();
+    if let Err(e) = ctx.register_channels(channels) {
+        let diagnostics = vec![Diagnostic::from_channel_error(e.to_string())];
+        return Bodies {
+            snapshot: degraded_snapshot_json(name, code, diagnostics.clone()),
+            diagnostics: diagnostics_body(&diagnostics),
+        };
+    }
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
         Ok(compiled) => Bodies {
@@ -112,8 +120,16 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
 /// One-shot and exits: this regenerates the frontend's golden test fixtures
 /// **without** standing up the never-exiting HTTP server (see
 /// `web/src/__fixtures__/`). The HTTP route keeps the compact form.
-pub fn snapshot_body_pretty(code: &str, name: &str) -> String {
+pub fn snapshot_body_pretty(code: &str, name: &str, channels: &[ChannelDecl]) -> String {
     let mut ctx = GlobalContext::default();
+    if let Err(e) = ctx.register_channels(channels) {
+        return serde_json::to_string_pretty(&InspectorPayload::degraded(
+            name,
+            code,
+            vec![Diagnostic::from_channel_error(e.to_string())],
+        ))
+        .expect("degraded snapshot payload serializes");
+    }
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
         Ok(compiled) => snapshot_json_pretty(&compiled, name),
@@ -154,11 +170,11 @@ fn text_header() -> tiny_http::Header {
 /// Loopback, not `0.0.0.0`: the payload is the user's source text and the whole
 /// compiler IR for it, and this is a local development tool. Reaching it from
 /// another host is a port-forward.
-pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
+pub fn serve(code: &str, name: &str, port: u16, channels: &[ChannelDecl]) -> io::Result<()> {
     // Started even without a program running: the route completes its handshake
     // and sends nothing, because nothing publishes until a run does.
     let live = LiveServer::start();
-    serve_bodies(build_bodies(code, name), name, port, &live)
+    serve_bodies(build_bodies(code, name, channels), name, port, &live)
 }
 
 /// Serve an already-compiled program on a background thread, and return the
@@ -251,7 +267,7 @@ mod tests {
     /// [`assert_snapshot_shape`].
     #[test]
     fn snapshot_body_success_carries_a_node_table_per_pane() {
-        let bodies = build_bodies("1 + 2\n", "prog.chl");
+        let bodies = build_bodies("1 + 2\n", "prog.chl", &[]);
         let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
 
         assert_snapshot_shape(&v);
@@ -289,7 +305,7 @@ mod tests {
     #[test]
     fn snapshot_body_failure_degrades() {
         let code = "1 and 2\n";
-        let bodies = build_bodies(code, "bad.chl");
+        let bodies = build_bodies(code, "bad.chl", &[]);
         let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
 
         assert_degraded_snapshot_shape(&v);
@@ -313,14 +329,14 @@ mod tests {
     /// snapshot carries.
     #[test]
     fn diagnostics_body_matches_snapshot_diagnostics() {
-        let ok = build_bodies("1 + 2\n", "ok.chl");
+        let ok = build_bodies("1 + 2\n", "ok.chl", &[]);
         let ok_diag: Value = serde_json::from_str(&ok.diagnostics).expect("valid JSON");
         assert!(
             ok_diag["diagnostics"].as_array().expect("array").is_empty(),
             "clean compile -> empty diagnostics endpoint"
         );
 
-        let bad = build_bodies("1 and 2\n", "bad.chl");
+        let bad = build_bodies("1 and 2\n", "bad.chl", &[]);
         let bad_diag: Value = serde_json::from_str(&bad.diagnostics).expect("valid JSON");
         let bad_snap: Value = serde_json::from_str(&bad.snapshot).expect("valid JSON");
         assert_eq!(

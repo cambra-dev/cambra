@@ -369,6 +369,22 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// A diagnostic for a failure that is not the compiler's.
+    ///
+    /// Its stage is `"channels"`: a host channel declaration is rejected before
+    /// any pass runs, so no `CompileError` variant names it, and reporting it as
+    /// one would point a reader at a compiler that never saw the program. There
+    /// is no span because the text at fault is the declaration file rather than
+    /// the source.
+    pub fn from_channel_error(message: String) -> Self {
+        Self {
+            severity: "error".to_string(),
+            stage: "channels".to_string(),
+            message,
+            span: None,
+        }
+    }
+
     /// Build a [`Diagnostic`] from a single [`CompileError`].
     ///
     /// The message is the variant's `Display` rendering, which is the same

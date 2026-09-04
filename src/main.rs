@@ -1,7 +1,8 @@
-use std::{thread, time::Duration};
+use std::{path::Path, thread, time::Duration};
 
 use cambra::{
     ccl::{
+        channels::{ChannelDecl, ChannelFile},
         context::{GlobalContext, compile_program, eprint_errors},
         provenance::NodeId,
     },
@@ -23,7 +24,12 @@ use log::debug;
 /// file name). Returns `Err(())` if compilation failed; the errors have
 /// already been rendered to stderr by [`eprint_errors`], so the caller's
 /// job is just to exit non-zero.
-fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<(), ()> {
+fn run_program(
+    src_name: &str,
+    code: &str,
+    inspect_port: Option<u16>,
+    channels: &[ChannelDecl],
+) -> Result<(), ()> {
     use std::{cell::RefCell, rc::Rc};
 
     let new_data = Rc::new(RefCell::new(false));
@@ -39,6 +45,10 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
     let recorder = inspect_port.map(|_| Rc::new(RefCell::new(ValueRecorder::with_defaults())));
 
     let mut ctx = GlobalContext::default();
+    if let Err(e) = ctx.register_channels(channels) {
+        eprintln!("error: {e}");
+        return Err(());
+    }
     let mut compiled = {
         let _recording = recorder.clone().map(value_recorder::install);
         match compile_program(&mut ctx, code, consumer) {
@@ -280,21 +290,34 @@ fn main() {
 
     let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
 
+    // A program that calls a host source does not say what that source is, so
+    // the declarations travel beside it. Reading them here rather than behind a
+    // flag is what lets such a program be run, inspected and dumped from a path
+    // like any other — including by the golden sweep, which spawns this binary.
+    let channels = match ChannelFile::beside(Path::new(&input_file)) {
+        Ok(Some(file)) => file.channels,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     match mode {
         Mode::DumpSnapshot => {
             println!(
                 "{}",
-                cambra::inspector_server::snapshot_body_pretty(&code, &input_file)
+                cambra::inspector_server::snapshot_body_pretty(&code, &input_file, &channels)
             );
         }
         Mode::InspectOnly { port } => {
-            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port) {
+            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port, &channels) {
                 eprintln!("error: serving the inspector: {e}");
                 std::process::exit(1);
             }
         }
         Mode::Run { inspect_port } => {
-            if run_program(&input_file, &code, inspect_port).is_err() {
+            if run_program(&input_file, &code, inspect_port, &channels).is_err() {
                 std::process::exit(1);
             }
 
@@ -317,6 +340,6 @@ mod tests {
 
     #[test]
     fn test_run_program() {
-        run_program("<test>", "x = 1; x", None).unwrap();
+        run_program("<test>", "x = 1; x", None, &[]).unwrap();
     }
 }
