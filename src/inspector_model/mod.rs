@@ -57,10 +57,12 @@
 //! `src/inspector_model/design.md`, "The usage model".
 
 mod definitions;
+mod frame;
 mod program;
 mod walk;
 mod wire;
 
+pub use frame::render_frame;
 pub use program::InspectedProgram;
 pub use wire::{
     DefinitionEntry, Diagnostic, InspectorPayload, IrChild, IrNode, Meta, PaneEntry, PaneLinkEntry,

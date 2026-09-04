@@ -207,6 +207,15 @@ fn run_program(
     // If there are sinks, keep the scheduler running until they all signal
     // completion.  Long-lived servers (e.g. http_serve) never signal, so this
     // loop runs until the process exits.
+    //
+    // TODO: drive this through `Host::tick`, which is the same body.
+    //
+    // `embed::Host` was extracted so a WebAssembly host and this one share a
+    // driver, and the two have already diverged in shape: the loop below owns
+    // its recorder, its windows and its publish bookkeeping, and `Host` owns the
+    // same three. Unifying them means `Host` handing back the `main` producer so
+    // the loop above can still run a pure program to convergence — a different
+    // shape from a tick, and the reason the two were not merged in one step.
     if compiled.sinks().next().is_some() {
         let mut out = std::io::stdout();
         /// Ticks with no sink output after end of input before the run stops.
