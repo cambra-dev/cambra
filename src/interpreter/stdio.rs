@@ -29,7 +29,13 @@ pub struct StdinDataSource {
 
     /// Lines from the background reader thread, then the end of file or the error that stopped
     /// it.
-    receiver: Receiver<StdinMessage>,
+    ///
+    /// Absent until the first poll, which starts the thread. Every
+    /// [`GlobalContext`](crate::ccl::context::GlobalContext) registers this
+    /// source so `stdin()` resolves during lowering, but only a program that
+    /// reads it subscribes it, and only a subscribed source is ever polled. A
+    /// program that never reads `stdin()` therefore starts no thread.
+    receiver: Option<Receiver<StdinMessage>>,
 }
 
 /// What the stdin reader thread sends.
@@ -71,17 +77,23 @@ fn read_lines(mut reader: impl BufRead, sender: Sender<StdinMessage>) {
 
 impl StdinDataSource {
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || read_lines(std::io::BufReader::new(std::io::stdin()), sender));
         Self {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: None,
         }
     }
 
+    #[cfg(test)]
     fn add(&mut self, line: SmolStr) {
         self.buf.push(line);
     }
+}
+
+/// Start a thread reading stdin with [`read_lines`], and return the channel it sends on.
+fn spawn_reader() -> Receiver<StdinMessage> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || read_lines(std::io::BufReader::new(std::io::stdin()), sender));
+    receiver
 }
 
 impl Default for StdinDataSource {
@@ -99,7 +111,8 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Some(self.buf.retained_window())
     }
 
-    /// Drains the lines the background reader thread has buffered, and never blocks.
+    /// Drains the lines the reader thread has sent, starting it on the first call, and never
+    /// blocks.
     ///
     /// Returns `true` if at least one line or the end of file arrived, which tells the scheduler
     /// to notify consumers. Panics on the error that stopped the reader: the stream can neither
@@ -109,11 +122,12 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         if self.buf.eof_reached {
             return false;
         }
+        let receiver = self.receiver.get_or_insert_with(spawn_reader);
         let mut got_data = false;
         loop {
-            match self.receiver.try_recv() {
+            match receiver.try_recv() {
                 Ok(StdinMessage::Line(line)) => {
-                    self.add(line);
+                    self.buf.push(line);
                     got_data = true;
                 }
                 Ok(StdinMessage::Eof) => {
@@ -199,7 +213,7 @@ mod tests {
         }
         StdinDataSource {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: Some(receiver),
         }
     }
 
