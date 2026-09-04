@@ -721,6 +721,15 @@ impl GlobalContext {
         &mut self.scheduler
     }
 
+    /// The scheduler, for reading what it holds.
+    ///
+    /// Sampling a source's window is a `&self` operation on the source — it
+    /// moves no data and releases nothing — so a caller that only looks needs
+    /// no exclusive borrow of the context.
+    pub fn scheduler_ref(&self) -> &Scheduler {
+        &self.scheduler
+    }
+
     /// Pre-register a data source so that `name()` is a valid call during lowering.
     ///
     /// This adds the source to the lowering-phase registry only.  Inference and

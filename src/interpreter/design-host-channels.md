@@ -114,10 +114,35 @@ run` before the WebAssembly host is ready, and so a channel program in the galle
 a subprocess test the way `streaming_echo` drives real stdin. A program with declared channels does
 not also read `stdin()`: stdin is the channel transport for the length of the run.
 
+## The embedding API
+
+`src/embed.rs` is `Host`: compile a program against declared channels, push rows into its sources,
+tick it, read what its sinks produced, and render a live frame. Nothing in it blocks, sleeps or
+spawns — the host owns the clock — which is what lets the same type serve a terminal driver and a
+WebAssembly module.
+
+`Host::frame` calls `inspector_model::render_frame`, which is a pure function of the recorder and
+the sources' windows. It lives in `inspector_model` rather than `inspector_server` for that reason:
+the frame is wire, and only its delivery is transport, so a host with no socket renders the same
+bytes the websocket route sends.
+
+A recorder is installed at compile time or never. A producer takes its handle when its
+`ProducerBase` is built, inside `compile_program`, and there is no traversal of the live graph to
+hand one out afterwards.
+
+**The binary's sink loop is a second copy of `Host::tick` and should become a call to it.** The two
+were not merged in one step because `main.rs` also runs a pure program's `main` output to
+convergence, which is a blocking run-to-completion shape rather than a tick, and unifying them means
+`Host` handing that producer back. The `TODO` sits on the loop.
+
 ## Replay
 
 Keys are minted from arrival order and nothing else, so a fresh source fed the same rows in the same
 order holds the same keys, and a program compiled against the same declarations and fed the same
-rows reaches the same state. A host that logs what it pushes can therefore rebuild a running
-program's state in a new instance by replaying the log — which is how a host swaps a program for a
-new version without any runtime support for carrying state across a recompile.
+rows reaches the same state. A host that logs what it pushes can therefore rebuild a program's state
+in a new process by replaying the log.
+
+Replaying is for a restart, not for a new version of the source. A version swap is a reload
+(`src/ccl/design/hot-reload.md`): `Host::reload` keeps every operator whose computation is unchanged
+and resumes each mutable variable from the value it was holding, and the sources keep the rows they
+already hold. Replaying a log into a reloaded program would deliver those rows a second time.

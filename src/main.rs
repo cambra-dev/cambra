@@ -280,6 +280,15 @@ fn run_program(
     // If there are sinks, keep the scheduler running until they all signal
     // completion.  Long-lived servers (e.g. http_serve) never signal, so this
     // loop runs until the process exits.
+    //
+    // TODO: drive this through `Host::tick`, which this loop is a superset of.
+    //
+    // `embed::Host` was extracted so a WebAssembly host and this one share a
+    // driver. Two things keep them apart. This loop services the control port,
+    // which is the binary's own surface — a host drives `Host::reload` itself.
+    // And it runs the `main` producer to convergence, which is a blocking
+    // run-to-completion shape rather than a tick, so unifying them means `Host`
+    // handing that producer back.
     if live.program().sinks().next().is_some() {
         let mut out = std::io::stdout();
         /// Ticks with no sink output after end of input before the run stops.

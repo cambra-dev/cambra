@@ -72,7 +72,9 @@ impl HostSource {
     ///
     /// Keys are the arrival indices the buffer mints, so a fresh source fed the
     /// same rows in the same order holds the same keys. That is what lets a
-    /// host rebuild a program's state by replaying what it pushed.
+    /// host rebuild a program's state in a new process by replaying what it
+    /// pushed; a new version of the source is a reload instead, which keeps the
+    /// rows this source already holds.
     pub fn push(&mut self, rows: impl IntoIterator<Item = Value>) {
         for row in rows {
             self.buf.push(row);
@@ -240,7 +242,7 @@ mod tests {
     /// is what makes replaying a host's pushes into a fresh program reproduce
     /// its state.
     #[test]
-    fn replaying_the_same_rows_reproduces_the_same_keys() {
+    fn the_same_rows_in_the_same_order_mint_the_same_keys() {
         let mut original = record_source();
         let mut replayed = record_source();
         let rows = [row("BTC-USD", 100), row("ETH-USD", 20), row("BTC-USD", 300)];
