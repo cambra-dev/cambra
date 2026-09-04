@@ -615,15 +615,15 @@ in the `provenance-design` note under projects/program-inspector in the internal
 vault.
 
 A pass reaches predicates through **every type slot a node carries**, not just
-`expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, a
-`Transact`'s `domain`, and — per binder — both the binder's declared type *and* its
-annotation. Each holds an independent predicate `Rc`. `Expr::walk_type_slots{,_mut}`
-is the single source of truth for that set, precisely because hand-rolling it per
-pass is how a pass silently acquires a blind spot — `Cast.target`, where a
-comprehension filter's predicate actually lives, is the one that costs most.
-`count_free`/`is_free` are on it too, and that is not cosmetic: several passes *skip
-work* when `is_free` says no, so a slot the free-variable walk cannot see is a slot
-those passes decline to rewrite.
+`expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, and —
+per binder — both the binder's declared type *and* its annotation. Each holds an
+independent predicate `Rc`. `Expr::walk_type_slots{,_mut}` is the single source of
+truth for that set, precisely because hand-rolling it per pass is how a pass
+silently acquires a blind spot — `Cast.target`, where a comprehension filter's
+predicate actually lives, is the one that costs most. `count_free`/`is_free` are on
+it too, and that is not cosmetic: several passes *skip work* when `is_free` says
+no, so a slot the free-variable walk cannot see is a slot those passes decline to
+rewrite.
 
 A binder's **annotation** is the subtle member of that set, and it is the only one
 with a bounded lifetime: it is where lowering writes a mutable variable's
@@ -634,15 +634,6 @@ A walk over the slot set must still cover it, because the passes that use
 `walk_type_slots` include ones that run before and during inference (`uniquify`,
 `subst`), and — because an erasure and its own post-condition share that walk — a
 slot the walk misses is a slot the check cannot report on.
-
-A `Transact`'s **sequencing domain** is on the walk for the same reason. The node is
-born by `plan_loops` and its domain is the extent of the source it iterates,
-refinements and all, so a `mut` accumulator over a filtered collection carries that
-filter's predicate there as well as on every other slot the same extent reaches.
-Planning's predicate compilation runs through this walk and the post-planning
-`typecheck` compares refinements structurally, so a domain the walk skipped would
-hold the bare predicate while its siblings held the compiled one, and the carrier
-would contradict its own type.
 
 The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
 stamps a distinct marker into every directly-carried `Type` in the AST and pins that

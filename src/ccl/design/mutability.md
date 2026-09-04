@@ -66,22 +66,13 @@ carry-forward, so channels never close a causal cycle — see [merge laws](#the-
 | `with begin():` transaction | `Txn`, an anonymous total order issued by the runtime | `get_prev_txn` |
 | `while` loop *(future)* | a prefix of `Nat` bounded by the running condition | `get_prev_seq` over a self-ceiling domain |
 
-A **filtered** loop source is the same row read literally: its domain is the refined extent
-`{[0, 𝑁] | 𝑝}`, so the recurrence runs at the positions that survived the filter and at no
-others. `restrict` keeps an element at its original position, so those positions are a subset
-of the extent's rather than a renumbering of them, and the induction store's ticks follow them
-(position `𝑝` decides tick `𝑝 + 1`, and an excluded position's tick is never occupied). A read
-of the accumulator's history still spans the whole extent: at an excluded position it folds to
-the latest write below it, the value the accumulator held there. The alternative — iterating
-the extent densely and gating the write, which is how an in-body `if` compiles — would put the
-store at odds with the domain the type carries.
-
-A **product** loop source is rejected at op-conversion. A comprehension across two sources
+A **product** loop source is unsupported. A comprehension across two sources
 (`[e for x in xs for y in ys]`, join or not) is keyed by `(𝑖, 𝑗)`, and the induction recurrence is
 sequenced by `UInt` position throughout: the driver pairs items with `UInt` domain keys, the commit
-engine's ticks are positions, and the dense read folds tick `𝑝 + 1` at each. The rejection is at the
-boundary rather than deeper because the driver's decode drops a non-`UInt` key instead of failing on
-it, so an unguarded product domain would be a loop that runs zero times.
+engine's ticks are positions, and the dense read folds tick `𝑝 + 1` at each. Supporting one means
+giving the recurrence a sequencing order over `(𝑖, 𝑗)`. Op-conversion rejects such a source until
+it has one, because the driver's decode drops a non-`UInt` key instead of failing on it, so an
+unguarded product domain is a loop that runs zero times.
 
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
 inferred, always spelled at the introduction). What the **introduction** site fixes is not that
