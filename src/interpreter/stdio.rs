@@ -9,8 +9,8 @@ use smol_str::SmolStr;
 
 use crate::ccl::Type;
 use crate::interpreter::{
-    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, stream_buffer::UIntStreamBuffer,
-    tiling::Predicate,
+    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
+    stream_buffer::UIntStreamBuffer, tiling::Predicate,
 };
 
 /// Buffers and tracks lines available on stdin.
@@ -57,7 +57,7 @@ impl StdinDataSource {
     }
 
     fn add(&mut self, line: SmolStr) {
-        self.buf.push(line);
+        self.buf.push(Value::String(line));
     }
 }
 
@@ -114,9 +114,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
 
     fn get(&self, key: ColumnValue) -> ColumnValue {
         match key {
-            ColumnValue::UInts(v) => {
-                ColumnValue::Strings(v.iter().map(|i| self.buf.get(*i)).cloned().collect())
-            }
+            ColumnValue::UInts(v) => self.buf.column(&v, &self.output_value_extent()),
             other => panic!("StdinDataSource::get expected UInt key, got {other:?}"),
         }
     }
@@ -250,8 +248,8 @@ mod tests {
         assert_eq!(Predicate::False, source.get_yield_predicate());
         source.add("a".into());
         source.add("b".into());
-        assert_eq!("a", source.buf.get(0));
-        assert_eq!("b", source.buf.get(1));
+        assert_eq!(&Value::String("a".into()), source.buf.get(0));
+        assert_eq!(&Value::String("b".into()), source.buf.get(1));
         assert_eq!(None, source.buf.get_opt(2));
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(1)),
@@ -263,11 +261,11 @@ mod tests {
             source.get_yield_predicate()
         );
         assert_eq!(None, source.buf.get_opt(0));
-        assert_eq!("b", source.buf.get(1));
+        assert_eq!(&Value::String("b".into()), source.buf.get(1));
         source.add("c".into());
         assert_eq!(None, source.buf.get_opt(0));
-        assert_eq!("b", source.buf.get(1));
-        assert_eq!("c", source.buf.get(2));
+        assert_eq!(&Value::String("b".into()), source.buf.get(1));
+        assert_eq!(&Value::String("c".into()), source.buf.get(2));
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(2)),
             source.get_yield_predicate()
@@ -279,7 +277,7 @@ mod tests {
         );
         assert_eq!(None, source.buf.get_opt(0));
         assert_eq!(None, source.buf.get_opt(1));
-        assert_eq!("c", source.buf.get(2));
+        assert_eq!(&Value::String("c".into()), source.buf.get(2));
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(2)),
             source.get_yield_predicate()
