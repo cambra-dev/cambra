@@ -19,6 +19,13 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 | `host_driver.rs` | The terminal host for a program that reads host channels: JSON rows in on stdin, JSON rows out on stdout. | [interpreter/design-host-channels.md](interpreter/design-host-channels.md) |
 | `main.rs`, `lib.rs` | CLI entry point and crate root (module declarations). | — |
 
+## Building the WebAssembly module
+
+`scripts/build-wasm.sh` builds `cambra.wasm` in the `wasm-release` profile and runs the embedding
+contract against it (`scripts/wasm-contract.mjs`). `./ci.sh wasm` type-checks the library for
+`wasm32-unknown-unknown` and runs that contract when `wasm-bindgen` is installed. See
+[interpreter/design-host-channels.md](interpreter/design-host-channels.md).
+
 ## Operational semantics
 
 The runtime's formal model lives under

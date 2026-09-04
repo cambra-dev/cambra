@@ -18,6 +18,7 @@
 //! an animation frame, or as fast as rows arrive, and can stop driving it
 //! without the module holding a thread.
 
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 use crate::ccl::channels::{ChannelDecl, row_from_json, row_to_json};
@@ -116,7 +117,11 @@ impl Program {
             "produced": result.produced,
             "done": result.done,
         });
-        serde_wasm_bindgen::to_value(&payload)
+        // `json_compatible`, because the default serializer renders a map as a
+        // JS `Map` rather than an object, and a caller reaching for
+        // `result.outputs` on a `Map` reads `undefined`.
+        payload
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
             .map_err(|e| JsValue::from_str(&format!("tick result: {e}")))
     }
 

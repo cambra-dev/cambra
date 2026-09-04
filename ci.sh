@@ -174,6 +174,14 @@ ci_wasm() {
     return 0
   fi
   cargo check -p cambra --target wasm32-unknown-unknown --lib
+  # The module itself, when the matching `wasm-bindgen` CLI is around. The check
+  # above is the gate; this is the contract, and it needs a tool the repo does
+  # not depend on.
+  if command -v wasm-bindgen > /dev/null 2>&1 && command -v node > /dev/null 2>&1; then
+    scripts/build-wasm.sh
+  else
+    echo "ci_wasm: wasm-bindgen or node not found; skipping the module contract" >&2
+  fi
 }
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
 # Validate intra-repo doc references so they can't silently rot: Markdown
