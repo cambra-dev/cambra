@@ -22,43 +22,61 @@ pub struct StdinDataSource {
     buf: UIntStreamBuffer,
 
     /// Lines arriving from the background reader thread.  `None` signals EOF.
-    receiver: Receiver<Option<SmolStr>>,
+    ///
+    /// Absent until the first poll, because the thread is started then. Every
+    /// [`GlobalContext`](crate::ccl::context::GlobalContext) registers this
+    /// source so `stdin()` resolves during lowering, but only a program that
+    /// reads it subscribes it, and only a subscribed source is ever polled. A
+    /// thread started at construction would therefore sit on the process's stdin
+    /// for programs that never mention it — which is not idle, it is a second
+    /// consumer taking lines away from whatever else is reading them.
+    receiver: Option<Receiver<Option<SmolStr>>>,
 }
 
 impl StdinDataSource {
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(std::io::stdin());
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match reader.read_line(&mut buf) {
-                    Ok(0) => {
-                        // EOF — signal the main thread and stop.
-                        let _ = sender.send(None);
-                        return;
-                    }
-                    Ok(_) => {
-                        let line = SmolStr::new(buf.trim_end_matches(['\n', '\r']));
-                        if sender.send(Some(line)).is_err() {
-                            // Receiver was dropped (source closed); stop reading.
-                            return;
-                        }
-                    }
-                    Err(err) => panic!("Error reading from stdin: {err}"),
-                }
-            }
-        });
         Self {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: None,
         }
+    }
+
+    /// The reader, starting the thread on the first poll.
+    fn reader(&mut self) -> &Receiver<Option<SmolStr>> {
+        self.receiver.get_or_insert_with(spawn_reader)
     }
 
     fn add(&mut self, line: SmolStr) {
         self.buf.push(Value::String(line));
     }
+}
+
+/// Read stdin into a channel until end of input.
+fn spawn_reader() -> Receiver<Option<SmolStr>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => {
+                    // EOF — signal the main thread and stop.
+                    let _ = sender.send(None);
+                    return;
+                }
+                Ok(_) => {
+                    let line = SmolStr::new(buf.trim_end_matches(['\n', '\r']));
+                    if sender.send(Some(line)).is_err() {
+                        // Receiver was dropped (source closed); stop reading.
+                        return;
+                    }
+                }
+                Err(err) => panic!("Error reading from stdin: {err}"),
+            }
+        }
+    });
+    receiver
 }
 
 impl Default for StdinDataSource {
@@ -82,20 +100,28 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     /// tells the scheduler to re-notify consumers.  Never blocks.
     fn check_for_new_data(&mut self) -> bool {
         let mut got_data = false;
+        let mut lines = Vec::new();
+        let mut eof = false;
         loop {
-            match self.receiver.try_recv() {
+            match self.reader().try_recv() {
                 Ok(Some(line)) => {
-                    self.add(line);
+                    lines.push(line);
                     got_data = true;
                 }
                 Ok(None) => {
                     debug!("EOF reached on stdin");
-                    self.buf.eof_reached = true;
+                    eof = true;
                     got_data = true;
                     break;
                 }
                 Err(_) => break,
             }
+        }
+        for line in lines {
+            self.add(line);
+        }
+        if eof {
+            self.buf.eof_reached = true;
         }
         got_data
     }
@@ -150,6 +176,17 @@ mod tests {
         ColumnValue, DataSourceDomainExtentImpl, Value, stdio::StdinDataSource, tiling::Predicate,
     };
     use test_log::test;
+
+    /// A source nobody polls starts no reader, so a program that never mentions
+    /// `stdin()` leaves the process's stdin to whoever else is reading it.
+    #[test]
+    fn the_reader_starts_on_the_first_poll() {
+        let source = StdinDataSource::new();
+        assert!(
+            source.receiver.is_none(),
+            "constructing the source must not take stdin"
+        );
+    }
 
     /// `Predicate::False` means nothing is obsolete: all indices in `start_idx..ready_size`.
     #[test]
