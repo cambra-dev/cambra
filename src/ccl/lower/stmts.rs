@@ -93,6 +93,30 @@ pub(super) fn lower_stmts_recovering(
             }
         });
 
+    // A host-declared sink has no statement of its own, so its channel is bound
+    // here: `let <name> = Defer in <program>`, outermost, so the name is in
+    // scope for every feed in the program. Reversed because each wrap becomes
+    // the new outermost binding, and the declaration order is what the host
+    // sees.
+    let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
+    let body = ctx
+        .host_sinks
+        .clone()
+        .into_iter()
+        .rev()
+        .fold(body, |acc, name| {
+            let channel = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Defer),
+                program_span,
+                "lower.host_sink",
+            );
+            ctx.tag_machinery(
+                Expr::let_bind(name, channel, acc),
+                program_span,
+                "lower.host_sink",
+            )
+        });
+
     if ctx.sink_bindings.is_empty() {
         return Some(body);
     }
@@ -101,7 +125,6 @@ pub(super) fn lower_stmts_recovering(
     // (sort for determinism — HashMap iteration is unordered). The record, its
     // field `Var`s, and the tail `ExprStmt` are program-owned plumbing with no
     // owning statement; they carry the whole-program span.
-    let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
     let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
     sink_names.sort();
     let fields = sink_names
@@ -532,7 +555,7 @@ pub(super) fn lower_middle_stmt(
                 path.clone(),
                 source_name.clone(),
             )));
-            let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
+            let sink: Rc<dyn DataSink> = source_obj.borrow().sink();
             ctx.sources.insert(source_name.clone(), source_obj);
             let requests_expr = ctx.tag_machinery(
                 Expr::new(TypedExprNode::Source(source_name.clone())),

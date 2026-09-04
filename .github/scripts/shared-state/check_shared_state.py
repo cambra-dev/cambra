@@ -80,6 +80,7 @@ JUSTIFICATION = re.compile(r"//\s*shared-state-ok:\s*\S")
 # Duplicate entries are meaningful — two sites in one file with the same shape are
 # two exceptions. Test code is not listed: `_blank_test_items` skips it entirely.
 EXPECTED_EXCEPTIONS = [
+    ("src/interpreter/host_sink.rs", "cell of `Vec<Value>`"),
     ("src/interpreter/http_server.rs", "ambient mutable state"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<usize, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),

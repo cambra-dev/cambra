@@ -4,7 +4,6 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
 use crate::chl_parser;
@@ -31,7 +30,7 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, HostSink, Scheduler, StdinDataSource,
         operator_conversion::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
@@ -421,6 +420,19 @@ impl GlobalContext {
     pub fn register_source(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
         let name = source.borrow().get_id().to_string();
         self.lowering.register_source(name, source);
+    }
+
+    /// Pre-declare a host sink so the program may feed it by name.
+    ///
+    /// The counterpart of [`register_source`](Self::register_source) for the
+    /// egress direction: lowering binds the name to a deferred channel wrapped
+    /// around the whole program, and every tile fed to it reaches `sink`.
+    ///
+    /// A declared sink the program never feeds is rejected at lowering, as any
+    /// unfed sink is — a channel nothing writes has no operator to subscribe.
+    pub fn declare_host_sink(&mut self, sink: Rc<HostSink>) {
+        let name = sink.name().to_string();
+        self.lowering.declare_host_sink(name, sink);
     }
 }
 
@@ -1242,7 +1254,7 @@ struct Frontend {
     panes: BTreeMap<Phase, Expr>,
     /// Sink bindings discovered during lowering. Drained before the sources,
     /// which is the order [`LoweringContext`] requires.
-    sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+    sink_bindings: HashMap<String, Rc<dyn DataSink>>,
     /// Every lowered node's `SourceAttribution`, the base every later fold
     /// bottoms out in and the source release `InferError` diagnostics resolve
     /// against one-hop.

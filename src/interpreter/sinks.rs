@@ -76,7 +76,7 @@ pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
     /// The sink that dispatches responses.
-    sink: Arc<dyn DataSink>,
+    sink: Rc<dyn DataSink>,
     /// Fired once when this sink receives a terminal tile.  `None` after it fires.
     done: Option<DoneNotifier>,
 }
@@ -87,7 +87,7 @@ impl SinkConsumer {
     /// The returned consumer holds a shared handle to the `producer` slot; the
     /// caller should fill that slot with the `TileProducer` returned by
     /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] before the first notification fires.
-    pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
+    pub fn new(sink: Rc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
         (
             Self {
