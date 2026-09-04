@@ -228,8 +228,8 @@ export class LiveStore {
  * whole root with a fatal message, which is the right answer for a snapshot
  * that would not load and the wrong one for a run that ended.
  */
-export function connectLive(store: LiveStore, open: () => WebSocket = openLive): () => void {
-  let socket: WebSocket;
+export function connectLive(store: LiveStore, open: () => FrameSource = openLive): () => void {
+  let socket: FrameSource;
   try {
     socket = open();
   } catch (e) {
@@ -268,6 +268,22 @@ export function connectLive(store: LiveStore, open: () => WebSocket = openLive):
   });
 
   return () => socket.close();
+}
+
+/**
+ * Where frames come from, as much of a `WebSocket` as this module uses.
+ *
+ * A `WebSocket` satisfies it, and so does anything else that delivers frames —
+ * an embedder relaying them over `postMessage` from a host that has no socket
+ * at all. Narrowed to the three events and the one method rather than taking a
+ * `WebSocket`, because a stand-in should not have to implement `send`,
+ * `binaryType` or a ready state that nothing here reads.
+ */
+export interface FrameSource {
+  addEventListener(type: "message", handler: (event: { data: unknown }) => void): void;
+  addEventListener(type: "close", handler: (event: { wasClean: boolean }) => void): void;
+  addEventListener(type: "error", handler: () => void): void;
+  close(): void;
 }
 
 /** The socket, addressed relative to whatever origin served the page. */

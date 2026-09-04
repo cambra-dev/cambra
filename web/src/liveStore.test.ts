@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { LiveStore, applyFrame, shownNodes, tagsFor, type LiveState } from "./liveStore";
+import {
+  LiveStore,
+  applyFrame,
+  connectLive,
+  shownNodes,
+  tagsFor,
+  type FrameSource,
+  type LiveState,
+} from "./liveStore";
 import type { LiveFrame, LiveProducer } from "./types";
 
 function producer(tick: number, value: string): LiveProducer {
@@ -174,5 +182,82 @@ describe("LiveStore tags", () => {
     store.subscribe(() => seen.push("second"));
     store.inspect("a", 1, [1]);
     expect(seen).toEqual(["second"]);
+  });
+});
+
+describe("connectLive over an injected frame source", () => {
+  /** A `FrameSource` an embedder would supply, driven by hand. */
+  function fakeSource() {
+    const handlers: Record<string, ((event: never) => void)[]> = {};
+    let closed = false;
+    const source: FrameSource = {
+      addEventListener(type: string, handler: (event: never) => void) {
+        (handlers[type] ??= []).push(handler);
+      },
+      close() {
+        closed = true;
+      },
+    } as FrameSource;
+    return {
+      source,
+      deliver(data: unknown) {
+        for (const h of handlers.message ?? []) h({ data } as never);
+      },
+      hangUp(wasClean: boolean) {
+        for (const h of handlers.close ?? []) h({ wasClean } as never);
+      },
+      isClosed: () => closed,
+    };
+  }
+
+  /**
+   * A host with no socket delivers frames through the same path a socket does,
+   * which is the whole point of the seam: the store cannot tell them apart.
+   */
+  it("applies frames an embedder delivers", () => {
+    const store = new LiveStore();
+    const fake = fakeSource();
+    const dispose = connectLive(store, () => fake.source);
+
+    store.inspect("n1", 1, [1]);
+    fake.deliver(JSON.stringify(frame(3, [[1, "42"]])));
+
+    const state = store.get();
+    expect(state.nodes.get(1)?.producers[0]?.rows[0]?.value).toBe("42");
+    expect(state.status).toEqual({ kind: "live", tick: 3, published: 3 });
+
+    dispose();
+    expect(fake.isClosed()).toBe(true);
+  });
+
+  /** A final frame outranks the close that follows it. */
+  it("keeps a finished status across the close", () => {
+    const store = new LiveStore();
+    const fake = fakeSource();
+    connectLive(store, () => fake.source);
+
+    fake.deliver(JSON.stringify(frame(1, [[1, "7"]], true)));
+    expect(store.get().status.kind).toBe("finished");
+    fake.hangUp(true);
+    expect(store.get().status.kind).toBe("finished");
+  });
+
+  /** A malformed frame is dropped rather than taking the pane down. */
+  it("rejects a frame that is not the wire shape", () => {
+    const store = new LiveStore();
+    const fake = fakeSource();
+    connectLive(store, () => fake.source);
+
+    fake.deliver('{"tick": "not a number"}');
+    expect(store.get().status.kind).toBe("connecting");
+  });
+
+  /** An opener that throws degrades the pane rather than the page. */
+  it("reports a source that will not open", () => {
+    const store = new LiveStore();
+    connectLive(store, () => {
+      throw new Error("no host");
+    });
+    expect(store.get().status).toEqual({ kind: "lost", clean: false });
   });
 });
