@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this directory — the inspector's `web/` frontend and its golden-fixture corpus. The Rust half lives in the `cambra` crate at `src/inspector_model/` and `src/inspector_server/`.
 
+## Embedding the inspector
+
+The bundle is one file with no external references, so a page can inline it and drive it instead of
+serving it. `window.__CAMBRA__` is the seam (`main.ts`, `InjectedHost`): a snapshot, a frame source,
+a hidden-pane set and a list of pins, each optional and each falling back to what the `cambra`
+binary serves.
+
+A frame source is `FrameSource` (`liveStore.ts`) — the three events and the one method `connectLive`
+actually uses, rather than a whole `WebSocket`, so a stand-in relaying frames over `postMessage`
+does not have to implement `send` or a ready state nothing reads.
+
+A pin travels as a `{line, col}` source position, never a `NodeId`. Ids are minted per compile,
+which is why the values pane declines to persist a tag; a position in the text survives every
+compile of that text. `applyPins` resolves one through `tightestNodeAt` then `operatorsFor` — the
+same path the source-hover gesture takes, so a configured pin and a clicked one are the same pin. A
+position naming no operator is skipped rather than reported.
+
 ## The golden fixtures
 
 `web/src/__fixtures__/*.snapshot.json` are full `/api/snapshot` payloads for the

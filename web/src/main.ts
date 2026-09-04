@@ -32,7 +32,7 @@ import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
-import { LiveStore, connectLive } from "./liveStore";
+import { type FrameSource, LiveStore, connectLive } from "./liveStore";
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
@@ -357,7 +357,58 @@ function renderPane(panels: HTMLElement, pane: PaneDescriptor): MountedPane {
   return { panel, reveal: pane.mount(body) };
 }
 
-export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): void {
+/**
+ * A source position an embedder asks to have pinned.
+ *
+ * Line and column, both 1-based, because a `NodeId` is not durable: ids are
+ * minted per compile, and the values pane says so where it declines to persist
+ * a tag. A position in the source text survives every compile of that text,
+ * which is what a deck reopening the same program needs.
+ */
+export interface PinRequest {
+  line: number;
+  col: number;
+}
+
+/**
+ * Resolve `pins` against `store` and pin what they name.
+ *
+ * The same path the source-hover gesture takes — `tightestNodeAt` then
+ * `operatorsFor` — so a configured pin and a clicked one are the same pin. A
+ * position naming no operator is skipped rather than reported: a deck whose
+ * program has moved on should open with fewer pins, not with an error in front
+ * of an audience.
+ */
+export function applyPins(
+  store: Store,
+  live: LiveStore,
+  pins: readonly PinRequest[],
+  lineStarts: number[],
+): number {
+  const paneId = store.sourceAnchorPaneId;
+  if (paneId === null) return 0;
+  const anchor = store.indicesFor(paneId);
+  if (!anchor) return 0;
+  let pinned = 0;
+  for (const pin of pins) {
+    const lineStart = lineStarts[pin.line - 1];
+    if (lineStart === undefined) continue;
+    const nodeId = anchor.tightestNodeAt(lineStart + (pin.col - 1));
+    if (nodeId === null) continue;
+    const operators = store.operatorsFor(nodeId);
+    if (operators.length === 0) continue;
+    live.inspect(tagLabel(store, nodeId, lineStarts), nodeId, operators);
+    pinned += 1;
+  }
+  return pinned;
+}
+
+export function renderApp(
+  root: HTMLElement,
+  store: Store,
+  live?: LiveStore,
+  config?: { hiddenPanes?: readonly string[]; pins?: readonly PinRequest[] },
+): void {
   // Set once the visibility controller exists, because pinning has to reveal
   // the pane and the controller is built from the pane list this produces.
   let reveal: ((paneId: string) => void) | null = null;
@@ -374,10 +425,14 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): vo
 
   // A storage that throws on access degrades the filter to one session.
   const storage = browserStorage();
+  // An embedder's hidden set wins over the stored one: it is asking for a
+  // particular layout on this page, where the stored set is whatever the last
+  // reader of some other page chose.
   const visibility = new PaneVisibility(
     panes.map((pane) => pane.id),
-    storage ? loadHiddenPanes(storage) : [],
+    config?.hiddenPanes ?? (storage ? loadHiddenPanes(storage) : []),
   );
+  if (live && config?.pins?.length) applyPins(store, live, config.pins, lineStarts);
 
   root.replaceChildren();
   renderHeader(root, store.snapshot, panes, visibility);
@@ -423,24 +478,61 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): vo
   applyVisibility();
 }
 
+/**
+ * What an embedder may hand the inspector instead of a server.
+ *
+ * The bundle is a single file with no external references, so a page can inline
+ * it and drive it directly — a WebAssembly host holds the snapshot and the
+ * frames already, and has no origin to fetch them from. Anything absent falls
+ * back to the network, which is what the `cambra` binary serves.
+ */
+export interface InjectedHost {
+  /** The `/api/snapshot` payload, unvalidated. */
+  snapshot?: unknown;
+  /** Where frames come from, in place of the websocket. */
+  openLive?: () => FrameSource;
+  /** Pane ids to open hidden, in place of whatever the reader last chose. */
+  hiddenPanes?: readonly string[];
+  /** Source positions to open pinned in the values pane. */
+  pins?: readonly PinRequest[];
+}
+
+declare global {
+  interface Window {
+    __CAMBRA__?: InjectedHost;
+  }
+}
+
+/** The snapshot an embedder supplied, or the one the server has. */
+async function loadSnapshot(injected: InjectedHost | undefined): Promise<unknown> {
+  if (injected?.snapshot !== undefined) return injected.snapshot;
+  const resp = await fetch("/api/snapshot");
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
 async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
+  const injected = window.__CAMBRA__;
   try {
-    const resp = await fetch("/api/snapshot");
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    // Validate the wire contract up front: a drifted backend surfaces as a
-    // clear path-naming error here, not a confusing downstream crash.
-    const snap = validateSnapshot(await resp.json());
+    // Validate the wire contract up front, whichever side supplied it: a
+    // drifted backend — or a drifted embedder — surfaces as a clear
+    // path-naming error here, not a confusing downstream crash.
+    const snap = validateSnapshot(await loadSnapshot(injected));
     // The live channel is opened alongside the snapshot, not instead of it, and
     // its failures never reach this `catch`: a run that ended must degrade the
     // values pane, where a snapshot that would not load has nothing to show at
     // all.
     const live = new LiveStore();
-    connectLive(live);
-    renderApp(root, new Store(snap), live);
+    if (injected?.openLive) connectLive(live, injected.openLive);
+    else connectLive(live);
+    renderApp(root, new Store(snap), live, {
+      hiddenPanes: injected?.hiddenPanes,
+      pins: injected?.pins,
+    });
   } catch (e) {
-    root.replaceChildren(el("div", "fatal", `Failed to load /api/snapshot: ${String(e)}`));
+    root.replaceChildren(el("div", "fatal", `Failed to load the snapshot: ${String(e)}`));
   }
 }
 

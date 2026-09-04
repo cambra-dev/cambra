@@ -11,6 +11,7 @@ import { EditorView } from "@codemirror/view";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  applyPins,
   byteLineStarts,
   describePanes,
   diagnosticLines,
@@ -19,12 +20,14 @@ import {
   renderApp,
   serializeDiagnostics,
 } from "./main";
+import { LiveStore } from "./liveStore";
 import { Store } from "./store";
 import { isIrPane } from "./types";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
+import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 
 describe("byteLineStarts / lineCol (byte offsets)", () => {
   it("records the byte offset of each line start (ASCII)", () => {
@@ -307,5 +310,65 @@ describe("renderApp: pane visibility", () => {
         "hidden",
       ),
     ).toBe(true);
+  });
+});
+
+describe("an embedder's configuration", () => {
+  beforeAll(stubLayout);
+
+  /**
+   * A pin travels as a source position, not a `NodeId`: ids are minted per
+   * compile, which is why the values pane declines to persist a tag. A position
+   * in the text survives every compile of that text.
+   */
+  it("resolves a pin at a source position to the operators there", () => {
+    const store = new Store(fixture(arithmeticJson));
+    const live = new LiveStore();
+    const lineStarts = byteLineStarts(store.snapshot.source.text);
+
+    // The first line's first identifier — whatever `arithmetic` binds there.
+    const pinned = applyPins(store, live, [{ line: 1, col: 1 }], lineStarts);
+
+    expect(pinned).toBe(1);
+    const tags = live.get().tags;
+    expect(tags).toHaveLength(1);
+    expect(tags[0]?.nodes.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * A deck whose program has moved on opens with fewer pins rather than an
+   * error in front of an audience.
+   */
+  it("skips a position that names no operator", () => {
+    const store = new Store(fixture(arithmeticJson));
+    const live = new LiveStore();
+    const lineStarts = byteLineStarts(store.snapshot.source.text);
+
+    expect(applyPins(store, live, [{ line: 9999, col: 1 }], lineStarts)).toBe(0);
+    expect(live.get().tags).toHaveLength(0);
+  });
+
+  /**
+   * The hidden set an embedder asks for wins over the stored one: it is asking
+   * for a layout on this page, where the stored set is what some other reader
+   * last chose.
+   */
+  it("opens with the panes an embedder hid", () => {
+    const root = document.createElement("div");
+    const store = new Store(fixture(arithmeticJson));
+    const hidden = ["pre-inference", "post-inference"];
+    renderApp(root, store, undefined, { hiddenPanes: hidden });
+
+    const paneIds = (selector: string) =>
+      Array.from(root.querySelectorAll(selector)).map(
+        (p) => (p as HTMLElement).dataset.paneId,
+      );
+    const shown = paneIds(".panel:not(.hidden)");
+    const all = paneIds(".panel");
+
+    expect(all).toEqual(expect.arrayContaining(hidden));
+    for (const id of hidden) expect(shown).not.toContain(id);
+    expect(shown).toContain("source");
+    expect(shown.length).toBe(all.length - hidden.length);
   });
 });
