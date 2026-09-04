@@ -30,6 +30,7 @@ import {
 } from "./paneVisibility";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
+import { ElkLayout } from "./graph/elk";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
 import { LiveStore, connectLive } from "./liveStore";
@@ -230,7 +231,10 @@ export function describePanes(
         paneClass: "tree",
         copyText: () => serializeOperatorGraph(pane),
         mount: (body) => {
-          if (pane.nodes.length > 0) new OperatorView(body, store, pane);
+          // The one place the layout engine is named. `OperatorView` takes the
+          // contract, so the licensed dependency reaches the pane from here and
+          // from nowhere else — see `graph/NOTICE`.
+          if (pane.nodes.length > 0) new OperatorView(body, store, pane, new ElkLayout());
         },
       });
       continue;
