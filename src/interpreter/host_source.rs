@@ -90,6 +90,11 @@ impl HostSource {
         self.pending = true;
     }
 
+    /// The CCL type of one row, as declared.
+    pub fn row_type(&self) -> &Type {
+        &self.row_type
+    }
+
     /// Rows held and not yet released, in arrival order.
     pub fn rows_held(&self) -> usize {
         self.buf.retained_keys().len()

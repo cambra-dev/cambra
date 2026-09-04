@@ -76,6 +76,44 @@ annotation. `channels::parse_type` pairs `chl_parser::parse_expression` with `lo
 compiled, so there is nothing to resolve a `Type::DataSource` against, and one appearing there is an
 error rather than a lookup failure.
 
+## Driving a program from a terminal
+
+`src/host_driver.rs` is the host the binary supplies: rows arrive as JSON lines on stdin and leave
+as JSON lines on stdout, one object per line.
+
+```text
+in   {"source": "price_updates", "rows": [{"ticker": "BTC-USD", "price": 8169291000000}]}
+out  {"sink": "btc_line", "rows": [{"qty": 2, "price": 8169291000000, "total": 16338582000000}]}
+```
+
+The declarations travel beside the program as `channels.json` (`ChannelFile`), so `cambra
+prog.cambra` runs, inspects and dumps a channel program from a path like any other — which is also
+how the golden sweep reaches one.
+
+Three properties the loop has, each of which the alternative gets wrong:
+
+**One line is one host event.** The loop pushes at most one input line per tick. A program's answer
+depends on what has already committed, so draining a backlog into one tick commits those rows
+together, and a view request that followed a price in the input reads the value from before it.
+
+**A malformed line is skipped, not fatal.** A host that sends one bad row has not stopped being a
+host, and a driver that exits on it loses every row after it.
+
+**End of input drains rather than stops.** A reader fires a tick or more after the write it reads,
+so the loop runs on until the program has been quiet for a fixed number of ticks. A program reading
+a socket has no end of input and keeps running.
+
+Numbers cross as JSON, so an `Int` outside ±(2⁵³−1) is rejected at the boundary rather than
+arriving rounded; scaled prices stay well inside it. A missing field, an extra field or a field of
+the wrong type is an error — filling a default would put a value in the program the host never
+sent, and ignoring an extra one would hide a host that believes it is sending something nothing
+reads.
+
+This is development plumbing. It exists so the app and the inspector can be built against `cargo
+run` before the WebAssembly host is ready, and so a channel program in the gallery can be driven by
+a subprocess test the way `streaming_echo` drives real stdin. A program with declared channels does
+not also read `stdin()`: stdin is the channel transport for the length of the run.
+
 ## Replay
 
 Keys are minted from arrival order and nothing else, so a fresh source fed the same rows in the same

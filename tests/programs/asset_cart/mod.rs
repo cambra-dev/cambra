@@ -331,3 +331,35 @@ fn asset_cart_needs_the_channels_declared_beside_it() {
         "the rejection names the unbound source; got: {rendered}"
     );
 }
+
+/// The binary is a host: JSON rows in, JSON rows out.
+///
+/// The in-process tests above push rows straight into the sources, which skips
+/// everything between a program on a path and a running one — the declaration
+/// file, the row codec and the drive loop. This drives the real binary the way
+/// `streaming_echo` drives real stdin.
+///
+/// One line is one host event, so the view request lands after the price it
+/// should see rather than committing alongside it.
+#[test]
+fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
+    let input = concat!(
+        r#"{"source":"cart_changes","rows":[{"ticker":"BTC-USD","qty":2}]}"#,
+        "\n",
+        r#"{"source":"price_updates","rows":[{"ticker":"BTC-USD","price":8169291000000}]}"#,
+        "\n",
+        r#"{"source":"price_updates","rows":[{"ticker":"DOGE-USD","price":100}]}"#,
+        "\n",
+        r#"{"source":"view_requests","rows":[true]}"#,
+        "\n",
+    );
+    super::common::expect_channel_program(
+        "asset_cart",
+        "v0.cambra",
+        input,
+        &[
+            r#"{"sink":"btc_line","rows":[{"price":8169291000000,"qty":2,"total":16338582000000}]}"#,
+            r#"{"sink":"eth_line","rows":[{"price":0,"qty":0,"total":0}]}"#,
+        ],
+    );
+}

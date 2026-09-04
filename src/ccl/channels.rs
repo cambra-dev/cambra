@@ -19,7 +19,9 @@ use crate::ccl::Type;
 use crate::ccl::context::GlobalContext;
 use crate::ccl::lower::{LoweringContext, lower_type_expr};
 use crate::chl_parser;
-use crate::interpreter::{Extent, HostSink, HostSource, operator_conversion::ground_extent_of};
+use crate::interpreter::{
+    BaseType, Extent, HostSink, HostSource, Value, operator_conversion::ground_extent_of,
+};
 
 /// Which way rows cross a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +165,97 @@ pub fn parse_type(source: &str) -> Result<Type, String> {
     lower_type_expr(&parsed, &mut ctx).map_err(|e| e.to_string())
 }
 
+/// The largest integer a JSON number carries exactly.
+///
+/// A row crosses as JSON, and a JavaScript host's numbers are `f64`. An `Int`
+/// outside this range would arrive at the program as a different number than
+/// the host sent, so it is rejected at the boundary rather than silently
+/// rounded. Scaled prices — dollars × 10⁸ — stay inside it for any plausible
+/// price.
+const JSON_SAFE_INT: i64 = 9_007_199_254_740_991;
+
+/// Decode one JSON row against the channel's declared row type.
+///
+/// A missing field, an extra field, or a field of the wrong type is an error.
+/// Filling a missing field with a default would put a value in the program that
+/// the host never sent, and ignoring an extra one would hide a host that
+/// believes it is sending something the program cannot see.
+pub fn row_from_json(json: &serde_json::Value, ty: &Type) -> Result<Value, String> {
+    match ty {
+        Type::Base(BaseType::Int) => integer(json).map(Value::Int),
+        Type::Base(BaseType::UInt) => {
+            let n = integer(json)?;
+            usize::try_from(n)
+                .map(Value::UInt)
+                .map_err(|_| format!("expected a non-negative integer, got {n}"))
+        }
+        Type::Base(BaseType::String) => json
+            .as_str()
+            .map(|s| Value::String(s.into()))
+            .ok_or_else(|| format!("expected a string, got {json}")),
+        Type::Base(BaseType::Bool) => json
+            .as_bool()
+            .map(Value::Bool)
+            .ok_or_else(|| format!("expected a boolean, got {json}")),
+        Type::Base(BaseType::Unit) => Ok(Value::Unit),
+        Type::Record(fields) => {
+            let object = json
+                .as_object()
+                .ok_or_else(|| format!("expected an object, got {json}"))?;
+            let mut row = HashMap::with_capacity(fields.len());
+            for (name, field_type) in fields {
+                let field = object
+                    .get(name)
+                    .ok_or_else(|| format!("missing field '{name}'"))?;
+                let decoded =
+                    row_from_json(field, field_type).map_err(|e| format!("field '{name}': {e}"))?;
+                row.insert(name.clone(), decoded);
+            }
+            if let Some(extra) = object.keys().find(|k| !row.contains_key(*k)) {
+                return Err(format!("unknown field '{extra}'"));
+            }
+            Ok(Value::Record(row))
+        }
+        other => Err(format!("no JSON encoding for the row type {other}")),
+    }
+}
+
+/// The integer `json` carries, if it carries one exactly.
+fn integer(json: &serde_json::Value) -> Result<i64, String> {
+    let n = json
+        .as_i64()
+        .ok_or_else(|| format!("expected an integer, got {json}"))?;
+    if n.abs() > JSON_SAFE_INT {
+        return Err(format!(
+            "{n} is outside the range a JSON number carries exactly (±{JSON_SAFE_INT})"
+        ));
+    }
+    Ok(n)
+}
+
+/// Encode one row a sink produced as JSON.
+///
+/// The inverse of [`row_from_json`] over the types a channel can declare. A
+/// value of any other shape is a program the sink's declared type did not
+/// describe, and says so rather than encoding something the host cannot read.
+pub fn row_to_json(value: &Value) -> Result<serde_json::Value, String> {
+    match value {
+        Value::Int(n) => Ok(serde_json::Value::from(*n)),
+        Value::UInt(n) => Ok(serde_json::Value::from(*n)),
+        Value::String(s) => Ok(serde_json::Value::from(s.as_str())),
+        Value::Bool(b) => Ok(serde_json::Value::from(*b)),
+        Value::Unit => Ok(serde_json::Value::Object(serde_json::Map::new())),
+        Value::Record(fields) => {
+            let mut object = serde_json::Map::with_capacity(fields.len());
+            for (name, field) in fields {
+                object.insert(name.clone(), row_to_json(field)?);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        other => Err(format!("no JSON encoding for the value {other:?}")),
+    }
+}
+
 /// A channel's row type, as both halves the runtime needs.
 fn row_type_of(decl: &ChannelDecl) -> Result<(Type, Extent), ChannelError> {
     let ty = parse_type(&decl.row_type).map_err(|message| ChannelError::TypeSyntax {
@@ -285,6 +378,69 @@ mod tests {
         assert!(
             format!("{err}").contains("price_updates"),
             "the rejection names the channel; got: {err}"
+        );
+    }
+
+    fn price_row_type() -> Type {
+        parse_type("{ticker: String, price: Int}").expect("a record type parses")
+    }
+
+    #[test]
+    fn a_row_round_trips_through_json() {
+        let ty = price_row_type();
+        let json = serde_json::json!({"ticker": "BTC-USD", "price": 8_169_291_000_000i64});
+        let row = row_from_json(&json, &ty).expect("a well-formed row decodes");
+        assert_eq!(row_to_json(&row).expect("a decoded row encodes"), json);
+    }
+
+    /// A missing field is an error rather than a default, so a program never
+    /// sees a value its host did not send.
+    #[test]
+    fn a_missing_field_is_rejected() {
+        let err = row_from_json(&serde_json::json!({"ticker": "BTC-USD"}), &price_row_type())
+            .expect_err("a row missing a declared field is rejected");
+        assert!(
+            err.contains("price"),
+            "the rejection names the field: {err}"
+        );
+    }
+
+    /// An extra field is an error rather than ignored, so a host that believes
+    /// it is sending something finds out that nothing reads it.
+    #[test]
+    fn an_unknown_field_is_rejected() {
+        let json = serde_json::json!({"ticker": "BTC-USD", "price": 1, "volume": 2});
+        let err = row_from_json(&json, &price_row_type())
+            .expect_err("a row with an undeclared field is rejected");
+        assert!(
+            err.contains("volume"),
+            "the rejection names the field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_type_is_rejected() {
+        let json = serde_json::json!({"ticker": "BTC-USD", "price": "cheap"});
+        let err = row_from_json(&json, &price_row_type())
+            .expect_err("a string where an Int is declared is rejected");
+        assert!(
+            err.contains("price"),
+            "the rejection names the field: {err}"
+        );
+    }
+
+    /// An integer a JSON number cannot carry exactly is rejected at the
+    /// boundary rather than arriving rounded.
+    #[test]
+    fn an_integer_beyond_json_precision_is_rejected() {
+        let ty = Type::Base(BaseType::Int);
+        assert_eq!(
+            row_from_json(&serde_json::json!(JSON_SAFE_INT), &ty),
+            Ok(Value::Int(JSON_SAFE_INT))
+        );
+        assert!(
+            row_from_json(&serde_json::json!(JSON_SAFE_INT + 1), &ty).is_err(),
+            "an integer past 2^53 - 1 does not survive a JSON round trip"
         );
     }
 

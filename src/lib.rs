@@ -2,6 +2,7 @@
 
 pub mod ccl;
 pub mod chl_parser;
+pub mod host_driver;
 pub mod inspector_model;
 pub mod inspector_server;
 pub mod interpreter;
