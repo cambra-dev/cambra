@@ -284,6 +284,46 @@ pub trait DataSourceDomainExtentImpl {
     /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
     fn release(&mut self, producer: &str, obsolete: Predicate);
+    /// Record what every current producer has released, so a producer
+    /// registering with this source from now on starts there rather than at the
+    /// oldest value it still holds.
+    ///
+    /// Called when a running program is replaced
+    /// ([`LiveProgram::update`](crate::live_program::LiveProgram::update)). The
+    /// operators the replacement rebuilds register as new producers, and a source
+    /// hands a newly-registered one everything it has retained, so without this
+    /// the replacement recomputes the program's history instead of continuing it
+    /// and re-emits an output for every input the replaced version answered.
+    ///
+    /// What is carried is the *agreed* release — the part every producer is
+    /// finished with — so an element that arrived but went unhandled is still
+    /// delivered to whoever takes over.
+    ///
+    /// There is no default: a source that silently did not carry would replay its
+    /// history into the replacement, which reads as the program answering every
+    /// request it had already answered.
+    fn carry_release_to_new_producers(&mut self);
+
+    /// The first position a producer registering with this source from now on
+    /// will be offered.
+    ///
+    /// A store built over this source starts here rather than at `0`: the source
+    /// will never offer the positions below it, and a drive based lower waits for
+    /// an element that is not coming. `0` for a source that has released nothing,
+    /// which is every source of a program's first version, so this is `0`
+    /// wherever there is no predecessor to have advanced it.
+    ///
+    /// The exception is a store resuming a predecessor over this same source,
+    /// which starts at *its* frontier instead — deliberately behind this, because
+    /// a drive reads one position back through its input and the source still owes
+    /// the replacement an element the recurrence has already decided.
+    ///
+    /// There is no default, for the same reason
+    /// [`carry_release_to_new_producers`](Self::carry_release_to_new_producers)
+    /// has none: a source that answered `0` when it had advanced would base a
+    /// drive below every position it will offer, and the drive would wait for an
+    /// element that is not coming.
+    fn first_position_for_a_new_producer(&self) -> usize;
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {

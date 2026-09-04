@@ -1,5 +1,8 @@
 use log::trace;
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::{Rc, Weak},
+};
 
 use super::*;
 use crate::{
@@ -63,10 +66,96 @@ struct FanOutShared {
     consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
+    /// What every subscriber had agreed to release the last time one released,
+    /// and so what this fan-out has already passed upstream.
+    ///
+    /// A subscriber registering from now on starts here rather than at nothing.
+    /// The region is gone: the fan-out told its input it would not be read again,
+    /// so the input is free to have dropped it and a late subscriber that claimed
+    /// to still want it would hold the intersection back at a frontier no one is
+    /// waiting on. Within one version every subscription is made before any data
+    /// flows, so this is the empty guard and seeding from it changes nothing;
+    /// across a version handover it is what a rebuilt subscriber inherits from the
+    /// one it replaces.
+    released: TileGuard,
+    /// Each subscriber's slot number, parallel to [`release_guards`] and
+    /// [`consumers`].
+    ///
+    /// The [`FanOutProducer`] a subscription handed out owns the strong side, so
+    /// a dead entry means that subscriber's producer has been dropped. Its slot
+    /// is then skipped: it neither blocks the release intersection nor gets
+    /// notified.
+    ///
+    /// A `Cell<usize>` rather than a bare token because the slot number *is* the
+    /// subscription's identity, and [`compact`](Self::compact) renumbers. A
+    /// producer reads its index out of the cell it shares with this entry, so
+    /// dropping dead slots stays compatible with addressing a guard by index:
+    /// the survivors are told their new numbers. Without that the list would
+    /// grow by one dead slot per replaced subscriber on every update, forever,
+    /// and both the notify walk and the release intersection scan it.
+    ///
+    /// [`release_guards`]: FanOutShared::release_guards
+    /// [`consumers`]: FanOutShared::consumers
+    subscribers: Vec<Weak<Cell<usize>>>,
     /// Re-entrancy bookkeeping for cyclic op graphs.  `None` for non-cyclic
     /// fan-outs (the overwhelming majority); `Some` only when constructed
     /// via [`FanOut::new_cyclic`].
     reentrancy: Option<FanOutReentrancy>,
+}
+
+impl FanOutShared {
+    /// The slots whose subscriber still exists, in subscription order.
+    fn live_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.subscribers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.strong_count() > 0)
+            .map(|(i, _)| i)
+    }
+
+    /// Drop every slot whose subscriber is gone, renumbering the survivors.
+    ///
+    /// Each surviving producer learns its new index through the `Cell` it shares
+    /// with its entry in [`subscribers`](Self::subscribers), so the three
+    /// parallel vectors stay bounded by the number of live subscriptions rather
+    /// than by the number ever made.
+    ///
+    /// Safe only when no producer is mid-pull, since a renumber between a
+    /// producer reading its index and using it would address another
+    /// subscriber's guard. [`FanOut::reopen`] is the one caller, and it runs at a
+    /// version handover with the graph already torn down.
+    fn compact(&mut self) {
+        // Upgrade once: `keep` and the renumbering must agree on which slots are
+        // live, and reading liveness twice would let them disagree.
+        let live: Vec<_> = self.subscribers.iter().map(Weak::upgrade).collect();
+        if live.iter().all(Option::is_some) {
+            return;
+        }
+        for (next, cell) in live.iter().flatten().enumerate() {
+            cell.set(next);
+        }
+        let keep: Vec<bool> = live.iter().map(Option::is_some).collect();
+        retain_flagged(&mut self.subscribers, &keep);
+        retain_flagged(&mut self.consumers, &keep);
+        retain_flagged(&mut self.release_guards, &keep);
+        debug_assert_eq!(
+            self.consumers.len(),
+            self.subscribers.len(),
+            "consumers stay parallel to subscribers"
+        );
+        debug_assert_eq!(
+            self.release_guards.len(),
+            self.subscribers.len(),
+            "release guards stay parallel to subscribers"
+        );
+    }
+}
+
+/// Keep the elements of `v` whose flag in `keep` is set, in order.
+fn retain_flagged<T>(v: &mut Vec<T>, keep: &[bool]) {
+    debug_assert_eq!(v.len(), keep.len(), "one flag per element");
+    let mut flags = keep.iter();
+    v.retain(|_| *flags.next().unwrap_or(&false));
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
@@ -165,6 +254,8 @@ impl FanOut {
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
+            released: tiling.empty_guard(),
+            subscribers: Vec::new(),
             reentrancy,
         }));
         Self {
@@ -191,6 +282,48 @@ impl FanOut {
 
     pub fn tiling(&self) -> &Tiling {
         &self.tiling
+    }
+
+    /// The tile this fan-out most recently served, for a cyclic fan-out;
+    /// `None` for an ordinary one, which keeps no memo.
+    ///
+    /// Reads the cyclic-mode memo rather than pulling the input, so it is safe
+    /// wherever the graph is not mid-traversal and observes exactly what the
+    /// fan's consumers last saw. A store's value is carried on its fan, so this
+    /// is how a version replacing this program reads what its variables hold
+    /// without a second channel out of the operator.
+    pub fn cached_tile(&self) -> Option<Tile> {
+        self.shared
+            .borrow()
+            .reentrancy
+            .as_ref()
+            .map(|r| r.cached_tile.clone())
+    }
+
+    /// Whether every subscriber has released everything this fan-out could
+    /// offer.
+    ///
+    /// Such a fan-out answers empty from here on: it has told its input that
+    /// nothing will be read again, and a `Memo` input drops what it holds in
+    /// response. A version handing its operators on offers only the ones that can
+    /// still produce, since adopting this one binds a name to nothing.
+    pub fn released_in_full(&self) -> bool {
+        self.shared.borrow().released.is_universal()
+    }
+
+    /// Reopen this fan-out for a fresh set of branches, keeping the inner
+    /// producer and everything it has accumulated.
+    ///
+    /// For carrying one operator across a program update. Only the
+    /// [`inspect`](TileOperator::inspect) bookkeeping resets: which branch
+    /// renders the input subtree and which renders a back-reference. The
+    /// subscriptions need no attention, because each is tied to the life of the
+    /// producer it handed out ([`FanOutShared::subscribers`]) — a subscriber the
+    /// update dropped stops counting on its own, and one the update carried
+    /// forward keeps its guard.
+    pub fn reopen(&self) {
+        *self.used.borrow_mut() = false;
+        self.shared.borrow_mut().compact();
     }
 }
 
@@ -229,14 +362,17 @@ impl TileOperator for FanOutBranch {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // Register the consumer and reserve its release-guard slot.
-        let index = {
+        // Register the consumer and reserve its release-guard slot. The slot
+        // number lives in the cell the producer holds, so `compact` can renumber.
+        let slot = Rc::new(Cell::new(0usize));
+        {
             let mut shared = self.shared.borrow_mut();
-            let index = shared.consumers.len();
+            slot.set(shared.consumers.len());
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
-            shared.release_guards.push(self.tiling.empty_guard());
-            index
-        }; // borrow released here before we might call input.subscribe
+            let carried = shared.released.clone();
+            shared.release_guards.push(carried);
+            shared.subscribers.push(Rc::downgrade(&slot));
+        } // borrow released here before we might call input.subscribe
 
         // Decide whether *this* call should drive the inner subscribe.
         // `producer.is_none()` is the standard "first subscription" check;
@@ -283,7 +419,13 @@ impl TileOperator for FanOutBranch {
                     // prevents a re-entrant panic when a consumer (e.g.
                     // SinkConsumer) calls FanOutProducer::get_impl(), which
                     // needs shared.borrow_mut() for the same Rc.
-                    let consumers = shared_rc.borrow().consumers.clone();
+                    let consumers = {
+                        let shared = shared_rc.borrow();
+                        shared
+                            .live_indices()
+                            .map(|i| shared.consumers[i].clone())
+                            .collect::<Vec<_>>()
+                    };
                     for c in &consumers {
                         c.borrow_mut().notify();
                     }
@@ -297,7 +439,7 @@ impl TileOperator for FanOutBranch {
         Box::new(FanOutProducer {
             base: ProducerBase::new(self.shared.borrow().id, &self.tiling),
             shared: self.shared.clone(),
-            index,
+            slot,
         })
     }
 
@@ -310,15 +452,30 @@ struct FanOutProducer {
     base: ProducerBase,
     /// Shared state (consumers + release guards).
     shared: Rc<RefCell<FanOutShared>>,
-    /// This producer's index into `shared.consumers` and `shared.release_guards`.
-    index: usize,
+    /// This producer's index into `shared.consumers` and `shared.release_guards`,
+    /// and the token that keeps its slot counted for as long as the producer
+    /// exists — one object, since the index *is* the subscription's identity.
+    /// Written by [`FanOutShared::compact`]. See [`FanOutShared::subscribers`].
+    // shared-state-ok: which slot this subscription owns — bookkeeping between a
+    // producer and the fan-out it subscribed to, not a back channel for data. No
+    // tile, tile guard, or program value passes through it; a producer only reads
+    // it to index its own release guard, which it would have done with a plain
+    // `usize` if dead slots never had to be reclaimed.
+    slot: Rc<Cell<usize>>,
+}
+
+impl FanOutProducer {
+    /// This producer's current slot number.
+    fn index(&self) -> usize {
+        self.slot.get()
+    }
 }
 
 impl TileProducer for FanOutProducer {
     impl_producer_base!();
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        if self.index == 0 {
+        if self.index() == 0 {
             InspectNode::new(self.name())
                 .with_tiling(self.tiling().to_string())
                 .child(
@@ -396,7 +553,7 @@ impl TileProducer for FanOutProducer {
         // Filter by the stored obsolete guard. Because upstream retains data according to the
         // intersection of all obsolete guards, it may have more data than this specific consumer
         // is interested in.
-        let guard = self.shared.borrow().release_guards[self.index].clone();
+        let guard = self.shared.borrow().release_guards[self.index()].clone();
         trace!("{} removing {guard:?} from {result:?}", self.name());
         result.remove_guarded(guard);
         result
@@ -408,13 +565,20 @@ impl TileProducer for FanOutProducer {
         // delivered data grows monotonically.  Replacing (instead of union-ing)
         // would forget previously-released ranges, causing FanOutBranch to
         // re-deliver data that a consumer has already released.
-        let accumulated = shared.release_guards[self.index].union(&obsolete_guard);
-        shared.release_guards[self.index] = accumulated;
+        let index = self.index();
+        let accumulated = shared.release_guards[index].union(&obsolete_guard);
+        shared.release_guards[index] = accumulated;
+        // Only live subscribers constrain the release. A subscriber whose
+        // producer has been dropped never releases again, so counting its guard
+        // would hold the intersection wherever that subscriber left it and the
+        // input would retain everything from there on.
         let intersection = shared
-            .release_guards
-            .iter()
-            .fold(self.tiling().universal_guard(), |acc, g| acc.intersect(g));
+            .live_indices()
+            .fold(self.tiling().universal_guard(), |acc, i| {
+                acc.intersect(&shared.release_guards[i])
+            });
         trace!("{} releasing: {intersection:?}", self.name());
+        shared.released = intersection.clone();
         // In cyclic mode the inner producer can be temporarily taken out
         // by a sibling-branch `get_impl`; skip the inner release in that
         // case (the next non-reentrant release will recompute and
@@ -548,7 +712,92 @@ impl TileProducer for MemoProducer {
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::QuietSpy;
-    use crate::interpreter::{BaseType, ColumnValue, Extent};
+    use crate::interpreter::tile_operators::{Constant, Scheduler};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+
+    /// Reopening a fan-out drops the slots whose subscribers are gone and tells
+    /// each survivor its new number, so the parallel slot vectors are bounded by
+    /// the live subscriptions rather than by every subscription ever made.
+    ///
+    /// The renumbering is the whole point: a producer addresses its release guard
+    /// by index, so a compaction that moved guards without telling the producers
+    /// would hand one subscriber another's guard. This drops the *first* of two
+    /// subscribers for that reason — the survivor has to move from slot 1 to slot
+    /// 0 and keep the guard it released.
+    #[test]
+    fn reopening_a_fan_out_drops_dead_slots_and_renumbers_the_rest() {
+        let extent = Extent::Base(BaseType::Int);
+        let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
+        let mut sched = Scheduler::new();
+        let tiling = Tiling::Scalar(extent);
+
+        let first = fan
+            .branch()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+        let mut second = fan
+            .branch()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+        assert_eq!(fan.shared.borrow().subscribers.len(), 2);
+
+        // Distinguish the survivor's guard from the empty one the dead slot holds.
+        let mine = TileGuard::Scalar(true);
+        second.release(mine.clone());
+        drop(first);
+
+        fan.reopen();
+
+        let shared = fan.shared.borrow();
+        assert_eq!(shared.subscribers.len(), 1, "the dead slot is gone");
+        assert_eq!(shared.consumers.len(), 1, "consumers stay parallel");
+        assert_eq!(shared.release_guards.len(), 1, "guards stay parallel");
+        drop(shared);
+        assert_eq!(
+            fan.shared.borrow().release_guards[0],
+            mine,
+            "the survivor's guard moved with it, and it reads its new slot"
+        );
+    }
+
+    /// A subscriber that registers after the fan-out has released starts having
+    /// released the same, because that data is gone: the fan-out told its input
+    /// it would not be read again.
+    ///
+    /// Within one version every subscription is made before any data flows, so
+    /// this only bites across a version handover — which is exactly when it has
+    /// to, since the subscriber registering is the one replacing the subscriber
+    /// that released.
+    #[test]
+    fn a_late_subscriber_starts_at_what_the_fan_out_has_released() {
+        let extent = Extent::Base(BaseType::Int);
+        let fan = FanOut::new(Box::new(Constant::new(Value::Int(1), extent.clone())));
+        let mut sched = Scheduler::new();
+        let tiling = Tiling::Scalar(extent);
+
+        let mut first = fan
+            .branch()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+        assert!(
+            !fan.released_in_full(),
+            "nothing has released, so the fan-out still has its value to give"
+        );
+        first.release(TileGuard::Scalar(true));
+        drop(first);
+        fan.reopen();
+
+        assert!(
+            fan.released_in_full(),
+            "the one subscriber released everything, so the fan-out can only answer empty"
+        );
+        let late = fan
+            .branch()
+            .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
+        assert_eq!(
+            fan.shared.borrow().release_guards[0],
+            TileGuard::Scalar(true),
+            "the late subscriber inherits the release rather than starting at nothing"
+        );
+        drop(late);
+    }
 
     /// A `Memo` releases its input universally as soon as the input hands over a
     /// complete tile, and from then on the cache is the value: repeated pulls

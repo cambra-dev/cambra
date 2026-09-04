@@ -86,6 +86,7 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/mod.rs", "shared cell of `C`"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
+    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),

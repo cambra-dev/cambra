@@ -79,6 +79,7 @@ use cambra::{
         ColumnValue, Consumer, FuncBinding, Tile, Value, bindings_are_list,
         tile_operators::scalar_tile_to_column_value,
     },
+    live_program::LiveProgram,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +246,19 @@ pub fn compile_sink(source: &str) -> GlobalContext {
     ctx
 }
 
+/// Start `source` as a [`LiveProgram`], for a test that replaces it with
+/// another version.
+///
+/// [`compile_sink`] is the right helper when a test only runs one version. This
+/// one hands back the program, which [`LiveProgram::update`] needs and which the
+/// caller must keep alive alongside the context.
+pub fn start_sink(source: &str) -> (GlobalContext, LiveProgram) {
+    let mut ctx = GlobalContext::default();
+    let program = LiveProgram::start(&mut ctx, source, &|| Box::new(|| {}))
+        .unwrap_or_render("<test>", source);
+    (ctx, program)
+}
+
 /// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the
 /// library, behind `test-helpers`, so this crate and `tests/http_server.rs`
 /// share one implementation — see [`reserve_test_port`] for why the naive
@@ -274,7 +288,21 @@ pub fn http_post(port: u16, path: &str, body: &str) -> String {
     raw_http(port, &request)
 }
 
-fn raw_http(port: u16, request: &str) -> String {
+pub fn raw_http(port: u16, request: &str) -> String {
+    raw_http_response(port, request)
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default()
+}
+
+/// Send `request` and return the whole response, status line and headers
+/// included.
+///
+/// [`raw_http`] answers with the body, which is what a test about a program's
+/// output wants. Use this one where the status code is the contract — the control
+/// port distinguishes an accepted request from a rejected one by status, and a
+/// body-only reading cannot tell them apart.
+pub fn raw_http_response(port: u16, request: &str) -> String {
     let mut stream =
         TcpStream::connect(format!("127.0.0.1:{port}")).expect("failed to connect to test server");
     stream
@@ -285,9 +313,7 @@ fn raw_http(port: u16, request: &str) -> String {
     stream
         .read_to_string(&mut raw)
         .expect("failed to read HTTP response");
-    raw.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default()
+    raw
 }
 
 /// Drive `ctx`'s scheduler on the current thread until `rx` delivers a

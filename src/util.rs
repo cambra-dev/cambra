@@ -171,6 +171,14 @@ impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> ScopeStack<K, V> {
         self.scopes.push(HashMap::new());
     }
 
+    /// Every binding in the stack, outermost scope first and innermost last.
+    ///
+    /// Order within one scope is unspecified — a scope is a `HashMap`, and two
+    /// bindings in one scope cannot share a key.
+    pub fn iter_bindings(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.scopes.iter().flat_map(|s| s.iter())
+    }
+
     /// Pop the innermost scope.
     ///
     /// Panics on underflow (unless already panicking).  Prefer the drop of a

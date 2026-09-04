@@ -51,14 +51,26 @@ type RouteMap = Arc<Mutex<HashMap<(String, String), RouteSender>>>;
 /// which returns a `Receiver` delivering matching requests.  Requests that do not match
 /// any registered route receive an immediate 404.
 ///
-/// The background dispatcher thread is spawned once on construction and runs until the
-/// server is dropped.
+/// The background dispatcher thread is spawned once on construction and runs until this
+/// handle is dropped, which is what releases the port. A program serves a port for as
+/// long as some version of it binds a route there; dropping the last handle closes the
+/// socket rather than leaving the address answering 404 forever (see
+/// [`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry)).
 pub struct SharedHttpServer {
     /// Routing table: `(method, path)` → sender half of each route's channel.
     ///
     /// Protected by a `Mutex` so that new routes can be registered after the
     /// dispatcher thread is already running.
     routes: RouteMap,
+
+    /// The listener, shared with the dispatcher thread.
+    ///
+    /// Held here as well as there so that dropping this handle can end the
+    /// thread: `unblock` makes its `recv` return an error, which is the shutdown
+    /// the loop already handles by telling every route `None`. Moving the server
+    /// into the thread alone would leave the port bound for the life of the
+    /// process, since nothing else can reach it to stop the loop.
+    server: Arc<Server>,
 }
 
 impl SharedHttpServer {
@@ -68,13 +80,15 @@ impl SharedHttpServer {
     /// returned immediately at construction rather than causing a silent hang
     /// after the program appears to start successfully.
     pub fn new(port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let server = Server::http(format!("0.0.0.0:{port}"))?;
+        let server = Arc::new(Server::http(format!("0.0.0.0:{port}"))?);
         debug!("HTTP server listening on 0.0.0.0:{port}");
 
         let routes: RouteMap = Arc::new(Mutex::new(HashMap::new()));
         let routes_bg = routes.clone();
+        let server_bg = server.clone();
 
         thread::spawn(move || {
+            let server = server_bg;
             loop {
                 match server.recv() {
                     Ok(mut request) => {
@@ -117,7 +131,7 @@ impl SharedHttpServer {
             }
         });
 
-        Ok(Self { routes })
+        Ok(Self { routes, server })
     }
 
     /// Register a new `(method, path)` route and return the `Receiver` for incoming requests.
@@ -132,6 +146,117 @@ impl SharedHttpServer {
         let (tx, rx) = mpsc::channel();
         self.routes.lock().unwrap().insert((method, path), tx);
         rx
+    }
+
+    /// Stop dispatching `method path`, so requests to it get the dispatcher's
+    /// 404 rather than being buffered for a reader that no longer exists.
+    ///
+    /// A route outlives the version of the program that opened it — the listener
+    /// and its table entry are held by the source/sink registry, not by the
+    /// operator graph — so a version that stops serving one has to say so.
+    /// Without this the route still matches, still buffers, and the client waits
+    /// on a reply nobody will compute.
+    pub fn unregister(&self, method: &str, path: &str) {
+        self.routes
+            .lock()
+            .unwrap()
+            .remove(&(method.to_string(), path.to_string()));
+    }
+}
+
+/// An `http_serve` route a compilation named but did not open.
+///
+/// A compile that only answers a question — `/diff`, and the planned tree the
+/// state guard reads — runs against the endpoints the program already holds. A
+/// version it is asked about may name a route the program does not serve, and
+/// opening one would make asking change what the program does: it binds a socket
+/// and registers a route that outlive the throwaway context, so the address
+/// starts answering for a version nobody installed and the real compile then
+/// fails to bind the port it just took.
+///
+/// So such a route lowers to this instead. It answers the type questions lowering
+/// and inference put to a source and nothing else, which is all a compile that
+/// stops above operator conversion asks. Reaching a runtime method means one
+/// escaped into an operator graph, so each is [`unreachable`].
+pub struct UnopenedRoute {
+    id: String,
+}
+
+impl UnopenedRoute {
+    pub fn new(id: String) -> Self {
+        Self { id }
+    }
+}
+
+impl DataSourceDomainExtentImpl for UnopenedRoute {
+    fn get_id(&self) -> &str {
+        &self.id
+    }
+
+    fn element_extent(&self) -> Extent {
+        Extent::Base(BaseType::UInt)
+    }
+
+    fn output_value_extent(&self) -> Extent {
+        Extent::Base(BaseType::String)
+    }
+
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
+    }
+
+    fn check_for_new_data(&mut self) -> bool {
+        unreachable!("`{}` was never opened, so nothing drives it", self.id)
+    }
+
+    fn get_yield_predicate(&self) -> Predicate {
+        unreachable!("`{}` was never opened, so it yields nothing", self.id)
+    }
+
+    fn get_elements(&self, _producer: &str) -> ColumnValue {
+        unreachable!("`{}` was never opened, so it holds no elements", self.id)
+    }
+
+    fn get(&self, _keys: ColumnValue) -> ColumnValue {
+        unreachable!("`{}` was never opened, so it answers no key", self.id)
+    }
+
+    fn release(&mut self, _producer: &str, _obsolete: Predicate) {
+        unreachable!(
+            "`{}` was never opened, so nothing subscribed to it",
+            self.id
+        )
+    }
+
+    fn carry_release_to_new_producers(&mut self) {
+        unreachable!(
+            "`{}` was never opened, so it has no release to carry",
+            self.id
+        )
+    }
+
+    fn first_position_for_a_new_producer(&self) -> usize {
+        unreachable!("`{}` was never opened, so it offers no position", self.id)
+    }
+}
+
+/// The reply sink of an [`UnopenedRoute`]. Dispatching to it would mean a version
+/// nobody installed answering a request.
+pub struct UnopenedRouteSink;
+
+impl DataSink for UnopenedRouteSink {
+    fn process(&self, _tile: &Tile) {
+        unreachable!("a route that was never opened has no client to answer");
+    }
+}
+
+impl Drop for SharedHttpServer {
+    fn drop(&mut self) {
+        // Ends the dispatcher thread, which is what drops its `Arc<Server>` and
+        // so closes the listener. `recv` returns an error, and the loop's error
+        // arm already sends `None` to every remaining route — the shutdown signal
+        // [`register`] documents.
+        self.server.unblock();
     }
 }
 
@@ -431,5 +556,13 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn release(&mut self, producer: &str, obsolete: Predicate) {
         self.buf.release(producer, obsolete);
+    }
+
+    fn carry_release_to_new_producers(&mut self) {
+        self.buf.releases.carry_to_new_producers();
+    }
+
+    fn first_position_for_a_new_producer(&self) -> usize {
+        self.buf.first_index_for_a_new_producer()
     }
 }

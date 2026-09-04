@@ -88,7 +88,10 @@ use crate::{
         Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt,
         VariantPayload as ChlVariantPayload,
     },
-    interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},
+    interpreter::{
+        DataSink, DataSourceDomainExtentImpl,
+        http_server::{SharedHttpServer, UnopenedRoute, UnopenedRouteSink},
+    },
 };
 
 mod comprehension;
@@ -248,6 +251,35 @@ impl LoweringResult {
 // Lowering context
 // ---------------------------------------------------------------------------
 
+/// What a pass may do with an `http_serve` route the source/sink registry does not
+/// already hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Endpoints {
+    /// Open it. The pass is compiling the version that will serve it, and serving
+    /// an address the previous version did not is what adding an endpoint means.
+    #[default]
+    Open,
+    /// Leave it unopened, and lower it to an
+    /// [`UnopenedRoute`](crate::interpreter::http_server::UnopenedRoute).
+    ///
+    /// For a pass that answers a question rather than installing a version — a
+    /// `/diff`, or the planned tree the state guard reads. Its context is thrown
+    /// away, but a socket and a routing-table entry are not: opening one would
+    /// make *asking* change what the program serves, and would leave the port
+    /// taken when the pass that installs the version comes to bind it.
+    Inherited,
+}
+
+/// One `http_serve` route as lowering knows it: its reply sink and the address
+/// it serves.
+#[derive(Clone)]
+pub struct LoweredRoute {
+    pub(super) sink: Arc<dyn DataSink>,
+    pub(super) port: u16,
+    pub(super) method: String,
+    pub(super) path: String,
+}
+
 /// Context for CHL → CCL lowering that carries registered data sources and sinks.
 ///
 /// Zero-argument function calls whose name appears in `sources` are lowered to
@@ -287,6 +319,33 @@ pub struct LoweringContext {
     /// `pub(super)` so the statement submodule's `http_serve` wiring can create
     /// and reuse the per-port server.
     pub(super) shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+
+    /// Every `http_serve` route this context knows: those seeded from the
+    /// registry and those this pass opened, by the route's source name.
+    ///
+    /// Keyed by *route* rather than by binding name, unlike
+    /// [`sink_bindings`](Self::sink_bindings): the response binding is a name the
+    /// program chooses and a new version may spell differently, whereas the route
+    /// is the address's identity. Carries the address as well as the sink,
+    /// because `sink()` is inherent on `HttpServerDataSource` and cannot be read
+    /// back off the erased `dyn DataSourceDomainExtentImpl` in
+    /// [`sources`](Self::sources), and because retiring a route needs the method
+    /// and path to unregister.
+    pub(super) http_routes: HashMap<String, LoweredRoute>,
+
+    /// Every `http_serve` route lowered *in this pass*, by source name.
+    ///
+    /// Separate from [`sources`](Self::sources) because that map is seeded with
+    /// the endpoints a previous version of the program opened
+    /// ([`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry)), so a name
+    /// being present there means "already open", not "already lowered". Two
+    /// `http_serve` calls on one route within a single program remain an error;
+    /// re-lowering the same route in a later version is the reuse path.
+    pub(super) http_routes_this_pass: HashSet<String>,
+
+    /// What this pass may do with an `http_serve` naming a route the registry does
+    /// not already hold.
+    pub(super) endpoints: Endpoints,
 
     /// Monotonic counter for minting unique synthetic names during lowering.
     /// Globally unique across nested scopes so inner binders cannot capture
@@ -389,6 +448,60 @@ impl LoweringContext {
         let out = f(self);
         self.in_refinement_predicate = old;
         out
+    }
+
+    /// Every source registered in this context, for folding into the
+    /// [`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry) that outlives
+    /// the compilation. Unlike [`take_sources`](Self::take_sources) this leaves
+    /// the map in place, so it may be called before the drain.
+    pub fn registered_sources(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> {
+        self.sources.iter().map(|(n, s)| (n.as_str(), s))
+    }
+
+    /// Every `http_serve` route this context knows, by source name.
+    pub fn registered_routes(&self) -> impl Iterator<Item = (&str, &LoweredRoute)> {
+        self.http_routes.iter().map(|(n, r)| (n.as_str(), r))
+    }
+
+    /// The routes this pass bound — every address the version being lowered
+    /// serves. A route the registry holds and this set omits is one the version
+    /// stopped serving.
+    pub fn routes_bound_this_pass(&self) -> &HashSet<String> {
+        &self.http_routes_this_pass
+    }
+
+    /// Hand over every bound TCP port's listener, leaving this context with none.
+    ///
+    /// Drained rather than cloned so that the registry it is folded into becomes
+    /// the sole owner. A copy left here would keep a retired port's listener alive
+    /// until the next pass replaced this context, which is a compilation later
+    /// than the pass that stopped serving it. Lowering is finished by the time
+    /// this is called, so nothing looks a port up afterwards.
+    pub fn take_servers(&mut self) -> impl Iterator<Item = (u16, Arc<SharedHttpServer>)> + use<> {
+        std::mem::take(&mut self.shared_servers).into_iter()
+    }
+
+    /// Answer against the endpoints this context already holds, opening none.
+    pub fn inherit_endpoints_only(&mut self) {
+        self.endpoints = Endpoints::Inherited;
+    }
+
+    /// Seed this context with the sources and sinks a program already holds.
+    ///
+    /// A call naming one of these binds it; a call naming anything else opens
+    /// it. Both are allowed in every version — a replacement inherits what the
+    /// running program has and may add to it.
+    pub fn adopt_sources_and_sinks(
+        &mut self,
+        sources: impl IntoIterator<Item = (String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>)>,
+        routes: impl IntoIterator<Item = (String, LoweredRoute)>,
+        servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>,
+    ) {
+        self.sources.extend(sources);
+        self.http_routes.extend(routes);
+        self.shared_servers.extend(servers);
     }
 
     /// Drain all sources accumulated for this compilation.

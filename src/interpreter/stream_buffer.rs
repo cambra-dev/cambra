@@ -1,10 +1,10 @@
 //! Shared buffer for uint-indexed string stream sources.
 //!
-//! [`UIntStreamBuffer`] captures the buffer, sliding-window indexing, and
-//! per-producer obsolete-predicate bookkeeping that is common to every
-//! streaming `UInt → String` data source (stdin, HTTP server, etc.).
-
-use std::collections::HashMap;
+//! [`UIntStreamBuffer`] captures the buffer and the sliding-window indexing
+//! common to every streaming `UInt → String` data source (stdin, HTTP server,
+//! etc.). Which producer has released what is
+//! [`ProducerReleases`](crate::interpreter::producer_releases::ProducerReleases),
+//! which every source keeps rather than only these.
 
 use intervalsets::{
     Bounding, Interval, IntervalSet,
@@ -13,7 +13,9 @@ use intervalsets::{
 use log::trace;
 use smol_str::SmolStr;
 
-use crate::interpreter::{ColumnValue, Value, tiling::Predicate};
+use crate::interpreter::{
+    ColumnValue, Value, producer_releases::ProducerReleases, tiling::Predicate,
+};
 
 /// Buffer and predicate bookkeeping for a uint-indexed string stream.
 ///
@@ -37,8 +39,9 @@ pub(crate) struct UIntStreamBuffer {
     /// `true` once a universal release has been received.
     closed: bool,
 
-    /// Per-producer obsolete predicates, accumulated via union on each [`release`].
-    pub(crate) obsolete_predicates: HashMap<String, Predicate>,
+    /// What each producer has released, and where one registering from now on
+    /// starts.
+    pub(crate) releases: ProducerReleases,
 }
 
 impl UIntStreamBuffer {
@@ -49,7 +52,7 @@ impl UIntStreamBuffer {
             ready_size: 0,
             eof_reached: false,
             closed: false,
-            obsolete_predicates: HashMap::new(),
+            releases: ProducerReleases::default(),
         }
     }
 
@@ -160,8 +163,8 @@ impl UIntStreamBuffer {
     /// Return the non-obsolete indices in `[start_idx, ready_size)` for `producer`.
     pub(crate) fn get_elements(&self, producer: &str) -> ColumnValue {
         let obsolete = self
-            .obsolete_predicates
-            .get(producer)
+            .releases
+            .of(producer)
             .unwrap_or_else(|| panic!("Unknown producer: {producer}"));
         let live = self.live_window().difference(&Self::index_set(obsolete));
         let mut indices = Vec::new();
@@ -176,35 +179,37 @@ impl UIntStreamBuffer {
         ColumnValue::from_uints(indices)
     }
 
+    /// The first index a producer registering now will be offered.
+    ///
+    /// The buffer has already dropped everything every producer agreed on, so
+    /// this is `start_idx` unless the carried release runs past it. A store built
+    /// over this source starts here: the source will never offer the positions
+    /// below it, and a drive based lower waits for an element that is not coming.
+    pub(crate) fn first_index_for_a_new_producer(&self) -> usize {
+        match self.released_prefix(&Self::index_set(self.releases.on_registration())) {
+            Some(last) => last + 1,
+            None => self.start_idx,
+        }
+    }
+
     /// Update per-producer obsolete predicates and release any buffer entries
     /// that all producers agree are no longer needed.
     pub(crate) fn release(&mut self, producer: &str, obsolete: Predicate) {
-        let recorded = self
-            .obsolete_predicates
-            .entry(producer.to_string())
-            .or_insert(Predicate::False);
-        *recorded = recorded.union(&obsolete);
+        self.releases.record(producer, &obsolete);
 
         // Every registered producer is done with every index, so nothing will be
         // read again. A producer with no entry has not subscribed, and so holds
         // nothing back.
-        if self.obsolete_predicates.values().all(Predicate::is_true) {
+        let agreed = self.releases.agreed();
+        if agreed.is_true() {
             self.close();
             return;
         }
 
-        // Each producer's accumulated set is every index it will not read again,
-        // so their intersection is what the buffer may drop. The intersection is
-        // over those accumulated sets rather than over this release and them:
-        // a producer's earlier releases still stand. Every recorded guard passes
-        // through `index_set` here, which is where one built for another extent
-        // fails.
-        let agreed = self
-            .obsolete_predicates
-            .values()
-            .fold(IntervalSet::from(Interval::unbounded()), |agreed, pred| {
-                agreed.intersection(&Self::index_set(pred))
-            });
+        // The agreement is every index no producer will read again, so it is what
+        // the buffer may drop. A guard built for another extent is rejected the
+        // first time one is read as an index set — here, or in `get_elements`.
+        let agreed = Self::index_set(&agreed);
         trace!("UIntStreamBuffer::release: {agreed:?}");
         if let Some(i) = self.released_prefix(&agreed) {
             self.release_index(i);
@@ -241,6 +246,8 @@ impl UIntStreamBuffer {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn buffer_with(n: usize) -> UIntStreamBuffer {
@@ -291,7 +298,7 @@ mod tests {
     /// is the intersection across producers, not the latest one to arrive.
     ///
     /// Both producers register before any release, which is what subscribing
-    /// does (`IterateExtent::subscribe` releases `Predicate::False` to enrol
+    /// does (`IterateExtent::subscribe` releases `Predicate::False` to register
     /// with each source in its extent). A producer with no entry is not in the
     /// intersection and so does not hold anything back.
     #[test]
@@ -383,5 +390,120 @@ mod tests {
     fn a_guard_over_the_wrong_value_sort_is_rejected() {
         let mut buf = buffer_with(8);
         buf.release("p", Predicate::LessThanEq(Value::Int(4)));
+    }
+
+    /// A producer registering before any release has been carried reads the
+    /// whole buffer, including values that arrived before it registered.
+    ///
+    /// This is a program's own producers, which all enrol during compilation:
+    /// anything that arrived while the program was being compiled is still
+    /// theirs to read.
+    #[test]
+    fn a_producer_registering_at_the_start_reads_everything() {
+        let mut buf = buffer_with(3);
+        buf.release("p", Predicate::False);
+        assert_eq!(
+            buf.get_elements("p"),
+            ColumnValue::from_uints(vec![0, 1, 2])
+        );
+    }
+
+    /// Once the release state is carried, a producer registering from then on
+    /// reads only what arrives next.
+    ///
+    /// This is what stops a replacement version reprocessing the stream: the
+    /// operators it rebuilds enrol as new producers, and a source hands a
+    /// A producer registering once everything buffered has been released reads
+    /// only what arrives next.
+    #[test]
+    fn a_producer_registering_after_the_carry_reads_only_what_follows() {
+        let mut buf = buffer_with(3);
+        buf.release("p", Predicate::False);
+        buf.release("p", covering(0, 2));
+
+        buf.releases.carry_to_new_producers();
+        buf.release("late", Predicate::False);
+        assert_eq!(
+            buf.get_elements("late"),
+            ColumnValue::from_uints(Vec::new()),
+            "`p` handled every buffered index, so none is the new producer's"
+        );
+
+        buf.push(SmolStr::new("e3"));
+        assert_eq!(
+            buf.get_elements("late"),
+            ColumnValue::from_uints(vec![3]),
+            "and what arrives next is"
+        );
+    }
+
+    /// Carrying the release state does not retroactively change a producer that
+    /// had already registered.
+    #[test]
+    fn carrying_the_release_state_leaves_registered_producers_alone() {
+        let mut buf = buffer_with(3);
+        buf.release("early", Predicate::False);
+        buf.releases.carry_to_new_producers();
+        assert_eq!(
+            buf.get_elements("early"),
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            "it applies at registration, not to whoever is already reading"
+        );
+    }
+
+    /// A producer that registers late still holds the buffer: the prefix is only
+    /// freed once it has released it too.
+    #[test]
+    fn a_late_producer_still_counts_toward_the_release_intersection() {
+        let mut buf = buffer_with(3);
+        buf.release("early", Predicate::False);
+        buf.release("early", covering(0, 2));
+        buf.releases.carry_to_new_producers();
+        buf.release("late", Predicate::False);
+
+        assert_eq!(
+            buf.start_idx, 3,
+            "both producers have released 0..=2, so the prefix frees"
+        );
+    }
+
+    /// What a late producer skips is what every producer has *released*, not
+    /// everything that has arrived.
+    ///
+    /// The regression this pins: taking the end of the buffer instead meant an
+    /// index that had arrived but that nobody had finished was skipped by the
+    /// producer taking over, so it was never handled by anyone. For an HTTP
+    /// source that is a request accepted and then silently never answered.
+    #[test]
+    fn a_late_producer_inherits_the_release_state_not_the_buffer_end() {
+        let mut buf = buffer_with(3);
+        buf.release("p", Predicate::False);
+        // `p` finished index 0; 1 and 2 have arrived and nobody has handled them.
+        buf.release("p", covering(0, 0));
+
+        buf.releases.carry_to_new_producers();
+        buf.release("late", Predicate::False);
+        assert_eq!(
+            buf.get_elements("late"),
+            ColumnValue::from_uints(vec![1, 2]),
+            "the unfinished indices are still the new producer's to read"
+        );
+    }
+
+    /// A release that is not a prefix lets a new producer skip only the released
+    /// indices, not the gap below them.
+    #[test]
+    fn a_non_prefix_release_starts_a_new_producer_at_the_gap() {
+        let mut buf = buffer_with(5);
+        buf.release("p", Predicate::False);
+        buf.release("p", covering(2, 4));
+
+        buf.releases.carry_to_new_producers();
+        buf.release("late", Predicate::False);
+        assert_eq!(
+            buf.get_elements("late"),
+            ColumnValue::from_uints(vec![0, 1]),
+            "and the new producer reads exactly what is unreleased"
+        );
     }
 }

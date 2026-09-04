@@ -72,6 +72,12 @@ impl DoneNotifier {
 /// filled after [`crate::interpreter::tile_operators::TileOperator::subscribe`] returns (solving the chicken-and-egg:
 /// the consumer must exist before subscribe is called, but subscribe is what
 /// creates the producer).
+///
+/// So a notification raised *during* `subscribe` — an induction store raises one
+/// to start its loop — arrives with the slot still empty and is dropped. Whoever
+/// fills the slot notifies once afterwards for that reason
+/// ([`crate::ccl::context::compile_program`]); a version installed while work was
+/// outstanding is otherwise never pulled.
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
@@ -84,9 +90,11 @@ pub struct SinkConsumer {
 impl SinkConsumer {
     /// Create a new consumer paired with `sink` and `done`.
     ///
-    /// The returned consumer holds a shared handle to the `producer` slot; the
-    /// caller should fill that slot with the `TileProducer` returned by
-    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] before the first notification fires.
+    /// The returned consumer holds a shared handle to the `producer` slot. The
+    /// caller fills it with the `TileProducer` returned by
+    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] and then
+    /// notifies once, which is the only way this consumer sees the notifications
+    /// `subscribe` itself raised.
     pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
         (
@@ -97,6 +105,20 @@ impl SinkConsumer {
             },
             slot,
         )
+    }
+
+    /// Stop dispatching and release the producer chain behind this consumer.
+    ///
+    /// A [`DataSink`] outlives any one version of a program; the subscription
+    /// that feeds it does not. Detaching is what ends a replaced version's
+    /// dispatch, and it is not achieved by dropping the consumer alone: an
+    /// operator carried across the replacement still holds the notification
+    /// closure that reaches this consumer, so the replaced version would keep
+    /// being woken and keep writing to a sink its successor now owns. Clearing
+    /// the producer slot also drops the operators behind it, which is what lets
+    /// the fan-outs they subscribed to see those subscriptions end.
+    pub fn detach(&mut self) {
+        *self.producer.borrow_mut() = None;
     }
 
     /// Call `f` with the sink's current producer, if it has been set.
