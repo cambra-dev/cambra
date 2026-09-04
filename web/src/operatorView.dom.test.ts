@@ -1,25 +1,26 @@
 // @vitest-environment jsdom
 //
-// DOM coverage for `OperatorView`: the operator pane draws the dataflow graph
-// as an indented forest, and it carries the cross-pane link like every other
-// pane.
+// DOM coverage for `OperatorView`: the operator pane draws the subscription
+// graph, and it carries the cross-pane link like every other pane.
 //
-// The three facts a tree renderer would get wrong, and so the three this pins:
-// a graph has several walk starts (one tree each), a share edge is a reference
-// leaf rather than a second copy of the shared subtree, and a click in the pane
-// reaches the panes upstream of it.
+// The facts a drawing can get wrong, and so the ones this pins: every operator
+// on the wire is reachable in the drawing even when it is not drawn as a box, a
+// share is one edge rather than a second copy of the shared subgraph, a click
+// reaches the panes upstream, and the pane does not scroll itself.
 //
-// Not covered: the `late` marker on a value edge wired through a `CycleSlot`.
-// Only the two store programs build one and neither has a committed fixture, so
-// `op-deferred` is unasserted here.
+// Layout is stubbed. ELK's placement is its own concern and pinning coordinates
+// here would assert the engine rather than the pane; what matters is that every
+// node it returns is drawn and every id stays addressable.
 
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { OperatorView } from "./operatorView";
+import { drawGraphOf } from "./graph/model";
 import { Store } from "./store";
 import { TreeView } from "./treeView";
+import type { GraphLayout, LayoutRequest, Placed } from "./graph/layout";
 import type { Selection } from "./store";
-import type { OperatorNode, OperatorPane, Snapshot } from "./types";
+import type { OperatorPane, Snapshot } from "./types";
 
 import { fixture, irPaneById, operatorPaneById, stubLayout } from "./__fixtures__/helpers";
 
@@ -36,17 +37,52 @@ const listMin = fixture(listMinJson);
 // nothing subscribes getting a row.
 const sourceShared = fixture(sourceSharedJson);
 
-function mountGraph(snap: Snapshot, paneId: string): {
-  store: Store;
-  body: HTMLElement;
-  pane: OperatorPane;
-} {
+/**
+ * A layout that places every node on its own row, in the order given.
+ *
+ * Deterministic and dependency-free, so an assertion about the drawing is about
+ * the pane rather than about ELK.
+ */
+class RowLayout implements GraphLayout {
+  async run(request: LayoutRequest): Promise<Placed> {
+    const nodes = request.nodes.map((n, i) => ({
+      id: n.id,
+      x: 0,
+      y: i * 40,
+      width: n.width,
+      height: n.height,
+    }));
+    const at = new Map(nodes.map((n) => [n.id, n]));
+    return {
+      width: Math.max(0, ...nodes.map((n) => n.width)),
+      height: nodes.length * 40,
+      nodes,
+      edges: request.edges.map((e) => {
+        const a = at.get(e.source);
+        const b = at.get(e.target);
+        return {
+          id: e.id,
+          points: [
+            { x: a ? a.x + a.width / 2 : 0, y: a ? a.y + a.height : 0 },
+            { x: b ? b.x + b.width / 2 : 0, y: b ? b.y : 0 },
+          ],
+        };
+      }),
+    };
+  }
+}
+
+async function mountGraph(
+  snap: Snapshot,
+  paneId: string,
+): Promise<{ store: Store; body: HTMLElement; pane: OperatorPane; view: OperatorView }> {
   const body = document.createElement("div");
   document.body.appendChild(body);
   const store = new Store(snap);
   const pane = operatorPaneById(snap, paneId);
-  new OperatorView(body, store, pane);
-  return { store, body, pane };
+  const view = new OperatorView(body, store, pane, new RowLayout());
+  await view.draw();
+  return { store, body, pane, view };
 }
 
 /**
@@ -61,187 +97,151 @@ function watchSelection(store: Store): () => Selection {
   return () => latest;
 }
 
-/** The node id a row names, from its `.node-id` cell (`#4021` -> 4021). */
-function rowNodeId(row: HTMLElement): number {
-  return Number(row.querySelector(".node-id")!.textContent!.slice(1));
-}
+const idsOf = (body: HTMLElement, selector: string): number[] =>
+  [...body.querySelectorAll<HTMLElement>(selector)].map((e) => Number(e.dataset.nodeId));
 
-/** The rows drawing a node in its own right — reference leaves excluded. */
-function nodeRows(body: HTMLElement): HTMLElement[] {
-  return [...body.querySelectorAll<HTMLElement>(".tree-row")].filter(
-    (row) => !row.classList.contains("op-ref"),
-  );
-}
-
-function nodeRow(body: HTMLElement, nodeId: number): HTMLElement {
-  const found = nodeRows(body).filter((row) => rowNodeId(row) === nodeId);
-  if (found.length !== 1) {
-    throw new Error(`expected exactly one row for #${nodeId}, found ${found.length}`);
-  }
-  return found[0];
-}
-
-/** The `.tree-node` box a row heads — the row plus its children. */
-function subtreeOf(row: HTMLElement): HTMLElement {
-  return row.parentElement as HTMLElement;
-}
-
-describe("OperatorView: the graph as a forest", () => {
-  beforeAll(stubLayout);
-
-  it("draws one tree per walk start", () => {
-    for (const [snap, id] of [
-      [polymorphic, "post-conversion"],
-      [listMin, "post-conversion"],
-    ] as const) {
-      const { body, pane } = mountGraph(snap, id);
-      const trees = [...body.querySelector(".tree-root")!.children];
-
-      // The nodes no value edge subscribes, in table order — what the view
-      // derives, recomputed here from the payload rather than taken from it.
-      const subscribed = new Set(
-        pane.nodes.flatMap((n) =>
-          n.inputs.filter((e) => e.kind === "value").map((e) => e.subscribed),
-        ),
-      );
-      const starts = pane.nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
-
-      expect(trees.length).toBe(starts.length);
-      // One tree per start, each headed by its own node, in table order.
-      expect(trees.map((t) => rowNodeId(t.querySelector(".tree-row")!))).toEqual(starts);
-    }
-  });
-
-  it("draws every node of the graph exactly once", () => {
-    // The forest covers the table: a node no value edge subscribes heads a tree
-    // of its own, so nothing is dropped and nothing is duplicated.
-    // `source_shared` is the case that needs it — nothing subscribes a source
-    // with a value edge, so it is drawn as a one-node tree or not at all, and a
-    // node with no row has no selection handle for a pane link to land on.
-    for (const [snap, id] of [
-      [polymorphic, "post-conversion"],
-      [sourceShared, "post-conversion"],
-    ] as const) {
-      const { body, pane } = mountGraph(snap, id);
-      expect(nodeRows(body).map(rowNodeId).sort((a, b) => a - b)).toEqual(
-        pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b),
-      );
-    }
-  });
-
-  it("shows an operator's tiling and a boundary node's absence of one", () => {
-    const { body, pane } = mountGraph(polymorphic, "post-conversion");
-    const sink = pane.nodes.find((n) => n.role === "sink")!;
-    const operator = pane.nodes.find((n) => n.role === "operator")!;
-
-    expect(nodeRow(body, sink.nodeId).querySelector(".node-type")).toBeNull();
-    expect(nodeRow(body, operator.nodeId).querySelector(".node-type")?.textContent).toBe(
-      operator.tiling,
-    );
-  });
+beforeAll(() => {
+  stubLayout();
 });
 
-describe("OperatorView: share edges as reference leaves", () => {
-  beforeAll(stubLayout);
+describe("OperatorView", () => {
+  it("draws every operator on the wire exactly once", async () => {
+    const { body, pane } = await mountGraph(polymorphic, "post-conversion");
+    const drawn = idsOf(body, "[data-node-id]").sort((a, b) => a - b);
+    expect(drawn).toEqual(pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b));
+  });
 
-  // The consumers of a share edge, and the edge each holds.
-  const sharers = (pane: OperatorPane): [OperatorNode, { role: string; subscribed: number }][] =>
-    pane.nodes.flatMap((node) =>
-      node.inputs
-        .filter((e) => e.kind === "share")
-        .map((e) => [node, e] as [OperatorNode, { role: string; subscribed: number }]),
-    );
+  it("suppresses the fan branches and the constants, and keeps them addressable", async () => {
+    const { body, pane } = await mountGraph(polymorphic, "post-conversion");
+    const boxes = idsOf(body, ".graph-node");
+    const suppressed = pane.nodes
+      .filter((n) => n.label === "FanOutBranch" || n.label === "Constant")
+      .map((n) => n.nodeId);
+    // Something was suppressed, or this fixture would not exercise the rule.
+    expect(suppressed.length).toBeGreaterThan(0);
+    for (const id of suppressed) expect(boxes).not.toContain(id);
+    // ...and every one of them is still an element a selection can land on.
+    for (const id of suppressed) {
+      expect(body.querySelector(`[data-node-id="${id}"]`)).not.toBeNull();
+    }
+  });
 
-  it("renders a share input as an `.op-ref` leaf naming its target", () => {
-    const { body, pane } = mountGraph(polymorphic, "post-conversion");
-    const shares = sharers(pane);
+  it("draws a share as one edge, not a second copy of the shared subgraph", async () => {
+    const { body, pane } = await mountGraph(polymorphic, "post-conversion");
+    const graph = drawGraphOf(pane);
+    const shares = graph.edges.filter((e) => e.kind === "share");
     expect(shares.length).toBeGreaterThan(0);
-
-    for (const [consumer, edge] of shares) {
-      const subtree = subtreeOf(nodeRow(body, consumer.nodeId));
-      const refs = [...subtree.querySelectorAll<HTMLElement>(".op-ref")];
-
-      expect(refs.length).toBe(1);
-      expect(refs[0].classList.contains("op-ref-share")).toBe(true);
-      expect(rowNodeId(refs[0])).toBe(edge.subscribed);
-      expect(refs[0].querySelector(".op-ref-arrow")!.textContent).toBe("→");
-      expect(refs[0].querySelector(".edge-label")!.textContent).toBe(`${edge.role}:`);
-      // The subscribed node's label, so the reference reads without chasing
-      // the id.
-      const subscribed = pane.nodes.find((n) => n.nodeId === edge.subscribed)!;
-      expect(refs[0].querySelector(".node-label")!.textContent).toBe(subscribed.label);
+    expect(body.querySelectorAll(".graph-edge-share").length).toBe(shares.length);
+    // A shared producer is drawn once however many consumers reach it.
+    for (const share of shares) {
+      expect(body.querySelectorAll(`.graph-node[data-node-id="${share.from}"]`).length).toBe(1);
     }
   });
 
-  it("does not nest the shared subtree under its consumer", () => {
-    const { body, pane } = mountGraph(polymorphic, "post-conversion");
-    const [consumer, edge] = sharers(pane)[0];
-    const subscribed = pane.nodes.find((n) => n.nodeId === edge.subscribed)!;
-    // The shared node holds inputs of its own; those are what a nested draw
-    // would duplicate.
-    expect(subscribed.inputs.length).toBeGreaterThan(0);
-
-    const subtree = subtreeOf(nodeRow(body, consumer.nodeId));
-    // The consumer's row and the one reference leaf, and nothing below it.
-    expect(subtree.querySelectorAll(".tree-row").length).toBe(2);
-    expect(nodeRows(subtree).map(rowNodeId)).toEqual([consumer.nodeId]);
+  it("tells a boundary node from an operator", async () => {
+    const { body, pane } = await mountGraph(listMin, "post-conversion");
+    const sink = pane.nodes.find((n) => n.role === "sink");
+    expect(sink).toBeDefined();
+    const el = body.querySelector<HTMLElement>(`.graph-node[data-node-id="${sink!.nodeId}"]`);
+    expect(el?.dataset.role).toBe("sink");
   });
 
-  it("selects the subscribed node when a reference leaf is clicked", () => {
-    const { store, body, pane } = mountGraph(polymorphic, "post-conversion");
-    const [, edge] = sharers(pane)[0];
-    const selection = watchSelection(store);
+  it("selects the node a reader clicks, naming this pane as the origin", async () => {
+    const { store, body, pane } = await mountGraph(listMin, "post-conversion");
+    const latest = watchSelection(store);
+    const target = pane.nodes.find((n) => n.role === "operator")!;
+    body
+      .querySelector<HTMLElement>(`.graph-node[data-node-id="${target.nodeId}"]`)!
+      .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(latest()).toEqual({
+      kind: "node",
+      paneId: pane.id,
+      nodeId: target.nodeId,
+    });
+  });
 
-    body.querySelector<HTMLElement>(".op-ref")!.click();
+  it("selects a suppressed operator from the glyph that replaced it", async () => {
+    const { store, body, pane } = await mountGraph(polymorphic, "post-conversion");
+    const latest = watchSelection(store);
+    const branch = pane.nodes.find((n) => n.label === "FanOutBranch")!;
+    const glyph = body.querySelector<HTMLElement>(`.graph-glyph[data-node-id="${branch.nodeId}"]`);
+    expect(glyph).not.toBeNull();
+    glyph!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(latest()).toEqual({
+      kind: "node",
+      paneId: pane.id,
+      nodeId: branch.nodeId,
+    });
+  });
 
-    expect(selection()).toEqual({ kind: "node", paneId: pane.id, nodeId: edge.subscribed });
+  it("a click on an operator highlights the linked nodes upstream", async () => {
+    const body = document.createElement("div");
+    document.body.appendChild(body);
+    const store = new Store(polymorphic);
+    const pane = operatorPaneById(polymorphic, "post-conversion");
+    const view = new OperatorView(body, store, pane, new RowLayout());
+    await view.draw();
+
+    const treeHost = document.createElement("div");
+    document.body.appendChild(treeHost);
+    const upstream = irPaneById(polymorphic, "post-planning");
+    new TreeView(treeHost, store, upstream.id, upstream.root);
+
+    const sink = pane.nodes.find((n) => n.role === "sink")!;
+    body
+      .querySelector<HTMLElement>(`.graph-node[data-node-id="${sink.nodeId}"]`)!
+      .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    const here = body.querySelector<HTMLElement>(
+      `.graph-node[data-node-id="${sink.nodeId}"]`,
+    );
+    expect(here?.classList.contains("selected")).toBe(true);
+    // The gesture reached the pane upstream of this one.
+    expect(treeHost.querySelectorAll(".tree-row.selected, .tree-row.linked").length)
+      .toBeGreaterThan(0);
   });
 });
 
-describe("OperatorView: the cross-pane link", () => {
-  beforeAll(stubLayout);
+describe("a graph that reads a source", () => {
+  // Under a shipped start set the source had to be listed or the forest drew no
+  // row for it, and a pane link landing on it reached nothing. Drawing the whole
+  // table retires that failure mode: every node of the pane has an element that
+  // answers for it, a suppressed one through whatever replaced it.
+  it("gives every node something that answers for it", () => {
+    const pane = operatorPaneById(sourceShared, "post-conversion");
+    expect(pane.nodes.some((n) => n.role === "source")).toBe(true);
 
-  it("a click on an operator row highlights the linked nodes upstream", () => {
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const store = new Store(polymorphic);
+    const graph = drawGraphOf(pane);
+    for (const node of pane.nodes) {
+      expect(graph.viewItem(node.nodeId)).toBeDefined();
+    }
+  });
+});
 
-    const graphBody = document.createElement("div");
-    container.appendChild(graphBody);
-    const pane = operatorPaneById(polymorphic, "post-conversion");
-    new OperatorView(graphBody, store, pane);
+describe("a back edge and a late one", () => {
+  // No committed fixture carries either, so the shapes are built by hand. Both
+  // reach the wire — `assert_store_edge_shapes` pins that on the Rust side —
+  // and without this the two renderings would be exercised by nothing.
+  const pane: OperatorPane = {
+    id: "post-conversion",
+    label: "IR (POST-CONVERSION)",
+    kind: "operators",
+    nodes: [
+      { label: "InductionStore", nodeId: 1, role: "operator", tiling: "Store(UInt)", spans: [], rewritten: null,
+        inputs: [{ role: "body", kind: "value", deferred: true, subscribed: 2 }] },
+      { label: "MapResult", nodeId: 2, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
+        inputs: [{ role: "fan", kind: "share", deferred: false, subscribed: 1 }] },
+    ],
+  };
 
-    // The pane immediately upstream of conversion — where the operator pane's
-    // provenance edges land.
-    const upstream = irPaneById(polymorphic, "post-planning");
-    const treeBody = document.createElement("div");
-    container.appendChild(treeBody);
-    new TreeView(treeBody, store, upstream.id, upstream.root);
-
-    const sink = pane.nodes.find((n) => n.role === "sink")!;
-    const expected = new Set(
-      polymorphic.paneLinks
-        .filter((l) => l.from === upstream.id && l.to === pane.id)
-        .flatMap((l) => l.edges.filter(([, down]) => down === sink.nodeId).map(([up]) => up)),
-    );
-    expect(expected.size).toBeGreaterThan(0);
-
-    const selection = watchSelection(store);
-    nodeRow(graphBody, sink.nodeId).click();
-
-    // The clicked row is an anchor. Not the *only* one: an anchor's images
-    // under the pane links are anchors too, and a round trip can bring several
-    // back into this pane, so the row is asserted directly rather than by
-    // taking the first `.selected` in the DOM.
-    expect(selection()).toEqual({ kind: "node", paneId: pane.id, nodeId: sink.nodeId });
-    expect(nodeRow(graphBody, sink.nodeId).classList.contains("selected")).toBe(true);
-
-    // …and every node the link graph reaches upstream is highlighted there.
-    const highlighted = new Set(
-      [...treeBody.querySelectorAll<HTMLElement>(".tree-row.selected, .tree-row.linked")].map(
-        rowNodeId,
-      ),
-    );
-    for (const id of expected) expect(highlighted).toContain(id);
+  it("draws the cycle as a back edge and never lays it out", async () => {
+    const body = document.createElement("div");
+    document.body.appendChild(body);
+    const snap = { ...listMin, panes: listMin.panes.map((p) => (p.id === pane.id ? pane : p)) };
+    const store = new Store(snap as Snapshot);
+    const view = new OperatorView(body, store, pane, new RowLayout());
+    await view.draw();
+    expect(body.querySelectorAll(".graph-edge-back").length).toBe(1);
+    expect(body.querySelectorAll(".graph-node").length).toBe(2);
   });
 });

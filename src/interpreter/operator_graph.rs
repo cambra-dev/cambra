@@ -17,9 +17,15 @@
 //! installs around conversion. Outside a session every record is a no-op, which
 //! is what keeps the operator constructions in engine tests from accumulating.
 //!
-//! What the edges mean: they are **construction** edges — which operator holds
-//! which, and how. Runtime dataflow follows `get` and `notify`, which is a
-//! different relation, and nothing here asserts the two coincide.
+//! What the edges mean: they are **subscriptions**. An operator's inputs are the
+//! operators it subscribes, which is why they can be stated from its fields at
+//! construction — `subscribe_impl` subscribes exactly those fields. The one
+//! recorded edge that is not a subscription is a source read: a source is a
+//! graph node and not a `TileOperator`, so nothing subscribes it.
+//!
+//! `notify` runs the other way along the same edges, and `get` runs along them
+//! as drawn. Neither adds a pair: a `FanOut` subscribes its input once and every
+//! branch reads the producer that came back.
 //!
 //! Degrees are counted in dataflow direction — a source has in-degree 0, a sink
 //! out-degree 0 — while a recorded edge is stored on the consumer and names the
