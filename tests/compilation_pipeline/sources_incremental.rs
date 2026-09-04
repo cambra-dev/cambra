@@ -787,3 +787,139 @@ fn test_incremental_aggregates() {
         Predicate::True
     );
 }
+
+// ---------------------------------------------------------------------------
+// Record-valued sources
+//
+// Every other registered source in this file carries a scalar element. A host
+// channel carries a record — `{ticker: String, price: Int}` — and the program
+// reads a field off a stream element (`u.ticker`) and filters on it. These pin
+// that the three shapes compile and evaluate, because the host-channel work
+// rests on all three.
+// ---------------------------------------------------------------------------
+
+/// `{ticker: String, price: Int}`, as a CCL type and as the matching extent.
+fn ticker_row_type() -> (Type, Extent) {
+    (
+        Type::Record(
+            [
+                ("ticker".to_string(), Type::Base(BaseType::String)),
+                ("price".to_string(), Type::Base(BaseType::Int)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        Extent::record(
+            [
+                ("ticker".to_string(), Extent::Base(BaseType::String)),
+                ("price".to_string(), Extent::Base(BaseType::Int)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    )
+}
+
+fn ticker_row(ticker: &str, price: i64) -> Value {
+    Value::Record(
+        [
+            ("ticker".to_string(), Value::String(ticker.into())),
+            ("price".to_string(), Value::Int(price)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+/// Compile `code` against a record-valued source named `updates` holding three
+/// rows, and return the tile its `main` output settles on.
+fn run_over_ticker_rows(code: &str) -> Tile {
+    let (row_type, row_extent) = ticker_row_type();
+    let mut ctx = GlobalContext::default();
+    let updates = Rc::new(RefCell::new(TestDataSource::new(
+        "updates", row_type, row_extent,
+    )));
+    ctx.register_source(updates.clone());
+    updates.borrow_mut().add_data(&[
+        (Value::UInt(0), ticker_row("BTC-USD", 100)),
+        (Value::UInt(1), ticker_row("ETH-USD", 20)),
+        (Value::UInt(2), ticker_row("BTC-USD", 300)),
+    ]);
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+    producer.get(producer.tiling().universal_guard())
+}
+
+/// A field projected off a record-valued stream element.
+#[test]
+fn a_field_projects_off_a_record_source_element() {
+    let mut tile = run_over_ticker_rows("[u.price for u in updates()]");
+    tile.compact();
+    assert_eq!(
+        sort_sealed_function_by_domain(tile),
+        sort_sealed_function_by_domain(Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 20, 300]))),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        })
+    );
+}
+
+/// A comprehension filtered on one field, projecting another — the ingest
+/// filter the demo program's per-ticker streams are built from.
+#[test]
+fn a_record_source_filters_on_one_field_and_projects_another() {
+    let mut tile = run_over_ticker_rows(r#"[u.price for u in updates() if u.ticker == "BTC-USD"]"#);
+    tile.compact();
+    assert_eq!(
+        sort_sealed_function_by_domain(tile),
+        sort_sealed_function_by_domain(Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 300]))),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        })
+    );
+}
+
+/// The whole record survives a filter: the codomain stays a pivoted
+/// [`ColumnValue::Records`] carrying both fields, holding the rows the filter
+/// kept.
+///
+/// Asserted on content rather than on the `deleted` positions, which index the
+/// tile and so follow `TestDataSource`'s unordered keys.
+#[test]
+fn a_filtered_record_source_keeps_its_row_shape() {
+    let mut tile = run_over_ticker_rows(r#"[u for u in updates() if u.ticker == "BTC-USD"]"#);
+    tile.compact();
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = &tile
+    else {
+        panic!("expected a SealedFunction, got {tile:?}");
+    };
+    let ColumnValue::UInts(keys) = domain else {
+        panic!("expected UInt keys, got {domain:?}");
+    };
+    let Tile::Scalar(ColumnValue::Records(fields)) = codomain.as_ref() else {
+        panic!("expected a pivoted Records codomain, got {codomain:?}");
+    };
+    let ColumnValue::Strings(tickers) = &fields["ticker"] else {
+        panic!("expected a String ticker column");
+    };
+    let ColumnValue::Ints(prices) = &fields["price"] else {
+        panic!("expected an Int price column");
+    };
+    let mut rows: Vec<(usize, &str, i64)> = keys
+        .iter()
+        .zip(tickers)
+        .zip(prices)
+        .map(|((k, t), p)| (*k, t.as_str(), *p))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![(0, "BTC-USD", 100), (2, "BTC-USD", 300)]);
+}
