@@ -372,3 +372,37 @@ describe("an embedder's configuration", () => {
     expect(shown.length).toBe(all.length - hidden.length);
   });
 });
+
+describe("the header's values badge", () => {
+  beforeAll(stubLayout);
+
+  /**
+   * The badge answers whether values are flowing, which is a different question
+   * from whether the payload compiled. It was a constant reading "static (no
+   * values)", which sat over a values pane filling up.
+   */
+  it("says values are waiting before a frame arrives", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)), new LiveStore());
+    const badges = Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
+    expect(badges).toContain("waiting for values");
+    expect(badges).not.toContain("static (no values)");
+  });
+
+  it("says a run is live once it publishes", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    renderApp(root, new Store(fixture(arithmeticJson)), live);
+    live.apply({ tick: 7, published: 3, final: false, nodes: [], sources: [] });
+    const badges = Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
+    expect(badges).toContain("live · tick 7");
+  });
+
+  /** With no live store there is no run, and the badge still says so. */
+  it("keeps the static wording when nothing is driving the program", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)));
+    const badges = Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
+    expect(badges).toContain("static (no values)");
+  });
+});

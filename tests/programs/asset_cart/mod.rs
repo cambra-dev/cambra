@@ -12,9 +12,41 @@
 //! the assertions are over what the host would render.
 //!
 //! The subtotal is summed here rather than in the program, and the reader is
-//! split one-per-ticker, for the reason `v0.cambra` records: a block reading all
-//! six slots costs about two seconds per price row. [`subtotal`] is what the
-//! demo host does instead.
+//! split one-per-ticker, for the reason `v0.cambra`'s TODO records: a block
+//! reading all six slots costs about two seconds per price row. [`subtotal`] is
+//! what the demo host does instead.
+//!
+//! # Why the program is shaped the way it is
+//!
+//! Three rules, each of which breaks it if violated. A write goes inside `with
+//! begin():`, and a reply from a loop that also writes never fires — so the
+//! writer loops carry no feed. The reader's reads go inside its own block: a
+//! transactional variable read outside one is rejected, and the read is live
+//! rather than terminal because the block does not write. The filter key is a
+//! literal, because a key taken from another stream is not a shape the planner
+//! accepts.
+//!
+//! One ticker is one filter, one slot, one loop and one reader, three times
+//! over. Naming the tickers once as data needs a join against a static list;
+//! holding prices and quantities in one collection needs `Mut(Map(String, Int),
+//! Txn)` and `for t -> q in cart`. Both are language work and neither changes
+//! what the program means.
+//!
+//! Three readers over one source cannot feed one sink — their branches fail to
+//! unify at post-channelize — which is why there is a sink per ticker rather
+//! than three readers sharing `cart_view`.
+//!
+//! The program text stays short because the inspector renders it on a slide,
+//! and a reader arriving at it should meet the program rather than a preamble —
+//! which is why the rules above live here and not in a comment block above the
+//! first line of the program.
+//!
+//! # The ladder above this rung
+//!
+//! `Mut(Map(String, Int), Txn)` replaces the six slots with two collections;
+//! `for t -> q in cart` collapses the three readers into one that serves the
+//! whole cart, subtotal included. Both are language work tracked separately,
+//! and neither changes what this program means.
 
 use std::cell::RefCell;
 use std::rc::Rc;

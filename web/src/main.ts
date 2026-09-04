@@ -139,6 +139,7 @@ function renderHeader(
   snap: Snapshot,
   panes: readonly PaneDescriptor[],
   visibility: PaneVisibility,
+  live?: LiveStore,
 ): void {
   const header = el("div", "header");
   header.appendChild(el("span", "title", "Cambra Inspector"));
@@ -147,8 +148,28 @@ function renderHeader(
   const failed = snap.meta.payloadKind === "failed";
   header.appendChild(el("span", `badge${failed ? " failed" : ""}`, snap.meta.payloadKind));
 
-  // The payload describes the program, with no execution and no values.
-  header.appendChild(el("span", "badge", "static (no values)"));
+  // Whether values are flowing, which is not the same question as whether the
+  // payload compiled. A run that is publishing frames says so; a payload served
+  // without one — `--inspect-only`, or a dump — says it describes a program
+  // nobody ran. Reading the live status rather than printing a constant: the
+  // constant said "static (no values)" over a values pane filling up.
+  const values = el("span", "badge", "static (no values)");
+  header.appendChild(values);
+  if (live) {
+    const describe = () => {
+      const status = live.get().status;
+      values.textContent =
+        status.kind === "live"
+          ? `live · tick ${status.tick}`
+          : status.kind === "finished"
+            ? "finished"
+            : status.kind === "lost"
+              ? "disconnected"
+              : "waiting for values";
+    };
+    describe();
+    live.subscribe(describe);
+  }
 
   header.appendChild(el("span", "spacer"));
   renderPaneMenu(header, panes, visibility);
@@ -435,7 +456,7 @@ export function renderApp(
   if (live && config?.pins?.length) applyPins(store, live, config.pins, lineStarts);
 
   root.replaceChildren();
-  renderHeader(root, store.snapshot, panes, visibility);
+  renderHeader(root, store.snapshot, panes, visibility, live);
 
   const panels = el("div", "panels");
   root.appendChild(panels);

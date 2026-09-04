@@ -106,6 +106,13 @@ debug = "line-tables-only"
 # unoptimized module's bytes. `panic = "abort"` drops the unwinding tables; a
 # panic in a module reaches the page as a trap either way, and
 # `console_error_panic_hook` reports it before that.
+# The module a page embeds rather than downloads. An artifact has megabytes to
+# spare and a per-row time budget it does not, so this trades the size
+# `wasm-release` optimizes for back into speed.
+[profile.wasm-fast]
+inherits = "wasm-release"
+opt-level = 3
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
