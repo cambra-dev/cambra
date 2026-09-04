@@ -301,3 +301,24 @@ describe("the values pane", () => {
     expect(text).toContain("MapResultWithSource#1");
   });
 });
+
+/**
+ * A panel that has said "no values yet" and then receives some drops the
+ * message. Groups are appended to the root rather than replacing it, so a
+ * message left behind would sit above live rows saying the run never started.
+ */
+it("drops the empty message once values arrive", async () => {
+  const live = new LiveStore();
+  const body = document.createElement("div");
+  new LiveView(body, live);
+  live.inspect("Var(words): L8", 202, [202]);
+  await nextFrame();
+
+  expect(body.querySelector(".live-empty")).not.toBeNull();
+
+  live.apply(frame());
+  await nextFrame();
+
+  expect(body.querySelector(".live-empty")).toBeNull();
+  expect(body.querySelectorAll(".live-group").length).toBe(1);
+});

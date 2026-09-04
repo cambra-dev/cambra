@@ -1,49 +1,7 @@
-# A live asset cart. The host pushes every (ticker, price) its feed sees into
-# `price_updates`; the program keeps the tickers it tracks, holds a quantity per
-# ticker, and serves one priced line per ticker on each view request.
-#
-# Host channels, declared in `channels.json` beside this file:
-#   price_updates(): {ticker: String, price: Int}   one row per feed message
-#   cart_changes():  {ticker: String, qty: Int}     one row per tap; qty is the new quantity
-#   view_requests(): Bool                           one row per refresh the host asks for
-#   btc_line, eth_line, sol_line:                   one sink per ticker, the app renders from
-#
-# Prices are scaled integers: dollars x 10^8, so no fractional arithmetic
-# happens here and none is needed. The host scales on the way in and formats on
-# the way out.
-#
-# Three rules this shape obeys, each of which breaks the program if violated:
-#
-#   - A write goes inside `with begin():`. A reply from a loop that also writes
-#     never fires, so the writer loops carry no feed.
-#   - The reader's reads go inside its own block. A transactional variable read
-#     outside one is rejected, and the read is live rather than terminal because
-#     the block does not write.
-#   - The filter key is a literal. A key taken from another stream is not a
-#     shape the planner accepts.
-#
-# TODO: collapse this into one reader over one keyed collection.
-#
-# The natural program holds prices and quantities in two keyed collections and
-# serves the whole cart from one reader:
-#
-#     lines = [(ticker=t, qty=q, price=prices[t], total=q * prices[t]) for t -> q in cart]
-#     cart_view << (lines=lines, subtotal=sum([l.total for l in lines]))
-#
-# Two things stand between this program and that one.
-#
-# `Mut(Map(String, Int), Txn)` and `for t -> q in cart` are language work, so
-# the tickers are named three times over and each gets its own slot.
-#
-# The reader is split one-per-ticker, and the subtotal is left to the host,
-# because a single read-only block reading all six slots costs about 2 s per
-# price row against 22 ms for these three — the per-row cost grows sharply in
-# how many transactional stores one block reads together. Three readers over one
-# source cannot feed one sink either (unifying their branches fails at
-# post-channelize), which is why there are three. Measured by
-# `transactions.rs`, "as_of_read_cost_grows_in_the_number_of_stores_one_block_reads".
-# When that cost comes down, this collapses back to one reader and one sink, and
-# the subtotal comes home.
+# A live asset cart. Four host channels, declared beside this file; prices are
+# integers scaled by 10^8. See `mod.rs` for the rules this shape obeys, and for
+# the TODO: one reader over one keyed collection, once `Mut(Map(K, V), Txn)`
+# lands and a multi-slot read stops costing what it does.
 
 btc_updates = [u for u in price_updates() if u.ticker == "BTC-USD"]
 eth_updates = [u for u in price_updates() if u.ticker == "ETH-USD"]

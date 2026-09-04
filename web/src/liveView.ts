@@ -350,6 +350,12 @@ export class LiveView {
       return;
     }
 
+    // The message the previous render left, if that render had no groups. It is
+    // dropped rather than left in place: a run that has started publishing must
+    // not still be saying it was compiled and not run, and groups are appended
+    // to the root rather than replacing it.
+    this.root.querySelector(".live-empty")?.remove();
+
     const seen = new Set<string>();
     for (const group of panel.groups) {
       const key = groupKey(group);

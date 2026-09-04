@@ -530,7 +530,10 @@ impl LoweringContext {
     /// because a listener is a socket: a wasm build has none to carry, and the
     /// field itself is not compiled there.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn adopt_servers(&mut self, servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>) {
+    pub fn adopt_servers(
+        &mut self,
+        servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>,
+    ) {
         self.shared_servers.extend(servers);
     }
 

@@ -4,9 +4,9 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::{cell::RefCell, rc::Rc};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ccl::lower::LoweredRoute;
