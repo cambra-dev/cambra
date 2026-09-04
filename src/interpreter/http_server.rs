@@ -25,7 +25,7 @@ use tiny_http::{Header, Response, Server};
 
 use crate::ccl::Type;
 use crate::interpreter::{
-    BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent,
+    BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent, Value,
     stream_buffer::UIntStreamBuffer,
     tiling::{Predicate, Tile},
 };
@@ -369,7 +369,7 @@ impl HttpServerDataSource {
     fn add(&mut self, body: SmolStr, request: tiny_http::Request) {
         let idx = self.buf.ready_size;
         self.shared.insert(idx, request);
-        self.buf.push(body);
+        self.buf.push(Value::String(body));
     }
 }
 
@@ -414,9 +414,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn get(&self, key: ColumnValue) -> ColumnValue {
         match key {
-            ColumnValue::UInts(v) => {
-                ColumnValue::Strings(v.iter().map(|i| self.buf.get(*i)).cloned().collect())
-            }
+            ColumnValue::UInts(v) => self.buf.column(&v, &self.output_value_extent()),
             other => panic!("HttpServerDataSource::get expected UInt key, got {other:?}"),
         }
     }

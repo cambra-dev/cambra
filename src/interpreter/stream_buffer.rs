@@ -1,8 +1,15 @@
-//! Shared buffer for uint-indexed string stream sources.
+//! Shared buffer for uint-indexed stream sources.
 //!
 //! [`UIntStreamBuffer`] captures the buffer, sliding-window indexing, and
 //! per-producer obsolete-predicate bookkeeping that is common to every
-//! streaming `UInt → String` data source (stdin, HTTP server, etc.).
+//! streaming data source keyed by arrival order (stdin, HTTP server, host
+//! channels).
+//!
+//! The buffer holds [`Value`]s rather than the lines stdin and the HTTP server
+//! deliver, because arrival-order keying is independent of what arrived. A
+//! source pivots what it holds into a column through
+//! [`ColumnValue::from_values`] against its own output extent, so a record row
+//! and a line take the same path.
 
 use std::collections::HashMap;
 
@@ -11,19 +18,18 @@ use intervalsets::{
     ops::{Difference, Intersection},
 };
 use log::trace;
-use smol_str::SmolStr;
 
-use crate::interpreter::{ColumnValue, Value, tiling::Predicate};
+use crate::interpreter::{ColumnValue, Extent, Value, tiling::Predicate};
 
-/// Buffer and predicate bookkeeping for a uint-indexed string stream.
+/// Buffer and predicate bookkeeping for a uint-indexed stream.
 ///
-/// Maintains a sliding window of [`SmolStr`] values indexed by monotonically
+/// Maintains a sliding window of [`Value`]s indexed by monotonically
 /// increasing `usize` keys.  Released indices are drained from the front of
 /// `buffer`; `start_idx` records the logical offset so that external keys
 /// remain stable across drains.
 pub(crate) struct UIntStreamBuffer {
     /// Buffered values.  `buffer[j]` corresponds to logical index `start_idx + j`.
-    pub(crate) buffer: Vec<SmolStr>,
+    pub(crate) buffer: Vec<Value>,
 
     /// Logical index of `buffer[0]`.  Indices below this have been released.
     pub(crate) start_idx: usize,
@@ -54,7 +60,10 @@ impl UIntStreamBuffer {
     }
 
     /// Append `value` to the buffer and increment `ready_size`.
-    pub(crate) fn push(&mut self, value: SmolStr) {
+    ///
+    /// The key is minted here, as the index the value lands at, so a source
+    /// fed the same values in the same order twice mints the same keys twice.
+    pub(crate) fn push(&mut self, value: Value) {
         if self.closed {
             // A closed buffer's universal release covers this index too, so
             // holding the value would re-accumulate what `close` just freed.
@@ -65,7 +74,7 @@ impl UIntStreamBuffer {
         self.ready_size += 1;
     }
 
-    pub(crate) fn get_opt(&self, i: usize) -> Option<&SmolStr> {
+    pub(crate) fn get_opt(&self, i: usize) -> Option<&Value> {
         if self.closed || self.start_idx > i || i >= self.ready_size {
             None
         } else {
@@ -73,9 +82,19 @@ impl UIntStreamBuffer {
         }
     }
 
-    pub(crate) fn get(&self, i: usize) -> &SmolStr {
+    pub(crate) fn get(&self, i: usize) -> &Value {
         self.get_opt(i)
             .unwrap_or_else(|| panic!("Invalid UIntStreamBuffer::get({i})"))
+    }
+
+    /// The buffered values at `indices`, pivoted into a column against
+    /// `extent`.
+    ///
+    /// The pivot is [`ColumnValue::from_values`], so a record row becomes a
+    /// column per field and a scalar becomes one column, on one path.
+    pub(crate) fn column(&self, indices: &[usize], extent: &Extent) -> ColumnValue {
+        let values = indices.iter().map(|i| self.get(*i).clone()).collect();
+        ColumnValue::from_values(values, extent)
     }
 
     /// Release all entries up to and including `i`, draining the buffer front.
@@ -262,7 +281,7 @@ mod tests {
     fn buffer_with(n: usize) -> UIntStreamBuffer {
         let mut buf = UIntStreamBuffer::new();
         for i in 0..n {
-            buf.push(SmolStr::new(format!("e{i}")));
+            buf.push(Value::String(format!("e{i}").into()));
         }
         buf
     }
@@ -296,7 +315,7 @@ mod tests {
     fn a_long_run_does_not_accumulate() {
         let mut buf = UIntStreamBuffer::new();
         for i in 0..200 {
-            buf.push(SmolStr::new(format!("e{i}")));
+            buf.push(Value::String(format!("e{i}").into()));
             buf.release("p", covering(0, i));
         }
         assert_eq!(buf.start_idx, 200);
@@ -371,7 +390,7 @@ mod tests {
         assert!(buf.buffer.is_empty());
         assert_eq!(buf.start_idx, 8);
 
-        buf.push(SmolStr::new("e8"));
+        buf.push(Value::String("e8".into()));
         assert!(buf.buffer.is_empty(), "the release covers index 8 too");
         assert_eq!(buf.ready_size, 9);
         assert_eq!(buf.get_opt(8), None);
