@@ -97,3 +97,21 @@ crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 debug = "line-tables-only"
+
+# The WebAssembly module, which is a file a page downloads rather than a binary
+# a machine runs, so it is optimized for size where `release` is optimized for
+# speed. A separate profile rather than a change to `release`: the demo program
+# is on a per-row time budget natively too, and `opt-level = "z"` would spend it.
+#
+# `debug = false` is the big one — `release`'s line tables are most of an
+# unoptimized module's bytes. `panic = "abort"` drops the unwinding tables; a
+# panic in a module reaches the page as a trap either way, and
+# `console_error_panic_hook` reports it before that.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true

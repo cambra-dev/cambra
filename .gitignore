@@ -10,3 +10,4 @@ docs/Scratch.md
 # Python bytecode from the tooling scripts under .github/scripts/
 __pycache__/
 *.pyc
+scripts/pkg/

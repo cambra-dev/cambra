@@ -156,6 +156,19 @@ bind that fails once the page has already loaded the module. **That arm is compi
 `ci_wasm` and its message is exercised by no test** — a test for it would have to be gated to a
 target the suite does not build, which is a test that cannot run.
 
+`scripts/build-wasm.sh` builds the module and runs `scripts/wasm-contract.mjs` against it — the
+same scenario `tests/embed.rs` runs natively, so a divergence is the wrapper's rather than the
+program's. It needs `wasm-bindgen-cli` at the exact version the lock resolved, which the repo does
+not depend on; `ci_wasm` runs it when it is present and reports the skip when it is not.
+
+Measured on the demo program at the time of writing, in the `wasm-release` profile
+(`opt-level = "z"`, LTO, stripped): **2.07 MB** module, **~160 ms** to compile the program in the
+browser, **~116 ms per price row**. The recorded feed runs at 2.33 rows/s, so a row has ~430 ms and
+the module uses about a quarter of it. Native release is ~22 ms per row, so wasm costs about five
+times — more than the two-to-three a rough estimate would give, and worth re-measuring rather than
+assuming. Size is traded for speed here: a `opt-level = "s"` or `"3"` module would be faster and
+larger, and the budget has room either way.
+
 `src/wasm_api.rs` is a thin wrapper over `Host`: every method converts JSON to and from the values
 the embedding API already takes and adds nothing else. There is no run loop in it — the page owns
 the clock — so a caller drives `tick` from whatever timer it likes and can stop without the module
