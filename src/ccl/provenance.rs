@@ -1392,8 +1392,10 @@ struct OpenRecording {
     /// [`RecordingGuard::also_consumes`] for a fusion. The produced side is
     /// discovered from the construction hooks, never declared.
     ///
-    /// Empty at open, and — `also_consumes` having no production caller — empty
-    /// for every rewrite in the compiler today. See [`named`](Self::named).
+    /// Empty at open, and empty for every rewrite the compiler's phases make:
+    /// each is 1:many, so it writes one parent per product. A source node is the
+    /// many:1 case — one node read from several expressions — and is where this
+    /// carries ids. See [`named`](Self::named).
     consumed: Vec<NodeId>,
     /// The id the recording site named — the node about to be rewritten. `None`
     /// for a [`copy_frame`], which names no node.
@@ -1765,6 +1767,18 @@ pub(crate) fn enter(named_id: NodeId, label: RewriteLabel, nature: Nature) -> Re
     })
 }
 
+/// The expression the innermost open recording names, if any.
+///
+/// Operator conversion opens one recording per expression node, so during
+/// conversion this is the expression whose operators are being built. An
+/// operator that must attribute itself to source without holding a `NodeId` of
+/// its own reads it here rather than threading one through its constructor.
+///
+/// `None` outside any recording, and for a `copy_frame`, which names no node.
+pub(crate) fn currently_named() -> Option<NodeId> {
+    RECORDING_STACK.with(|s| s.borrow().last().and_then(|r| r.named))
+}
+
 /// Open a recording over the conversion of one expression node, for the whole
 /// extent of that node's conversion including its children.
 ///
@@ -1816,13 +1830,13 @@ impl RecordingGuard {
     /// meaningless there and [`assert_copy_only`] catches it.
     ///
     /// [`assert_copy_only`]: OpenRecording::assert_copy_only
-    // No production caller: every rewrite in the compiler is 1:many, so each
-    // recording writes one parent per product. The channel is retained because
-    // nothing else can express the many:1 shape — a fusion onto an older
-    // survivor has to remint (`consumed: [S, D…] → produced: [S′]`) to keep
+    // Every rewrite the phases make is 1:many, so each writes one parent per
+    // product and needs none of this. The many:1 shape is the operator graph's
+    // source node, which `materialize_sources` names at one read site and
+    // consumes the rest through here. A fusion onto an older survivor would use
+    // it the same way, reminting (`consumed: [S, D…] → produced: [S′]`) to keep
     // parents ahead of children. Exercised by
     // `a_fusion_gives_every_product_the_bipartite_product`.
-    #[allow(dead_code)]
     pub(crate) fn also_consumes(&self, id: NodeId) {
         if id == NodeId::PLACEHOLDER {
             return;
