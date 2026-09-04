@@ -289,6 +289,20 @@ fn in_loop_mut_var_error(span: Span, name: &str) -> LoweringError {
     )
 }
 
+/// Rejection for a `yield` or `<<` inside a `match` arm in a for-loop body.
+///
+/// A conditional feed rides its path's predicate as a `to_<defer>__fire` gate,
+/// and a `match` arm has no predicate to ride: it is selected by its tag, which
+/// the writer decision reads as a `Case` over the scrutinee rather than as a
+/// boolean.
+fn feed_in_match_arm_error(span: Span) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        "a `yield` or `<<` feed inside a `match` arm in a for-loop body is not \
+         supported; move it after the `match`, where it fires once per iteration",
+    )
+}
+
 /// Rejection for `x op= e` inside a for-loop body where `x` is not a mutable
 /// variable declared before the loop.
 ///
@@ -696,6 +710,11 @@ fn collect_mutation_loop_vars(
                 collect_mutation_loop_vars(else_body, scope, vars, seen);
             }
         }
+        if let ChlStmt::Match { arms, .. } = &stmt.node {
+            for arm in arms {
+                collect_mutation_loop_vars(&arm.body, scope, vars, seen);
+            }
+        }
         if let Some(inner) = block_value_stmt(stmt) {
             collect_mutation_loop_vars(std::slice::from_ref(inner), scope, vars, seen);
         }
@@ -756,6 +775,13 @@ pub(super) fn find_nested_mutation_var(
                     && let Some(n) = find_nested_mutation_var(else_body, mutation_scope)
                 {
                     return Some(n);
+                }
+            }
+            ChlStmt::Match { arms, .. } => {
+                for arm in arms {
+                    if let Some(n) = find_nested_mutation_var(&arm.body, mutation_scope) {
+                        return Some(n);
+                    }
                 }
             }
             ChlStmt::For { body, .. } => {
@@ -992,6 +1018,39 @@ fn lower_loop_body_chain(
                 let lowered = lower_expr(y, ctx)?;
                 let feed = ctx.tag_image(Expr::feed(defer_name.to_string(), lowered), value.span);
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
+            }
+            // ``match m: case `tag(w): …`` — tag dispatch over a conditional
+            // write path, the `match` counterpart of the `if` below. Every arm
+            // is a write path; there is no complement, because the arms
+            // partition the scrutinee's tags.
+            ChlStmt::Match { scrutinee, arms } => {
+                if let Some(bad) = arms
+                    .iter()
+                    .find(|a| for_body_has_yield(&a.body) || for_body_has_feed(&a.body))
+                {
+                    return Err(feed_in_match_arm_error(
+                        bad.body.first().map_or(stmt.span, |s| s.span),
+                    ));
+                }
+                let case = lower_match_over(
+                    stmt.span,
+                    scrutinee,
+                    arms,
+                    outer_bindings,
+                    ctx,
+                    |body, scope, ctx| {
+                        lower_loop_body_chain(
+                            body,
+                            acc_names,
+                            yield_defer,
+                            true,
+                            scope,
+                            stmt.span,
+                            ctx,
+                        )
+                    },
+                )?;
+                ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `if p: … [else: …]` — a conditional write path. Lowered to a
             // statement-position filter-`Case` (`[gᵢ → branchᵢ; true → else|unit]`)

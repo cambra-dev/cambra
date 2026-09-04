@@ -1717,11 +1717,7 @@ type-checked as one.
 Patterns are **shallow**: an arm matches one tag and binds the whole
 payload, with no nesting, no literal patterns, and no per-arm guard.
 
-A `match` is not yet accepted **inside a `for`-loop body**, which admits
-only assignments, `<<` feeds, `yield`, `if` guards, `with begin():` blocks
-and bare calls. Dispatching per element is written as a `def` that matches
-on its parameter and is called from the loop or a comprehension, which is
-the same first-match rule reached through a call.
+**A `for`-loop body admits a `match`.** An arm may not `yield` or `<<`.
 
 #### The one-line form
 

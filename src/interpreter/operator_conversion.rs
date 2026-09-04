@@ -30,7 +30,7 @@ use crate::{
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
             MapFilter, MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource,
             Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
-            VariantProject, VariantWrap, fan_in, fan_in_named,
+            VariantIs, VariantProject, VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -1175,6 +1175,25 @@ fn convert_impl_inner(
                         tag.clone(),
                         payload_extent,
                     )))
+                }
+                // `variant_is(c)` — the total tag test. Same scrutinee shapes as
+                // `variant_project(c)`, but every key of the domain is answered,
+                // which is what a writer decision's guard position takes.
+                Builtin::VariantIs(tag) => {
+                    let ok = match input.tiling() {
+                        Tiling::Scalar(Extent::Union(_)) => true,
+                        Tiling::SealedFunction { codomain, .. } => {
+                            matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(ConversionError::TypeError(format!(
+                            "variant_is({tag}) expects a (Sealed)Union scrutinee, got {}",
+                            input.tiling()
+                        )));
+                    }
+                    Ok(Box::new(VariantIs::new(input, tag.clone())))
                 }
                 // `variant_wrap(c)` — the point-free constructor. Consumes the fed
                 // payload stream and injects it at tag `c`. The union extents come

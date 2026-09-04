@@ -1469,6 +1469,35 @@ pub(super) fn lower_match(
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    lower_match_over(
+        match_span,
+        scrutinee,
+        arms,
+        outer_bindings,
+        ctx,
+        |body, scope, ctx| lower_stmts_inner(body, scope, ctx, false),
+    )
+}
+
+/// [`lower_match`] over how an arm's body is lowered.
+///
+/// The tag rules — one arm per tag, `case _:` last and unique — and the
+/// `Pattern` each arm carries belong to `match` wherever it is written, and a
+/// for-loop body differs only in what a statement in an arm may be
+/// ([`lower_loop_body_chain`]). This is the production the two share, in the
+/// shape `match_arms` has in the parser.
+pub(super) fn lower_match_over(
+    match_span: Span,
+    scrutinee: &Spanned<ChlExpr>,
+    arms: &[MatchArm],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+    mut lower_body: impl FnMut(
+        &[Spanned<ChlStmt>],
+        &HashSet<String>,
+        &mut LoweringContext,
+    ) -> Result<Expr, LoweringError>,
+) -> Result<Expr, LoweringError> {
     // The parser's `.at_least(1)` guarantees this; a zero-arm `match` would
     // lower to a `Case` with no branches, which has no value to denote.
     assert!(
@@ -1508,7 +1537,7 @@ pub(super) fn lower_match(
     // back from it is simply the value. Sequencing it after the scrutinee keeps
     // the scrutinee typed without letting it decide anything.
     if arms.len() == 1 && defaults == 1 {
-        let body = lower_stmts_inner(&arms[0].body, outer_bindings, ctx, false)?;
+        let body = lower_body(&arms[0].body, outer_bindings, ctx)?;
         return Ok(ctx.tag_image(Expr::expr_stmt(scrutinee_expr, body), match_span));
     }
     let mut branches = Vec::with_capacity(arms.len());
@@ -1517,7 +1546,7 @@ pub(super) fn lower_match(
             // The default arm binds nothing — the tags it covers have different
             // payload types, so there is no single thing to bind — and lowers to a
             // tag-less `Branch`, which is what makes it the fallback.
-            let body = lower_stmts_inner(&arm.body, outer_bindings, ctx, false)?;
+            let body = lower_body(&arm.body, outer_bindings, ctx)?;
             branches.push(Branch {
                 pattern: None,
                 // Tag dispatch carries no boolean test, so every arm's guard is
@@ -1549,7 +1578,7 @@ pub(super) fn lower_match(
         let mut arm_scope = outer_bindings.clone();
         arm_scope.insert(binder.clone());
         let body = ctx.with_shadowed(vec![binder.clone()], |ctx| {
-            lower_stmts_inner(&arm.body, &arm_scope, ctx, false)
+            lower_body(&arm.body, &arm_scope, ctx)
         })?;
         branches.push(Branch {
             pattern: Some(Pattern {
