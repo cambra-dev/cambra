@@ -525,13 +525,36 @@ fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
         }
     }
 
-    let spans = source["spans"].as_array().expect("spans is an array");
+    // A read *site* is a span, not an operator: one `stdin()` is read by both the
+    // `IterateExtent` that iterates its domain and the `MapResultWithSource` that
+    // reads its values, and the two carry the same span. So the node's spans are
+    // compared against the distinct sites its readers name, not against how many
+    // readers there are.
+    let site_of = |n: &Value| -> Vec<(u64, u64)> {
+        n["spans"]
+            .as_array()
+            .expect("spans is an array")
+            .iter()
+            .map(|s| {
+                (
+                    s["start"].as_u64().expect("start is a number"),
+                    s["end"].as_u64().expect("end is a number"),
+                )
+            })
+            .collect()
+    };
+    let reader_sites: std::collections::BTreeSet<(u64, u64)> =
+        readers.iter().flat_map(|r| site_of(r)).collect();
+    let source_sites: std::collections::BTreeSet<(u64, u64)> =
+        site_of(source).into_iter().collect();
     assert!(
-        spans.len() >= readers.len(),
-        "the source node carries {} span(s) for {} read site(s): it was minted against one \
-         read rather than after the walk, so `also_consumes` reached none of the others",
-        spans.len(),
-        readers.len()
+        source_sites.is_superset(&reader_sites),
+        "the source node names {source_sites:?} but is read from {reader_sites:?}: it was minted \
+         against one read rather than after the walk, so `also_consumes` reached none of the others"
+    );
+    assert!(
+        reader_sites.len() >= 2,
+        "source_shared reads stdin at two sites; got {reader_sites:?}"
     );
 }
 

@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
 use crate::ccl::TagMap;
+use crate::interpreter::operator_graph::source;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, SharedConsumer,
     UnionArm, Value, scheduler::shared_consumer,
@@ -26,9 +27,54 @@ impl IterateExtent {
             domain: extent.clone(),
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
+        // An `IterateExtent` over a source domain is what the scheduler wakes
+        // when that source produces, so it reads the source as surely as the
+        // `MapResultWithSource` above it does. The edge comes from
+        // `visit_inputs` like every other; what has to happen here is minting
+        // the source's node, because an extent may iterate a source no
+        // `Source(name)` expression reads.
+        Self::record_source_reads(&extent);
         Self {
             base: OperatorBase::new(tiling),
             extent,
+        }
+    }
+
+    /// Mint a node for every source this operator's extent iterates.
+    ///
+    /// Mirrors [`add_all_source_handles`](Self::add_all_source_handles), which
+    /// walks the same compound shapes to register the runtime wakeups. A source
+    /// reached twice through one extent is recorded once.
+    fn record_source_reads(extent: &Extent) {
+        let Some(expr) = crate::ccl::provenance::currently_named() else {
+            return;
+        };
+        let mut seen: Vec<String> = Vec::new();
+        Self::each_source(extent, &mut |name| {
+            if seen.iter().any(|s| s == name) {
+                return;
+            }
+            seen.push(name.to_string());
+            crate::interpreter::operator_graph::record_source_read(name, expr);
+        });
+    }
+
+    /// Every registered source this extent iterates, in extent order.
+    fn each_source(extent: &Extent, f: &mut impl FnMut(&str)) {
+        match extent {
+            Extent::DataSourceDomain(source) => f(source.borrow().get_id()),
+            Extent::Record(fields) => {
+                for field in fields.values() {
+                    Self::each_source(field, f);
+                }
+            }
+            Extent::Union(arms) => {
+                for arm in arms.values() {
+                    Self::each_source(arm, f);
+                }
+            }
+            Extent::Restricted { base, .. } => Self::each_source(base, f),
+            Extent::Base(_) | Extent::Function { .. } | Extent::UIntRange(_) => {}
         }
     }
 
@@ -63,7 +109,18 @@ impl IterateExtent {
 impl TileOperator for IterateExtent {
     impl_operator_base!();
 
-    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        // One edge per distinct source, not per reach: the edge says this
+        // operator reads that source, and it says it once.
+        let mut seen: Vec<String> = Vec::new();
+        Self::each_source(&self.extent, &mut |name| {
+            if seen.iter().any(|s| s == name) {
+                return;
+            }
+            seen.push(name.to_string());
+            visit(source(name));
+        });
+    }
 
     fn subscribe(
         &mut self,
