@@ -5,6 +5,7 @@
 
 mod binop;
 pub mod commit_operator;
+mod host_source;
 pub mod http_server;
 pub mod operator_conversion;
 pub mod operator_graph;
@@ -21,6 +22,7 @@ mod unary_op;
 pub mod value_recorder;
 
 pub use binop::*;
+pub use host_source::*;
 pub use http_server::HttpServerDataSource;
 pub use scheduler::*;
 pub use stdio::*;
