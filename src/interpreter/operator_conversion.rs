@@ -1378,99 +1378,115 @@ identities is not distinguishing them",
     /// never produce empty, unsubscribed [`crate::interpreter::Restriction`] objects that would
     /// panic when iterated.
     pub fn extent_of(&self, ty: &Type) -> Result<Extent, ConversionError> {
-        match ty {
-            // Strip refinements at every level — Filter handles them instead.
-            Type::Refinement(inner, _) => self.extent_of(inner),
-            // Look up the runtime impl and wrap it in DataSourceDomain.
-            Type::DataSource(name) => self
-                .sources
-                .get(name.as_str())
-                .map(|rc| Extent::DataSourceDomain(rc.clone()))
-                .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}"))),
-            // Recurse through compound types so nested refinements are stripped.
-            Type::Tuple(ts) => {
-                let fields: Result<HashMap<String, Extent>, _> = ts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| Ok((tuple_field(i), self.extent_of(t)?)))
-                    .collect();
-                Ok(Extent::record(fields?))
+        extent_of_resolving(ty, &|name| self.sources.get(name).cloned())
+    }
+}
+
+/// Resolves a source name to its runtime implementation, or `None` where the
+/// name names nothing.
+pub type SourceResolver<'a> =
+    dyn Fn(&str) -> Option<Rc<RefCell<dyn DataSourceDomainExtentImpl>>> + 'a;
+
+/// Convert a CCL [`Type`] to an interpreter [`Extent`], resolving each
+/// [`Type::DataSource`] through `source`.
+///
+/// The derivation is otherwise structural, so the source registry is the only
+/// thing it needs a context for. Splitting that out lets a caller holding no
+/// operator graph — a host declaring a channel's row type before anything is
+/// compiled — derive an extent through [`ground_extent_of`].
+pub fn extent_of_resolving(
+    ty: &Type,
+    source: &SourceResolver<'_>,
+) -> Result<Extent, ConversionError> {
+    let recur = |t: &Type| extent_of_resolving(t, source);
+    match ty {
+        // Strip refinements at every level — Filter handles them instead.
+        Type::Refinement(inner, _) => recur(inner),
+        // Look up the runtime impl and wrap it in DataSourceDomain.
+        Type::DataSource(name) => source(name.as_str())
+            .map(Extent::DataSourceDomain)
+            .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}"))),
+        // Recurse through compound types so nested refinements are stripped.
+        Type::Tuple(ts) => {
+            let fields: Result<HashMap<String, Extent>, _> = ts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| Ok((tuple_field(i), recur(t)?)))
+                .collect();
+            Ok(Extent::record(fields?))
+        }
+        Type::Record(named) => {
+            let fields: Result<HashMap<String, Extent>, _> = named
+                .iter()
+                .map(|(name, t)| Ok((name.clone(), recur(t)?)))
+                .collect();
+            Ok(Extent::record(fields?))
+        }
+        // A **keyed** sum, whose witness the value itself carries. `SubtypesOf(𝐾)`'s members
+        // are key types refined by membership, so the extent that describes one is the
+        // key type — a map cell holding only the keys it holds, which is how the store
+        // already describes its own (`map_extent`). That leaves nothing for a runtime
+        // witness to supply, unlike the arms below: a `UIntRanges` sum needs a concrete
+        // bound and a `Type` sum a domain, and neither is recoverable from a value's
+        // shape. Ahead of the general function arm because a sum's domain is its
+        // witness reference, which that arm cannot convert.
+        Type::Fun { codomain, .. }
+            if matches!(ty.witness_kind(), Some(crate::ccl::TypeKind::SubtypesOf(_))) =>
+        {
+            let Some(crate::ccl::TypeKind::SubtypesOf(key)) = ty.witness_kind() else {
+                unreachable!("guarded by the arm")
+            };
+            Ok(Extent::Function {
+                domain: Box::new(recur(&key)?),
+                codomain: Box::new(recur(codomain)?),
+            })
+        }
+        Type::Fun {
+            domain: a,
+            codomain: b,
+            ..
+        } => Ok(Extent::Function {
+            domain: Box::new(recur(a)?),
+            codomain: Box::new(recur(b)?),
+        }),
+        // Tagged sum — at runtime `UnionOperator` already
+        // discriminates by tag position, so the tags carry no
+        // additional dispatch information here; payloads lower to an
+        // `Extent::Union`. This covers both the anonymous positional
+        // sums that `++`/`Copair` produces (all `Index` tags)
+        // and named source-level variants. The tags carry through: they are
+        // the arm identities every union column and predicate is keyed by.
+        Type::Variant(tags, _) => {
+            let mut arms = Vec::with_capacity(tags.len());
+            for (k, t) in tags {
+                arms.push((k.clone(), recur(t)?));
             }
-            Type::Record(named) => {
-                let fields: Result<HashMap<String, Extent>, _> = named
-                    .iter()
-                    .map(|(name, t)| Ok((name.clone(), self.extent_of(t)?)))
-                    .collect();
-                Ok(Extent::record(fields?))
-            }
-            // A **keyed** sum, whose witness the value itself carries. `SubtypesOf(𝐾)`'s members
-            // are key types refined by membership, so the extent that describes one is the
-            // key type — a map cell holding only the keys it holds, which is how the store
-            // already describes its own (`map_extent`). That leaves nothing for a runtime
-            // witness to supply, unlike the arms below: a `UIntRanges` sum needs a concrete
-            // bound and a `Type` sum a domain, and neither is recoverable from a value's
-            // shape. Ahead of the general function arm because a sum's domain is its
-            // witness reference, which that arm cannot convert.
-            Type::Fun { codomain, .. }
-                if matches!(ty.witness_kind(), Some(crate::ccl::TypeKind::SubtypesOf(_))) =>
-            {
-                let Some(crate::ccl::TypeKind::SubtypesOf(key)) = ty.witness_kind() else {
-                    unreachable!("guarded by the arm")
-                };
-                Ok(Extent::Function {
-                    domain: Box::new(self.extent_of(&key)?),
-                    codomain: Box::new(self.extent_of(codomain)?),
-                })
-            }
-            Type::Fun {
-                domain: a,
-                codomain: b,
-                ..
-            } => Ok(Extent::Function {
-                domain: Box::new(self.extent_of(a)?),
-                codomain: Box::new(self.extent_of(b)?),
-            }),
-            // Tagged sum — at runtime `UnionOperator` already
-            // discriminates by tag position, so the tags carry no
-            // additional dispatch information here; payloads lower to an
-            // `Extent::Union`. This covers both the anonymous positional
-            // sums that `++`/`Copair` produces (all `Index` tags)
-            // and named source-level variants. The tags carry through: they are
-            // the arm identities every union column and predicate is keyed by.
-            Type::Variant(tags, _) => {
-                let mut arms = Vec::with_capacity(tags.len());
-                for (k, t) in tags {
-                    arms.push((k.clone(), self.extent_of(t)?));
-                }
-                Ok(Extent::Union(TagMap::from_arms(arms)))
-            }
-            // Leaf types — no refinements possible, handle inline.
-            Type::Base(b) => Ok(Extent::Base(b.clone())),
-            Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
-            // A `Txn` domain enumerates as UInt commit ticks (the prototype's
-            // `CommitTime`); its positions are minted at runtime, like a data
-            // source's. `transact_phase` emits `Mut(V, Txn)` stores, so this is a
-            // live path — a transactional store's history domain converts here.
-            Type::Txn => Ok(Extent::Base(BaseType::UInt)),
-            // An **unrealized sum**, rejected by name rather than through the catch-all
-            // below. Realization erases the sums whose witness is statically enumerable
-            // (`src/ccl/planning/conditionals.rs`), so one reaching here ranges over
-            // domains no fan-out could name — a `List(T)`'s `UIntRanges` or a
-            // `Collection(T)`'s universe — and what it needs is the runtime witness
-            // (`src/ccl/design/collections.md`, "Compiling a conditional collection"). That is an unimplemented
-            // capability, so it must not be reported as a compiler bug; `planning::iterate`
-            // and `planning::conditionals` both leave such a type standing for this arm.
-            Type::WitnessRef(_) => Err(ConversionError::Unsupported(format!(
-                "a collection whose domain is not statically known ({ty}) has no extent: \
-                 the runtime witness is not implemented"
-            ))),
-            other => Err(ConversionError::TypeError(format!(
-                "Cannot convert CCL type {other:?} to an interpreter extent; \
+            Ok(Extent::Union(TagMap::from_arms(arms)))
+        }
+        // Leaf types — no refinements possible, handle inline.
+        Type::Base(b) => Ok(Extent::Base(b.clone())),
+        Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
+        // A `Txn` domain enumerates as UInt commit ticks (the prototype's
+        // `CommitTime`); its positions are minted at runtime, like a data
+        // source's. `transact_phase` emits `Mut(V, Txn)` stores, so this is a
+        // live path — a transactional store's history domain converts here.
+        Type::Txn => Ok(Extent::Base(BaseType::UInt)),
+        other => Err(ConversionError::TypeError(format!(
+            "Cannot convert CCL type {other:?} to an interpreter extent; \
                  this is a compiler bug — type inference should have resolved \
                  or rejected this type before compilation"
-            ))),
-        }
+        ))),
     }
+}
+
+/// Convert a CCL [`Type`] with no [`Type::DataSource`] in it to an [`Extent`].
+///
+/// The derivation a caller can run before anything is compiled: a channel's row
+/// type is a record of base types, and its extent is needed to build the
+/// channel that carries it. A `DataSource` reaching here is an error rather
+/// than a lookup failure — there is no registry to look in.
+pub fn ground_extent_of(ty: &Type) -> Result<Extent, ConversionError> {
+    extent_of_resolving(ty, &|_| None)
 }
 
 /// Core conversion: translate `expr` into an operator that transforms `input`.

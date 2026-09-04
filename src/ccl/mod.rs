@@ -8,6 +8,7 @@
 
 pub mod ccl_utils;
 pub mod channelize;
+pub mod channels;
 pub mod content_hash;
 pub mod context;
 pub mod diff;

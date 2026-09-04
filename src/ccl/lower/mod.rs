@@ -101,6 +101,8 @@ mod functions;
 mod http;
 mod loops;
 mod stmts;
+
+pub use stmts::lower_type_expr;
 mod transactions;
 
 /// The names a type alias may not rebind, re-exported so the test that pins the
