@@ -95,3 +95,31 @@ fn http_multi_mut_var_live_read() {
     let got = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(got.trim(), "xx");
 }
+
+/// Repeated live reads track the latest write, one read per write.
+///
+/// `http_counter` above reads once after two writes, which pins that the read
+/// is live rather than seeded but says nothing about a read that repeats. A
+/// served view over a mutable variable is read once per request for the life of
+/// the program, so a latch that advanced once and then stalled would satisfy
+/// that test and still serve a stale value forever after.
+#[test]
+fn repeated_live_reads_each_see_the_preceding_write() {
+    let port = reserve_test_port();
+    let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
+    let mut ctx = compile_sink(&source);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for name in ["alice", "bob", "carol"] {
+            http_post(port, "/set", name);
+            tx.send(http_get(port, "/get")).unwrap();
+        }
+    });
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(drive_until(&mut ctx, &rx, Duration::from_secs(5)));
+    }
+    assert_eq!(seen, vec!["alice", "bob", "carol"]);
+}
