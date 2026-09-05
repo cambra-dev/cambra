@@ -189,8 +189,8 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
-    /// Which derivation this cache serves. The representation poses two questions
-    /// and they do not have the same answer in all three
+    /// Which derivation this cache serves: the live solve and a pass-boundary
+    /// re-derivation answer `opens_unconditionally` differently
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
     derivation: Derivation,
     /// **Γ for each side of the judgment** — what the witnesses in scope range over
@@ -208,7 +208,7 @@ pub struct ConstrainCache {
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
-/// draws an edge, which is what those questions are answered against.
+/// draws an edge, which is what that question is answered against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Derivation {
     /// Emission and its specialization pins — where a recorded bound becomes
@@ -218,41 +218,9 @@ pub enum Derivation {
     /// passes spelled in different coordinates, but every binder the tree's
     /// refinements reference is a binder the walk itself can enter.
     PostPass,
-    /// A probe over a sub-tree cut from its context: `debug_typecheck`'s
-    /// per-operation check, its one caller. Its refinements reference binders the
-    /// absent context holds, which no walk of the sub-tree can see, so the
-    /// closure invariant is not a record-time error here. Planning's in-place
-    /// checks of a morphism it has just built do not need the excuse: a
-    /// morphism carries its own binder, so they take
-    /// [`PostPass`](Self::PostPass), which enforces.
-    SubTree,
 }
 
 impl Derivation {
-    /// Whether every binder a reference in this derivation's types names is one the walk can
-    /// enter — so a reference Γ does not classify is **free**.
-    ///
-    /// True over a self-contained tree, where free is a malformed type and the escape check
-    /// reports it. A sub-tree probe cannot say it, and a refinement predicate is not the
-    /// case that shows why: a predicate's type does bind the witnesses it names. **A
-    /// Σ-typed lambda's parameter** is the case. Its type is a bare `WitnessRef`, and the
-    /// sum that binds it rides the *lambda's* type rather than the parameter's
-    /// (`crate::ccl::infer::debug_assert_no_free_witness`), so a cut anywhere inside the
-    /// body leaves the index unclassifiable while the enclosing walk classifies it. The
-    /// probe has no verdict to give there and gives none; the whole-tree walls decide. Same
-    /// excuse, and the same reason, as [`enforces_closure`](Self::enforces_closure).
-    pub(crate) fn sees_every_binder(self) -> bool {
-        self != Derivation::SubTree
-    }
-
-    /// Whether bounds recorded through this derivation must close against the
-    /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
-    /// Every derivation over a self-contained tree does. Only a sub-tree probe
-    /// is excused, because its absent context is what carries the binders.
-    pub(crate) fn enforces_closure(self) -> bool {
-        self != Derivation::SubTree
-    }
-
     /// Whether a closed `Fun`/`Fun` codomain opens unconditionally rather than
     /// only toward a side carrying inference variables. A re-derivation is
     /// reconciling two passes' spellings of one type; the live solve is not, and
@@ -1269,15 +1237,7 @@ fn constrain_go_impl(
             // Fun/Fun arm's rename between two Σs, [`witness_instantiation`]'s where a value
             // meets a shape written over binders — so both sides arrive in one spelling and
             // nothing is left for this to reconcile.
-            //
-            // A **sub-tree** probe is the one abstention: a binder its refinements reference
-            // may be held by the context the cut removed, so Γ classifies neither reference
-            // and the probe has no verdict to give ([`Derivation::sees_every_binder`]).
-            let same = a == b
-                || (!cache.derivation.sees_every_binder()
-                    && (cache.lctx.type_kind_of(a).is_none()
-                        || cache.rctx.type_kind_of(b).is_none()));
-            if same {
+            if a == b {
                 Ok(())
             } else {
                 Err(ConstrainError::Mismatch {
@@ -1416,7 +1376,7 @@ fn constrain_go_impl(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
-                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.derivation);
+                crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
                 let lows = Rc::clone(s.lower());
@@ -1485,7 +1445,7 @@ fn constrain_go_impl(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
-                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.derivation);
+                crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
                 let ups = Rc::clone(s.upper());
@@ -2138,9 +2098,6 @@ mod tests {
     /// live solve does: the tree it walks holds every binder its refinements name, so
     /// a reference to one it does not is the escape the invariant catches.
     ///
-    /// This is what a `Derivation::SubTree` cache is excused from. The two
-    /// tests together are why that excuse is narrow: a probe over a sub-tree
-    /// has no context to hold the binder, and a walk over the whole tree does.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "open bound recorded")]
@@ -2149,54 +2106,6 @@ mod tests {
         let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
         let v = fresh_var(0);
         let _ = constrain_subtype(&escaped, &v, &mut cache);
-    }
-
-    /// Two references to one index, spelled under different binders, at a cut where Γ
-    /// classifies only one of them.
-    ///
-    /// The shape is a comprehension over a conditional collection: the collection is
-    /// `Σ (σ_coll : 𝐾). (σ_coll ⤇ Int)` and the index reaching it is the enclosing
-    /// Σ-typed lambda's parameter, a bare reference the *lambda's* type binds. A cut inside
-    /// the body classifies the collection's binder and not the parameter's, so a probe that
-    /// read the pair as free rejected every such program — 80 tests, all of them
-    /// well-typed at every whole-tree wall.
-    #[test]
-    fn a_sub_tree_probe_abstains_where_only_one_reference_is_classified() {
-        use crate::ccl::infer_var::fresh_witness_binder_id;
-        use crate::ccl::ty::{TypeKind, Witness, WitnessContext};
-
-        let kind = TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]);
-        let collection = Witness::bound_to(fresh_witness_binder_id(), kind.clone());
-        let parameter = Witness::bound_to(fresh_witness_binder_id(), kind);
-        let (classified, unclassified) = (
-            Type::WitnessRef(*collection.id()),
-            Type::WitnessRef(*parameter.id()),
-        );
-        // Γ holds the collection's binder, the one the cut kept.
-        let gamma = WitnessContext::default().extended(std::slice::from_ref(&collection));
-
-        let mut probe = ConstrainCache::for_derivation(Derivation::SubTree);
-        probe.seed_context(&gamma);
-        constrain_subtype(&unclassified, &classified, &mut probe)
-            .expect("a sub-tree probe gives no verdict on a reference its context binds");
-
-        let mut whole = ConstrainCache::for_derivation(Derivation::PostPass);
-        whole.seed_context(&gamma);
-        constrain_subtype(&unclassified, &classified, &mut whole)
-            .expect_err("over a whole tree an unclassified reference is free");
-    }
-
-    /// A sub-tree probe records the same bound without complaint: its refinements
-    /// reference binders the context it was cut from holds, and no walk of the
-    /// sub-tree can enter them.
-    #[test]
-    #[cfg(debug_assertions)]
-    fn a_sub_tree_probe_admits_a_reference_its_context_binds() {
-        let escaped = escaped_refinement();
-        let mut cache = ConstrainCache::for_derivation(Derivation::SubTree);
-        let v = fresh_var(0);
-        constrain_subtype(&escaped, &v, &mut cache)
-            .expect("a sub-tree's free reference is admitted");
     }
 
     /// The tripwire is armed for the one place the record/variant arms and the
@@ -3552,11 +3461,7 @@ mod tests {
     /// cache and used one.
     #[test]
     fn a_rejection_holds_at_every_derivation() {
-        for derivation in [
-            Derivation::LiveSolve,
-            Derivation::PostPass,
-            Derivation::SubTree,
-        ] {
+        for derivation in [Derivation::LiveSolve, Derivation::PostPass] {
             // A capability where a collection is demanded: the fun-kind rejection.
             assert!(
                 matches!(
