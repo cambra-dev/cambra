@@ -486,11 +486,13 @@ key rebind, key-init stash, carrier, the cross-domain and await-final rules), an
 `channelize` (`channelize.cluster`, `channelize.defer_lift`,
 `channelize.defer_collapse`), `transact_phase`'s as-of-read rewrite
 (`transact.as_of_read`), and `lambda_elim` (`lambda_elim.abstract`,
-`lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Two
-shared helpers record under whichever phase
-scope is open around them: `subst` (`subst.vacuous`, `subst.transport`,
-`subst.force_refinement`) and `ccl_utils`' `PredMemo::rebuild`
-(`predicate.rebuild`).
+`lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Three
+shared helpers record under whichever phase scope is open around them: `subst`
+(`subst.vacuous`, `subst.transport`, `subst.force_refinement`), `ccl_utils`'
+`PredMemo::rebuild` (`predicate.rebuild`), and `mut_elim`'s
+`fold_induction_loop` (`letrec.accumulator`, `letrec.feed`), which
+`transact_phase` calls for a cross-domain loop and so records a `letrec.*` label
+under `Transact`.
 
 Every phase that rewrites expression nodes runs under a `PhaseScope`, so no
 recording is inert: `simplify`'s rule combinator and `planning/iterate` both sit
@@ -533,7 +535,7 @@ recordings are one per rewrite it performs. A recording takes only an
 **id**, so a site that has already moved `expr.node` out can still open one —
 read `expr.node_id()` before the destructure.
 
-Three refinements the shapes above do not cover:
+Four refinements the shapes above do not cover:
 
 - **A product spanning several nodes** — the transaction carrier is what a set of
   scattered `with begin():` blocks and register declarations collectively became.
@@ -553,8 +555,18 @@ Three refinements the shapes above do not cover:
   recording is innermost while it runs, so the mint hook attaches to it and the
   outer one keeps only what it built itself: `mut_elim` opens
   `letrec.accumulator` on each write statement and `letrec.feed` on each feed
-  statement inside `letrec.loop`, and the commit-store builder opens one per
-  writer inside `opconv.convert`.
+  statement inside `letrec.loop`, and `planning/loops` opens `planning.txn_read`
+  on each continuation read inside `planning.recognize`.
+
+  Two shapes bound the split. An expansion with **one product covering several
+  constructs** cannot be split at all: a conditional feed rides a single lambda
+  over the whole loop body, so no per-feed recording has anything to adopt, and
+  the products stay on the enclosing recording. An expansion where the **enclosing
+  construct mints nothing** inverts it: every product of an accumulator-free
+  mutation loop belongs to one of its feeds, so the inner recordings take the
+  whole expansion and the `for` around them rides their blame column
+  (`mut_elim`'s `StmtSite::blamed_in`). Blame is what a construct that produced
+  nothing gets, rather than an ancestry edge it did not earn or no edge at all.
 
 #### Choosing between `Expansion` and `Machinery`
 

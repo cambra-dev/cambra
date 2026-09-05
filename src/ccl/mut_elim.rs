@@ -59,12 +59,20 @@ use crate::ccl::{
 // Phase: For/MutWrite → LetRec
 // ---------------------------------------------------------------------------
 
+/// A `for` statement's whole expansion, minus what a nested recording claims:
+/// the history binder and its guard, the decision variant, the writer lambda.
+const LOOP_LABEL: RewriteLabel = "letrec.loop";
+
 /// One accumulator's recurrence slot: its snapshot projection, its seed in the
 /// guard, and its trailing final read.
 const ACCUMULATOR_LABEL: RewriteLabel = "letrec.accumulator";
 
-/// One in-loop feed's tap: the projected view of its field on the decision.
+/// One feed's tap: the projected view of its field on the decision in an
+/// induction loop, and the whole mapped source in an accumulator-free one.
 const FEED_LABEL: RewriteLabel = "letrec.feed";
+
+/// The shadowing `let` a mutable write outside any loop normalizes to.
+const BARE_WRITE_LABEL: RewriteLabel = "letrec.bare_write";
 
 /// The two nodes one statement occupies: the `ExprStmt` holding it and the
 /// marker that is its effect (`For`, `MutWrite`, `Feed`).
@@ -87,10 +95,28 @@ impl StmtSite {
     }
 
     /// Open a recording over what this statement became.
+    ///
+    /// The marker is blamed only when it is a node beside the named one. A site
+    /// that fell back to the marker for both (see [`collect_writes_in`]) would
+    /// otherwise put one pair in both the ancestry and the blame relation,
+    /// which says nothing the ancestry edge does not already say.
     fn enter(self, label: RewriteLabel, nature: provenance::Nature) -> RecordingGuard {
         let g = provenance::enter(self.stmt, label, nature);
-        g.blame(&[self.effect]);
+        if self.effect != self.stmt {
+            g.blame(&[self.effect]);
+        }
         g
+    }
+
+    /// Relate this statement to a recording another site opened: both of its
+    /// nodes ride the blame column, so either answers with the products without
+    /// claiming to have produced them.
+    ///
+    /// The enclosing construct uses this where it mints nothing of its own —
+    /// [`transform_feed_only_loop`], where every product belongs to a feed and
+    /// the `for` around them would otherwise reach nothing at all.
+    fn blamed_in(self, g: &RecordingGuard) {
+        g.blame(&[self.stmt, self.effect]);
     }
 }
 
@@ -697,8 +723,8 @@ fn rewrite(mut expr: Expr) -> Expr {
             // predict it. Predicting it meant re-running `collect_writes` and
             // `body_has_feed` here to guess what `transform_loop` would decide
             // ~140 lines away.
-            let _g = site.enter("letrec.loop", provenance::Nature::Expansion);
-            return transform_loop(target, *iter, *loop_body, *body);
+            let _g = site.enter(LOOP_LABEL, provenance::Nature::Expansion);
+            return transform_loop(site, target, *iter, *loop_body, *body);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
         // top-level `cnt += 1`, or an inlined pass-by-reference writer
@@ -709,7 +735,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             // node it replaces, with the `MutWrite` blamed. Neither is claimed
             // dead: both are absent from the output tree, so the boundary
             // difference reports them.
-            let _g = site.enter("letrec.bare_write", provenance::Nature::Machinery);
+            let _g = site.enter(BARE_WRITE_LABEL, provenance::Nature::Machinery);
             return normalize_bare_write(name, *value, *body);
         }
         // Not a loop/write statement: rebuild and recurse.
@@ -989,7 +1015,13 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
 /// projection* of the history (causal — see `check_letrec_causal`); each
 /// feed rides the decision as a `to_<feed>` field, hoisted to
 /// `Feed(defer, __hist ≫ .to_<feed>)` for `channelize` to route.
-fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
+fn transform_loop(
+    loop_site: StmtSite,
+    target: TypedBinding,
+    iter: Expr,
+    loop_body: Expr,
+    cont: Expr,
+) -> Expr {
     // Every reference to an accumulator is either in the loop (a read-your-writes
     // read) or downstream of it (the trailing final read), so these two trees
     // carry every `Mut(V, D)` this loop's mutable variables have.
@@ -1022,6 +1054,11 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
                 // `{gᵢ → Feed; true → unit}` shape `channelize::try_extract_fanout_feed`
                 // recognizes — the same shape a non-transactional conditional feed
                 // lowers to directly.
+                //
+                // The products stay on the enclosing `letrec.loop`, unlike the two
+                // paths that split per feed. One lambda carries the whole body
+                // here, however many arms feed, so there is no product to hand to
+                // any one feed statement.
                 let body = strip_trailing_unit(loop_body.clone());
                 let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), body);
                 lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
@@ -1032,7 +1069,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
                 stmt.ty = cont_ty;
                 return stmt;
             }
-            return transform_feed_only_loop(target, iter, loop_body, cont);
+            return transform_feed_only_loop(loop_site, target, iter, loop_body, cont);
         }
         return rewrite(cont);
     }
@@ -1068,7 +1105,6 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
 /// projection, the guard's seed, the trailing final read — so each accumulator
 /// of a two-accumulator loop resolves to the line that writes it rather than
 /// both resolving to the loop.
-#[derive(Clone)]
 pub(crate) struct Accumulator {
     pub name: Name,
     pub ty: Type,
@@ -1337,10 +1373,16 @@ pub(crate) fn fold_induction_loop(
 /// as-of read to every loop position; `transact_phase::rewrite_as_of_reads`
 /// (post-`channelize`, pre-lambda-elim) then pairs it with this loop as its trigger,
 /// which is where the outer-indexed as-of join gets the position it reads at.
-fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
+fn transform_feed_only_loop(
+    loop_site: StmtSite,
+    target: TypedBinding,
+    iter: Expr,
+    loop_body: Expr,
+    cont: Expr,
+) -> Expr {
     let (domain_ty, _item_ty) = fun_parts(&iter.ty);
     let mut env: HashMap<Name, Expr> = HashMap::new();
-    let mut feeds: Vec<(Name, Expr)> = Vec::new();
+    let mut feeds: Vec<(Name, Expr, StmtSite)> = Vec::new();
     collect_feed_only(loop_body, &mut env, &mut feeds);
     debug_assert!(
         !feeds.is_empty(),
@@ -1351,7 +1393,16 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
     // Emit in reverse so the first source feed ends up outermost — channelize
     // collects feeds outermost-first into the channel union, preserving source
     // order (mirrors the accumulator path's hoist ordering).
-    for (defer, value) in feeds.into_iter().rev() {
+    for (defer, value, site) in feeds.into_iter().rev() {
+        // The map is what this feed became: one per feed, so each is recorded
+        // against its own statement rather than all of them against the loop.
+        // The enclosing `letrec.loop` mints nothing of its own on this path —
+        // an accumulator-free loop is its feeds — so the `For` rides the blame
+        // column instead: the map iterates, and the loop keyword is what that
+        // is about, without being an ancestor of a node the feed produced.
+        let g = site.enter(FEED_LABEL, provenance::Nature::Expansion);
+        loop_site.blamed_in(&g);
+
         let value_ty = value.ty.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
         lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
@@ -1367,8 +1418,16 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
 
 /// Walk an accumulator-free loop body (a read-only `with begin():` block:
 /// `Let`s, `Feed`s, terminal `Unit` — no `MutWrite`), threading `Let` values
-/// through `env` and collecting each feed's `(defer, env-resolved value)`.
-fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<(Name, Expr)>) {
+/// through `env` and collecting each feed's `(defer, env-resolved value, site)`.
+///
+/// The site is the feed statement its map is recorded against, the same
+/// attribution the induction path's [`FeedSite`] carries.
+fn collect_feed_only(
+    expr: Expr,
+    env: &mut HashMap<Name, Expr>,
+    feeds: &mut Vec<(Name, Expr, StmtSite)>,
+) {
+    let stmt_id = expr.node_id();
     match expr.node {
         TypedExprNode::Let {
             binding,
@@ -1380,10 +1439,11 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
             collect_feed_only(*body, env, feeds);
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
+            let site = StmtSite::new(stmt_id, effect.node_id());
             match effect.node {
                 TypedExprNode::Feed { name, value } => {
                     let val = Subst::discharge_env_in_place(*value, env);
-                    feeds.push((name, val));
+                    feeds.push((name, val, site));
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in read-only `with begin():` block: {}",
@@ -1438,6 +1498,12 @@ pub(crate) fn mut_var_value_tys<'a>(
 /// Collect the loop's accumulators in first-write order, each with its value type
 /// taken from `value_tys` — the join inference recorded on the mutable variable's
 /// `Mut(V, D)` — and the write statement its recurrence slot is recorded against.
+///
+/// One accumulator has one slot however many times the body writes it, so the
+/// recording goes to the first write and a later write to the same variable takes
+/// none. What the later statement contributes is not a mint: [`transform_chain`]
+/// inlines its value into the read-your-writes environment by id, and its marker
+/// and `ExprStmt` die, which the boundary difference reports.
 ///
 /// A mutable variable with no entry is one no reference types as a `Mut`: either nothing
 /// reads it (only writes mention it, so its value type is unobservable), or the
