@@ -9,13 +9,9 @@
 //! `DUMP_PANICS`, since a program that does not compile has no payload to
 //! validate.
 //!
-//! The needle names the mismatch, not the check that reports it. Which
-//! checkpoint fires first depends on the build: the always-on pass-boundary
-//! check says "post-lambda-elim produced an invalid tree", while under
-//! `--features deep-typecheck` (which CI sets via `DEEP_TYPECHECK=1`) the
-//! per-operation typecheck reaches it earlier and says "Failed post-transform
-//! typecheck". Both render the same incomparable-kinds sentence, so pinning that
-//! is what makes this test say the same thing in either configuration.
+//! The needle names the mismatch, not the check that reports it: the
+//! pass-boundary check reports "post-lambda-elim produced an invalid tree", and
+//! the incomparable-kinds sentence it renders is what this test pins.
 
 use super::common::expect_compile_error;
 

@@ -77,13 +77,10 @@ pub(super) struct CheckCtx {
     /// telescope and the record-time closure observation stays meaningful in
     /// both modes.
     telescope: Telescope,
-    /// Whether this walk has the whole tree or a sub-tree cut from its context
-    /// — the two answer the closure invariant differently. See [`Derivation`].
-    derivation: Derivation,
 }
 
 impl CheckCtx {
-    fn new(root: NodeId, derivation: Derivation) -> Self {
+    fn new(root: NodeId) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
@@ -94,7 +91,6 @@ impl CheckCtx {
             pred_memo: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
-            derivation,
         }
     }
 }
@@ -243,10 +239,11 @@ impl Typing for CheckCtx {
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
         //
-        // The cache serves this walk's derivation: a whole tree enforces the
-        // closure invariant like the live solve, a sub-tree probe cannot (the
-        // binders its refinements reference are held by the context it was cut from).
-        let mut cache = ConstrainCache::for_derivation(self.derivation);
+        // Check re-derives at a pass boundary, reconciling types two passes
+        // spelled in different forms, so its cache takes `Derivation::PostPass`.
+        // That is the one respect in which Check's constraint solving differs
+        // from the live solve's (see [`Derivation`]).
+        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
         if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
@@ -603,21 +600,20 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// record name the caller's real nodes rather than scratch ones nobody can
 /// resolve.
 ///
-/// Cost note: the full-tree clone makes each call O(tree). The hot caller is
-/// `simplify`'s `debug_typecheck` (one call per *fired* rewrite rule), which
-/// is compiled out of release builds; the remaining callers (`typecheck`,
-/// post-planning validation in `context.rs`) run once per pipeline stage.
+/// Cost note: the full-tree clone makes each call O(tree). Every caller
+/// (`typecheck`, `check_pre_channelize`, post-planning validation in
+/// `context.rs`) runs once per pipeline stage.
 ///
-/// **TODO(scratch-copy): ripe for refactoring — this is quadratic.** One tree
-/// copy per fired rule is O(tree x rules) over a debug compile, for a value that
-/// is read and dropped. The clone exists only because the shared per-node rules
+/// **TODO(scratch-copy): ripe for refactoring.** The clone is a whole tree per
+/// pass boundary, for a value that is read and dropped. It exists only because
+/// the shared per-node rules
 /// take `&mut Expr` for inference's in-place type writes, while Check needs
 /// nothing but reads. Splitting the rules' slot access — a `&mut` writer in
 /// Infer mode, a reader in Check mode — removes the copy entirely rather than
 /// making it cheaper.
-pub fn check(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>> {
+pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut cloned = expr.clone_preserving_ids();
-    let mut ctx = CheckCtx::new(cloned.node_id(), derivation);
+    let mut ctx = CheckCtx::new(cloned.node_id());
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
@@ -666,7 +662,7 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id(), Derivation::PostPass);
+        let mut ctx = CheckCtx::new(tree.node_id());
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();

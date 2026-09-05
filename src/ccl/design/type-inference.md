@@ -1021,19 +1021,15 @@ of the bound's type is in the telescope or in the edge's substitution domain. Th
 the bound is recorded, and it is a lookup, since uniquify gives every binding site one uid. A
 violation names the variable and the reference and fails.
 
-Enforcement covers every derivation over a self-contained tree: the live solve, meaning emission and
-its specialization pins, and the pass-boundary re-derivations that check what a pass produced. A
+Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
+and the pass-boundary re-derivations that check what a pass produced. A
 re-derivation walks a tree where a pass has erased term binders, and the refinements it meets still
 name them. The dependent function's type binds them there, and the chain walk enters its Pi binder
 (see [Where the conversions run](#where-the-conversions-run)). The tree holds every binder its
 refinements reference; a reference to one it does not hold is a bound that left its binder's scope.
 
-One derivation is excused: a probe over a sub-tree cut from its tree, which is `debug_typecheck`'s
-per-operation check and nothing else. The context it was cut from holds the binders, and no walk of
-the sub-tree can enter them. Planning's in-place checks of a morphism it has just built are not
-excused, because a morphism carries its own binder. `ConstrainCache::for_derivation` names the three
-cases, and the `Fun`/`Fun` codomain edge reads the same value (see [Where the conversions
-run](#where-the-conversions-run)). `CAMBRA_TELESCOPE_LOG` enables the observation log.
+`ConstrainCache::for_derivation` names the two cases, and the `Fun`/`Fun` codomain edge reads the
+same value (see [Where the conversions run](#where-the-conversions-run)).
 
 A program source needs no standing in the telescope, because the check never sees a reference to
 one. A source is referenced by a `TypedExprNode::Source` node rather than by a variable: lowering

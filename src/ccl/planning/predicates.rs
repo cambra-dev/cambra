@@ -293,8 +293,8 @@ mod tests {
         let int_ty = Type::Base(BaseType::Int);
         let bool_ty = Type::Base(BaseType::Bool);
         let elem = || Expr::var(Name::elem()).with_ty(int_ty.clone());
-        // A real `𝐷 ⇒ Bool`, so the deep typechecker accepts the η-expansion the
-        // slow path builds.
+        // A real `𝐷 ⇒ Bool`, so the η-expansion the slow path builds is
+        // well-typed.
         let pred_fn = |domain: Type| trivially_true_predicate(domain);
 
         // Fast path: already `__elem ▷ p`, so the raise is a single clone of `p`.

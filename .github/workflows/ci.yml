@@ -180,16 +180,12 @@ jobs:
         # Read more about the "hidden ifs" and general inanity here
         # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
         if: steps.filter.outputs.code == 'true' && (success() || failure())
-        # Enable the opt-in per-operation typecheck (the `deep-typecheck`
-        # feature) in automated runs so it keeps guarding against a pass that
-        # produces an ill-typed tree — it is off by default locally because it is
-        # superlinear on nested comprehensions (see `ci_test` / `debug_typecheck`).
         # `CAMBRA_PROVENANCE_GATE=1` makes every compile fold every gated pane pair
         # and gate the leak classes, so the gate's corpus is the whole test suite
         # rather than the handful of programs `context.rs`'s `corpus()` lists. Two
         # recording gaps lived outside that sample; measured at ~+4% on the test
         # step, which is worth paying to keep the next one from doing the same.
-        run: DEEP_TYPECHECK=1 CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
+        run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
       - name: Test (reversed refinement order)
         if: steps.filter.outputs.code == 'true' && (success() || failure())
