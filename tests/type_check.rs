@@ -2226,9 +2226,9 @@ fn test_groupby_key_relation_is_per_occurrence(#[case] code: &str) {
 // pinning the variant would make the test fail on any change to that — it says
 // only that the two types met and were refused.
 #[test]
-#[ignore = "the membership deferral rejects every bare-key lookup first, so the key-type \
-            reason this pins is not the one reported (see the note below); tightens back \
-            when the lookup discharge lands"]
+#[ignore = "on a group-by the membership rejection fires before the key-type edge, so this \
+            reason is unobservable until the proven lookup lands; \
+            `a_checked_lookup_is_not_an_application` covers the same edge on a map"]
 fn test_groupby_lookup_at_wrong_key_type_rejected() {
     let errs = infer_program_err(indoc! {r#"
         groups = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
@@ -2320,14 +2320,24 @@ fn map_injects_into_nominal_map_annotation() {
     );
 }
 
-// NOTE: direct key lookup on a group-by (`g = groups(k)`) is deferred. `groupby`
-// infers the honest keyed type `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (see
-// `src/ccl/design/collections.md`, "`groupby`'s exact type"), so applying it at a plain
-// key demands proving the key is in *that* key domain — the discharge described in
-// `src/ccl/design/collections.md`, "Lookup: membership discharge", which will
-// re-enable this test as a discharged / `Option`-typed lookup. It "worked" before
-// only because the old total-function type was too loose.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+// Aggregating **one group** of a group-by, reached by key.
+//
+// As written this asserts the *proven* form `groups(1)`, and that will not come back:
+// `groupby` infers the honest keyed type `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (see
+// `src/ccl/design/collections.md`, "`groupby`'s exact type"), so a bare literal key cannot
+// be shown present, and rejecting it is the design rather than a gap
+// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). It "worked" before
+// only because the old total-function type admitted every key.
+//
+// The checked form does not stand in for it. `groups[1]?` types — the group-by's key
+// binder discharges to the key (`a_key_dependent_lookup_discharges_the_key_binder`) — but
+// a group is a collection, so the answer carries one as its `` `some `` payload and
+// nothing materializes that yet, which op-conversion rejects
+// (`a_group_valued_lookup_is_rejected_by_name`). After that capability this becomes
+// `match groups[1]? { some(g) -> sum(g), none -> 0 }` — a different assertion than the one
+// here, so it is restated rather than un-ignored.
+#[ignore = "superseded: `groups(1)` is rejected by design; restating it as a checked lookup \
+            needs dependent lookup and then a materializable collection payload"]
 #[test]
 fn test_groupby_aggregate() {
     // groups = groupby([1, 2, 3], \x -> x)
@@ -2345,76 +2355,63 @@ sum(g)
     assert_eq!(ty, int(), "expected Int, got {ty}");
 }
 
-/// Dependent application: looking up one partition of a group-by applies the
-/// key function `(k) ⇒ {i | key(i) == k} ⇒ V` at a concrete key, and the
-/// surviving partition predicate must reflect that key — the binder is
-/// *discharged* to the argument (design §5 / Appendix A). This is the headline
-/// case the Pi-type + substitution machinery unlocks: before it, the predicate
-/// kept the unbound group-by key.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+/// **Dependent application discharges the binder to the argument.** The headline case
+/// the Pi-type + substitution machinery unlocks: a function whose *result type mentions
+/// its parameter*, applied at a concrete value, must have that value substituted into the
+/// result — before it, the predicate kept the unbound binder.
+///
+/// The vehicle is a filtered comprehension over the parameter, which is dependent for the
+/// ordinary reason (the body's type mentions `k`) and needs **no membership proof**. A
+/// group-by key lookup would not serve: it couples this machinery to whether a bare key can
+/// be shown present in a keyed collection, an unrelated question that the proven operator
+/// answers "no" by design (`src/ccl/design/collections.md`, "Lookup: membership
+/// discharge").
 #[test]
-fn test_groupby_dependent_application_discharges_key() {
-    // groups : (k) ⇒ ({i | i ▷ xs ▷ key_fn == k} ⇒ Int); groups(0) discharges
-    // k ↦ 0, so the partition predicate must mention the literal 0 and no
-    // longer reference the group-by key binder `__gb_k`.
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-groups(0)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
-    };
-    let [r] = dom.refinements() else {
-        panic!("expected a singly-refined partition domain, got {ty}");
-    };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
+fn dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    // The function is genuinely dependent: its codomain refinement mentions the binder.
     assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged, but predicate still has it: {pred}"
+        infer_program(&format!("{f}f"))
+            .to_string()
+            .starts_with("((k: Int) ⇒ "),
+        "the vehicle must be a dependent function"
     );
-    assert!(
-        pred.contains('0'),
-        "discharged predicate should mention the argument 0: {pred}"
+    assert_predicate_discharged(&infer_program(&format!("{f}f(0)")), "k");
+}
+
+/// O3 (**higher-order** dependent application): apply a dependent function through a
+/// function-typed *parameter* whose type is still an inference variable at emit time.
+/// `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply` cannot peek its Pi
+/// binder to build the identity correspondence — the discharge `[k ↦ 0]` must instead be
+/// resolved at coalesce, once `g` resolves to the dependent function.
+///
+/// `apply0(f)` must therefore land on exactly what the *direct* `f(0)` yields.
+#[test]
+fn higher_order_dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    let direct = infer_program(&format!("{f}f(0)"));
+    let through = infer_program(&format!("{f}apply0 = \\g -> g(0)\napply0(f)"));
+    assert_predicate_discharged(&through, "k");
+    assert_eq!(
+        through, direct,
+        "applying through a function-typed parameter must give the same type as applying \
+         directly"
     );
 }
 
-// O3 (higher-order dependent application): apply a dependent function through a
-// function-typed *parameter* whose type is still an inference variable at emit
-// time. `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply`
-// cannot peek its Pi binder to build the identity correspondence — the discharge
-// `[k ↦ 0]` must instead be resolved at coalesce, once `g` resolves to the
-// group-by partition function. The result of `apply0(groups)` must be the same
-// `{i | key(i) == 0} ⇒ Int` partition the *direct* `groups(0)` yields: predicate
-// mentions `0`, not the group-by key binder `__gb_k`.
-//
-// Was blocked on O3 until the apply discharge moved to coalesce: `coalesce_node`
-// re-derives each application's type from its already-resolved function child,
-// discharging on the function's *real* binder rather than the fresh `__arg`
-// binder `emit_apply` peeks when the function is still an inference variable.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
-#[test]
-fn test_higher_order_dependent_application_discharges_key() {
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-apply0 = \g -> g(0)
-apply0(groups)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
+/// Shared assertion for the two discharge tests: `ty` is a data function whose domain
+/// refinement mentions the discharged argument `0` and no longer references `binder`.
+fn assert_predicate_discharged(ty: &Type, binder: &str) {
+    let Type::Fun { domain: dom, .. } = ty else {
+        panic!("expected a refined data function, got {ty}");
     };
     let [r] = dom.refinements() else {
-        panic!("expected a singly-refined partition domain, got {ty}");
+        panic!("expected a singly-refined domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged through the higher-order apply, but: {pred}"
+        !pred.contains(binder),
+        "binder `{binder}` should be discharged, but the predicate still has it: {pred}"
     );
     assert!(
         pred.contains('0'),
@@ -5257,5 +5254,238 @@ sum([x + y for x in a for y in b])"
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lookup: `Option`, its constructors, and the subscript pair
+// ---------------------------------------------------------------------------
+
+/// `Option(T)` is the tagged variant `` `some(T) | `none `` — no new type constructor,
+/// just the `Variant` the surface-variants work landed. What this pins is the
+/// **abbreviation**: an `Option(𝑇)` annotation and the variant a `` `some ``/`` `none ``
+/// constructor builds are one type, so the constructors reach it with no rule of their
+/// own.
+#[test]
+fn option_annotation_abbreviates_the_tagged_variant() {
+    // Bounded, so the program keeps the narrower one-tag type it built; an exact
+    // annotation binds at `Option(Int)` and is a different claim.
+    assert_eq!(
+        infer_program("x <: Option(Int) = `some(1)\nx").to_string(),
+        "{`some{Int@1}}"
+    );
+    assert_eq!(
+        infer_program("x <: Option(Int) = `none\nx").to_string(),
+        "{`none}"
+    );
+    // The payload still flows: a `` `some(String) `` is not an `Option(Int)`.
+    assert!(
+        !infer_program_err("x <: Option(Int) = `some(\"a\")\nx").is_empty(),
+        "`some(String) must not satisfy Option(Int)"
+    );
+}
+
+/// An integer-*literal* subscript keeps meaning tuple projection. A tuple is a
+/// heterogeneous product rather than a finite function, and lowering has no types
+/// with which to tell `t[0]` from `xs[0]`, so this case is unchanged.
+#[test]
+fn integer_literal_subscript_is_still_tuple_projection() {
+    // Projection selects an element rather than computing one, so the element's
+    // own singleton survives the projection.
+    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
+    assert_eq!(infer_program("t = (1, \"a\")\nt.1"), str_lit("a"));
+}
+
+/// A non-literal subscript is **application** — subscript and call are one
+/// operation, evaluating a finite function at a point (chl-spec §3.9) — so it
+/// inherits the proof obligation: the index must be in the collection's domain.
+/// An unconstrained index is not, and that is the whole point of the pair.
+///
+/// Checked **at the call site**. A parameter annotation is a *bound* on the param
+/// rather than its type, so an un-applied `f` still has an open index variable and
+/// nothing to reject yet — same as any un-applied function over an inferred parameter.
+/// Applying it is what closes the variable and fires the obligation.
+#[test]
+fn total_subscript_demands_a_provable_index() {
+    for program in [
+        // A bare `Int` is not provably a member of `[0, 3)`.
+        "def f(a: Array(3, Int), i: Int):\n    a[i]\nf([1,2,3], 5)",
+        // Nor is a bare key provably present in a map's key domain.
+        "def f(m: Map(Int, Int), k: Int):\n    m[k]\nf(groupby([1,2,3], \\x -> x), 5)",
+    ] {
+        assert!(
+            !infer_program_err(program).is_empty(),
+            "an unprovable index must be rejected, not silently allowed: {program}"
+        );
+    }
+}
+
+/// `[…]` means **collection lookup only**, and `.0` / `.name` mean projection — disjoint
+/// spellings, so lowering never has to guess which operation a subscript was.
+///
+/// The **proven** form does not type-check for a range domain: an `Array(3, 𝑇)`'s domain is
+/// the range `[0, 3)`, which relates only by equality, so no integer carries the membership
+/// proof a total lookup needs and there is no refinement for the checked form to relax
+/// either (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What this pins
+/// is that the *rejection* is uniform — `xs[0]`, `xs[i]` and `xs(0)` are one operation and
+/// fail alike — so none of them is quietly reinterpreted as projection.
+#[test]
+fn subscript_is_lookup_and_dot_is_projection() {
+    // Projection: both keys, on the shapes that have them.
+    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
+    assert_eq!(
+        infer_program("t = (1, \"a\")\nt.1").to_string(),
+        "String@\"a\""
+    );
+    assert_eq!(infer_program("r = (a=1, b=2)\nr.b"), int_lit(2));
+
+    // Subscripting a tuple is *not* projection: a tuple is a heterogeneous product,
+    // not a finite function.
+    assert!(
+        !infer_program_err("t = (1, \"a\")\nt[0]").is_empty(),
+        "a tuple has no domain to look up in"
+    );
+
+    // Lookup on a collection is one operation however it is spelled, and all three
+    // spellings fail the same undischarged-membership edge.
+    for program in [
+        "xs = [10, 20, 30]\nxs[0]",
+        "xs = [10, 20, 30]\ni = 0\nxs[i]",
+        "xs = [10, 20, 30]\nxs(0)",
+    ] {
+        assert!(
+            !infer_program_err(program).is_empty(),
+            "no index proves membership yet, so `{program}` must be rejected"
+        );
+    }
+}
+
+/// The **checked** lookup `c[k]?` types as `Option(𝑉)`, and it is **not an application**.
+///
+/// An application demands its argument lie in the function's domain, and `c[k]?` is
+/// reached exactly when that is not known — so it is typed as its own total operation
+/// instead: the key owes the collection's key *base*, the answer is `Option` of the value,
+/// and presence is decided at runtime. [`Builtin::CollectionContains`] is the same shape
+/// one payload lighter, `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)`.
+///
+/// Two consequences are asserted here because they are what "not an application" buys:
+/// a key that cannot be shown present is accepted, and a key of the wrong *type* is still
+/// rejected. `Option` answers "is this key present", never "is this a key at all".
+#[test]
+fn a_checked_lookup_is_not_an_application() {
+    let m = "m = map([(1, 10), (2, 20)])\n";
+    // A key that is certainly absent still type-checks: presence is not a typing question.
+    assert_eq!(
+        infer_program(&format!("{m}m[9]?")).to_string(),
+        "{`none | `some{Int}}"
+    );
+    // The proven form is the pair to it, and it still demands the membership its domain
+    // states — the two are different rules, not one rule with a flag.
+    assert!(
+        !infer_program_err(&format!("{m}m(9)")).is_empty(),
+        "the proven form must still demand a membership proof"
+    );
+    // Only membership is waived. The key's base type is the collection's, and a `String`
+    // does not become one by being looked up carefully.
+    assert!(
+        !infer_program_err(&format!("{m}m[\"nope\"]?")).is_empty(),
+        "a String key must not reach an Int-keyed map"
+    );
+}
+
+/// A collection whose **values depend on the key** answers at that key: a group-by's group
+/// is refined by the key binder, and `𝑔[𝑘]` reads the group refined at `𝑘`.
+///
+/// The discharge is what makes the answer total. `𝑘` is only *maybe* present, and the
+/// substituted type stands for any key of the key type — denoting the empty group where
+/// the key is absent, which is what `` `none `` versus `` `some `` of an empty group then
+/// distinguishes. Sound because a keyed access is not an application: the binder's
+/// declared domain is where the binder was introduced, not an obligation the key owes
+/// ([`keyed_access_value`] relates the key to the key *base*).
+///
+/// Whether the answer can be **materialized** is a separate question, and the group-valued
+/// case cannot be — decided at op-conversion, which
+/// `tests/compilation_pipeline/joins_aggregates_groupby.rs`'s
+/// `a_group_valued_lookup_is_rejected_by_name` covers as a whole program.
+#[test]
+fn a_key_dependent_lookup_discharges_the_key_binder() {
+    assert_eq!(
+        infer_program("g = groupby([1, 2, 3], \\x -> x)\ng[1]?").to_string(),
+        "{`none | `some{({[0, 2] | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int)}}",
+        "the group's predicate must name the key it was looked up at"
+    );
+}
+
+/// What the checked operator does **not** reach yet, pinned so the boundary is a decision
+/// rather than a surprise.
+///
+/// A **range** domain has no membership refinement to drop: `UIntRange(𝑛)` is a primitive
+/// relating only by equality, not an index type refined by a bound, so no integer
+/// discharges against it and there is nothing for the relaxation to strip. Closing this is
+/// the representation question in `src/ccl/design/collections.md`, "Lookup: membership
+/// discharge" — deciding it is what makes `lst[𝑖]?` work, not a missing case in the rule.
+///
+/// A **bounded** parameter target is unresolved at emit, where the relaxation runs: a use
+/// of the binder carries the binder's variable rather than its annotation, so there is no
+/// domain to read. An **exact** one is a concrete type at the binder, so it reaches —
+/// asserted below.
+///
+/// A **tuple** is not a finite function at all, so it has no lookup — `t.0` projects it.
+#[test]
+fn checked_lookup_boundaries() {
+    for (program, why) in [
+        (
+            "xs = [10, 20, 30]\nxs[0]?",
+            "a range domain has no membership refinement",
+        ),
+        (
+            "def f(m <: Map(Int, Int)):\n    m[1]?\nf",
+            "a bounded parameter is unresolved where the relaxation runs",
+        ),
+        ("t = (1, \"a\")\nt[0]?", "a tuple is not a finite function"),
+    ] {
+        assert!(
+            !infer_program_err(program).is_empty(),
+            "expected a rejection: {why}"
+        );
+    }
+    // The exact form binds `m` at `Map(Int, Int)` itself, so the relaxation has a domain
+    // to strip the token from and the lookup answers `Option(Int)`.
+    assert_eq!(
+        infer_program("def f(m: Map(Int, Int)):\n    m[1]?\nf")
+            .codomain()
+            .expect("f is a function")
+            .to_string(),
+        "{`none | `some{Int}}"
+    );
+}
+/// A `Set(K)` is `Map(K, unit)`, so its checked lookup answers `Option(unit)` —
+/// membership as a value, which is what `k in s` will be built on. The set half of the
+/// pair [`checked_lookup_on_a_map_answers_the_value`] completes: the two constructors
+/// differ only in the codomain their collapse leaves.
+#[test]
+fn checked_lookup_on_a_set_is_membership_as_a_value() {
+    assert_eq!(
+        infer_program("s = set([1, 2, 3])\ns[1]?").to_string(),
+        "{`none | `some}"
+    );
+    assert!(
+        !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]?").is_empty(),
+        "a String key must not reach an Int-keyed set"
+    );
+}
+
+/// A checked lookup on a `map` answers the value type, where the same lookup on a `set`
+/// answers `Option(unit)` — the two constructors differing only in the codomain their
+/// collapse leaves.
+#[test]
+fn checked_lookup_on_a_map_answers_the_value() {
+    assert_eq!(
+        infer_program("m = map([(1, 10), (2, 20)])\nm[1]?").to_string(),
+        "{`none | `some{Int}}"
+    );
+    assert!(
+        !infer_program_err("m = map([(1, 10), (2, 20)])\nm[\"nope\"]?").is_empty(),
+        "a String key must not reach an Int-keyed map"
     );
 }

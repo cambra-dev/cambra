@@ -122,14 +122,15 @@ fn test_multi_arg_param_in_filter_predicate() {
 // the collection by the key-discharged partition predicate at the iteration
 // boundary, exercising the dependent type through to runtime values.
 //
-// DEFERRED: `groupby` infers the honest keyed type
+// DEFERRED, and not on one capability. `groupby` infers the honest keyed type
 // `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`
-// (see `src/ccl/design/collections.md`, "`groupby`'s exact type"), so a direct lookup
-// `g(k)` at a plain key demands proving the key is in *that* key domain — the
-// discharge described in `src/ccl/design/collections.md`, "Lookup: membership
-// discharge", which will re-enable these as discharged / `Option` lookups. They
-// passed before only because the old total-function type was too loose (any key
-// admitted, absent → empty group).
+// (`src/ccl/design/collections.md`, "`groupby`'s exact type"), so the proven `g(k)` at a
+// plain key cannot be shown present, and rejecting it is the design rather than a gap.
+// Restating these as the checked `g[k]?` needs two things that do not exist: dependent
+// lookup, because a group-by's codomain names its key binder
+// (`src/ccl/design/collections.md`, "`𝑐[𝑘]?` is not an application"), and then a
+// materialization for a collection-valued `some` payload. They passed before only because
+// the old total-function type was too loose (any key admitted, absent → empty group).
 #[rstest]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1))", Value::Int(2))] // {1,1}
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(2))", Value::Int(4))] // {2,2}
@@ -137,7 +138,7 @@ fn test_multi_arg_param_in_filter_predicate() {
 #[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(0))", Value::Int(1))] // {1}
 #[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(1))", Value::Int(5))] // {2,3}
 #[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(2))", Value::Int(9))] // {4,5}
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+#[ignore = "a bare-key `g(k)` is rejected by design and is not coming back; restating as `g[k]?` needs dependent lookup and then a materializable collection payload (see the comment above)"]
 fn test_dependent_groupby_lookup(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

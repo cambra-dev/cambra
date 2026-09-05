@@ -752,6 +752,21 @@ impl Typing for InferCtx {
         v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
     }
+
+    /// Emission computes the discharge; the operator's type is not stamped yet, so
+    /// `stamped` says nothing here.
+    fn keyed_value_at(
+        &mut self,
+        codomain: &Type,
+        key_binder: Option<&Name>,
+        key: &Expr,
+        _stamped: &Type,
+    ) -> Type {
+        match key_binder {
+            Some(binder) => crate::ccl::subst::discharge_codomain(binder, key, codomain),
+            None => codomain.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -923,13 +923,16 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 >
 > So `arr[i]: T` and `lst[i]?: Option(T)` are one operator pair on two proof
 > outcomes, as are `m[k]: V` for a key known present and `m[k]?: Option(V)`
-> otherwise. A `Set` has no subscript — its keys are its content, so test it with
-> `k in s` (below). A `FullMap` (§6.3) discharges every key by construction, so
-> `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
-> *Partiality*, §3). **Partly implemented** — `c[k]` lowers as the lookup `c(k)`, so a
-> `FullMap` subscript answers `V` today, its key set being the key type itself. For every
-> other collection nothing discharges the index's membership, so the subscript is a type
-> error whatever the index.
+> otherwise. A `Set` is `Map(K, unit)`, so `s[k]?: Option(unit)` states membership as a
+> value — `` `some `` for a present key, `` `none `` for an absent one — where `k in s`
+> (below) states it as a `Bool`. A `FullMap` (§6.3) discharges every key by construction,
+> so `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
+> *Partiality*, §3). **Partly implemented** — `c[k]?` answers on a `map` and a `set`; on a
+> `groupby` it is rejected, because a group's type names the key it was looked up at, and
+> on a list it is rejected, because a range domain carries no membership to decide.
+> `c[k]` lowers as the lookup `c(k)`, so a `FullMap` subscript answers `V` today, its key
+> set being the key type itself; for every other collection nothing discharges the index's
+> membership, so the proven subscript is a type error whatever the index.
 
 ### 3.10 Lambda
 
@@ -2234,8 +2237,8 @@ and how the checker carries the distinction, is
   (§3.9).
 - `List(T)` — values in order, count known only at runtime. `lst[i]?:
   Option(T)`, since nothing bounds `i`.
-- `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4); there
-  is no subscript, because the keys are the content.
+- `Set(K)` — distinct keys and no values, so it is `Map(K, unit)`. Membership is
+  `k in s` (§3.4) as a `Bool`, or `s[k]?: Option(unit)` (§3.9) as a value.
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
   `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
 - `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]: V` needs no

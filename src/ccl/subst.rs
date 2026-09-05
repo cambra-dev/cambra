@@ -2101,6 +2101,29 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
     references_enclosing_function(codomain) || type_free_vars(codomain).contains(binder)
 }
 
+/// Plug `argument` in for `binder` throughout `codomain` — the action
+/// [`codomain_depends_on`] is the test for, admitting the same two reference forms.
+///
+/// A closed codomain names the binder by index and opens through
+/// [`open_pi_binder`]; a name-spelled one substitutes by name. A codomain naming it in
+/// neither form comes back unchanged, so a caller need not case-split on whether the
+/// codomain is dependent at all.
+pub fn discharge_codomain(binder: &Name, argument: &TypedExpr, codomain: &Type) -> Type {
+    let opened = if references_enclosing_function(codomain) {
+        open_pi_binder(
+            &Mapping::Discharge(Box::new(argument.clone_preserving_ids())),
+            codomain,
+        )
+    } else {
+        codomain.clone()
+    };
+    if type_free_vars(&opened).contains(binder) {
+        Subst::discharge(binder, argument.clone_preserving_ids()).apply_type(&opened)
+    } else {
+        opened
+    }
+}
+
 /// The functions a refinement-closing walk is inside of, and the memo that closes
 /// refinements against them (see `src/ccl/design/type-inference.md`, "Where the
 /// conversions run").

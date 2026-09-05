@@ -1435,6 +1435,14 @@ pub enum TypeKind {
     Type,
 }
 
+/// The `` `some `` tag of an `Option` — a value that is present.
+///
+/// Named here, beside [`Type::option_of`], because the runtime builds the same tag when it
+/// answers a checked lookup (`FunctionDef::LookupChecked`). One spelling, two builders.
+pub const V_SOME: &str = "some";
+/// The `` `none `` tag of an `Option` — a value that is absent. See [`V_SOME`].
+pub const V_NONE: &str = "none";
+
 /// The kind part of a `Σ… ⤇ V` rendering — candidates in brackets, every other kind by
 /// name. Brackets rather than braces because braces are the record type's, and candidates
 /// are a sequence rather than a record.
@@ -2146,9 +2154,9 @@ impl Type {
     /// It is **not** a distinguished kind of type: the result is an ordinary
     /// structural [`Type::Variant`], and the constructors `` `some(𝑒) `` / `` `none ``
     /// are ordinary variant constructors that no pass gives special treatment.
-    /// This function is the only place in the compiler that mentions either tag
-    /// spelling; when type aliases land it is replaced by a prelude
-    /// `` Option(T) = {`some{T} | `none} `` and deleted.
+    /// The spellings live in [`V_SOME`]/[`V_NONE`] rather than here, because the runtime
+    /// builds the same tags when it answers a checked lookup; when type aliases land this
+    /// is replaced by a prelude `` Option(T) = {`some{T} | `none} `` and deleted.
     ///
     /// Tags are listed in **name order** (`none` before `some`) on purpose: the
     /// solver materializes a coalesced variant from a `BTreeMap`, so an inferred
@@ -2157,9 +2165,24 @@ impl Type {
     /// the inferred type structurally instead of differing only by tag order.
     pub fn option_of(payload: Self) -> Self {
         Type::variant(vec![
-            (FieldKey::Name("none".into()), Type::Base(BaseType::Unit)),
-            (FieldKey::Name("some".into()), payload),
+            (FieldKey::Name(V_NONE.into()), Type::Base(BaseType::Unit)),
+            (FieldKey::Name(V_SOME.into()), payload),
         ])
+    }
+
+    /// The payload of an [`option_of`](Self::option_of), or `None` for any other type.
+    ///
+    /// The constructor's inverse, for a rule that recovers an answer it recorded earlier
+    /// rather than recomputing it.
+    pub fn option_payload(&self) -> Option<&Self> {
+        let Type::Variant(arms, Openness::Closed) = self else {
+            return None;
+        };
+        let [(none, _), (some, payload)] = arms.as_slice() else {
+            return None;
+        };
+        (*none == FieldKey::Name(V_NONE.into()) && *some == FieldKey::Name(V_SOME.into()))
+            .then_some(payload)
     }
 
     /// A **closed** tagged sum: these arms and no others.
