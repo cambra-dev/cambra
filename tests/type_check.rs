@@ -2242,6 +2242,84 @@ fn test_groupby_lookup_at_wrong_key_type_rejected() {
     );
 }
 
+/// `set(xs)` infers the keyed collection `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ unit` — this
+/// site's key domain, deduplicated, each key mapped to `unit` (the
+/// `Set(K) = Map(K, unit)` payload). The arrow is **Data** (`⤇`): a `set` *is* a
+/// data collection, so its
+/// outer lambda is stamped `Data` by provenance at lowering (like a
+/// comprehension), which is what lets it inject into a nominal `Set(K)`.
+#[test]
+fn set_infers_deduped_keyed_unit_collection() {
+    assert_eq!(
+        infer_program("set([1,2,3])").to_string(),
+        "({Int | __elem ▷ (([1, 2, 3] ≫ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)"
+    );
+}
+
+/// `box(set(xs))` reaching the nominal `Set(K)` annotation. A `Set(K)` is
+/// `Σ (𝐷 : SubtypesOf(K)). 𝐷 ⤇ unit`, and entering a sum is a term — so the `box` is required
+/// and the annotation is then **kind containment**: this site's concrete key domain is
+/// one of the domains `SubtypesOf(K)` ranges over. That works only because the constructor
+/// stamps its own iteration binder with the present-key domain at lowering
+/// (`present_key_domain`): containment reads the domain's *shape*, and it runs at
+/// constraint-emission time, so a key domain that only became concrete at coalesce would
+/// fall through to a mismatch. Regression guard for exactly that.
+#[test]
+fn set_injects_into_nominal_set_annotation() {
+    // The **bounded** form keeps the one-candidate sum the `box` built: this site's
+    // concrete key domain is the sole candidate. An exact `x: Set(Int)` binds `x` at the
+    // annotation instead and gives back the abstract `SubtypesOf` sum, as
+    // [`map_injects_into_nominal_map_annotation`] shows.
+    assert_eq!(
+        infer_program("x <: Set(Int) = box(set([1,2,3]))\nx").to_string(),
+        "Σ (σ : [{Int | __elem ▷ (([1, 2, 3] ≫ (λ __set_key : Int → __set_key)) ▷ collection_contains)}]). (σ ⤇ Unit)"
+    );
+    // The **key type** flows too: it is a kind *parameter*, so the edge relates it
+    // rather than ignoring it — and it survives the `box`, which reaches the annotation
+    // by the cross-form width edge rather than the same-form one.
+    assert!(
+        !infer_program_err("x <: Set(String) = box(set([1,2,3]))\nx").is_empty(),
+        "an Int-keyed set must not satisfy Set(String)"
+    );
+    // The codomain still flows: a `Set(Int)` is not a `Map(Int, Int)`.
+    assert!(
+        !infer_program_err("x <: Map(Int, Int) = box(set([1,2,3]))\nx").is_empty(),
+        "a set's `unit` codomain must not satisfy Map(Int, Int)"
+    );
+}
+
+/// `map(kvs)` infers `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ V` — this site's key
+/// domain, each key mapped to its entry's second component. The key morphism is `.0`,
+/// where `set`'s is the identity, and that is the whole difference in the type: both
+/// constructors are one re-keying shape at two collapses ([`lower_rekeyed`]).
+#[test]
+fn map_infers_a_keyed_collection_over_the_value() {
+    assert_eq!(
+        infer_program("map([(1, 10), (2, 20)])").to_string(),
+        "({Int | __elem ▷ (([(1, 10), (2, 20)] ≫ (λ __map_kv : (Int, Int) → __map_kv.0)) ▷ collection_contains)} ⤇ Int)"
+    );
+}
+
+/// `box(map(kvs))` reaching the nominal `Map(K, V)` annotation, the `map` half of
+/// [`set_injects_into_nominal_set_annotation`]. Both the key type and the codomain are
+/// related by the edge, so neither a wrong key type nor a `Set`'s `unit` codomain
+/// satisfies it.
+#[test]
+fn map_injects_into_nominal_map_annotation() {
+    assert_eq!(
+        infer_program("x: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nx").to_string(),
+        "Σ (σ : SubtypesOf(Int)). (σ ⤇ Int)"
+    );
+    assert!(
+        !infer_program_err("x <: Map(String, Int) = box(map([(1, 10), (2, 20)]))\nx").is_empty(),
+        "an Int-keyed map must not satisfy Map(String, Int)"
+    );
+    assert!(
+        !infer_program_err("x <: Set(Int) = box(map([(1, 10), (2, 20)]))\nx").is_empty(),
+        "a map's value codomain must not satisfy Set(Int)"
+    );
+}
+
 // NOTE: direct key lookup on a group-by (`g = groups(k)`) is deferred. `groupby`
 // infers the honest keyed type `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (see
 // `src/ccl/design/collections.md`, "`groupby`'s exact type"), so applying it at a plain

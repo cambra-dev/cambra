@@ -307,6 +307,106 @@ applies to the predicates planning reifies into a `Restrict`, and this one it ne
 reaches — a membership evaluation would be a keyed lookup or an `x in s` filter, neither of
 which exists.
 
+### Constructor lowering: runtime `groupby` now, constant-folding later
+
+The re-keying constructors are the first surface (before the `[k -> v]` sugar and
+annotation-driven implicit insertion). Their **value construction is a runtime
+`groupby`** on the key projection ([chl-spec
+§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)): `map([𝑘𝑣…])` groups the pairs by
+`.0` and collapses each group to its `.1`; `set([𝑒…])` groups by the element,
+codomain `unit`; `list([𝑒…])` keeps the positional domain (`Array` widened to
+`List`). The result is the keyed Σ (`Map`/`Set`) or `List`.
+
+Two consequences are **deferred to a future constant-folding pass**, recorded
+here so the shortcut is explicit:
+
+- **Compile-time construction.** A literal argument has statically-known keys, so
+  the ideal is to build the sealed keyed tile at compile time rather than run a
+  `groupby` over a constant. Cambra has no constant-folding today; when it lands,
+  folding a re-keying over a constant collection *is* the compile-time
+  construction, with no literal-detection special-case (the fold either succeeds
+  on constant inputs or falls through to the runtime operator).
+- **Duplicate-key error timing.** The spec makes a duplicate key in a map
+  *literal* a *compile-time* error
+  ([§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)). At runtime, a duplicate produces a
+  non-singleton group, which `map`'s `sole` collapse **rejects at run time** (that
+  is its whole point) — so the error is *enforced*, just later than the spec wants.
+  Moving it to compile time needs the key *values*, which only a constant fold
+  has; so the compile-time-ness (not the enforcement) rides on constant-folding.
+  (`set` has no `sole`, so duplicates there are absorbed by the group — set
+  semantics — no error either way.)
+
+#### `sole` is an `Option`-accumulator aggregate
+
+`sole : (𝐷 ⤇ 𝐴) ⇒ 𝐴` is an ordinary [`AggregateKind`] (`Sole`) reusing the
+aggregation framework — per-key accumulator, fold, extract. Its accumulator law is
+`Option(𝐴)`'s: identity `none`, and the partial monoid where combining two `some`
+values faults, two elements under one key being the duplicate. `Sum` and `Max` have
+total monoids for accumulators, so `Sole` is the first partial one.
+
+The fault is raised in `accumulate`, which is the only one of the three that sees a
+single group. Under `MapAggregate` a fold receives one key's slice at a time, so a
+length bound there is a bound on a group; `extract` instead runs on a column holding
+one accumulated value per key, whose length is the key count, so it cannot check a
+group's size and is the identity.
+
+Two realization details separate `sole` from the scalar aggregates. Both follow from
+`map`'s codomain; `set`'s `unit` codomain needs neither.
+
+- **Presence is out-of-band.** `Sum` and `Max` carry an in-band identity (`0`, `MIN`)
+  and `sole` has none, any element being a valid value. So `none` is the empty
+  accumulator column and `some` a column of length one, and `initial_accumulator`
+  builds the empty column from the extent rather than a value of the element type.
+- **`sole` folds a structured codomain.** Each group's codomain in `map` is the pair
+  `(𝐾, 𝑉)`, so the fold takes the sole *row* of a tuple-valued group where `Sum`
+  takes a scalar column. This needs no per-shape code: `ColumnValue::select_indices`
+  and `ColumnValue::append` both recurse through a record column, so one group folds
+  by the same two calls whether its elements are pairs or scalars.
+
+#### Runtime realization: nothing new for construction + value iteration
+
+A keyed collection is **already a first-class runtime tile**: `groupby`'s
+`λ 𝑘 → cast(…)` eliminates to a Pi-const source that planning recognizes as
+`Converse` (see [Lowering realization](#lowering-realization-the-key-binder-states-its-domain)),
+and `Converse` emits a `CurriedFunction` tile whose outer domain column *is* the
+present keys. The `map`/`set` codomain map runs over that
+`Converse` (as the group-consuming body of a comprehension-shaped iteration; see
+[Consuming a keyed
+collection](#consuming-a-keyed-collection-discharge-not-point-free-compose) for why
+it is not a bare `Compose`). So construction and **value-iteration** consumption (`for v in m`)
+reuse the existing operator set with **no new `Domain` and no hash store**. A keyed domain
+dispatching `extent_of` to a hash store is for *lookup* (`𝑚[𝑘]`), which arrives with that
+feature — not for immutable construction.
+
+`set([𝑒…])` lowers to the group-by on an identity key, collapsed by the terminal
+aggregate [`AggregateKind::Drain`] — `(𝐷 ⤇ 𝛾) ⇒ unit`, accumulator `Units(1)`,
+`accumulate` a no-op — folding each key's group (of ≥ 1 duplicate elements) to the
+one `unit` a `Set` holds. `set([1,2,2,3])` produces the sealed keyed tile over keys
+`{1, 2, 3}`. `map([𝑘𝑣…])` is the same shape at the `Sole` collapse
+([`lower_rekeyed`] builds both), so `map([(1, 10), (2, 20)])` produces the sealed
+keyed tile carrying `10` and `20`.
+
+Neither constructor compiles over a literal whose elements share **one** singleton
+type. The element type stays that singleton (`Int@1`) where the key domain's base
+widens to `Int`, and the two meet at the cast as a domain conflict, so `set([1])` and
+`map([(1, 10)])` are rejected where `set([1, 2])` and `map([(1, 10), (2, 20)])`
+compile (`test_rekeying_over_a_singleton_literal`). The single-entry seed a mutable
+map wants is that shape.
+
+Where a keyed collection value is and is not **driven** is a planning property, not
+a constructor one, and the boundary is narrower than it looks. Planning inserts the
+driving `iterate` at a *chain head*, so a `set(…)` reaches the runtime when it is
+the program tail (`set([1,2,3])`), when it is a bare `groupby(…)`
+(`a_bare_groupby_tail_is_driven`), or when it is let-bound and then consumed
+(`s = set([…])` … `[k for k in s]`). What fails is a keyed collection **nested as
+the source of another comprehension** (`[1 for k in set([1,2,3])]`), which surfaces as
+*"list literal reached op-conversion without an input"*: the underlying source is never
+given an iteration site. `test_undriven_keyed_collection` records it, and fixing it is a
+planning change rather than part of the constructor surface. Separately, a keyed collection
+cannot yet **yield its keys under iteration** — the deferred `items` view above, itself
+blocked on the
+[kind-representation question](#the-collection-type-is-declared-not-read-off-the-shape).
+
 ## Keyed entry needs the key domain written down at lowering
 
 An entry term runs a membership predicate on the entering side, so it decides at
