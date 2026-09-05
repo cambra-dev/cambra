@@ -9,7 +9,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-use itertools::Itertools;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::{RefinementScope, Subst};
@@ -18,6 +17,7 @@ use crate::ccl::{
 };
 
 use crate::ccl::FieldKey;
+pub use crate::ccl::ty::KindPin;
 
 // ---------------------------------------------------------------------------
 // CompactType + compact_type: bound-graph flattening
@@ -50,6 +50,22 @@ pub enum AtomKey {
     Source(SmolStr),
     /// The transaction-commit domain (nullary, like a base type).
     Txn,
+    /// A reference to the nearest enclosing sum's witness — [`Type::WitnessRef`],
+    /// which is nullary and anonymous exactly as [`Txn`](Self::Txn) is.
+    ///
+    /// It is an atom because it is a *bound* nullary type: it stands for one candidate
+    /// without saying which, so it matches only itself, and the union-merge atoms get is
+    /// the right law (a witness meeting a concrete type is two atoms at one position —
+    /// the same collision `Int` meeting `String` is). Putting it in the body rather than
+    /// factoring it out is what makes a sum's body an ordinary [`CompactType`], and
+    /// hence what makes `𝐵 ⊓ 𝑇` an ordinary merge.
+    ///
+    /// Carries the **binder**, whose kind can reach a `RefCell` — an undecided candidate is
+    /// an ordinary inference variable, whose bounds are a cell — hence
+    /// the `mutable_key_type` allows on the sets these atoms key. Ordering and equality
+    /// read the binder id alone (`impl Ord for Witness`), which no write touches, so a
+    /// key's position in a set is fixed at insertion.
+    Witness(crate::ccl::ty::WitnessId),
     /// a nominal feed-channel domain (rigid until
     /// channelize substitutes it).
     ChanDom(Name, crate::ccl::ChanLevel),
@@ -65,6 +81,7 @@ impl AtomKey {
             Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
             Type::DataSource(n) => Some(AtomKey::Source(SmolStr::from(n.as_str()))),
             Type::Txn => Some(AtomKey::Txn),
+            Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             _ => None,
         }
@@ -76,7 +93,610 @@ impl AtomKey {
             AtomKey::UIntRange(n) => Type::UIntRange(*n),
             AtomKey::Source(n) => Type::DataSource(n.to_string()),
             AtomKey::Txn => Type::Txn,
+            AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
+        }
+    }
+}
+
+/// [`TypeKind`](crate::ccl::ty::TypeKind) with its types compacted — the same classifier,
+/// carried through the lattice.
+///
+/// Variant for variant with `TypeKind`, `CompactType` standing where `Type` does. The one
+/// thing that differs is what the types inside are: a kind's parameters and candidates are
+/// positions like any other, so they compact and merge like any other, rather than riding
+/// through as written.
+///
+/// Not an identity between domains and kinds: a domain is a *type*, and a kind *classifies*
+/// types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactTypeKind {
+    /// Finitely many candidate types, named, compacted and deduplicated by structural
+    /// [`CompactType`] equality. At a Σ's witness one candidate is an ordinary collection
+    /// and two or more is a conditional collection.
+    Enumerated(Vec<CompactType>),
+    /// Every type below a given one — a `Map`'s key bound. The parameter compacts, which is
+    /// what lets an unannotated key be determined by the types that reach it.
+    SubtypesOf(Box<CompactType>),
+    /// Every `UIntRange`, the kind a `List`'s domain has. It names no candidates and takes
+    /// no parameter, so there is nothing under it to compact.
+    UIntRanges,
+    /// Every type — the top of the kind order, what a `Collection`'s witness is summed
+    /// over.
+    Type,
+}
+
+impl CompactTypeKind {
+    /// Do these two kinds denote the same set? The [`CompactType::equiv`] of a kind: the same
+    /// comparison, reaching the positions a kind carries.
+    fn equiv(&self, other: &CompactTypeKind) -> bool {
+        use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
+        match (self, other) {
+            (Enumerated(a), Enumerated(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.equiv(y))
+            }
+            (SubtypesOf(a), SubtypesOf(b)) => a.equiv(b),
+            (UIntRanges, UIntRanges) | (Universe, Universe) => true,
+            _ => false,
+        }
+    }
+
+    /// What a binder ranges over when two contributions meet at its position — the kind
+    /// order's **⊔** at a positive position and its **⊓** at a negative one.
+    ///
+    /// The order is the one the kind premise draws (`constrain_type_kinds`): `Enumerated`
+    /// names its members, so containment is membership per member; `UIntRanges` and `Type` state a
+    /// property of theirs and name none; `SubtypesOf` names them by a type; and everything
+    /// lies in the universe.
+    ///
+    /// **The polarity is the enclosing function's.** A Σ binder is a property of the function
+    /// and not of its domain, so the kind widens as the function does — `Map(𝐾, 𝑉)`'s
+    /// `SubtypesOf(𝐾)` lies below `Collection(𝑉)`'s `Type` for the same reason the map lies
+    /// below the collection — and the premise is drawn unswapped, unlike the domain's.
+    ///
+    /// **Total**, and every row is the bound of the order this lattice actually has. The two
+    /// meets a key bound takes part in are intersections of a named set with a down-set, so
+    /// each is a named set again — a sublist, needing no kind the grammar lacks. Membership in
+    /// the down-set is decided by [`CompactType::is_below`], the order the merge itself
+    /// induces: sound as subtyping and incomplete, which at a negative position errs toward
+    /// the smaller answer.
+    ///
+    /// Least answers per row, both directions, in
+    /// `formal/CclFormal/TypeKindIsALattice.lean`.
+    ///
+    /// A bound whose parameter names **no shape**, read as the kind it is: one naming no
+    /// members.
+    ///
+    /// Whether a candidate lies below an unresolved parameter is unknown, and a lower bound
+    /// admits only what is certain — so the answer is the empty candidate list, the same answer
+    /// the rows that read a parameter give a conflicted one, and for the same reason. It is not
+    /// the universe: `Type ⊓ UIntRanges` is `UIntRanges`, which claims every range lies below
+    /// the parameter, and a parameter resolving to `Int` has none below it. A meet answering
+    /// above its operand is the defect this file already carries one fix for.
+    ///
+    /// **Not an error.** An unresolved parameter is an ordinary mid-inference state — a
+    /// `Map(𝐾, 𝑉)` whose key type nothing has pinned yet — so rejecting it would reject
+    /// programs. A parameter naming *two* shapes is an error, and it stays reportable: this
+    /// leaves it alone, so a lone bound carrying one still materializes as
+    /// `IncompatibleBounds`, and the rows that read a parameter answer the empty kind without
+    /// re-spelling the kind that holds it.
+    ///
+    /// Applied at the meet only, since no join row reads a parameter: they merge it or fold
+    /// candidates into it, and neither loses anything to an unresolved one.
+    fn resolve_bound_naming_no_shape(self) -> CompactTypeKind {
+        match self {
+            CompactTypeKind::SubtypesOf(k) if k.shapes() == 0 => {
+                CompactTypeKind::Enumerated(Vec::new())
+            }
+            names_a_shape => names_a_shape,
+        }
+    }
+
+    /// The kind merge, for the differential oracle (`tests/differential_oracle.rs`).
+    ///
+    /// Same gate as [`CompactType::merge_bounds`] and for the same reason: the feature adds
+    /// this door rather than widening [`merge`](Self::merge)'s own visibility, so the
+    /// production configuration is the ungated one. The oracle is the only thing that compares
+    /// this operation against the model — the polar merge's oracle cannot, since the model's
+    /// compact form has no Σ binder slot to carry a kind.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn merge_kinds(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
+        Self::merge(pol, a, b)
+    }
+
+    /// **A `SubtypesOf` parameter must name exactly one shape**, and the two rows that decide
+    /// a membership read it. The `SubtypesOf`/`SubtypesOf` row writes [`CompactType::merge`],
+    /// which unions contributions rather than reconciling them, so two incomparable parameters
+    /// leave a position denoting no type ([`CompactType::denotes_a_type`]). Read through
+    /// [`CompactType::is_below`] that position absorbs every candidate, since it contains each
+    /// side's atoms — an answer *above* an operand. The meet row answers the empty kind
+    /// instead, which is what that parameter's down-set is.
+    ///
+    /// **A parameter naming no shape is the other end**, and
+    /// [`resolve_bound_naming_no_shape`](Self::resolve_bound_naming_no_shape) answers it before
+    /// any row dispatches — the merge would otherwise erase it, since an unconstrained position
+    /// is the merge's identity, and a bound is not unconstrained just because nothing has
+    /// pinned its parameter yet.
+    ///
+    /// With both ends answered the meet is a lower bound and associative, checked
+    /// exhaustively rather than proved: `formal/CclFormal/TypeKindMerge.lean` runs all 5832
+    /// triples over 18 kinds at both polarities. `kind_glb_assoc` in
+    /// `formal/CclFormal/TypeKindIsALattice.lean` is why associativity was the thing to check —
+    /// it follows from leastness, so losing it located a defect in this procedure rather than
+    /// in the order. No program in the suite reaches any of the three rows.
+    fn merge(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
+        use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
+        let (a, b) = if pol {
+            (a, b)
+        } else {
+            (
+                a.resolve_bound_naming_no_shape(),
+                b.resolve_bound_naming_no_shape(),
+            )
+        };
+        match (a, b) {
+            // The order's top: it absorbs a join and imposes nothing on a meet.
+            (Universe, other) | (other, Universe) => {
+                if pol {
+                    Universe
+                } else {
+                    other
+                }
+            }
+            // Candidates are members, so the two directions are set union and set
+            // intersection. An empty intersection is two collections with no domain in
+            // common — a kind admitting nothing, which is what it is.
+            (Enumerated(xs), Enumerated(ys)) => Enumerated(if pol {
+                let mut out = xs;
+                for y in ys {
+                    if !out.contains(&y) {
+                        out.push(y);
+                    }
+                }
+                out
+            } else {
+                xs.into_iter().filter(|x| ys.contains(x)).collect()
+            }),
+            // `UIntRanges` names no members, so a join rises to it only when it admits every
+            // candidate — and to the universe when it does not, since nothing between them
+            // holds both. A meet keeps the candidates it admits.
+            (Enumerated(xs), UIntRanges) | (UIntRanges, Enumerated(xs)) => {
+                if pol {
+                    if xs.iter().all(denotes_a_uint_range) {
+                        UIntRanges
+                    } else {
+                        Universe
+                    }
+                } else {
+                    Enumerated(xs.into_iter().filter(denotes_a_uint_range).collect())
+                }
+            }
+            (UIntRanges, UIntRanges) => UIntRanges,
+            // Two bounds are ordered by their parameters, so this is the parameter's own
+            // merge at this polarity — the reason the parameter is a [`CompactType`].
+            (SubtypesOf(x), SubtypesOf(y)) => SubtypesOf(Box::new(CompactType::merge(pol, *x, *y))),
+            // **A join with a bound is a bound, not the universe.** Every type below the
+            // parameter is below the parameter joined with the candidates, and so is every
+            // candidate; and nothing smaller is above both, since the only kinds above a
+            // bound are the universe and wider bounds
+            // (`formal/CclFormal/TypeKindIsALattice.lean`, `lub_candidates_subtypesOf`).
+            //
+            // Computable because it needs **joins only**. Nothing here decides whether a
+            // candidate lies below the parameter; the join dominates them however they relate
+            // to it, which is what separates this row from its meet
+            // (`glb_candidates_subtypesOf`, and the arm below).
+            //
+            // **The fold is the compact join; the leastness is about subtyping.** Those are
+            // different orders — the compact one is strictly finer ([`CompactType::merge`]'s
+            // order is on representations, not on types) — so what holds here is what already
+            // holds for the `SubtypesOf`/`SubtypesOf` row above: the fold materializes to the
+            // subtyping join where the operands have one, and coalesce reports it where they
+            // do not (`MaterializedMergeIsABound.lean`).
+            //
+            // **Leastness is the whole reason, and it is not that the universe fails to
+            // compile.** Neither answer realizes today: realization splits a conditional on
+            // `Enumerated` candidates and neither a bound nor the universe has any, so the sum
+            // survives either way and op-conversion rejects it by name. What the least answer
+            // buys is the *type* — `Map(𝐾′, 𝑉)` where the universe gives `Collection(𝑉)` — and
+            // since a kind is covariant with the function it kinds, the second is the
+            // supertype. A consumer demanding a keyed collection accepts the first and rejects
+            // the second.
+            (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) if pol => {
+                SubtypesOf(Box::new(
+                    xs.into_iter()
+                        .fold(*k, |acc, x| CompactType::merge(true, acc, x)),
+                ))
+            }
+            // **A bound and `UIntRanges` have only the universe above them.** Anything above
+            // `UIntRanges` is `UIntRanges` or the universe, so the question is whether a bound
+            // is ever below `UIntRanges` — and it is not, for a reason that holds of every
+            // parameter rather than only of an unrelated one: the types below a parameter
+            // include its *refinements*, and a refined range is not a range. That is the
+            // distinction `UIntRanges` exists to draw, since a filtered range has holes and
+            // admitting it would hand a length witness to a domain that lacks one. So the
+            // universe is the only upper bound there is, and hence the least
+            // (`lub_subtypesOf_uintRanges`).
+            //
+            // Not "no kind spells every range below a type": where the parameter is itself a
+            // range, `UIntRange` subtyping is equality and the ranges below it look
+            // spellable. The refinements are what rule it out.
+            (SubtypesOf(_), UIntRanges) | (UIntRanges, SubtypesOf(_)) if pol => Universe,
+            // **A meet with a bound keeps the candidates below the parameter**
+            // (`glb_candidates_subtypesOf`). Membership is decided by the order this merge
+            // induces ([`CompactType::is_below`]), which is what the lattice at this
+            // representation *has*: sound as subtyping, incomplete, and its incompleteness
+            // drops a candidate rather than keeping one it should not — the safe direction for
+            // a lower bound.
+            (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) => {
+                debug_assert!(
+                    k.shapes() > 0,
+                    "resolve_bound_naming_no_shape left a bound whose parameter names no shape"
+                );
+                // **Nothing certain is nothing named**, whether the uncertainty is the
+                // parameter's or a candidate's. A parameter naming two shapes names no type, so
+                // its down-set is empty; a candidate naming none has unknown membership, and a
+                // lower bound answers "no" where it cannot say. An unresolved candidate is
+                // legitimate and the join keeps it — `coalesce_type_kind` deduplicates
+                // candidates *after* materializing, so two spelled as distinct variables become
+                // one once the variables answer.
+                Enumerated(if k.denotes_a_type() {
+                    xs.into_iter()
+                        .filter(|x| x.denotes_a_type() && x.is_below(&k))
+                        .collect()
+                } else {
+                    Vec::new()
+                })
+            }
+            // **A bound meets `UIntRanges` at the ranges below the parameter, and there is at
+            // most one** (`glb_subtypesOf_uintRanges`): `UIntRange` subtyping is equality, so
+            // the only range below the parameter is the parameter. That is a question about
+            // its shape rather than a subtyping search, which is why this row needs nothing
+            // the join did not already have.
+            (SubtypesOf(k), UIntRanges) | (UIntRanges, SubtypesOf(k)) => {
+                Enumerated(if denotes_a_uint_range(&k) {
+                    vec![*k]
+                } else {
+                    Vec::new()
+                })
+            }
+        }
+    }
+}
+
+/// A binder as compaction carries it: **which** binder, and what it ranges over with the
+/// kind's children in the lattice.
+///
+/// The children are the reason this is not a [`Witness`](crate::ccl::ty::Witness). Candidates
+/// and a key bound's parameter are alike ordinary types the solver resolves, so they compact
+/// at the position that reached them and materialize with everything else; a `Witness` would
+/// carry them as raw `Type`s straight through to the output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactWitness {
+    /// Which binder this is — the whole of its identity.
+    pub id: crate::ccl::ty::WitnessId,
+    /// What it ranges over.
+    pub type_kind: CompactTypeKind,
+}
+
+/// A merged function shape — the **single** carrier for every function-shaped type,
+/// plain function and dependent sum alike. What distinguishes them is the
+/// [`CompactTypeKind`], so both reach one position through one slot and
+/// [`CompactFun::merge`] reconciles them; there is no second route for a sum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactFun {
+    /// The Pi (element) binder, `na.or(nb)` on merge.
+    pub name: Option<Name>,
+    /// The merged kind — **compute or data, and nothing else**. What a data function is
+    /// indexed by lives in [`binders`](Self::binders), where it is merged rather than
+    /// snapshotted.
+    pub kind: KindPin,
+    /// The binders this function is over, outermost first — what its kind states, carried so
+    /// materialization can close the sum without asking the kind graph again.
+    ///
+    /// The *identity* at a position is settled before a merge sees it — the kind edge that
+    /// related two sides put their binders in correspondence — so a merge reconciles only
+    /// what each side says the position ranges over.
+    pub binders: Vec<CompactWitness>,
+    /// The two **domains** had no common answer.
+    ///
+    /// Not a kind, which is why it is not in the kind: a domain disagreement says the arms
+    /// are over different data and wants "box these arms", where a kind collision says
+    /// "this is a function, not a collection". Carried beside the kind so neither
+    /// diagnostic has to be recovered from the shape of the other.
+    pub domains_disagree: bool,
+    /// The domain — **one** domain, compacted like any other position.
+    ///
+    /// Exactly one, and coalesce asserts it. Nothing puts a candidate *set* here:
+    /// entering a sum is a term, so a join never forms a conditional collection out of
+    /// two ordinary collections, and a consumed sum *names* its witness rather than
+    /// putting a sum where a domain belongs. A candidate set lives one level up, on the
+    /// witness a Σ binds ([`CompactWitness::type_kind`]).
+    pub domain: Box<CompactType>,
+    /// The two domains a merge had to **combine** into this one, where it had to.
+    ///
+    /// The single domain position cannot say afterwards that it was assembled from two:
+    /// the contravariant meet unions a record's fields and a position's refinements, so
+    /// `{a}` and `{b}` leave as `{a, b}` and look exactly like one domain reached twice.
+    /// Whether that combination is legal depends on the slot's kind, which a merge may not
+    /// know yet — an unpinned kind can still become either — so the pair is recorded here
+    /// and the rule applied once, where the kind is resolved
+    /// (`design/type-inference.md`, "Data domains are invariant").
+    ///
+    /// The operands rather than a flag, because the diagnostic names them: the merged
+    /// position is neither of the domains the program wrote, so reporting it says a
+    /// collection conflicts over a domain that appears nowhere in the source. Boxed —
+    /// every function slot carries this and almost none of them fill it.
+    pub combined: Option<CombinedDomains>,
+    /// The codomain (covariant).
+    pub codomain: Box<CompactType>,
+}
+
+/// The two domains a merge had to combine — an **unordered** pair.
+///
+/// Unordered because `CompactFun` derives `PartialEq` and a merged slot's identity must not
+/// depend on which bound arrived first: the same two domains met in either order are one
+/// merge. That is the argument `RefinementSet`'s equality rests on, and the reason a bare
+/// tuple will not do here. Boxed: every function slot carries the `Option` and almost none
+/// of them fill it.
+#[derive(Debug, Clone)]
+pub struct CombinedDomains(Box<(CompactType, CompactType)>);
+
+impl CombinedDomains {
+    fn new(a: CompactType, b: CompactType) -> Self {
+        CombinedDomains(Box::new((a, b)))
+    }
+
+    /// The two domains, in the order they were met — a rendering order, never an identity.
+    pub(super) fn pair(&self) -> (&CompactType, &CompactType) {
+        (&self.0.0, &self.0.1)
+    }
+
+    /// Both domains rewritten by `f` — for a pass that rebuilds the slot and must carry
+    /// them across. Dropping them there is silent: the merged position survives and reads
+    /// as one domain, so the diagnostic loses a side rather than failing.
+    pub(super) fn map(self, mut f: impl FnMut(CompactType) -> CompactType) -> Self {
+        let (a, b) = *self.0;
+        CombinedDomains::new(f(a), f(b))
+    }
+}
+
+impl PartialEq for CombinedDomains {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = self.pair();
+        let (c, d) = other.pair();
+        (a == c && b == d) || (a == d && b == c)
+    }
+}
+
+/// Which of a position's **concrete** slots are occupied.
+///
+/// `vars` is deliberately not among them. By the time the domain lattice reads a
+/// position, compaction has folded every variable's bounds into these slots, and
+/// coalesce likewise materializes a position from them alone — so a leftover variable
+/// alongside resolved content says nothing about what the position denotes.
+///
+/// Built by destructuring, so a new [`CompactType`] slot is a compile error here
+/// rather than a silently-ignored contribution.
+struct Occupied<'a> {
+    atoms: usize,
+    fun: Option<&'a CompactFun>,
+    others: bool,
+}
+
+impl CompactType {
+    fn occupied(&self) -> Occupied<'_> {
+        let CompactType {
+            vars: _,
+            // A kinding constraint says what a position must *be*, never that it is
+            // occupied — it is a condition on the answer, like `vars`, not a
+            // contribution to it.
+            kinds: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements,
+            history_slot,
+        } = self;
+        Occupied {
+            atoms: atoms.len(),
+            fun: fun.as_ref(),
+            others: rec.is_some()
+                || var.is_some()
+                || refinements.as_ref().is_some_and(|r| !r.is_empty())
+                || history_slot.is_some(),
+        }
+    }
+}
+
+/// Whether this position denotes a **dense prefix range** and nothing else — the property
+/// `UIntRanges` states of its members ([`crate::ccl::ty::TypeKind::refuses`]).
+///
+/// A refinement disqualifies it, as it does at the type level: a filtered range has holes,
+/// and admitting it would hand a length witness to a domain that lacks one. So does an
+/// unresolved variable, which has not said what it is; a join asking "is every candidate a
+/// range" must not read silence as yes.
+fn denotes_a_uint_range(ct: &CompactType) -> bool {
+    let o = ct.occupied();
+    o.atoms == 1
+        && o.fun.is_none()
+        && !o.others
+        && ct.vars.is_empty()
+        && ct.atoms.iter().all(|a| matches!(a, AtomKey::UIntRange(_)))
+}
+
+/// The domains a compacted **data**-function domain position denotes, as types.
+///
+/// [`CompactType::merge`] unions atom sets. At a scalar position that is the only
+/// sound reading — `Int` and `String` cannot both hold, so two atoms are a collision
+/// — but a data function's domain *is* the data, and the join law for data is
+/// lossless, so atoms meeting there are *alternatives*: one domain each. Both facts
+/// live in the same atom set, so which reading applies is decided by the enclosing
+/// function's kind, which only the caller knows.
+///
+/// `None` when the position denotes no domain set at all: its concrete content must
+/// be nothing but atoms, since anything alongside them (a record, a nested function, a
+/// refinement) means this is an ordinary domain that merely accumulated bounds — and
+/// then the atoms really are a collision. Variables do not disqualify it; compaction
+/// has already folded their bounds in.
+///
+/// This is the single reading of a domain position, and both consumers take it from here:
+/// coalesce materializes the alternatives as a sum's candidates, and [`CompactFun::merge`]
+/// reads them to decide whether two domains had to be combined. Two readings would let one
+/// accept several atoms where the other saw one, and a position is either several domains or
+/// one at both.
+pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
+    let o = ct.occupied();
+    // A witness atom denotes no domain *set*: it is one domain, the one the witness
+    // picked, and which one is not settled here. Same reading as a bare variable —
+    // naming a position is not filling it.
+    let bare_atoms = o.atoms >= 1
+        && o.fun.is_none()
+        && !o.others
+        && !ct.atoms.iter().any(|a| matches!(a, AtomKey::Witness(_)));
+    bare_atoms.then(|| ct.atoms.iter().map(|a| a.to_type()).collect())
+}
+
+/// Whether a contravariant meet of two **data** domains had to combine anything — which is
+/// two domains meeting, not one domain reached twice.
+///
+/// Read on the inputs, because the meet erases the evidence: it unions a record's fields and
+/// a position's refinements, so `{a}` and `{b}` leave as the single domain `{a, b}` and the
+/// merged position no longer says they disagreed. A domain is the data and data domains are
+/// invariant, so combining is exactly the narrowing the representation exists to refuse.
+///
+/// A position that **names** rather than fills — a bare variable, a witness reference — is
+/// not a domain to disagree with: consuming a sum is what resolves it, and
+/// [`denoted_domains`] excludes witness atoms for the same reason.
+fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
+    let names_only = |ct: &CompactType| {
+        let o = ct.occupied();
+        (o.atoms == 0 && o.fun.is_none() && !o.others)
+            || ct.atoms.iter().any(|x| matches!(x, AtomKey::Witness(_)))
+    };
+    if names_only(a) || names_only(b) {
+        return false;
+    }
+    let keys = |ct: &CompactType| {
+        ct.rec
+            .as_ref()
+            .map(|r| r.keys().cloned().collect::<Vec<_>>())
+    };
+    a.refinements != b.refinements || a.atoms != b.atoms || keys(a) != keys(b)
+}
+
+/// Whether these **types** denote more than one domain — [`denoted_domains`]'s reading,
+/// applied after a merge has put both sides in one position.
+fn denotes_several_domains_ty(ds: &[Type]) -> bool {
+    let mut seen: Vec<&Type> = Vec::new();
+    for d in ds {
+        if !seen.contains(&d) {
+            seen.push(d);
+        }
+    }
+    seen.len() > 1
+}
+
+/// The binders of a merged position: one of the spellings that arrived, over the merge of
+/// what each side said it ranges over.
+///
+/// Position `i` against position `i`, because that is what a kind edge relates. A side with
+/// no binders is a plain collection meeting a sum and contributes nothing to range over.
+///
+/// **The least of the two spellings**, which is the rule the *occurrence* resolution uses
+/// for the same position (`super::coalesce::coalesce_compact_go`), so a merged Σ declares
+/// the binder its own domain references. Answering from anything else names a binder no
+/// occurrence spells: a name is chosen here, and nothing renames the references afterwards.
+/// The choice is a min over the sides rather than a first-wins so that a fold over several
+/// bounds gives one answer whatever order they merge in (`tests/constraint_order_fuzz.rs`).
+///
+/// Two sides are two spellings of one binder, not two binders: they meet at this position
+/// because a kind edge relates them, and which of their names a type keeps is the
+/// α-invariance the comparison model already absorbs.
+///
+/// **Unequal widths align at the front and nothing depends on it.** Two sums related by an
+/// edge are two spellings of one collection and so are over the same number of positions;
+/// two of different width are a `KindPin::Conflict` on the `kind` computed beside this, and
+/// coalesce reports that before it reads a binder. So the surplus positions of the longer
+/// side pass through unmerged rather than being paired with a position that is not theirs.
+fn merge_binders(pol: bool, a: &[CompactWitness], b: &[CompactWitness]) -> Vec<CompactWitness> {
+    let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    longer
+        .iter()
+        .enumerate()
+        .map(|(i, w)| match shorter.get(i) {
+            Some(other) => CompactWitness {
+                id: w.id.min(other.id),
+                type_kind: CompactTypeKind::merge(
+                    pol,
+                    w.type_kind.clone(),
+                    other.type_kind.clone(),
+                ),
+            },
+            None => w.clone(),
+        })
+        .collect()
+}
+
+impl CompactFun {
+    /// Merge two function slots. `pol` is the *outer* polarity; the domain merges
+    /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
+    fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
+        let name = a.name.clone().or_else(|| b.name.clone());
+        let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
+        // The domain merges **contravariantly** and as one ordinary position — there is no
+        // domain lattice left to consult, because a `fun` slot holds one domain. What was a
+        // join or meet of candidate *sets* is now the same `CompactType::merge` every other
+        // position gets.
+        let domain = Box::new(CompactType::merge(
+            !pol,
+            (*a.domain).clone(),
+            (*b.domain).clone(),
+        ));
+        // **Distinct domains have no common data-function type.** A domain is the data, so
+        // two collections over different domains share no type at all, and there is no sum
+        // above them either — entering one is a term. The merge above has put both domains
+        // in one position; several *denoted* domains there is exactly that conflict, and it
+        // is what `[1] if c else [2, 3]` must report instead of quietly acquiring a sum.
+        // **A data domain's refinements are part of it**, and the guard below cannot see
+        // them, because it reads the position *after* the merge: a contravariant meet unions
+        // refinements, so `{𝑑 | 𝑝}` and `𝑑` arrive as two domains and leave as one. Distinct
+        // *shapes* survive the meet and are counted; a distinct refinement is resolved by it,
+        // and the join then denotes a collection filtered by a predicate only one side owed.
+        //
+        // Compared on the inputs for that reason. Their refinement lists are compared rather
+        // than the whole positions, which would demand representational identity the meet
+        // exists to smooth over — variable ids and slot order among them.
+        // Recorded whatever the kind is, because an unpinned one can still become `Data`
+        // and the meet has already erased the evidence by the time it does. An earlier
+        // combination outranks this one: it is the pair that first had no common answer.
+        let combined = a
+            .combined
+            .clone()
+            .or_else(|| b.combined.clone())
+            .or_else(|| {
+                data_domains_disagree(&a.domain, &b.domain)
+                    .then(|| CombinedDomains::new((*a.domain).clone(), (*b.domain).clone()))
+            });
+        let kind = a.kind.clone().join(b.kind.clone());
+        let binders = merge_binders(pol, &a.binders, &b.binders);
+
+        // A domain disagreement is a fact about the **domains**, so it is recorded beside
+        // the kind rather than inside it: the kind still says what the function is, and the
+        // flag says the arms are over data that has no common answer.
+        let domains_disagree = a.domains_disagree
+            || b.domains_disagree
+            || (kind.is_data()
+                && (combined.is_some()
+                    || denoted_domains(&domain).is_some_and(|ds| denotes_several_domains_ty(&ds))));
+        CompactFun {
+            name,
+            kind,
+            binders,
+            domains_disagree,
+            domain,
+            combined,
+            codomain,
         }
     }
 }
@@ -89,237 +709,6 @@ impl AtomKey {
 /// neither directly, so [`coalesce_compact`](super::coalesce::coalesce_compact)
 /// picks a single concrete type from these bag-of-types contributions and
 /// errors on conflict.
-/// The kind of a merged function slot. The four values form the flat semilattice
-/// `Unknown < {Data, Compute} < Conflict`, joined the same way at both
-/// polarities: `Unknown` is the identity and `Conflict` absorbing, so
-/// [`CompactType::merge`] stays infallible and a `Data`/`Compute` collision is
-/// reported loudly at coalesce
-/// ([`super::coalesce::CoalesceError::DomainJoinConflict`]) rather than as a
-/// mid-merge panic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum KindMerge {
-    /// A capability: its domain is a requirement, so the alternatives a join
-    /// accumulated meet contravariantly when coalesce reads them.
-    Compute,
-    /// A collection: its domain *is* the data, so the alternatives never meet —
-    /// exactly one must survive ([`DomainSet`]).
-    Data,
-    /// A data/compute or multi-domain collision; deferred to coalesce.
-    Conflict,
-    /// A kind variable nothing pinned. **Not** the same as `Compute`: nothing
-    /// *required* a capability here, so meeting or joining this with a resolved
-    /// kind yields that kind rather than a collision. It becomes `Compute` only
-    /// at coalesce, where the capability default applies because nothing else
-    /// determined it.
-    Unknown,
-}
-
-impl KindMerge {
-    /// Resolve a function's kind. FunKind is a **provenance** property, not a
-    /// function of the domain: a concrete [`FunKind`](crate::ccl::ty::FunKind)
-    /// passes through unchanged. Data collections — list literals, comprehensions,
-    /// `groupby` — are concrete-stamped `Data` at construction; a bare lambda is
-    /// concrete `Compute` (a capability, `emit_lambda`). Only an *inferred* kind
-    /// ([`FunKind::Var`](crate::ccl::ty::FunKind::Var) — a function parameter or a
-    /// freshened scheme kind) reaches the flags, and the two points are
-    /// incomparable, so those record *pins* rather than bounds: pinned to
-    /// `Compute` → `Compute`, to `Data` → `Data`, to both → the conflict, to
-    /// neither → [`KindMerge::Unknown`], which coalesce resolves to the `Compute`
-    /// capability default. No domain inspection is
-    /// involved: a capability supplied where a collection is demanded (e.g.
-    /// `sum(λ x → x + 1)`) is a concrete `Compute` value against a concrete `Data`
-    /// demand, rejected up front in [`constrain_kind`](super::constrain) — it
-    /// never reaches a var here.
-    pub(super) fn of(kind: &crate::ccl::ty::FunKind) -> Self {
-        use crate::ccl::ty::{FunKind, KindPin};
-        match kind {
-            FunKind::Compute => KindMerge::Compute,
-            FunKind::Data => KindMerge::Data,
-            FunKind::Var(v) => match v.pin() {
-                KindPin::Conflict => KindMerge::Conflict,
-                // A var pinned only as data is `Data` (e.g. a parameter used only
-                // as a collection). A capability flowing in would carry a concrete
-                // `Compute`, reaching `KindPin::Conflict` or failing at
-                // `constrain_kind` first.
-                KindPin::Data => KindMerge::Data,
-                KindPin::Compute => KindMerge::Compute,
-                // Unpinned: not yet an answer — see `KindMerge::Unknown`.
-                KindPin::Unpinned => KindMerge::Unknown,
-            },
-        }
-    }
-}
-
-/// A merged function shape. `domains` holds the alternatives a positive join
-/// accumulated — one entry unless two distinct domains met — and coalesce
-/// applies the resolved [`KindMerge`]'s rule to them (see [`DomainSet`] and
-/// [`CompactFun::merge`]). A negative merge takes the contravariant meet
-/// directly, since that rule does not read the kind.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompactFun {
-    /// The Pi (element) binder, `na.or(nb)` on merge.
-    pub name: Option<Name>,
-    /// The merged kind.
-    pub kind: KindMerge,
-    /// Domain alternatives — `len == 1` unless a positive join accumulated more.
-    pub domains: DomainSet,
-    /// The codomain (covariant).
-    pub codomain: Box<CompactType>,
-}
-
-/// The domain alternatives a positive join accumulated: a **set**, deduplicated
-/// by [`CompactType`] equality.
-///
-/// Order-insensitive, which is what keeps a merged slot's *identity* independent
-/// of bound arrival order. Appending into a bare `Vec` did not: `CompactFun`
-/// derives `PartialEq`, which compares a `Vec` positionally, so two data-function
-/// bounds over distinct domains merged to `[d₁, d₂]` or `[d₂, d₁]` and the two
-/// results compared unequal. Structural equality is load-bearing where types are
-/// identities, which is the same reason refinements are a
-/// [`RefinementSet`](crate::ccl::RefinementSet) rather than a `Vec`.
-///
-/// Deduplicating here does not make coalesce's second dedup redundant: at compact
-/// time a domain still carries inference-variable identity that `simplify_type`
-/// may merge afterwards, so two alternatives that are unequal here can still
-/// materialize to one `Type`.
-#[derive(Debug, Clone, Default)]
-pub struct DomainSet(Vec<CompactType>);
-
-impl PartialEq for DomainSet {
-    /// Set equality. Sound as stated because both sides are deduplicated, so
-    /// equal cardinality plus one-way containment is mutual containment — the
-    /// same argument `RefinementSet`'s equality rests on.
-    fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len() && self.0.iter().all(|d| other.0.contains(d))
-    }
-}
-
-impl DomainSet {
-    /// The one alternative an ordinary function slot carries.
-    pub(super) fn one(d: CompactType) -> Self {
-        Self(vec![d])
-    }
-
-    /// The union of two alternative sets. Never a meet — a `Data` domain *is* the
-    /// data, so narrowing it drops rows, and whether the slot reads as data is not
-    /// known here ([`CompactFun::merge`]).
-    pub(super) fn union(mut self, other: Self) -> Self {
-        for d in other.0 {
-            if !self.0.contains(&d) {
-                self.0.push(d);
-            }
-        }
-        self
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn iter(&self) -> std::slice::Iter<'_, CompactType> {
-        self.0.iter()
-    }
-
-    /// The alternatives as a slice, for a reader that only materializes them —
-    /// the same accessor `RefinementSet` offers for the same reason.
-    pub fn as_slice(&self) -> &[CompactType] {
-        &self.0
-    }
-}
-
-impl<'a> IntoIterator for &'a DomainSet {
-    type Item = &'a CompactType;
-    type IntoIter = std::slice::Iter<'a, CompactType>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl IntoIterator for DomainSet {
-    type Item = CompactType;
-    type IntoIter = std::vec::IntoIter<CompactType>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-impl FromIterator<CompactType> for DomainSet {
-    fn from_iter<I: IntoIterator<Item = CompactType>>(iter: I) -> Self {
-        iter.into_iter()
-            .fold(Self::default(), |acc, d| acc.union(Self::one(d)))
-    }
-}
-
-impl CompactFun {
-    /// Merge two function slots. `pol` is the *outer* polarity; domains merge
-    /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
-    fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
-        use KindMerge::*;
-        let name = a.name.clone().or_else(|| b.name.clone());
-        let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
-        // On any prior conflict, stay conflicted (keep the wider domain list
-        // so coalesce can render diagnostics).
-        let widest = |x: DomainSet, y: DomainSet| if x.len() >= y.len() { x } else { y };
-        // The kinds join in the flat semilattice `Unknown < {Data, Compute} <
-        // Conflict`, the same operation at both polarities: `Unknown` is the
-        // identity (nothing required a kind on that side, so the other side's
-        // answer stands), a kind meeting itself is itself, and the two concrete
-        // kinds are incomparable — neither reading stands in for the other, so
-        // `Data` meeting `Compute` has no answer at either polarity.
-        let kind = match (a.kind, b.kind) {
-            (Conflict, _) | (_, Conflict) => Conflict,
-            (Unknown, k) | (k, Unknown) => k,
-            (x, y) if x == y => x,
-            _ => Conflict,
-        };
-        let (kind, domains) = if kind == Conflict {
-            // Keep the wider list so coalesce can render diagnostics.
-            (Conflict, widest(a.domains, b.domains))
-        } else if pol {
-            // A join accumulates the alternatives whatever the kind. Which
-            // combination the alternatives want *is* a function of the kind — a
-            // `Data` join needs one surviving domain, a `Compute` join needs their
-            // contravariant meet — and the kind is not settled until the last bound
-            // has merged, so a choice made here is made from an answer that does not
-            // exist yet, and a later bound cannot undo it. `coalesce_compact_go`
-            // applies the resolved kind's rule once, at the same place
-            // [`DomainSet`]'s dedup is re-decided.
-            (kind, a.domains.union(b.domains))
-        } else if a.domains.len() == 1 && b.domains.len() == 1 {
-            // The contravariant meet. A negative position's rule does not read the
-            // kind, so taking it here decides nothing early. The meet is defined
-            // only where both sides carry a single domain — a multi-domain
-            // requirement has no one domain to meet — which is what the guard
-            // establishes. `exactly_one` re-reads the cardinality instead of taking
-            // the head: the alternatives are unordered, so a set of any other size
-            // has no first element to fall back on.
-            let sole = |d: DomainSet| {
-                d.into_iter()
-                    .exactly_one()
-                    .expect("a one-element DomainSet yields its element")
-            };
-            (
-                kind,
-                DomainSet::one(CompactType::merge(!pol, sole(a.domains), sole(b.domains))),
-            )
-        } else {
-            // Two multi-domain requirements meeting at a negative position — no current
-            // program produces this; flag it loudly at coalesce.
-            (Conflict, widest(a.domains, b.domains))
-        };
-        CompactFun {
-            name,
-            kind,
-            domains,
-            codomain,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactType {
     /// Variable contributions from this position. Multiple variables
@@ -354,10 +743,11 @@ pub struct CompactType {
     /// the absorbing element (here from intersecting disjoint tag sets at
     /// negative polarity).
     pub var: Option<CompactVariant>,
-    /// Function shape, if any: see [`CompactFun`]. Carries the Pi binder, the
-    /// merged [`KindMerge`], the domain alternatives (one, unless a positive
-    /// positive join accumulated alternatives via [`DomainSet::union`]), and the
-    /// codomain. Recursively merged with polarity flip on the domain.
+    /// Arrow shape, if any: see [`CompactFun`]. Carries the Pi binder, the merged
+    /// [`KindPin`], the [`CompactTypeKind`], and the codomain. Recursively merged
+    /// with polarity flip on the domain. Plain functions *and* dependent sums both
+    /// live here — one slot, so the two ways a sum reaches a position (directly, and
+    /// as the domain a consumed sum named) merge instead of colliding.
     pub fun: Option<CompactFun>,
     /// Refinement contributions at this position — the same
     /// [`RefinementSet`](crate::ccl::RefinementSet) the materialized `Type`
@@ -389,6 +779,18 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
+    /// **Kinding** constraints gathered from the variables contributing here —
+    /// `α :: 𝐾` for each, conjunctively. Folded in by the variable walk exactly as
+    /// its bounds are, and discharged by
+    /// [`coalesce_compact`](super::coalesce::coalesce_compact) against the type this
+    /// position materializes to. Not polar: a kinding constraint is an assertion about
+    /// a resolution, so both merge directions union.
+    ///
+    /// This slot is why the check needs no side channel. A variable's kinding
+    /// constraint reaches the position it determines by the same route its bounds do,
+    /// so "check it where the variable resolves" is a local question at coalesce
+    /// rather than a list to be drained afterwards.
+    pub kinds: Vec<crate::ccl::ty::TypeKind>,
 }
 
 /// A variant contribution: the tag map, and whether the arm set is the whole one.
@@ -475,6 +877,174 @@ impl CompactType {
         Self::merge(pol, lhs, rhs)
     }
 
+    /// How many **shapes** this position names: an atom, a record, a variant, an arrow, a
+    /// history.
+    ///
+    /// [`coalesce_compact_go`](super::coalesce) materializes a position from exactly one of
+    /// them and reports two as `CoalesceError::IncompatibleBounds` at either polarity, because
+    /// the merge unions contributions rather than reconciling them.
+    ///
+    /// **Every witness atom is one shape between them**, not one each. A reference resolves
+    /// against the enclosing scope rather than against its neighbours, so several names at one
+    /// position are one index and the rest are spellings from the routes it arrived by — the
+    /// position materializes as a single `Type::WitnessRef`. Two names *both* in scope is a
+    /// real conflict, and `CoalesceError::WitnessScope` reports it there, where the scope is
+    /// known; counting them here instead would read a re-spelled domain as a conflict.
+    ///
+    /// Two more things that look like a second shape are not. Refinements ride the one shape
+    /// there is, so `{Int | p}` names one; and a disagreeing pair of data domains sits inside
+    /// the arrow, which materializes as a Σ over the operands rather than as an error.
+    fn shapes(&self) -> usize {
+        let CompactType {
+            vars: _,
+            kinds: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements: _,
+            history_slot,
+        } = self;
+        let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
+        atoms.iter().filter(|a| !is_witness(a)).count()
+            + usize::from(atoms.iter().any(|a| is_witness(&a)))
+            + usize::from(rec.is_some())
+            + usize::from(var.is_some())
+            + usize::from(fun.is_some())
+            + usize::from(history_slot.is_some())
+    }
+
+    /// Does this position, or any below it, name two shapes where coalesce admits one?
+    fn conflicted(&self) -> bool {
+        self.shapes() > 1
+            || self.rec.iter().flatten().any(|(_, t)| t.conflicted())
+            || self
+                .var
+                .iter()
+                .flat_map(|v| v.tags.values())
+                .any(Self::conflicted)
+            || self
+                .fun
+                .as_ref()
+                .is_some_and(|f| f.domain.conflicted() || f.codomain.conflicted())
+            || self
+                .history_slot
+                .as_ref()
+                .is_some_and(|(v, d, _)| v.conflicted() || d.conflicted())
+    }
+
+    /// Does this position name a type? Exactly one shape here, and no conflict below.
+    ///
+    /// **Zero shapes is not a type either.** An unconstrained position imposes nothing, which
+    /// is the merge's identity rather than a type — `merge` leaves it untouched at either
+    /// polarity — and coalesce materializes it as an unresolved [`Type::Infer`], or reports
+    /// `UnresolvedInfer` where not even a variable remains.
+    ///
+    /// A *child* may name zero: a record field nothing has constrained materializes as that
+    /// `Infer` and the record is a type all the same. Only a conflict below disqualifies one,
+    /// which is why the recursion asks [`conflicted`](Self::conflicted) and not this.
+    pub(super) fn denotes_a_type(&self) -> bool {
+        self.shapes() == 1 && !self.conflicted()
+    }
+
+    /// Is `self` **below** `other` in the order this merge induces — `self ⊔ other ≡ other`?
+    ///
+    /// Sound as a subtyping test and incomplete: absorption implies the two materialize to
+    /// subtypes (`formal/CclFormal/MaterializedMergeIsABound.lean`, `coalesce_monotone_record`
+    /// and its siblings), while two positions can materialize to one type and absorb neither
+    /// the other — a positive merge accumulates a function slot's domain alternatives rather
+    /// than deciding between them. Incompleteness is the safe direction wherever this decides
+    /// membership at a *negative* position: it answers "no" where the truth is unknown, which
+    /// shrinks a lower bound rather than growing it.
+    ///
+    /// **Both operands must name a type** ([`denotes_a_type`](Self::denotes_a_type)), and each
+    /// way of failing that answers wrongly rather than imprecisely. A position naming two
+    /// shapes contains each side's atoms, so every `self` absorbs into it. A position naming
+    /// none is the merge's identity, so it absorbs into every `other` — this reads it as ⊥,
+    /// which is its denotation at a *positive* position and not at the negative one where a
+    /// meet reads it. Callers establish the precondition; the assertion states it.
+    ///
+    /// Judged by [`equiv`](Self::equiv) and not `==`, because the merge unions `vars`: a
+    /// structural comparison would ask that `self` carry no variable `other` lacks, which is
+    /// a fact about the route each was reached by and not about the types.
+    pub(super) fn is_below(&self, other: &CompactType) -> bool {
+        debug_assert!(
+            self.denotes_a_type() && other.denotes_a_type(),
+            "is_below reads both operands as types at a fixed polarity: a position naming two \
+             shapes absorbs every candidate, and one naming none absorbs into every parameter"
+        );
+        CompactType::merge(true, self.clone(), other.clone()).equiv(other)
+    }
+
+    /// Do these two positions denote the same thing?
+    ///
+    /// `PartialEq` is structural and asks more than denotation does. Three slots are excluded
+    /// and each for its own reason:
+    ///
+    /// * `vars` — by the time the domain lattice reads a position, compaction has folded every
+    ///   variable's bounds into the other slots ([`occupied`](Self::occupied) drops them for
+    ///   the same reason). Which variables were walked to get here is a fact about the route.
+    /// * `kinds` — a kinding constraint is a condition on what the position resolves to, not a
+    ///   part of what it denotes.
+    /// * `combined` on a function slot — the two domains that had no common answer, kept for
+    ///   the diagnostic. `domains_disagree` beside it is the fact; this is the payload.
+    ///
+    /// Everything else compares structurally, which for the set- and map-backed slots is
+    /// already denotational. That leaves the relaxation minimal, and a too-strict equivalence
+    /// only makes [`is_below`](Self::is_below) answer "no" more often.
+    pub(super) fn equiv(&self, other: &CompactType) -> bool {
+        let CompactType {
+            vars: _,
+            kinds: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements,
+            history_slot,
+        } = self;
+        // `atoms` and `refinements` hold no position, so structural equality on those is
+        // already denotational — the first is a `BTreeSet` and the second a set of terms.
+        // Every slot that *does* hold one recurses, or the excluded `vars` would come back
+        // one level down.
+        let keyed = |x: &BTreeMap<FieldKey, CompactType>, y: &BTreeMap<FieldKey, CompactType>| {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| v.equiv(w)))
+        };
+        atoms == &other.atoms
+            && refinements == &other.refinements
+            && match (rec, &other.rec) {
+                (None, None) => true,
+                (Some(x), Some(y)) => keyed(x, y),
+                _ => false,
+            }
+            && match (var, &other.var) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.openness == b.openness && keyed(&a.tags, &b.tags),
+                _ => false,
+            }
+            && match (history_slot, &other.history_slot) {
+                (None, None) => true,
+                (Some((v, d, k)), Some((v2, d2, k2))) => k == k2 && v.equiv(v2) && d.equiv(d2),
+                _ => false,
+            }
+            && match (fun, &other.fun) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.name == b.name
+                        && a.kind == b.kind
+                        && a.domains_disagree == b.domains_disagree
+                        && a.binders.len() == b.binders.len()
+                        && a.binders
+                            .iter()
+                            .zip(&b.binders)
+                            .all(|(x, y)| x.id == y.id && x.type_kind.equiv(&y.type_kind))
+                        && a.domain.equiv(&b.domain)
+                        && a.codomain.equiv(&b.codomain)
+                }
+                _ => false,
+            }
+    }
+
     /// Merge two CompactTypes at the given polarity.
     ///
     /// - `vars`, `atoms`: union (always).
@@ -488,8 +1058,36 @@ impl CompactType {
     ///   positive polarity and union at negative
     ///   ([`merge_refinements`](Self::merge_refinements)).
     pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+        if lhs.imposes_nothing() {
+            return rhs.absorbing_vars_of(lhs);
+        }
+        if rhs.imposes_nothing() {
+            return lhs.absorbing_vars_of(rhs);
+        }
+        // **The cross-slot Σ laws.** A sum meeting a *non*-sum cannot be handled
+        // slot-against-slot the way `Σ ⊔ Σ` and `Σ ⊓ Σ` are, because the two live in
+        // different slots — so it is decided here, before the per-slot merges
+        // (`src/ccl/design/type-inference.md`, "How a sum flows through the solver").
+        //
+        // Both directions reduce to **distributing over the candidates**, and both are
+        // derived rather than chosen:
+        //
+        // - **positive (`Σ ⊔ 𝑇`)** — no subtyping edge builds a sum, so none lies above a bare
+        //   `𝑇`, so every upper bound of both is a non-sum; consuming the sum then requires
+        //   it above every candidate. The sum *dissolves* into the join. This is what makes
+        //   `box(xs) if c else xs` collapse to `xs`'s type.
+        // - **negative (`Σ ⊓ 𝑇`)** — only a sum satisfies a sum demand, and a sum
+        //   satisfies a plain demand by being consumed, so `𝑇` strengthens the body. For a
+        //   witness-bodied sum the body *is* the witness, so that is again each
+        //   candidate.
+        //
+        // Restricted to a witness-bodied sum, which is the only shape this slot holds:
+        // a function-bodied one needs `𝐵[𝑑]` at the compact level, which arrives with the
+        // migration off the `fun` slot.
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
+        #[allow(clippy::mutable_key_type)]
+        // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
         let mut atoms = lhs.atoms;
         atoms.extend(rhs.atoms);
         let rec = match (lhs.rec, rhs.rec) {
@@ -512,6 +1110,15 @@ impl CompactType {
             (None, r) | (r, None) => r,
             (Some(a), Some(b)) => Some(Self::merge_refinements(pol, a, b)),
         };
+        // Conjunction at both polarities: the position must satisfy every kinding
+        // constraint of every variable that determines it. Deduplicated so a variable
+        // reached twice through the bound graph does not grow the list.
+        let mut kinds = lhs.kinds;
+        for k in rhs.kinds {
+            if !kinds.contains(&k) {
+                kinds.push(k);
+            }
+        }
         // History children merge componentwise at the outer polarity
         // (invariance was already enforced when the constraint edges were
         // recorded). Two histories at one position share a kind — a mutable variable and a
@@ -531,6 +1138,7 @@ impl CompactType {
         CompactType {
             vars,
             atoms,
+            kinds,
             rec,
             var,
             fun,
@@ -539,13 +1147,43 @@ impl CompactType {
         }
     }
 
-    /// Merge two refinement sets. The set-op tracks
-    /// polarity the same way `rec` does — positive ⇒ *intersect*,
-    /// negative ⇒ *union* — because refinement-sets width-subtype like
-    /// record fields (more refinements ⇒ subtype). At a positive
-    /// position the value reliably carries only the refinements *both*
-    /// sides guarantee; at a negative position a consumer that may
-    /// impose either set imposes their union.
+    /// Whether this contribution says nothing about the position at all — an
+    /// unresolved variable and nothing else.
+    ///
+    /// Every component's `None` already acts as its own merge identity, so the
+    /// per-slot merges pass an empty contribution through unchanged; this
+    /// whole-contribution test exists for the cross-slot Σ laws, which must not
+    /// fire against a side that says nothing.
+    ///
+    /// The variables themselves are still carried across by
+    /// [`absorbing_vars_of`](Self::absorbing_vars_of); they are this
+    /// contribution's only content, and they join at every polarity.
+    fn imposes_nothing(&self) -> bool {
+        let CompactType {
+            vars: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements,
+            history_slot,
+            kinds,
+        } = self;
+        atoms.is_empty()
+            && rec.is_none()
+            && var.is_none()
+            && fun.is_none()
+            && refinements.is_none()
+            && history_slot.is_none()
+            && kinds.is_empty()
+    }
+
+    /// Take the variable identities of a contribution that
+    /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
+    fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
+        self.vars.extend(identity.vars);
+        self
+    }
     fn merge_refinements(pol: bool, lhs: RefinementSet, rhs: RefinementSet) -> RefinementSet {
         if pol {
             // The types are being unioned, so the refinements should be intersected.
@@ -637,6 +1275,8 @@ impl CompactType {
     }
 
     pub(super) fn from_atom(a: AtomKey) -> Self {
+        #[allow(clippy::mutable_key_type)]
+        // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
         let mut atoms = BTreeSet::new();
         atoms.insert(a);
         Self {
@@ -750,9 +1390,10 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
             .iter()
             .flat_map(|v| v.tags.values())
             .all(refinement_slot_present)
-        && ct.fun.iter().all(|f| {
-            f.domains.iter().all(refinement_slot_present) && refinement_slot_present(&f.codomain)
-        })
+        && ct
+            .fun
+            .iter()
+            .all(|f| refinement_slot_present(&f.domain) && refinement_slot_present(&f.codomain))
         && ct.history_slot.iter().all(|(value, domain, _)| {
             refinement_slot_present(value) && refinement_slot_present(domain)
         })
@@ -865,6 +1506,228 @@ struct CompactState {
     scope: RefinementScope,
 }
 
+/// What the binder at `position` of a kind **variable** ranges over, derived here from the
+/// relations the kind graph records.
+///
+/// Compaction is the one place a kind is merged, so this is where a variable's binder is
+/// answered too: it combines with [`CompactTypeKind::merge`], the same lattice a position
+/// meeting another uses, and compacts each concrete witness's kind once at the polarity a
+/// candidate takes. Answering it on [`crate::ccl::ty::FunKindVar`] instead put a second
+/// lattice beside this one, and the two then differ by whatever each did.
+///
+/// Three relations reach a binder and they are not the same relation:
+///
+/// * **Built over** — a comprehension binds one position per position of each generator, so
+///   its arity is their sum and one source *owns* each position. The range is that source's
+///   at its own offset, not a merge of everything at the same numeric position.
+/// * **Below** — a collection that flowed in contributes its own candidates, and several
+///   arriving is a conditional collection over all of them.
+/// * **Above** — a demand says what the position must satisfy rather than what it ranges
+///   over, so it answers only where nothing arrived. Merging it in would widen a position to
+///   whatever a consumer accepts; answering nothing leaves the consumer's own containment
+///   check with no candidates to check. **Read, never continued through**: what a demand
+///   states is a fact about this position, but its own lowers are the *other* collections
+///   reaching that consumer, which are siblings of this one rather than more of it. A demand
+///   that is a variable therefore answers nothing, since a variable states no range.
+///   `a_source_shared_between_two_joins_keeps_the_joins_apart` is the program that rule
+///   keeps apart.
+fn var_binder_kind(
+    k: &Rc<crate::ccl::ty::FunKindVar>,
+    position: usize,
+    pol: bool,
+    subst_acc: &Subst,
+    st: &mut CompactState,
+    seen: &mut Vec<crate::ccl::ty::FunKindVarId>,
+) -> Option<CompactTypeKind> {
+    if seen.contains(&k.uid) {
+        return None;
+    }
+    seen.push(k.uid);
+    let mut offset = 0;
+    for src in k.built_over() {
+        let n = src.arity().unwrap_or(0);
+        if position < offset + n {
+            return kind_at(&src, position - offset, pol, true, subst_acc, st, seen);
+        }
+        offset += n;
+    }
+    // **Which list decides the lattice operation, not where the position sits.** Everything
+    // in `lower` is below this kind, so combining them is a join at either polarity, and
+    // everything in `upper` is above it, so combining those is a meet. Reducing a list at
+    // the *position's* polarity instead intersected the arms of a conditional at every
+    // negative position — two collections below one kind are a conditional over both, so
+    // their candidate sets union, and a negative occurrence of that kind does not turn the
+    // union into the empty kind, which admits no type at all.
+    let merged = |ks: Vec<crate::ccl::ty::FunKind>,
+                  joining: bool,
+                  through: bool,
+                  st: &mut CompactState,
+                  seen: &mut _| {
+        ks.iter()
+            .filter_map(|f| kind_at(f, position, pol, through, subst_acc, st, seen))
+            .reduce(|a, b| CompactTypeKind::merge(joining, a, b))
+    };
+    merged(k.lower(), true, true, st, seen).or_else(|| merged(k.upper(), false, false, st, seen))
+}
+
+/// The same question of one kind, concrete or variable — a concrete kind states its binders,
+/// a variable derives them from the relations it is in ([`var_binder_kind`]), where
+/// `through` permits it.
+fn kind_at(
+    f: &crate::ccl::ty::FunKind,
+    position: usize,
+    pol: bool,
+    through: bool,
+    subst_acc: &Subst,
+    st: &mut CompactState,
+    seen: &mut Vec<crate::ccl::ty::FunKindVarId>,
+) -> Option<CompactTypeKind> {
+    match f {
+        // A variable states no range of its own, so `through` decides whether this asks the
+        // relations it is in. Off — at a demand — it answers nothing rather than the other
+        // collections that reach the consumer (see [`var_binder_kind`], *Above*).
+        crate::ccl::ty::FunKind::Var(v) if through => {
+            var_binder_kind(v, position, pol, subst_acc, st, seen)
+        }
+        crate::ccl::ty::FunKind::Var(_) => None,
+        // A candidate takes the *kind's* polarity: it is a member of the kind's set, and the
+        // set is covariant with the function it kinds.
+        other => other
+            .witnesses()
+            .get(position)
+            .map(|w| compact_type_kind(&w.type_kind(), pol, subst_acc, st)),
+    }
+}
+
+/// A [`TypeKind`] as a [`CompactTypeKind`]: every type it carries decomposed into the
+/// lattice, the kind itself crossing as itself. The one conversion, so a kind reaching the
+/// carrier as a Σ's witness and one reaching it as a *kinding constraint* on a free
+/// witness become the same thing — which is what lets binding read either.
+fn compact_type_kind(
+    type_kind: &crate::ccl::ty::TypeKind,
+    pol: bool,
+    subst_acc: &Subst,
+    st: &mut CompactState,
+) -> CompactTypeKind {
+    use crate::ccl::ty::TypeKind;
+    // Variant for variant: every type a kind carries — a candidate, a key bound's parameter
+    // — is a position, so it compacts like one. A kind that carries no type has nothing to
+    // decompose and crosses as itself.
+    match type_kind {
+        TypeKind::Enumerated(domains) => CompactTypeKind::Enumerated(
+            domains
+                .iter()
+                .map(|d| compact_go(d, pol, subst_acc, None, st))
+                .collect(),
+        ),
+        TypeKind::SubtypesOf(k) => {
+            CompactTypeKind::SubtypesOf(Box::new(compact_go(k, pol, subst_acc, None, st)))
+        }
+        TypeKind::UIntRanges => CompactTypeKind::UIntRanges,
+        TypeKind::Type => CompactTypeKind::Type,
+    }
+}
+
+/// Every kind variable's binder correspondence, one per line. Diagnostic only — the
+/// substitution half of [`crate::ccl::ty::dump_kind_vars`], which shows only the edges.
+#[cfg(debug_assertions)]
+pub fn dump_kind_correspondences() -> String {
+    let mut out = String::new();
+    for v in crate::ccl::ty::fun_kind_vars() {
+        let kind = crate::ccl::ty::FunKind::Var(Rc::clone(&v));
+        let corr = fun_kind_correspondence(&kind, &Subst::id());
+        if corr.is_id() {
+            continue;
+        }
+        out.push_str(&format!("k{}: {}\n", v.uid.0, corr.render_witnesses()));
+    }
+    out
+}
+
+/// `acc` extended with the **binder correspondence** this kind states.
+///
+/// A kind variable's binders are the positions on it, and everything recorded below it is a
+/// collection whose binders correspond to those positions one for one. So a reference to an
+/// arm's binder, reaching a consumer, denotes the consumer's — and the map that says so is
+/// derivable here and nowhere earlier: it needs an arity, and an arity is what the bounds
+/// answer once the kind graph is closed.
+///
+/// Composed into the accumulated substitution exactly as a Pi binder's rename is, so every
+/// bound the walk records below this function is already spelled in this kind's binders.
+fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> Subst {
+    let crate::ccl::ty::FunKind::Var(k) = fun_kind else {
+        return acc.clone();
+    };
+    let Some(arity) = k.arity() else {
+        return acc.clone();
+    };
+    // Built on its own and **composed** onto the accumulator, not inserted into it: a
+    // reference already renamed by an outer hop has to be carried on by this one. Inserting
+    // leaves the outer entry pointing at a name this hop has since moved, so a chain
+    // resolves to its first hop and the walk answers with an intermediate spelling.
+    // A **bound** relates two spellings of one collection, so position *i* is position *i*;
+    // a **source** contributes its positions to a stretch of this kind's, so the offset
+    // walks.
+    //
+    // This kind's own binders, picked once — every rename below targets one of them.
+    let mine = k.binder_ids();
+    // **Downward without limit, upward one hop.** A spelling reaching this position can be
+    // several relations away: a filter over a conditional whose arms are themselves
+    // comprehensions puts the arm's source three hops below the consumer — built over the
+    // join, which holds the arms, each built over its own source — and a reference to that
+    // source arrives at this position spelled in the source's binder. Every hop downward
+    // says the same thing, that what flowed in is this position's index, so following them
+    // to the end is the same statement repeated rather than a new one.
+    //
+    // Closing over the whole *component* is what does not work, and the direction is why:
+    // an edge is recorded on both ends, so expanding upward as well yields `σ_a → σ_b` at
+    // one kind and `σ_b → σ_a` at another, and which applies depends on where the walk
+    // stands. `built_over` and `lower` are both directed away from this kind, so their
+    // closure stays a function onto `mine`. A demand above is read and not continued
+    // through, for the reason [`var_binder_kind`] gives under *Above*: the kinds below a
+    // consumer are the other collections reaching it, siblings of this one rather than more
+    // of it.
+    let push_below = |stack: &mut Vec<(crate::ccl::ty::FunKind, usize, bool)>,
+                      k: &Rc<crate::ccl::ty::FunKindVar>,
+                      at: usize| {
+        for l in k.lower() {
+            stack.push((l, at, true));
+        }
+        let mut offset = at;
+        for src in k.built_over() {
+            let n = src.arity().unwrap_or(0);
+            stack.push((src, offset, true));
+            offset += n;
+        }
+    };
+    let mut stack: Vec<(crate::ccl::ty::FunKind, usize, bool)> =
+        k.upper().into_iter().map(|u| (u, 0, false)).collect();
+    push_below(&mut stack, k, 0);
+    let mut seen: Vec<crate::ccl::ty::FunKindVarId> = vec![k.uid];
+    let mut hop = Subst::id();
+    while let Some((below, at, expand)) = stack.pop() {
+        if let crate::ccl::ty::FunKind::Var(v) = &below
+            && expand
+            && !seen.contains(&v.uid)
+        {
+            seen.push(v.uid);
+            push_below(&mut stack, v, at);
+        }
+        for (i, id) in below.binder_ids().into_iter().enumerate() {
+            if at + i >= arity {
+                break;
+            }
+            let Some(mine) = mine.get(at + i) else {
+                break;
+            };
+            if id != *mine {
+                hop = hop.extended_witness_rename(&id, mine);
+            }
+        }
+    }
+    Subst::then(&acc.shadow_witnesses(&mine), &hop)
+}
+
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
 /// accumulated from the edges walked so far — into every refinement predicate
 /// materialized along the way. `subst_acc` is `Subst::id()` for ordinary
@@ -910,6 +1773,21 @@ fn compact_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
+        // A witness reference is an ordinary atom: nullary, standing for one candidate
+        // without saying which, matching only itself (see [`AtomKey::Witness`]). The
+        // range comes from the variable the occurrence carries, so nothing is looked
+        // up by name.
+        // **A reference arrives spelled in the binders of whatever it flowed into.** The
+        // accumulated substitution carries the correspondence each enclosing kind states
+        // ([`fun_kind_correspondence`]), so an arm's binder reaching a consumer is the
+        // consumer's by the time it lands in a position.
+        Type::WitnessRef(w) => {
+            let named = match subst_acc.apply_witnesses(ty) {
+                Type::WitnessRef(x) => x,
+                _ => *w,
+            };
+            CompactType::from_atom(AtomKey::Witness(named))
+        }
         // Refinements ride the lattice as a refinement set: compact the underlying
         // type, then attach this layer's refinement. Walking a variable's bound
         // that is `Refinement(D, r)` therefore unions `r` into that variable's
@@ -937,10 +1815,14 @@ fn compact_go(
         Type::Hole | Type::SharedHole(_) => CompactType::empty(),
         Type::Fun {
             name,
-            kind,
+            fun_kind,
             domain: d,
             codomain: c,
         } => {
+            // **The kind's binder correspondence rides the walk from here down**, so an
+            // arm's occurrences arrive already spelled in this function's binders.
+            let owned_acc = fun_kind_correspondence(fun_kind, subst_acc);
+            let subst_acc = &owned_acc;
             // Function: domain is contravariant. A fresh `parents` set
             // per child mirrors Scala's `Set.empty` argument — cycles
             // span only one variable's bound chain, not across
@@ -963,11 +1845,80 @@ fn compact_go(
                 "landing closes: a function's own refinement must reference its binder by index, \
                  not by name"
             );
+            // **What the kind states this function binds**, spelled in the binders the walk
+            // arrived in. Recovering the list from what landed in the domain instead reads
+            // the shape of a position rather than the fact the kind states, and answers a
+            // multi-generator comprehension from the arity of its index tuple. Which *name*
+            // each position answers to is settled at materialization, where a reference is
+            // resolved against the binders in scope (`super::coalesce::coalesce_compact_go`).
+            //
+            // Substituted for the same reason the domain is: an enclosing kind's
+            // correspondence renames a reference in the body, and the binder it refers to
+            // moves with it or the function binds a name its body no longer spells.
+            //
+            // **The kind's children compact here**, at the kind's own polarity and under the
+            // substitution the walk reached this function with. A candidate is a *member of
+            // the kind's set*, not a type in the domain position: the set is covariant with
+            // the function, as the Σ rule has it (`Map(𝐾, 𝑉)`'s kind lies below
+            // `Collection(𝑉)`'s for the same reason the map lies below the collection), so a
+            // candidate takes the kind's polarity and not the domain's flipped one. A
+            // candidate carrying a refinement still needs the accumulated discharges.
+            // Only the **name** moves under the walk's substitution; what a binder ranges
+            // over is not a name.
+            let moved = |id: crate::ccl::ty::WitnessId| match subst_acc
+                .apply_witnesses(&Type::WitnessRef(id))
+            {
+                Type::WitnessRef(x) => x,
+                _ => id,
+            };
+            let binders: Vec<CompactWitness> = match fun_kind {
+                // **A width claimed is a width ranged.** A variable states no binders of its
+                // own, so both its positions and what each ranges over come from the
+                // relations it is in — and this materializes a sum only where those answer
+                // every position. An arity is pinned by whatever reached the kind, a demand
+                // from *above* among it, and a consumer asking to read something as a
+                // width-`n` sum does not make it one ([`crate::ccl::ty::FunKind::admits_sum`]
+                // declines the same claim for the same reason). Materializing the positions
+                // it does answer would put a binder count in the type that no relation
+                // supports; the alternatives at an unanswered position are the universe,
+                // which types it `Collection(𝑉)` and loses the extent, and an empty
+                // candidate set, which is `Σ (σ : []). σ ⤇ 𝑉` — a type nothing inhabits and
+                // one [`crate::ccl::Type::sum_over`] refuses to build.
+                crate::ccl::ty::FunKind::Var(v) => fun_kind
+                    .binder_ids()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        Some(CompactWitness {
+                            id: moved(id),
+                            type_kind: var_binder_kind(v, i, pol, subst_acc, st, &mut Vec::new())?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default(),
+                stated => stated
+                    .witnesses()
+                    .iter()
+                    .map(|w| CompactWitness {
+                        id: moved(*w.id()),
+                        type_kind: compact_type_kind(&w.type_kind(), pol, subst_acc, st),
+                    })
+                    .collect(),
+            };
             CompactType {
                 fun: Some(CompactFun {
+                    // **Compute or data, never which index.** A slot carrying binders is a
+                    // sum by carrying them; the pin's own sum spelling says the same thing
+                    // twice and the two can then disagree.
+                    kind: match fun_kind.resolved() {
+                        KindPin::Sum(_) => KindPin::Data,
+                        other => other,
+                    },
                     name: name.clone(),
-                    kind: KindMerge::of(kind),
-                    domains: DomainSet::one(dom),
+                    binders,
+                    domains_disagree: false,
+                    domain: Box::new(dom),
+                    combined: None,
                     codomain: Box::new(cod),
                 }),
                 ..CompactType::value()
@@ -1023,12 +1974,12 @@ fn compact_go(
         Type::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => {
             let value = compact_go(value, pol, subst_acc, None, st);
             let domain = compact_go(domain, pol, subst_acc, None, st);
             CompactType {
-                history_slot: Some((Box::new(value), Box::new(domain), *kind)),
+                history_slot: Some((Box::new(value), Box::new(domain), *history_kind)),
                 ..CompactType::value()
             }
         }
@@ -1051,6 +2002,17 @@ fn compact_go(
                 return CompactType::from_var(placeholder);
             }
             st.in_process.insert(key);
+            // **A variable states a binder correspondence too**, and it is the only thing
+            // that states the one a join needs: two conditional arms are two sums recorded
+            // below one variable's kind, each spelled in its own binder, and the kind is what
+            // puts those binders in correspondence with the position's. Applied on the way
+            // in, exactly as a function's own kind is, so every bound below arrives spelled
+            // in the position's binders.
+            let owned_acc = fun_kind_correspondence(
+                &crate::ccl::ty::FunKind::Var(Rc::clone(&state.fun_kind)),
+                subst_acc,
+            );
+            let subst_acc = &owned_acc;
             // The opposite-polarity fallback below is monomorphization's
             // coalesce-time *read* for a contravariant position. A function
             // domain is negative, so an argument flowing in (`arg <: domain`) is
@@ -1103,6 +2065,7 @@ fn compact_go(
             // one-way" and "Closing the single-sided blind spots (no separate
             // pass)").
             let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
+            let type_kinds = s.type_kinds.clone();
             drop(s);
             // Walk bounds, transitively expanding, seeded from the variable's own
             // identity: `from_var` is not a value, so it imposes nothing at any
@@ -1143,10 +2106,13 @@ fn compact_go(
                     fun,
                     history_slot,
                     var,
-                    // Not shape. Both are carried across the fallback explicitly
+                    // A sum is a shape: it is what the position *is*, and it
+                    // determines the position as much as an atom does.
+                    // Not shape. These are carried across the fallback explicitly
                     // below, rather than deciding whether it fires.
                     vars: _,
                     refinements: _,
+                    kinds: _,
                 } = &bound;
                 // A variant shape counts as concrete only at a **positive**
                 // position, where it is the value's own tags — read off the lower
@@ -1201,6 +2167,13 @@ fn compact_go(
                     bound = recovered;
                 }
             }
+            // The variable's kinding constraints join its identity: they are facts
+            // about what this position resolves to, and coalesce reads them there.
+            for k in type_kinds {
+                if !bound.kinds.contains(&k) {
+                    bound.kinds.push(k);
+                }
+            }
             st.in_process.remove(&key);
             // Recursive types: store the bound under the placeholder
             // variable and emit a reference.
@@ -1248,6 +2221,76 @@ mod tests {
             refinements_name_binder(&free, &binder),
             "a free reference by name is what the invariant forbids"
         );
+    }
+
+    /// **A refinement is part of a data domain, so a join may not acquire one.** The
+    /// contravariant meet a `fun` slot's domain takes *unions* refinements, so a domain
+    /// carrying a filter and one carrying none merge to the filtered domain — and the joined
+    /// collection then denotes rows filtered by a predicate only one side owed. That is the
+    /// wrong-answer half of the losslessness `FunKind::Data` exists to enforce.
+    ///
+    /// Reported as a domain conflict rather than by dropping the refinement, which is the
+    /// other wrong answer: it loses a filter the program wrote.
+    ///
+    /// A distinct domain *shape* needs no test here — it survives the meet as two denoted
+    /// domains and the guard already counts it. A refinement is the case the meet *resolves*,
+    /// which is why it has to be compared before merging.
+    #[test]
+    fn a_data_join_does_not_acquire_one_sides_domain_refinement() {
+        let filtered_domain = CompactType {
+            refinements: Some(RefinementSet::one(Refinement::born(Rc::new(
+                TypedExpr::lit(crate::ccl::Lit::Bool(true)),
+            )))),
+            ..CompactType::from_atom(AtomKey::UIntRange(2))
+        };
+        let data_fun = |domain: CompactType| CompactType {
+            fun: Some(CompactFun {
+                binders: Vec::new(),
+                name: None,
+                kind: KindPin::Data,
+                domains_disagree: false,
+                domain: Box::new(domain),
+                combined: None,
+                codomain: Box::new(CompactType::from_atom(AtomKey::Prim(BaseType::Int))),
+            }),
+            ..Default::default()
+        };
+        // Positive polarity: the join a conditional's two arms build.
+        let merged = CompactType::merge(
+            true,
+            data_fun(filtered_domain),
+            data_fun(CompactType::from_atom(AtomKey::UIntRange(2))),
+        );
+        assert!(
+            merged.fun.expect("fun slot present").domains_disagree,
+            "a data join must not acquire a refinement only one side carried"
+        );
+    }
+
+    /// The control: two data functions over the *same* refined domain join without
+    /// conflict. The rule is about a refinement one side lacks, not about refinements.
+    #[test]
+    fn a_data_join_over_one_refined_domain_is_fine() {
+        let refined = || CompactType {
+            refinements: Some(RefinementSet::one(Refinement::born(Rc::new(
+                TypedExpr::lit(crate::ccl::Lit::Bool(true)),
+            )))),
+            ..CompactType::from_atom(AtomKey::UIntRange(2))
+        };
+        let data_fun = |domain: CompactType| CompactType {
+            fun: Some(CompactFun {
+                binders: Vec::new(),
+                name: None,
+                kind: KindPin::Data,
+                domains_disagree: false,
+                domain: Box::new(domain),
+                combined: None,
+                codomain: Box::new(CompactType::from_atom(AtomKey::Prim(BaseType::Int))),
+            }),
+            ..Default::default()
+        };
+        let merged = CompactType::merge(true, data_fun(refined()), data_fun(refined()));
+        assert_eq!(merged.fun.expect("fun slot present").kind, KindPin::Data);
     }
 
     /// Compact merge at positive polarity unions tags.
@@ -1427,7 +2470,7 @@ mod tests {
     }
 
     /// A function slot of `kind` over one record domain with `fields`.
-    fn fun_over(kind: KindMerge, fields: &[&str]) -> CompactType {
+    fn fun_over(kind: KindPin, fields: &[&str]) -> CompactType {
         let int = || CompactType::from_atom(AtomKey::Prim(BaseType::Int));
         let mut rec = BTreeMap::new();
         for f in fields {
@@ -1435,12 +2478,15 @@ mod tests {
         }
         CompactType {
             fun: Some(CompactFun {
+                binders: Vec::new(),
                 name: None,
                 kind,
-                domains: DomainSet::one(CompactType {
+                domains_disagree: false,
+                domain: Box::new(CompactType {
                     rec: Some(rec),
                     ..CompactType::value()
                 }),
+                combined: None,
                 codomain: Box::new(int()),
             }),
             ..CompactType::value()
@@ -1465,9 +2511,9 @@ mod tests {
     /// three collections over `{a, b}`, `{a}`, and `{b}`.
     #[test]
     fn undetermined_kinds_join_without_deciding_the_domain_rule() {
-        let data = fun_over(KindMerge::Data, &["a", "b"]);
-        let u1 = fun_over(KindMerge::Unknown, &["a"]);
-        let u2 = fun_over(KindMerge::Unknown, &["b"]);
+        let data = fun_over(KindPin::Data, &["a", "b"]);
+        let u1 = fun_over(KindPin::Unpinned, &["a"]);
+        let u2 = fun_over(KindPin::Unpinned, &["b"]);
         for (x, y, z) in [
             (data.clone(), u1.clone(), u2.clone()),
             (u1.clone(), data.clone(), u2.clone()),
@@ -1492,27 +2538,29 @@ mod tests {
         }
     }
 
-    /// Two undetermined-kind bounds over distinct domains still join: the
-    /// alternatives accumulate at the merge, and the resolved kind's rule — here
-    /// the capability default nothing pinned away from — applies once at
-    /// coalesce, meeting the domains contravariantly.
+    /// Two undetermined-kind bounds over distinct domains still join: the merge keeps the
+    /// kind unpinned, and the resolved kind's rule — here the capability default nothing
+    /// pinned away from — applies once at coalesce, meeting the domains contravariantly.
     #[test]
     fn two_undetermined_kinds_join_to_a_capability_over_the_met_domain() {
         let merged = CompactType::merge(
             true,
-            fun_over(KindMerge::Unknown, &["a"]),
-            fun_over(KindMerge::Unknown, &["b"]),
+            fun_over(KindPin::Unpinned, &["a"]),
+            fun_over(KindPin::Unpinned, &["b"]),
         );
         assert_eq!(
-            merged.fun.as_ref().map(|f| (f.kind, f.domains.len())),
-            Some((KindMerge::Unknown, 2)),
-            "the merge accumulates the alternatives rather than combining them"
+            merged.fun.as_ref().map(|f| f.kind.clone()),
+            Some(KindPin::Unpinned),
+            "an unpinned kind stays unpinned through the merge"
         );
         let ty = coalesce_compact(&as_graph(merged)).expect("the domains meet");
-        let Type::Fun { kind, domain, .. } = &ty else {
+        let Type::Fun {
+            fun_kind, domain, ..
+        } = &ty
+        else {
             panic!("expected a function; got {ty}");
         };
-        assert_eq!(*kind, crate::ccl::ty::FunKind::Compute);
+        assert_eq!(*fun_kind, crate::ccl::ty::FunKind::Compute);
         assert_eq!(
             *domain,
             Box::new(Type::Record(vec![
@@ -1532,9 +2580,12 @@ mod tests {
     fn a_positive_join_of_two_domains_is_order_insensitive() {
         let fun = |dom: BaseType| CompactType {
             fun: Some(CompactFun {
+                binders: Vec::new(),
                 name: None,
-                kind: KindMerge::Data,
-                domains: DomainSet::one(CompactType::from_atom(AtomKey::Prim(dom))),
+                kind: KindPin::Data,
+                domains_disagree: false,
+                domain: Box::new(CompactType::from_atom(AtomKey::Prim(dom))),
+                combined: None,
                 codomain: Box::new(CompactType::from_atom(AtomKey::Prim(BaseType::Int))),
             }),
             ..CompactType::value()
@@ -1544,14 +2595,21 @@ mod tests {
         let ab = CompactType::merge(true, a.clone(), b.clone());
         let ba = CompactType::merge(true, b, a);
         assert_eq!(
-            ab.fun.as_ref().map(|f| f.domains.len()),
-            Some(2),
-            "the alternatives accumulate"
-        );
-        assert_eq!(
             ab, ba,
-            "and the merged slot does not depend on which arrived first"
+            "the merged slot does not depend on which arrived first"
         );
+        // Two *plain* collections over distinct domains have no join: entering a sum is a
+        // term, so nothing here builds one (`design/type-inference.md`, "Only a term
+        // builds a sum"). What the order-insensitivity claim protects is that the
+        // rejection is the same rejection either way.
+        for merged in [ab, ba] {
+            let err = coalesce_compact(&as_graph(merged))
+                .expect_err("two distinct data domains have no single join");
+            assert!(
+                matches!(err, CoalesceError::DomainJoinConflict { .. }),
+                "expected a domain-join conflict; got {err:?}"
+            );
+        }
     }
 
     /// `None` and `Some(empty)` in the refinement slot are different merges, which is
@@ -1597,7 +2655,7 @@ mod refinement_closing_tests {
     fn dep_fun(binder: &str) -> Type {
         Type::Fun {
             name: Some(Name::raw(binder)),
-            kind: FunKind::Data,
+            fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::refined_one(
                 Type::Base(BaseType::Int),
@@ -1677,11 +2735,11 @@ mod refinement_closing_tests {
     fn closing_keeps_distinct_binders_distinct() {
         let nested = |referenced: &str| Type::Fun {
             name: Some(Name::raw("x")),
-            kind: FunKind::Data,
+            fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Fun {
                 name: Some(Name::raw("y")),
-                kind: FunKind::Data,
+                fun_kind: FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(4)),
                 codomain: Box::new(Type::refined_one(
                     Type::Base(BaseType::Int),

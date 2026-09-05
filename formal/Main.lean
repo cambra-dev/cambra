@@ -8,6 +8,8 @@ per case, or `error: …` when a line does not decode. An empty line (or EOF) te
 
 - `"sub"`: `true` / `false`, the model's `subtypeCheck` on a concrete type pair.
 - `"merge"`: `ok`, or `mismatch: <CompactTy>` carrying the model's own merged bound.
+- `"mergeKind"`: the same, for a Σ binder's kind.
+- `"refuses"`: `ok`, or `mismatch: <Bool>` carrying the model's own verdict.
 - `"coalesce"`: `ok`, or `mismatch: <outcome>` carrying the model's own.
 
 The Rust half lives in `tests/differential_oracle.rs`, which generates the cases, computes the
@@ -34,6 +36,36 @@ def mergeVerdict (j : Lean.Json) : Except String String := do
   let got ← CompactTy.fromJson? (← j.getObjVal? "got")
   let want := CompactTy.merge pol lhs rhs
   pure (if CompactTy.equiv want got then "ok" else s!"mismatch: {(CompactTy.toJson want).compress}")
+
+/-- `{"op":"mergeKind","pol":<Bool>,"lhs":<CompactTypeKind>,"rhs":<CompactTypeKind>,
+"got":<CompactTypeKind>}` — whether the Rust's merged kind is the model's, judged by
+`equivTypeKind`, the equality every law in `CclFormal/TypeKindMerge.lean` is stated up to.
+
+This is the operation nothing else compares. The polar merge oracle cannot reach it: the
+model's `CompactTy` has no Σ binder slot, so `cty_json` refuses a bound carrying binders and
+every case that would exercise a kind is filtered out before the wire. -/
+def mergeKindVerdict (j : Lean.Json) : Except String String := do
+  let pol ← Lean.fromJson? (← j.getObjVal? "pol")
+  let lhs ← CompactTypeKind.fromJson? (← j.getObjVal? "lhs")
+  let rhs ← CompactTypeKind.fromJson? (← j.getObjVal? "rhs")
+  let got ← CompactTypeKind.fromJson? (← j.getObjVal? "got")
+  let want := CompactTypeKind.mergeTypeKind pol lhs rhs
+  pure (if CompactTypeKind.equivTypeKind want got then "ok"
+        else s!"mismatch: {(CompactTypeKind.toJson want).compress}")
+
+/-- `{"op":"refuses","kind":<TypeKind>,"ty":<Ty>,"got":<Bool>}` — whether the solver's certain
+non-membership verdict is the model's.
+
+The half of membership a caller may act on, and the one every caller of it turns into a
+rejection, so a disagreement here is a program refused or an error missed.
+`not_admits_of_refuses` proves a refusal never lands on a member; this checks that the two
+sides refuse the same things. -/
+def refusesVerdict (j : Lean.Json) : Except String String := do
+  let kind ← TypeKind.fromJson? (← j.getObjVal? "kind")
+  let ty ← Ty.fromJson? (← j.getObjVal? "ty")
+  let got : Bool ← Lean.fromJson? (← j.getObjVal? "got")
+  let want := refuses kind ty
+  pure (if want == got then "ok" else s!"mismatch: {want}")
 
 /-- `{"op":"coalesce","pol":<Bool>,"ct":<CompactTy>,"got":<outcome>}` — whether the
 solver's materialization of a bound is the model's. The outcome is `{"k":"ok","ty":<Ty>}`,
@@ -67,6 +99,8 @@ def verdict (line : String) : String :=
         match ← (← j.getObjVal? "op").getStr? with
         | "sub" => subVerdict j
         | "merge" => mergeVerdict j
+        | "mergeKind" => mergeKindVerdict j
+        | "refuses" => refusesVerdict j
         | "coalesce" => coalesceVerdict j
         | op => throw s!"unknown op: {op}"
       match checked with

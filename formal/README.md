@@ -18,6 +18,10 @@ without it, both halves stay internally consistent while describing different sy
 | The polar merge (`CompactType::merge`) | `CompactTy`, `merge` | commutativity; idempotence; congruence; associativity; the merge is the unique least upper bound of the order it induces |
 | Materialization (`coalesce_compact`) | `coalesce` | totality; the result is well-formed; the merge materializes to a bound of both operands where one exists, and to the least such type |
 | Terms and typing (a small pure core) | `Term`, `HasTy`, `Step` | progress (a well-typed term is a value, steps, or is filter-blocked), preservation (a step keeps the term's type), refinement soundness |
+| What a Σ's witness ranges over (`TypeKind`) | `TypeKind`, `Admits`, `ContainedIn`, `refuses` | containment transports membership; reflexivity; transitivity; and a **refusal is sound** — what `TypeKind::refuses` rejects is never a member, which is what every caller raising `NotOfKind` rests on, with the pair the bound arm's old equality test refused while admitting it |
+| Type kinds are a **lattice** | `IsKindLub`, `IsKindGlb` | every pair has a least upper and greatest lower bound, named row by row and proved in **both** directions — wherever the type order the kinds are built on has the bound they need, and unconditionally elsewhere; both bounds are associative from leastness alone (`kind_glb_assoc`, `kind_lub_assoc`), which is what made the compact merge's loss of it a fact about that merge rather than about the order |
+| The kind premise (`constrain_type_kinds`) | `SigmaBelow` | the premise **is** the elementwise reading of what a Σ denotes, which is what fixes its direction; the swapped premise is a different relation |
+| A binder's range when contributions meet (`CompactTypeKind::merge`) | `CompactTypeKind`, `mergeTypeKind` | `equivTypeKind` is an equivalence; the merge is commutative, idempotent and **associative** — the join proved, the meet checked over every triple of the kinds built from six positions, since a proof would need the two polar orders to relate and `Merge.lean` proves one polarity at a time; a `subtypesOf` parameter must name exactly one shape, and both failures answer the empty candidate list, so the meet is a lower bound as well; the range test is invariant under `equiv`, and a union names only ranges exactly when both sides do; mutual containment is equality of the atom *sets*, so a predicate over them is invariant by construction |
 
 A type is **concrete** when no inference-time unknown occurs anywhere in it — what a checked program
 exhibits, and the fragment everything above is stated over. The model has no node for any of the
@@ -26,6 +30,13 @@ those are.
 
 Three things the model does not do: infer a type — it checks one it is given — reproduce the
 solver's choice where several types are valid, or say anything about those transients.
+
+A Σ is stated as a **rule** rather than as a grammar node: `SigmaBelow` relates a candidate
+list and an element type to a kind and an element type, and `Ty` carries no witness. Putting
+one in the grammar makes `Ty` and `TypeKind` mutually inductive — a kind names types and a
+type contains Σs — which the Rust hides behind an `Rc` and Lean would need a hand-written
+mutual `BEq` for. What the rule form already settles is the premise's direction; what it
+leaves open is any statement about a Σ *inside* a larger type.
 
 ## One rule, end to end
 
@@ -83,6 +94,17 @@ test when the two disagree.
 - `"sub"` — type pairs, `constrain_subtype`'s verdict against `subtypeCheck`.
 - `"merge"` — every step of a fold over one variable's bounds through `CompactType::merge`, against
   `merge`, up to the model's `equiv` (the equality every merge theorem is stated over).
+- `"mergeKind"` — every step of a fold through `CompactTypeKind::merge`, against `mergeTypeKind`,
+  up to `equivTypeKind`. The `"merge"` oracle cannot reach this: `CompactTy` has no Σ binder slot,
+  so the wire encoder refuses a bound carrying binders and every case that would exercise a kind
+  is filtered out before it. Verified sensitive by reverting each of the two readings a bound
+  naming no shape gets — one answers 68 mismatches, the other trips `is_below`'s own assertion.
+- `"refuses"` — `TypeKind::refuses` against `refuses`, on the concrete fragment. `Ty` carries no
+  `Infer` and no `Hole`, so what the wire expresses of `Type::holds_an_unresolved_position` is
+  its refinement disjunct — the one that decides real cases, a refined range being what the
+  range test exists to refuse. Verified sensitive on all three deciding arms: restoring the
+  bound's equality test gives 415 mismatches of 4000, dropping the candidate list's abstention
+  448, and peeling refinements before the range test 15.
 - `"coalesce"` — each folded bound materialized, against `coalesce`.
 
 Each oracle found a real defect on its first sweep. The subtype oracle caught a capture in the

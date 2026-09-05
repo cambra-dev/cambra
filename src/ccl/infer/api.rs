@@ -107,6 +107,11 @@ impl InferArena {
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
         crate::ccl::arena_enter();
+        // The witness range index is per-run for the same reason the variable capture is:
+        // it maps a binder minted by this run to the domains that run found it ranging
+        // over. Binder ids are globally unique, so a stale entry is unreachable rather
+        // than wrong — dropping it here is a growth bound, and it is what makes the
+        // index's lifetime the arena's.
         // The trait-narrowing audit trail is per-run, exactly as the variable
         // capture is: checking one run's obligations against another's graph would
         // resolve variables that no longer have bounds.
@@ -231,7 +236,7 @@ impl TypeInferenceContext {
         );
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Data,
+            fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource(name.to_string())),
             codomain: Box::new(elem_ty),
         };
@@ -390,6 +395,22 @@ pub enum InferError {
         annotation: Type,
         /// The type that inference determined.
         inferred: Type,
+    },
+    /// Collections over domains with no common answer met at one position.
+    ///
+    /// A collection's domain **is** its data, so a join may not narrow it: two collections
+    /// over distinct domains have no common type, and there is no sum above them either
+    /// unless a term builds one (`src/ccl/design/type-inference.md`, "Only a term builds a
+    /// sum").
+    DomainJoinConflict {
+        /// The domains that have no common answer, in the order they were met.
+        domains: Vec<Type>,
+        /// The expression whose type carries the conflict, rendered symbolically.
+        ///
+        /// A field rather than part of the message: the report's span already underlines
+        /// this expression, so writing it into the text says the same thing twice, once in
+        /// source and once in CCL. A caller that has no span can still reach it.
+        origin: String,
     },
     /// The expression kind is not yet handled by this inference pass.
     Unsupported(String),
@@ -661,6 +682,76 @@ impl LocatedInferError {
 ///
 /// Both messages are facts about the *pair*, true whichever side the solver reports as
 /// "expected" — an application's domain can be raised from either side of its edge.
+/// Where two types that **render identically** actually differ.
+///
+/// `Display` is deliberately lossy: a refinement prints its predicate through `symbolic`,
+/// which shows terms without their types, so two refinements whose predicates differ only in
+/// their *internal* annotations print the same. A mismatch between them reads as
+/// "expected 𝑇, found 𝑇" — a message that states the types agree while reporting that they
+/// do not, which sends a reader looking for the bug anywhere but where it is.
+///
+/// So when the rendered forms agree, fall through to the structural form and quote the first
+/// place it diverges. Only ever computed on this path: `Debug` of a type carrying a compiled
+/// predicate runs to a hundred kilobytes, which is exactly why the excerpt is a window and
+/// not the whole thing.
+fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
+    if type_a.to_string() != type_b.to_string() {
+        return None;
+    }
+    let (a, b) = (format!("{type_a:?}"), format!("{type_b:?}"));
+    let Some(at) = a
+        .char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map(|((i, _), _)| i)
+    else {
+        // No character disagrees. Either one structure is a *prefix* of the other — the
+        // difference is depth, something wrapping one side and not the other — or the two
+        // are structurally identical, in which case the types are not what disagree at all
+        // and the rule that rejected them is where to look.
+        if a.len() == b.len() {
+            return Some(
+                "note: these are structurally identical, not merely identical as printed — \
+                 so the disagreement is not in the types. Look at the rule that rejected \
+                 them: it failed on something the types do not carry (a witness range read \
+                 from the index, a kind obligation, a scope) rather than on their shape."
+                    .to_string(),
+            );
+        }
+        let (shorter, longer, which) = if a.len() < b.len() {
+            (a.len(), b.len(), "found")
+        } else {
+            (b.len(), a.len(), "expected")
+        };
+        return Some(format!(
+            "note: these render identically, and structurally one is a prefix of the other \
+             — `{which}` carries {} more characters of structure ({longer} vs {shorter}), so \
+             the two differ in *depth*: a wrapper on one side that the other lacks",
+            longer - shorter
+        ));
+    };
+    // A window wide enough to name the constructor that differs, narrow enough to read.
+    let window = |s: &str| {
+        let start = s[..at.min(s.len())]
+            .char_indices()
+            .rev()
+            .nth(60)
+            .map_or(0, |(i, _)| i);
+        let end = s
+            .char_indices()
+            .skip_while(|(i, _)| *i < at)
+            .nth(60)
+            .map_or(s.len(), |(i, _)| i);
+        s[start..end].to_string()
+    };
+    Some(format!(
+        "note: these render identically — they differ where `Display` does not look, \
+         most often a refinement predicate's own types. First structural difference:\n             expected: …{}…\n    found:    …{}…",
+        window(&a),
+        window(&b)
+    ))
+}
+
 fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     match (type_a, type_b) {
         (Type::Record(_), Type::Tuple(_)) | (Type::Tuple(_), Type::Record(_)) => Some(
@@ -688,6 +779,9 @@ impl std::fmt::Debug for InferError {
                         "Type mismatch for {ctx}: expected {expected}, found {found}"
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
+                        write!(f, "\n  {hint}")?;
+                    }
+                    if let Some(hint) = identical_rendering_hint(found, expected) {
                         write!(f, "\n  {hint}")?;
                     }
                     Ok(())
@@ -840,6 +934,20 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
+            InferError::DomainJoinConflict { domains, origin: _ } => {
+                // Joined with `vs`, not commas: a domain is often a tuple and renders with
+                // commas of its own, so a comma-separated list of them reads as one long
+                // tuple.
+                let listed: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
+                write!(
+                    f,
+                    "Type Inference Error: collection domains have no common answer\n\
+                     Conflicting Domains: {}\n\
+                     A collection's domain is its data, so a join may not narrow it. Wrap each \
+                     arm in `box` to keep them.",
+                    listed.join(" vs ")
+                )
+            }
             InferError::MutNotBareVariable { at } => {
                 write!(
                     f,
@@ -904,7 +1012,20 @@ pub fn infer(
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    let ty = super::run(expr, &ctx.source_types)?;
+    let ty = super::run(expr, &ctx.source_types);
+    #[cfg(debug_assertions)]
+    if std::env::var_os("DUMP_KINDS").is_some() {
+        eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
+        eprintln!(
+            "=== correspondences ===\n{}",
+            crate::ccl::infer::solver::compact::dump_kind_correspondences()
+        );
+        eprintln!(
+            "=== typed tree ===\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
+    let ty = ty?;
     // Only on success: an error path's tree is reported against, and the
     // annotation is part of what an `AnnotationMismatch` renders.
     clear_annotations(expr);
@@ -1008,6 +1129,110 @@ pub enum Strictness {
     /// induction accumulators (`Overwrite` histories whose `Infer` domain the unified
     /// phase resolves), none of which are erased yet.
     PreChannelize,
+}
+
+/// Assert that no type slot in `expr` carries a **free** witness reference.
+///
+/// A pass that reaches into a sum for its body and forgets to close it leaves a type that
+/// is locally well-formed and globally meaningless: `WitnessRef` is a leaf, so every
+/// consumer downstream compares it against real domains and fails somewhere far from
+/// where it was made. This is the boundary that names the invariant instead.
+///
+/// **A node's binder slots are inside its own type's sum.** A Σ-typed lambda *is* a
+/// collection over the witness, so its parameter ranges over whichever domain the witness
+/// picked — the sum on `expr.ty` is what binds the `WitnessRef` in `param.ty`, even
+/// though the slot sits beside that type rather than inside it. Reading the slot in
+/// isolation would report the one form the binder is allowed to have.
+#[cfg(debug_assertions)]
+pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
+    fn check(t: &Type, scope: &[crate::ccl::ty::WitnessId], e: &Expr, stage: &str) {
+        // **Named, not just counted.** A witness renders as a bare `σ` unless
+        // `CCL_SHOW_BINDERS` is set, and this report is about *which* name is unbound — so
+        // it carries the ids rather than a type whose whole content is the one thing the
+        // rendering drops.
+        let free = crate::ccl::ty::free_witness_refs(t, scope);
+        assert!(
+            free.is_empty(),
+            "{stage}: free witness reference {free:?} in a type slot: {t} on {}",
+            symbolic(e)
+        );
+    }
+    /// A refinement predicate's own type slots, under the binders the type it rides
+    /// introduces.
+    ///
+    /// A predicate is an expression hanging off a `Type`, so `walk_children` never reaches
+    /// it and [`check`] compares the type it sits in whole — which leaves the one place a
+    /// free reference can sit with nothing reporting it. A `Σ` binds its witnesses over
+    /// everything below it, the predicate on its domain included, so the scope grows here
+    /// as the walk enters one and shrinks on the way out.
+    fn in_type(
+        t: &Type,
+        stage: &str,
+        scope: &mut Vec<crate::ccl::ty::WitnessId>,
+        visited: &mut HashSet<crate::ccl::PredicateId>,
+    ) {
+        let mut opened = 0;
+        if let Some(ws) = t.sum() {
+            for w in ws {
+                scope.push(*w.id());
+                opened += 1;
+            }
+        }
+        if let Type::Refinement(_, refinements) = t {
+            for r in refinements {
+                if visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                    go(&r.predicate, stage, scope, visited);
+                }
+            }
+        }
+        t.walk_children(|c| in_type(c, stage, scope, visited));
+        scope.truncate(scope.len() - opened);
+    }
+    fn go(
+        e: &Expr,
+        stage: &str,
+        scope: &mut Vec<crate::ccl::ty::WitnessId>,
+        visited: &mut HashSet<crate::ccl::PredicateId>,
+    ) {
+        check(&e.ty, scope, e, stage);
+        if let Some(a) = &e.user_annotation {
+            check(a, scope, e, stage);
+        }
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            check(target, scope, e, stage);
+        }
+        // A node whose own type is a sum opens that binder over its binder slots and its
+        // whole subtree: the sum on `expr.ty` is what a decomposed term's scattered
+        // occurrences still name.
+        //
+        // **The whole chain, not just the head.** Consuming two conditional collections at
+        // once nests the closes — `Σ (𝜎₁ : 𝐾₁). Σ (𝜎₂ : 𝐾₂). (𝜎₁, 𝜎₂) ⤇ 𝑉` — and every binder
+        // in that chain scopes over the same subtree, so opening only the outermost
+        // reports the inner witness's occurrences as free.
+        let mut opened = 0;
+        if let Some(ws) = e.ty.peel_refinements().sum() {
+            for w in ws {
+                scope.push(*w.id());
+                opened += 1;
+            }
+        }
+        e.walk_binders(|b| {
+            check(&b.ty, scope, e, stage);
+            if let Some(a) = &b.user_annotation {
+                check(a, scope, e, stage);
+            }
+        });
+        e.walk_type_slots(|t| in_type(t, stage, scope, visited));
+        e.walk_children(|c| go(c, stage, scope, visited));
+        scope.truncate(scope.len() - opened);
+    }
+    if std::env::var("DBG_TREE").is_ok() {
+        eprintln!(
+            "TREE {stage}:\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
+    go(expr, stage, &mut Vec::new(), &mut HashSet::new());
 }
 
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
@@ -1165,7 +1390,7 @@ fn collect_type_errors(
         Type::Infer(var) => {
             // Pre-channelize, an induction accumulator's domain is still `Infer` (a
             // `Mut(V)` with no annotated domain — the unified phase resolves it
-            // to the writing loop's extent); the relaxation tolerates it (see
+            // to the writing loop's domain); the relaxation tolerates it (see
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
             // handled below, not `Infer`.
             if strictness == Strictness::Strict {
@@ -1188,17 +1413,26 @@ fn collect_type_errors(
         Type::Fun {
             domain,
             codomain,
-            kind,
+            fun_kind,
             ..
         } => {
             // Coalesce resolves every kind var to a concrete `Data`/`Compute`
-            // (`KindMerge::of`); a surviving `FunKind::Var` is a missed resolution
+            // (`FunKind::resolved`); a surviving `FunKind::Var` is a missed resolution
             // that would silently display `⇒` and behave as `Compute`. Catch it
             // loudly rather than letting the wrong default ride downstream.
             debug_assert!(
-                !matches!(kind, crate::ccl::ty::FunKind::Var(_)),
+                !matches!(fun_kind, crate::ccl::ty::FunKind::Var(_)),
                 "unresolved FunKind::Var survived coalesce at `{context_sym}`"
             );
+            // **A kind's children are types.** A candidate and a key bound's parameter are
+            // alike ordinary types that inference resolves like any other, so an unresolved
+            // one there is the same defect as in the domain.
+            // They are reachable only through the kind, which no other walk enters.
+            for w in fun_kind.witnesses() {
+                for t in w.types() {
+                    collect_type_errors(t, context_sym, strictness, errors, seen_refinements);
+                }
+            }
             collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
             collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
         }
@@ -1236,13 +1470,13 @@ fn collect_type_errors(
         Type::History {
             value,
             domain,
-            kind,
+            history_kind,
         } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, an `Overwrite`
             // history by the unified phase (`transact_phase` / `mut_elim`).
             if strictness == Strictness::Strict {
-                let what = match kind {
+                let what = match history_kind {
                     HistoryKind::Append => "feed handle type survived channelize",
                     HistoryKind::Overwrite => "mutable-reference type survived the unified phase",
                 };
@@ -1261,7 +1495,7 @@ fn collect_type_errors(
             //
             // The same visited-set pattern lives in
             // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`] and
-            // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both via
+            // [`crate::ccl::lambda_elim`]'s own predicate walk (both via
             // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site
             // doesn't share the helper because it mixes per-node error checks
             // with the refinement walk.
@@ -1277,6 +1511,7 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
+        Type::WitnessRef(_) => {}
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }
@@ -1483,7 +1718,7 @@ fn check_no_nested_mut(
         Type::History {
             value,
             domain,
-            kind: HistoryKind::Overwrite,
+            history_kind: HistoryKind::Overwrite,
         } => {
             if !allow_mut {
                 errors.push(InferError::MutInCompositeType {
@@ -1889,7 +2124,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
-                kind: crate::ccl::ty::FunKind::Compute,
+                fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -2117,7 +2352,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
-                kind: crate::ccl::ty::FunKind::Compute,
+                fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -2157,6 +2392,145 @@ mod tests {
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::Int));
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, int_lit_ty(42));
+    }
+
+    /// `λ (xs: List(Int)) → Sum(xs)` — *consuming* a List param. The Σ-typed
+    /// param flows into the aggregate's `α ⤇ β` consumer, so the sum is consumed:
+    /// the length-bounded index domain flows to the
+    /// consumer (Σ-witness length opened), the element type `int` to the
+    /// result. Sum's result is `int`.
+    #[test]
+    fn test_infer_list_param_consumed_by_aggregate() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
+        });
+        let ty = infer(&mut expr, &mut ctx).expect("consuming a List param type-checks");
+        let Type::Fun { codomain, .. } = &ty else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert_eq!(
+            codomain.as_ref(),
+            &Type::Base(BaseType::Int),
+            "Sum over a List(Int) is Int, got {codomain}"
+        );
+    }
+
+    /// `λ (xs: List(Int)) → let ys: List(Int) = xs in ys` — a List-typed value
+    /// (the param) ascribed at another List. `xs`'s type is the List Σ, so the
+    /// ascription emits `List Σ <: List Σ` — the **Σ rule** between two sums.
+    /// This is an ordinary pattern (re-binding, passing, returning a list), so
+    /// that edge must be wired.
+    #[test]
+    fn test_infer_list_to_list_ascription() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::let_bind_annotated(
+                "ys",
+                Expr::var("xs"),
+                Expr::var("ys"),
+                Type::list_of(Type::Base(BaseType::Int)),
+            )),
+        });
+        infer(&mut expr, &mut ctx).expect("list-to-list ascription type-checks via the Σ rule");
+
+        // The codomain still flows: a List(Int) is not a List(Str).
+        let mut ctx = TypeInferenceContext::new();
+        let mut bad = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::let_bind_annotated(
+                "ys",
+                Expr::var("xs"),
+                Expr::var("ys"),
+                Type::list_of(Type::Base(BaseType::String)),
+            )),
+        });
+        assert!(
+            infer(&mut bad, &mut ctx).is_err(),
+            "List(Int) must not ascribe at List(Str) — the codomain premise still flows"
+        );
+    }
+
+    /// `λ (xs: List(Int)) → xs` — a **parameter** List annotation. The annotation
+    /// bounds `xs`, and with no other demand on it the bound *is* the param type: it
+    /// rides the lambda's domain and body type through the compact/coalesce
+    /// round-trip with its `UIntRanges` domain inert, re-forming the identical Σ.
+    #[test]
+    fn test_infer_list_param_annotation_round_trips() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::var("xs")),
+        });
+        let ty = infer(&mut expr, &mut ctx).expect("List(Int) param annotation round-trips");
+        // The lambda's domain and codomain both re-form the List Σ.
+        let Type::Fun {
+            domain, codomain, ..
+        } = &ty
+        else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert!(
+            domain.sum().is_some(),
+            "param domain should be the `List` Σ, got {domain}"
+        );
+        assert!(
+            codomain.sum().is_some(),
+            "body (returns xs) should be the `List` Σ, got {codomain}"
+        );
+    }
+
+    /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
+    /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
+    /// does not inject into `Σ (D: UIntRanges). D ⤇ Int`
+    /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
+    /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
+    /// witness's type kind through `emit_annotation_predicates`. A conflicting element type is
+    /// rejected too, and for a different reason — the element types meet inside the body,
+    /// with no sum involved.
+    #[test]
+    fn test_infer_list_node_annotation_needs_box() {
+        let mut ctx = TypeInferenceContext::new();
+        let ints = vec![
+            Expr::lit(Lit::Int(1)),
+            Expr::lit(Lit::Int(2)),
+            Expr::lit(Lit::Int(3)),
+        ];
+        let mut expr = Expr::new(TypedExprNode::List(ints))
+            .with_user_annotation(Type::list_of(Type::Base(BaseType::Int)));
+        let err = infer(&mut expr, &mut ctx)
+            .expect_err("a bare list literal does not enter List(Int); that needs `box`");
+        assert!(
+            format!("{err:?}").contains("Annotation mismatch"),
+            "expected an annotation mismatch, got {err:?}"
+        );
+
+        // A `List(Str)` annotation over an int list is a conflict.
+        let mut ctx = TypeInferenceContext::new();
+        let mut bad = Expr::new(TypedExprNode::List(vec![Expr::lit(Lit::Int(1))]))
+            .with_user_annotation(Type::list_of(Type::Base(BaseType::String)));
+        assert!(
+            infer(&mut bad, &mut ctx).is_err(),
+            "List(Str) annotation over an int list must be rejected"
+        );
     }
 
     #[test]
@@ -2228,7 +2602,7 @@ mod tests {
                 ty: Type::History {
                     value: Box::new(Type::Base(BaseType::Int)),
                     domain: Box::new(Type::Hole),
-                    kind: HistoryKind::Overwrite,
+                    history_kind: HistoryKind::Overwrite,
                 },
                 user_annotation: None,
             },
@@ -2448,7 +2822,12 @@ mod tests {
         let value = Expr::lambda("x", int(), Expr::var("x").with_ty(int()))
             .with_ty(Type::fun(int(), int()));
         let predicate = Expr::lit(Lit::Bool(true));
-        let target = crate::ccl::ccl_utils::refined_data_fun(int(), predicate, int());
+        let target = crate::ccl::ccl_utils::refined_data_fun(
+            int(),
+            predicate,
+            int(),
+            crate::ccl::ty::FunKind::fresh_data(),
+        );
         let mut expr = crate::ccl::ccl_utils::make_cast(value, target);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         match ty {
@@ -2712,7 +3091,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AnnotationMismatch: user_annotation conflicts with inferred type
+    // Param annotation conflicts (caught at the use site)
     // -----------------------------------------------------------------------
 
     /// A parameter annotation conflicting with the body's demand is caught, and
@@ -2819,7 +3198,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
-                kind: crate::ccl::ty::FunKind::Compute,
+                fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Unit))
             }
@@ -2841,7 +3220,7 @@ mod tests {
         // Registration constructs the source's data function from the element type.
         let source_ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Data,
+            fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
@@ -2869,13 +3248,13 @@ mod tests {
         ctx.register_source_type("strs", Type::Base(BaseType::String));
         let int_ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Data,
+            fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("ints".into())),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let str_ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Data,
+            fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("strs".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
@@ -3073,7 +3452,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -3133,7 +3512,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -3186,7 +3565,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -3205,7 +3584,7 @@ mod tests {
         // The node type is Fun(Hole, Int) — the Hole is inside the compound type.
         let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Hole),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -3441,7 +3820,7 @@ mod tests {
         let str_elem = Expr::lit(Lit::String("hello".into())).with_ty(Type::Base(BaseType::String));
         let list_ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -3475,7 +3854,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::String)),
             codomain: Box::new(Type::Base(BaseType::String)),
         });
@@ -3508,11 +3887,9 @@ mod tests {
         assert_eq!(typecheck(&expr), Ok(()));
     }
 
-    /// A lambda that applies two different projections to the same parameter
-    /// should infer a tuple-typed domain after `set()` merging and `TupleField`
-    /// constraint accumulation.
+    /// A lambda that applies two different projections to the same parameter infers a
+    /// tuple-typed domain, after `set()` merging and `TupleField` constraint accumulation.
     #[test]
-    #[ignore]
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ p → ((p ► .0) + 0, p ► .1)
@@ -3545,5 +3922,55 @@ mod tests {
         } else {
             panic!("expected Fun type for lambda");
         }
+    }
+
+    /// **A mismatch whose two sides render identically still says where they differ.**
+    ///
+    /// A sum prints its witness as `σ` whatever binder it names, so two sums built by
+    /// different derivations render identically while comparing unequal — the α-invariance
+    /// cost that naming the binder buys, recorded in
+    /// `src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind". A mismatch
+    /// between them reads as "expected 𝑇, found 𝑇": a message that states the two agree
+    /// while reporting that they do not, which sends a reader looking anywhere but at the
+    /// binder.
+    #[test]
+    fn a_mismatch_that_renders_identically_says_where_it_differs() {
+        use crate::ccl::infer_var::fresh_witness_binder_id;
+        use crate::ccl::ty::{Type, TypeKind, Witness};
+
+        let sum = || {
+            let binder = fresh_witness_binder_id();
+            let w = Witness::bound_to(binder, TypeKind::Enumerated(vec![Type::UIntRange(2)]));
+            let occurrence = Type::WitnessRef(*w.id());
+            Type::sum_binding(w, Type::data_fun(occurrence, Type::Base(BaseType::Int)))
+        };
+        let (a, b) = (sum(), sum());
+        assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "the premise: these must render identically"
+        );
+        assert_ne!(a, b, "the premise: these must actually differ");
+
+        let rendered = format!(
+            "{:?}",
+            InferError::TypeMismatch {
+                ctx: "type of x".to_string(),
+                found: Box::new(a),
+                expected: Some(Box::new(b)),
+            }
+        );
+        assert!(
+            rendered.contains("render identically"),
+            "no hint that the rendering is lossy: {rendered}"
+        );
+        assert!(
+            rendered.contains("First structural difference"),
+            "no structural excerpt: {rendered}"
+        );
+        assert!(
+            rendered.contains("σ@"),
+            "the excerpt does not show what differs: {rendered}"
+        );
     }
 }

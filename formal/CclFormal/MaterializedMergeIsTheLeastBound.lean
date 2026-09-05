@@ -586,76 +586,6 @@ theorem mapM_ok_mem {α β ε} {f : α → Except ε β} :
     · obtain ⟨b', hb', hfa⟩ := mapM_ok_mem hbs a ha'
       exact ⟨b', List.mem_cons_of_mem _ hb', hfa⟩
 
-/-- The `attach` a keyed walk uses is invisible to the values it maps. -/
-theorem mapM_attach_eq {α ε} (l : List CompactTy) (f : CompactTy → Except ε α) :
-    l.attach.mapM (fun x => f x.1) = l.mapM f := by simp
-
-theorem coalesce_fun_data_alts (pol : Bool) {ds : List CompactTy} {cod : CompactTy}
-    {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.data, ds, cod)) c) = .ok (some ty)) :
-    ∃ dt ct, (∀ d ∈ ds, coalesce (!pol) d = .ok (some dt)) ∧
-      coalesce pol cod = .ok (some ct) ∧
-      ty = attachRefinements (.fn none .data dt ct) c := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.data, ds, cod)) c) with e | x <;>
-    rw [coalesce_fun_only, hf] at h
-  · cases h
-  rcases x with _ | base
-  · cases h
-  cases h
-  rw [funShapes] at hf
-  simp only [mapM_attach_eq] at hf
-  rcases hc : coalesce pol cod with e | oc
-  · simp [hc, Bind.bind, Except.bind] at hf
-  simp only [hc, Bind.bind, Except.bind] at hf
-  rcases hm : ds.mapM (coalesce (!pol)) with e | mats
-  · simp [hm] at hf
-  simp only [hm] at hf
-  rcases he : mats.eraseDups with _ | ⟨one, rest⟩ <;> rw [he] at hf <;> try cases hf
-  rcases rest with _ | ⟨r0, rs⟩ <;> try cases hf
-  rcases one with _ | dt
-  · rcases oc with _ | ct <;> exact absurd hf (by simp [funTy, pure, Except.pure])
-  rcases oc with _ | ct
-  · exact absurd hf (by simp [funTy, pure, Except.pure])
-  replace hf : (Except.ok (some (Ty.fn none FunKind.data dt ct)) : Except CoalesceError (Option Ty))
-      = .ok (some base) := hf
-  cases hf
-  refine ⟨dt, ct, fun d hd => ?_, rfl, rfl⟩
-  obtain ⟨o, ho, hco⟩ := mapM_ok_mem hm d hd
-  have hone : o ∈ mats.eraseDups := List.mem_eraseDups.mpr ho
-  rw [he] at hone
-  simp only [List.mem_singleton] at hone
-  rw [hco, hone]
-
-theorem coalesce_fun_compute_alts (pol : Bool) {d : CompactTy} {rest : List CompactTy}
-    {cod : CompactTy}
-    {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.compute, d :: rest, cod)) c) = .ok (some ty)) :
-    ∃ dt ct, coalesce (!pol) (meetAll (!pol) d rest) = .ok (some dt) ∧
-      coalesce pol cod = .ok (some ct) ∧
-      ty = attachRefinements (.fn none .compute dt ct) c := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.compute, d :: rest, cod)) c)
-    with e | x <;> rw [coalesce_fun_only, hf] at h
-  · cases h
-  rcases x with _ | base
-  · cases h
-  cases h
-  rw [funShapes] at hf
-  rcases hc : coalesce pol cod with e | oc
-  · simp [hc, Bind.bind, Except.bind] at hf
-  simp only [hc, Bind.bind, Except.bind] at hf
-  rcases hd : coalesce (!pol) (meetAll (!pol) d rest) with e | od
-  · simp [hd] at hf
-  simp only [hd] at hf
-  rcases od with _ | dt
-  · rcases oc with _ | ct <;> exact absurd hf (by simp [funTy, pure, Except.pure])
-  rcases oc with _ | ct
-  · exact absurd hf (by simp [funTy, pure, Except.pure])
-  replace hf :
-    (Except.ok (some (Ty.fn none FunKind.compute dt ct)) : Except CoalesceError (Option Ty))
-      = .ok (some base) := hf
-  cases hf
-  exact ⟨dt, ct, rfl, rfl, rfl⟩
-
 /-! ## Assembling one edge
 
 Every case below ends the same way: the shapes are related and the refinement sets sit on the
@@ -720,7 +650,7 @@ theorem merge_variant_slot (pol : Bool) (ma mb : List (FieldKey × CompactTy))
   rw [merge.eq_def]
   rfl
 
-theorem merge_fn_slot (pol : Bool) (g₁ g₂ : KindMerge × List CompactTy × CompactTy)
+theorem merge_fn_slot (pol : Bool) (g₁ g₂ : KindMerge × CompactTy × CompactTy)
     (c₁ c₂ : Option (List Predicate)) :
     merge pol (.mk [] none none (some g₁) c₁) (.mk [] none none (some g₂) c₂)
       = .mk [] none none (some (mergeFun pol g₁ g₂)) (mergeRefinements pol c₁ c₂) := by
@@ -732,7 +662,7 @@ leaves a slot absent only when both operands do, so a slot only one of them
 carries lands beside the other's and `combine` sees two contributions. -/
 theorem merge_shape_agrees (pol : Bool) {as bs : List Atom}
     {ra va rb vb : Option (List (FieldKey × CompactTy))}
-      {fa fb : Option (KindMerge × List CompactTy × CompactTy)}
+      {fa fb : Option (KindMerge × CompactTy × CompactTy)}
     {ca cb : Option (List Predicate)} {tm : Ty}
     (hm : coalesce pol (merge pol (.mk as ra va fa ca) (.mk bs rb vb fb cb))
       = .ok (some tm)) :
@@ -1244,7 +1174,7 @@ theorem fn_bounds_of (above : Bool) {n0 n1 : Option String} {k : FunKind} {d0 c0
 
 /-- A conflicted slot has no type, so a pair of concrete kinds that disagree never
 reaches the comparison. -/
-theorem coalesce_fun_conflict (pol : Bool) {ds : List CompactTy} {cod : CompactTy}
+theorem coalesce_fun_conflict (pol : Bool) {ds cod : CompactTy}
     {c : Option (List Predicate)} {ty : Ty}
     (h : coalesce pol (.mk [] none none (some (.conflict, ds, cod)) c) = .ok (some ty)) :
     False := by
@@ -1257,19 +1187,9 @@ theorem coalesce_fun_conflict (pol : Bool) {ds : List CompactTy} {cod : CompactT
 
 theorem mergeFun_same (pol : Bool) {kf : KindMerge} (hkf : kf ≠ .conflict)
     (d₁ d₂ cod₁ cod₂ : CompactTy) :
-    mergeFun pol (kf, [d₁], cod₁) (kf, [d₂], cod₂)
-      = (kf, (if pol then unionDomains [d₁] [d₂] else [merge true d₁ d₂]),
-          merge pol cod₁ cod₂) := by
+    mergeFun pol (kf, d₁, cod₁) (kf, d₂, cod₂)
+      = (kf, merge (!pol) d₁ d₂, merge pol cod₁ cod₂) := by
   rw [mergeFun, joinKind_idem]
-  have hnc : (kf == KindMerge.conflict) = false := by
-    cases kf <;> simp_all
-  rw [hnc]
-  cases pol <;> simp [meetDomains, subtypeDomains]
-
-theorem unionDomains_pair (d₁ d₂ : CompactTy) :
-    unionDomains [d₁] [d₂] = d₁ :: (if anyEquiv d₂ [d₁] then [] else [d₂]) := by
-  rw [unionDomains]
-  cases h : anyEquiv d₂ [d₁] <;> simp [h]
 
 /-- The `FunKind` a resolved kind slot materializes at, which
 `coalesce_compact_go` writes as a literal at each of its arms. -/
@@ -1289,10 +1209,10 @@ theorem bounds_fun (pol above : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ 
       coalesce pol cod₁ = .ok (some tx) → coalesce pol cod₂ = .ok (some ty') →
       coalesce pol (merge pol cod₁ cod₂) = .ok (some tz) →
       t.WellFormed → bounds above t tx → bounds above t ty' → bounds above t tz)
-    (ha : coalesce pol (.mk [] none none (some (k₁, [d₁], cod₁)) (some p)) = .ok (some ta))
-    (hb : coalesce pol (.mk [] none none (some (k₂, [d₂], cod₂)) (some q)) = .ok (some tb))
-    (hm : coalesce pol (merge pol (.mk [] none none (some (k₁, [d₁], cod₁)) (some p))
-      (.mk [] none none (some (k₂, [d₂], cod₂)) (some q))) = .ok (some tm))
+    (ha : coalesce pol (.mk [] none none (some (k₁, d₁, cod₁)) (some p)) = .ok (some ta))
+    (hb : coalesce pol (.mk [] none none (some (k₂, d₂, cod₂)) (some q)) = .ok (some tb))
+    (hm : coalesce pol (merge pol (.mk [] none none (some (k₁, d₁, cod₁)) (some p))
+      (.mk [] none none (some (k₂, d₂, cod₂)) (some q))) = .ok (some tm))
     (hba : bounds above u ta) (hbb : bounds above u tb) : bounds above u tm := by
   rw [merge_fn_slot] at hm
   -- Concrete kinds that disagree join to `conflict`, which has no type.
@@ -1304,7 +1224,7 @@ theorem bounds_fun (pol above : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ 
   rw [mergeFun_same pol hkf] at hm
   -- Both operands, materialized.
   have hop : ∀ (d cod : CompactTy) (c : List Predicate) (t : Ty),
-      coalesce pol (.mk [] none none (some (k₁, [d], cod)) (some c)) = .ok (some t) →
+      coalesce pol (.mk [] none none (some (k₁, d, cod)) (some c)) = .ok (some t) →
       ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
         t = attachRefinements (.fn none (funKindOf k₁) dt ct) (some c) := by
     intro d cod c t ht
@@ -1313,41 +1233,17 @@ theorem bounds_fun (pol above : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ 
     · exact coalesce_fun_compute_ok pol ht
   obtain ⟨D₁, C₁, hd₁, hc₁, rfl⟩ := hop d₁ cod₁ p ta ha
   obtain ⟨D₂, C₂, hd₂, hc₂, rfl⟩ := hop d₂ cod₂ q tb hb
-  -- The merged slot: its codomain is the merged codomain, and its domain is
-  -- either the first operand's outright — a positive merge accumulates rather
-  -- than combines — or the two folded at the flipped polarity.
+  -- The merged slot: its codomain is the merged codomain and its domain is the merged
+  -- domain, at both polarities and either kind — the domain is one position now, so a
+  -- positive merge combines it like any other rather than accumulating alternatives.
   obtain ⟨Dm, Cm, hDm, hCm, rfl⟩ :
-      ∃ dt ct, (dt = D₁ ∨ coalesce (!pol) (merge (!pol) d₁ d₂) = .ok (some dt)) ∧
+      ∃ dt ct, coalesce (!pol) (merge (!pol) d₁ d₂) = .ok (some dt) ∧
         coalesce pol (merge pol cod₁ cod₂) = .ok (some ct) ∧
         tm = attachRefinements (.fn none (funKindOf k₁) dt ct)
           (mergeRefinements pol (some p) (some q)) := by
     rcases hk₁ with rfl | rfl
-    · cases pol
-      · obtain ⟨dt, ct, hall, hct, rfl⟩ := coalesce_fun_data_alts false hm
-        exact ⟨dt, ct, Or.inr (hall _ (by simp)), hct, rfl⟩
-      · obtain ⟨dt, ct, hall, hct, rfl⟩ := coalesce_fun_data_alts true hm
-        refine ⟨dt, ct, Or.inl ?_, hct, rfl⟩
-        have hone := hall d₁ (by simp only [if_true, unionDomains_pair]; simp)
-        rw [hd₁] at hone
-        cases hone
-        rfl
-    · cases pol
-      · obtain ⟨dt, ct, hdt, hct, rfl⟩ :=
-          coalesce_fun_compute_alts false (by simpa using hm)
-        exact ⟨dt, ct, Or.inr (by simpa [meetAll] using hdt), hct, rfl⟩
-      · rw [show (if true then unionDomains [d₁] [d₂] else [merge true d₁ d₂])
-            = d₁ :: (if anyEquiv d₂ [d₁] then [] else [d₂]) from by
-              simp only [if_true]; exact unionDomains_pair d₁ d₂] at hm
-        obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_compute_alts true hm
-        refine ⟨dt, ct, ?_, hct, rfl⟩
-        cases hae : anyEquiv d₂ [d₁]
-        · rw [hae] at hdt
-          exact Or.inr (by simpa [meetAll] using hdt)
-        · refine Or.inl ?_
-          rw [show meetAll (!true) d₁ (if anyEquiv d₂ [d₁] then [] else ([d₂] : List CompactTy)) = d₁
-            from by rw [hae]; rfl, hd₁] at hdt
-          cases hdt
-          rfl
+    · exact coalesce_fun_data_ok pol (by simpa using hm)
+    · exact coalesce_fun_compute_ok pol (by simpa using hm)
   -- The refinement half, and the edge's three parts.
   rw [bounds_attach_iff above (by simp [Ty.isRefined]) hwu] at hba hbb
   rw [bounds_attach_iff above (by simp [Ty.isRefined]) hwu]
@@ -1363,17 +1259,13 @@ theorem bounds_fun (pol above : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ 
   have hwDu : Du.WellFormed := hwup.fn_domain
   have hwCu : Cu.WellFormed := hwup.fn_codomain
   refine fn_bounds_of above ?_ ?_ (ihc C₁ C₂ Cm Cu hc₁ hc₂ hCm hwCu hcoda hcodb)
-  · rcases hDm with rfl | hDm
-    · exact hdoma
-    · exact ihd (!above) D₁ D₂ Dm Du hd₁ hd₂ hDm hwDu hdoma hdomb
+  · exact ihd (!above) D₁ D₂ Dm Du hd₁ hd₂ hDm hwDu hdoma hdomb
   · intro hkd
     have hkd' : k₁ = .data := by
       rcases hk₁ with rfl | rfl
       · rfl
       · exact absurd hkd (by simp [funKindOf])
-    rcases hDm with rfl | hDm
-    · exact hinva hkd
-    · exact ihd above D₁ D₂ Dm Du hd₁ hd₂ hDm hwDu (hinva hkd) (hinvb hkd)
+    exact ihd above D₁ D₂ Dm Du hd₁ hd₂ hDm hwDu (hinva hkd) (hinvb hkd)
 
 /-! ## The lemma, assembled
 
@@ -1386,7 +1278,7 @@ sixteen cases close on `merge_shape_agrees`. -/
 /-- A position with content carries a refinement slot; `wellFormed` says so, and every
 case reads the slot as a set. -/
 theorem wellFormed_refs {as : List Atom} {r v : Option (List (FieldKey × CompactTy))}
-    {f : Option (KindMerge × List CompactTy × CompactTy)} {c : Option (List Predicate)}
+    {f : Option (KindMerge × CompactTy × CompactTy)} {c : Option (List Predicate)}
     (hw : wellFormed (.mk as r v f c) = true)
     (hcontent : as ≠ [] ∨ r ≠ none ∨ v ≠ none ∨ f ≠ none) : ∃ ps, c = some ps := by
   rcases c with _ | ps
@@ -1482,10 +1374,10 @@ theorem bounds_merge : ∀ (n : Nat) (pol above : Bool) (a b : CompactTy) (u : T
     · exact absurd (merge_shape_agrees pol hm) (by simp_all)
     · exact absurd (merge_shape_agrees pol hm) (by simp_all)
     -- function / function
-    · obtain ⟨k₁, ds₁, cod₁⟩ := ga
-      obtain ⟨k₂, ds₂, cod₂⟩ := gb
-      obtain ⟨d₁, rfl, hgd₁, hgc₁, hk₁⟩ := concrete_fun hga
-      obtain ⟨d₂, rfl, hgd₂, hgc₂, hk₂⟩ := concrete_fun hgb
+    · obtain ⟨k₁, d₁, cod₁⟩ := ga
+      obtain ⟨k₂, d₂, cod₂⟩ := gb
+      obtain ⟨hgd₁, hgc₁, hk₁⟩ := concrete_fun hga
+      obtain ⟨hgd₂, hgc₂, hk₂⟩ := concrete_fun hgb
       simp only [concrete, Bool.and_eq_true] at hga hgb
       obtain ⟨p, rfl⟩ := wellFormed_refs hga.1 (Or.inr (Or.inr (Or.inr (by simp))))
       obtain ⟨q, rfl⟩ := wellFormed_refs hgb.1 (Or.inr (Or.inr (Or.inr (by simp))))
@@ -1549,15 +1441,16 @@ theorem variant_wellFormed {base : Ty} (hv : isVariant base = true)
 
 /-- An unpinned kind slot materializes by the `compute` reading, which is the
 same branch of `funShapes` — the default is in the match, not in a second rule. -/
-theorem funShapes_unknown_eq_compute (pol : Bool) (ds : List CompactTy) (cod : CompactTy)
+theorem funShapes_unknown_eq_compute (pol : Bool) (ds cod : CompactTy)
     (c : Option (List Predicate)) :
     funShapes pol (.mk [] none none (some (.unknown, ds, cod)) c)
       = funShapes pol (.mk [] none none (some (.compute, ds, cod)) c) := by
   rw [funShapes, funShapes]
+  simp
 
 theorem coalesce_fun_unknown_ok (pol : Bool) {d cod : CompactTy} {c : Option (List Predicate)}
     {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.unknown, [d], cod)) c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] none none (some (.unknown, d, cod)) c) = .ok (some ty)) :
     ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
       ty = attachRefinements (.fn none .compute dt ct) c := by
   refine coalesce_fun_compute_ok pol ?_
@@ -1602,32 +1495,26 @@ theorem coalesce_wellFormed : ∀ (n : Nat) (pol : Bool) (t : CompactTy) (ty : T
       have hdw : depth w < depth (CompactTy.mk [] none (some m) none c) :=
         depth_variantPayload_lt (mem_of_lookup hwlk)
       exact ih pol w t (by omega) (wfKeys_iff.mp hwk k (mem_keys_of_lookup hwlk) w hwlk) hcw
-    · obtain ⟨k, ds, cod⟩ := g
+    · obtain ⟨k, d, cod⟩ := g
       rw [wellFormed.eq_def] at hw
       simp only [Bool.and_eq_true] at hw
-      obtain ⟨⟨hknc, hdom⟩, hwcod⟩ := hw.1.2
-      rcases ds with _ | ⟨d, rest⟩
-      · simp at hdom
-      rcases rest with _ | ⟨_, _⟩
-      case cons.nil =>
-        have hwd : wellFormed d = true := by simpa using hdom
-        have hdd : depth d < depth (CompactTy.mk [] none none (some (k, [d], cod)) c) :=
-          depth_dom_lt (by simp)
-        have hdc : depth cod < depth (CompactTy.mk [] none none (some (k, [d], cod)) c) :=
-          depth_cod_lt
-        have hbuild : ∀ (kf : FunKind) (dt ct : Ty), coalesce (!pol) d = .ok (some dt) →
-            coalesce pol cod = .ok (some ct) → (Ty.fn none kf dt ct).WellFormed :=
-          fun kf dt ct hdt hct =>
-            .fn (ih (!pol) d dt (by omega) hwd hdt) (ih pol cod ct (by omega) hwcod hct)
-        cases k
-        · obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_data_ok pol hc
-          exact attachRefinements_wellFormed (by simp [Ty.isRefined]) (hbuild _ dt ct hdt hct) c
-        · obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_compute_ok pol hc
-          exact attachRefinements_wellFormed (by simp [Ty.isRefined]) (hbuild _ dt ct hdt hct) c
-        · simp at hknc
-        · obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_unknown_ok pol hc
-          exact attachRefinements_wellFormed (by simp [Ty.isRefined]) (hbuild _ dt ct hdt hct) c
-      case cons.cons => simp at hdom
+      obtain ⟨⟨hknc, hwd⟩, hwcod⟩ := hw.1.2
+      have hdd : depth d < depth (CompactTy.mk [] none none (some (k, d, cod)) c) :=
+        depth_dom_lt
+      have hdc : depth cod < depth (CompactTy.mk [] none none (some (k, d, cod)) c) :=
+        depth_cod_lt
+      have hbuild : ∀ (kf : FunKind) (dt ct : Ty), coalesce (!pol) d = .ok (some dt) →
+          coalesce pol cod = .ok (some ct) → (Ty.fn none kf dt ct).WellFormed :=
+        fun kf dt ct hdt hct =>
+          .fn (ih (!pol) d dt (by omega) hwd hdt) (ih pol cod ct (by omega) hwcod hct)
+      cases k
+      · obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_data_ok pol hc
+        exact attachRefinements_wellFormed (by simp [Ty.isRefined]) (hbuild _ dt ct hdt hct) c
+      · obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_compute_ok pol hc
+        exact attachRefinements_wellFormed (by simp [Ty.isRefined]) (hbuild _ dt ct hdt hct) c
+      · simp at hknc
+      · obtain ⟨dt, ct, hdt, hct, rfl⟩ := coalesce_fun_unknown_ok pol hc
+        exact attachRefinements_wellFormed (by simp [Ty.isRefined]) (hbuild _ dt ct hdt hct) c
 
 /-! ## The two instances
 

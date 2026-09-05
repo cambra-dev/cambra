@@ -13,7 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ccl::InferVarId;
 
-use super::compact::{AtomKey, CompactFun, CompactGraph, CompactType, CompactVariant};
+use super::compact::{
+    AtomKey, CompactFun, CompactGraph, CompactType, CompactTypeKind, CompactVariant, CompactWitness,
+};
 
 // ---------------------------------------------------------------------------
 // Type simplification: co-occurrence analysis
@@ -132,6 +134,8 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
                                 // (Never reached today — rec_vars is always empty.)
                             } else {
                                 // Non-recursive: intersect v's !pol co-occs with w's !pol co-occs.
+                                #[allow(clippy::mutable_key_type)]
+                                // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
                                 let w_neg: HashSet<CoOccItem> =
                                     co_occurrences.get(&(!pol, w)).cloned().unwrap_or_default();
                                 if let Some(v_neg) = co_occurrences.get_mut(&(!pol, v)) {
@@ -186,6 +190,8 @@ fn simplify_analyze(
     co_occurrences: &mut HashMap<(bool, InferVarId), HashSet<CoOccItem>>,
 ) {
     // Items present at this position (vars + atoms).
+    #[allow(clippy::mutable_key_type)]
+    // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
     let here: HashSet<CoOccItem> = ct
         .vars
         .iter()
@@ -247,15 +253,17 @@ fn simplify_analyze(
         }
     }
     if let Some(cf) = &ct.fun {
-        for dom in &cf.domains {
-            simplify_analyze(
-                dom,
-                !pol,
-                input_rec_vars,
-                all_vars,
-                rec_processed,
-                co_occurrences,
-            );
+        {
+            {
+                simplify_analyze(
+                    &cf.domain,
+                    !pol,
+                    input_rec_vars,
+                    all_vars,
+                    rec_processed,
+                    co_occurrences,
+                );
+            }
         }
         simplify_analyze(
             &cf.codomain,
@@ -286,6 +294,26 @@ fn simplify_analyze(
             rec_processed,
             co_occurrences,
         );
+    }
+}
+
+/// Apply `var_subst` to a binder's kind — variant for variant, since every type a kind
+/// carries is a position.
+fn reconstruct_type_kind(
+    type_kind: CompactTypeKind,
+    var_subst: &HashMap<InferVarId, Option<InferVarId>>,
+) -> CompactTypeKind {
+    match type_kind {
+        CompactTypeKind::Enumerated(candidates) => CompactTypeKind::Enumerated(
+            candidates
+                .into_iter()
+                .map(|c| simplify_reconstruct(c, var_subst))
+                .collect(),
+        ),
+        CompactTypeKind::SubtypesOf(bound) => {
+            CompactTypeKind::SubtypesOf(Box::new(simplify_reconstruct(*bound, var_subst)))
+        }
+        other @ (CompactTypeKind::UIntRanges | CompactTypeKind::Type) => other,
     }
 }
 
@@ -325,13 +353,25 @@ fn simplify_reconstruct(
     let new_fun = ct.fun.map(|cf| CompactFun {
         name: cf.name,
         kind: cf.kind,
-        // Rebuilt through `FromIterator`, which deduplicates: merging variables can
-        // make two previously-distinct alternatives equal.
-        domains: cf
-            .domains
+        // A binder's candidates are ordinary positions, so they are reconstructed like any
+        // other. The binder's identity carries through unchanged: a binder is not a
+        // position, and simplification merges positions.
+        binders: cf
+            .binders
             .into_iter()
-            .map(|d| simplify_reconstruct(d, var_subst))
+            .map(|w| CompactWitness {
+                id: w.id,
+                type_kind: reconstruct_type_kind(w.type_kind, var_subst),
+            })
             .collect(),
+        // Carried for the reason `combined` is, below.
+        domains_disagree: cf.domains_disagree,
+        domain: Box::new(simplify_reconstruct(*cf.domain, var_subst)),
+        // Carried, not dropped: these are the two domains the diagnostic names, and they
+        // hold the same variables the position does.
+        combined: cf
+            .combined
+            .map(|c| c.map(|d| simplify_reconstruct(d, var_subst))),
         codomain: Box::new(simplify_reconstruct(*cf.codomain, var_subst)),
     });
 
@@ -346,6 +386,9 @@ fn simplify_reconstruct(
     CompactType {
         vars: new_vars,
         atoms: ct.atoms,
+        // Carried through unchanged: the constraint is already a property of this
+        // *position*, so merging away the variable that contributed it must not drop it.
+        kinds: ct.kinds,
         rec: new_rec,
         var: new_var,
         fun: new_fun,
@@ -356,18 +399,20 @@ fn simplify_reconstruct(
 
 #[cfg(test)]
 mod tests {
-    use itertools::Itertools;
 
-    use super::super::compact::KindMerge;
     use super::*;
+    use crate::ccl::ty::KindPin;
     use crate::ccl::{BaseType, InferVar};
 
     /// A single-domain compute `fun` slot, for the simplify tests below.
     fn compute_fun(dom: CompactType, cod: CompactType) -> Option<CompactFun> {
         Some(CompactFun {
+            binders: Vec::new(),
             name: None,
-            kind: KindMerge::Compute,
-            domains: crate::ccl::infer::solver::compact::DomainSet::one(dom),
+            kind: KindPin::Compute,
+            domains_disagree: false,
+            domain: Box::new(dom),
+            combined: None,
             codomain: Box::new(cod),
         })
     }
@@ -403,7 +448,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a kept in dom");
         assert!(cod_s.vars.contains(&uid_a), "a kept in cod");
@@ -435,7 +480,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.is_empty(), "a absorbed in dom");
         assert!(cod_s.vars.is_empty(), "a absorbed in cod");
@@ -470,7 +515,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert_eq!(dom_s.vars.len(), 1, "one var after merge in dom");
         assert_eq!(cod_s.vars.len(), 1, "one var after merge in cod");
@@ -502,7 +547,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = cf.domains.iter().exactly_one().expect("one domain");
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a preserved in dom");
         assert!(cod_s.vars.contains(&uid_a), "a preserved in cod");

@@ -435,16 +435,16 @@ fn committed_fixtures_are_structurally_valid() {
 // Ratchet 5: the whole gallery, validated
 // ---------------------------------------------------------------------------
 
-/// The gallery sources whose `--dump-snapshot` currently **panics**, so the
-/// sweep below has no payload to validate.
+/// The gallery sources whose `--dump-snapshot` **panics**, so the sweep below
+/// has no payload to validate. Empty: every gallery program dumps.
 ///
 /// A pinned list rather than a silent skip, in both directions: a program that
 /// starts dumping must leave this list (the sweep says so), and a program that
-/// stops dumping cannot join it without an edit. `defer_generators` is the
-/// gallery's own `expect_compile_error` case for the same failure — a `zip` of
-/// two generators typed as a compute function where the letrec binder wants a
-/// data collection.
-const DUMP_PANICS: &[&str] = &["defer_generators"];
+/// stops dumping cannot join it without an edit. A program that does not
+/// compile still dumps — the degraded contract carries source and diagnostics
+/// with empty panes — so a panic here is a hole in the dump path, not a
+/// rejected program.
+const DUMP_PANICS: &[&str] = &[];
 
 /// Every `*.cambra` source under `tests/programs/`, as (program-directory name,
 /// repo-root-relative path). Walks the directory rather than reading a list:

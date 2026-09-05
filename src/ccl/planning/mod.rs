@@ -35,6 +35,7 @@ use crate::ccl::{
     symbolic::{symbolic, symbolic_typed},
 };
 
+mod conditionals;
 mod groupby;
 mod iterate;
 mod join;
@@ -95,9 +96,13 @@ pub fn run(mut expr: Expr) -> Expr {
     // The group-by recognizer runs first and matches the bare predicate
     // directly; the generic filter / hash-join paths compile the predicate
     // lazily at each iteration site (see `wrap_with_iterate`).
+    // Realize conditional collections first: the gated union it produces is an ordinary
+    // collection, so every later phase — recognizers, iteration-site materialisation,
+    // predicate compilation — sees one shape rather than needing a `Case` case.
+    let discharged = conditionals::realize_conditional_collections(&mut expr);
     groupby::recognize_groupby_sites(&mut expr);
     let mut expr = simplify(expr);
-    insert_iterate_markers(&mut expr);
+    insert_iterate_markers(&mut expr, &discharged);
     // Normalize every remaining bare predicate tree-wide to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
     // refinement also rides **consumer contracts** that sit outside any site —
@@ -278,7 +283,7 @@ pub(crate) mod test_helpers {
     pub(crate) fn fun_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
@@ -675,7 +680,7 @@ mod tests {
 
         let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
 
-        insert_iterate_markers(&mut expr);
+        insert_iterate_markers(&mut expr, &Default::default());
 
         let TypedExprNode::Let {
             bound_expr, body, ..
@@ -710,7 +715,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_markers(&mut expr);
+        insert_iterate_markers(&mut expr, &Default::default());
         let TypedExprNode::Apply { argument, function } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -744,7 +749,7 @@ mod tests {
             ("out_b".to_string(), field_ty),
         ]));
 
-        insert_iterate_markers(&mut expr);
+        insert_iterate_markers(&mut expr, &Default::default());
 
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("expected Record, got: {}", symbolic(&expr));

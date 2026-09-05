@@ -81,7 +81,7 @@ fn emit_groupby(
     // so building it with a bare literal would leave the name free and the
     // checker's rebuilt (closed) type would no longer match the recorded one.
     let partition = |codomain: Type| match &key_binder {
-        Some(k) => Type::pi_kinded(k.clone(), key_ty.clone(), codomain, FunKind::Data),
+        Some(k) => Type::pi_kinded(k.clone(), key_ty.clone(), codomain, FunKind::Data(None)),
         None => Type::data_fun(key_ty.clone(), codomain),
     };
     let group_of = |codomain: Type| Type::data_fun(group_idx_ty.clone(), codomain);
@@ -224,8 +224,13 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
             .map(|(_, r)| r.clone())
             .collect(),
     );
-    let keys =
-        compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
+    // The key stream: the collection read through its key function, so it is a
+    // collection too, and it carries the kind of the source it is a read of.
+    let keys = compose((**c).clone(), key_pf).with_ty(Type::fun_like(
+        &c.ty,
+        value_idx_ty.clone(),
+        (**key_ty).clone(),
+    ));
     let grouped_values = emit_groupby(
         keys,
         (**c).clone(),

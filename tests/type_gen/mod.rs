@@ -15,7 +15,7 @@ use smol_str::SmolStr;
 
 use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, FunKindVar, Lit, Name, Openness,
-    Refinement, Type, TypedExpr, UnaryOpKind, ccl_utils,
+    Refinement, Type, TypeKind, TypedExpr, UnaryOpKind, ccl_utils,
 };
 
 /// A seed or case count from the environment, or `default`. Every harness here
@@ -130,6 +130,9 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
                 Type::Base(BaseType::Int),
                 (*gen_pred_at(rng, depth - 1)).clone(),
                 Type::Base(BaseType::Int),
+                // A plain collection: the sum shapes come from `gen_ty`'s
+                // `Type::sum_over` arm.
+                FunKind::Data(None),
             );
             Rc::new(
                 ccl_utils::make_cast((*gen_pred_at(rng, depth - 1)).clone(), target)
@@ -161,7 +164,7 @@ pub fn gen_leaf(rng: &mut Rng) -> Type {
 /// The kind variables one generated constraint set draws from.
 ///
 /// Sharing is the point. A variable minted per generated type is written by at
-/// most one constraint, which leaves the relation `constrain_kind` records
+/// most one constraint, which leaves the relation `constrain_fun_kind` records
 /// between two kind variables unobservable: nothing checks whether a pin reaches
 /// the far side, or whether it still does when it arrives after the edge. Drawing
 /// from a pool gives a set a few variables spread across many constraints, so a
@@ -196,7 +199,7 @@ impl KindVarPool {
 /// Replace a function's concrete kind with a kind *variable* from `pool`
 /// (sometimes, top-level only). Nothing else produces one: [`gen_ty`] stamps a
 /// concrete `FunKind`, so the states only a variable kind reaches —
-/// `KindMerge::Unknown`, and `constrain_kind`'s variable-against-variable arm —
+/// `KindMerge::Unknown`, and `constrain_fun_kind`'s variable-against-variable arm —
 /// are unreachable without this. A kind variable holds mutable state behind an
 /// `Rc` (its pin, and the variables it is related to), which is why a generator
 /// that replays re-runs rather than cloning.
@@ -204,12 +207,12 @@ pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Ty
     match t {
         Type::Fun {
             name,
-            kind: _,
+            fun_kind: _,
             domain,
             codomain,
         } if rng.chance(1, 2) => Type::Fun {
             name,
-            kind: FunKind::Var(pool.pick(rng)),
+            fun_kind: FunKind::Var(pool.pick(rng)),
             domain,
             codomain,
         },
@@ -223,18 +226,54 @@ pub fn maybe_kind_var(rng: &mut Rng, t: Type) -> Type {
     maybe_kind_var_from(rng, &mut KindVarPool::new(), t)
 }
 
-pub fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
+/// Which fragment of the type language a sampler draws from.
+///
+/// The differential oracles compare against the Lean model, whose `Ty` has no dependent
+/// sum, and they **assert** that every generated case reaches the wire rather than counting
+/// skips — a sampler wandering outside the fragment would quietly stop comparing. The
+/// property fuzzers answer to no model and want the sums: they are the only shapes that
+/// reach `FunKindVar::record_sum`, the witness scope change a kind edge carries, or
+/// `TypeKindVar` at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fragment {
+    /// Everything the model's `Ty` expresses, and nothing else.
+    Modelled,
+    /// The above plus dependent sums.
+    WithSums,
+}
+
+pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
     if depth == 0 || rng.chance(1, 3) {
         return gen_leaf(rng);
     }
-    match rng.below(5) {
+    // The sum arm is last, so dropping it is dropping the top of the range.
+    let arms = match fragment {
+        Fragment::WithSums => 6,
+        Fragment::Modelled => 5,
+    };
+    match rng.below(arms) {
+        // A dependent sum, built the one way a sum is ever built: over named candidates
+        // (`Type::sum_over`). Generated because nothing else in this sampler reaches
+        // `FunKindVar::record_sum`, the witness scope change a kind edge carries, or
+        // `TypeKindVar` at all — and those are exactly where a fact recorded on one
+        // derivation has to be visible from another, which is the property this harness
+        // states.
+        5 => {
+            let candidates: Vec<Type> = (0..1 + rng.below(2)).map(|_| gen_leaf(rng)).collect();
+            let name = rng.chance(1, 3).then(|| Name::raw("k"));
+            Type::sum_over(
+                TypeKind::Enumerated(candidates),
+                name,
+                gen_ty(rng, depth - 1, fragment),
+            )
+        }
         0 => {
-            let kind = if rng.chance(1, 2) {
-                FunKind::Data
+            let fun_kind = if rng.chance(1, 2) {
+                FunKind::Data(None)
             } else {
                 FunKind::Compute
             };
-            let domain = gen_ty(rng, depth - 1);
+            let domain = gen_ty(rng, depth - 1, fragment);
             let name = match rng.below(3) {
                 0 => None,
                 1 => Some(Name::raw("x")),
@@ -243,23 +282,30 @@ pub fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
             // With a Pi binder present, bias the codomain toward a dependent
             // refinement so the binder correspondence actually fires.
             let codomain = if name.is_some() && rng.chance(1, 2) {
-                Type::refined_one(gen_ty(rng, depth - 1), Refinement::born(gen_pred(rng)))
+                Type::refined_one(
+                    gen_ty(rng, depth - 1, fragment),
+                    Refinement::born(gen_pred(rng)),
+                )
             } else {
-                gen_ty(rng, depth - 1)
+                gen_ty(rng, depth - 1, fragment)
             };
             Type::Fun {
                 name,
-                kind,
+                fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
             }
         }
-        1 => Type::Tuple((0..rng.below(3)).map(|_| gen_ty(rng, depth - 1)).collect()),
+        1 => Type::Tuple(
+            (0..rng.below(3))
+                .map(|_| gen_ty(rng, depth - 1, fragment))
+                .collect(),
+        ),
         2 => {
             let mut fields = Vec::new();
             for key in ["a", "b", "c"] {
                 if rng.chance(1, 2) {
-                    fields.push((key.to_string(), gen_ty(rng, depth - 1)));
+                    fields.push((key.to_string(), gen_ty(rng, depth - 1, fragment)));
                 }
             }
             Type::Record(fields)
@@ -269,19 +315,28 @@ pub fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
             if rng.chance(1, 2) {
                 for key in ["t0", "t1"] {
                     if rng.chance(2, 3) {
-                        tags.push((FieldKey::Name(SmolStr::from(key)), gen_ty(rng, depth - 1)));
+                        tags.push((
+                            FieldKey::Name(SmolStr::from(key)),
+                            gen_ty(rng, depth - 1, fragment),
+                        ));
                     }
                 }
             } else {
                 for i in 0..rng.below(3) {
-                    tags.push((FieldKey::Index(i as usize), gen_ty(rng, depth - 1)));
+                    tags.push((
+                        FieldKey::Index(i as usize),
+                        gen_ty(rng, depth - 1, fragment),
+                    ));
                 }
             }
             // Closed: an open arm set is only ever *demanded*, never produced, so
             // a generated type — which stands in for a value's type — is closed.
             Type::Variant(tags, Openness::Closed)
         }
-        _ => Type::refined_one(gen_ty(rng, depth - 1), Refinement::born(gen_pred(rng))),
+        _ => Type::refined_one(
+            gen_ty(rng, depth - 1, fragment),
+            Refinement::born(gen_pred(rng)),
+        ),
     }
 }
 
@@ -294,7 +349,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
 
 /// A small directed edit of `t` — targets the width/refinement rules, where
 /// near-miss pairs have the interesting verdicts.
-pub fn edit(rng: &mut Rng, t: &Type) -> Type {
+pub fn edit(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
     match rng.below(4) {
         // Add a refinement layer (rhs gains a demand / lhs gains a supply).
         0 => Type::refined_one(t.clone(), Refinement::born(gen_pred(rng))),
@@ -318,53 +373,56 @@ pub fn edit(rng: &mut Rng, t: &Type) -> Type {
                 ts.push(Type::Base(BaseType::Bool));
                 Type::Tuple(ts)
             }
-            _ => gen_ty(rng, 2),
+            _ => gen_ty(rng, 2, fragment),
         },
-        _ => gen_ty(rng, 3),
+        _ => gen_ty(rng, 3, fragment),
     }
 }
 
 /// A plausible subtype-partner for `t`, biased toward *accepted* edges so
 /// transitivity chains form at a workable rate: clones, directed edits, and
 /// domain/codomain-level edits that exercise contravariance.
-pub fn partner(rng: &mut Rng, t: &Type) -> Type {
+pub fn partner(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
     match rng.below(8) {
         0 | 1 => t.clone(),
-        2 | 3 => edit(rng, t),
+        2 | 3 => edit(rng, t, fragment),
         4..=6 => match t {
             // Edit *inside* a function: domain/codomain near-misses probe the
             // contravariant edge and the codomain correspondence.
             Type::Fun {
                 name,
-                kind,
+                fun_kind,
                 domain,
                 codomain,
             } => {
                 let flip_kind = rng.chance(1, 4);
                 Type::Fun {
                     name: name.clone(),
-                    kind: if flip_kind {
-                        match kind {
-                            FunKind::Data => FunKind::Compute,
-                            _ => FunKind::Data,
+                    // Flipping data-vs-compute, not the binder slot: a slot carrying
+                    // binders is a sum, and dropping them here would edit the *kind* into
+                    // a shape no term built.
+                    fun_kind: if flip_kind {
+                        match fun_kind {
+                            FunKind::Data(..) => FunKind::Compute,
+                            _ => FunKind::Data(None),
                         }
                     } else {
-                        kind.clone()
+                        fun_kind.clone()
                     },
                     domain: Box::new(if rng.chance(1, 2) {
-                        edit(rng, domain)
+                        edit(rng, domain, fragment)
                     } else {
                         (**domain).clone()
                     }),
                     codomain: Box::new(if rng.chance(1, 2) {
-                        edit(rng, codomain)
+                        edit(rng, codomain, fragment)
                     } else {
                         (**codomain).clone()
                     }),
                 }
             }
-            _ => edit(rng, t),
+            _ => edit(rng, t, fragment),
         },
-        _ => gen_ty(rng, 3),
+        _ => gen_ty(rng, 3, fragment),
     }
 }

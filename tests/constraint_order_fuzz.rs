@@ -23,7 +23,7 @@ use cambra::ccl::infer::solver::{
     ConstrainCache, coalesce_compact, compact_type, constrain_subtype, simplify_type,
 };
 use cambra::ccl::{BaseType, FunKind, FunKindVar, InferVar, Name, Telescope, Type};
-use type_gen::{KindVarPool, Rng, env_or, gen_ty, maybe_kind_var_from};
+use type_gen::{Fragment, KindVarPool, Rng, env_or, gen_ty, maybe_kind_var_from};
 
 /// One constraint in a generated set, phrased over variable *indices* so the
 /// same set can be replayed against freshly-minted variables per run.
@@ -128,7 +128,7 @@ fn gen_specs(rng: &mut Rng, nvars: usize) -> Vec<Spec> {
     for _ in 0..count {
         let v = rng.below(nvars as u64) as usize;
         let concrete = |rng: &mut Rng, kinds: &mut KindVarPool| {
-            let t = gen_ty(rng, 2);
+            let t = gen_ty(rng, 2, Fragment::WithSums);
             maybe_kind_var_from(rng, kinds, t)
         };
         match rng.below(4) {
@@ -170,7 +170,7 @@ fn shuffle(rng: &mut Rng, n: usize) -> Vec<usize> {
 /// the edge that relates it.
 ///
 /// Every permutation of these four constraints has to coalesce both variables the
-/// same way. `constrain_kind` relates two kind variables and `FunKindVar::pin`
+/// same way. `constrain_fun_kind` relates two kind variables and `FunKindVar::pin`
 /// joins over the relation at the read, so the answer is a function of the set;
 /// resolving at the edge instead answers from the pins that had arrived, and `v1`
 /// renders `⇒` in the orders where the edge precedes the pin and `⤇` in the rest.
@@ -181,9 +181,9 @@ fn shuffle(rng: &mut Rng, n: usize) -> Vec<usize> {
 /// rather than left to the sampler.
 #[test]
 fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
-    let fun_over = |kind: FunKind| Type::Fun {
+    let fun_over = |fun_kind: FunKind| Type::Fun {
         name: None,
-        kind,
+        fun_kind,
         domain: Box::new(Type::UIntRange(3)),
         codomain: Box::new(Type::Base(BaseType::Int)),
     };
@@ -213,7 +213,11 @@ fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
                     &v1,
                     &mut ConstrainCache::new(),
                 ),
-                _ => constrain_subtype(&v0, &fun_over(FunKind::Data), &mut ConstrainCache::new()),
+                _ => constrain_subtype(
+                    &v0,
+                    &fun_over(FunKind::Data(None)),
+                    &mut ConstrainCache::new(),
+                ),
             };
             rejected |= r.is_err();
         }

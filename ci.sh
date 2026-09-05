@@ -38,9 +38,10 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # the physical order of every refinement set. The workflow runs the suite
 # both ways: set semantics makes that order meaningless by contract, but a
 # consumer that lets it become observable — or a dedup keeping the
-# first-inserted of two `eq`-equal refinements — compiles clean either way. Same
-# argument as `ci_clippy_lib`: a configuration nothing runs is a
-# configuration that rots.
+# first-inserted of two `eq`-equal refinements — compiles clean either way. It
+# reaches planning too, which recovers the order a nested filter's predicate
+# implies rather than reading it off the storage this reverses. Same argument as
+# `ci_clippy_lib`: a configuration nothing runs is a configuration that rots.
 ci_test() { cargo test -p cambra -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list

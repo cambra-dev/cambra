@@ -23,7 +23,7 @@ mod type_gen;
 
 use cambra::ccl::Type;
 use cambra::ccl::infer::solver::{ConstrainCache, constrain_subtype};
-use type_gen::{Rng, env_or, gen_ty, partner};
+use type_gen::{Fragment, Rng, env_or, gen_ty, partner};
 
 /// Chains `a <: b <: c` that `constrain` accepts, checked against the direct
 /// edge. No violation is tolerated — a hit is a finding, and fails the test with
@@ -43,9 +43,9 @@ fn transitivity_chain_fuzz() {
     let mut violations: Vec<(Type, Type, Type)> = Vec::new();
     while chains < n && attempts < n * 100 {
         attempts += 1;
-        let b = gen_ty(&mut rng, 3);
-        let a = partner(&mut rng, &b);
-        let c = partner(&mut rng, &b);
+        let b = gen_ty(&mut rng, 3, Fragment::WithSums);
+        let a = partner(&mut rng, &b, Fragment::WithSums);
+        let c = partner(&mut rng, &b, Fragment::WithSums);
         if !(ok(&a, &b) && ok(&b, &c)) {
             continue;
         }
