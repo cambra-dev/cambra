@@ -254,7 +254,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Instantiation is a no-op for the monomorphic accumulator bindings
         // lowering produces (a polymorphic init would under-constrain the
         // write and surface as `UnresolvedInfer`).
-        TypedExprNode::MutWrite { name, value } => {
+        TypedExprNode::MutWrite { name, key, value } => {
             let var_ty = match ctx.scopes.lookup(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => binding.scheme.instantiate(ctx.level),
@@ -267,6 +267,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // The *target* is a handle, resolved by name above. The written **value** is
             // an ordinary value position, so a mutable variable mention there reads: `b := a`
             // between two mutable variables writes `a`'s current value into `b`.
+            // The key is an ordinary value position, like the written value: a mutable
+            // variable mentioned there reads rather than passing its handle along.
+            let key_ty = match key {
+                Some(k) => Some(emit_value_read(k, ctx)?),
+                None => None,
+            };
             let value_ty = emit_value_read(value, ctx)?;
             let write_label = name.clone();
             // The written value flows in **verbatim**, as one contribution to the
@@ -290,9 +296,15 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // writable in a type annotation — so what a program can exercise today is
             // the demand on an unrefined annotation and the skip on a non-mutable one.)
             if let Some(mut_val) = mut_value {
-                ctx.require_sub(&value_ty, mut_val, &|| {
-                    format!("write to mutable variable `{write_label}`")
-                })?;
+                match key {
+                    None => ctx.require_sub(&value_ty, mut_val, &|| {
+                        format!("write to mutable variable `{write_label}`")
+                    })?,
+                    // The key *term* is not needed: a write states its obligation on the
+                    // value, and the one shape that would discharge against the key — a
+                    // key-dependent codomain — has no write.
+                    Some(_) => emit_keyed_write(mut_val, &key_ty, &value_ty, &write_label, ctx)?,
+                }
             }
             Type::Base(BaseType::Unit)
         }
@@ -954,8 +966,10 @@ pub(super) fn emit_apply<C: Typing>(
 
 /// The value type `𝑚[𝑘]` reads, with the key related to the collection's keys.
 ///
-/// One shape per keyed access, so every use of `m[k]` reads the same type off it rather
-/// than restating the rule. The read ([`emit_lookup_checked`]) wraps it in `Option`.
+/// One shape at both uses. A read ([`emit_lookup_checked`]) wraps it in `Option`; a write
+/// ([`emit_keyed_write`]) requires the written value against it. That is what makes
+/// `m[k] := v` and `m[k]?` agree about what `m[k]` is, rather than two rules kept in step
+/// by hand.
 ///
 /// **Not an application.** A keyed access is reached precisely when the key is *not* known
 /// to lie in the collection's domain, and application demands that it does — so typing one
@@ -1018,6 +1032,62 @@ fn emit_lookup_checked<C: Typing>(
         result.clone(),
     );
     Ok(result)
+}
+
+/// Type a **keyed write** `m[k] := v`: check `k` against the collection's key type and
+/// `v` against the value type at that key.
+///
+/// One rule with the checked lookup ([`keyed_access_value`]), so `m[k]` names the same
+/// value type whether it is being read or written. Neither is an application: a read is
+/// reached when the key is not known to be present, and a write is what *makes* it
+/// present, so demanding a presence proof of the key being written would be backwards.
+fn emit_keyed_write<C: Typing>(
+    collection: &Type,
+    key_ty: &Option<Type>,
+    value_ty: &Type,
+    label: &Name,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    let key_ty = key_ty
+        .as_ref()
+        .expect("a keyed write emits its key's type alongside the key");
+    let (keys, binder, value) = keyed_access_types(collection)
+        .ok_or_else(|| {
+            if matches!(collection, Type::Infer(_) | Type::Hole) {
+                return InferError::Unsupported(format!(
+                    "keyed write `{label}[k] := …` needs the collection's type at this \
+                     point, but `{collection}` is not resolved yet — annotate the \
+                     introduction (`{label}: Mut(Map(K, V), Txn) := …`)"
+                ));
+            }
+            not_a_keyed_access(collection, &format!("keyed write `{label}[k] := …`"))
+        })
+        .map_err(|e| ctx.raise(e))?;
+    // A **dependent** codomain has no write. The read discharges the key binder to the key
+    // term and answers `Option` of the result; a write would have to state the obligation
+    // on the value at a key the write itself is what makes present, and a `Mut(Map(𝐾, 𝑉))`
+    // register holds a fixed `𝑉` besides, so no register reaches this.
+    if let Some(binder) = binder.as_ref()
+        && crate::ccl::subst::codomain_depends_on(binder, &value)
+    {
+        return Err(ctx.raise(InferError::Unsupported(format!(
+            "keyed write `{label}[k] := …` on a collection whose values depend on the \
+             key: `{collection}`'s codomain names its key binder, so the value written \
+             at one key is a different type from the value written at another"
+        ))));
+    }
+    // A write is `Unit`-valued, so nothing downstream would resolve a fresh variable
+    // standing in for the value type; the obligation is stated here directly.
+    let expected = keyed_access_value(
+        &keys,
+        value,
+        key_ty,
+        &|| format!("keyed write key of `{label}`"),
+        ctx,
+    )?;
+    ctx.require_sub(value_ty, &expected, &|| {
+        format!("keyed write to mutable variable `{label}`")
+    })
 }
 
 /// Why `what` has no keyed access on `collection`.

@@ -20,7 +20,7 @@ use smol_str::SmolStr;
 use super::*;
 use crate::{
     ccl::{Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
-    chl_parser::ast::{Expr as ChlExpr, IfBranch, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{AssignTarget, Expr as ChlExpr, IfBranch, Span, Spanned, Stmt as ChlStmt},
 };
 
 /// Validate that a `with` block's context is the `begin()` transaction marker.
@@ -207,6 +207,19 @@ fn lower_tx_block_inner(
             // sole variable-write operator; `write_or_let` gates it (a write to a
             // mutable variable commits; a `:=` to anything else is a
             // per-transaction local `let`).
+            // `store[k] := value` — the keyed write, a write to one key of a
+            // transactional collection. Never a local `let`: a subscript binds nothing,
+            // so `write_or_let`'s fallback does not apply and the target must already
+            // be a mutable variable.
+            ChlStmt::MutAssign { target, value, .. }
+                if matches!(target.node, AssignTarget::Subscript { .. }) =>
+            {
+                let AssignTarget::Subscript { target, index } = &target.node else {
+                    unreachable!("guarded by the match arm above")
+                };
+                let write = lower_keyed_write(target, index, value, stmt.span, ctx)?;
+                ctx.tag_machinery(Expr::expr_stmt(write, chain), stmt.span, "lower.stmt_seq")
+            }
             ChlStmt::MutAssign { target, value, .. } => {
                 let name = extract_name_target(target, "mutable assignment")?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;

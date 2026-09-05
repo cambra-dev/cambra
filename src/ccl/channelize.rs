@@ -1031,8 +1031,9 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             iter: Box::new(drop_expr_stmts(*iter)),
             body: Box::new(drop_expr_stmts(*body)),
         },
-        TypedExprNode::MutWrite { name, value } => TypedExprNode::MutWrite {
+        TypedExprNode::MutWrite { name, key, value } => TypedExprNode::MutWrite {
             name,
+            key: key.map(|k| Box::new(drop_expr_stmts(*k))),
             value: Box::new(drop_expr_stmts(*value)),
         },
         TypedExprNode::Begin { body } => TypedExprNode::Begin {
@@ -1152,7 +1153,12 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(iter)?;
             assert_no_defer_residue(body)
         }
-        TypedExprNode::MutWrite { value, .. } => assert_no_defer_residue(value),
+        TypedExprNode::MutWrite { key, value, .. } => {
+            if let Some(key) = key {
+                assert_no_defer_residue(key)?;
+            }
+            assert_no_defer_residue(value)
+        }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
@@ -1882,7 +1888,12 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(body, bound, out);
                 bound.pop();
             }
-            TypedExprNode::MutWrite { value, .. } => rec(value, bound, out),
+            TypedExprNode::MutWrite { key, value, .. } => {
+                if let Some(key) = key {
+                    rec(key, bound, out);
+                }
+                rec(value, bound, out);
+            }
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)

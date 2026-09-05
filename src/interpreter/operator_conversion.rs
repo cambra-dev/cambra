@@ -432,6 +432,25 @@ impl OpConversionContext {
                     .collect();
                 Ok(Extent::record(fields?))
             }
+            // A **keyed** sum, whose witness the value itself carries. `SubtypesOf(𝐾)`'s members
+            // are key types refined by membership, so the extent that describes one is the
+            // key type — a map cell holding only the keys it holds, which is how the store
+            // already describes its own (`map_extent`). That leaves nothing for a runtime
+            // witness to supply, unlike the arms below: a `UIntRanges` sum needs a concrete
+            // bound and a `Type` sum a domain, and neither is recoverable from a value's
+            // shape. Ahead of the general function arm because a sum's domain is its
+            // witness reference, which that arm cannot convert.
+            Type::Fun { codomain, .. }
+                if matches!(ty.witness_kind(), Some(crate::ccl::TypeKind::SubtypesOf(_))) =>
+            {
+                let Some(crate::ccl::TypeKind::SubtypesOf(key)) = ty.witness_kind() else {
+                    unreachable!("guarded by the arm")
+                };
+                Ok(Extent::Function {
+                    domain: Box::new(self.extent_of(&key)?),
+                    codomain: Box::new(self.extent_of(codomain)?),
+                })
+            }
             Type::Fun {
                 domain: a,
                 codomain: b,
@@ -1127,7 +1146,7 @@ fn convert_impl_inner(
             let option_extent = ctx.extent_of(&option_ty)?;
             let collection = convert_impl(argument, None, ctx)?;
             reject_collection_valued_lookup(collection.tiling())?;
-            Ok(Box::new(CheckedLookup::new(
+            Ok(Box::new(CheckedLookup::split(
                 collection,
                 keys,
                 option_extent,
@@ -1159,7 +1178,7 @@ fn convert_impl_inner(
             let collection = convert_impl(coll_expr, None, ctx)?;
             reject_collection_valued_lookup(collection.tiling())?;
             let keys = convert_impl(key_expr, None, ctx)?;
-            Ok(Box::new(CheckedLookup::new(
+            Ok(Box::new(CheckedLookup::split(
                 collection,
                 keys,
                 option_extent,
@@ -1211,6 +1230,71 @@ fn convert_impl_inner(
             let input = expect_input(input, &format!("Builtin({})", b.name()))?;
             match b {
                 Builtin::Id => Ok(input),
+                // Entering a **described** sum is the identity at runtime. A sum's value is
+                // a domain paired with a collection over it, and a collection carries its
+                // own domain — so a described witness is recoverable from the value and
+                // nothing represents it separately (`src/ccl/design/mutability.md`, "A
+                // mutable collection's key set varies with the position").
+                //
+                // Only a described kind goes through here. A box over two or more listed
+                // candidates records a choice the value cannot answer, and realization
+                // leaves it standing for the arm below to reject by name; a box over one is
+                // erased before op-conversion (`src/ccl/planning/conditionals.rs`).
+                Builtin::Box
+                    if expr
+                        .ty
+                        .codomain()
+                        .and_then(|c| {
+                            c.witness_kind()
+                                .map(|k| !matches!(k, crate::ccl::TypeKind::Enumerated(_)))
+                        })
+                        .unwrap_or(false) =>
+                {
+                    Ok(input)
+                }
+                // `insert(m, k, v)` — pointwise over the zipped `(collection, key, value)`
+                // triple, one map in and one map out, the same shape a binop takes over its
+                // pair. The output extent is the node's own codomain: a keyed sum's extent
+                // is its key type mapped to its value type, so the cell it describes is the
+                // map this produces.
+                Builtin::Insert => {
+                    let out_extent = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "insert must have function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let fn_extent = Extent::Function {
+                        domain: Box::new(result_extent(input.tiling())),
+                        codomain: Box::new(ctx.extent_of(&out_extent)?),
+                    };
+                    Ok(Box::new(MapResult::new(
+                        input,
+                        Box::new(Constant::new(
+                            Value::ComputableFunction(FunctionDef::Insert),
+                            fn_extent,
+                        )),
+                    )))
+                }
+                // `lookup?` over an assembled stream of `(collection, key)` rows — what the
+                // point-free form of a lookup inside an iteration composes to. The two
+                // collection representations arrive as two shapes of field 0 and
+                // `CheckedLookup` reads whichever it is given: a nested function tile is one
+                // collection shared by every row, a scalar column is one materialized map
+                // value per row.
+                Builtin::LookupChecked => {
+                    let option_ty = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "`lookup?` must have function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let option_extent = ctx.extent_of(&option_ty)?;
+                    Ok(Box::new(
+                        CheckedLookup::paired(input, option_extent)
+                            .map_err(ConversionError::Unsupported)?,
+                    ))
+                }
                 Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
                 // `variant_project(c)` consumes the fed scrutinee stream and
                 // narrows it to that tag's restricted sub-domain, yielding the
@@ -1586,6 +1670,32 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         .collect()
 }
 
+/// The store key of register `reg` at data key `at`.
+///
+/// A store's key space is a tagged sum over its registers, each arm carrying that
+/// register's own key type: `Σ reg. K_reg`. A scalar register's key type is `Unit`,
+/// so it occupies the single key `` `reg(unit) ``. The tag is what keeps one
+/// register's keys disjoint from another's — without it a keyed register holding
+/// the string `"pool"` would alias the scalar register spelled `pool`.
+fn store_key(reg: &str, at: Value) -> Value {
+    Value::Union {
+        tag: FieldKey::Name(reg.into()),
+        inner: Box::new(at),
+    }
+}
+
+/// The extent of a store's key space — one arm per register, plus one per reply
+/// tap (a tap occupies a write-only arm of its own). An arm is `Unit` where the
+/// register's key space is the single name; a keyed register contributes its data
+/// key extent instead.
+fn store_key_extent(arms: Vec<(String, Extent)>) -> Extent {
+    Extent::Union(TagMap::from_arms(
+        arms.into_iter()
+            .map(|(f, e)| (FieldKey::Name(f.into()), e))
+            .collect(),
+    ))
+}
+
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
 /// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
 /// branch of the shared store output). Each fused writer reads the cyclic store,
@@ -1599,10 +1709,28 @@ fn build_commit_store(
     writers: &[WriterSite],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
-    // Each variable becomes a key under its `field_key`'s runtime value; the
-    // store is one `CommitOperator` over them all (one commit clock, so writes
-    // to different keys commit atomically and disjoint footprints concurrently).
-    let key_extent = Extent::Base(BaseType::String);
+    // Each variable becomes an arm of the store's key space, tagged by its
+    // `field_key`; the store is one `CommitOperator` over them all (one commit
+    // clock, so writes to different keys commit atomically and disjoint
+    // footprints concurrently).
+    //
+    // The reply taps join that key space, so their arms are collected before the
+    // operator is built — the extent it carries has to describe every key the
+    // store will hold, and a tap key is written from the first commit on.
+    let per_writer_taps: Vec<Vec<(String, Type)>> = writers
+        .iter()
+        .map(|w| body_tap_fields(&w.body.ty))
+        .collect();
+    let mut key_arms: Vec<(String, Extent)> = keys
+        .iter()
+        .map(|k| (k.name.field_key(), Extent::Base(BaseType::Unit)))
+        .collect();
+    for taps in &per_writer_taps {
+        for (field, _) in taps {
+            key_arms.push((field.clone(), Extent::Base(BaseType::Unit)));
+        }
+    }
+    let key_extent = store_key_extent(key_arms);
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     // Per scalar key, an acyclic init operator seeding its tick-0 value (a literal
     // init is the trivial op; a computed init drains to its scalar).
@@ -1619,7 +1747,7 @@ fn build_commit_store(
     let mut value_extents: Vec<Extent> = Vec::new();
     for k in keys {
         let field = k.name.field_key();
-        let runtime_key = Value::String(field.clone().into());
+        let runtime_key = store_key(&field, Value::Unit);
         let key_value_extent = ctx.extent_of(&k.init.ty)?;
         if !value_extents.contains(&key_value_extent) {
             value_extents.push(key_value_extent.clone());
@@ -1648,7 +1776,7 @@ fn build_commit_store(
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
     // Resolve a footprint key's runtime value from its `field_key`.
-    let runtime_key = |n: &Name| Value::String(n.field_key().into());
+    let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
 
     // Each writer's static write footprint, so the store can close a key once the
     // writers that may touch it have finished rather than only when every writer
@@ -1663,7 +1791,7 @@ fn build_commit_store(
                 .chain(
                     body_tap_fields(&w.body.ty)
                         .into_iter()
-                        .map(|(f, _)| Value::String(f.into())),
+                        .map(|(f, _)| store_key(&f, Value::Unit)),
                 )
                 .collect()
         })
@@ -1680,7 +1808,7 @@ fn build_commit_store(
         .collect();
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
 
-    for (set_writer, w) in setters.into_iter().zip(writers.iter()) {
+    for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
         let item_ty = w.source.ty.codomain().ok_or_else(|| {
             ConversionError::TypeError(format!(
                 "transact writer source must have function type, got {}",
@@ -1721,16 +1849,15 @@ fn build_commit_store(
         // keys), so the reply rides this transaction's commit and is read back as a
         // `Fun(Txn, V)` value-stream off the shared log. A tap takes no `init_op` —
         // it has no tick-0 value, so its stream starts at the first reply.
-        let taps = body_tap_fields(&w.body.ty);
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
         let mut tap_fields: Vec<String> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
             let tap_value_extent = ctx.extent_of(&tap_ty)?;
-            write_keys.push(Value::String(field.clone().into()));
+            write_keys.push(store_key(&field, Value::Unit));
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
-                    runtime_key: Value::String(field.clone().into()),
+                    runtime_key: store_key(&field, Value::Unit),
                     value_extent: tap_value_extent,
                     index: 0, // unused for `commit` reads (keyed by `runtime_key`)
                     // A reply tap is a per-commit event, not a persistent value:
@@ -1836,8 +1963,15 @@ fn build_induction_store_single(
     w: &WriterSite,
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
-    let key_extent = Extent::Base(BaseType::String);
-    let runtime_key = |n: &Name| Value::String(n.field_key().into());
+    let taps = body_tap_fields(&w.body.ty);
+    let key_extent = store_key_extent(
+        keys.iter()
+            .map(|k| k.name.field_key())
+            .chain(taps.iter().map(|(f, _)| f.clone()))
+            .map(|f| (f, Extent::Base(BaseType::Unit)))
+            .collect(),
+    );
+    let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
 
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
@@ -1847,7 +1981,7 @@ fn build_induction_store_single(
     let mut value_extents: Vec<Extent> = Vec::new();
     for k in keys {
         let field = k.name.field_key();
-        let rk = Value::String(field.clone().into());
+        let rk = store_key(&field, Value::Unit);
         let value_extent = ctx.extent_of(&k.init.ty)?;
         if !value_extents.contains(&value_extent) {
             value_extents.push(value_extent.clone());
@@ -1929,13 +2063,13 @@ fn build_induction_store_single(
     // reads to omit a non-fired tap from the delta.
     let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
     let mut tap_fields: Vec<String> = Vec::new();
-    for (field, tap_ty) in body_tap_fields(&w.body.ty) {
+    for (field, tap_ty) in taps {
         let tap_value_extent = ctx.extent_of(&tap_ty)?;
-        write_keys.push(Value::String(field.clone().into()));
+        write_keys.push(store_key(&field, Value::Unit));
         keys_map.insert(
             field.clone(),
             KeyReadInfo {
-                runtime_key: Value::String(field.clone().into()),
+                runtime_key: store_key(&field, Value::Unit),
                 value_extent: tap_value_extent,
                 index: 0,             // unused: dense reads fold by runtime_key
                 carry_forward: false, // a tap fires only at its own position
@@ -2225,7 +2359,10 @@ fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
 /// those today (a key-dependent codomain has no checked lookup), so this is the boundary
 /// check for a shape that reaches op-conversion by some other route.
 fn reject_collection_valued_lookup(tiling: &Tiling) -> Result<(), ConversionError> {
-    if matches!(tiling, Tiling::SealedFunction { .. }) {
+    if matches!(
+        tiling,
+        Tiling::SealedFunction { .. } | Tiling::Scalar(Extent::Function { .. })
+    ) {
         return Ok(());
     }
     Err(ConversionError::Unsupported(format!(

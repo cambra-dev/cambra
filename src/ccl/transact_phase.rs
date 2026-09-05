@@ -776,8 +776,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
             // reads the rewrite mints are recorded inside `resolve_await_finals`.
             let mut init = key_init[&k].init.clone_preserving_ids();
             resolve_await_finals(&mut init, &hist, &key_init);
-            let decl = key_init[&k].decl;
-            key_init.insert(k, MutVarDecl { decl, init });
+            key_init.get_mut(&k).expect("key seed present").init = init;
         }
     }
     assert!(
@@ -1693,7 +1692,7 @@ fn check_store_acyclicity(
                 ..
             } => Some((&binding.name, &**bound_expr)),
             TypedExprNode::MutDecl { binding, init, .. } => Some((&binding.name, &**init)),
-            TypedExprNode::MutWrite { name, value } => Some((name, &**value)),
+            TypedExprNode::MutWrite { name, value, .. } => Some((name, &**value)),
             _ => None,
         };
         if let Some((name, value)) = bound {
@@ -1913,7 +1912,7 @@ fn collect_footprint(block: &Expr, txn_mut_vars: &HashSet<Name>) -> (Vec<Name>, 
             TypedExprNode::Var(n) if txn_mut_vars.contains(n) && !reads.contains(n) => {
                 reads.push(n.clone());
             }
-            TypedExprNode::MutWrite { name, value } => {
+            TypedExprNode::MutWrite { name, value, .. } => {
                 // The write's value is read first (its embedded mutable variable reads are
                 // snapshots), then the target joins the write set.
                 walk(value, txn_mut_vars, in_case, reads, writes);
@@ -1988,7 +1987,7 @@ fn build_writer(
     let value_ty = |k: &Name| {
         key_init
             .get(k)
-            .map(|d| mut_var_value_ty(&d.init.ty))
+            .map(|d| d.value_ty.clone())
             .expect("transact_phase: footprint key must be a mutable variable key")
     };
     let read_tys: Vec<Type> = site.read_keys.iter().map(value_ty).collect();
@@ -2253,7 +2252,7 @@ fn walk_block(
         ),
         TypedExprNode::ExprStmt { expr, body } => {
             match &expr.node {
-                TypedExprNode::MutWrite { name, value } => {
+                TypedExprNode::MutWrite { name, value, .. } => {
                     // Every `MutWrite` in a stripped `with begin():` block must
                     // target a transactional mutable variable the site records as a write
                     // key. `build_writer` only emits `write_keys` into the
@@ -2470,6 +2469,14 @@ struct MutVarDecl {
     /// type — [`StorePlan::reads`], [`final_key`] — borrow it rather than
     /// placing it.
     init: Expr,
+    /// The type of one committed value — the binder's, refinements stripped.
+    ///
+    /// Off the **binder**, not off the seed. A seed is one contribution to the value
+    /// type and the binder carries the join over the seed and every write, so the two
+    /// differ wherever a write widens the seed — a keyed register seeded with two keys
+    /// and written at a third is the case where reading the seed rejects the program
+    /// (`src/ccl/expr.rs`, [`TypedExprNode::MutDecl`]).
+    value_ty: Type,
 }
 
 /// Locate each mutable variable key's `let` binding and record it (keeping the outermost
@@ -2498,6 +2505,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
             MutVarDecl {
                 decl: expr.node_id(),
                 init: (**init).clone(),
+                value_ty: mut_var_value_ty(&binding.ty),
             },
         );
     }
@@ -2733,7 +2741,7 @@ fn plan_store(
     let value_ty = |k: &Name| {
         key_init
             .get(k)
-            .map(|d| mut_var_value_ty(&d.init.ty))
+            .map(|d| d.value_ty.clone())
             .expect("transact_phase: footprint key must be a mutable variable key")
     };
 
@@ -3063,7 +3071,7 @@ impl StorePlan {
                     "transact.key_rebind",
                     provenance::Nature::Expansion,
                 );
-                let v = mut_var_value_ty(&key_init[k].init.ty);
+                let v = key_init[k].value_ty.clone();
                 (binding(k.clone(), v.clone()), as_of_read(&self.hist[k], v))
             })
             .collect()
@@ -3396,13 +3404,15 @@ fn resolve_await_finals(
 /// writers finish. Minted only for a [`Builtin::AwaitFinal`] marker.
 ///
 /// No seed operand, for the same reason [`as_of_read`] has none: this samples the carried
-/// value, and tick 0 of every store is its keys' seeds. The key's `init` is still read
-/// here, for its *type* — the value type of the history the read names — and not as a
-/// term. A key no writer site writes never reaches here at all:
-/// [`resolve_writer_free_awaits`] has replaced its await with the seed.
+/// value, and tick 0 of every store is its keys' seeds. The key's recorded value type is
+/// still read here — it is the value type of the history the read names. A key no writer
+/// site writes never reaches here at all: [`resolve_writer_free_awaits`] has replaced its
+/// await with the seed.
 fn final_key(k: &Name, hist: &HashMap<Name, Name>, key_init: &HashMap<Name, MutVarDecl>) -> Expr {
-    let init = &key_init.get(k).expect("key init present").init;
-    let v = mut_var_value_ty(&init.ty);
+    let v = key_init
+        .get(k)
+        .map(|d| d.value_ty.clone())
+        .expect("key init present");
     sampling_read(&hist[k], v, Builtin::FinalRead)
 }
 

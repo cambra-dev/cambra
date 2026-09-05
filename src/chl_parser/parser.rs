@@ -1588,6 +1588,15 @@ fn expr_to_assign_target(spanned: Spanned<Expr>) -> Result<Spanned<AssignTarget>
             }
             AssignTarget::Tuple(out)
         }
+        // `m[k]` in target position. The **checked** form is refused here rather
+        // than at lowering: `m[k]? := v` asks to write at a key that may be
+        // absent, and a write establishes presence rather than testing it, so
+        // there is nothing for the `?` to mean.
+        Expr::Subscript {
+            target,
+            index,
+            checked: false,
+        } => AssignTarget::Subscript { target, index },
         _ => return Err(span),
     };
     Ok(Spanned::new(span, node))
@@ -1980,6 +1989,35 @@ mod tests {
             },
             other => panic!("expected Assign, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn keyed_write_target() {
+        // `m[k] := v` — the collection and the key both survive as expressions, so
+        // lowering can resolve which variable is written and at what key.
+        let m = parse_m("m[k] := 1\n");
+        match &m.body[0].node {
+            Stmt::MutAssign { target, .. } => match &target.node {
+                AssignTarget::Subscript { target, index } => {
+                    assert!(matches!(&target.node, Expr::Name(n) if n == "m"));
+                    assert!(matches!(&index.node, Expr::Name(n) if n == "k"));
+                }
+                other => panic!("expected Subscript target, got {other:?}"),
+            },
+            other => panic!("expected MutAssign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checked_subscript_is_not_an_assign_target() {
+        // `m[k]? := v` asks to write at a key that may be absent. A write is what
+        // makes a key present, so the checked form has nothing to mean on the left
+        // and is refused in target position rather than at lowering.
+        let r = parse_module("m[k]? := 1\n");
+        assert!(
+            !r.errors.is_empty(),
+            "expected parse error for a checked subscript in target position"
+        );
     }
 
     #[test]

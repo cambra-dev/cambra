@@ -3013,3 +3013,176 @@ fn a_variant_match_inside_a_block_releases_per_commit() {
     "#});
     assert_eq!(value, Value::Int(3));
 }
+
+/// A `Map`-valued transactional register, read inside a block and never written.
+///
+/// The register's value type is the abstract map `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, so the whole path
+/// from seed to store runs on a sum: the seed's introduction states that type and survives
+/// realization, entering the sum compiles to the identity, and the seed drains to one map
+/// cell rather than to a scalar.
+#[test]
+fn a_map_valued_register_reads_inside_a_block() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                hit = m["a"]?
+                n := n + 1
+        await_final(n)
+    "#});
+    assert_eq!(value, Value::Int(3));
+}
+
+/// A keyed write `m[k] := v` reaching a transactional store.
+///
+/// The write denotes the whole-value write `m := insert(m, k, v)`
+/// ([`cambra::ccl::Builtin::Insert`]), so the register's history stays an ordinary
+/// overwrite one and the store holds the collection it names. Asserting the *value* is what
+/// makes this more than a compile check: the seed's two keys survive and the written key
+/// joins them, so neither the seed nor the write replaced the other.
+#[test]
+fn a_keyed_write_reaches_a_transactional_store() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+        for r in [1, 2, 3]:
+            with begin():
+                m["c"] := 3
+        await_final(m)
+    "#});
+    assert_eq!(
+        map_entries(&value),
+        vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ]
+    );
+}
+
+/// A keyed write over an **induction** domain.
+///
+/// The key is the **loop binder**, which is what makes this more than the transactional
+/// case repeated over another domain: a variable key's type is reachable from no other slot,
+/// since a write is `Unit`, so a pass that skips the key slot leaves it an unresolved
+/// inference variable and nothing downstream notices.
+#[test]
+fn a_keyed_write_reaches_an_induction_store() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        for x in [3, 4]:
+            m[x] := 99
+        m
+    "#});
+    assert_eq!(
+        map_entries_int(&value),
+        vec![(1, 10), (2, 20), (3, 99), (4, 99)]
+    );
+}
+
+/// A map value's bindings, key-sorted — a `Value::Function`'s order follows construction,
+/// which is not what a test about *contents* should depend on.
+fn map_entries(v: &Value) -> Vec<(String, i64)> {
+    let Value::Function(bindings) = v else {
+        panic!("expected a map value, got {v:?}");
+    };
+    let mut out: Vec<(String, i64)> = bindings
+        .iter()
+        .map(|b| match (&b.input, &b.output) {
+            (Value::String(k), Value::Int(n)) => (k.to_string(), *n),
+            other => panic!("expected String ↦ Int, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// [`map_entries`] for an `Int`-keyed map.
+fn map_entries_int(v: &Value) -> Vec<(i64, i64)> {
+    let Value::Function(bindings) = v else {
+        panic!("expected a map value, got {v:?}");
+    };
+    let mut out: Vec<(i64, i64)> = bindings
+        .iter()
+        .map(|b| match (&b.input, &b.output) {
+            (Value::Int(k), Value::Int(n)) => (*k, *n),
+            other => panic!("expected Int ↦ Int, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A keyed write and a keyed read, round trip: `m[k] := v` commits and `m[k]?` reads it
+/// back. This is the pair that makes a mutable collection usable rather than write-only.
+///
+/// The read goes through the **materialized** path in `CheckedLookup`: a register holds its
+/// collection as one map value at one store key, so the lookup searches that value's
+/// bindings rather than a domain column. A map value carries its own bindings, so it is
+/// complete wherever it is present and absence needs no terminality wait.
+#[test]
+fn a_keyed_write_reads_back_through_a_checked_lookup() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m["c"] := 3
+            final: Map(String, Int) = await_final(m)
+            match final["c"]?:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        "#},
+        Value::Int(3),
+    );
+}
+
+/// A key the register never held answers `` `none `` — the seed's keys and the written one
+/// are what it has, and nothing else.
+#[test]
+fn a_checked_lookup_on_a_register_answers_none_for_an_absent_key() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m["c"] := 3
+            final: Map(String, Int) = await_final(m)
+            match final["zzz"]?:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        "#},
+        Value::Int(0),
+    );
+}
+
+/// A keyed read at the **loop item** inside a block — the register's snapshot is a per-row
+/// column, so the lookup's collection varies by position.
+///
+/// This is the shape only a transaction produces: `transact_phase` applies the writer body
+/// to a snapshot tuple, so the register arrives as a projection of that tuple rather than as
+/// a free variable, and no eta-reduction makes it closed again. The collection leg being a
+/// projection is what distinguishes it from the same source expression in a comprehension,
+/// where the collection is closed in the loop binder and read once.
+#[test]
+fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
+    let value = final_mut_var_value(indoc! {r#"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                n := n + or_zero(m[r]?)
+        await_final(n)
+    "#});
+    assert_eq!(value, Value::Int(30));
+}
