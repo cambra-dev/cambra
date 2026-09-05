@@ -610,6 +610,24 @@ pub enum Builtin {
     /// scheme: its type `P_c ⇒ Union` is stamped on the node and the post-phase
     /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
     VariantWrap(FieldKey),
+
+    /// `collection_contains : (𝐼 ⤇ 𝐾) ⇒ (𝐾 ⇒ Bool)` — the **characteristic predicate of a
+    /// collection's outputs**. Applied to a key morphism it yields the predicate testing
+    /// membership in what that morphism produces, which is how a concrete keyed collection
+    /// states its domain (`src/ccl/design/collections.md`, "Representation: the key domain is
+    /// the key morphism's image"). Nothing enumerates the set; the image is tested.
+    ///
+    /// The `⤇` is load-bearing — membership in a collection's outputs is defined only where
+    /// the domain is the data. Unlike the other type-carried builtins this one has an
+    /// [`crate::ccl::infer::OperatorSchemes`] scheme, `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)`, because
+    /// `κ` is shared between the morphism's codomain and the predicate's domain.
+    ///
+    /// **Never executed.** Membership would be evaluated at a keyed lookup or an `x in s`
+    /// filter, neither of which exists. Until then it is a carried refinement term: planning
+    /// compiles it to point-free form like any other surviving predicate, but never lowers it
+    /// to a `Restrict`, so no `collection_contains` reaches op-conversion as a term. That
+    /// holds because nothing reifies it, not because a check rejects one that does.
+    CollectionContains,
 }
 
 impl Builtin {
@@ -653,6 +671,7 @@ impl Builtin {
             // carry it); this bare name is the fallback for other callers.
             Self::VariantProject(_) => "variant_project",
             Self::VariantWrap(_) => "variant_wrap",
+            Self::CollectionContains => "collection_contains",
         }
     }
 

@@ -124,6 +124,12 @@ pub struct OperatorSchemes {
     /// accumulator (`Mut(V, [0, 3])`) a type error rather than a silent success,
     /// since two histories of the same kind equate invariantly in their domain.
     await_final: PolyScheme,
+    /// `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)` — [`Builtin::CollectionContains`], the
+    /// characteristic predicate of a collection's outputs. Inline-built because `κ` is
+    /// shared between the argument's codomain and the result's domain, and that sharing
+    /// is what pins a keyed collection's key type from inside its own domain
+    /// refinement.
+    collection_contains: PolyScheme,
 }
 
 impl OperatorSchemes {
@@ -169,6 +175,23 @@ impl OperatorSchemes {
                     Some(elem),
                     epsilon,
                 ),
+            ),
+        );
+
+        // CollectionContains: ∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool). The argument is a **data**
+        // function: membership in a collection's outputs is defined only where the
+        // domain is the data, so the `⤇` rejects a capability here rather than leaving
+        // that to a convention. `κ` is shared between the morphism's codomain and the
+        // predicate's domain, which is what resolves the refinement base at the use
+        // site — a keyed collection's domain `{κ | __elem ▷ (𝑚 ▷ collection_contains)}`
+        // takes its key type from `𝑚` and needs nothing outside the predicate to pin it.
+        let iota = fresh_var(BODY_LEVEL);
+        let kappa = fresh_var(BODY_LEVEL);
+        let collection_contains = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(
+                Type::data_fun(iota, kappa.clone()),
+                fun(kappa, prim(BaseType::Bool)),
             ),
         );
 
@@ -276,6 +299,7 @@ impl OperatorSchemes {
 
         Self {
             box_intro,
+            collection_contains,
             bool_logic,
             concat,
             not_op,
@@ -358,6 +382,7 @@ impl OperatorSchemes {
     pub(super) fn builtin(&self, b: Builtin) -> Option<&PolyScheme> {
         match b {
             Builtin::Box => Some(&self.box_intro),
+            Builtin::CollectionContains => Some(&self.collection_contains),
             Builtin::FinalOrDefault => Some(&self.final_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             Builtin::GetPrevTxn => Some(&self.get_prev_txn),

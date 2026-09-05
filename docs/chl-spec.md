@@ -926,9 +926,10 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > otherwise. A `Set` has no subscript — its keys are its content, so test it with
 > `k in s` (below). A `FullMap` (§6.3) discharges every key by construction, so
 > `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
-> *Partiality*, §3). **Not yet implemented** — `c[k]` lowers as the lookup `c(k)`
-> today, but nothing discharges the index's membership, so a collection subscript is a
-> type error whatever the index.
+> *Partiality*, §3). **Partly implemented** — `c[k]` lowers as the lookup `c(k)`, so a
+> `FullMap` subscript answers `V` today, its key set being the key type itself. For every
+> other collection nothing discharges the index's membership, so the subscript is a type
+> error whatever the index.
 
 ### 3.10 Lambda
 
@@ -1587,7 +1588,7 @@ collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
 > collection — so a map iterates its values (as `groupby` results do) and a set
 > iterates `unit`. Entry/key iteration is the [Planned] work; it only *adds* the
 > type-directed element choice, so `for k -> v in m` is the form to write once it
-> lands. Design: [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
+> lands. Design: [collections.md, "Operations: how the trait layer is realized [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-is-realized-planned).
 
 **Iterations are unordered and may run in parallel** (§3): unless the
 body introduces a data dependency from one iteration to the next, the
@@ -1934,7 +1935,9 @@ marked one carries its status per "How to read this document".)
   unimplemented.
 - `FullMap(K, V)` — *total*-map type (**[Tentative]**, §6.3): every value
   of `K` is a key, so lookup yields `V` rather than `Option(V)` and has
-  no missing case. Not implemented.
+  no missing case. The annotation and its total lookup are implemented;
+  what obligation totality places on whatever builds the map is **[Open]**,
+  so the annotation is a promise the checker propagates rather than checks.
 - `Time` — a position in the commit order, what a transaction handle's
   `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
   itself a `Txn` value, and the two spellings are not reconciled.
@@ -2220,7 +2223,7 @@ are not.
 
 ### 6.3 Direction: collection types [Decided]
 
-CHL has five collection types, and they are distinct types rather than one type
+CHL has six collection types, and they are distinct types rather than one type
 in different clothes: each has its own lookup, its own iteration element
 (§4.6), and its own answer to whether it is ordered. How they are represented,
 and how the checker carries the distinction, is
@@ -2235,12 +2238,14 @@ and how the checker carries the distinction, is
   is no subscript, because the keys are the content.
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
   `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
+- `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]: V` needs no
+  proof of presence. It stands to `Map` as `Array` stands to `List`: the key set
+  is readable from the type rather than known only at runtime.
 - `Collection(T)` — some collection of `T`, saying nothing about which. Every
   other collection type widens to it.
 
-`FullMap(K, V)` is a `Map` that holds a value for every `K`, so `m[k]: V` needs
-no proof of presence. Totality is earned by refining the key type down to keys
-known to exist rather than by promising it over an open type:
+A `FullMap`'s totality is earned by refining the key type down to keys known to
+exist rather than by promising it over an open type:
 `FullMap({String where _ in ks}, Int)` is total because its domain says which
 strings it holds (§6.4). That makes "the lookup hits" an obligation on whatever
 builds the map. **[Open]**: what that obligation is — a literal must cover the

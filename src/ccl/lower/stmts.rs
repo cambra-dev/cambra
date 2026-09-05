@@ -1430,18 +1430,39 @@ fn lower_type_application(
             };
             Ok(Type::list_of(lower_type_expr(elem, ctx)?))
         }
-        // The **keyed** collections (`Map`/`Set`) are sums over `TypeKind::SubtypesOf`
-        // (`src/ccl/design/collections.md`, "The five collection types"). Deferred:
-        // Cambra has no keyed-collection *values* yet, so the type would be uninhabited.
-        "Map" | "Set" => Err(LoweringError::unsupported(
-            span,
-            format!(
-                "`{head}(…)` is deferred — Cambra has no {head}/keyed-collection \
-                 values yet, so the type would be uninhabited (see \
-                 `src/ccl/design/collections.md` \"The five collection types\"); \
-                 `Array(n, T)` and `List(T)` are available"
-            ),
-        )),
+        // `Map(K, V)` = `Σ (𝐷 : SubtypesOf(K)). 𝐷 ⤇ V` — a sum over the kind of every key
+        // domain on `K` (`Type::map_of`, `src/ccl/design/collections.md`, "The six
+        // collection types").
+        "Map" => {
+            let [k, v] = args else {
+                return Err(arity_err("a key and a value type"));
+            };
+            Ok(Type::map_of(
+                lower_type_expr(k, ctx)?,
+                lower_type_expr(v, ctx)?,
+            ))
+        }
+        // `FullMap(K, V)` = `(𝑘: K) ⤇ V` — a *total* map, and not a sum: its key set is
+        // readable from `K` instead of hidden behind a witness (`Type::full_map_of`,
+        // `src/ccl/design/collections.md`, "The six collection types"). Reaching a
+        // `Map(K, V)` from here is `box`, which is where that readability is given up.
+        "FullMap" => {
+            let [k, v] = args else {
+                return Err(arity_err("a key and a value type"));
+            };
+            Ok(Type::full_map_of(
+                lower_type_expr(k, ctx)?,
+                lower_type_expr(v, ctx)?,
+            ))
+        }
+        // `Set(K)` = `Map(K, unit)` — a keyed collection whose codomain is `unit`, so the
+        // key domain is the payload (`Type::set_of`).
+        "Set" => {
+            let [k] = args else {
+                return Err(arity_err("one key type"));
+            };
+            Ok(Type::set_of(lower_type_expr(k, ctx)?))
+        }
         // `Collection(T)` = `Σ (𝐷: Any). 𝐷 ⤇ T` — the whole-domain-witness sum (a
         // `TypeKind::Type` type-witness): an unordered, opaque-extent collection, the ⊤
         // of the kind order (`Type::collection_of`, design/collections.md).

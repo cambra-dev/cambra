@@ -2,11 +2,13 @@
 //! operators, function calls (aggregates, `groupby`, sources, general
 //! application), unary ops, feeds, defines, and literal constants.
 
+use std::rc::Rc;
+
 use super::*;
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Builtin, CompareKind, Expr, LogicKind, Name,
-        Type, TypedExprNode, UnaryOpKind,
+        Refinement, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
     },
     chl_parser::ast::{
@@ -53,15 +55,21 @@ pub(super) fn lower_call(
     };
 
     match name {
-        // groupby(c: I -> A, key_fn: A -> K) lowers to
-        //   λ k → cast({I | key_fn(c(__elem)) == k} ⇒ A, λ i → c(i))
+        // groupby(c: I ⤇ A, key: A → K) lowers to a keyed collection over this site's
+        // key domain (`src/ccl/design/collections.md`, "Lowering realization: the key
+        // binder states its domain"):
         //
-        // The cast wraps the (unrefined) inner λ i → c(i) under a function
-        // type whose domain carries the partition predicate.  The predicate
-        // is a bare boolean expression whose element is the implicit
-        // REFINEMENT_BINDER and which captures `k` from the outer lambda's
-        // scope — surfacing this as the canonical "dependent refinement" site
-        // without a dedicated AST shape.
+        //   λ (k : {K | __elem ▷ ((c ≫ key) ▷ collection_contains)}) →
+        //     cast(λ i → c(i), {I | key(c(__elem)) == k} ⤇ A)
+        //
+        // The inner cast is the dependent-refinement site, unchanged; the outer binder's
+        // domain names the same `c` and `key` the inner predicate does, so the key type
+        // resolves from the morphism's codomain rather than from outside.
+        // The arrow is a collection because the `data_fun` annotation says so, which
+        // `emit_node` stamps onto the arrow `emit_lambda` builds. Planning rewrites the
+        // shape to `Converse`, which discharges the present-key domain: the extraction
+        // morphism is typed at the bare `K` and the partition at the present-key domain,
+        // so the predicate rides on types and never reaches op-conversion as a term.
         "groupby" => {
             if args.len() != 2 {
                 return Err(LoweringError::unsupported(
@@ -72,19 +80,17 @@ pub(super) fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
-            // A partition function's **domain is the type of its keys**, and nothing
-            // in the lowered shape says so. One `SharedHole` states it, on the key
-            // application and on the domain of the group-by's own `data_fun`
-            // annotation — the two positions the claim is about. (`__gb_k` is an
-            // artifact of this desugaring, so the binder stays a plain `Hole` and
-            // takes its type from the annotation like any other parameter.)
-            //
-            // On the annotation's domain the edge is also **directional for free**:
-            // `bind_annotation` records `inferred <: ann` and a function type is
-            // contravariant in its domain, so this reduces to `key_ty <: ⟨the
-            // parameter⟩` — produced keys flow *into* the domain, rather than the two
-            // being forced equal.
-            let key_ty = ctx.fresh_shared_hole();
+            // The key binder states its domain rather than leaving it to be guessed:
+            // the keys `c ≫ key` produces. The key type inside it resolves from that
+            // morphism's codomain, so nothing outside the refinement has to pin it.
+            // Built first so the two terms it borrows can be *moved* into the main
+            // tree below: a `Clone` freshens ids, and a main-tree clone would leave
+            // its interior unexplained at the lowering boundary.
+            let key_dom = {
+                let key = ctx.fresh_shared_hole();
+                present_key_domain(&collection, &key_fn, key, func.span, ctx)
+            };
+
             // `bare_pred` (and the `collection` clone inside it) lives in the
             // cast target's refinement predicate — a type slot outside the
             // `walk_children` domain. It used to be left deliberately untagged
@@ -94,12 +100,13 @@ pub(super) fn lower_call(
             // clone is the reason this matters more than it used to: `Clone`
             // freshens, so that clone no longer aliases an already-tagged
             // main-tree id.
+            //
+            // Inner group: cast(λ i → c(i), {I | key(c(__elem)) == k} ⇒ A).
             let bare_pred = Expr::binop(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
                     key_fn,
-                )
-                .with_user_annotation(key_ty.clone()),
+                ),
                 BinOpKind::Compare(CompareKind::Equals),
                 Expr::var("__gb_k"),
             );
@@ -127,13 +134,14 @@ pub(super) fn lower_call(
                 Type::Hole,
                 crate::ccl::ty::FunKind::fresh_data(),
             );
-            let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
-            // A group-by is a **data function** (a keyed collection): stamp its
-            // outer function `Data` by provenance (the `data_fun` annotation is a
-            // concrete-kind stamp — see `emit_node`), so its kind is data-by-
-            // construction rather than guessed from its (scalar key) domain.
-            Ok(Expr::lambda("__gb_k", Type::Hole, cast)
-                .with_user_annotation(Type::data_fun(key_ty, Type::Hole)))
+            let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
+            // A group-by is a **data function** (a keyed collection), and the
+            // `data_fun` annotation is what says so: `emit_node` stamps that kind onto
+            // the arrow `emit_lambda` builds, which already carries the binder and this
+            // domain. So the kind is provenance, not a guess from the (scalar key)
+            // domain, and no term is needed to cross from `⇒` to `⤇`.
+            Ok(Expr::lambda("__gb_k", key_dom, inner)
+                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -286,6 +294,49 @@ pub(super) fn lower_call(
             Ok(Expr::apply(arg_tuple, callee))
         }
     }
+}
+
+/// The **present-key domain** of a re-keying: `{𝐾 | __elem ▷ ((c ≫ key) ▷
+/// collection_contains)}` — the keys the key morphism produces, which is how a keyed
+/// collection states its domain (`src/ccl/design/collections.md`, "Representation: the key
+/// domain is the key morphism's image").
+///
+/// `key` is the [`Type::SharedHole`] naming the key type, written into both the
+/// refinement's base and the morphism's codomain. The builtin's scheme alone does not pin
+/// it — `__elem` is *applied* to the characteristic predicate, so the shared variable takes
+/// the base as a lower bound only, and `Map(String, _)` over `Int` keys would be accepted.
+///
+/// Every re-keying producer stamps its own key binder with this, because the gate on
+/// entering a keyed Σ runs at constraint-emission time and a domain that only became
+/// concrete at coalesce could not discharge it (same doc, "Keyed entry needs the key domain
+/// written down at lowering").
+fn present_key_domain(
+    collection: &Expr,
+    key_fn: &Expr,
+    key: Type,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Type {
+    // `c ≫ key`, the morphism whose outputs are this collection's keys. Composed
+    // rather than written as the applied `(__elem ▷ c) ▷ key` the group predicate
+    // uses: the domain is about the morphism itself, not about one element's image
+    // under it, and a composition is the standard shape refinement reasoning will
+    // meet elsewhere.
+    // One annotation, two jobs. The chain's **kind** is decided where it is built, like
+    // every other minted `Compose`: `c ≫ key` re-images the collection's own domain, so
+    // it is a data function rather than the `Compute` default. Its **codomain** is the
+    // key type, and the caller's shared hole written there is what equates it with the
+    // refinement's base.
+    let morphism = Expr::compose(vec![collection.clone(), key_fn.clone()])
+        .with_user_annotation(Type::data_fun(Type::Hole, key.clone()));
+    let characteristic = Expr::apply(morphism, Expr::builtin(Builtin::CollectionContains));
+    // The domain's nodes are minted here and live in a type slot, outside the
+    // `walk_children` domain the lowering fold covers — so the fold cannot explain
+    // them and they reach the boundary as `Leak::Unexplained`. Sweeping the predicate
+    // is what records them, exactly as the group predicate is swept at its own site.
+    let predicate = Expr::apply(Expr::var(Name::elem()), characteristic);
+    ctx.tag_predicate(&predicate, span, "lower.present_key_domain");
+    Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only
@@ -710,25 +761,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[rstest]
-    // Variable collection and inline key lambda
+    // Variable collection and inline key lambda. The outer binder's domain is
+    // membership in what the key morphism `xs ≫ key` produces, and the `data_fun`
+    // annotation on the lambda (not rendered here) is what makes it a collection.
     #[case(
         "groupby(xs, \\x -> x)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "λ __gb_k : {_#0 | __elem ▷ (([1, 2, 3] ≫ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

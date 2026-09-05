@@ -2581,6 +2581,36 @@ impl Type {
         Type::sum_over(TypeKind::SubtypesOf(Box::new(key)), None, value)
     }
 
+    /// The type of a **set**: [`map_of`](Self::map_of) at a `unit` value, so the key domain
+    /// is the payload and the codomain carries nothing.
+    pub fn set_of(key: Type) -> Self {
+        Type::map_of(key, Type::Base(BaseType::Unit))
+    }
+
+    /// The type of a **full map**: the data function `(𝑘: 𝐾) ⤇ 𝑉`, holding a value for
+    /// every key of `𝐾` so a lookup needs no proof of presence. Not a sum
+    /// (`src/ccl/design/collections.md`, "The six collection types").
+    ///
+    /// **A Pi, always.** A full map's value may depend on its key — a `groupby`'s group is
+    /// `{𝐼 | key(𝑖) == 𝑘} ⤇ 𝑉` — so the type declares the binder that dependence names.
+    /// Without one the codomain edge has no name to put the initializer's binder in
+    /// correspondence with (`constrain_go`'s `cod_sl`), and the dependent codomain lands as
+    /// a bound naming a binder the holder's telescope does not hold
+    /// (`src/ccl/design/type-inference.md`, "The invariant"). A codomain that does not
+    /// reference the binder is an ordinary function either way, so the Pi costs a
+    /// non-dependent full map nothing.
+    ///
+    /// The binder is **freshly minted**: two annotation sites are two binding sites and the
+    /// closure check is a lookup by uid.
+    pub fn full_map_of(key: Type, value: Type) -> Self {
+        Type::pi_kinded(
+            crate::ccl::Name::fresh("__map_k"),
+            key,
+            value,
+            FunKind::Data(None),
+        )
+    }
+
     /// The type of a **collection**: the dependent sum `Σ (𝐷: Any). 𝐷 ⤇ elem` — a
     /// *type*-witness of [`TypeKind::Type`] (the universe of types). Its domain is an
     /// unknown, unordered, opaque domain, which is what makes it the ⊤ of the kind
