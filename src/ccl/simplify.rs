@@ -48,7 +48,6 @@
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 
 use crate::ccl::ccl_utils::{PredMemo, apply_primitive, is_builtin, walk_refined_predicates_mut};
-use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{id, zip_pair};
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
@@ -286,21 +285,12 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     // iteration sources, so they fire regardless of any `iterate` present.
     // (They also preserve the subtree's iteration set, so `contains_iteration`
     // — computed before they run — is still accurate at the guard below.)
-    changed |= check(
-        ruled("simplify.compose_identity", expr, try_compose_identity),
+    changed |= ruled("simplify.compose_identity", expr, try_compose_identity);
+    changed |= ruled("simplify.flatten_compose", expr, try_flatten_compose);
+    changed |= ruled(
+        "simplify.string_add_to_concat",
         expr,
-    );
-    changed |= check(
-        ruled("simplify.flatten_compose", expr, try_flatten_compose),
-        expr,
-    );
-    changed |= check(
-        ruled(
-            "simplify.string_add_to_concat",
-            expr,
-            try_string_add_to_concat,
-        ),
-        expr,
+        try_string_add_to_concat,
     );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
@@ -312,44 +302,23 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     // what lets the rule set run correctly at any point in the pipeline — the
     // invariant is a property of the *nodes*, not of pass timing.
     if !contains_iteration {
-        changed |= check(ruled("simplify.const_reduce", expr, try_const_reduce), expr);
-        changed |= check(
-            ruled("simplify.product_beta_fst", expr, try_product_beta_fst),
+        changed |= ruled("simplify.const_reduce", expr, try_const_reduce);
+        changed |= ruled("simplify.product_beta_fst", expr, try_product_beta_fst);
+        changed |= ruled("simplify.product_beta_snd", expr, try_product_beta_snd);
+        changed |= ruled(
+            "simplify.literal_tuple_projection",
             expr,
+            try_literal_tuple_projection,
         );
-        changed |= check(
-            ruled("simplify.product_beta_snd", expr, try_product_beta_snd),
+        changed |= ruled("simplify.ccc_universal", expr, try_ccc_universal);
+        changed |= ruled("simplify.exponential_beta", expr, try_exponential_beta);
+        changed |= ruled("simplify.exponential_eta", expr, try_exponential_eta);
+        changed |= ruled("simplify.const_apply", expr, try_const_apply);
+        changed |= ruled("simplify.product_eta", expr, try_product_eta);
+        changed |= ruled(
+            "simplify.zip_distribute_compose",
             expr,
-        );
-        changed |= check(
-            ruled(
-                "simplify.literal_tuple_projection",
-                expr,
-                try_literal_tuple_projection,
-            ),
-            expr,
-        );
-        changed |= check(
-            ruled("simplify.ccc_universal", expr, try_ccc_universal),
-            expr,
-        );
-        changed |= check(
-            ruled("simplify.exponential_beta", expr, try_exponential_beta),
-            expr,
-        );
-        changed |= check(
-            ruled("simplify.exponential_eta", expr, try_exponential_eta),
-            expr,
-        );
-        changed |= check(ruled("simplify.const_apply", expr, try_const_apply), expr);
-        changed |= check(ruled("simplify.product_eta", expr, try_product_eta), expr);
-        changed |= check(
-            ruled(
-                "simplify.zip_distribute_compose",
-                expr,
-                try_zip_distribute_compose,
-            ),
-            expr,
+            try_zip_distribute_compose,
         );
     }
 
@@ -391,19 +360,6 @@ fn ruled(
         crate::ccl::provenance::Nature::Machinery,
     );
     rule(expr)
-}
-
-fn check(changed: bool, expr: &Expr) -> bool {
-    // Only re-typecheck when a rewrite actually fired: the assertion validates
-    // that a *transformation* preserved typing, so an untouched expression
-    // (already valid on the way in) needs no re-check. Skipping the no-op case
-    // avoids re-typechecking every subexpression after every rewrite *attempt*
-    // (10 per node per fixpoint pass), which otherwise dominates simplify in
-    // debug builds.
-    if changed {
-        debug_typecheck(expr);
-    }
-    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,10 +1333,10 @@ mod tests {
     /// projection — the rule must leave it alone.
     ///
     /// (Out-of-range and non-product projections can't reach `simplify`:
-    /// inference rejects them, and the unified `typecheck` — run by
-    /// `debug_typecheck` inside `simplify` — now enforces the `Proj` input shape.
-    /// So the scaffolding here is kept well-typed; the only thing under test is
-    /// that a non-literal argument leaves the rewrite untriggered.)
+    /// inference rejects them, and the pass-boundary typecheck enforces the
+    /// `Proj` input shape. The scaffolding here is kept well-typed; the only
+    /// thing under test is that a non-literal argument leaves the rewrite
+    /// untriggered.)
     #[test]
     fn simplify_literal_tuple_projection_non_literal_argument_is_noop() {
         let xs_ty = Type::Tuple(vec![int_ty()]);

@@ -27,7 +27,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
-use crate::ccl::infer::solver::Derivation;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -1304,7 +1303,7 @@ fn collect_type_errors(
 /// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    super::check(expr, Derivation::PostPass)
+    super::check(expr)
 }
 
 /// [`typecheck`] for the window between inference and `channelize`:
@@ -1313,22 +1312,6 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreChannelize`]).
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_as(expr, Derivation::PostPass)
-}
-
-/// [`check_pre_channelize`] for a **sub-tree cut from its context**, which is
-/// `debug_typecheck`'s per-operation probe and nothing else.
-///
-/// The difference is the telescope closure invariant, not the typing rules: a
-/// sub-tree's refinements reference binders the enclosing tree holds, and no walk of
-/// the sub-tree can enter them, so recording such a bound is expected here and a
-/// record-time internal error over a whole tree
-/// (`src/ccl/design/type-inference.md`, "The invariant").
-pub fn check_pre_channelize_sub_tree(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_as(expr, Derivation::SubTree)
-}
-
-fn check_pre_channelize_as(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
@@ -1340,7 +1323,7 @@ fn check_pre_channelize_as(expr: &Expr, derivation: Derivation) -> Result<(), Ve
         Strictness::Strict
     };
     check_annotated(expr, strictness)?;
-    crate::ccl::infer::check(expr, derivation)
+    crate::ccl::infer::check(expr)
 }
 
 /// Whether the tree carries pre-channelize artifacts: a `Defer`/`Feed`/
@@ -1349,21 +1332,18 @@ fn check_pre_channelize_as(expr: &Expr, derivation: Derivation) -> Result<(), Ve
 /// `Feed`/`ChanDom` (and `Overwrite`-history `Infer`-domain) types the pre-channelize check
 /// tolerates.
 ///
-/// The transient-*type* check matters because a defer-read *alias* (`Var(x) :
-/// feed(_)`) carries a `Feed` type with no defer *node*. Inline runs before
-/// channelize, so its beta-reduction ([`crate::ccl::lambda_elim::substitute`])
-/// can hand such an alias to [`debug_typecheck`] as a standalone subtree;
-/// keying only on defer nodes would wrongly check it strictly and reject the
-/// legitimate channel type. `Mut` is analogous: a mutable reference carries a
-/// `Mut` type whose `Infer` domain the pre-channelize relaxation must tolerate
-/// until the unified phase resolves it.
+/// The type check matters because a defer-read alias (`Var(x) : feed(_)`)
+/// carries a `Feed` type with no defer node; keying only on defer nodes would
+/// check such a tree strictly and reject the legitimate channel type. `Mut` is
+/// analogous: a mutable reference carries a `Mut` type whose `Infer` domain the
+/// pre-channelize relaxation must tolerate until the unified phase resolves it.
 ///
 /// The transient type can live on a **binder slot** rather than a node type — a
 /// dead mutable variable `let cnt: Mut(Int, _) = 0 in (cnt := 1)` carries `Mut` only on the
 /// `Let` binding (the `MutWrite` target is a bare `Name`, the value is `Int`,
 /// the `Let` node's type is `Unit`). The strict checker inspects binder types
 /// (`check_binder`), so the selector must too, or it under-detects and drives
-/// such a subtree to the strict arm — a spurious `debug_typecheck` panic.
+/// such a tree to the strict arm.
 fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
     fn ty_has_transient(ty: &Type) -> bool {
         if matches!(ty, Type::History { .. }) {
@@ -1709,41 +1689,6 @@ fn check_mut_write_targets_go(
         });
     }
     expr.walk_children(|c| check_mut_write_targets_go(c, muts, errors));
-}
-
-/// Per-operation post-rewrite typecheck — a **debugging aid**, off by default.
-///
-/// Pass-internal helpers (lambda elimination, substitution, simplify) call this
-/// after each rewrite to localize *which* operation first produced an ill-typed
-/// tree. Routes through [`check_pre_channelize`], which self-selects strictness: a
-/// (sub)tree carrying defer artifacts (a `Feed`/`Infer` channel type — which
-/// `substitute` now sees, since inline runs before channelize) is checked at the
-/// relaxed `PreChannelize` level; a fully-channelized tree is checked strictly (the
-/// `typecheck` bar).
-///
-/// Gated behind the opt-in `deep-typecheck` feature. `compile_program` already
-/// runs [`check_pre_channelize`] at every *pass boundary* — those walls are the
-/// always-on correctness net — so this per-op version only adds localization.
-/// It is O(subtree) and fires once per rewrite, so on nested comprehensions it
-/// is superlinear (O(rewrites) × O(subtree)) and dominated debug/test compile
-/// time; release built it out entirely. Enable it (`cargo test --features
-/// deep-typecheck`) to bisect a miscompile to its introducing operation.
-pub fn debug_typecheck(expr: &Expr) {
-    #[cfg(feature = "deep-typecheck")]
-    assert_eq!(
-        check_pre_channelize_sub_tree(expr),
-        Ok(()),
-        "Failed post-transform typecheck: {}",
-        crate::ccl::symbolic::symbolic_typed(expr)
-    );
-    #[cfg(not(feature = "deep-typecheck"))]
-    let _ = expr;
-}
-
-// Helper to run typechecking inline when building an Expr
-pub fn dbg_typecheck_mv(expr: Expr) -> Expr {
-    debug_typecheck(&expr);
-    expr
 }
 
 // ---------------------------------------------------------------------------
@@ -3357,7 +3302,7 @@ mod tests {
     fn typecheck_surfaces_a_propagated_error() {
         let empty_case =
             Expr::match_expr(Expr::lit(Lit::Int(1)), Vec::new()).with_ty(Type::Base(BaseType::Int));
-        let errs = super::super::check(&empty_case, Derivation::PostPass)
+        let errs = super::super::check(&empty_case)
             .expect_err("an empty Case must be reported, not silently accepted");
         assert!(
             errs.iter()

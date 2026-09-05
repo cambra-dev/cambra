@@ -47,7 +47,6 @@ use crate::ccl::ccl_utils::{
     is_free_in_value, make_cast, refine_with, strip_refinements, synthesize_arm_predicate,
     typed_compose,
 };
-use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::provenance;
 use crate::ccl::simplify::simplify;
 use crate::ccl::ty::FunKind;
@@ -147,7 +146,7 @@ pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
 /// (`Unit`) rather than minting a second one.
 pub(crate) fn typed_tuple(elts: Vec<Expr>) -> Expr {
     let ty = Type::tuple(elts.iter().map(|e| e.ty.clone()).collect());
-    dbg_typecheck_mv(Expr::tuple(elts).with_ty(ty))
+    Expr::tuple(elts).with_ty(ty)
 }
 
 /// Build `⟨f, g⟩`: the product/fanout `zip(f, g)` using the [`Builtin::Zip`]
@@ -160,7 +159,7 @@ pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
     let inner_tuple = typed_tuple(vec![f, g]);
     let zip_fn_ty = Type::compute_fun_or_hole(&inner_tuple.ty, &result_ty);
     let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
-    dbg_typecheck_mv(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
+    Expr::apply(inner_tuple, zip_var).with_ty(result_ty)
 }
 
 /// Build `curry(f)`: `f ▷ curry` = `Apply { argument: f, function: Builtin(Curry) }`.
@@ -209,10 +208,8 @@ pub fn const_(c: Expr) -> Expr {
 /// the same `Name`, so the discipline is still load-bearing); capture is
 /// impossible under the Barendregt convention and the engine asserts it.
 pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
-    debug_typecheck(&expr);
     let mut expr = expr;
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
-    debug_typecheck(&expr);
     expr
 }
 
@@ -758,7 +755,6 @@ fn elim_lambda_impl(
     fun_kind: FunKind,
 ) -> Result<Expr, LambdaElimError> {
     log::trace!("elim_lambda: eliminating λ {param}: {}", symbolic(&body));
-    debug_typecheck(&body);
     // Names the lambda **body**, not the enclosing `Lambda`: one call per body
     // node, each replacing that node with its own scaffolding — naming the
     // `Lambda` would collapse a whole body onto one parent. The four desugaring
@@ -799,7 +795,6 @@ fn elim_lambda_impl(
         let const_fn_ty = Type::compute_fun_or_hole(&body.ty, &result_ty);
         let const_var = Expr::builtin(Builtin::Const).with_ty(const_fn_ty);
         let result = Expr::apply(body, const_var).with_ty(result_ty);
-        debug_typecheck(&result);
         return Ok(result);
     }
 
@@ -821,14 +816,13 @@ fn elim_lambda_impl(
         let const_fn =
             Expr::builtin(Builtin::Const).with_ty(Type::fun(body.ty.clone(), result_pi.clone()));
         let result = Expr::apply(body, const_fn).with_ty(result_pi);
-        debug_typecheck(&result);
         return Ok(result);
     }
 
     let TypedExpr {
         node: body_node, ..
     } = body;
-    let result = match body_node {
+    match body_node {
         // Identity: λ x → x  ⟹  id
         TypedExprNode::Var(ref name) if name == param => Ok(id().with_ty(result_ty)),
 
@@ -891,7 +885,7 @@ fn elim_lambda_impl(
             // abstraction, so it carries the enclosing function's kind: currying a
             // collection does not make it a capability.
             let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
-            Ok(dbg_typecheck_mv(curry_at(inner_elim, result_ty)))
+            Ok(curry_at(inner_elim, result_ty))
         }
 
         // Cast-wrapped lambda: `λ param → cast(λ y → body, {𝐷 | 𝑝} ⇒ 𝑉)` — the
@@ -977,7 +971,7 @@ fn elim_lambda_impl(
                 Expr::new(TypedExprNode::Cast { value, target }).with_ty(body_ty.clone());
             let const_fn = Expr::builtin(Builtin::Const)
                 .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
-            return Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi));
+            Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi))
         }
 
         // Application: λ x → e ▷ f  ⟹  ⟨λx→e, λx→f⟩ ≫ apply
@@ -1559,11 +1553,7 @@ fn elim_lambda_impl(
         body => Err(LambdaElimError::Unsupported(format!(
             "unsupported body kind in lambda elimination for param '{param}' in body {body:?}"
         ))),
-    };
-    if let Ok(e) = &result {
-        debug_typecheck(e);
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,7 +1584,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         );
     }
     log::trace!("elim_lambdas: eliminating {}", symbolic(&expr));
-    debug_typecheck(&expr);
     // Names the node this call was handed. Every arm below rewrites it and every
     // node the pass touches passes through here exactly once, so each arm's
     // products — combinator scaffolding, the catch-all's structural rebuild —
@@ -1708,7 +1697,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let refined_source = target_elim.with_ty(refined_ty);
             let body_elim = elim_lambda(ctx, &param.name, &param.ty, true_body)?;
             let result = typed_compose(vec![refined_source, elim_lambdas(ctx, body_elim)?]);
-            debug_typecheck(&result);
             return Ok(result);
         }
 
@@ -1724,7 +1712,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let mut desugared = Expr::apply(tuple, fn_var);
             desugared.ty = ty;
-            debug_typecheck(&desugared);
             Ok(desugared)
         }
 
@@ -1741,7 +1728,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 .collect::<Result<_, _>>()?;
             let mut result = Expr::copair(elim_ops);
             result.ty = ty;
-            debug_typecheck(&result);
             Ok(result)
         }
 
@@ -1754,7 +1740,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let mut desugared = Expr::apply(inner_elim, fn_var);
             desugared.ty = ty;
-            debug_typecheck(&desugared);
             Ok(desugared)
         }
 
@@ -1762,9 +1747,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let input2 = elim_lambdas(ctx, *input)?;
             let agg_builtin = Builtin::for_aggregate(kind);
             let agg_ty = Type::compute_fun_or_hole(&input2.ty, &ty);
-            Ok(dbg_typecheck_mv(
-                Expr::apply(input2, Expr::builtin(agg_builtin).with_ty(agg_ty)).with_ty(ty),
-            ))
+            Ok(Expr::apply(input2, Expr::builtin(agg_builtin).with_ty(agg_ty)).with_ty(ty))
         }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
@@ -1797,7 +1780,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             } else {
                 build_value_case_cform(ctx, branches, ty)?
             };
-            debug_typecheck(&result);
             Ok(result)
         }
 
@@ -1813,7 +1795,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             .all(|(i, b)| b.pattern.is_some() || i + 1 == branches.len()) =>
         {
             let result = build_scrutinee_case_cform(ctx, *scrut, branches, ty)?;
-            Ok(dbg_typecheck_mv(result))
+            Ok(result)
         }
 
         // Control-flow constructs not yet supported.
@@ -1845,12 +1827,11 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let mut expr = Expr::new(node).with_ty(ty);
             expr.user_annotation = user_annotation;
             expr.try_map_children(|child| elim_lambdas(ctx, child))?;
-            Ok(dbg_typecheck_mv(expr))
+            Ok(expr)
         }
     };
+    #[cfg(debug_assertions)]
     if let Ok(e) = &result {
-        debug_typecheck(e);
-        #[cfg(debug_assertions)]
         assert!(
             original_ty.without_pi_names() == e.ty.without_pi_names(),
             "{} vs {}",
@@ -2375,10 +2356,10 @@ mod tests {
     ///
     /// The typecheck is the load-bearing half: it confirms the emitted arms are
     /// well-typed `≫`-chains and not merely well-shaped ones — that
-    /// `variant_project(cᵢ)`'s stamped `scrut_ty ⇒ Pᵢ` really does compose
-    /// between the eliminated scrutinee and the eliminated arm body. `run`
-    /// itself only checks this under the opt-in `deep-typecheck` feature, so
-    /// asking here keeps it checked in every configuration.
+    /// `variant_project(cᵢ)`'s stamped `scrut_ty ⇒ Pᵢ` composes between the
+    /// eliminated scrutinee and the eliminated arm body. `run` checks nothing
+    /// itself: the pass-boundary walls in `compile_program` do, and a unit test
+    /// calling `run` directly sits below them.
     fn elim_and_typecheck(binder: &str, binder_ty: Type, body: Expr) -> String {
         let result = run(Expr::lambda(binder, binder_ty, body)).expect("lambda elimination");
         assert_eq!(

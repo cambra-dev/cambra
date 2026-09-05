@@ -29,11 +29,6 @@ ci_clippy_release() { cargo clippy -p cambra --release --all-targets -- -D warni
 # and fails `cargo build --lib`. A configuration nothing compiles is a
 # configuration that rots.
 ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
-# `DEEP_TYPECHECK=1` turns on the opt-in per-operation typecheck (see the
-# `deep-typecheck` feature). The GitHub workflow sets it so automated runs keep
-# exercising that check; it stays off for a bare local `./ci.sh` because it is
-# superlinear on nested comprehensions (that cost is why it is gated).
-#
 # `CAMBRA_REFINEMENT_ORDER=reverse` (read at runtime, debug builds only) flips
 # the physical order of every refinement set. The workflow runs the suite
 # both ways: set semantics makes that order meaningless by contract, but a
@@ -41,7 +36,7 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # first-inserted of two `eq`-equal refinements — compiles clean either way. Same
 # argument as `ci_clippy_lib`: a configuration nothing runs is a
 # configuration that rots.
-ci_test() { cargo test -p cambra -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
+ci_test() { cargo test -p cambra -q; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list
 # (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
