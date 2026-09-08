@@ -327,10 +327,10 @@ fn assert_rewrite_shape(node: &Value, at: &str) {
 /// entry of this same pane's `nodes`, no id appears twice, and every node
 /// carries the node shape its pane's `kind` mandates.
 ///
-/// The two pane shapes name their walk starts under different keys, and each
-/// key is absent on the other shape: a tree pane ships `root`, one id by
-/// construction, and an operator pane ships `unowned`, the nodes no `value`
-/// edge names.
+/// A tree pane ships `root`, one id by construction. An operator pane ships no
+/// start set at all: the nodes no `value` edge names are what a walk starts
+/// from, and the edges already say which those are, so this derives them and
+/// checks that they reach the whole table.
 ///
 /// The closure check is what the table buys over the nested tree it
 /// replaced: an edge a consumer follows always lands on an entry it holds.
@@ -361,33 +361,17 @@ fn assert_node_table(pane: &Value, at: &str) {
             "{at}.nodes[{i}] repeats node id {id} — the table holds each node once"
         );
     }
-    // The walk starts, under the key the pane's shape names them by. Neither
-    // key ships on the other shape: a tree's start is singular by type, so
-    // nothing has to assert that it is one id.
     if kind == OPERATOR_PANE_KIND {
-        assert!(
-            pane.get("root").is_none(),
-            "{at} is an operator pane, which ships `unowned` and no `root`; got {}",
-            pane["root"]
-        );
-        let unowned = pane["unowned"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{at}.unowned is an array"));
-        assert!(!unowned.is_empty(), "{at}.unowned is non-empty");
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for (i, r) in unowned.iter().enumerate() {
-            let id = r
-                .as_u64()
-                .unwrap_or_else(|| panic!("{at}.unowned[{i}] is a number"));
+        // Superseded by the derivation below: a shipped start set could only
+        // repeat, or contradict, what the edges say.
+        for retired in ["root", "unowned"] {
             assert!(
-                ids.contains(&id),
-                "{at}.unowned[{i}] {id} names an entry of {at}.nodes"
-            );
-            assert!(
-                seen.insert(id),
-                "{at}.unowned repeats {id} — a node is unowned once"
+                pane.get(retired).is_none(),
+                "{at} is an operator pane, which ships no `{retired}`; got {}",
+                pane[retired]
             );
         }
+        assert_value_edges_reach_every_node(pane, at, &ids);
     } else {
         assert!(
             pane.get("unowned").is_none(),
@@ -412,6 +396,61 @@ fn assert_node_table(pane: &Value, at: &str) {
         // The rewrite tag is one channel with one meaning on both shapes.
         assert_rewrite_shape(n, &node_at);
     }
+}
+
+/// Assert every node of an operator pane is reachable along `value` edges from
+/// the nodes no `value` edge names.
+///
+/// That set is the walk's start and is derived here rather than shipped. Two
+/// defects fail this: a node reachable only along a `share` edge, which no view
+/// draws as a row and no selection reaches, and a cycle among the `value` edges,
+/// whose members no start set can enter.
+fn assert_value_edges_reach_every_node(
+    pane: &Value,
+    at: &str,
+    ids: &std::collections::HashSet<u64>,
+) {
+    let nodes = pane["nodes"].as_array().expect("nodes is an array");
+    let value_edges = |n: &Value| -> Vec<u64> {
+        n["inputs"]
+            .as_array()
+            .map(|es| {
+                es.iter()
+                    .filter(|e| e["kind"] == "value")
+                    .filter_map(|e| e["subscribed"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let owned: std::collections::HashSet<u64> = nodes.iter().flat_map(value_edges).collect();
+    let subscribed_by: std::collections::HashMap<u64, Vec<u64>> = nodes
+        .iter()
+        .filter_map(|n| n["nodeId"].as_u64().map(|id| (id, value_edges(n))))
+        .collect();
+
+    let mut stack: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|id| !owned.contains(id))
+        .collect();
+    assert!(
+        !stack.is_empty() || nodes.is_empty(),
+        "{at} has nodes but every one of them is owned, so no walk of it can start"
+    );
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        stack.extend(subscribed_by.get(&id).into_iter().flatten().copied());
+    }
+    let stranded: Vec<u64> = ids.difference(&seen).copied().collect();
+    assert!(
+        stranded.is_empty(),
+        "{at}: {} node(s) unreachable along the value edges from the nodes nothing owns, so \
+         nothing draws them: {stranded:?}",
+        stranded.len()
+    );
 }
 
 /// Assert one entry of an **operator** pane's node table: the scalar fields,

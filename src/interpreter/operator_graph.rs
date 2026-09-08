@@ -170,7 +170,6 @@ pub enum GraphNode {
 #[derive(Clone, Debug, Default)]
 pub struct OperatorGraph {
     nodes: Vec<GraphNode>,
-    unowned: Vec<NodeId>,
     /// Read sites per registered source, accumulated during the walk and spent by
     /// [`materialize_sources`].
     ///
@@ -195,22 +194,30 @@ impl OperatorGraph {
         &self.nodes
     }
 
-    /// The nodes no `Value` edge names, which is where a walk of the
+    /// The nodes no `Value` edge subscribes, which is where a walk of the
     /// subscription forest starts.
     ///
-    /// Three kinds of node qualify. A **sink**: the conversion boundary supplies
-    /// those, since only the caller knows which operators it compiled a field
-    /// to. A **fan input**: the `Rc<FanOut>` holding it is dropped when
-    /// conversion ends, so only its branches survive and nothing owns the input
-    /// itself — and a binding whose variable is never used has a fan with no
-    /// branches at all, so its input is reached by no edge at all. A **source**:
-    /// a source is a graph node rather than a `TileOperator`, so nothing
-    /// subscribes it and a reader's edge to it is a `Share`.
+    /// Derived from the edges rather than recorded. A node's owner is the one
+    /// `Value` edge that names it, so the edge table already answers this and a
+    /// stored copy could only disagree with it.
+    ///
+    /// Three kinds of node qualify. A **sink**: nothing subscribes it. A **fan
+    /// input**: the `Rc<FanOut>` holding it is dropped when conversion ends, so
+    /// only its branches survive, and each names it with a `Share` — and a
+    /// binding whose variable is never used has a fan with no branches at all,
+    /// so nothing names it. A **source**: a source is a graph node rather than a
+    /// `TileOperator`, so nothing subscribes it and a reader's edge to it is a
+    /// `Share`.
     ///
     /// Every node of the graph is reachable from here along `Value` edges alone,
     /// which is what [`assert_graph_invariants`] pins.
-    pub(crate) fn unowned(&self) -> &[NodeId] {
-        &self.unowned
+    pub(crate) fn walk_starts(&self) -> Vec<NodeId> {
+        let owned: std::collections::HashSet<NodeId> = self
+            .edges()
+            .filter(|(_, e)| matches!(e.kind, EdgeKind::Value { .. }))
+            .map(|(_, e)| e.subscribed)
+            .collect();
+        self.ids().filter(|id| !owned.contains(id)).collect()
     }
 
     /// Every node's id.
@@ -251,7 +258,7 @@ impl OperatorGraph {
 ///   its owner existed, and every such cycle also runs through a fan branch's
 ///   `Share` hop, so no cycle is made of value edges alone. The renderer's
 ///   absence of a cycle guard rests on this.
-/// * **Every node is reachable from [`OperatorGraph::unowned`] along the `Value`
+/// * **Every node is reachable from [`OperatorGraph::walk_starts`] along the `Value`
 ///   edges.** That relation is the one every consumer walks — the renderer draws
 ///   value edges as the child relation and share edges as reference leaves — so a
 ///   node it misses is a node nothing draws. An unreachable node is one a
@@ -282,11 +289,11 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
         }
     }
 
-    // `Value` edges only, from `unowned`: that is the relation a consumer walks,
+    // `Value` edges only, from `walk_starts`: that is the relation a consumer walks,
     // and every node nothing owns — a sink, a fan input, a source — is in
-    // `unowned` already, so no share edge has to be followed to reach one.
+    // `walk_starts` already, so no share edge has to be followed to reach one.
     let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    let mut stack: Vec<NodeId> = graph.unowned().to_vec();
+    let mut stack: Vec<NodeId> = graph.walk_starts();
     let by_id: std::collections::HashMap<NodeId, &GraphNode> = graph
         .nodes()
         .iter()
@@ -324,7 +331,7 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
         .collect();
     assert!(
         stranded.is_empty(),
-        "operator graph: {} node(s) unreachable from `unowned` along the value edges — a \
+        "operator graph: {} node(s) unreachable from `walk_starts` along the value edges — a \
          construction site built an operator and dropped it: {stranded:?}",
         stranded.len()
     );
@@ -471,11 +478,6 @@ pub(crate) fn materialize_sources() {
                 id,
                 name: name.clone(),
             });
-            // Unowned by the same definition as a sink or a fan input: no
-            // `Value` edge names it, because a reader subscribes operators and a
-            // source is not one. Listing it is what puts it inside the walk
-            // every consumer runs, rather than reachable only along a `Share`.
-            graph.unowned.push(id);
             for read in &reads {
                 // Shared, not owned: one registered source may be read by
                 // several expressions, and each reader holds it through an `Rc`
@@ -511,7 +513,6 @@ pub(crate) fn record_sink(name: &str, subscribed: Option<NodeId>) -> Option<Node
                 subscribed,
             },
         });
-        graph.unowned.push(id);
     });
     Some(id)
 }
@@ -537,22 +538,6 @@ pub(crate) fn drop_operator(op: &dyn TileOperator) {
                 GraphNode::Operator { id: node, .. } => *node != id,
                 GraphNode::Source { .. } | GraphNode::Sink { .. } => true,
             });
-            graph.unowned.retain(|node| *node != id);
-        }
-    });
-}
-
-/// Record a fan input as unowned.
-///
-/// Called by `FanOut`'s constructor, which is the only place that knows an
-/// operator has been moved into a fan and so is owned by no operator.
-pub(crate) fn record_fan_input(id: Option<NodeId>) {
-    let Some(id) = id else {
-        return;
-    };
-    ACTIVE_GRAPH.with(|slot| {
-        if let Some(graph) = slot.borrow_mut().as_mut() {
-            graph.unowned.push(id);
         }
     });
 }
@@ -602,7 +587,7 @@ fn push_edge(
         }
     }
     // Losing the edge here surfaces much later, as the subscribed node being
-    // unreachable from `unowned`, which names neither end of the edge that went
+    // unreachable from `walk_starts`, which names neither end of the edge that went
     // missing.
     debug_assert!(
         false,

@@ -4247,12 +4247,6 @@
       "id": "post-conversion",
       "label": "IR (POST-CONVERSION)",
       "kind": "operators",
-      "unowned": [
-        417,
-        424,
-        428,
-        429
-      ],
       "nodes": [
         {
           "label": "IterateExtent",

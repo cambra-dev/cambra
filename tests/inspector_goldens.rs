@@ -484,18 +484,21 @@ fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
     let source = sources[0];
     let source_id = source["nodeId"].as_u64().expect("nodeId is a number");
 
-    // Nothing subscribes a source, so it is unowned like a sink or a fan input.
-    // Listing it is what puts it inside the value-edge walk every consumer runs;
-    // omitted, it is a node the pane holds and no walk reaches.
-    let unowned: Vec<u64> = pane["unowned"]
+    // Nothing subscribes a source with a `value` edge, so a walk of the value
+    // edges starts at it rather than reaching it. Were it owned, it would be a
+    // node the pane holds that no view draws and no selection reaches.
+    let owned: Vec<u64> = pane["nodes"]
         .as_array()
-        .expect("an operator pane ships unowned")
+        .expect("nodes is an array")
         .iter()
-        .map(|v| v.as_u64().expect("an id is a number"))
+        .flat_map(|n| n["inputs"].as_array().expect("inputs is an array"))
+        .filter(|e| e["kind"] == "value")
+        .filter_map(|e| e["subscribed"].as_u64())
         .collect();
     assert!(
-        unowned.contains(&source_id),
-        "the source node {source_id} is absent from the pane's unowned set {unowned:?}"
+        !owned.contains(&source_id),
+        "the source node {source_id} is subscribed by a value edge, so the walk of the value \
+         edges never starts at it"
     );
 
     let readers: Vec<&Value> = pane["nodes"]
@@ -722,8 +725,8 @@ fn every_gallery_program_produces_a_valid_payload() {
 /// in place, and likewise every inference-variable number inside a rendered
 /// type.
 ///
-/// The id fields are exactly each pane's walk starts — `panes[].root` on a tree
-/// pane, `panes[].unowned` on the operator pane — every `panes[].nodes[].nodeId`,
+/// The id fields are exactly `panes[].root` on a tree pane (an operator pane
+/// ships no start set), every `panes[].nodes[].nodeId`,
 /// every inbound edge id a node names — `children[].id` on a tree pane,
 /// `inputs[].subscribed` on an operator pane — and both endpoints of every
 /// `paneLinks[].edges` pair; spans and the pane's own string `id` are not ids and
@@ -786,14 +789,10 @@ fn canonicalize_ids(v: &mut Value) {
     };
 
     for pane in v["panes"].as_array_mut().into_iter().flatten() {
-        // A tree pane's walk start is one id under `root`, the operator pane's a
-        // list under `unowned`, and a pane carries one of the two — so touching
-        // both keys reaches every start without a kind test.
+        // A tree pane's walk start is one id under `root`; an operator pane ships
+        // none, so the null check covers both shapes without a kind test.
         if !pane["root"].is_null() {
             renumber(&mut pane["root"]);
-        }
-        for id in pane["unowned"].as_array_mut().into_iter().flatten() {
-            renumber(id);
         }
         for node in pane["nodes"].as_array_mut().into_iter().flatten() {
             renumber(&mut node["nodeId"]);

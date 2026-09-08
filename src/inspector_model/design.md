@@ -80,8 +80,8 @@ node is that pane's own answer.
 ### A node on the wire
 
 A tree pane ships `nodes`, every node of that pane exactly once, and `root`, the id its walk starts
-from — one id, since a tree has one by construction. The operator pane names its walk starts under
-`unowned` instead, and neither key ships on the other shape.
+from — one id, since a tree has one by construction. The operator pane names no start at all, and
+carries neither key.
 
 A node reached from several places — a shared refinement predicate, most often — is one entry that
 several children name. The order is first-visit pre-order, so the payload is byte-reproducible.
@@ -135,9 +135,9 @@ the absence. A predicate several nodes reach still carries a child edge from eac
 
 ### An operator node on the wire
 
-The operator pane ships the dataflow graph, so its node is a different shape: `unowned` rather than
-a single `root`, `inputs` rather than `children`, and no type. It carries `label`, `nodeId`, `spans`
-and `rewritten` on the same terms as a tree node, plus:
+The operator pane ships the dataflow graph, so its node is a different shape: no `root`, `inputs`
+rather than `children`, and no type. It carries `label`, `nodeId`, `spans` and `rewritten` on the
+same terms as a tree node, plus:
 
 | field | what it holds |
 |---|---|
@@ -148,11 +148,13 @@ and `rewritten` on the same terms as a tree node, plus:
 An input edge is a subscription, stored on the consumer: `subscribed` names the node the consumer
 reads, so the recorded relation runs against dataflow.
 
-`unowned` is the pane's walk starts: the nodes no `value` edge names — a sink per compiled output, a
-fan input per share point, and a source per registered data source. Every node of the pane is
-reachable from `unowned` following `value` edges alone, which is the relation a consumer walks, so
-the forest a renderer draws covers the pane with no special case. Both validators pin that closure;
-a source outside it is a node the pane holds, that pane links land on, and that nothing draws.
+A walk of the pane starts at the nodes no `value` edge subscribes — a sink per compiled output, a
+fan input per share point, and a source per registered data source. That set is derived from
+`inputs` rather than shipped: a node's owner is the one `value` edge naming it, so the table already
+answers it and a shipped copy could only disagree. Every node is reachable from there following
+`value` edges alone, which is the relation a consumer walks, so the forest a renderer draws covers
+the pane with no special case. Both validators pin that closure, which fails on a node reachable
+only along a `share` edge and on a cycle among the `value` edges.
 
 `spans` means what it means on a tree node, down to the ordering: narrowest first, each span once.
 Both shapes take them from `wire_spans` (`wire.rs`) for that reason. Stating the invariant twice

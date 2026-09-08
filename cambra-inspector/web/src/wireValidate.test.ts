@@ -107,9 +107,9 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       id,
       label: `IR (${id.toUpperCase()})`,
       kind: kindOf(id),
-      // A tree pane's walk start is `root`, singular; the operator pane's is
-      // `unowned`. Neither key ships on the other shape.
-      ...(kindOf(id) === "operators" ? { unowned: [0] } : { root: 0 }),
+      // A tree pane's walk start is `root`, singular. An operator pane ships
+      // none — a consumer derives them from the edges.
+      ...(kindOf(id) === "operators" ? {} : { root: 0 }),
       nodes: [kindOf(id) === "operators" ? minimalOperatorNode() : minimalNode()],
     })),
     paneLinks: PANE_IDS.slice(1).map((to, i) => ({
@@ -274,56 +274,47 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     const bad = minimalSuccess();
     (bad.panes as Record<string, unknown>[])[0].root = 99;
     expect(() => validateSnapshot(bad)).toThrow(/panes\[0\]\.root.*present in this pane/);
-
-    const badGraph = minimalSuccess();
-    (badGraph.panes as Record<string, unknown>[])[OPERATORS].unowned = [99];
-    expect(() => validateSnapshot(badGraph)).toThrow(
-      new RegExp(`panes\\[${OPERATORS}\\]\\.unowned\\[0\\].*present in this pane`),
-    );
   });
 
-  it("throws when a pane names no walk start at all", () => {
-    const bad = minimalSuccess();
-    (bad.panes as Record<string, unknown>[])[OPERATORS].unowned = [];
-    expect(() => validateSnapshot(bad)).toThrow(
-      new RegExp(`panes\\[${OPERATORS}\\]\\.unowned.*non-empty`),
-    );
-
+  it("throws when a tree pane names no walk start at all", () => {
     const missing = minimalSuccess();
     delete (missing.panes as Record<string, unknown>[])[0].root;
     expect(() => validateSnapshot(missing)).toThrow(/panes\[0\]\.root.*number/);
   });
 
-  it("throws when a pane carries the other shape's walk-start key", () => {
+  it("throws when a pane carries a walk-start key it has no business with", () => {
     // A tree's start is singular by type, so nothing has to assert that it is
-    // one id — what does have to be pinned is that neither key crosses over.
+    // one id. What has to be pinned is that a tree does not carry the retired
+    // `unowned`, and that an operator pane carries neither key.
     const treeWithUnowned = minimalSuccess();
     (treeWithUnowned.panes as Record<string, unknown>[])[0].unowned = [0];
     expect(() => validateSnapshot(treeWithUnowned)).toThrow(
       /panes\[0\]\.unowned.*absent on a tree pane/,
     );
 
-    const graphWithRoot = minimalSuccess();
-    (graphWithRoot.panes as Record<string, unknown>[])[OPERATORS].root = 0;
-    expect(() => validateSnapshot(graphWithRoot)).toThrow(
-      new RegExp(`panes\\[${OPERATORS}\\]\\.root.*absent on an operator pane`),
-    );
+    for (const retired of ["root", "unowned"] as const) {
+      const graphWithKey = minimalSuccess();
+      (graphWithKey.panes as Record<string, unknown>[])[OPERATORS][retired] =
+        retired === "root" ? 0 : [0];
+      expect(() => validateSnapshot(graphWithKey)).toThrow(
+        new RegExp(`panes\\[${OPERATORS}\\]\\.${retired}.*absent on an operator pane`),
+      );
+    }
   });
 
-  it("accepts an operator pane naming several unowned nodes", () => {
+  it("accepts an operator pane where several nodes are subscribed by nothing", () => {
     const ok = minimalSuccess();
     const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
     pane.nodes = [minimalOperatorNode(), { ...minimalOperatorNode(), nodeId: 1 }];
-    pane.unowned = [0, 1];
     expect(() => validateSnapshot(ok)).not.toThrow();
   });
 
-  it("throws when a node is unreachable from unowned along the value edges", () => {
-    // The gap this check exists for: a node the table holds and the value-edge
-    // walk never reaches is a node no view draws. A `share` edge does not carry
-    // the walk, so a node reachable only through one has to be unowned itself.
-    const bad = minimalSuccess();
-    const pane = (bad.panes as Record<string, unknown>[])[OPERATORS];
+  it("accepts a node reachable only through a share edge", () => {
+    // A source is subscribed by no value edge, so the derived walk starts at it.
+    // Under a shipped start set this was the source-shaped bug: the producer had
+    // to remember to list it, and omitting it stranded the node.
+    const ok = minimalSuccess();
+    const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
     pane.nodes = [
       {
         ...minimalOperatorNode(),
@@ -331,13 +322,28 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       },
       { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
     ];
-    pane.unowned = [0];
-    expect(() => validateSnapshot(bad)).toThrow(
-      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes.*reachable from unowned`),
-    );
+    expect(() => validateSnapshot(ok)).not.toThrow();
+  });
 
-    pane.unowned = [0, 1];
-    expect(() => validateSnapshot(bad)).not.toThrow();
+  it("throws when the value edges form a cycle, which no walk can enter", () => {
+    // The gap the derived check still catches: every member of a value cycle is
+    // subscribed, so none of them is a walk start and none is ever drawn.
+    const bad = minimalSuccess();
+    const pane = (bad.panes as Record<string, unknown>[])[OPERATORS];
+    pane.nodes = [
+      {
+        ...minimalOperatorNode(),
+        inputs: [{ role: "input", kind: "value", deferred: false, subscribed: 1 }],
+      },
+      {
+        ...minimalOperatorNode(),
+        nodeId: 1,
+        inputs: [{ role: "input", kind: "value", deferred: false, subscribed: 0 }],
+      },
+    ];
+    expect(() => validateSnapshot(bad)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes.*reachable along the value edges`),
+    );
   });
 
   it("throws when a node id appears twice in one pane's table", () => {
@@ -475,7 +481,6 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
         ],
       },
     ];
-    pane.unowned = [0];
     expect(() => validateSnapshot(ok)).not.toThrow();
   });
 

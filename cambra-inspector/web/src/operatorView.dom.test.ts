@@ -5,7 +5,7 @@
 // pane.
 //
 // The three facts a tree renderer would get wrong, and so the three this pins:
-// a graph has several unowned nodes (one tree each), a share edge is a reference
+// a graph has several walk starts (one tree each), a share edge is a reference
 // leaf rather than a second copy of the shared subtree, and a click in the pane
 // reaches the panes upstream of it.
 //
@@ -27,9 +27,9 @@ import listMinJson from "./__fixtures__/list_min.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
 
-// `polymorphic` is the fixture with a fanned-out graph: three unowned nodes and
+// `polymorphic` is the fixture with a fanned-out graph: three walk starts and
 // a `share` edge into one of them. `list_min` is the degenerate one — one
-// unowned node, all value edges.
+// walk start, all value edges.
 const polymorphic = fixture(polymorphicJson);
 const listMin = fixture(listMinJson);
 // The only fixture with a `Source` node, and so the only one that pins a node
@@ -89,7 +89,7 @@ function subtreeOf(row: HTMLElement): HTMLElement {
 describe("OperatorView: the graph as a forest", () => {
   beforeAll(stubLayout);
 
-  it("draws one tree per unowned node", () => {
+  it("draws one tree per walk start", () => {
     for (const [snap, id] of [
       [polymorphic, "post-conversion"],
       [listMin, "post-conversion"],
@@ -97,18 +97,27 @@ describe("OperatorView: the graph as a forest", () => {
       const { body, pane } = mountGraph(snap, id);
       const trees = [...body.querySelector(".tree-root")!.children];
 
-      expect(trees.length).toBe(pane.unowned.length);
-      // In `unowned` order, each tree headed by its own node.
-      expect(trees.map((t) => rowNodeId(t.querySelector(".tree-row")!))).toEqual(pane.unowned);
+      // The nodes no value edge subscribes, in table order — what the view
+      // derives, recomputed here from the payload rather than taken from it.
+      const subscribed = new Set(
+        pane.nodes.flatMap((n) =>
+          n.inputs.filter((e) => e.kind === "value").map((e) => e.subscribed),
+        ),
+      );
+      const starts = pane.nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
+
+      expect(trees.length).toBe(starts.length);
+      // One tree per start, each headed by its own node, in table order.
+      expect(trees.map((t) => rowNodeId(t.querySelector(".tree-row")!))).toEqual(starts);
     }
   });
 
   it("draws every node of the graph exactly once", () => {
-    // The forest covers the table: a node no value edge names is unowned and so
-    // heads a tree of its own, so nothing is dropped and nothing is duplicated.
-    // `source_shared` is the case that needs the source in `unowned` — nothing
-    // subscribes it, so it is drawn as a one-node tree or not at all, and a node
-    // with no row has no selection handle for a pane link to land on.
+    // The forest covers the table: a node no value edge subscribes heads a tree
+    // of its own, so nothing is dropped and nothing is duplicated.
+    // `source_shared` is the case that needs it — nothing subscribes a source
+    // with a value edge, so it is drawn as a one-node tree or not at all, and a
+    // node with no row has no selection handle for a pane link to land on.
     for (const [snap, id] of [
       [polymorphic, "post-conversion"],
       [sourceShared, "post-conversion"],
