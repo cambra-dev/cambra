@@ -1513,9 +1513,9 @@ impl OpenRecording {
 ///
 /// The skip is the whole point. A node the main-tree walk already explained has
 /// a precise span and label; re-recording it here would replace both with this
-/// sweep's coarse ones, because the fold is last-write-wins. Measured on the
-/// pipeline corpus: 318 nodes would be clobbered without it, and no leak class
-/// would report anything, since a clobbered node is still explained.
+/// sweep's coarse ones, because the fold is last-write-wins. Without the skip
+/// the sweep clobbers nodes the main-tree walk already explained, and no leak
+/// class reports anything, since a clobbered node is still explained.
 /// `the_predicate_sweep_skips_already_recorded_nodes` pins the skip.
 pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
     if id == NodeId::PLACEHOLDER {
@@ -3088,9 +3088,9 @@ mod tests {
     ///
     /// This is the one property of `lowering_predicate_leaf` that **no leak class
     /// can see**: the fold is last-write-wins, so a node re-recorded by the sweep
-    /// is still perfectly *explained* — it has just silently swapped its real
-    /// span and label for the sweep's coarse ones. Measured on the pipeline
-    /// corpus, a blanket sweep clobbers 318 nodes and every gate stays green.
+    /// is still explained — it has swapped its real span and label for the
+    /// sweep's coarse ones. A blanket sweep clobbers nodes across the pipeline
+    /// corpus and every gate stays green.
     #[test]
     fn the_predicate_sweep_skips_already_recorded_nodes() {
         let [recorded_id, fresh] = ids::<2>();

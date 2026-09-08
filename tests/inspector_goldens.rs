@@ -380,7 +380,7 @@ fn for_accumulator_produces_dense_channelize_window() {
 /// without this nothing checks that either reaches the wire at all.
 ///
 /// Structural rather than a fixture, matching the two window checks above: a
-/// transaction program's operator pane is 77 nodes, and pinning its bytes would
+/// transaction program's operator pane is large, and pinning its bytes would
 /// re-bless on every change to how a store is built.
 fn assert_store_edge_shapes(example: &str) {
     let raw = dump(example);

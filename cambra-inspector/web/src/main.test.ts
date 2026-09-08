@@ -176,11 +176,12 @@ describe("describePanes", () => {
     const roster = describePanes(store);
     expect(roster[roster.length - 1].id).toBe(operatorPanes[0].id);
 
-    // The descriptor mounts a real view, not an empty body.
+    // The descriptor mounts a real view, not an empty body. Which nodes that
+    // view draws is `operatorView.dom.test.ts`'.
     const body = document.createElement("div");
     document.body.appendChild(body);
     roster[roster.length - 1].mount(body);
-    expect(body.querySelectorAll(".tree-row").length).toBe(operatorPanes[0].nodes.length);
+    expect(body.querySelector(".tree-root")).not.toBeNull();
   });
 
   it("badges the holes pane and the operator pane", () => {

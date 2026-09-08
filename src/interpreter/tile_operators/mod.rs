@@ -148,10 +148,9 @@ static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLo
 
 /// The concrete type's name with its module path stripped, e.g. `"MapResult"`.
 ///
-/// Four call sites want this and each had its own copy: the operator's
-/// [`TileOperator::kind`], the producer's [`TileProducer::name`] and
-/// [`TileProducer::alloc_id`] counter key, and [`TileOperator::inspect`]'s
-/// label.
+/// Every caller wants the same name and each had its own copy:
+/// [`TileOperator::kind`], [`TileProducer::name`], [`TileProducer::alloc_id`]'s
+/// counter key, and the label [`OperatorBase::new`] records.
 pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
     full.rsplit_once("::").map_or(full, |(_, tail)| tail)
@@ -160,7 +159,7 @@ pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
 /// Common identity and tiling state shared by every [`TileOperator`].
 ///
 /// The operator-side counterpart of [`ProducerBase`], and it exists for the same
-/// reason: 46 operators held a `tiling` field and a trivial accessor for it.
+/// reason: every operator held a `tiling` field and a trivial accessor for it.
 /// Identity rides here too, because construction is the only point every
 /// operator type passes through — there is no shared constructor, so a
 /// [`NodeId`] taken anywhere else would be a call site's responsibility to
@@ -182,8 +181,8 @@ impl OperatorBase {
     /// ambient conversion recording names, and record the inputs it holds.
     ///
     /// Construction is the recording point because it is the only place every
-    /// operator type passes through: there is no shared constructor, and 80 call
-    /// sites build operators directly. It is also the only point at which an
+    /// operator type passes through: there is no shared constructor, so every
+    /// operator is built at its own call site. It is also the only point at which an
     /// edge's kind is known — see [`operator_graph`](crate::interpreter::operator_graph).
     ///
     /// State the inputs with [`value`](crate::interpreter::operator_graph::value)
