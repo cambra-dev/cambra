@@ -489,10 +489,10 @@ key rebind, key-init stash, carrier, the cross-domain and await-final rules), an
 `lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Three
 shared helpers record under whichever phase scope is open around them: `subst`
 (`subst.vacuous`, `subst.transport`, `subst.force_refinement`), `ccl_utils`'
-`PredMemo::rebuild` (`predicate.rebuild`), and `mut_elim`'s
-`fold_induction_loop` (`letrec.accumulator`, `letrec.feed`), which
-`transact_phase` calls for a cross-domain loop and so records a `letrec.*` label
-under `Transact`.
+`PredMemo::rebuild` (`predicate.rebuild`), and `mut_elim`'s induction fold —
+`fold_induction_loop` and `InductionFold::acc_view` (`letrec.accumulator`,
+`letrec.feed`), which `transact_phase` calls for a cross-domain loop and so
+records a `letrec.*` label under `Transact`.
 
 Every phase that rewrites expression nodes runs under a `PhaseScope`, so no
 recording is inert: `simplify`'s rule combinator and `planning/iterate` both sit

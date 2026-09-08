@@ -1146,8 +1146,18 @@ impl InductionFold {
     /// A per-position cross-domain read of that accumulator (`acc(pos)`) is this
     /// applied at `pos`; the transaction phase uses it to resolve a `commits(r)`
     /// decision that reads an induction accumulator at its request position.
+    ///
+    /// The view is the accumulator's product, so the recording is the
+    /// accumulator's: one slot's stream, named on the statement that writes it.
+    /// Opening it here rather than at the call site is what puts it on the write
+    /// statement at all — the caller is `transact_phase`, which holds the
+    /// enclosing `transact.cross_domain_fold` recording on the *loop* statement
+    /// and has no access to [`Accumulator`]'s site.
     pub(crate) fn acc_view(&self, i: usize) -> Expr {
-        let vty = &self.accs[i].ty;
+        let acc = &self.accs[i];
+        let _g = acc
+            .site
+            .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         writes_index_view(
             &self.hist,
             &self.hist_ty,
@@ -1155,7 +1165,7 @@ impl InductionFold {
             &self.writes_ty,
             &self.decision_ty,
             i,
-            vty,
+            &acc.ty,
         )
     }
 }
@@ -2315,5 +2325,93 @@ mod tests {
         // Assert through the real checker rather than a local copy of its walk:
         // uniqueness within a tree is one invariant with one implementation.
         crate::ccl::context::assert_unique_node_ids(&out, "flatten_spine");
+    }
+
+    /// **An accumulator's cross-domain view is recorded against the statement
+    /// that writes it, not against the recording its caller holds.**
+    /// [`InductionFold::acc_view`] is called from
+    /// `transact_phase::fold_cross_domain_loops`, which has
+    /// `transact.cross_domain_fold` open on the *loop* statement — so a view
+    /// minted with no recording of its own resolves to the loop, and the write
+    /// that produced the accumulator answers with nothing about the stream a
+    /// transaction reads it through. The nested recording is what splits it, the
+    /// same rule the slot machinery follows (`src/ccl/design/provenance.md`,
+    /// "Where to open a recording").
+    ///
+    /// Asserted here rather than through a compiled program because the products
+    /// are five nodes of a shape the fold also builds for the trailing final read
+    /// — reachable in a pane pair, indistinguishable from their neighbours once
+    /// there. The parent of a mint is what changed, so the parent is what this
+    /// reads.
+    #[test]
+    fn a_cross_domain_view_is_recorded_against_the_write_statement() {
+        use crate::ccl::context::Phase;
+        use crate::ccl::provenance::{PhaseScope, TableSession};
+
+        let (tree, ..) = direct_mirror_sum();
+        let TypedExprNode::MutDecl { body: stmt, .. } = tree.node else {
+            unreachable!("`direct_mirror_sum` is a `MutDecl`")
+        };
+        let loop_stmt_id = stmt.node_id();
+        let TypedExprNode::ExprStmt {
+            expr: effect,
+            body: cont,
+        } = stmt.node
+        else {
+            unreachable!("the introduction's body is the loop statement")
+        };
+        let TypedExprNode::For { target, iter, body } = effect.node else {
+            unreachable!("the statement's effect is the loop")
+        };
+        // The write statement inside the loop body, and the marker that is its
+        // effect — the two nodes the recording names and blames.
+        let write_stmt_id = body.node_id();
+        let TypedExprNode::ExprStmt { expr: write, .. } = &body.node else {
+            unreachable!("the loop body is one write statement")
+        };
+        let write_id = write.node_id();
+        let value_tys = mut_var_value_tys([&*body, &*cont]);
+
+        let session = TableSession::install();
+        let view_ids = {
+            let _scope = PhaseScope::enter(Phase::Transact);
+            // The recording the transaction phase holds across the call, named on
+            // the loop statement. Without one the mints would land nowhere and the
+            // assertion below would pass for the wrong reason.
+            let _enclosing = provenance::enter(
+                loop_stmt_id,
+                "transact.cross_domain_fold",
+                provenance::Nature::Expansion,
+            );
+            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let view = fold.acc_view(0);
+            let mut ids = Vec::new();
+            fn collect(e: &Expr, out: &mut Vec<NodeId>) {
+                out.push(e.node_id());
+                e.walk_children(|c| collect(c, out));
+            }
+            collect(&view, &mut ids);
+            ids
+        };
+        let table = session.into_table();
+
+        assert!(!view_ids.is_empty(), "the view is a tree of minted nodes");
+        for id in view_ids {
+            assert_eq!(
+                table.parents(id),
+                [write_stmt_id],
+                "a view node descends from the write statement, not from {loop_stmt_id:?}",
+            );
+            assert_eq!(
+                table.blame(id),
+                [write_id],
+                "and blames the `MutWrite`, so either node answers with it",
+            );
+            assert_eq!(
+                table.tag(id).map(|t| t.label),
+                Some(ACCUMULATOR_LABEL),
+                "under the accumulator's own label",
+            );
+        }
     }
 }
