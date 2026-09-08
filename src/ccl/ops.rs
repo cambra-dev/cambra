@@ -703,6 +703,23 @@ impl Builtin {
         }
     }
 
+    /// The aggregate this builtin folds with, or `None` for a builtin that is not one
+    /// — a total inverse of [`for_aggregate`](Self::for_aggregate).
+    ///
+    /// The single reader of which builtins are aggregates: op-conversion dispatches its
+    /// `Aggregation` arms on it, and [`iterates_arg`](Self::iterates_arg) derives the
+    /// aggregate half of the input-internalising group from it. A hand-maintained second
+    /// list is what let `Sole` fall out of that group.
+    pub fn as_aggregate(&self) -> Option<AggregateKind> {
+        Some(match self {
+            Self::Sum => AggregateKind::Sum,
+            Self::Max => AggregateKind::Max,
+            Self::Drain => AggregateKind::Drain,
+            Self::Sole => AggregateKind::Sole,
+            _ => return None,
+        })
+    }
+
     /// Op-conversion's `Apply { argument, function: Builtin(self) }` arm
     /// compiles `argument` (or, for tuple-shaped arguments, its
     /// iteration-source sub-parts) with `input=None`, treating it as a
@@ -717,13 +734,13 @@ impl Builtin {
     ///   and `FinalOrDefault` are in this list because they self-iterate
     ///   from sub-parts of their tuple argument, but the walk's
     ///   per-shape match arms handle them before the catch-all that
-    ///   consults this metho — so the per-element wrapping fires first
-    ///   and the catch-all isd never reached for them.
+    ///   consults this method — so the per-element wrapping fires first
+    ///   and the catch-all is never reached for them.
     /// - `is_iteration_bearing` — at chain heads, decides which builtins
     ///   already provide their own iteration (and so should not be
     ///   wrapped with another `iterate(_)`).  Scalar-result builtins
-    ///   (`Sum`, `Max`, `FinalOrDefault`) are in the list too; the
-    ///   caller's `expr.ty.domain()` check filters them out at chain
+    ///   (every aggregate, and `FinalOrDefault`) are in the group too;
+    ///   the caller's `expr.ty.domain()` check filters them out at chain
     ///   heads independently.
     ///
     /// `Iterate` is NOT in this list — it is an iteration source, but
@@ -735,26 +752,28 @@ impl Builtin {
     ///
     /// Keep in sync with the corresponding arms in operator_conversion.rs.
     pub fn iterates_arg(self) -> bool {
-        matches!(
-            self,
-            Self::Sum
-                | Self::Max
-                | Self::Drain
-                | Self::Converse
-                | Self::MapDomain
-                | Self::Uncurry
-                | Self::PermuteDomain
-                | Self::FlattenDomain
-                | Self::Copair
-                // `GetPrevSeq`/`GetPrevTxn` share `FinalOrDefault`'s
-                // classification (a scalar-result builtin over a tuple whose
-                // stream sub-part self-iterates), but op-conversion never sees
-                // them: letrec pattern recognition consumes them first, and the
-                // op-conv arm errors deliberately (see the variant docs).
-                | Self::FinalOrDefault
-                | Self::GetPrevSeq
-                | Self::GetPrevTxn
-        )
+        // Every aggregate folds a function-typed input to a scalar, so every aggregate
+        // internalises its input. Deriving that half of the group from
+        // [`as_aggregate`](Self::as_aggregate) keeps a newly added `AggregateKind` in it
+        // by construction, rather than depending on two lists staying in agreement.
+        self.as_aggregate().is_some()
+            || matches!(
+                self,
+                Self::Converse
+                    | Self::MapDomain
+                    | Self::Uncurry
+                    | Self::PermuteDomain
+                    | Self::FlattenDomain
+                    | Self::Copair
+                    // `GetPrevSeq`/`GetPrevTxn` share `FinalOrDefault`'s
+                    // classification (a scalar-result builtin over a tuple whose
+                    // stream sub-part self-iterates), but op-conversion never sees
+                    // them: letrec pattern recognition consumes them first, and the
+                    // op-conv arm errors deliberately (see the variant docs).
+                    | Self::FinalOrDefault
+                    | Self::GetPrevSeq
+                    | Self::GetPrevTxn
+            )
     }
 }
 
@@ -800,5 +819,26 @@ mod tests {
             assert_eq!(BaseType::from_keyword(b.keyword()), Some(b));
         }
         assert_eq!(BaseType::from_keyword("List"), None);
+    }
+
+    /// `as_aggregate` is a total inverse of `for_aggregate`, and every aggregate
+    /// internalises its input — the two laws that make one mapping serve op-conversion's
+    /// dispatch and the iteration-site walk's policy.
+    #[test]
+    fn aggregate_builtins_round_trip_and_internalise_their_input() {
+        for kind in [
+            AggregateKind::Sum,
+            AggregateKind::Max,
+            AggregateKind::Drain,
+            AggregateKind::Sole,
+        ] {
+            let builtin = Builtin::for_aggregate(kind);
+            assert_eq!(builtin.as_aggregate(), Some(kind));
+            assert!(
+                builtin.clone().iterates_arg(),
+                "aggregate `{builtin}` folds a function-typed input, so it internalises it"
+            );
+        }
+        assert_eq!(Builtin::Converse.as_aggregate(), None);
     }
 }

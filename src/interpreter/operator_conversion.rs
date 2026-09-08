@@ -964,7 +964,7 @@ fn convert_impl_inner(
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
-            if let Some(kind) = as_builtin(function).and_then(builtin_to_aggregate) =>
+            if let Some(kind) = as_builtin(function).and_then(|b| b.as_aggregate()) =>
         {
             expect_no_input(input, "scalar aggregate")?;
             let input = convert_impl(argument, None, ctx)?;
@@ -1230,9 +1230,10 @@ fn convert_impl_inner(
                 b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
                 b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                b if let Some(kind) = builtin_to_aggregate(b.clone()) => Ok(Box::new(
-                    MapExtractAggregate::new(Box::new(MapAggregate::new(input, kind)), kind),
-                )),
+                b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(
+                    Box::new(MapAggregate::new(input, kind)),
+                    kind,
+                ))),
                 _ => Err(ConversionError::Unsupported(format!(
                     "unsupported Builtin({}) in λ-free CCL",
                     b.name()
@@ -2359,16 +2360,6 @@ fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
         B::BoolLogic(L::Nor) => InterpreterBinOp::BoolLogic(LogicKind::Nor),
         B::BoolLogic(L::Xor) => InterpreterBinOp::BoolLogic(LogicKind::Xor),
         B::BoolLogic(L::Xnor) => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
-    })
-}
-
-fn builtin_to_aggregate(b: Builtin) -> Option<AggregateKind> {
-    Some(match b {
-        Builtin::Sum => AggregateKind::Sum,
-        Builtin::Max => AggregateKind::Max,
-        Builtin::Drain => AggregateKind::Drain,
-        Builtin::Sole => AggregateKind::Sole,
-        _ => return None,
     })
 }
 
