@@ -14,9 +14,7 @@
       "id": "pre-inference",
       "label": "IR (PRE-INFERENCE)",
       "kind": "holes",
-      "roots": [
-        5
-      ],
+      "root": 5,
       "nodes": [
         {
           "label": "List",
@@ -106,9 +104,7 @@
       "id": "post-inference",
       "label": "IR (POST-INFERENCE)",
       "kind": "typed",
-      "roots": [
-        5
-      ],
+      "root": 5,
       "nodes": [
         {
           "label": "List",
@@ -458,9 +454,7 @@
       "id": "post-channelize",
       "label": "IR (POST-CHANNELIZE)",
       "kind": "typed",
-      "roots": [
-        5
-      ],
+      "root": 5,
       "nodes": [
         {
           "label": "List",
@@ -810,9 +804,7 @@
       "id": "post-as-of-read",
       "label": "IR (POST-AS-OF-READ)",
       "kind": "typed",
-      "roots": [
-        5
-      ],
+      "root": 5,
       "nodes": [
         {
           "label": "List",
@@ -1162,9 +1154,7 @@
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
-      "roots": [
-        42
-      ],
+      "root": 42,
       "nodes": [
         {
           "label": "List",
@@ -1534,9 +1524,7 @@
       "id": "post-planning",
       "label": "IR (POST-PLANNING)",
       "kind": "typed",
-      "roots": [
-        256
-      ],
+      "root": 256,
       "nodes": [
         {
           "label": "Compose",
@@ -2723,7 +2711,7 @@
       "id": "post-conversion",
       "label": "IR (POST-CONVERSION)",
       "kind": "operators",
-      "roots": [
+      "unowned": [
         392
       ],
       "nodes": [
@@ -2784,13 +2772,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 389
+              "subscribed": 389
             },
             {
               "role": "fn",
               "kind": "value",
               "deferred": false,
-              "id": 390
+              "subscribed": 390
             }
           ]
         },
@@ -2815,7 +2803,7 @@
               "role": "output",
               "kind": "value",
               "deferred": false,
-              "id": 391
+              "subscribed": 391
             }
           ]
         }

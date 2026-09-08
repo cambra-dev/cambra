@@ -12,9 +12,12 @@
 //   twice. Every cycle in the graph is a feedback edge, which is what keeps the
 //   child relation acyclic.
 //
-// The roots are the nodes nothing owns: a sink per compiled output, and a fan
-// input per share point. Each gets its own tree, which is why this is a forest
-// and `TreeView`'s single root does not fit.
+// The walk starts at `pane.unowned`, the nodes no value edge names: a sink per
+// compiled output, a fan input per share point, and a source per registered data
+// source. Each gets its own tree, which is why this is a forest and `TreeView`'s
+// single root does not fit. Every node is reachable from there along the value
+// edges, so the forest covers the pane — a source with no reader of its own is a
+// one-node tree.
 
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
 import type { Resolved, Store } from "./store";
@@ -66,12 +69,12 @@ export class OperatorView {
     this.paneId = pane.id;
     this.nodeById = new Map(pane.nodes.map((n) => [n.nodeId, n]));
 
-    const root = el("div", "tree-root");
-    for (const rootId of pane.roots) {
-      const node = this.nodeById.get(rootId);
-      if (node) root.appendChild(this.renderNode(node, null, 0, null));
+    const renderRoot = el("div", "tree-root");
+    for (const id of pane.unowned) {
+      const node = this.nodeById.get(id);
+      if (node) renderRoot.appendChild(this.renderNode(node, null, 0, null));
     }
-    parent.appendChild(root);
+    parent.appendChild(renderRoot);
 
     store.subscribe((resolved) => this.renderSelection(resolved));
   }
@@ -120,7 +123,7 @@ export class OperatorView {
 
     const childrenBox = el("div", "tree-children");
     for (const childEdge of children) {
-      const child = this.nodeById.get(childEdge.id);
+      const child = this.nodeById.get(childEdge.subscribed);
       if (child) {
         childrenBox.appendChild(this.renderNode(child, childEdge, depth + 1, node.nodeId));
       }
@@ -156,20 +159,21 @@ export class OperatorView {
     return container;
   }
 
-  // A share or feedback edge: a leaf naming its target, so the shared subtree is
-  // drawn once at its own root rather than under every consumer. Clicking it
-  // selects the target, which is how a reader follows the reference.
+  // A share or feedback edge: a leaf naming the node it subscribes, so the
+  // shared subtree is drawn once where that node is unowned rather than under
+  // every consumer. Clicking it selects that node, which is how a reader follows
+  // the reference.
   private renderReference(edge: OperatorEdge): HTMLElement {
     const container = el("div", "tree-node");
     const row = el("div", `tree-row selectable op-ref op-ref-${edge.kind}`);
     row.appendChild(el("span", "twisty leaf", "·"));
     row.appendChild(el("span", "edge-label", `${edge.role}:`));
     row.appendChild(el("span", "op-ref-arrow", edge.kind === "feedback" ? "↺" : "→"));
-    const target = this.nodeById.get(edge.id);
-    row.appendChild(el("span", "node-label", target ? target.label : "?"));
-    row.appendChild(el("span", "node-id", `#${edge.id}`));
+    const subscribed = this.nodeById.get(edge.subscribed);
+    row.appendChild(el("span", "node-label", subscribed ? subscribed.label : "?"));
+    row.appendChild(el("span", "node-id", `#${edge.subscribed}`));
     row.addEventListener("click", () => {
-      this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: edge.id });
+      this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: edge.subscribed });
     });
     container.appendChild(row);
     return container;
@@ -233,16 +237,16 @@ export function serializeOperatorGraph(pane: OperatorPane): string {
     lines.push(INDENT.repeat(depth) + prefix + rowText(node));
     for (const input of node.inputs) {
       if (isChildEdge(input)) {
-        walk(input.id, input, depth + 1);
+        walk(input.subscribed, input, depth + 1);
       } else {
-        const target = nodeById.get(input.id);
+        const ref = nodeById.get(input.subscribed);
         const arrow = input.kind === "feedback" ? "↺" : "→";
         lines.push(
-          `${INDENT.repeat(depth + 1)}${input.role}: ${arrow} ${target ? target.label : "?"} #${input.id}`,
+          `${INDENT.repeat(depth + 1)}${input.role}: ${arrow} ${ref ? ref.label : "?"} #${input.subscribed}`,
         );
       }
     }
   };
-  for (const root of pane.roots) walk(root, null, 0);
+  for (const start of pane.unowned) walk(start, null, 0);
   return lines.join("\n");
 }

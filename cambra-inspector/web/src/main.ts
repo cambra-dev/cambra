@@ -196,8 +196,8 @@ export function describePanes(store: Store): PaneDescriptor[] {
   }
 
   for (const pane of store.panes) {
-    // The operator pane holds a dataflow graph — several roots, and inputs
-    // rather than children — so it gets its own view.
+    // The operator pane holds a dataflow graph — a forest of unowned nodes, and
+    // inputs rather than children — so it gets its own view.
     if (!isIrPane(pane)) {
       panes.push({
         id: pane.id,
@@ -214,8 +214,7 @@ export function describePanes(store: Store): PaneDescriptor[] {
     // Holes-kind panes (still hole-typed, pre-inference) carry a badge
     // mirroring the static-no-values one.
     const holes = pane.kind === "holes";
-    // A tree pane names exactly one root, which the wire validator pins.
-    const root = pane.roots[0];
+    const root = pane.root;
     const nodesOf = () => (pane.nodes.length > 0 ? store.indicesFor(pane.id)?.nodeById : undefined);
     panes.push({
       id: pane.id,

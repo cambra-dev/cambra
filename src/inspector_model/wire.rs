@@ -107,12 +107,20 @@ pub struct PaneEntry {
     /// [`nodes`](Self::nodes) holds: `"holes"` for a tree inference has not run
     /// on yet, `"typed"` for one it has, `"operators"` for the dataflow graph.
     pub kind: &'static str,
-    /// The ids a consumer starts walking [`nodes`](Self::nodes) from.
+    /// The id a consumer starts walking [`nodes`](Self::nodes) from, on a tree
+    /// pane. A tree has exactly one by construction, so the field is singular
+    /// and absent on an operator pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<u64>,
+    /// The nodes of an operator pane that no `value` edge names — a sink per
+    /// compiled output, a fan input per share point, and a source per registered
+    /// data source. Absent on a tree pane.
     ///
-    /// One for a tree. An operator graph has several: a sink per compiled
-    /// output, and a fan input per share point, which are the nodes nothing
-    /// owns.
-    pub roots: Vec<u64>,
+    /// Every node of the pane is reachable from here following `value` edges
+    /// alone, which is the relation a consumer walks; see
+    /// `src/inspector_model/design.md`, "An operator node on the wire".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unowned: Option<Vec<u64>>,
     /// Every node of this pane exactly once, in first-visit pre-order for a
     /// tree and conversion order for a graph. A node reached from several
     /// places — a refinement predicate shared by several type slots, or a fan
@@ -212,8 +220,9 @@ pub struct OperatorEdge {
     /// Whether the edge was wired after its consumer was constructed, through a
     /// `CycleSlot`. An attribute of when, not of ownership.
     pub deferred: bool,
-    /// The input's node id.
-    pub id: u64,
+    /// The id of the node this edge subscribes — an entry of the same pane's
+    /// [`nodes`](PaneEntry::nodes).
+    pub subscribed: u64,
 }
 
 /// One node of a pane's shipped node table.
@@ -480,7 +489,7 @@ pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64)> {
 /// several type slots — is emitted once and named by id from each place that
 /// reaches it, so nothing repeats and the walk terminates on a shared term. The
 /// pre-order is what makes the emitted array byte-reproducible.
-/// The operator pane's node table and its roots.
+/// The operator pane's node table and its unowned nodes.
 ///
 /// Nodes come out in the graph's own order, which is conversion order and so
 /// deterministic. Attribution is read the same way an expression node's is: the
@@ -535,7 +544,10 @@ fn build_operator_table(
             }
         })
         .collect();
-    (graph.roots().iter().map(|id| id.as_u64()).collect(), nodes)
+    (
+        graph.unowned().iter().map(|id| id.as_u64()).collect(),
+        nodes,
+    )
 }
 
 /// The rewrite tag as it ships, or `None` for a
@@ -584,7 +596,7 @@ fn wire_edge(edge: &InputEdge) -> OperatorEdge {
         },
         kind,
         deferred,
-        id: edge.target.as_u64(),
+        subscribed: edge.subscribed.as_u64(),
     }
 }
 
@@ -692,21 +704,22 @@ impl InspectedProgram<'_> {
             .panes()
             .iter()
             .map(|pane| {
-                let (roots, nodes) = match pane.content {
+                let (root, unowned, nodes) = match pane.content {
                     PaneContent::Ir(ir) => {
                         let (root, nodes) = build_node_table(ir, &pane.projection);
-                        (vec![root], PaneNodes::Ir(nodes))
+                        (Some(root), None, PaneNodes::Ir(nodes))
                     }
                     PaneContent::Operators(graph) => {
-                        let (roots, nodes) = build_operator_table(graph, &pane.projection);
-                        (roots, PaneNodes::Operators(nodes))
+                        let (unowned, nodes) = build_operator_table(graph, &pane.projection);
+                        (None, Some(unowned), PaneNodes::Operators(nodes))
                     }
                 };
                 PaneEntry {
                     id: pane.id,
                     label: pane.label.clone(),
                     kind: pane.kind,
-                    roots,
+                    root,
+                    unowned,
                     nodes,
                 }
             })
@@ -1187,9 +1200,9 @@ mod tests {
         );
     }
 
-    /// Every child id, every operator input id, and every root of every pane
-    /// names a node of that pane's own table. A dangling id is the failure the
-    /// node table makes possible and a nested tree could not express.
+    /// Every child id, every operator input id, and every walk start of every
+    /// pane names a node of that pane's own table. A dangling id is the failure
+    /// the node table makes possible and a nested tree could not express.
     #[test]
     fn every_child_id_resolves_in_its_own_table() {
         for code in corpus() {
@@ -1197,21 +1210,21 @@ mod tests {
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
-                for root in &pane.roots {
+                for start in pane.root.iter().chain(pane.unowned.iter().flatten()) {
                     assert!(
-                        ids.contains(root),
-                        "the {} root {root} is absent from its own table",
+                        ids.contains(start),
+                        "the {} walk start {start} is absent from its own table",
                         pane.id
                     );
                 }
                 match &pane.nodes {
                     PaneNodes::Ir(nodes) => {
-                        assert_eq!(
-                            pane.roots.len(),
-                            1,
-                            "a tree pane has one root; {} names {:?}",
+                        assert!(
+                            pane.root.is_some() && pane.unowned.is_none(),
+                            "a tree pane ships `root` and no `unowned`; {} ships {:?}/{:?}",
                             pane.id,
-                            pane.roots
+                            pane.root,
+                            pane.unowned
                         );
                         for node in nodes {
                             for child in &node.children {
@@ -1228,14 +1241,22 @@ mod tests {
                     }
                     // An operator's inputs are its edges into the same table.
                     PaneNodes::Operators(nodes) => {
+                        assert!(
+                            pane.unowned.is_some() && pane.root.is_none(),
+                            "an operator pane ships `unowned` and no `root`; {} ships \
+                             {:?}/{:?}",
+                            pane.id,
+                            pane.root,
+                            pane.unowned
+                        );
                         for node in nodes {
                             for input in &node.inputs {
                                 assert!(
-                                    ids.contains(&input.id),
+                                    ids.contains(&input.subscribed),
                                     "{}'s {} input {} of {} is absent from the {} table",
                                     node.label,
                                     input.role,
-                                    input.id,
+                                    input.subscribed,
                                     node.node_id,
                                     pane.id
                                 );

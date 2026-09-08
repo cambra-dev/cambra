@@ -92,7 +92,7 @@ function walk(pane: IrPane, follow: (child: { predicate: boolean }) => boolean):
     out.push(node);
     for (const child of node.children) if (follow(child)) visit(child.id);
   };
-  if (pane.nodes.length > 0) visit(pane.roots[0]);
+  if (pane.nodes.length > 0) visit(pane.root);
   return out;
 }
 

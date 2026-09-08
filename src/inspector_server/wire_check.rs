@@ -125,7 +125,7 @@ fn kind_for(id: &str) -> &'static str {
 ///
 /// Pins the full pane contract: the retired top-level `ir`/`spanIndex`
 /// absent, the panes in pipeline order with their kinds, each pane's node
-/// table closed under its own inbound edges and `roots`, each pane's
+/// table closed under its own inbound edges and its own walk starts, each pane's
 /// `spanIndex` non-empty, the windowed `paneLinks` with matching from/to ids
 /// and every edge endpoint a live node id in its respective pane (self-edges
 /// legal), and every node's `rewritten` tag in the observed vocabulary.
@@ -325,16 +325,21 @@ fn assert_rewrite_shape(node: &Value, at: &str) {
     }
 }
 
-/// Assert a pane's node table: every root and every inbound `id` names an
+/// Assert a pane's node table: every walk start and every inbound id names an
 /// entry of this same pane's `nodes`, no id appears twice, and every node
 /// carries the node shape its pane's `kind` mandates.
+///
+/// The two pane shapes name their walk starts under different keys, and each
+/// key is absent on the other shape: a tree pane ships `root`, one id by
+/// construction, and an operator pane ships `unowned`, the nodes no `value`
+/// edge names.
 ///
 /// The closure check is what the table buys over the nested tree it
 /// replaced: an edge a consumer follows always lands on an entry it holds.
 fn assert_node_table(pane: &Value, at: &str) {
     assert!(
         pane.get("ir").is_none(),
-        "{at} has no `ir` tree — a pane ships `roots` + `nodes`"
+        "{at} has no `ir` tree — a pane ships its walk starts + `nodes`"
     );
     // The parallel span table shipped one row per node per span, which is
     // what a node's own `spans` says.
@@ -358,31 +363,45 @@ fn assert_node_table(pane: &Value, at: &str) {
             "{at}.nodes[{i}] repeats node id {id} — the table holds each node once"
         );
     }
-    // A tree has the one node nothing owns; an operator graph has several —
-    // a sink per compiled output and a fan input per share point.
-    let roots = pane["roots"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{at}.roots is an array"));
-    assert!(!roots.is_empty(), "{at}.roots is non-empty");
-    if kind != OPERATOR_PANE_KIND {
-        assert_eq!(
-            roots.len(),
-            1,
-            "{at} is a tree pane, so {at}.roots holds exactly one id; got {roots:?}"
+    // The walk starts, under the key the pane's shape names them by. Neither
+    // key ships on the other shape: a tree's start is singular by type, so
+    // nothing has to assert that it is one id.
+    if kind == OPERATOR_PANE_KIND {
+        assert!(
+            pane.get("root").is_none(),
+            "{at} is an operator pane, which ships `unowned` and no `root`; got {}",
+            pane["root"]
         );
-    }
-    let mut seen_roots: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for (i, r) in roots.iter().enumerate() {
-        let root = r
+        let unowned = pane["unowned"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{at}.unowned is an array"));
+        assert!(!unowned.is_empty(), "{at}.unowned is non-empty");
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (i, r) in unowned.iter().enumerate() {
+            let id = r
+                .as_u64()
+                .unwrap_or_else(|| panic!("{at}.unowned[{i}] is a number"));
+            assert!(
+                ids.contains(&id),
+                "{at}.unowned[{i}] {id} names an entry of {at}.nodes"
+            );
+            assert!(
+                seen.insert(id),
+                "{at}.unowned repeats {id} — a node is unowned once"
+            );
+        }
+    } else {
+        assert!(
+            pane.get("unowned").is_none(),
+            "{at} is a tree pane, which ships `root` and no `unowned`; got {}",
+            pane["unowned"]
+        );
+        let root = pane["root"]
             .as_u64()
-            .unwrap_or_else(|| panic!("{at}.roots[{i}] is a number"));
+            .unwrap_or_else(|| panic!("{at}.root is a number"));
         assert!(
             ids.contains(&root),
-            "{at}.roots[{i}] {root} names an entry of {at}.nodes"
-        );
-        assert!(
-            seen_roots.insert(root),
-            "{at}.roots repeats {root} — a node is a root once"
+            "{at}.root {root} names an entry of {at}.nodes"
         );
     }
     for (i, n) in nodes.iter().enumerate() {
@@ -398,8 +417,8 @@ fn assert_node_table(pane: &Value, at: &str) {
 }
 
 /// Assert one entry of an **operator** pane's node table: the scalar fields,
-/// the expression-node fields' absence, and every input `id` resolving
-/// within `ids`.
+/// the expression-node fields' absence, and every input's `subscribed` id
+/// resolving within `ids`.
 fn assert_operator_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
     assert!(v["label"].is_string(), "{at}.label is a string");
     assert!(v["nodeId"].is_number(), "{at}.nodeId is a number");
@@ -449,12 +468,12 @@ fn assert_operator_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64
             e["deferred"].is_boolean(),
             "{at}.inputs[{i}].deferred is a boolean"
         );
-        let id = e["id"]
+        let id = e["subscribed"]
             .as_u64()
-            .unwrap_or_else(|| panic!("{at}.inputs[{i}].id is a number"));
+            .unwrap_or_else(|| panic!("{at}.inputs[{i}].subscribed is a number"));
         assert!(
             ids.contains(&id),
-            "{at}.inputs[{i}].id {id} names an entry of this pane's nodes"
+            "{at}.inputs[{i}].subscribed {id} names an entry of this pane's nodes"
         );
     }
 }

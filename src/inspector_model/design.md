@@ -15,7 +15,7 @@ compile reads the lowering projection alone.
 | | |
 |---|---|
 | Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table and its root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
+| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table and the ids a walk of it starts from), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | `src/inspector_server`, which serves the payload, and the `cambra-inspector/web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
@@ -79,7 +79,10 @@ node is that pane's own answer.
 
 ### A node on the wire
 
-A pane ships `nodes`, every node of that pane exactly once, and `root`, the id its walk starts from.
+A tree pane ships `nodes`, every node of that pane exactly once, and `root`, the id its walk starts
+from — one id, since a tree has one by construction. The operator pane names its walk starts under
+`unowned` instead, and neither key ships on the other shape.
+
 A node reached from several places — a shared refinement predicate, most often — is one entry that
 several children name. The order is first-visit pre-order, so the payload is byte-reproducible.
 
@@ -132,15 +135,24 @@ the absence. A predicate several nodes reach still carries a child edge from eac
 
 ### An operator node on the wire
 
-The operator pane ships the dataflow graph, so its node is a different shape: several `roots`
-rather than one, `inputs` rather than `children`, and no type. It carries `label`, `nodeId`,
-`spans` and `rewritten` on the same terms as a tree node, plus:
+The operator pane ships the dataflow graph, so its node is a different shape: `unowned` rather than
+a single `root`, `inputs` rather than `children`, and no type. It carries `label`, `nodeId`, `spans`
+and `rewritten` on the same terms as a tree node, plus:
 
 | field | what it holds |
 |---|---|
 | `role` | `operator`, `source` or `sink` |
 | `tiling` | the operator's output tiling, rendered; `null` for a boundary node |
-| `inputs` | the graph inputs it holds, each `{ id, role, kind, deferred }` |
+| `inputs` | the nodes it subscribes, each `{ subscribed, role, kind, deferred }` |
+
+An input edge is a subscription, stored on the consumer: `subscribed` names the node the consumer
+reads, so the recorded relation runs against dataflow.
+
+`unowned` is the pane's walk starts: the nodes no `value` edge names — a sink per compiled output, a
+fan input per share point, and a source per registered data source. Every node of the pane is
+reachable from `unowned` following `value` edges alone, which is the relation a consumer walks, so
+the forest a renderer draws covers the pane with no special case. Both validators pin that closure;
+a source outside it is a node the pane holds, that pane links land on, and that nothing draws.
 
 `spans` means what it means on a tree node, down to the ordering: narrowest first, each span once.
 Both shapes take them from `wire_spans` (`wire.rs`) for that reason. Stating the invariant twice

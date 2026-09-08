@@ -5,8 +5,8 @@
 // pane.
 //
 // The three facts a tree renderer would get wrong, and so the three this pins:
-// a graph has several roots (one tree each), a share edge is a reference leaf
-// rather than a second copy of the shared subtree, and a click in the pane
+// a graph has several unowned nodes (one tree each), a share edge is a reference
+// leaf rather than a second copy of the shared subtree, and a click in the pane
 // reaches the panes upstream of it.
 //
 // Not covered: `feedback` edges. No committed fixture carries one, so the
@@ -24,12 +24,16 @@ import { fixture, irPaneById, operatorPaneById, stubLayout } from "./__fixtures_
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
+import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
 
-// `polymorphic` is the fixture with a fanned-out graph: three roots and a
-// `share` edge into one of them. `list_min` is the degenerate one — a single
-// root, all value edges.
+// `polymorphic` is the fixture with a fanned-out graph: three unowned nodes and
+// a `share` edge into one of them. `list_min` is the degenerate one — one
+// unowned node, all value edges.
 const polymorphic = fixture(polymorphicJson);
 const listMin = fixture(listMinJson);
+// The only fixture with a `Source` node, and so the only one that pins a node
+// nothing subscribes getting a row.
+const sourceShared = fixture(sourceSharedJson);
 
 function mountGraph(snap: Snapshot, paneId: string): {
   store: Store;
@@ -84,7 +88,7 @@ function subtreeOf(row: HTMLElement): HTMLElement {
 describe("OperatorView: the graph as a forest", () => {
   beforeAll(stubLayout);
 
-  it("draws one tree per root", () => {
+  it("draws one tree per unowned node", () => {
     for (const [snap, id] of [
       [polymorphic, "post-conversion"],
       [listMin, "post-conversion"],
@@ -92,19 +96,27 @@ describe("OperatorView: the graph as a forest", () => {
       const { body, pane } = mountGraph(snap, id);
       const trees = [...body.querySelector(".tree-root")!.children];
 
-      expect(trees.length).toBe(pane.roots.length);
-      // In `roots` order, each tree headed by its own root.
-      expect(trees.map((t) => rowNodeId(t.querySelector(".tree-row")!))).toEqual(pane.roots);
+      expect(trees.length).toBe(pane.unowned.length);
+      // In `unowned` order, each tree headed by its own node.
+      expect(trees.map((t) => rowNodeId(t.querySelector(".tree-row")!))).toEqual(pane.unowned);
     }
   });
 
   it("draws every node of the graph exactly once", () => {
-    // The forest covers the table: a node reachable only through a share edge
-    // is a root of its own, so nothing is dropped and nothing is duplicated.
-    const { body, pane } = mountGraph(polymorphic, "post-conversion");
-    expect(nodeRows(body).map(rowNodeId).sort((a, b) => a - b)).toEqual(
-      pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b),
-    );
+    // The forest covers the table: a node no value edge names is unowned and so
+    // heads a tree of its own, so nothing is dropped and nothing is duplicated.
+    // `source_shared` is the case that needs the source in `unowned` — nothing
+    // subscribes it, so it is drawn as a one-node tree or not at all, and a node
+    // with no row has no selection handle for a pane link to land on.
+    for (const [snap, id] of [
+      [polymorphic, "post-conversion"],
+      [sourceShared, "post-conversion"],
+    ] as const) {
+      const { body, pane } = mountGraph(snap, id);
+      expect(nodeRows(body).map(rowNodeId).sort((a, b) => a - b)).toEqual(
+        pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b),
+      );
+    }
   });
 
   it("shows an operator's tiling and a boundary node's absence of one", () => {
@@ -123,11 +135,11 @@ describe("OperatorView: share edges as reference leaves", () => {
   beforeAll(stubLayout);
 
   // The consumers of a share edge, and the edge each holds.
-  const sharers = (pane: OperatorPane): [OperatorNode, { role: string; id: number }][] =>
+  const sharers = (pane: OperatorPane): [OperatorNode, { role: string; subscribed: number }][] =>
     pane.nodes.flatMap((node) =>
       node.inputs
         .filter((e) => e.kind === "share")
-        .map((e) => [node, e] as [OperatorNode, { role: string; id: number }]),
+        .map((e) => [node, e] as [OperatorNode, { role: string; subscribed: number }]),
     );
 
   it("renders a share input as an `.op-ref` leaf naming its target", () => {
@@ -141,22 +153,23 @@ describe("OperatorView: share edges as reference leaves", () => {
 
       expect(refs.length).toBe(1);
       expect(refs[0].classList.contains("op-ref-share")).toBe(true);
-      expect(rowNodeId(refs[0])).toBe(edge.id);
+      expect(rowNodeId(refs[0])).toBe(edge.subscribed);
       expect(refs[0].querySelector(".op-ref-arrow")!.textContent).toBe("→");
       expect(refs[0].querySelector(".edge-label")!.textContent).toBe(`${edge.role}:`);
-      // The target's label, so the reference reads without chasing the id.
-      const target = pane.nodes.find((n) => n.nodeId === edge.id)!;
-      expect(refs[0].querySelector(".node-label")!.textContent).toBe(target.label);
+      // The subscribed node's label, so the reference reads without chasing
+      // the id.
+      const subscribed = pane.nodes.find((n) => n.nodeId === edge.subscribed)!;
+      expect(refs[0].querySelector(".node-label")!.textContent).toBe(subscribed.label);
     }
   });
 
   it("does not nest the shared subtree under its consumer", () => {
     const { body, pane } = mountGraph(polymorphic, "post-conversion");
     const [consumer, edge] = sharers(pane)[0];
-    const target = pane.nodes.find((n) => n.nodeId === edge.id)!;
-    // The share target owns inputs of its own; those are what a nested draw
+    const subscribed = pane.nodes.find((n) => n.nodeId === edge.subscribed)!;
+    // The shared node holds inputs of its own; those are what a nested draw
     // would duplicate.
-    expect(target.inputs.length).toBeGreaterThan(0);
+    expect(subscribed.inputs.length).toBeGreaterThan(0);
 
     const subtree = subtreeOf(nodeRow(body, consumer.nodeId));
     // The consumer's row and the one reference leaf, and nothing below it.
@@ -164,14 +177,14 @@ describe("OperatorView: share edges as reference leaves", () => {
     expect(nodeRows(subtree).map(rowNodeId)).toEqual([consumer.nodeId]);
   });
 
-  it("selects the target when a reference leaf is clicked", () => {
+  it("selects the subscribed node when a reference leaf is clicked", () => {
     const { store, body, pane } = mountGraph(polymorphic, "post-conversion");
     const [, edge] = sharers(pane)[0];
     const selection = watchSelection(store);
 
     body.querySelector<HTMLElement>(".op-ref")!.click();
 
-    expect(selection()).toEqual({ kind: "node", paneId: pane.id, nodeId: edge.id });
+    expect(selection()).toEqual({ kind: "node", paneId: pane.id, nodeId: edge.subscribed });
   });
 });
 
@@ -193,7 +206,7 @@ describe("OperatorView: the cross-pane link", () => {
     const upstream = irPaneById(polymorphic, "post-planning");
     const treeBody = document.createElement("div");
     container.appendChild(treeBody);
-    new TreeView(treeBody, store, upstream.id, upstream.roots[0]);
+    new TreeView(treeBody, store, upstream.id, upstream.root);
 
     const sink = pane.nodes.find((n) => n.role === "sink")!;
     const expected = new Set(

@@ -36,11 +36,7 @@ function spanContains(start: number, end: number, off: number): boolean {
   return start <= off && off < end;
 }
 
-export function buildIndices(
-  roots: number[],
-  nodes: IrNode[],
-  definitions: Definition[],
-): Indices {
+export function buildIndices(root: number, nodes: IrNode[], definitions: Definition[]): Indices {
   const nodeById = new Map<number, IrNode>();
   for (const node of nodes) nodeById.set(node.nodeId, node);
 
@@ -56,22 +52,17 @@ export function buildIndices(
 
   // Depth and predicate-ness are properties of a *position* in the tree, and the
   // table is a DAG: a shared predicate hangs off several parents. Both are
-  // resolved at first visit of a pre-order walk from the pane's roots — the same
+  // resolved at first visit of a pre-order walk from the pane's root — the same
   // order the producer emits `nodes` in, so a node's depth here is the depth of
   // the position that put it in the array. Value children precede predicate
   // children at every node, so a node reachable both as an operand and inside a
   // type is first reached as the operand and is correctly not a predicate
   // interior.
-  //
-  // A tree pane names exactly one root, so the stack starts with one entry; an
-  // empty `roots` walks nothing.
   const depthById = new Map<number, number>();
   const predicateIds = new Set<number>();
-  const stack: Array<{ id: number; depth: number; inPredicate: boolean }> = roots.map((id) => ({
-    id,
-    depth: 0,
-    inPredicate: false,
-  }));
+  const stack: Array<{ id: number; depth: number; inPredicate: boolean }> = [
+    { id: root, depth: 0, inPredicate: false },
+  ];
   while (stack.length > 0) {
     const { id, depth, inPredicate } = stack.pop()!;
     if (depthById.has(id)) continue;

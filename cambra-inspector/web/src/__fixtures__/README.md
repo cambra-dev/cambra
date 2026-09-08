@@ -26,11 +26,13 @@ validator instead of passing silently. There is no top-level `ir`/`spanIndex`
 
 ## What a pane ships
 
-`nodes` holds each node of that pane exactly once, and `roots` names the ids its
-walk starts from. `kind` is the discriminant for which shape `nodes` holds.
+`nodes` holds each node of that pane exactly once, and the pane's own walk-start
+key names the ids a walk of it starts from. `kind` is the discriminant for which
+shape `nodes` holds, and for which of the two keys the pane carries.
 
 A **tree pane** (`holes`, `typed`) holds expression nodes, in first-visit
-pre-order, and names exactly one root. A child is `{ edge, id, predicate }` — the
+pre-order, and names its start under `root` — one id, since a tree has one by
+construction. A child is `{ edge, id, predicate }` — the
 id names an entry of the same table, so a node reached from several places is one
 entry that several edges name. A refinement predicate riding a type slot is a
 node like any other, reached under a `where.N`-labelled child edge instead of a
@@ -39,14 +41,19 @@ inside a type from an operand, and the label is for display. Each node carries
 its type as a rendered string in `type` (`"Int"`, `"_"`).
 
 The **operator pane** (`operators`) holds the dataflow graph, in conversion
-order, and names several roots — a sink per compiled output and a fan input per
-share point, which are the nodes nothing owns. A node carries `role`
-(`operator`, `source`, `sink`), a `tiling` for an operator and none for a
-boundary, and `inputs`: `{ role, kind, deferred, id }`. An edge's `kind` is
-`value` for an exclusively owned input, `share` for one several consumers may
-reach, `feedback` for a share that closes a cycle. These are construction edges —
-which operator holds which. Runtime dataflow follows `get` and `notify`, a
-different relation, and nothing on this wire says the two coincide.
+order, and names its starts under `unowned` — the nodes no `value` edge names: a
+sink per compiled output, a fan input per share point, and a source per
+registered data source. Every node of the pane is reachable from `unowned`
+following `value` edges alone, which is the relation a consumer walks.
+
+A node carries `role` (`operator`, `source`, `sink`), a `tiling` for an operator
+and none for a boundary, and `inputs`: `{ role, kind, deferred, subscribed }`. An
+edge's `kind` is `value` for an exclusively owned input, `share` for one several
+consumers may reach, `feedback` for a share that closes a cycle. These are
+construction edges — which operator holds which — stored on the consumer, so
+`subscribed` names the node read and the recorded relation runs against dataflow.
+Runtime dataflow follows `get` and `notify`, a different relation, and nothing on
+this wire says the two coincide.
 
 ## Regenerating
 
