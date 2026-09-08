@@ -949,9 +949,15 @@ fn lower_loop_body_chain(
                 // replaces it wholesale. Both are writes to the same accumulator, so
                 // only the emitted node differs.
                 let write = match &target.node {
-                    AssignTarget::Subscript { target, index } => {
-                        lower_keyed_write(target, index, value, stmt.span, ctx)?
-                    }
+                    AssignTarget::Subscript { target, index } => lower_keyed_write(
+                        target,
+                        index,
+                        value,
+                        &[],
+                        outer_bindings,
+                        stmt.span,
+                        ctx,
+                    )?,
                     _ => {
                         check_mut_write_context(&name, stmt.span, ctx)?;
                         let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;

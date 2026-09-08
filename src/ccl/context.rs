@@ -1560,13 +1560,18 @@ fn run_passes(
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars)?;
 
-    // A register's seed enters the value type its binder declares — a concrete collection
-    // reaches an abstract one only through an introduction.
-    mut_elim::view_seeds_at_value_type(&mut expr);
-    // `m[k] := v` becomes the whole-value write it denotes, `m := insert(m, k, v)`, so
-    // every phase below sees one kind of `MutWrite` and none of them needs a key.
-    mut_elim::desugar_keyed_writes(&mut expr);
+    // The two rewrites the transactional slice runs before its own: both mint expression
+    // nodes, so both sit inside the phase's recording — outside it their nodes reach the
+    // audit span opened above as `Leak::Unrecorded`, and the span's floor stops being
+    // reachable.
     expr = recorded(capture_provenance, Phase::Transact, || {
+        let mut expr = expr;
+        // A register's seed enters the value type its binder declares — a concrete
+        // collection reaches an abstract one only through an introduction.
+        mut_elim::view_seeds_at_value_type(&mut expr);
+        // `m[k] := v` becomes the whole-value write it denotes, `m := insert(m, k, v)`, so
+        // every phase below sees one kind of `MutWrite` and none of them needs a key.
+        mut_elim::desugar_keyed_writes(&mut expr);
         transact_phase::run(expr, &txn_mut_vars)
     })
     .map_err(|msg| vec![CompileError::Unsupported(msg)])?;

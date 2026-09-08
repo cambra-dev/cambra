@@ -831,6 +831,14 @@ pub fn view_seeds_at_value_type(expr: &mut Expr) {
     if let TypedExprNode::MutDecl { binding, init, .. } = &mut expr.node {
         let value_ty = value_type_of(&binding.ty);
         if value_ty.peel_refinements().sum().is_some() && init.ty != value_ty {
+            // The `box` this mints stands in for the seed it restates, so the recording
+            // names the seed. Opened around `view_at` alone: the recursion below must
+            // attach its own products to their own nodes.
+            let _g = provenance::enter(
+                init.node_id(),
+                "transact.view_seed_at_value_type",
+                provenance::Nature::Machinery,
+            );
             view_at(init, value_ty);
         }
     }
@@ -875,10 +883,23 @@ pub fn desugar_keyed_writes(expr: &mut Expr) {
     rewrite_keyed_writes(expr, &value_tys);
 }
 
-/// Record each mutable variable's value type, read off its `MutDecl` binder.
+/// Record each mutable variable's value type, read off the binder that introduces it.
+///
+/// Two binders introduce one, and both are read here: [`TypedExprNode::MutDecl`], and a
+/// `Lambda` param that takes a mutable variable *by reference* — the case that genuinely
+/// crosses a function boundary (see [`TypedExprNode::MutDecl`]'s own docs). Reading only
+/// the declaration leaves a keyed write through a `Mut` parameter with no value type,
+/// which `def bump(m: Mut(Map(Int, Int)), k: Int): m[k] := 1` reaches whenever the writer
+/// is not inlined — a returned one is not.
 fn collect_mut_value_types(expr: &Expr, out: &mut HashMap<Name, Type>) {
-    if let TypedExprNode::MutDecl { binding, .. } = &expr.node {
-        out.insert(binding.name.clone(), value_type_of(&binding.ty));
+    match &expr.node {
+        TypedExprNode::MutDecl { binding, .. } => {
+            out.insert(binding.name.clone(), value_type_of(&binding.ty));
+        }
+        TypedExprNode::Lambda { param, .. } if param.ty.mut_value_type().is_some() => {
+            out.insert(param.name.clone(), value_type_of(&param.ty));
+        }
+        _ => {}
     }
     expr.walk_children(&mut |c| collect_mut_value_types(c, out));
 }
@@ -894,14 +915,27 @@ fn value_type_of(ty: &Type) -> Type {
 
 fn rewrite_keyed_writes(expr: &mut Expr, value_tys: &HashMap<Name, Type>) {
     expr.walk_children_mut(&mut |c| rewrite_keyed_writes(c, value_tys));
+    let write_id = expr.node_id();
     let TypedExprNode::MutWrite { name, key, value } = &mut expr.node else {
         return;
     };
     let Some(key) = key.take() else {
         return;
     };
+    // `m := insert(m, k, v)` is what `m[k] := v` denotes, so the nodes below are that
+    // write's faithful expansion and the recording names the write. Opened after the
+    // recursion and after the two returns that abandon it.
+    let _g = provenance::enter(
+        write_id,
+        "transact.keyed_write",
+        provenance::Nature::Expansion,
+    );
     let map_ty = value_tys.get(name).cloned().unwrap_or_else(|| {
-        panic!("desugar_keyed_writes: keyed write to `{name}`, which has no `MutDecl` to read a value type off")
+        panic!(
+            "desugar_keyed_writes: keyed write to `{name}`, which neither a `MutDecl` nor a \
+             `Mut` parameter binds — the two binders of a mutable variable, and an unbound \
+             target is rejected before this phase"
+        )
     });
     let arg_ty = Type::Tuple(vec![map_ty.clone(), key.ty.clone(), value.ty.clone()]);
     let mut arg = Expr::tuple(vec![tvar(name, map_ty.clone()), *key, (**value).clone()]);

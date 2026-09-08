@@ -395,9 +395,11 @@ pub(super) fn lower_final_stmt(
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
-        // A keyed write as the final statement, the `m[k] := v` sibling of the bare
-        // write above. `Unit`-valued like any write, so it cannot be the program's
-        // value; it falls through to the "must end in a value" error the same way.
+        // A keyed write as the final statement, the `m[k] := v` sibling of the bare write
+        // above. It needs no in-scope guard: a subscript declares nothing, so the form is a
+        // write wherever it appears, and there is no introduction to fall through to the
+        // "must end in a value" error. `Unit`-valued like any write, so a program ending in
+        // one has value `unit`.
         ChlStmt::MutAssign {
             target,
             annotation: None,
@@ -406,7 +408,15 @@ pub(super) fn lower_final_stmt(
             let AssignTarget::Subscript { target, index } = &target.node else {
                 unreachable!("guarded by the match arm above")
             };
-            lower_keyed_write(target, index, value, last.span, ctx)
+            lower_keyed_write(
+                target,
+                index,
+                value,
+                preceding,
+                outer_bindings,
+                last.span,
+                ctx,
+            )
         }
         // A standalone `with begin():` as the program's final statement: one
         // transaction whose value is `Unit` (a trailing transaction produces no
@@ -639,7 +649,15 @@ pub(super) fn lower_middle_stmt(
             let AssignTarget::Subscript { target, index } = &target.node else {
                 unreachable!("guarded by the match arm above")
             };
-            let write = lower_keyed_write(target, index, value, stmt.span, ctx)?;
+            let write = lower_keyed_write(
+                target,
+                index,
+                value,
+                preceding,
+                outer_bindings,
+                stmt.span,
+                ctx,
+            )?;
             Ok(ctx.tag_machinery(Expr::expr_stmt(write, body), stmt.span, "lower.stmt_seq"))
         }
         ChlStmt::MutAssign {
@@ -943,12 +961,21 @@ pub(super) fn write_target_name(target: &Spanned<AssignTarget>) -> Option<&str> 
 ///
 /// Always a write, never an introduction: writing one key of a collection presumes the
 /// collection, so there is no spelling of `:=` at a subscript that declares one. That is
-/// why this takes no annotation and consults no scope — an unbound `m` surfaces as an
-/// unbound variable from inference, where every other use of a name does.
+/// why this takes no annotation — an unbound `m` surfaces as an unbound variable from
+/// inference, where every other use of a name does.
+///
+/// The **value** is an assignment's right-hand side like any other, so it carries
+/// `preceding`/`outer_bindings` through [`lower_assigned_value`]: a block in that position
+/// reads the scope to tell a write from an introduction, and lowering it with an empty one
+/// silently turns an inner `n := n + 1` into a branch-local binding
+/// ([`super::lower_expr`] states the invariant). The **key** is an ordinary expression, not
+/// an assigned value, so it takes no scope.
 pub(super) fn lower_keyed_write(
     target: &Spanned<ChlExpr>,
     index: &Spanned<ChlExpr>,
     value: &Spanned<ChlExpr>,
+    preceding: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -964,7 +991,7 @@ pub(super) fn lower_keyed_write(
     let name = id.as_str().to_string();
     check_mut_write_context(&name, span, ctx)?;
     let key = lower_expr(index, ctx)?;
-    let val = lower_expr(value, ctx)?;
+    let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
     Ok(ctx.tag_image(Expr::mut_write_keyed(name, key, val), span))
 }
 

@@ -3080,6 +3080,41 @@ fn a_keyed_write_reaches_an_induction_store() {
     );
 }
 
+/// A keyed write through a `Mut` **parameter**: `fw(m, x)` writes one key of the caller's
+/// register, the pass-by-reference shape `def fw(c: Mut(Int))` already supports for a
+/// scalar accumulator.
+///
+/// The write crosses a function boundary, so the register's own value type is what the
+/// write is typed against — the parameter binder carries `Mut(Σ (σ : SubtypesOf(Int)). (σ
+/// ⤇ Int), _)`, not the seed's concrete key domain — and `desugar_keyed_writes` reads that
+/// binder as well as the `MutDecl`, both being binders of a mutable variable.
+///
+/// The seed holds **two** entries deliberately. A single-entry `map(…)` literal resolves
+/// its key type to that key's own singleton, so the present-key domain reads `{Int | __elem
+/// == 1, __elem ▷ (… ▷ collection_contains)}` and fails the invariance check on a
+/// collection domain downstream; the arity is the workaround, not part of what this pins.
+///
+/// Two adjacent shapes are absent because neither is about a keyed collection. A
+/// *constant* whole-collection write through a parameter (`m := box(map(…))`) reaches
+/// `letrec recognition: decision is not a compose`, which a scalar `c := 5` through a
+/// parameter does too. Transactional pass-by-reference is refused at lowering: a `with
+/// begin():` block takes writes, bindings, guards and feeds, not a call.
+#[test]
+fn a_keyed_write_through_a_mut_parameter() {
+    let value = final_mut_var_value(indoc! {r#"
+        def fw(m: Mut(Map(Int, Int)), k: Int):
+            m[k] := 1
+        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        for x in [3, 4]:
+            fw(m, x)
+        m
+    "#});
+    assert_eq!(
+        map_entries_int(&value),
+        vec![(1, 10), (2, 20), (3, 1), (4, 1)]
+    );
+}
+
 /// A map value's bindings, key-sorted — a `Value::Function`'s order follows construction,
 /// which is not what a test about *contents* should depend on.
 fn map_entries(v: &Value) -> Vec<(String, i64)> {

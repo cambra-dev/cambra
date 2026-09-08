@@ -1685,10 +1685,13 @@ fn store_key(reg: &str, at: Value) -> Value {
     }
 }
 
-/// The extent of a store's key space — one arm per register, plus one per reply
-/// tap (a tap occupies a write-only arm of its own). An arm is `Unit` where the
-/// register's key space is the single name; a keyed register contributes its data
-/// key extent instead.
+/// The extent of a store's key space — one arm per register, plus one per reply tap (a tap
+/// occupies a write-only arm of its own).
+///
+/// Every arm is `Unit`, a keyed register included: `desugar_keyed_writes` rewrites `m[k] :=
+/// v` into the whole-value write `m := insert(m, k, v)`, so a register holds its whole
+/// collection at the single key `` `reg(unit) `` and the data key never reaches this key
+/// space. The tag is what would keep two registers' keys disjoint if one ever did.
 fn store_key_extent(arms: Vec<(String, Extent)>) -> Extent {
     Extent::Union(TagMap::from_arms(
         arms.into_iter()

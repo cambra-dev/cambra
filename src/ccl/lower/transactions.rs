@@ -217,7 +217,8 @@ fn lower_tx_block_inner(
                 let AssignTarget::Subscript { target, index } = &target.node else {
                     unreachable!("guarded by the match arm above")
                 };
-                let write = lower_keyed_write(target, index, value, stmt.span, ctx)?;
+                let write =
+                    lower_keyed_write(target, index, value, &[], outer_bindings, stmt.span, ctx)?;
                 ctx.tag_machinery(Expr::expr_stmt(write, chain), stmt.span, "lower.stmt_seq")
             }
             ChlStmt::MutAssign { target, value, .. } => {
