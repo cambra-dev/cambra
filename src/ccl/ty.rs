@@ -1438,7 +1438,8 @@ pub enum TypeKind {
 /// The `` `some `` tag of an `Option` — a value that is present.
 ///
 /// Named here, beside [`Type::option_of`], because the runtime builds the same tag when it
-/// answers a checked lookup (`FunctionDef::LookupChecked`). One spelling, two builders.
+/// answers a checked lookup (`some_of` in `src/interpreter/tile_operators/lookup.rs`). One
+/// spelling, two builders.
 pub const V_SOME: &str = "some";
 /// The `` `none `` tag of an `Option` — a value that is absent. See [`V_SOME`].
 pub const V_NONE: &str = "none";

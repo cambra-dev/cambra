@@ -1126,7 +1126,7 @@ fn convert_impl_inner(
             })?;
             let option_extent = ctx.extent_of(&option_ty)?;
             let collection = convert_impl(argument, None, ctx)?;
-            reject_collection_valued_lookup(collection.tiling())?;
+            reject_unanswerable_lookup_collection(collection.tiling())?;
             Ok(Box::new(CheckedLookup::new(
                 collection,
                 keys,
@@ -1157,7 +1157,7 @@ fn convert_impl_inner(
             };
             let option_extent = ctx.extent_of(&expr.ty)?;
             let collection = convert_impl(coll_expr, None, ctx)?;
-            reject_collection_valued_lookup(collection.tiling())?;
+            reject_unanswerable_lookup_collection(collection.tiling())?;
             let keys = convert_impl(key_expr, None, ctx)?;
             Ok(Box::new(CheckedLookup::new(
                 collection,
@@ -2217,22 +2217,30 @@ fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
     as_builtin(argument)
 }
 
-/// Reject a lookup whose collection does not tile as a sealed function.
+/// Reject a lookup whose collection has no answer shape.
 ///
-/// The operator reads the domain column of a sealed function to decide presence, so any
-/// other tiling has nothing to search. A collection-**valued** codomain is the shape this
-/// guards: its rows tile as a `CurriedFunction`, and the answer would carry a collection as
-/// its `` `some `` payload, which nothing materializes. Typing rejects the one producer of
-/// those today (a key-dependent codomain has no checked lookup), so this is the boundary
-/// check for a shape that reaches op-conversion by some other route.
-fn reject_collection_valued_lookup(tiling: &Tiling) -> Result<(), ConversionError> {
-    if matches!(tiling, Tiling::SealedFunction { .. }) {
+/// Two requirements, both of which `CheckedLookup` asserts rather than re-checks. The
+/// collection tiles as a **sealed function**: the operator searches a domain column to
+/// decide presence, and any other tiling has nothing to search. Its codomain tiles as a
+/// **scalar**: an answer's `` `some `` payload is one column value, so a codomain of any
+/// other shape — a `CurriedFunction`'s collection-valued rows, a `Record`'s several columns
+/// — has nothing to put there.
+///
+/// Typing rejects the one producer of a key-dependent codomain today, so this is the
+/// boundary check for a shape that reaches op-conversion by some other route. Naming it
+/// here is what lets the runtime read a non-scalar codomain as the impossibility it is: the
+/// operator answers `None` for "the collection has not decided this key yet", and a
+/// permanent shape mismatch reported that way is a lookup that spins instead of erroring.
+fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), ConversionError> {
+    if let Tiling::SealedFunction { codomain, .. } = tiling
+        && matches!(codomain.as_ref(), Tiling::Scalar(_))
+    {
         return Ok(());
     }
     Err(ConversionError::Unsupported(format!(
-        "`c[k]?` needs a collection that tiles as a sealed function, so that its domain can \
-         be searched; this one tiles as {tiling}. A collection-valued codomain is the usual \
-         reason — the answer would carry a collection as its `some` payload"
+        "`c[k]?` needs a collection that tiles as a sealed function over a scalar codomain, \
+         so that its domain can be searched and its values carried as the `some` payload; \
+         this one tiles as {tiling}. A collection-valued codomain is the usual reason"
     )))
 }
 

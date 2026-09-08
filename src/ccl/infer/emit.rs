@@ -901,9 +901,16 @@ pub(super) fn emit_apply<C: Typing>(
         };
         let (collection, key_ty) = (read_through(collection), key_ty.clone());
         // The key **term**, not just its type: a dependent codomain discharges its key
-        // binder to it, so `g[k]` reads the group refined at `k`.
+        // binder to it, so `g[k]` reads the group refined at `k`. A `Type::Tuple` does not
+        // make the node one — a `Var` bound to a pair has that type, as does a `Proj` or a
+        // `Let` yielding one — so the pair is required as a term here, and its absence is a
+        // diagnosable shape failure like the two above rather than an impossibility.
         let TypedExprNode::Tuple(pair) = &argument.node else {
-            unreachable!("`lookup?`'s argument typed as a Tuple, so its node is one");
+            return Err(ctx.raise(InferError::Unsupported(format!(
+                "`lookup?` needs its `(collection, key)` pair as a term, so that the key can \
+                 discharge a dependent codomain's binder; got `{}`",
+                symbolic(argument)
+            ))));
         };
         let [_, key] = pair.as_slice() else {
             unreachable!("`lookup?`'s argument typed as a two-element Tuple");
@@ -1096,7 +1103,7 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
 /// obligation the key owes — and the substituted type stands for any key of the key type,
 /// denoting the empty group when the key is absent. Whether the answer can be
 /// *materialized* is a separate question, decided at op-conversion
-/// (`reject_collection_valued_lookup`).
+/// (`reject_unanswerable_lookup_collection`).
 fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
     let viewed = match collection.sum() {

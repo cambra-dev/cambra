@@ -1,7 +1,12 @@
+use bit_set::BitSet;
+
 use super::*;
 use crate::{
     ccl::FieldKey,
-    interpreter::{ColumnValue, Consumer, Scheduler, Value, tiling::FunctionGuard},
+    interpreter::{
+        ColumnValue, Consumer, Scheduler, Value, forwarding_consumer, shared_consumer,
+        tiling::FunctionGuard,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -76,12 +81,19 @@ impl TileOperator for CheckedLookup {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let keys = self
-            .keys
-            .subscribe(self.keys.tiling().universal_guard(), consumer, scheduler);
+        // Both legs wake the same consumer. The collection is what decides an absence, so
+        // when it settles after the keys it is the input that completes the answer — and a
+        // collection subscribed with a consumer of its own would settle with nobody
+        // scheduled to read it (see [`SharedConsumer`]).
+        let shared = shared_consumer(consumer);
+        let keys = self.keys.subscribe(
+            self.keys.tiling().universal_guard(),
+            forwarding_consumer(&shared),
+            scheduler,
+        );
         let collection = self.collection.subscribe(
             self.collection.tiling().universal_guard(),
-            Box::new(|| {}),
+            forwarding_consumer(&shared),
             scheduler,
         );
         Box::new(CheckedLookupProducer {
@@ -127,8 +139,14 @@ impl CheckedLookupProducer {
                 domain, codomain, ..
             } => match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
                 Some(i) => {
+                    // `None` here would read as "still deciding" for a shape that will never
+                    // change, and the lookup would spin instead of answering. Op-conversion's
+                    // `reject_unanswerable_lookup_collection` is what makes this unreachable.
                     let Tile::Scalar(values) = codomain.as_ref() else {
-                        return None;
+                        panic!(
+                            "CheckedLookup: an answer's `some` payload is one column value, so \
+                             the collection's codomain tiles as a scalar; got {codomain:?}"
+                        )
                     };
                     Some(some_of(values.index_at(i)))
                 }
@@ -158,28 +176,36 @@ impl TileProducer for CheckedLookupProducer {
         if self.released {
             return empty_scalar;
         }
-        let key_tile = self.keys.get(self.keys.tiling().universal_guard());
-        let coll = self
+        // Both legs are searched by position, and a release marks rows deleted rather than
+        // removing them (`Tile::mark_deleted`), so a tile still carrying deletions answers a
+        // released or filtered-out key as present. Compacting drops those rows and clears the
+        // bitset, which is what leaves the answer below with no deletions of its own.
+        let mut key_tile = self.keys.get(self.keys.tiling().universal_guard());
+        key_tile.compact();
+        let mut coll = self
             .collection
             .get(self.collection.tiling().universal_guard());
+        coll.compact();
         match key_tile {
+            // No key has arrived yet, so there is nothing to answer.
+            Tile::Scalar(ref keys) if keys.is_empty() => empty_scalar,
             // One key: the scalar form `m[k]?`.
-            Tile::Scalar(keys) if !keys.is_empty() => {
-                match self.answer_for(&keys.index_at(0), &coll) {
-                    Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
-                    None => empty_scalar,
-                }
-            }
+            Tile::Scalar(ref keys) => match self.answer_for(&keys.index_at(0), &coll) {
+                Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
+                None => empty_scalar,
+            },
             // A stream of keys: the lookup sits in an iteration, and each row is answered
             // against the same collection — read once, not lifted into every row.
             Tile::SealedFunction {
                 ref domain,
                 ref codomain,
                 ref domain_predicate,
-                ref deleted,
+                ..
             } => {
                 let Tile::Scalar(key_col) = codomain.as_ref() else {
-                    return empty_scalar;
+                    panic!(
+                        "CheckedLookup: a key is one value, so the key stream's codomain tiles as a scalar; got {codomain:?}"
+                    )
                 };
                 // A key the collection has not decided yet contributes no row, so the
                 // answer is a *prefix* of the key stream and grows with it. Keeping the
@@ -199,17 +225,29 @@ impl TileProducer for CheckedLookupProducer {
                     panic!("CheckedLookup answers a stream when its keys are one")
                 };
                 let domain_extent = dom_ext.clone();
+                // The answer seals only where it holds a row for every key. A key the
+                // collection has not decided is a *missing* row, not a decided absence, so
+                // passing the keys' own seal through would let a consumer read the whole
+                // answer as complete while those rows are still outstanding.
+                let domain_predicate = if kept.len() == domain.len() {
+                    domain_predicate.clone()
+                } else {
+                    Predicate::False
+                };
                 Tile::SealedFunction {
                     domain: ColumnValue::from_values(kept, &domain_extent),
                     codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
                         answers,
                         &out_extent,
                     ))),
-                    domain_predicate: domain_predicate.clone(),
-                    deleted: deleted.clone(),
+                    domain_predicate,
+                    // The rows are the live keys the collection has decided, a subsequence of
+                    // an already-compacted domain. Carrying the keys' bitset forward would
+                    // name positions of a column this one no longer shares.
+                    deleted: BitSet::new(),
                 }
             }
-            _ => empty_scalar,
+            other => panic!("CheckedLookup keys tile as a scalar or a stream, got {other:?}"),
         }
     }
 

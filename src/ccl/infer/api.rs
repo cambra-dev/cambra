@@ -763,14 +763,15 @@ fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     }
 }
 
-/// The hint for an application whose **domain is a collection's** and whose argument
+/// The hint for an application whose **domain is a keyed collection's** and whose argument
 /// cannot be shown to lie in it — i.e. an attempted lookup.
 ///
-/// A collection's domain is not a type an ordinary value inhabits: an `Array(3, 𝑇)`'s is
-/// the range `[0, 3)`, and a keyed collection's is that collection's own key domain. So a
-/// bare `Int` index, literal or not, fails the edge — and the raw mismatch reads as an
-/// internal confusion rather than as what it is, a lookup whose proof obligation cannot be
-/// discharged. Named here rather than at the subscript form because `c[k]` lowers to
+/// A collection's domain is not a type an ordinary value inhabits: a keyed collection's is
+/// that collection's own present-key domain. So a bare `Int` index, literal or not, fails
+/// the edge — and the raw mismatch reads as an internal confusion rather than as what it
+/// is, a lookup whose proof obligation cannot be discharged. An `Array(3, 𝑇)`'s range
+/// domain `[0, 3)` is left to its own message, which already says it wanted an index in the
+/// range. Named here rather than at the subscript form because `c[k]` lowers to
 /// exactly the application `c(k)`, so the diagnosis has to be type-directed to cover both
 /// spellings.
 ///
@@ -778,20 +779,45 @@ fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
 /// "3.9 Subscript and attribute access"; the discharge it rests on is
 /// `src/ccl/design/collections.md`, "Lookup: membership discharge".
 fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
-    // A **refined** domain only. Its refinement is what describes which keys are present,
-    // so the checked form has something to decide. A range domain's mismatch is already
-    // self-explanatory — it demanded an index in the range and got an integer — and naming
-    // the checked form there would send the reader to a spelling that fails identically.
-    fn is_collection_domain(ty: &Type) -> bool {
-        !ty.refinements().is_empty()
+    /// A **present-key domain** — `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`, how a keyed
+    /// collection states which keys it holds. Its sole producer is `present_key_domain` in
+    /// `src/ccl/lower/exprs.rs`, and the test is the shape that function builds.
+    ///
+    /// Recognizing the predicate rather than asking whether *any* refinement is present is
+    /// what keeps the hint to the case it describes. A literal's type is the singleton
+    /// `{Int | __elem == 5}`, so "carries a refinement" holds of every literal: it fires on
+    /// any mismatch with a literal on one side, names the literal's own type as the
+    /// collection's domain, and advises a checked lookup where no lookup occurs. A range
+    /// domain stays excluded for the reason it always was — its mismatch already reads as
+    /// what it is, and the checked form fails on it identically.
+    fn is_present_key_domain(ty: &Type) -> bool {
+        ty.refinements().iter().any(|refinement| {
+            let TypedExprNode::Apply { argument, function } = &refinement.predicate.node else {
+                return false;
+            };
+            if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
+                return false;
+            }
+            let TypedExprNode::Apply {
+                function: characteristic,
+                ..
+            } = &function.node
+            else {
+                return false;
+            };
+            matches!(
+                &characteristic.node,
+                TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
+            )
+        })
     }
     // Read whichever side is the domain. The two are not in a fixed order here: which one
     // the solver reports as "expected" depends on where the edge was raised, and an
     // application's domain can be reported from either side of it.
-    let (domain, index) = match (is_collection_domain(type_a), is_collection_domain(type_b)) {
+    let (domain, index) = match (is_present_key_domain(type_a), is_present_key_domain(type_b)) {
         (true, false) => (type_a, type_b),
         (false, true) => (type_b, type_a),
-        // Neither side is a collection domain (an ordinary mismatch, which keeps its
+        // Neither side is a present-key domain (an ordinary mismatch, which keeps its
         // unadorned message), or both are (a genuine domain-vs-domain edge, where the
         // index is not what went wrong).
         _ => return None,
@@ -4124,6 +4150,44 @@ mod tests {
         assert!(
             rendered.contains("σ@"),
             "the excerpt does not show what differs: {rendered}"
+        );
+    }
+
+    /// The index hint fires for a present-key domain and stays silent otherwise.
+    ///
+    /// The silent half is the one that bites: every literal's type is a singleton
+    /// refinement, so a test for "carries a refinement" reports the literal's own type as
+    /// a collection's domain and advises a checked lookup on a mismatch that is not a
+    /// lookup at all.
+    #[test]
+    fn index_hint_names_only_a_present_key_domain() {
+        // `{Int | __elem ▷ (m ▷ collection_contains)}` — what `present_key_domain` builds.
+        let morphism = Expr::apply(
+            Expr::var("m"),
+            Expr::builtin(crate::ccl::Builtin::CollectionContains),
+        );
+        let key_domain = Type::refined_one(
+            Type::Base(BaseType::Int),
+            crate::ccl::ty::Refinement::born(std::rc::Rc::new(Expr::apply(
+                Expr::var(Name::elem()),
+                morphism,
+            ))),
+        );
+        let hint = undischarged_index_hint(&key_domain, &Type::Base(BaseType::Int))
+            .expect("a bare index against a present-key domain is an undischarged lookup");
+        assert!(
+            hint.contains("c[k]?"),
+            "the hint names the checked form: {hint}"
+        );
+
+        // A literal on one side of an ordinary mismatch is not a lookup.
+        assert_eq!(
+            undischarged_index_hint(&int_lit_ty(7), &Type::Base(BaseType::String)),
+            None
+        );
+        assert_eq!(
+            undischarged_index_hint(&str_lit_ty("nope"), &Type::Base(BaseType::Int)),
+            None
         );
     }
 }
