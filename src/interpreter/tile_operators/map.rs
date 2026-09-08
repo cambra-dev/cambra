@@ -5,6 +5,7 @@ use super::*;
 use crate::{
     interpreter::{
         BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
+        forwarding_consumer, shared_consumer,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -148,20 +149,18 @@ impl TileOperator for MapResult {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         let function_producer = self.function.subscribe(
             self.function.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         Box::new(MapResultProducer {
@@ -576,20 +575,18 @@ impl TileOperator for MapResultToConst {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         let constant_producer = self.constant.subscribe(
             self.constant.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         Box::new(MapResultToConstProducer {

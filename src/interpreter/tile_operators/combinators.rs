@@ -1,10 +1,13 @@
 use bit_set::BitSet;
 use log::trace;
-use std::{cell::RefCell, collections::HashMap, iter, rc::Rc};
+use std::{collections::HashMap, iter};
 
 use super::*;
 use crate::{
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, tuple_field},
+    interpreter::{
+        ColumnValue, Consumer, Extent, Scheduler, Value, forwarding_consumer, shared_consumer,
+        tuple_field,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -543,20 +546,18 @@ impl TileOperator for Filter {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         Box::new(FilterProducer {
@@ -728,20 +729,18 @@ impl TileOperator for MapFilter {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
+            forwarding_consumer(&shared),
             scheduler,
         );
         Box::new(MapFilterProducer {
