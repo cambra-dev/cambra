@@ -2,7 +2,7 @@ use log::trace;
 use std::{cell::RefCell, rc::Rc};
 
 use super::*;
-use crate::interpreter::operator_graph::{record_fan_input, share, value};
+use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{Consumer, Scheduler},
     pretty_graph::VizOptions,
@@ -170,9 +170,6 @@ impl FanOut {
     ) -> Self {
         let tiling = input.tiling().clone();
         let input_id = input.operator_id();
-        // The fan owns its input from here on, and the fan itself is dropped when
-        // conversion ends, so nothing in the graph owns this operator.
-        record_fan_input(input_id);
         let shared = Rc::new(RefCell::new(FanOutShared {
             id: FanOutProducer::alloc_id(),
             producer: None,

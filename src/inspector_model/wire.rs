@@ -112,15 +112,6 @@ pub struct PaneEntry {
     /// and absent on an operator pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<u64>,
-    /// The nodes of an operator pane that no `value` edge names — a sink per
-    /// compiled output, a fan input per share point, and a source per registered
-    /// data source. Absent on a tree pane.
-    ///
-    /// Every node of the pane is reachable from here following `value` edges
-    /// alone, which is the relation a consumer walks; see
-    /// `src/inspector_model/design.md`, "An operator node on the wire".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unowned: Option<Vec<u64>>,
     /// Every node of this pane exactly once, in first-visit pre-order for a
     /// tree and conversion order for a graph. A node reached from several
     /// places — a refinement predicate shared by several type slots, or a fan
@@ -479,16 +470,13 @@ pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// The operator pane's node table and its unowned nodes.
+/// The operator pane's node table.
 ///
 /// Nodes come out in the graph's own order, which is conversion order and so
 /// deterministic. Attribution is read the same way an expression node's is: the
 /// pane's projection is a fold product like any other.
-fn build_operator_table(
-    graph: &OperatorGraph,
-    projection: &SourceProjection,
-) -> (Vec<u64>, Vec<OperatorNode>) {
-    let nodes = graph
+fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) -> Vec<OperatorNode> {
+    graph
         .nodes()
         .iter()
         .map(|node| {
@@ -533,11 +521,7 @@ fn build_operator_table(
                 inputs: inputs.iter().map(wire_edge).collect(),
             }
         })
-        .collect();
-    (
-        graph.unowned().iter().map(|id| id.as_u64()).collect(),
-        nodes,
-    )
+        .collect()
 }
 
 /// An attribution's spans as they ship: **narrowest first**, deduplicated.
@@ -702,22 +686,21 @@ impl InspectedProgram<'_> {
             .panes()
             .iter()
             .map(|pane| {
-                let (root, unowned, nodes) = match pane.content {
+                let (root, nodes) = match pane.content {
                     PaneContent::Ir(ir) => {
                         let (root, nodes) = build_node_table(ir, &pane.projection);
-                        (Some(root), None, PaneNodes::Ir(nodes))
+                        (Some(root), PaneNodes::Ir(nodes))
                     }
-                    PaneContent::Operators(graph) => {
-                        let (unowned, nodes) = build_operator_table(graph, &pane.projection);
-                        (None, Some(unowned), PaneNodes::Operators(nodes))
-                    }
+                    PaneContent::Operators(graph) => (
+                        None,
+                        PaneNodes::Operators(build_operator_table(graph, &pane.projection)),
+                    ),
                 };
                 PaneEntry {
                     id: pane.id,
                     label: pane.label.clone(),
                     kind: pane.kind,
                     root,
-                    unowned,
                     nodes,
                 }
             })
@@ -1208,21 +1191,19 @@ mod tests {
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
-                for start in pane.root.iter().chain(pane.unowned.iter().flatten()) {
+                for start in pane.root.iter() {
                     assert!(
                         ids.contains(start),
-                        "the {} walk start {start} is absent from its own table",
+                        "the {} root {start} is absent from its own table",
                         pane.id
                     );
                 }
                 match &pane.nodes {
                     PaneNodes::Ir(nodes) => {
                         assert!(
-                            pane.root.is_some() && pane.unowned.is_none(),
-                            "a tree pane ships `root` and no `unowned`; {} ships {:?}/{:?}",
-                            pane.id,
-                            pane.root,
-                            pane.unowned
+                            pane.root.is_some(),
+                            "a tree pane ships the one root its walk starts from; {} ships none",
+                            pane.id
                         );
                         for node in nodes {
                             for child in &node.children {
@@ -1239,13 +1220,14 @@ mod tests {
                     }
                     // An operator's inputs are its edges into the same table.
                     PaneNodes::Operators(nodes) => {
+                        // A graph ships no start set: the nodes no `value` edge
+                        // names are derivable from the edges, so shipping them
+                        // would only add a channel that can disagree.
                         assert!(
-                            pane.unowned.is_some() && pane.root.is_none(),
-                            "an operator pane ships `unowned` and no `root`; {} ships \
-                             {:?}/{:?}",
+                            pane.root.is_none(),
+                            "an operator pane ships no root; {} ships {:?}",
                             pane.id,
-                            pane.root,
-                            pane.unowned
+                            pane.root
                         );
                         for node in nodes {
                             for input in &node.inputs {

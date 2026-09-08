@@ -160,20 +160,21 @@ export interface IrPane extends PaneCommon {
 // The pane holding the dataflow operator graph.
 export interface OperatorPane extends PaneCommon {
   kind: "operators";
-  // The nodes no `value` edge names — a sink per compiled output, a fan input
-  // per share point, and a source per registered data source. Every node of the
-  // pane is reachable from here following `value` edges alone, which is the
-  // relation a consumer walks; `wireValidate.ts` pins that.
-  unowned: number[];
+  // A graph names no walk start. The nodes no `value` edge subscribes are where
+  // a walk begins — a sink per compiled output, a fan input per share point, a
+  // source per registered data source — and the `inputs` already say which those
+  // are, so a consumer derives them. `wireValidate.ts` pins that they reach the
+  // whole table.
+  //
   // Every node of this pane exactly once, in conversion order.
   nodes: OperatorNode[];
 }
 
 // One ordered pipeline pane. `kind` is the discriminant for which shape `nodes`
 // holds: the two share an id and a label and nothing else — a tree pane names
-// one `root` and its nodes have a type and children, an operator pane names its
-// `unowned` nodes and its nodes have a tiling and typed input edges, and neither
-// field set is meaningful for the other.
+// one `root` and its nodes have a type and children, an operator pane names no
+// start and its nodes have a tiling and typed input edges, and neither field set
+// is meaningful for the other.
 export type PaneEntry = IrPane | OperatorPane;
 
 /**

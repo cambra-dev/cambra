@@ -196,7 +196,7 @@ export function describePanes(store: Store): PaneDescriptor[] {
   }
 
   for (const pane of store.panes) {
-    // The operator pane holds a dataflow graph — a forest of unowned nodes, and
+    // The operator pane holds a dataflow graph — a forest of subscription trees, and
     // inputs rather than children — so it gets its own view.
     if (!isIrPane(pane)) {
       panes.push({

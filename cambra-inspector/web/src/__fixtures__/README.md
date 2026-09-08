@@ -41,10 +41,11 @@ inside a type from an operand, and the label is for display. Each node carries
 its type as a rendered string in `type` (`"Int"`, `"_"`).
 
 The **operator pane** (`operators`) holds the dataflow graph, in conversion
-order, and names its starts under `unowned` — the nodes no `value` edge names: a
-sink per compiled output, a fan input per share point, and a source per
-registered data source. Every node of the pane is reachable from `unowned`
-following `value` edges alone, which is the relation a consumer walks.
+order, and names no walk start. A walk begins at the nodes no `value` edge
+subscribes — a sink per compiled output, a fan input per share point, and a
+source per registered data source — which a consumer derives from `inputs`.
+Every node is reachable from there following `value` edges alone, which is the
+relation a consumer walks.
 
 A node carries `role` (`operator`, `source`, `sink`), a `tiling` for an operator
 and none for a boundary, and `inputs`: `{ role, kind, deferred, subscribed }`. An

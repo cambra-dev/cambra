@@ -13,9 +13,9 @@
 // their kinds and the adjacent paneLinks windows (dense — self-edges legal,
 // every edge endpoint a live node id in its pane); a degraded
 // (`payloadKind: "failed"`) payload ships empty panes/paneLinks; each pane's
-// node table is closed under its own walk starts and its own edges — child
-// edges from the one `root` on a tree pane, `value` inputs from `unowned` on
-// the operator pane; and every node's `rewritten` tag stays inside the pinned
+// node table is closed under its own edges, and reachable from where its walk
+// starts — the one `root` a tree pane names, and on an operator pane the nodes
+// no `value` edge subscribes, derived; and every node's `rewritten` tag stays inside the pinned
 // vocabulary. Extend both validators together.
 //
 // One contract, no relaxations: a committed fixture is a whole payload document,
@@ -262,13 +262,13 @@ function validateChild(v: unknown, path: string): IrChild {
 // The closure check is what the table buys over the nested tree it replaced — an
 // edge a consumer follows always lands on an entry the pane holds.
 //
-// The two shapes name their walk starts under different keys, and each key is
-// absent on the other: a tree pane ships `root`, one id by construction, and an
-// operator pane ships `unowned`, the nodes no `value` edge names. An operator
-// pane gets one check a tree pane cannot need — that the `value` edges reach
-// every node from `unowned`. A node outside that closure is one the pane holds,
-// that pane links land on, and that no view draws; only a whole-graph walk sees
-// it, since every individual edge and id resolves.
+// A tree pane ships `root`, one id by construction. An operator pane ships no
+// start set: the nodes no `value` edge subscribes are what a walk starts from,
+// and the `inputs` already say which those are, so shipping them could only add
+// a channel that disagrees. This derives them and checks they reach every node.
+// A node outside that closure is one the pane holds, that pane links land on,
+// and that no view draws; only a whole-graph walk sees it, since every
+// individual edge and id resolves.
 //
 // `kind` is the shape discriminant, so it picks both the node validator and the
 // edge relation the closure runs over. A kind outside the pinned set reads as a
@@ -284,19 +284,14 @@ function validatePane(v: unknown, path: string): PaneEntry {
   if (o.spanIndex !== undefined) throw new WireError(`${path}.spanIndex`, "absent", o.spanIndex);
   const operators = kind === "operators";
 
-  // The walk starts, under the key this pane's shape names them by. Each key is
-  // pinned absent on the other shape, so a payload cannot carry both.
-  let starts: number[];
+  // A tree pane's one walk start. An operator pane names none, and both keys are
+  // pinned absent on it so a stale producer says what happened.
+  let starts: number[] = [];
   if (operators) {
-    if (o.root !== undefined) {
-      throw new WireError(`${path}.root`, "absent on an operator pane", o.root);
-    }
-    starts = arr(o.unowned, `${path}.unowned`).map((r, i) => num(r, `${path}.unowned[${i}]`));
-    if (starts.length === 0) {
-      throw new WireError(`${path}.unowned`, "a non-empty array", o.unowned);
-    }
-    if (new Set(starts).size !== starts.length) {
-      throw new WireError(`${path}.unowned`, "no repeated id", starts);
+    for (const retired of ["root", "unowned"] as const) {
+      if (o[retired] !== undefined) {
+        throw new WireError(`${path}.${retired}`, "absent on an operator pane", o[retired]);
+      }
     }
   } else {
     if (o.unowned !== undefined) {
@@ -304,9 +299,6 @@ function validatePane(v: unknown, path: string): PaneEntry {
     }
     starts = [num(o.root, `${path}.root`)];
   }
-  // A tree's one start has no index in its path; an operator pane's does.
-  const startPath = (i: number): string =>
-    operators ? `${path}.unowned[${i}]` : `${path}.root`;
 
   const rawNodes = arr(o.nodes, `${path}.nodes`);
   const ids = new Set<number>();
@@ -324,11 +316,11 @@ function validatePane(v: unknown, path: string): PaneEntry {
       }
       ids.add(n.nodeId);
     });
-    starts.forEach((start, i) => {
+    for (const start of starts) {
       if (!ids.has(start)) {
-        throw new WireError(startPath(i), "an id present in this pane's nodes", start);
+        throw new WireError(`${path}.root`, "an id present in this pane's nodes", start);
       }
-    });
+    }
   };
 
   if (operators) {
@@ -345,13 +337,17 @@ function validatePane(v: unknown, path: string): PaneEntry {
         }
       });
     });
-    // The `value` edges reach every node from `unowned`. That is the relation
-    // the renderer follows — value edges are the child relation, share edges are
-    // reference leaves — so a node outside this closure is one no view draws and
-    // no selection can reach.
+    // The `value` edges reach every node from the ones no `value` edge
+    // subscribes. That is the relation the renderer follows — value edges are the
+    // child relation, share edges are reference leaves — so a node outside this
+    // closure is one no view draws and no selection can reach. A `value` cycle
+    // fails it too: its members are all subscribed, so no walk enters them.
     const inputsById = new Map(nodes.map((n) => [n.nodeId, n.inputs]));
+    const subscribed = new Set(
+      nodes.flatMap((n) => n.inputs.filter((e) => e.kind === "value").map((e) => e.subscribed)),
+    );
     const reached = new Set<number>();
-    const stack = [...starts];
+    const stack = nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
     while (stack.length > 0) {
       const id = stack.pop()!;
       if (reached.has(id)) continue;
@@ -364,7 +360,7 @@ function validatePane(v: unknown, path: string): PaneEntry {
     if (stranded.length > 0) {
       throw new WireError(
         `${path}.nodes`,
-        "every node reachable from unowned along the value edges",
+        "every node reachable along the value edges from the nodes nothing subscribes",
         stranded,
       );
     }

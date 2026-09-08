@@ -36,12 +36,12 @@
 arithmetic udf_closure
 # Monomorph clones + the Derived(Inline) copies they carry, so the type-set
 # stitch (_ -> (Int, Int) | (Bool, Bool)) and non-identity edges in both
-# paneLinks windows. Its operator graph names three unowned nodes, which is what
+# paneLinks windows. Its operator graph has three nodes nothing subscribes, which is what
 # operatorView.dom.test.ts walks.
 polymorphic polymorphic
 # The smallest payload in the corpus: one list literal, every node carrying its
 # own span, identity-linked across every pane, and the degenerate operator graph
-# that names one unowned node. The one to read when asking what the wire looks like at all.
+# with one node nothing subscribes. The one to read when asking what the wire looks like at all.
 list_min list_min
 # A deliberate type error -> the degraded (payloadKind: "failed") payload: empty
 # panes and paneLinks, non-empty diagnostics. The only row that is not a
