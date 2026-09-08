@@ -281,13 +281,25 @@ pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
         }
         return match flat.len() {
             0 => out,
-            1 => flat.into_iter().next().expect("len == 1"),
-            // **The node's own slots survive**, so the elements are replaced in place
-            // rather than rebuilt around them. A rebuild carried `ty` and dropped
-            // `user_annotation`, which is the kind stamp lowering puts on a chain it mints
-            // — `present_key_domain`'s `c ≫ key` is one, and it lives inside a refinement
-            // predicate, so this is the only rewrite it passes through. Losing the stamp
-            // left it reaching inference as a `Compose` with no kind
+            // A one-element chain is its element, which carries its own type and
+            // annotation. The compose node's slots are dropped, so a chain whose kind
+            // stamp says something its surviving element does not would lose it here;
+            // no chain that collapses to one element carries a stamp, because the
+            // stamped chains lowering mints have no `iterate` marker to strip.
+            1 => {
+                debug_assert!(
+                    out.user_annotation.is_none(),
+                    "a `Compose` collapsing to one element carries a stamp the element \
+                     does not: {:?}",
+                    out.user_annotation,
+                );
+                flat.into_iter().next().expect("len == 1")
+            }
+            // The node's own slots survive, so the elements are replaced in place rather
+            // than rebuilt around them. `user_annotation` is the kind stamp lowering puts
+            // on a chain it mints — `present_key_domain`'s `c ≫ key` is one, and it lives
+            // inside a refinement predicate, so this is the only rewrite it passes
+            // through. Without the stamp it reaches inference as a `Compose` with no kind
             // (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions").
             _ => {
                 out.node = TypedExprNode::Compose(flat);

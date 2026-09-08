@@ -652,7 +652,7 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
 }
 
 /// The same sharing where at least one use is a **lookup**, split out because those are
-/// deferred with every other `g(k)` (see `test_grouping_lookup_edges`). The sharing
+/// rejected with every other `g(k)` (see `test_grouping_lookup_edges`). The sharing
 /// claim is the same one; only how the grouping is used differs.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -666,7 +666,7 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
     "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
     Value::Int(9)
 )]
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see `test_grouping_lookup_edges`)"]
+#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see `test_grouping_lookup_edges`)"]
 fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -676,12 +676,12 @@ fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: V
 /// A lookup walks the grouping for the key and slices out its rows; a key the
 /// grouping settled without ever seeing yields the empty group, which sums to
 /// zero rather than failing.
-// **Lookup cases are deferred.** `groupby` infers the honest keyed type
-// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`, so `g(k)` at a plain key demands proving the key
-// is in *that* key domain — the discharge in `src/ccl/design/collections.md`, "Lookup:
-// membership discharge", which re-enables them as discharged / `Option` lookups. They
-// passed before only because the old total-function type was too loose: any key was
-// admitted, and an absent one gave the empty group.
+// **The lookup cases are rejected, and stay rejected.** `groupby` infers the keyed type
+// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`, so `g(k)` at a plain key demands
+// proving the key is in that key domain, which a bare key does not carry
+// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). They return
+// restated as a checked lookup. A total function type admitted any key and gave the
+// empty group for an absent one, which is why they read as passing.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))]
@@ -690,7 +690,7 @@ fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: V
     "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(9))",
     Value::Int(2)
 )]
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
 fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -728,14 +728,14 @@ fn test_grouping_built_once(#[case] code: &str) {
     );
 }
 
-/// The same claim where the uses are **lookups**, deferred with every other `g(k)`
+/// The same claim where the uses are **lookups**, rejected with every other `g(k)`
 /// (see `test_grouping_lookup_edges`). One `converse` per program is the property
 /// either way; only how the grouping is used differs.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))")]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))")]
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see `test_grouping_lookup_edges`)"]
+#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see `test_grouping_lookup_edges`)"]
 fn test_grouping_built_once_through_a_lookup(#[case] code: &str) {
     use cambra::ccl::symbolic::symbolic;
 

@@ -687,13 +687,21 @@ pub(super) fn emit_lambda<C: Typing>(
     // binds under its bare type here.
     let declared = param.user_annotation.clone().unwrap_or(param.ty.clone());
     let mut param_simple = ctx.normalize(&declared);
-    // Type any refinement predicate carried on the param type in the **enclosing** scope,
-    // before the param binds: its terms may reference outer bindings — a keyed
-    // collection's key binder `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}` closes
-    // over the collection. Emit-only, routed through the mode, because `check` trusts
-    // resolved predicates and would mistype planning's function predicates. A no-op for
-    // the ordinary unrefined or fresh-variable param.
-    ctx.type_annotation_predicates(&mut param_simple)?;
+    // A refinement riding `param.ty` rather than a `user_annotation` — the shape
+    // lowering gives a keyed collection's key binder,
+    // `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}` — has its predicate typed
+    // here, in the enclosing scope, because its terms reference the collection bound
+    // outside the param.
+    //
+    // The annotated param is covered by the call above and must not be typed twice:
+    // `normalize` preserves the refinement's `Rc`, and `TermMemo::rebuild_always` keys
+    // on the current one, so a second pass re-emits the predicate against a fresh copy
+    // rather than hitting the memo. Routed through the mode because `check` trusts a
+    // resolved predicate and would mistype planning's function predicates (`D ⇒ Bool`)
+    // as bare `__elem`-Bool ones. A no-op for the ordinary unrefined param.
+    if param.user_annotation.is_none() {
+        ctx.type_annotation_predicates(&mut param_simple)?;
+    }
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
     // `Var(param)` body references stay bare; restriction refinements decorate only

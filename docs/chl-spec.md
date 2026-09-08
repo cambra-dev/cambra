@@ -2235,7 +2235,9 @@ and how the checker carries the distinction, is
 - `List(T)` — values in order, count known only at runtime. `lst[i]?:
   Option(T)`, since nothing bounds `i`.
 - `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4); there
-  is no subscript, because the keys are the content.
+  is no subscript, because the keys are the content. The checker does not yet
+  tell a `Set(K)` from a `Map(K, unit)`; both lower to one type
+  ([collections.md, "Telling `Set` and `Map` apart [Open]"](../src/ccl/design/collections.md#telling-set-and-map-apart-open)).
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
   `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
 - `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]: V` needs no
@@ -2249,7 +2251,8 @@ exist rather than by promising it over an open type:
 `FullMap({String where _ in ks}, Int)` is total because its domain says which
 strings it holds (§6.4). That makes "the lookup hits" an obligation on whatever
 builds the map. **[Open]**: what that obligation is — a literal must cover the
-domain, and a domain that grows must extend the map.
+domain, and a domain that grows must extend the map. Nothing checks it yet, so
+the annotation is accepted over an open key type and has no inhabitants there.
 
 Decided consequences:
 

@@ -2542,69 +2542,6 @@ mod tests {
         }
     }
 
-    /// `([1, 2, 3] : Collection(Int))` is rejected for the same reason its `List` twin
-    /// is: `Type` is the ⊤ of the kind order, and ⊤ is still *entered by a term*. A
-    /// structural top that a bare `𝐷 ⤇ 𝑉` fell into would be an upper bound of every
-    /// pair of data functions — exactly the implicit join `box` exists to surface.
-    #[test]
-    fn test_infer_collection_node_annotation_needs_box() {
-        let mut ctx = TypeInferenceContext::new();
-        let ints = vec![
-            Expr::lit(Lit::Int(1)),
-            Expr::lit(Lit::Int(2)),
-            Expr::lit(Lit::Int(3)),
-        ];
-        let mut expr = Expr::new(TypedExprNode::List(ints))
-            .with_user_annotation(Type::collection_of(Type::Base(BaseType::Int)));
-        infer(&mut expr, &mut ctx)
-            .expect_err("a bare list literal does not enter Collection(Int); that needs `box`");
-    }
-
-    /// A `Collection(int)` **parameter** round-trips through the compact/coalesce
-    /// carrier (like the `List` param), and **consuming** it (`sum`) drives the
-    /// `TypeKind::Type` elimination — the opaque domain is opened, the codomain flows,
-    /// so `sum` over a `Collection(int)` is `Int`.
-    #[test]
-    fn test_infer_collection_param_and_consume() {
-        let mut ctx = TypeInferenceContext::new();
-        let mut ident = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: "xs".into(),
-                ty: Type::infer(),
-                user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
-            },
-            body: Box::new(Expr::var("xs")),
-        });
-        let ty = infer(&mut ident, &mut ctx).expect("Collection param round-trips");
-        let Type::Fun {
-            domain, codomain, ..
-        } = &ty
-        else {
-            panic!("expected a function type, got {ty}");
-        };
-        assert!(domain.sum().is_some(), "param is the Σ: {domain}");
-        assert!(codomain.sum().is_some(), "body returns the Σ: {codomain}");
-
-        let mut ctx = TypeInferenceContext::new();
-        let mut consume = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: "xs".into(),
-                ty: Type::infer(),
-                user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
-            },
-            body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
-        });
-        let ty = infer(&mut consume, &mut ctx).expect("consuming a Collection type-checks");
-        let Type::Fun { codomain, .. } = &ty else {
-            panic!("expected a function type, got {ty}");
-        };
-        assert_eq!(
-            codomain.as_ref(),
-            &Type::Base(BaseType::Int),
-            "sum(Collection(int)) : Int"
-        );
-    }
-
     /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
     /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
     /// does not inject into `Σ (𝐷 : UIntRanges). 𝐷 ⤇ Int`

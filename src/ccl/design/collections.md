@@ -152,10 +152,10 @@ whatever the morphism's free variables are bound to where the fact is used.
 domains conflict, `box` does not help, and what the sum would need is a witness ranging over
 both key domains.
 
-[`Type::SharedHole`] equates the refinement's base with the morphism's codomain. The
-builtin's scheme relates those two positions without equating them — `__elem` is *applied*
-to the characteristic predicate, so the application contributes a lower bound only, and a
-key type contradicting the morphism's would join with it rather than conflict.
+A `Type::SharedHole` equates the refinement's base with the morphism's codomain. The
+builtin's scheme relates those two positions without equating them: `__elem` is applied to
+the characteristic predicate, so the application contributes a lower bound only, and a key
+type contradicting the morphism's would join with it rather than conflict.
 
 ## Operations: how the trait layer is realized [Planned]
 

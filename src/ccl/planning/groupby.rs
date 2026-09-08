@@ -14,9 +14,10 @@
 //! - [`match_pointful_site`] — **is this the term shape I can rebuild from?** Coupled to
 //!   what `lambda_elim` emits; a new site pattern is a sibling of this, not an edit to it.
 //!
-//! Declining to rewrite is safe — the site falls back to the generic iterate/restrict
-//! lowering — so the failure mode to guard against is *silence*. A refinement that
-//! partitions at a site that did not match is logged as a near miss.
+//! Declining to rewrite is safe: the site falls back to the generic iterate/restrict
+//! lowering, which is correct and unbucketized. A spelling drift is caught by
+//! `test_grouping_built_once`, which asserts one `converse` per program; a site the
+//! recognizer stops matching bucketizes none.
 
 use super::*;
 use crate::ccl::ty::FunKind;
@@ -29,14 +30,8 @@ use crate::ccl::ty::FunKind;
 /// `converse(c ≫ key) ≫ map(c)`. Walks the tree, rewriting every such site
 /// (a rewritten site's tail may contain further sites).
 ///
-/// Not matching is **not** an error: the site falls back to the generic
-/// iterate/restrict lowering, which is correct, just unbucketized. But a *near miss*
-/// — a refinement that [partitions](partition_key_of), at a site this recognizer
-/// could not rebuild from — is worth seeing, because it is the difference between
-/// "there was nothing to recognize here" and "this should have been recognized and
-/// the spelling drifted". [`log_near_miss`] reports those; as the recognizer grows to
-/// cover refinements from beyond the group-by lowering, that log is the list of
-/// patterns still to add.
+/// Not matching is not an error: the site falls back to the generic iterate/restrict
+/// lowering, which is correct and unbucketized.
 pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
     // The recording names the composition site — the term-tree node the
     // bucketize chain replaces — and deliberately not the key morphism the
@@ -50,12 +45,14 @@ pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
     // `planning.hash_join`, which is `Machinery` because a hash join is a
     // materialization strategy for a site the user wrote as a comprehension.
     //
-    // Scoped to the *attempt* and closed before the child walk. Recursing under
-    // it would make a nested site's products descend from this one. A
-    // non-matching node writes no rows here: the matcher bails on node shape
-    // before it reaches anything that mints, and the type work it does reach
-    // (`open_codomain`) opens its own `subst.*` recordings, so wrapping the
-    // attempt costs a push and a pop.
+    // Scoped to the attempt and closed before the child walk. Recursing under it
+    // would make a nested site's products descend from this one.
+    //
+    // A non-matching node can write rows here, because two of the matcher's gates
+    // run `lambda_elim` on a clone before deciding: the element-path comparison and
+    // the key lift. Their products are discarded on a decline, so the rows they
+    // leave carry nothing in the output tree and drop out of the fold
+    // (`src/ccl/design/provenance.md`, "The fold").
     let rewritten = {
         let _g = provenance::enter(
             expr.node_id(),
@@ -67,45 +64,7 @@ pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
     }
-    log_near_miss(expr);
     expr.walk_children_mut(recognize_groupby_sites);
-}
-
-/// Report a partitioning refinement the recognizer declined to rewrite.
-///
-/// Scoped to the shape the rewrite *starts* from — a `Compose` head — so this stays
-/// about sites, not about every partition refinement anywhere in the tree.
-fn log_near_miss(expr: &Expr) {
-    if !log::log_enabled!(log::Level::Debug) {
-        return;
-    }
-    let TypedExprNode::Compose(elts) = &expr.node else {
-        return;
-    };
-    let Some(head) = elts.first() else { return };
-    let Type::Fun {
-        codomain: inner, ..
-    } = &head.ty
-    else {
-        return;
-    };
-    let Type::Fun { domain: dom, .. } = inner.as_ref() else {
-        return;
-    };
-    let Type::Refinement(_, refinements) = dom.as_ref() else {
-        return;
-    };
-    // Any member of the set may be the partition; the others are ordinary filters.
-    for r in refinements.iter() {
-        if partition_key_of(&r.predicate).is_some() {
-            log::debug!(
-                "group-by near miss: {} partitions, but the site did not match — planning \
-                 falls back to iterate/restrict. Head: {}",
-                symbolic(&r.predicate),
-                symbolic(head)
-            );
-        }
-    }
 }
 
 /// Build the bucketize-and-aggregate chain `converse(keys) ≫ map(values)`
@@ -159,17 +118,10 @@ fn emit_groupby(
     grouped_values
 }
 
-/// A refinement that **partitions** its domain by a key: `{𝑖 | 𝑖 ▷ path ▷ key == 𝑘}`
-/// — every element reaches `key` through the refinement binder, and the result is
-/// compared against a `𝑘` bound *outside* the refinement, which names *which*
-/// partition this is.
-///
-/// This is the durable half of group-by recognition, and the half worth growing. It
-/// is a fact about a **refinement**, so it holds however that refinement arrived —
-/// today only the `groupby` lowering writes one, but a user-written or
-/// pass-generated refinement of the same shape is the same partition and should plan
-/// the same way. Nothing here knows about `const`, `cast`, or `Compose`; matching the
-/// particular term a site is spelled in is [`match_pointful_site`]'s job.
+/// The two halves of a refinement that **partitions** its domain by a key,
+/// `{𝑖 | 𝑖 ▷ path ▷ key == 𝑘}`: every element reaches `key` through the refinement
+/// binder, and the result is compared against a `𝑘` bound outside the refinement,
+/// which names which partition this is. Read by [`partition_key_of`].
 struct PartitionKey<'a> {
     /// The key morphism, applied to `elem_path` — `key` in `𝑖 ▷ path ▷ key`.
     key_fn: &'a Expr,
@@ -183,8 +135,15 @@ struct PartitionKey<'a> {
 /// partition.
 ///
 /// The key binder is identified structurally, as the free variable on one side of an
-/// equality whose other side extracts the element — deliberately *not* by matching a
-/// Pi name, which the comprehension's discharge may have stripped.
+/// equality whose other side extracts the element, rather than by matching a Pi name,
+/// which the comprehension's discharge may have stripped.
+///
+/// This is the durable half of group-by recognition, and the half to grow. It is a fact
+/// about a refinement, so it holds however that refinement arrived: today only the
+/// `groupby` lowering writes one, and a user-written or pass-generated refinement of the
+/// same shape is the same partition and plans the same way. Nothing here reads `const`,
+/// `cast`, or `Compose` — matching the term a site is spelled in is
+/// [`match_pointful_site`]'s job.
 fn partition_key_of(predicate: &Expr) -> Option<PartitionKey<'_>> {
     let TypedExprNode::BinOp {
         left,
@@ -212,16 +171,8 @@ fn partition_key_of(predicate: &Expr) -> Option<PartitionKey<'_>> {
     Some(PartitionKey { key_fn, elem_path })
 }
 
-/// Match the **pointful** group-by site: a `Compose` whose head is
-/// `const(cast(c)) : (𝑘) ⇒ ({𝑖: 𝐼 | 𝑖 ▷ c ▷ key == 𝑘} ⇒ 𝑉)`, the form lambda-elim
-/// produces for `groupby(c, key)`.
-///
-/// This is the *syntactic* half — coupling to how a site is currently spelled, as
-/// opposed to [`partition_key_of`]'s question of whether a refinement partitions at
-/// all. Keep it narrow; grow the other one.
-///
-/// Returns the pieces `emit_groupby` needs, or `None` (in which case the site falls
-/// back to the generic iterate/restrict lowering).
+/// The pieces [`emit_groupby`] needs, read off a matched group-by site by
+/// [`match_pointful_site`].
 struct PointfulSite<'a> {
     /// The collection the group-by ranges over — the cast's value.
     collection: &'a Expr,
@@ -251,6 +202,14 @@ struct PointfulSite<'a> {
     value_ty: Type,
 }
 
+/// Match the **pointful** group-by site: a head `const(cast(c)) : (𝑘) ⇒ ({𝑖: 𝐼 | 𝑖 ▷ c
+/// ▷ key == 𝑘} ⇒ 𝑉)`, the form lambda-elim produces for `groupby(c, key)`. Returns the
+/// pieces [`emit_groupby`] needs, or `None`, in which case the site falls back to the
+/// generic iterate/restrict lowering.
+///
+/// This is the syntactic half, coupled to how a site is currently spelled, as against
+/// [`partition_key_of`]'s question of whether a refinement partitions at all. It stays
+/// narrow: a new site pattern is a sibling of this function rather than an edit to it.
 fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
     let TypedExprNode::Apply {
         argument: cast_expr,
@@ -564,10 +523,10 @@ mod tests {
         }
     }
 
-    /// A partitioning refinement at a site the rewriter cannot rebuild from is a
-    /// **near miss**: the analysis says yes, the site match says no, and the plan
-    /// falls back rather than miscompiling. Pins that the two halves are genuinely
-    /// independent — the whole point of the split.
+    /// A partitioning refinement at a site the rewriter cannot rebuild from leaves the
+    /// term alone: [`partition_key_of`] answers yes, [`match_pointful_site`] answers no,
+    /// and the plan falls back rather than miscompiling. This is what makes the two
+    /// halves independent of each other.
     #[test]
     fn a_partition_at_an_unrecognized_site_falls_back() {
         let pred = equals(extraction("c", "key"), var("k"));
@@ -588,7 +547,7 @@ mod tests {
         assert_eq!(
             symbolic(&expr),
             before,
-            "a near miss must leave the term alone"
+            "an unrecognized site must leave the term alone"
         );
     }
 }

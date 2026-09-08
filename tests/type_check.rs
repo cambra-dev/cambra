@@ -2226,9 +2226,9 @@ fn test_groupby_key_relation_is_per_occurrence(#[case] code: &str) {
 // pinning the variant would make the test fail on any change to that — it says
 // only that the two types met and were refused.
 #[test]
-#[ignore = "the membership deferral rejects every bare-key lookup first, so the key-type \
-            reason this pins is not the one reported (see the note below); tightens back \
-            when the lookup discharge lands"]
+#[ignore = "on a group-by the membership rejection fires before the key-type edge, so \
+            the reason this pins is not the one reported (see the note below); it \
+            tightens back when a checked lookup gives the key type an edge to fail on"]
 fn test_groupby_lookup_at_wrong_key_type_rejected() {
     let errs = infer_program_err(indoc! {r#"
         groups = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
@@ -2242,14 +2242,15 @@ fn test_groupby_lookup_at_wrong_key_type_rejected() {
     );
 }
 
-// NOTE: direct key lookup on a group-by (`g = groups(k)`) is deferred. `groupby`
-// infers the honest keyed type `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (see
-// `src/ccl/design/collections.md`, "`groupby`'s exact type"), so applying it at a plain
-// key demands proving the key is in *that* key domain — the discharge described in
-// `src/ccl/design/collections.md`, "Lookup: membership discharge", which will
-// re-enable this test as a discharged / `Option`-typed lookup. It "worked" before
-// only because the old total-function type was too loose.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+// NOTE: a direct key lookup on a group-by (`g = groups(k)`) is rejected, and stays
+// rejected. `groupby` infers the keyed type
+// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (`src/ccl/design/collections.md`,
+// "`groupby`'s exact type"), so applying it at a plain key demands proving the key is in
+// that key domain, which a bare key does not carry
+// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What returns these
+// cases is a checked lookup at the surface, restating them rather than un-ignoring them.
+// A total function type admitted any key, which is why they read as passing.
+#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
 #[test]
 fn test_groupby_aggregate() {
     // groups = groupby([1, 2, 3], \x -> x)
@@ -2273,7 +2274,7 @@ sum(g)
 /// *discharged* to the argument (design §5 / Appendix A). This is the headline
 /// case the Pi-type + substitution machinery unlocks: before it, the predicate
 /// kept the unbound group-by key.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
 #[test]
 fn test_groupby_dependent_application_discharges_key() {
     // groups : (k) ⇒ ({i | i ▷ xs ▷ key_fn == k} ⇒ Int); groups(0) discharges
@@ -2316,7 +2317,7 @@ groups(0)
 // re-derives each application's type from its already-resolved function child,
 // discharging on the function's *real* binder rather than the fresh `__arg`
 // binder `emit_apply` peeks when the function is still an inference variable.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
 #[test]
 fn test_higher_order_dependent_application_discharges_key() {
     let ty = infer_program(
