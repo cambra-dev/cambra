@@ -990,10 +990,7 @@ fn constrain_go_impl(
             // and the reverse obligation a variable's domain owes is discharged where every
             // contribution to it meets.
             let invariant_domains = k0.resolved().is_data() || k1.resolved().is_data();
-            let cod_sl = match (n0, n1) {
-                (Some(k), Some(x)) => sl.extended_rename(k, x),
-                _ => sl.clone(),
-            };
+            let cod_sl = sl.aligned(n0, n1);
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
             // conversions run"): a *closed* codomain — one whose refinements
             // reference this function's binder as indices — opens at its own

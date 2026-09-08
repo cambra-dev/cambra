@@ -1177,6 +1177,14 @@ name-spelled one at a single position — what closing in those walks exists to 
 mirrors `Fun`s one-to-one, so a closed index counts to the function being built; closing is the
 identity there, and the `Fun` literal says so.
 
+**Closing reaches only references spelled as the binder it closes over**, so a codomain carried
+from one function into another is aligned before it is closed. Two functions related at a position
+have one binder under two names, and `Subst::aligned` is that alignment. Both sites that carry a
+codomain across take it: `constrain_go` draws the codomain edge under it, and `complete_annotation`
+fills an exact annotation's codomain from its initializer's. A fill that skipped it would leave the
+initializer's name free in a stored type, which no construction-time close can repair, because the
+name it closes over is the annotation's.
+
 **A refinement closes against the enclosing functions of the walk carrying it.** `compact_go` and
 the `SpecKey` walk both do so in the same two arms that force the edge substitutions into it
 (`force_refinement`). Nothing earlier can: `CompactType::merge` dedups refinements while bounds

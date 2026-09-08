@@ -580,15 +580,22 @@ fn apply_unary_scheme<C: Typing>(
 /// Positions where the two shapes disagree keep the annotation's: a value that
 /// cannot flow into its annotation at all is already an `AnnotationMismatch`, so
 /// there is no second diagnosis to make here.
-fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
+///
+/// `sl` carries the binder alignment for the positions filled under a binder
+/// ([`Subst::aligned`]): a filled codomain lands under the annotation's binder while
+/// the type it is filled from references the initializer's, and the two are one
+/// binder under two names. Applied where an inferred type is copied, which is the
+/// `Hole` arm and nowhere else — every other arm either recurses or keeps the
+/// annotation's own content, already spelled in the annotation's scope.
+fn complete_annotation(ann: &Type, inferred: &Type, sl: &crate::ccl::subst::Subst) -> Type {
     match (ann, inferred) {
-        (Type::Hole, _) => inferred.clone(),
+        (Type::Hole, _) => sl.apply_type(inferred),
         // A refinement's base can be the unspecified part (`{_ | p}`); the
         // refinement itself is the user's claim and is kept. `peel_refinements`
         // on the inferred side because its own refinements describe the *value*,
         // and this is filling in a *shape*.
         (Type::Refinement(base, refinements), _) => Type::refined(
-            complete_annotation(base, inferred.peel_refinements()),
+            complete_annotation(base, inferred.peel_refinements(), sl),
             refinements.clone(),
         ),
         // The binder and kind come from the *annotation*, per the rule
@@ -597,24 +604,37 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
         // fill in.
         (
             Type::Fun {
+                name: an,
                 domain: ad,
                 codomain: ac,
                 ..
             },
             Type::Fun {
+                name: inn,
                 domain: id,
                 codomain: ic,
                 ..
             },
-        ) => Type::fun_like(
-            ann,
-            complete_annotation(ad, id),
-            complete_annotation(ac, ic),
-        ),
+        ) => {
+            // The domain is outside the binder and keeps the incoming alignment; the
+            // codomain is filled under `an`, so the initializer's binder aligns to it.
+            // `fun_like` then closes over `an` — which only reaches a reference already
+            // spelled `an`, so an unaligned copy would leave the initializer's name free
+            // rather than bound.
+            let cod_sl = sl.aligned(inn, an);
+            let cod = complete_annotation(ac, ic, &cod_sl);
+            debug_assert!(
+                inn.as_ref()
+                    .is_none_or(|i| !crate::ccl::subst::type_free_vars(&cod).contains(i)),
+                "a filled codomain still references the initializer's binder {inn:?}, so \
+                 the alignment did not reach it: {cod}",
+            );
+            Type::fun_like(ann, complete_annotation(ad, id, sl), cod)
+        }
         (Type::Tuple(ats), Type::Tuple(its)) if ats.len() == its.len() => Type::Tuple(
             ats.iter()
                 .zip(its)
-                .map(|(a, i)| complete_annotation(a, i))
+                .map(|(a, i)| complete_annotation(a, i, sl))
                 .collect(),
         ),
         // Records match by *name*, not position, and width-subtyping means the
@@ -627,7 +647,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
                     let i = ifs.iter().find(|(m, _)| m == n).map(|(_, t)| t);
                     (
                         n.clone(),
-                        i.map_or_else(|| a.clone(), |i| complete_annotation(a, i)),
+                        i.map_or_else(|| a.clone(), |i| complete_annotation(a, i, sl)),
                     )
                 })
                 .collect(),
@@ -644,8 +664,8 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
                 ..
             },
         ) => Type::History {
-            value: Box::new(complete_annotation(av, iv)),
-            domain: Box::new(complete_annotation(ad, id)),
+            value: Box::new(complete_annotation(av, iv, sl)),
+            domain: Box::new(complete_annotation(ad, id, sl)),
             history_kind: *history_kind,
         },
         _ => ann.clone(),
@@ -1493,7 +1513,7 @@ pub(super) fn emit_let<C: Typing>(
         Some(ann) => {
             let declared = match ann {
                 Type::BoundedHole(_) => ann.clone(),
-                _ => complete_annotation(ann, &bound_ty),
+                _ => complete_annotation(ann, &bound_ty, &crate::ccl::subst::Subst::id()),
             };
             ctx.bind_annotation(&bound_ty, &declared)?
         }

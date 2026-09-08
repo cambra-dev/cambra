@@ -1534,25 +1534,42 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     }
 }
 
-/// A `groupby` **is** a `FullMap`, and cannot be *annotated* as one until its key type is
-/// writable.
+/// A `groupby` **is** a `FullMap`, at either annotation strength, and only with its key
+/// type elided.
 ///
 /// Its domain is the present-key domain `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, and
 /// a data function's domain is invariant, so an annotation has to name that refinement
 /// rather than the bare key type. Naming it needs the key morphism's image at the surface
 /// — `keys(…)`, which does not exist — so `FullMap(_, _)` is the only form a group-by
-/// satisfies today. The elided form is not a workaround: it is the honest statement that
-/// the checker knows the key set and the surface cannot spell it.
+/// satisfies. The elided form is not a workaround: it is the honest statement that the
+/// checker knows the key set and the surface cannot spell it.
 ///
-/// Contrast `Map(𝐾, 𝑉)`, which a group-by cannot satisfy *at any spelling*: it is a sum,
-/// entry is `box`, and `𝑉` is one type with no binder for the dependent group to name.
+/// The **exact** form binds `g` at the annotation, so its filled codomain lands under the
+/// annotation's own binder and the group's predicate names that one
+/// ([`an_exact_keyed_annotation_aligns_the_filled_binder`]). The bounded form leaves `g`
+/// the initializer's type, binder included.
 #[test]
-fn a_groupby_is_a_full_map_but_its_key_type_is_not_yet_writable() {
+fn a_groupby_is_a_full_map_at_either_strength() {
     let gb = "groupby([1,2], \\v -> v)";
-    let ty = infer_program(&format!("g <: FullMap(_, _) = {gb}\ng")).to_string();
+    // Bounded: `g` keeps the initializer's type, so the group-by's own binder survives.
+    let bounded = infer_program(&format!("g <: FullMap(_, _) = {gb}\ng")).to_string();
     assert!(
-        ty.starts_with("((__gb_k: {Int | ") && ty.contains("collection_contains"),
-        "a group-by satisfies FullMap and keeps its present-key domain, got {ty}"
+        bounded.starts_with("((__gb_k: {Int | ") && bounded.contains("collection_contains"),
+        "a group-by satisfies FullMap and keeps its present-key domain, got {bounded}"
+    );
+    // Exact: `g` binds at the annotation, whose binder the filled codomain names.
+    let exact = infer_program(&format!("g: FullMap(_, _) = {gb}\ng")).to_string();
+    assert!(
+        exact.starts_with("((__map_k: {Int | ") && exact.contains("== __map_k"),
+        "the exact form binds at the annotation's binder, got {exact}"
+    );
+    // And it is usable, not merely inhabited: consuming the groups sums them.
+    assert_eq!(
+        infer_program(&format!(
+            "g: FullMap(_, _) = {gb}\nsum([sum(v) for v in g])"
+        )),
+        int(),
+        "an exact keyed annotation is consumable"
     );
     assert!(
         !infer_program_err(&format!("g <: FullMap(Int, _) = {gb}\ng")).is_empty(),
@@ -1560,16 +1577,48 @@ fn a_groupby_is_a_full_map_but_its_key_type_is_not_yet_writable() {
     );
 }
 
+/// An **exact** keyed annotation fills its codomain from the initializer, and the fill
+/// lands under the *annotation's* binder — so a reference to the initializer's binder is
+/// respelled on the way in ([`Subst::aligned`], the alignment `constrain_go` draws its
+/// codomain edge under).
+///
+/// Copying the codomain unaligned binds nothing: `Type::fun_like` closes over the
+/// annotation's binder, which reaches no reference spelled as the initializer's, leaving
+/// that name free in a stored type (`src/ccl/design/type-inference.md`, "The invariant").
+/// That is unobservable in the result — both spellings *print* a bound-looking binder —
+/// so this asserts the name the predicate carries, which is the one that differs.
+///
+/// A group-by is the only producer that reaches it: the fill needs a codomain that
+/// references the binder at all, which takes a dependent collection.
+#[test]
+fn an_exact_keyed_annotation_aligns_the_filled_binder() {
+    for ann in ["FullMap(_, _)", "Map(_, _)"] {
+        let gb = if ann.starts_with("Map") {
+            "box(groupby([1,2,3], \\x -> x))"
+        } else {
+            "groupby([1,2,3], \\x -> x)"
+        };
+        let ty = infer_program(&format!("g: {ann} = {gb}\ng")).to_string();
+        assert!(
+            ty.contains("== __map_k"),
+            "`{ann}` must fill its codomain at its own binder, got {ty}"
+        );
+        assert!(
+            !ty.contains("__gb_k") && !ty.contains("__box_k"),
+            "no initializer binder may survive the fill, got {ty}"
+        );
+    }
+}
+
 /// A keyed annotation's **key type** is checked, not just the shape of the domain's
 /// refinement: an `Int`-keyed `groupby` does not satisfy `Map(String, _)`.
 ///
-/// The annotation is the **bounded** form because a `groupby` is a *dependent*
-/// collection — its value type names the key binder — and that is a shape `Map(𝐾, 𝑉)`
-/// cannot hold: `𝑉` is one type, with no binder to name. An exact annotation binds `g`
-/// at the annotation, so filling `𝑉` from the initializer captures `__gb_k`; a bound
-/// leaves `g` its own type and checks the subtyping edge, which is what this pins. Today
-/// that exact spelling reports the capture as a scope violation labelled "compiler bug"
-/// rather than as the annotation error it is.
+/// The annotation is the **bounded** form so that what this pins is the subtyping edge:
+/// a bound leaves `g` its own type and checks the edge, while an exact annotation binds
+/// `g` at the annotation and fills `𝑉` from the initializer instead
+/// ([`an_exact_keyed_annotation_aligns_the_filled_binder`] covers that path). A *written*
+/// `𝑉` is one type with no binder to name, so a group-by's dependent codomain fails it
+/// either way.
 #[test]
 fn keyed_entry_checks_the_annotated_key_type() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
