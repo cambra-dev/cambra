@@ -2237,8 +2237,10 @@ and how the checker carries the distinction, is
   (§3.9).
 - `List(T)` — values in order, count known only at runtime. `lst[i]?:
   Option(T)`, since nothing bounds `i`.
-- `Set(K)` — distinct keys and no values, so it is `Map(K, unit)`. Membership is
-  `k in s` (§3.4) as a `Bool`, or `s[k]?: Option(unit)` (§3.9) as a value.
+- `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4) as a
+  `Bool`, or `s[k]?: Option(unit)` (§3.9) as a value. The checker does not yet
+  tell a `Set(K)` from a `Map(K, unit)`; both lower to one type
+  ([collections.md, "Telling `Set` and `Map` apart [Open]"](../src/ccl/design/collections.md#telling-set-and-map-apart-open)).
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
   `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
 - `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]: V` needs no
