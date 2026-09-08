@@ -25,7 +25,7 @@ use crate::{
 /// type. It is passed in rather than re-derived here (see [`new`](Self::new)).
 pub struct UnionOperator {
     /// Identity and the output tiling: a `SealedFunction` over the arms' domains.
-    base: OperatorBase,
+    base: OperatorBase<UnionOperator>,
     /// Input operators; each must have a `SealedFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
     /// Flat-merge mode (see [`new_flat`](Self::new_flat)): arms share one domain
@@ -53,7 +53,7 @@ impl UnionOperator {
             .map(|(i, op)| value_at(i, &**op))
             .collect();
         Self {
-            base: OperatorBase::new::<Self>(tiling, &edges),
+            base: OperatorBase::new(tiling, &edges),
             inputs,
             flat: false,
         }
@@ -168,7 +168,7 @@ impl UnionOperator {
             .map(|(i, op)| value_at(i, &**op))
             .collect();
         Self {
-            base: OperatorBase::new::<Self>(tiling, &edges),
+            base: OperatorBase::new(tiling, &edges),
             inputs,
             flat: true,
         }

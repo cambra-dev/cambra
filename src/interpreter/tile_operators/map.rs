@@ -18,7 +18,7 @@ use crate::{
 pub struct MapResult {
     /// Identity and the output tiling, which matches `input` tiling with the
     /// codomain transformed according to `function`.
-    base: OperatorBase,
+    base: OperatorBase<MapResult>,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
     /// The function to apply to each element.
@@ -55,7 +55,7 @@ impl MapResult {
                     "a single-key lookup's key extent must match the collection's key extent"
                 );
                 return Self {
-                    base: OperatorBase::new::<Self>(
+                    base: OperatorBase::new(
                         Tiling::SealedFunction {
                             domain: fn_domain2.clone(),
                             codomain: Box::new(Tiling::Scalar(fn_codomain.clone())),
@@ -104,7 +104,7 @@ impl MapResult {
                 codomain: fn_codomain.clone(),
             };
             return Self {
-                base: OperatorBase::new::<Self>(
+                base: OperatorBase::new(
                     tiling,
                     &[value("input", &*input), value("fn", &*function)],
                 ),
@@ -136,10 +136,7 @@ impl MapResult {
             output_tiling
         });
         Self {
-            base: OperatorBase::new::<Self>(
-                tiling,
-                &[value("input", &*input), value("fn", &*function)],
-            ),
+            base: OperatorBase::new(tiling, &[value("input", &*input), value("fn", &*function)]),
             input,
             function,
         }
@@ -526,7 +523,7 @@ impl TileProducer for MapResultProducer {
 pub struct MapResultToConst {
     /// Identity and the output tiling, which matches `input` tiling with the
     /// codomain transformed to `constant`.
-    base: OperatorBase,
+    base: OperatorBase<MapResultToConst>,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
     /// The constant to apply to each element.
@@ -565,7 +562,7 @@ impl MapResultToConst {
             }),
         };
         Self {
-            base: OperatorBase::new::<Self>(
+            base: OperatorBase::new(
                 tiling,
                 &[value("input", &*input), value("constant", &*constant)],
             ),
@@ -735,7 +732,7 @@ pub struct MapResultWithSource {
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
     /// Identity and the output tiling:
     /// `SealedFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
-    base: OperatorBase,
+    base: OperatorBase<MapResultWithSource>,
 }
 
 impl MapResultWithSource {
@@ -754,7 +751,7 @@ impl MapResultWithSource {
             Tiling::Scalar(output_extent)
         });
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             source: source.clone(),
         }

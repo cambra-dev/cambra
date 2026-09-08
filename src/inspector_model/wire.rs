@@ -212,11 +212,12 @@ pub struct OperatorEdge {
     /// store key, rendered.
     pub role: String,
     /// `"value"` for an exclusively owned input, `"share"` for one several
-    /// consumers may reach, `"feedback"` for a share that closes a cycle.
+    /// consumers may reach.
     ///
     /// The value edges form a forest, which is what lets a renderer walk them as
-    /// a child relation with no cycle guard; share and feedback are the
-    /// cross-references.
+    /// a child relation with no cycle guard; the share edges are the
+    /// cross-references. A cycle is a `"value"` edge with
+    /// [`deferred`](Self::deferred) set.
     pub kind: &'static str,
     /// Whether the edge was wired after its consumer was constructed, through a
     /// `CycleSlot`. An attribute of when, not of ownership.
@@ -572,7 +573,6 @@ fn wire_edge(edge: &InputEdge) -> OperatorEdge {
     let (kind, deferred) = match edge.kind {
         EdgeKind::Value { deferred } => ("value", deferred),
         EdgeKind::Share => ("share", false),
-        EdgeKind::Feedback => ("feedback", false),
     };
     OperatorEdge {
         role: match &edge.role {

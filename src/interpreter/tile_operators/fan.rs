@@ -20,7 +20,7 @@ pub struct FanIn {
     /// `SealedFunction { domain, codomain: Record { … } }` or a
     /// `CurriedFunction { domain1, domain2, codomain: Record { … } }`, depending
     /// on the input operators.
-    base: OperatorBase,
+    base: OperatorBase<FanIn>,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
     /// The input function operators to zip together (either all `SealedFunction` or all `CurriedFunction`).
@@ -152,7 +152,7 @@ impl FanIn {
             .map(|(i, op)| value_at(i, &**op))
             .collect();
         Self {
-            base: OperatorBase::new::<Self>(tiling, &edges),
+            base: OperatorBase::new(tiling, &edges),
             names,
             inputs: ops,
         }
@@ -458,7 +458,7 @@ impl TileProducer for FanInProducer {
 /// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
 pub struct ScalarFanIn {
     /// Identity and the output tiling: a `Record` of the inputs' scalar tilings.
-    base: OperatorBase,
+    base: OperatorBase<ScalarFanIn>,
     /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<String>,
     inputs: Vec<Box<dyn TileOperator>>,
@@ -506,7 +506,7 @@ impl ScalarFanIn {
             .map(|(i, op)| value_at(i, &**op))
             .collect();
         Self {
-            base: OperatorBase::new::<Self>(tiling, &edges),
+            base: OperatorBase::new(tiling, &edges),
             names,
             inputs,
         }

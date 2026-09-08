@@ -105,7 +105,7 @@ const ALLOWED_NATURE = ["expansion", "machinery"];
 // An operator node's `role`, and an operator input edge's `kind` — the two
 // closed vocabularies of the operator pane.
 const ALLOWED_ROLE = ["operator", "source", "sink"];
-const ALLOWED_EDGE_KIND = ["value", "share", "feedback"];
+const ALLOWED_EDGE_KIND = ["value", "share"];
 
 function describe(v: unknown): string {
   if (v === null) return "null";
@@ -346,9 +346,9 @@ function validatePane(v: unknown, path: string): PaneEntry {
       });
     });
     // The `value` edges reach every node from `unowned`. That is the relation
-    // the renderer follows — value edges are the child relation, share and
-    // feedback edges are reference leaves — so a node outside this closure is
-    // one no view draws and no selection can reach.
+    // the renderer follows — value edges are the child relation, share edges are
+    // reference leaves — so a node outside this closure is one no view draws and
+    // no selection can reach.
     const inputsById = new Map(nodes.map((n) => [n.nodeId, n.inputs]));
     const reached = new Set<number>();
     const stack = [...starts];

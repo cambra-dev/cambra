@@ -373,11 +373,12 @@ fn for_accumulator_produces_dense_channelize_window() {
 
 /// The operator-pane edge shapes only a store produces, over a fresh dump.
 ///
-/// A store is the one construct that closes a cycle and wires an input late, so
-/// `feedback` and `deferred` edges exist nowhere else — and neither does a
-/// store-keyed edge role. Every committed fixture carries `value` and `share`
-/// alone. The renderer draws feedback and deferred each their own way, so
-/// without this nothing checks that either reaches the wire at all.
+/// A store is the one construct that wires an input late, so a `deferred` edge
+/// exists nowhere else — and neither does a store-keyed edge role. Every
+/// committed fixture carries neither, so without this nothing checks that either
+/// reaches the wire at all. That the deferred edges are the cycle set is
+/// `every_operator_graph_cycle_runs_through_a_deferred_edge`'s claim, over the
+/// graph rather than the payload.
 ///
 /// Structural rather than a fixture, matching the two window checks above: a
 /// transaction program's operator pane is large, and pinning its bytes would
@@ -413,7 +414,7 @@ fn assert_store_edge_shapes(example: &str) {
         }
     }
 
-    for want in ["value", "share", "feedback"] {
+    for want in ["value", "share"] {
         assert!(
             kinds.contains(want),
             "{example}: the operator pane carries no {want} edge; got {kinds:?}"

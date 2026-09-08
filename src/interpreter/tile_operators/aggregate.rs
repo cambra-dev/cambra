@@ -22,7 +22,7 @@ pub struct Aggregate {
     input: Box<dyn TileOperator>,
     /// Identity and the output tiling — always
     /// `Tiling::Aggregation { accumulator: <output extent> }`.
-    base: OperatorBase,
+    base: OperatorBase<Aggregate>,
 }
 
 impl Aggregate {
@@ -42,7 +42,7 @@ impl Aggregate {
             accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -168,7 +168,7 @@ impl TileProducer for AggregateProducer {
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
     /// Identity and the output tiling.
-    base: OperatorBase,
+    base: OperatorBase<ExtractAggregate>,
     kind: AggregateKind,
     only_terminal: bool,
 }
@@ -181,7 +181,7 @@ impl ExtractAggregate {
             todo!("functions on partial aggregates")
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             kind,
             only_terminal,
@@ -277,7 +277,7 @@ pub struct MapExtractAggregate {
     kind: AggregateKind,
     /// Identity and the output tiling:
     /// `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
-    base: OperatorBase,
+    base: OperatorBase<MapExtractAggregate>,
 }
 
 impl MapExtractAggregate {
@@ -300,7 +300,7 @@ impl MapExtractAggregate {
             t => panic!("MapExtractAggregate expected SealedFunction input, got {t:?}"),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             kind,
         }
@@ -406,7 +406,7 @@ pub struct MapAggregate {
     kind: AggregateKind,
     /// Identity and the output tiling:
     /// `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
-    base: OperatorBase,
+    base: OperatorBase<MapAggregate>,
 }
 
 impl MapAggregate {
@@ -433,7 +433,7 @@ impl MapAggregate {
             }),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             kind,
         }

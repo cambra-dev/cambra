@@ -18,7 +18,7 @@ pub struct IterateExtent {
     pub extent: Extent,
     /// Identity and the tiling — always
     /// `Tiling::SealedFunction { domain: extent, codomain: extent }`.
-    pub base: OperatorBase,
+    base: OperatorBase<IterateExtent>,
 }
 
 impl IterateExtent {
@@ -28,7 +28,7 @@ impl IterateExtent {
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[]),
+            base: OperatorBase::new(tiling, &[]),
             extent,
         }
     }

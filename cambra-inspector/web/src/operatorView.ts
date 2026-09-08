@@ -7,10 +7,13 @@
 //   they form a forest — that is asserted at the producer, in
 //   `operator_graph::assert_graph_invariants`. Following them needs no cycle
 //   guard.
-// - **Share and feedback edges are reference rows.** A leaf naming its target,
-//   clickable, so a reader follows sharing without the subtree being drawn
-//   twice. Every cycle in the graph is a feedback edge, which is what keeps the
-//   child relation acyclic.
+// - **Share edges are reference rows.** A leaf naming its target, clickable, so
+//   a reader follows sharing without the subtree being drawn twice.
+//
+// Every cycle in the graph runs through a value edge wired late — the `late`
+// marker — so following the value edges from `unowned` terminates without a
+// cycle guard only because those late edges each land on a node already drawn
+// above them.
 //
 // The walk starts at `pane.unowned`, the nodes no value edge names: a sink per
 // compiled output, a fan input per share point, and a source per registered data
@@ -159,7 +162,7 @@ export class OperatorView {
     return container;
   }
 
-  // A share or feedback edge: a leaf naming the node it subscribes, so the
+  // A share edge: a leaf naming the node it subscribes, so the
   // shared subtree is drawn once where that node is unowned rather than under
   // every consumer. Clicking it selects that node, which is how a reader follows
   // the reference.
@@ -168,7 +171,7 @@ export class OperatorView {
     const row = el("div", `tree-row selectable op-ref op-ref-${edge.kind}`);
     row.appendChild(el("span", "twisty leaf", "·"));
     row.appendChild(el("span", "edge-label", `${edge.role}:`));
-    row.appendChild(el("span", "op-ref-arrow", edge.kind === "feedback" ? "↺" : "→"));
+    row.appendChild(el("span", "op-ref-arrow", "→"));
     const subscribed = this.nodeById.get(edge.subscribed);
     row.appendChild(el("span", "node-label", subscribed ? subscribed.label : "?"));
     row.appendChild(el("span", "node-id", `#${edge.subscribed}`));
@@ -240,9 +243,8 @@ export function serializeOperatorGraph(pane: OperatorPane): string {
         walk(input.subscribed, input, depth + 1);
       } else {
         const ref = nodeById.get(input.subscribed);
-        const arrow = input.kind === "feedback" ? "↺" : "→";
         lines.push(
-          `${INDENT.repeat(depth + 1)}${input.role}: ${arrow} ${ref ? ref.label : "?"} #${input.subscribed}`,
+          `${INDENT.repeat(depth + 1)}${input.role}: → ${ref ? ref.label : "?"} #${input.subscribed}`,
         );
       }
     }

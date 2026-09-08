@@ -17,7 +17,7 @@ pub struct Constant {
     /// The extent (type) of the produced value.
     pub extent: Extent,
     /// Identity and the tiling — always `Tiling::Scalar`.
-    pub base: OperatorBase,
+    base: OperatorBase<Constant>,
 }
 
 impl Constant {
@@ -33,7 +33,7 @@ impl Constant {
         Self {
             value,
             extent,
-            base: OperatorBase::new::<Self>(tiling, &[]),
+            base: OperatorBase::new(tiling, &[]),
         }
     }
 }
@@ -108,7 +108,7 @@ pub struct ToScalar {
     input: Box<dyn TileOperator>,
     /// Identity and the output tiling: the codomain of the input's
     /// `SealedFunction` tiling.
-    base: OperatorBase,
+    base: OperatorBase<ToScalar>,
 }
 
 impl ToScalar {
@@ -124,7 +124,7 @@ impl ToScalar {
             )
         });
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -180,7 +180,7 @@ pub struct VariantWrap {
     variant_extents: TagMap<Extent>,
     /// Identity and the output tiling — `Scalar(Union)` for a scalar payload, or
     /// `SealedFunction { D ⇒ Scalar(Union) }` for a payload stream.
-    base: OperatorBase,
+    base: OperatorBase<VariantWrap>,
 }
 
 impl VariantWrap {
@@ -207,7 +207,7 @@ impl VariantWrap {
             _ => Tiling::Scalar(union_ext),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             tag,
             variant_extents,
@@ -393,7 +393,7 @@ pub struct VariantProject {
     /// shape without destructuring it back out.
     payload_extent: Extent,
     /// Identity and the output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
-    base: OperatorBase,
+    base: OperatorBase<VariantProject>,
 }
 
 impl VariantProject {
@@ -426,7 +426,7 @@ impl VariantProject {
             codomain: Box::new(Tiling::Scalar(payload_extent.clone())),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("scrutinee", &*input)]),
+            base: OperatorBase::new(tiling, &[value("scrutinee", &*input)]),
             input,
             tag,
             payload_extent,

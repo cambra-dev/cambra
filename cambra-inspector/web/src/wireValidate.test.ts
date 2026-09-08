@@ -449,7 +449,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     ];
     expect(() => validateSnapshot(wrongKind)).toThrow(
       new RegExp(
-        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.kind.*value, share, feedback`,
+        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.kind.*value, share`,
       ),
     );
 
@@ -462,7 +462,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
   });
 
-  it("accepts an operator node's value and feedback inputs", () => {
+  it("accepts an operator node's value, deferred and share inputs", () => {
     const ok = minimalSuccess();
     const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
     pane.nodes = [
@@ -471,7 +471,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
         ...minimalOperatorNode(),
         inputs: [
           { role: "input", kind: "value", deferred: false, subscribed: 1 },
-          { role: "acc", kind: "feedback", deferred: true, subscribed: 1 },
+          { role: "acc", kind: "value", deferred: true, subscribed: 1 },
         ],
       },
     ];

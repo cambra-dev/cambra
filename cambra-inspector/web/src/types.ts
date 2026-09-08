@@ -99,11 +99,11 @@ export interface OperatorEdge {
   // key, rendered.
   role: string;
   // "value" for an exclusively owned input, "share" for one several consumers
-  // may reach, "feedback" for a share that closes a cycle.
+  // may reach.
   //
   // The value edges form a forest, which is what lets a renderer walk them as a
-  // child relation with no cycle guard; share and feedback are the
-  // cross-references.
+  // child relation with no cycle guard; the share edges are the
+  // cross-references. A cycle is a "value" edge with `deferred` set.
   kind: string;
   // Whether the edge was wired after its consumer was constructed. An attribute
   // of when, not of ownership.
