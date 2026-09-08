@@ -484,14 +484,29 @@ fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
     let source = sources[0];
     let source_id = source["nodeId"].as_u64().expect("nodeId is a number");
 
+    // Nothing subscribes a source, so it is unowned like a sink or a fan input.
+    // Listing it is what puts it inside the value-edge walk every consumer runs;
+    // omitted, it is a node the pane holds and no walk reaches.
+    let unowned: Vec<u64> = pane["unowned"]
+        .as_array()
+        .expect("an operator pane ships unowned")
+        .iter()
+        .map(|v| v.as_u64().expect("an id is a number"))
+        .collect();
+    assert!(
+        unowned.contains(&source_id),
+        "the source node {source_id} is absent from the pane's unowned set {unowned:?}"
+    );
+
     let readers: Vec<&Value> = pane["nodes"]
         .as_array()
         .expect("nodes is an array")
         .iter()
         .filter(|n| {
-            n["inputs"]
-                .as_array()
-                .is_some_and(|es| es.iter().any(|e| e["id"].as_u64() == Some(source_id)))
+            n["inputs"].as_array().is_some_and(|es| {
+                es.iter()
+                    .any(|e| e["subscribed"].as_u64() == Some(source_id))
+            })
         })
         .collect();
     assert!(
@@ -502,7 +517,7 @@ fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
 
     for reader in &readers {
         for edge in reader["inputs"].as_array().expect("inputs is an array") {
-            if edge["id"].as_u64() == Some(source_id) {
+            if edge["subscribed"].as_u64() == Some(source_id) {
                 assert_eq!(
                     edge["kind"], "share",
                     "a source has no single owner, so a read of it is a share edge"
@@ -707,11 +722,12 @@ fn every_gallery_program_produces_a_valid_payload() {
 /// in place, and likewise every inference-variable number inside a rendered
 /// type.
 ///
-/// The id fields are exactly every entry of `panes[].roots`, every
-/// `panes[].nodes[].nodeId`, every inbound edge id a node names — `children[].id`
-/// on a tree pane, `inputs[].id` on an operator pane — and both endpoints of
-/// every `paneLinks[].edges` pair; spans and the pane's own string `id` are not
-/// ids and are left alone. Renumbering is global rather than per-pane because a
+/// The id fields are exactly each pane's walk starts — `panes[].root` on a tree
+/// pane, `panes[].unowned` on the operator pane — every `panes[].nodes[].nodeId`,
+/// every inbound edge id a node names — `children[].id` on a tree pane,
+/// `inputs[].subscribed` on an operator pane — and both endpoints of every
+/// `paneLinks[].edges` pair; spans and the pane's own string `id` are not ids and
+/// are left alone. Renumbering is global rather than per-pane because a
 /// surviving node keeps one id across every pane it appears in, and that
 /// identity — not the number — is what the frontend joins on.
 ///
@@ -770,19 +786,27 @@ fn canonicalize_ids(v: &mut Value) {
     };
 
     for pane in v["panes"].as_array_mut().into_iter().flatten() {
-        for root in pane["roots"].as_array_mut().into_iter().flatten() {
-            renumber(root);
+        // A tree pane's walk start is one id under `root`, the operator pane's a
+        // list under `unowned`, and a pane carries one of the two — so touching
+        // both keys reaches every start without a kind test.
+        if !pane["root"].is_null() {
+            renumber(&mut pane["root"]);
+        }
+        for id in pane["unowned"].as_array_mut().into_iter().flatten() {
+            renumber(id);
         }
         for node in pane["nodes"].as_array_mut().into_iter().flatten() {
             renumber(&mut node["nodeId"]);
             canonical_type(&mut node["type"]);
-            // A tree pane names its inbound edges `children`, an operator pane
-            // `inputs`. Both carry the id under `id`, and a node has one of the
-            // two, so walking both reaches every edge without a kind test.
-            for channel in ["children", "inputs"] {
-                for edge in node[channel].as_array_mut().into_iter().flatten() {
-                    renumber(&mut edge["id"]);
-                }
+            // A tree pane names its inbound edges `children` and an operator
+            // pane `inputs`; a child carries `id` and an operator input
+            // `subscribed`. A node has one of the two, so walking both reaches
+            // every edge without a kind test.
+            for edge in node["children"].as_array_mut().into_iter().flatten() {
+                renumber(&mut edge["id"]);
+            }
+            for edge in node["inputs"].as_array_mut().into_iter().flatten() {
+                renumber(&mut edge["subscribed"]);
             }
         }
     }

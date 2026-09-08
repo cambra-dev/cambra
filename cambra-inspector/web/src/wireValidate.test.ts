@@ -41,11 +41,11 @@ describe("validateSnapshot: real fixtures", () => {
     expect(source.tiling ?? null).toBeNull();
     expect(source.spans.length).toBeGreaterThanOrEqual(2);
     const reads = pane!.nodes.flatMap((n) =>
-      "inputs" in n ? n.inputs.filter((e) => e.id === source.nodeId) : [],
+      "inputs" in n ? n.inputs.filter((e) => e.subscribed === source.nodeId) : [],
     );
     expect(reads.length).toBeGreaterThanOrEqual(2);
-    // A shared target has no owner: recording a read as `value` is what trips
-    // the producer's exclusive-ownership assertion.
+    // A shared node has no owner: recording a read as `value` is what trips the
+    // producer's exclusive-ownership assertion.
     expect(reads.every((e) => e.kind === "share")).toBe(true);
   });
 
@@ -73,8 +73,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   // A minimal valid *successful* snapshot: the exact panes and windows the
   // pinned contract requires, built from `PANE_IDS` so a pane added upstream
   // fails the validator's own pin rather than this fixture's spelling. Every
-  // pane's table is one node (nodeId 0) named by `roots`, so the (empty)
-  // paneLinks trivially satisfy endpoint liveness.
+  // pane's table is one node (nodeId 0), named by that pane's own walk-start
+  // key, so the (empty) paneLinks trivially satisfy endpoint liveness.
   const minimalNode = (): Record<string, unknown> => ({
     label: "Lit(Int(1))",
     nodeId: 0,
@@ -107,7 +107,9 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       id,
       label: `IR (${id.toUpperCase()})`,
       kind: kindOf(id),
-      roots: [0],
+      // A tree pane's walk start is `root`, singular; the operator pane's is
+      // `unowned`. Neither key ships on the other shape.
+      ...(kindOf(id) === "operators" ? { unowned: [0] } : { root: 0 }),
       nodes: [kindOf(id) === "operators" ? minimalOperatorNode() : minimalNode()],
     })),
     paneLinks: PANE_IDS.slice(1).map((to, i) => ({
@@ -268,38 +270,74 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
   });
 
-  it("throws when a root names an id the pane's table does not hold", () => {
+  it("throws when a walk start names an id the pane's table does not hold", () => {
     const bad = minimalSuccess();
-    (bad.panes as Record<string, unknown>[])[0].roots = [99];
-    expect(() => validateSnapshot(bad)).toThrow(/panes\[0\]\.roots\[0\].*present in this pane/);
+    (bad.panes as Record<string, unknown>[])[0].root = 99;
+    expect(() => validateSnapshot(bad)).toThrow(/panes\[0\]\.root.*present in this pane/);
+
+    const badGraph = minimalSuccess();
+    (badGraph.panes as Record<string, unknown>[])[OPERATORS].unowned = [99];
+    expect(() => validateSnapshot(badGraph)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.unowned\\[0\\].*present in this pane`),
+    );
   });
 
-  it("throws when a pane names no roots at all", () => {
+  it("throws when a pane names no walk start at all", () => {
     const bad = minimalSuccess();
-    (bad.panes as Record<string, unknown>[])[0].roots = [];
-    expect(() => validateSnapshot(bad)).toThrow(/panes\[0\]\.roots.*non-empty/);
+    (bad.panes as Record<string, unknown>[])[OPERATORS].unowned = [];
+    expect(() => validateSnapshot(bad)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.unowned.*non-empty`),
+    );
 
     const missing = minimalSuccess();
-    delete (missing.panes as Record<string, unknown>[])[0].roots;
-    expect(() => validateSnapshot(missing)).toThrow(/panes\[0\]\.roots.*array/);
+    delete (missing.panes as Record<string, unknown>[])[0].root;
+    expect(() => validateSnapshot(missing)).toThrow(/panes\[0\]\.root.*number/);
   });
 
-  it("throws when a tree pane names more than one root", () => {
-    // Several roots is the operator graph's shape — a sink per compiled output,
-    // a fan input per share point. A tree has exactly one by construction.
-    const bad = minimalSuccess();
-    const pane = (bad.panes as Record<string, unknown>[])[0];
-    pane.nodes = [minimalNode(), { ...minimalNode(), nodeId: 1 }];
-    pane.roots = [0, 1];
-    expect(() => validateSnapshot(bad)).toThrow(/panes\[0\]\.roots.*exactly one root/);
+  it("throws when a pane carries the other shape's walk-start key", () => {
+    // A tree's start is singular by type, so nothing has to assert that it is
+    // one id — what does have to be pinned is that neither key crosses over.
+    const treeWithUnowned = minimalSuccess();
+    (treeWithUnowned.panes as Record<string, unknown>[])[0].unowned = [0];
+    expect(() => validateSnapshot(treeWithUnowned)).toThrow(
+      /panes\[0\]\.unowned.*absent on a tree pane/,
+    );
+
+    const graphWithRoot = minimalSuccess();
+    (graphWithRoot.panes as Record<string, unknown>[])[OPERATORS].root = 0;
+    expect(() => validateSnapshot(graphWithRoot)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.root.*absent on an operator pane`),
+    );
   });
 
-  it("accepts an operator pane naming several roots", () => {
+  it("accepts an operator pane naming several unowned nodes", () => {
     const ok = minimalSuccess();
     const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
     pane.nodes = [minimalOperatorNode(), { ...minimalOperatorNode(), nodeId: 1 }];
-    pane.roots = [0, 1];
+    pane.unowned = [0, 1];
     expect(() => validateSnapshot(ok)).not.toThrow();
+  });
+
+  it("throws when a node is unreachable from unowned along the value edges", () => {
+    // The gap this check exists for: a node the table holds and the value-edge
+    // walk never reaches is a node no view draws. A `share` edge does not carry
+    // the walk, so a node reachable only through one has to be unowned itself.
+    const bad = minimalSuccess();
+    const pane = (bad.panes as Record<string, unknown>[])[OPERATORS];
+    pane.nodes = [
+      {
+        ...minimalOperatorNode(),
+        inputs: [{ role: "source", kind: "share", deferred: false, subscribed: 1 }],
+      },
+      { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
+    ];
+    pane.unowned = [0];
+    expect(() => validateSnapshot(bad)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes.*reachable from unowned`),
+    );
+
+    pane.unowned = [0, 1];
+    expect(() => validateSnapshot(bad)).not.toThrow();
   });
 
   it("throws when a node id appears twice in one pane's table", () => {
@@ -394,10 +432,12 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
 
   it("throws when an operator input names an id the pane's table does not hold", () => {
     const bad = minimalSuccess();
-    operatorNodes(bad)[0].inputs = [{ role: "0", kind: "value", deferred: false, id: 99 }];
+    operatorNodes(bad)[0].inputs = [
+      { role: "0", kind: "value", deferred: false, subscribed: 99 },
+    ];
     expect(() => validateSnapshot(bad)).toThrow(
       new RegExp(
-        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.id.*present in this pane`,
+        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.subscribed.*present in this pane`,
       ),
     );
   });
@@ -405,7 +445,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   it("throws on an operator input's kind or deferred flag", () => {
     const wrongKind = minimalSuccess();
     operatorNodes(wrongKind)[0].inputs = [
-      { role: "0", kind: "owned", deferred: false, id: 0 },
+      { role: "0", kind: "owned", deferred: false, subscribed: 0 },
     ];
     expect(() => validateSnapshot(wrongKind)).toThrow(
       new RegExp(
@@ -414,7 +454,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
 
     const noFlag = minimalSuccess();
-    operatorNodes(noFlag)[0].inputs = [{ role: "0", kind: "share", id: 0 }];
+    operatorNodes(noFlag)[0].inputs = [{ role: "0", kind: "share", subscribed: 0 }];
     expect(() => validateSnapshot(noFlag)).toThrow(
       new RegExp(
         `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.deferred.*boolean`,
@@ -430,12 +470,12 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       {
         ...minimalOperatorNode(),
         inputs: [
-          { role: "input", kind: "value", deferred: false, id: 1 },
-          { role: "acc", kind: "feedback", deferred: true, id: 1 },
+          { role: "input", kind: "value", deferred: false, subscribed: 1 },
+          { role: "acc", kind: "feedback", deferred: true, subscribed: 1 },
         ],
       },
     ];
-    pane.roots = [0];
+    pane.unowned = [0];
     expect(() => validateSnapshot(ok)).not.toThrow();
   });
 

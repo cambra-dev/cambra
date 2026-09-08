@@ -125,7 +125,7 @@ describe("serializeTree", () => {
     const snap = fixture(listMinJson);
     const pane = irPaneById(snap, "post-inference");
     const lines = serializeTree(
-      pane.roots[0],
+      pane.root,
       new Map(pane.nodes.map((n) => [n.nodeId, n])),
     ).split("\n");
     expect(lines.length).toBeGreaterThan(1);

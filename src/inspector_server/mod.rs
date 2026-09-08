@@ -164,9 +164,7 @@ mod tests {
             .iter()
             .find(|s| s["id"] == "post-inference")
             .expect("the post-inference pane is present");
-        let roots = pane["roots"].as_array().expect("roots is an array");
-        assert_eq!(roots.len(), 1, "a tree pane has one root");
-        let root = roots[0].as_u64().expect("root is a number");
+        let root = pane["root"].as_u64().expect("root is a number");
         let node = pane["nodes"]
             .as_array()
             .expect("nodes is an array")

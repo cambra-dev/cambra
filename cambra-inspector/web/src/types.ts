@@ -108,8 +108,9 @@ export interface OperatorEdge {
   // Whether the edge was wired after its consumer was constructed. An attribute
   // of when, not of ownership.
   deferred: boolean;
-  // The input's node id.
-  id: number;
+  // The id of the node this edge subscribes — an entry of the same pane's
+  // `nodes`.
+  subscribed: number;
 }
 
 export interface Definition {
@@ -142,11 +143,6 @@ export interface Meta {
 interface PaneCommon {
   id: string;
   label: string;
-  // The ids a consumer starts walking `nodes` from — each an entry of `nodes`.
-  //
-  // One for a tree. An operator graph has several: a sink per compiled output,
-  // and a fan input per share point, which are the nodes nothing owns.
-  roots: number[];
 }
 
 // A pane holding an expression tree: "holes" for the still-hole-typed
@@ -154,6 +150,9 @@ interface PaneCommon {
 // post-inference on).
 export interface IrPane extends PaneCommon {
   kind: "holes" | "typed";
+  // The id the walk starts from — an entry of `nodes`. A tree has exactly one
+  // by construction, which is why the field is singular.
+  root: number;
   // Every node of this pane exactly once, in first-visit pre-order.
   nodes: IrNode[];
 }
@@ -161,14 +160,20 @@ export interface IrPane extends PaneCommon {
 // The pane holding the dataflow operator graph.
 export interface OperatorPane extends PaneCommon {
   kind: "operators";
+  // The nodes no `value` edge names — a sink per compiled output, a fan input
+  // per share point, and a source per registered data source. Every node of the
+  // pane is reachable from here following `value` edges alone, which is the
+  // relation a consumer walks; `wireValidate.ts` pins that.
+  unowned: number[];
   // Every node of this pane exactly once, in conversion order.
   nodes: OperatorNode[];
 }
 
 // One ordered pipeline pane. `kind` is the discriminant for which shape `nodes`
-// holds: the two share an id, a label and an attribution, and nothing else — an
-// expression node has a type and children, an operator has a tiling and typed
-// input edges, and neither field set is meaningful for the other.
+// holds: the two share an id and a label and nothing else — a tree pane names
+// one `root` and its nodes have a type and children, an operator pane names its
+// `unowned` nodes and its nodes have a tiling and typed input edges, and neither
+// field set is meaningful for the other.
 export type PaneEntry = IrPane | OperatorPane;
 
 /**

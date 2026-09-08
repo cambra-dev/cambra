@@ -83,10 +83,7 @@ export class Store {
     this.indicesByPane = new Map();
     for (const pane of this.panes) {
       if (!isIrPane(pane)) continue;
-      this.indicesByPane.set(
-        pane.id,
-        buildIndices(pane.roots, pane.nodes, snapshot.definitions),
-      );
+      this.indicesByPane.set(pane.id, buildIndices(pane.root, pane.nodes, snapshot.definitions));
     }
 
     // Hover/goto-def/squiggles read fully-resolved types, so they anchor on the

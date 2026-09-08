@@ -59,9 +59,7 @@
       "id": "pre-inference",
       "label": "IR (PRE-INFERENCE)",
       "kind": "holes",
-      "roots": [
-        23
-      ],
+      "root": 23,
       "nodes": [
         {
           "label": "Let(tagged)",
@@ -509,9 +507,7 @@
       "id": "post-inference",
       "label": "IR (POST-INFERENCE)",
       "kind": "typed",
-      "roots": [
-        167
-      ],
+      "root": 167,
       "nodes": [
         {
           "label": "Let(__mono)",
@@ -1129,9 +1125,7 @@
       "id": "post-channelize",
       "label": "IR (POST-CHANNELIZE)",
       "kind": "typed",
-      "roots": [
-        167
-      ],
+      "root": 167,
       "nodes": [
         {
           "label": "Let(__mono)",
@@ -1749,9 +1743,7 @@
       "id": "post-as-of-read",
       "label": "IR (POST-AS-OF-READ)",
       "kind": "typed",
-      "roots": [
-        167
-      ],
+      "root": 167,
       "nodes": [
         {
           "label": "Let(__mono)",
@@ -2369,9 +2361,7 @@
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
-      "roots": [
-        234
-      ],
+      "root": 234,
       "nodes": [
         {
           "label": "Let(__mono)",
@@ -3095,9 +3085,7 @@
       "id": "post-planning",
       "label": "IR (POST-PLANNING)",
       "kind": "typed",
-      "roots": [
-        234
-      ],
+      "root": 234,
       "nodes": [
         {
           "label": "Let(__mono)",
@@ -4379,10 +4367,11 @@
       "id": "post-conversion",
       "label": "IR (POST-CONVERSION)",
       "kind": "operators",
-      "roots": [
+      "unowned": [
         632,
         639,
-        643
+        643,
+        644
       ],
       "nodes": [
         {
@@ -4424,13 +4413,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 626
+              "subscribed": 626
             },
             {
               "role": "source",
               "kind": "share",
               "deferred": false,
-              "id": 644
+              "subscribed": 644
             }
           ]
         },
@@ -4473,13 +4462,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 627
+              "subscribed": 627
             },
             {
               "role": "constant",
               "kind": "value",
               "deferred": false,
-              "id": 628
+              "subscribed": 628
             }
           ]
         },
@@ -4522,13 +4511,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 629
+              "subscribed": 629
             },
             {
               "role": "fn",
               "kind": "value",
               "deferred": false,
-              "id": 630
+              "subscribed": 630
             }
           ]
         },
@@ -4553,7 +4542,7 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 631
+              "subscribed": 631
             }
           ]
         },
@@ -4596,13 +4585,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 633
+              "subscribed": 633
             },
             {
               "role": "source",
               "kind": "share",
               "deferred": false,
-              "id": 644
+              "subscribed": 644
             }
           ]
         },
@@ -4645,13 +4634,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 634
+              "subscribed": 634
             },
             {
               "role": "constant",
               "kind": "value",
               "deferred": false,
-              "id": 635
+              "subscribed": 635
             }
           ]
         },
@@ -4694,13 +4683,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 636
+              "subscribed": 636
             },
             {
               "role": "fn",
               "kind": "value",
               "deferred": false,
-              "id": 637
+              "subscribed": 637
             }
           ]
         },
@@ -4725,7 +4714,7 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 638
+              "subscribed": 638
             }
           ]
         },
@@ -4750,7 +4739,7 @@
               "role": "fan",
               "kind": "share",
               "deferred": false,
-              "id": 632
+              "subscribed": 632
             }
           ]
         },
@@ -4775,7 +4764,7 @@
               "role": "fan",
               "kind": "share",
               "deferred": false,
-              "id": 639
+              "subscribed": 639
             }
           ]
         },
@@ -4800,13 +4789,13 @@
               "role": "0",
               "kind": "value",
               "deferred": false,
-              "id": 640
+              "subscribed": 640
             },
             {
               "role": "1",
               "kind": "value",
               "deferred": false,
-              "id": 641
+              "subscribed": 641
             }
           ]
         },
@@ -4831,7 +4820,7 @@
               "role": "output",
               "kind": "value",
               "deferred": false,
-              "id": 642
+              "subscribed": 642
             }
           ]
         },

@@ -59,7 +59,7 @@ function mountApp(snap: Snapshot): {
     const body = document.createElement("div");
     root.appendChild(body);
     trees.set(pane.id, body);
-    if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.roots[0]);
+    if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.root);
   }
   return { store, source: sourceBody, trees };
 }
@@ -193,7 +193,7 @@ describe("pane copy button", () => {
     // the same panel class, so an index would not say which pane was clicked.
     panelFor(root, pane.id).querySelector<HTMLButtonElement>(".pane-copy")!.click();
     expect(writeText).toHaveBeenCalledWith(
-      serializeTree(pane.roots[0], new Map(pane.nodes.map((n) => [n.nodeId, n]))),
+      serializeTree(pane.root, new Map(pane.nodes.map((n) => [n.nodeId, n]))),
     );
   });
 

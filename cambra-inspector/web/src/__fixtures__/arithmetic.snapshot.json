@@ -59,9 +59,7 @@
       "id": "pre-inference",
       "label": "IR (PRE-INFERENCE)",
       "kind": "holes",
-      "roots": [
-        24
-      ],
+      "root": 24,
       "nodes": [
         {
           "label": "Let(g)",
@@ -416,9 +414,7 @@
       "id": "post-inference",
       "label": "IR (POST-INFERENCE)",
       "kind": "typed",
-      "roots": [
-        24
-      ],
+      "root": 24,
       "nodes": [
         {
           "label": "Let(g)",
@@ -1074,9 +1070,7 @@
       "id": "post-channelize",
       "label": "IR (POST-CHANNELIZE)",
       "kind": "typed",
-      "roots": [
-        24
-      ],
+      "root": 24,
       "nodes": [
         {
           "label": "Let(g)",
@@ -1654,9 +1648,7 @@
       "id": "post-as-of-read",
       "label": "IR (POST-AS-OF-READ)",
       "kind": "typed",
-      "roots": [
-        24
-      ],
+      "root": 24,
       "nodes": [
         {
           "label": "Let(g)",
@@ -2234,9 +2226,7 @@
       "id": "post-lambda-elim",
       "label": "IR (POST-LAMBDA-ELIM)",
       "kind": "typed",
-      "roots": [
-        131
-      ],
+      "root": 131,
       "nodes": [
         {
           "label": "Let(g)",
@@ -2706,9 +2696,7 @@
       "id": "post-planning",
       "label": "IR (POST-PLANNING)",
       "kind": "typed",
-      "roots": [
-        131
-      ],
+      "root": 131,
       "nodes": [
         {
           "label": "Let(g)",
@@ -3694,7 +3682,7 @@
       "id": "post-conversion",
       "label": "IR (POST-CONVERSION)",
       "kind": "operators",
-      "roots": [
+      "unowned": [
         375,
         385
       ],
@@ -3738,7 +3726,7 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 374
+              "subscribed": 374
             }
           ]
         },
@@ -3799,13 +3787,13 @@
               "role": "0",
               "kind": "value",
               "deferred": false,
-              "id": 376
+              "subscribed": 376
             },
             {
               "role": "1",
               "kind": "value",
               "deferred": false,
-              "id": 377
+              "subscribed": 377
             }
           ]
         },
@@ -3848,13 +3836,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 378
+              "subscribed": 378
             },
             {
               "role": "fn",
               "kind": "value",
               "deferred": false,
-              "id": 379
+              "subscribed": 379
             }
           ]
         },
@@ -3879,7 +3867,7 @@
               "role": "fan",
               "kind": "share",
               "deferred": false,
-              "id": 375
+              "subscribed": 375
             }
           ]
         },
@@ -3904,13 +3892,13 @@
               "role": "0",
               "kind": "value",
               "deferred": false,
-              "id": 380
+              "subscribed": 380
             },
             {
               "role": "1",
               "kind": "value",
               "deferred": false,
-              "id": 381
+              "subscribed": 381
             }
           ]
         },
@@ -3953,13 +3941,13 @@
               "role": "input",
               "kind": "value",
               "deferred": false,
-              "id": 382
+              "subscribed": 382
             },
             {
               "role": "fn",
               "kind": "value",
               "deferred": false,
-              "id": 383
+              "subscribed": 383
             }
           ]
         },
@@ -3984,7 +3972,7 @@
               "role": "output",
               "kind": "value",
               "deferred": false,
-              "id": 384
+              "subscribed": 384
             }
           ]
         }

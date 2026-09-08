@@ -21,6 +21,10 @@
 //! which, and how. Runtime dataflow follows `get` and `notify`, which is a
 //! different relation, and nothing here asserts the two coincide.
 //!
+//! Degrees are counted in dataflow direction — a source has in-degree 0, a sink
+//! out-degree 0 — while a recorded edge is stored on the consumer and names the
+//! node it subscribes, so the stored relation runs the other way.
+//!
 //! [`FanOut::branch`]: crate::interpreter::tile_operators::FanOut::branch
 //! [`OperatorBase::new`]: crate::interpreter::tile_operators::OperatorBase::new
 
@@ -77,21 +81,21 @@ pub enum EdgeRole {
 pub struct InputEdge {
     pub role: EdgeRole,
     pub kind: EdgeKind,
-    pub target: NodeId,
+    pub subscribed: NodeId,
 }
 
 /// An input edge as a constructor states it, before the session resolves it.
 ///
-/// `target` is an `Option` because a test double carries no [`OperatorBase`] and
-/// so answers no id. Such an edge is dropped rather than recorded: a graph is
-/// only ever assembled under a session, and nothing installs one around a test
-/// that builds operators by hand.
+/// `subscribed` is an `Option` because a test double carries no [`OperatorBase`]
+/// and so answers no id. Such an edge is dropped rather than recorded: a graph
+/// is only ever assembled under a session, and nothing installs one around a
+/// test that builds operators by hand.
 ///
 /// [`OperatorBase`]: crate::interpreter::tile_operators::OperatorBase
 pub struct InputEdgeSpec {
     pub role: EdgeRole,
     pub kind: EdgeKind,
-    pub target: Option<NodeId>,
+    pub subscribed: Option<NodeId>,
 }
 
 /// An owned input held under a named field.
@@ -99,7 +103,7 @@ pub(crate) fn value(role: &'static str, op: &dyn TileOperator) -> InputEdgeSpec 
     InputEdgeSpec {
         role: EdgeRole::Named(role),
         kind: EdgeKind::Value { deferred: false },
-        target: op.operator_id(),
+        subscribed: op.operator_id(),
     }
 }
 
@@ -108,7 +112,7 @@ pub(crate) fn value_at(index: usize, op: &dyn TileOperator) -> InputEdgeSpec {
     InputEdgeSpec {
         role: EdgeRole::Positional(index),
         kind: EdgeKind::Value { deferred: false },
-        target: op.operator_id(),
+        subscribed: op.operator_id(),
     }
 }
 
@@ -117,7 +121,7 @@ pub(crate) fn value_keyed(key: impl Into<String>, op: &dyn TileOperator) -> Inpu
     InputEdgeSpec {
         role: EdgeRole::StoreKey(key.into()),
         kind: EdgeKind::Value { deferred: false },
-        target: op.operator_id(),
+        subscribed: op.operator_id(),
     }
 }
 
@@ -130,7 +134,7 @@ pub(crate) fn share(fan_input: Option<NodeId>, cyclic: bool) -> InputEdgeSpec {
         } else {
             EdgeKind::Share
         },
-        target: fan_input,
+        subscribed: fan_input,
     }
 }
 
@@ -155,7 +159,7 @@ pub enum GraphNode {
     /// truthful about sharing the way it is everywhere else — a shared input is a
     /// node several consumers point at, never a node duplicated per consumer.
     Source { id: NodeId, name: String },
-    /// A compiled output field. Out-degree 0, and a root of every walk.
+    /// A compiled output field. Out-degree 0, and a start of every walk.
     Sink {
         id: NodeId,
         name: String,
@@ -170,7 +174,7 @@ pub enum GraphNode {
 #[derive(Clone, Debug, Default)]
 pub struct OperatorGraph {
     nodes: Vec<GraphNode>,
-    roots: Vec<NodeId>,
+    unowned: Vec<NodeId>,
     /// Read sites per registered source, accumulated during the walk and spent by
     /// [`materialize_sources`].
     ///
@@ -195,17 +199,22 @@ impl OperatorGraph {
         &self.nodes
     }
 
-    /// The nodes no operator owns, which is where a walk of the graph starts.
+    /// The nodes no `Value` edge names, which is where a walk of the
+    /// subscription forest starts.
     ///
-    /// A fan input is one: the `Rc<FanOut>` holding it is dropped when conversion
-    /// ends, so only its branches survive and nothing owns the input itself. A
-    /// binding whose variable is never used has a fan with no branches at all, so
-    /// its input is reached by no edge either.
+    /// Three kinds of node qualify. A **sink**: the conversion boundary supplies
+    /// those, since only the caller knows which operators it compiled a field
+    /// to. A **fan input**: the `Rc<FanOut>` holding it is dropped when
+    /// conversion ends, so only its branches survive and nothing owns the input
+    /// itself — and a binding whose variable is never used has a fan with no
+    /// branches at all, so its input is reached by no edge at all. A **source**:
+    /// a source is a graph node rather than a `TileOperator`, so nothing
+    /// subscribes it and a reader's edge to it is a `Share`.
     ///
-    /// The program outputs are the other roots, and the boundary supplies those —
-    /// only the caller knows which operators it compiled a field to.
-    pub fn roots(&self) -> &[NodeId] {
-        &self.roots
+    /// Every node of the graph is reachable from here along `Value` edges alone,
+    /// which is what [`assert_graph_invariants`] pins.
+    pub fn unowned(&self) -> &[NodeId] {
+        &self.unowned
     }
 
     /// Every node's id.
@@ -245,9 +254,11 @@ impl OperatorGraph {
 ///   input is a `Box`, and acyclicity comes from cycles routing through the two
 ///   cyclic fans rather than through owned inputs. The renderer's absence of a
 ///   cycle guard rests on this.
-/// * **Every node is reachable from a root** — a sink, or a fan input, which are
-///   the two kinds of node nothing owns. An unreachable node is one a
-///   construction site built and dropped, which nothing else notices.
+/// * **Every node is reachable from [`OperatorGraph::unowned`] along the `Value`
+///   edges.** That relation is the one every consumer walks — the renderer draws
+///   value edges as the child relation and share and feedback edges as reference
+///   leaves — so a node it misses is a node nothing draws. An unreachable node is
+///   one a construction site built and dropped, which nothing else notices.
 pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
     if !cfg!(any(debug_assertions, test)) {
         return;
@@ -258,26 +269,27 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
         std::collections::HashMap::new();
     for (consumer, edge) in graph.edges() {
         assert!(
-            ids.contains(&edge.target),
+            ids.contains(&edge.subscribed),
             "operator graph: an edge from {consumer:?} points at {:?}, which is no node of \
              the graph",
-            edge.target
+            edge.subscribed
         );
         if matches!(edge.kind, EdgeKind::Value { .. }) {
-            let previous = value_parent.insert(edge.target, consumer);
+            let previous = value_parent.insert(edge.subscribed, consumer);
             assert!(
                 previous.is_none(),
                 "operator graph: {:?} is owned by both {previous:?} and {consumer:?}, but a \
                  value edge is exclusive ownership",
-                edge.target
+                edge.subscribed
             );
         }
     }
 
-    // Reachability follows every edge kind: a fan input is reached through its
-    // branches' share edges, not by being owned.
+    // `Value` edges only, from `unowned`: that is the relation a consumer walks,
+    // and every node nothing owns — a sink, a fan input, a source — is in
+    // `unowned` already, so no share edge has to be followed to reach one.
     let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    let mut stack: Vec<NodeId> = graph.roots().to_vec();
+    let mut stack: Vec<NodeId> = graph.unowned().to_vec();
     let by_id: std::collections::HashMap<NodeId, &GraphNode> = graph
         .nodes()
         .iter()
@@ -293,9 +305,14 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
         }
         match by_id.get(&id) {
             Some(GraphNode::Operator { inputs, .. }) => {
-                stack.extend(inputs.iter().map(|e| e.target));
+                stack.extend(
+                    inputs
+                        .iter()
+                        .filter(|e| matches!(e.kind, EdgeKind::Value { .. }))
+                        .map(|e| e.subscribed),
+                );
             }
-            Some(GraphNode::Sink { input, .. }) => stack.push(input.target),
+            Some(GraphNode::Sink { input, .. }) => stack.push(input.subscribed),
             Some(GraphNode::Source { .. }) | None => {}
         }
     }
@@ -310,8 +327,8 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
         .collect();
     assert!(
         stranded.is_empty(),
-        "operator graph: {} node(s) unreachable from any output — a construction site \
-         built an operator and dropped it: {stranded:?}",
+        "operator graph: {} node(s) unreachable from `unowned` along the value edges — a \
+         construction site built an operator and dropped it: {stranded:?}",
         stranded.len()
     );
 }
@@ -457,6 +474,11 @@ pub(crate) fn materialize_sources() {
                 id,
                 name: name.clone(),
             });
+            // Unowned by the same definition as a sink or a fan input: no
+            // `Value` edge names it, because a reader subscribes operators and a
+            // source is not one. Listing it is what puts it inside the walk
+            // every consumer runs, rather than reachable only along a `Share`.
+            graph.unowned.push(id);
             for read in &reads {
                 // Shared, not owned: one registered source may be read by
                 // several expressions, and each reader holds it through an `Rc`
@@ -473,9 +495,9 @@ pub(crate) fn materialize_sources() {
     }
 }
 
-/// Record a compiled output field, reading `target`.
-pub(crate) fn record_sink(name: &str, target: Option<NodeId>) -> Option<NodeId> {
-    let target = target?;
+/// Record a compiled output field, reading `subscribed`.
+pub(crate) fn record_sink(name: &str, subscribed: Option<NodeId>) -> Option<NodeId> {
+    let subscribed = subscribed?;
     let id = NodeId::fresh();
     crate::ccl::provenance::on_mint(id);
     ACTIVE_GRAPH.with(|slot| {
@@ -489,10 +511,10 @@ pub(crate) fn record_sink(name: &str, target: Option<NodeId>) -> Option<NodeId> 
             input: InputEdge {
                 role: EdgeRole::Named("output"),
                 kind: EdgeKind::Value { deferred: false },
-                target,
+                subscribed,
             },
         });
-        graph.roots.push(id);
+        graph.unowned.push(id);
     });
     Some(id)
 }
@@ -518,12 +540,12 @@ pub(crate) fn drop_operator(op: &dyn TileOperator) {
                 GraphNode::Operator { id: node, .. } => *node != id,
                 GraphNode::Source { .. } | GraphNode::Sink { .. } => true,
             });
-            graph.roots.retain(|root| *root != id);
+            graph.unowned.retain(|node| *node != id);
         }
     });
 }
 
-/// Record a fan input as a root.
+/// Record a fan input as unowned.
 ///
 /// Called by `FanOut`'s constructor, which is the only place that knows an
 /// operator has been moved into a fan and so is owned by no operator.
@@ -533,7 +555,7 @@ pub(crate) fn record_fan_input(id: Option<NodeId>) {
     };
     ACTIVE_GRAPH.with(|slot| {
         if let Some(graph) = slot.borrow_mut().as_mut() {
-            graph.roots.push(id);
+            graph.unowned.push(id);
         }
     });
 }
@@ -544,8 +566,8 @@ pub(crate) fn record_fan_input(id: Option<NodeId>) {
 /// owner was constructed, so the edge cannot be stated at construction.
 ///
 /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
-pub(crate) fn record_deferred_edge(owner: NodeId, role: EdgeRole, target: Option<NodeId>) {
-    let Some(target) = target else {
+pub(crate) fn record_deferred_edge(owner: NodeId, role: EdgeRole, subscribed: Option<NodeId>) {
+    let Some(subscribed) = subscribed else {
         return;
     };
     ACTIVE_GRAPH.with(|slot| {
@@ -556,7 +578,7 @@ pub(crate) fn record_deferred_edge(owner: NodeId, role: EdgeRole, target: Option
                 owner,
                 role,
                 EdgeKind::Value { deferred: true },
-                target,
+                subscribed,
             );
         }
     });
@@ -568,13 +590,17 @@ fn push_edge(
     owner: NodeId,
     role: EdgeRole,
     kind: EdgeKind,
-    target: NodeId,
+    subscribed: NodeId,
 ) {
     for node in &mut graph.nodes {
         if let GraphNode::Operator { id, inputs, .. } = node
             && *id == owner
         {
-            inputs.push(InputEdge { role, kind, target });
+            inputs.push(InputEdge {
+                role,
+                kind,
+                subscribed,
+            });
             return;
         }
     }
@@ -584,10 +610,10 @@ fn resolve(specs: &[InputEdgeSpec]) -> Vec<InputEdge> {
     specs
         .iter()
         .filter_map(|s| {
-            s.target.map(|target| InputEdge {
+            s.subscribed.map(|subscribed| InputEdge {
                 role: s.role.clone(),
                 kind: s.kind,
-                target,
+                subscribed,
             })
         })
         .collect()
