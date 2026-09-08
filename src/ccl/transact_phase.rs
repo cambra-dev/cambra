@@ -553,6 +553,12 @@ pub fn collect_txn_mut_vars(expr: &Expr) -> HashSet<Name> {
 /// value-type reads, so the emitted `LetRec` (and the `Transact` recognition
 /// derives from it) is `Mut`-free by construction, never feeding a `Mut` type
 /// into the commit engine.
+///
+/// Untouched includes a non-`Mut` type's refinements. A register holds a different value at
+/// each position of its domain, so inference stamps the binder's value type without the
+/// refinements any one contribution carries: a register seeded at `Int@100` binds
+/// `Mut(Int, _)`, and a keyed one seeded at a concrete map binds
+/// `Mut(Σ (σ : SubtypesOf(𝐾)). (σ ⤇ 𝑉), _)`.
 fn mut_var_value_ty(ty: &Type) -> Type {
     fn under_mut(ty: &Type) -> Option<&Type> {
         match ty {
@@ -569,7 +575,7 @@ fn mut_var_value_ty(ty: &Type) -> Type {
     }
     match under_mut(ty) {
         Some(v) => mut_var_value_ty(v),
-        None => crate::ccl::ccl_utils::strip_refinements(ty),
+        None => ty.clone(),
     }
 }
 
