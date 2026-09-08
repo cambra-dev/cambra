@@ -35,7 +35,7 @@ pub struct ExtractFinal {
     default: Option<Box<dyn TileOperator>>,
     /// Identity and the output tiling — the codomain of the source
     /// SealedFunction (always `Scalar`).
-    base: OperatorBase,
+    base: OperatorBase<ExtractFinal>,
 }
 
 impl ExtractFinal {
@@ -67,7 +67,7 @@ impl ExtractFinal {
             default.tiling(),
         );
         Self {
-            base: OperatorBase::new::<Self>(
+            base: OperatorBase::new(
                 tiling,
                 &[value("source", &*source), value("default", &*default)],
             ),
@@ -85,7 +85,7 @@ impl ExtractFinal {
     pub fn without_default(source: Box<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("source", &*source)]),
+            base: OperatorBase::new(tiling, &[value("source", &*source)]),
             source,
             default: None,
         }

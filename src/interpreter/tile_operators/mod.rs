@@ -10,7 +10,7 @@
 //!
 //! The operators are grouped into submodules by cohesive operator+producer
 //! cluster; this `mod.rs` carries the shared spine (the [`TileOperator`] /
-//! [`TileProducer`] traits, [`OperatorBase`] and [`ProducerBase`] with their
+//! [`TileProducer`] traits, `OperatorBase` and [`ProducerBase`] with their
 //! `impl_*_base` macros, and [`TilePathStep`]) and re-exports every cluster so
 //! consumers continue to reach items as `tile_operators::X`.
 
@@ -75,7 +75,7 @@ pub trait TileOperator {
     fn tiling(&self) -> &Tiling;
 
     /// This operator's identity, or `None` for a type that carries no
-    /// [`OperatorBase`].
+    /// `OperatorBase`.
     ///
     /// Production operators supply this through [`impl_operator_base`]. The
     /// default exists for test doubles, which need no identity: nothing folds
@@ -152,9 +152,14 @@ static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLo
 ///
 /// Every caller wants the same name and each had its own copy:
 /// [`TileOperator::kind`], [`TileProducer::name`], [`TileProducer::alloc_id`]'s
-/// counter key, and the label [`OperatorBase::new`] records.
+/// counter key, and the label `OperatorBase::new` records.
 pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
+    debug_assert!(
+        !full.contains('<'),
+        "short_type_name splits on the last `::`, which for a generic type falls \
+         inside the generic argument list and returns a fragment of it: {full}"
+    );
     full.rsplit_once("::").map_or(full, |(_, tail)| tail)
 }
 
@@ -171,14 +176,21 @@ pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
 /// runs after every rewrite phase and mints no expression nodes, so every
 /// operator id is greater than every expression id in the same compile, and the
 /// two sets are disjoint. `src/ccl/design/provenance.md` owns why that matters.
-pub struct OperatorBase {
+///
+/// `T` is the operator type that holds this base, and it is what the recorded
+/// label names. Declaring it in the field type (`base: OperatorBase<Filter>`)
+/// makes a label that disagrees with its holder a type error rather than a call
+/// site's convention.
+pub(crate) struct OperatorBase<T: ?Sized> {
     /// Identity, minted at construction. See the type's own docs for why here.
     pub(crate) id: NodeId,
     /// Output tiling for this operator.
     pub(crate) tiling: Tiling,
+    /// `fn() -> T` rather than `T`: covariant, and neutral for auto traits.
+    _holder: std::marker::PhantomData<fn() -> T>,
 }
 
-impl OperatorBase {
+impl<T: ?Sized> OperatorBase<T> {
     /// Mint an identity for an operator, row it against the expression the
     /// ambient conversion recording names, and record the inputs it holds.
     ///
@@ -190,7 +202,7 @@ impl OperatorBase {
     /// State the inputs with [`value`](crate::interpreter::operator_graph::value)
     /// and its siblings. An input that answers no id is a test double and its
     /// edge is dropped.
-    pub(crate) fn new<T: ?Sized>(tiling: Tiling, inputs: &[InputEdgeSpec]) -> Self {
+    pub(crate) fn new(tiling: Tiling, inputs: &[InputEdgeSpec]) -> Self {
         let id = NodeId::fresh();
         crate::ccl::provenance::on_mint(id);
         crate::interpreter::operator_graph::record_operator(
@@ -199,13 +211,17 @@ impl OperatorBase {
             &tiling,
             inputs,
         );
-        Self { id, tiling }
+        Self {
+            id,
+            tiling,
+            _holder: std::marker::PhantomData,
+        }
     }
 }
 
 /// Implement [`TileOperator::tiling`] and [`TileOperator::operator_id`] for a
 /// concrete operator that stores its shared state in a field named
-/// `base: OperatorBase`.
+/// `base: OperatorBase<Self>`.
 ///
 /// Usage: place `impl_operator_base!();` inside the `impl TileOperator for Foo`
 /// block in place of the boilerplate accessors.
@@ -215,7 +231,10 @@ macro_rules! impl_operator_base {
             &self.base.tiling
         }
         fn operator_id(&self) -> Option<$crate::ccl::provenance::NodeId> {
-            Some(self.base.id)
+            // Binding through `OperatorBase<Self>` is what makes the label's
+            // subject the struct that holds it rather than a call-site choice.
+            let base: &$crate::interpreter::tile_operators::OperatorBase<Self> = &self.base;
+            Some(base.id)
         }
     };
 }

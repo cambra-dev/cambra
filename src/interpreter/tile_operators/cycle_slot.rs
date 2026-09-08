@@ -41,7 +41,11 @@ impl<T: ?Sized> CycleSlot<T> {
     /// owner is already gone by the time the setter runs — the commit store is
     /// moved into its cyclic `FanOut` between `setter` and the fill — so this is
     /// the last point at which both ends of the edge are in hand.
-    pub fn setter(&self, owner: Option<NodeId>, role: EdgeRole) -> impl FnOnce(Box<T>) + use<T>
+    pub(crate) fn setter(
+        &self,
+        owner: Option<NodeId>,
+        role: EdgeRole,
+    ) -> impl FnOnce(Box<T>) + use<T>
     where
         T: TileOperator,
     {

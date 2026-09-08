@@ -33,7 +33,7 @@ use crate::{
 /// input does.
 pub struct CheckedLookup {
     /// Identity and the answer's tiling, one `` {`none | `some{𝑉}} `` per key.
-    base: OperatorBase,
+    base: OperatorBase<CheckedLookup>,
     /// Where the collection and the keys come from — see [`LookupSource`].
     source: LookupSource,
 }
@@ -66,7 +66,7 @@ impl CheckedLookup {
     ) -> Self {
         let tiling = answer_tiling(keys.tiling(), option_extent);
         Self {
-            base: OperatorBase::new::<Self>(
+            base: OperatorBase::new(
                 tiling,
                 &[value("collection", &*collection), value("keys", &*keys)],
             ),
@@ -121,7 +121,7 @@ impl CheckedLookup {
             codomain: Box::new(Tiling::Scalar(option_extent)),
         };
         Ok(Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("pairs", &*pairs)]),
+            base: OperatorBase::new(tiling, &[value("pairs", &*pairs)]),
             source: LookupSource::Paired(pairs),
         })
     }

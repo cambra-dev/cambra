@@ -21,7 +21,7 @@ use crate::{
 pub struct Converse {
     /// Identity and the output tiling:
     /// `CurriedFunction { domain: input.codomain, codomain: input.domain }`.
-    base: OperatorBase,
+    base: OperatorBase<Converse>,
     /// The sealed-function input to invert.
     input: Box<dyn TileOperator>,
 }
@@ -39,7 +39,7 @@ impl Converse {
             codomain: domain,
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -244,7 +244,7 @@ impl TileProducer for ConverseProducer {
 pub struct MapDomain {
     /// Identity and the output tiling:
     /// `SealedFunction { domain, codomain: Scalar(domain) }`.
-    base: OperatorBase,
+    base: OperatorBase<MapDomain>,
     /// The sealed-function input.
     input: Box<dyn TileOperator>,
 }
@@ -263,7 +263,7 @@ impl MapDomain {
             codomain: Box::new(Tiling::Scalar(domain.clone())),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -347,7 +347,7 @@ impl TileProducer for MapDomainProducer {
 pub struct Uncurry {
     /// Identity and the output tiling:
     /// `SealedFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
-    base: OperatorBase,
+    base: OperatorBase<Uncurry>,
     /// The curried-function input.
     input: Box<dyn TileOperator>,
 }
@@ -372,7 +372,7 @@ impl Uncurry {
             codomain: Box::new(Tiling::Scalar(codomain.clone())),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
         }
     }
@@ -522,7 +522,7 @@ impl TileProducer for UncurryProducer {
 pub struct Filter {
     /// Identity and the output tiling, equal to the input tiling (filtering
     /// preserves the type).
-    base: OperatorBase,
+    base: OperatorBase<Filter>,
     /// The sealed-function input to filter.
     input: Box<dyn TileOperator>,
     /// The boolean predicate applied to each domain element.
@@ -534,7 +534,7 @@ impl Filter {
     pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         Self {
-            base: OperatorBase::new::<Self>(
+            base: OperatorBase::new(
                 tiling,
                 &[value("input", &*input), value("predicate", &*predicate)],
             ),
@@ -694,7 +694,7 @@ impl TileProducer for FilterProducer {
 pub struct MapFilter {
     /// Identity and the output tiling, equal to the input's — filtering removes
     /// rows, not structure.
-    base: OperatorBase,
+    base: OperatorBase<MapFilter>,
     /// The curried-function input whose inner collections are filtered.
     input: Box<dyn TileOperator>,
     /// A `Bool`-codomain curried function over the input's keys and inner domain.
@@ -719,7 +719,7 @@ impl MapFilter {
             predicate.tiling()
         );
         Self {
-            base: OperatorBase::new::<Self>(
+            base: OperatorBase::new(
                 tiling,
                 &[value("input", &*input), value("predicate", &*predicate)],
             ),
@@ -839,7 +839,7 @@ impl TileProducer for MapFilterProducer {
 pub struct Restrict {
     /// Identity and the output tiling — `SealedFunction(D, D)` mirroring an
     /// [`IterateExtent`] over D.
-    base: OperatorBase,
+    base: OperatorBase<Restrict>,
     /// The boolean predicate over the domain to restrict.
     predicate: Box<dyn TileOperator>,
 }
@@ -858,7 +858,7 @@ impl Restrict {
             codomain: Box::new(Tiling::Scalar(domain_extent)),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("predicate", &*predicate)]),
+            base: OperatorBase::new(tiling, &[value("predicate", &*predicate)]),
             predicate,
         }
     }

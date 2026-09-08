@@ -55,10 +55,6 @@ pub enum EdgeKind {
     /// indirection. A node several consumers subscribe has no single owner,
     /// which is why the forest invariant ranges over value edges alone.
     Share,
-    /// A `FanOutBranch`'s edge to the fan input of a cyclic fan. Every cycle in
-    /// the graph is one of these, which is what makes the cycle set explicit and
-    /// lets the value edges stay a forest.
-    Feedback,
 }
 
 /// What names an input at its consumer.
@@ -79,9 +75,9 @@ pub enum EdgeRole {
 /// One recorded input edge.
 #[derive(Clone, Debug)]
 pub struct InputEdge {
-    pub role: EdgeRole,
-    pub kind: EdgeKind,
-    pub subscribed: NodeId,
+    pub(crate) role: EdgeRole,
+    pub(crate) kind: EdgeKind,
+    pub(crate) subscribed: NodeId,
 }
 
 /// An input edge as a constructor states it, before the session resolves it.
@@ -92,10 +88,10 @@ pub struct InputEdge {
 /// test that builds operators by hand.
 ///
 /// [`OperatorBase`]: crate::interpreter::tile_operators::OperatorBase
-pub struct InputEdgeSpec {
-    pub role: EdgeRole,
-    pub kind: EdgeKind,
-    pub subscribed: Option<NodeId>,
+pub(crate) struct InputEdgeSpec {
+    role: EdgeRole,
+    kind: EdgeKind,
+    subscribed: Option<NodeId>,
 }
 
 /// An owned input held under a named field.
@@ -125,15 +121,15 @@ pub(crate) fn value_keyed(key: impl Into<String>, op: &dyn TileOperator) -> Inpu
     }
 }
 
-/// A branch's edge to its fan input, `Feedback` when the fan is cyclic.
-pub(crate) fn share(fan_input: Option<NodeId>, cyclic: bool) -> InputEdgeSpec {
+/// A branch's edge to its fan input.
+///
+/// Whether the fan closes a cycle is not this edge's business. Every cycle in
+/// the graph runs through an input wired late — see [`EdgeKind::Value`]'s
+/// `deferred` — and a store's remaining branches serve its downstream reads.
+pub(crate) fn share(fan_input: Option<NodeId>) -> InputEdgeSpec {
     InputEdgeSpec {
         role: EdgeRole::Named("fan"),
-        kind: if cyclic {
-            EdgeKind::Feedback
-        } else {
-            EdgeKind::Share
-        },
+        kind: EdgeKind::Share,
         subscribed: fan_input,
     }
 }
@@ -213,12 +209,12 @@ impl OperatorGraph {
     ///
     /// Every node of the graph is reachable from here along `Value` edges alone,
     /// which is what [`assert_graph_invariants`] pins.
-    pub fn unowned(&self) -> &[NodeId] {
+    pub(crate) fn unowned(&self) -> &[NodeId] {
         &self.unowned
     }
 
     /// Every node's id.
-    pub fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+    pub(crate) fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes.iter().map(|n| match n {
             GraphNode::Operator { id, .. }
             | GraphNode::Source { id, .. }
@@ -227,7 +223,7 @@ impl OperatorGraph {
     }
 
     /// Every edge, as `(consumer, edge)`.
-    pub fn edges(&self) -> impl Iterator<Item = (NodeId, &InputEdge)> + '_ {
+    pub(crate) fn edges(&self) -> impl Iterator<Item = (NodeId, &InputEdge)> + '_ {
         self.nodes
             .iter()
             .flat_map(|n| -> Box<dyn Iterator<Item = _>> {
@@ -251,14 +247,15 @@ impl OperatorGraph {
 /// Two invariants, neither type-enforced:
 ///
 /// * **The value edges form a forest.** Ownership is single because every owned
-///   input is a `Box`, and acyclicity comes from cycles routing through the two
-///   cyclic fans rather than through owned inputs. The renderer's absence of a
-///   cycle guard rests on this.
+///   input is a `Box`. Acyclicity is separate: a cycle needs an input wired after
+///   its owner existed, and every such cycle also runs through a fan branch's
+///   `Share` hop, so no cycle is made of value edges alone. The renderer's
+///   absence of a cycle guard rests on this.
 /// * **Every node is reachable from [`OperatorGraph::unowned`] along the `Value`
 ///   edges.** That relation is the one every consumer walks — the renderer draws
-///   value edges as the child relation and share and feedback edges as reference
-///   leaves — so a node it misses is a node nothing draws. An unreachable node is
-///   one a construction site built and dropped, which nothing else notices.
+///   value edges as the child relation and share edges as reference leaves — so a
+///   node it misses is a node nothing draws. An unreachable node is one a
+///   construction site built and dropped, which nothing else notices.
 pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
     if !cfg!(any(debug_assertions, test)) {
         return;
@@ -604,6 +601,14 @@ fn push_edge(
             return;
         }
     }
+    // Losing the edge here surfaces much later, as the subscribed node being
+    // unreachable from `unowned`, which names neither end of the edge that went
+    // missing.
+    debug_assert!(
+        false,
+        "operator graph: no operator {owner:?} to hang a {kind:?} edge on — its node was \
+         dropped, or the edge outlived it"
+    );
 }
 
 fn resolve(specs: &[InputEdgeSpec]) -> Vec<InputEdge> {

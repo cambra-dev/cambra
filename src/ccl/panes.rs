@@ -1229,6 +1229,92 @@ mod tests {
         );
     }
 
+    /// Whether the subscription relation is acyclic, optionally with the edges
+    /// wired through a `CycleSlot` removed. Kahn over the whole graph.
+    fn subscription_relation_is_acyclic(
+        graph: &crate::interpreter::operator_graph::OperatorGraph,
+        without_deferred: bool,
+    ) -> bool {
+        use crate::interpreter::operator_graph::EdgeKind;
+        use std::collections::HashMap;
+
+        let mut indegree: HashMap<NodeId, usize> = graph.ids().map(|id| (id, 0usize)).collect();
+        let mut forward: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (consumer, edge) in graph.edges() {
+            if without_deferred && matches!(edge.kind, EdgeKind::Value { deferred: true }) {
+                continue;
+            }
+            *indegree.entry(edge.subscribed).or_default() += 1;
+            forward.entry(consumer).or_default().push(edge.subscribed);
+        }
+        let mut ready: Vec<NodeId> = indegree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut settled = 0usize;
+        while let Some(id) = ready.pop() {
+            settled += 1;
+            for next in forward.get(&id).into_iter().flatten() {
+                let Some(d) = indegree.get_mut(next) else {
+                    continue;
+                };
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(*next);
+                }
+            }
+        }
+        settled == indegree.len()
+    }
+
+    /// **Every cycle in the operator graph runs through a deferred edge.**
+    ///
+    /// A `CycleSlot` is the only way an operator subscribes something built after
+    /// it — every other input is handed to a constructor, so it names an operator
+    /// that already exists — and `record_deferred_edge` runs only when a slot is
+    /// filled. So the deferred edges are the set whose removal leaves the
+    /// relation acyclic, which is the set a layered layout withholds from ranking
+    /// and draws back as returns.
+    ///
+    /// A few programs rather than every compile: this is a property of the shapes
+    /// the corpus reaches, and `assert_graph_invariants` should not carry a graph
+    /// walk on the compile path to restate it.
+    ///
+    /// Non-vacuous because the store programs are asserted cyclic first — without
+    /// that, "acyclic once the deferred edges are gone" would hold of any acyclic
+    /// graph.
+    #[test]
+    fn every_operator_graph_cycle_runs_through_a_deferred_edge() {
+        use crate::interpreter::operator_graph::EdgeKind;
+
+        let mut cyclic_programs = 0usize;
+        for (name, code) in corpus() {
+            let program = compile_ok(&code);
+            let graph = &program.operator_graph;
+            let deferred = graph
+                .edges()
+                .filter(|(_, e)| matches!(e.kind, EdgeKind::Value { deferred: true }))
+                .count();
+
+            if !subscription_relation_is_acyclic(graph, false) {
+                cyclic_programs += 1;
+                assert!(
+                    deferred > 0,
+                    "{name}: the graph has a cycle and no deferred edge, so a construct closed a                      cycle without a `CycleSlot` and the cycle set no longer names it",
+                );
+            }
+            assert!(
+                subscription_relation_is_acyclic(graph, true),
+                "{name}: a cycle survives with the {deferred} deferred edge(s) removed, so the                  deferred edges are not the cycle set a layout can cut",
+            );
+        }
+        assert!(
+            cyclic_programs > 0,
+            "no corpus program builds a cyclic operator graph, so this check is vacuous",
+        );
+    }
+
     /// **Each writer of a transaction names some operator of its own.**
     ///
     /// Every operator of the commit complex is minted after the writer's own

@@ -17,7 +17,7 @@ pub struct PermuteRecordDomain {
     input: Box<dyn TileOperator>,
     /// Identity and the output tiling: the input's `SealedFunction` with its
     /// `Record` domain permuted.
-    base: OperatorBase,
+    base: OperatorBase<PermuteRecordDomain>,
     permutation: Vec<usize>,
 }
 
@@ -51,7 +51,7 @@ impl PermuteRecordDomain {
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             permutation,
         }
@@ -316,7 +316,7 @@ fn flatten_result_correlation(
 pub struct FlattenTupleDomain {
     /// Identity and the output tiling: `SealedFunction` with a single-level
     /// `Record` domain.
-    base: OperatorBase,
+    base: OperatorBase<FlattenTupleDomain>,
     /// Input operator whose domain is a `Record`.
     input: Box<dyn TileOperator>,
     /// Maps output field index `i` to `(outer_field_key, inner_field_key_opt)`.
@@ -380,7 +380,7 @@ impl FlattenTupleDomain {
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new::<Self>(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling, &[value("input", &*input)]),
             input,
             field_map,
         }

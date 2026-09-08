@@ -88,9 +88,9 @@ const OPERATOR_PANE_KIND: &str = "operators";
 /// The operator-node `role` discriminants: an operator, or one of the two
 /// program boundaries.
 const ALLOWED_OPERATOR_ROLE: &[&str] = &["operator", "source", "sink"];
-/// The operator-input `kind` discriminants: an exclusively owned input, one
-/// several consumers reach, and one that closes a cycle.
-const ALLOWED_EDGE_KIND: &[&str] = &["value", "share", "feedback"];
+/// The operator-input `kind` discriminants: an exclusively owned input, and one
+/// several consumers reach. A cycle is a `value` edge carrying `deferred`.
+const ALLOWED_EDGE_KIND: &[&str] = &["value", "share"];
 
 /// The `meta.payloadKind` discriminants: `"program"` for a compiled program,
 /// `"failed"` for the degraded payload.

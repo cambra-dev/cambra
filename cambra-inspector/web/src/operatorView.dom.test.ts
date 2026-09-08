@@ -9,8 +9,9 @@
 // leaf rather than a second copy of the shared subtree, and a click in the pane
 // reaches the panes upstream of it.
 //
-// Not covered: `feedback` edges. No committed fixture carries one, so the
-// `op-ref-feedback` class and the `↺` arrow are unasserted here.
+// Not covered: the `late` marker on a value edge wired through a `CycleSlot`.
+// Only the two store programs build one and neither has a committed fixture, so
+// `op-deferred` is unasserted here.
 
 import { beforeAll, describe, expect, it } from "vitest";
 

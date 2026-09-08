@@ -1749,8 +1749,8 @@ pub fn compile_program(
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
     // The frontend is [], shared with []: parse through
-    // join planning, every check between, and the three panes the inspector
-    // reads — each of which is a captured phase output.
+    // join planning, every check between, and every pane but `post-conversion`
+    // — each of which is a captured phase output.
     //
     // Phase-internal consistency checks (, )
     // keep their  inside the frontend because firing them means the
