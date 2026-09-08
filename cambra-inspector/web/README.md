@@ -169,12 +169,12 @@ binary search.
 
 ## Scope: multi-pane (interactive, snapshot-first)
 
-The view is a **generic, N-pane layout**: a source pane plus one IR tree pane
-per pipeline pane, ordered upstream → downstream — `[source]` then one pane per
+The view is a **generic, N-pane layout**: a source pane plus one pane per
+pipeline pane, ordered upstream → downstream — `[source]` then one pane per
 pipeline pane in order, each `flex: 1 1 0` (equal width). The panes come from the
 payload's `panes[]`; adding a pane is a backend payload change, not a frontend
-rewrite. The live wire ships six panes, so the layout is seven panes wide, which
-is what the header's pane filter exists to narrow.
+rewrite. The layout is one pane wider than the wire's pane list, the extra one
+being the source pane, which is what the header's pane filter exists to narrow.
 
 `describePanes` (`main.ts`) names that pane set once — source, then the pipeline
 panes, or a single diagnostics pane on a degraded snapshot — and both the layout

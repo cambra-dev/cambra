@@ -52,7 +52,7 @@ payload built at compile time.
 That path needs node identity in operator conversion and a tick channel. The first exists —
 conversion records, and `post-conversion` is a pane — and the tick channel does not. On the first,
 see
-[provenance.md](../ccl/design/provenance.md#known-prerequisites-for-panes-past-post-planning).
+[provenance.md](../ccl/design/provenance.md#panes-past-post-planning).
 
 It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.
@@ -249,7 +249,7 @@ name is a field rather than a node, so the only span available is the whole node
 covering a statement would contain the narrower uses inside it, and a consumer takes the first
 containing row, so a broad row would shadow them. Those uses contribute none: `out` in
 `out << value` does not resolve to its declaration. Closing it needs a span on the name field, which
-is a `ccl` change. Over the fixture corpus this is 2 rows of 31.
+is a `ccl` change. Over the fixture corpus a small minority of rows.
 
 This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
 and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a

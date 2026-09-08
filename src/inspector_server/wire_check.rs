@@ -120,8 +120,7 @@ fn kind_for(id: &str) -> &'static str {
     PANE_KINDS[i]
 }
 
-/// Assert `v` is a structurally-valid **successful** `/api/snapshot` payload
-/// under `ctx`.
+/// Assert `v` is a structurally-valid **successful** `/api/snapshot` payload.
 ///
 /// Pins the full pane contract: the retired top-level `ir`/`spanIndex`
 /// absent, the panes in pipeline order with their kinds, each pane's node
@@ -131,7 +130,6 @@ fn kind_for(id: &str) -> &'static str {
 /// legal), and every node's `rewritten` tag in the observed vocabulary.
 /// Panics naming the offending path otherwise. Does not assert
 /// program-specific content — that is each caller's job.
-///
 pub fn assert_snapshot_shape(v: &Value) {
     assert_common_shape(v);
 
@@ -154,7 +152,7 @@ pub fn assert_snapshot_shape(v: &Value) {
         ids, PANE_IDS,
         "panes are the pipeline panes in upstream → downstream order"
     );
-    // Each retained pane carries the kind its id mandates (subset-safe).
+    // Each pane carries the kind its id mandates.
     for (i, pane) in panes.iter().enumerate() {
         let id = pane["id"].as_str().expect("pane id is a string");
         let kind = pane["kind"].as_str().expect("pane kind is a string");

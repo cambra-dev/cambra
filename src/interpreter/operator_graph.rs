@@ -52,8 +52,8 @@ pub enum EdgeKind {
     /// edge to its fan input, or a reader's edge to a data source.
     ///
     /// What separates this from [`Value`](Self::Value) is exclusivity, not
-    /// indirection. A shared target has no single owner, which is why the forest
-    /// invariant ranges over value edges alone.
+    /// indirection. A node several consumers subscribe has no single owner,
+    /// which is why the forest invariant ranges over value edges alone.
     Share,
     /// A `FanOutBranch`'s edge to the fan input of a cyclic fan. Every cycle in
     /// the graph is one of these, which is what makes the cycle set explicit and

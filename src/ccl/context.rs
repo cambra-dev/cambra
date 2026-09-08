@@ -577,9 +577,9 @@ pub struct CompiledProgram {
     /// none — it was never rewritten. Refinement-predicate interiors are rows
     /// like any other: `collect_tree_ids` enumerates them, so the fold must
     /// explain them, and `PredMemo::rebuild` records a derived predicate against
-    /// the one it was built from. What is not recorded is planning **raising** a
-    /// predicate back into the main tree; see `design/provenance.md`, "Known
-    /// prerequisites for panes past `post-planning`".
+    /// the one it was built from. Planning raising a predicate back into the main
+    /// tree keeps the predicate's own parentage; see `design/provenance.md`,
+    /// "Panes past `post-planning`".
     ///
     /// Empty when capture is switched off — no phase scope is opened then, so
     /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
@@ -593,6 +593,11 @@ pub struct CompiledProgram {
     /// Recorded rather than walked: an edge's kind is not recoverable from the
     /// operators, and `subscribe` empties the `CycleSlot`s before this struct
     /// exists. See [`operator_graph`](crate::interpreter::operator_graph).
+    ///
+    /// Retained unconditionally, unlike
+    /// [`provenance_table`](Self::provenance_table): `CAMBRA_PROVENANCE`
+    /// switches off attribution, and the graph is the `post-conversion` pane's
+    /// content, held like the trees beside it.
     pub operator_graph: OperatorGraph,
     /// The original program source text, retained verbatim.
     ///
@@ -1795,6 +1800,11 @@ pub fn compile_program(
     // runs inside `run_frontend`, and conversion is past the frontend's last
     // pane. `table_session` is still installed here, which is what lets these
     // rows reach the same table.
+    //
+    // The session is unconditional while the rows it carries are gated: the
+    // graph is a pane's content, and a pane's content is retained whatever
+    // `CAMBRA_PROVENANCE` says. Gating it would ship an empty pane, which both
+    // wire validators reject.
     let graph_session = GraphSession::install();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
         let ops = if sink_bindings_registry.is_empty() {

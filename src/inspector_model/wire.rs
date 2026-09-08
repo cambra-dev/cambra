@@ -201,9 +201,10 @@ pub struct OperatorNode {
 
 /// One input edge of an operator node.
 ///
-/// A **construction** edge — which operator holds which, and how. Runtime
-/// dataflow follows `get` and `notify`, a different relation, and nothing here
-/// asserts the two coincide.
+/// A subscription: the consumer holds this operator and calls `get` on it. What
+/// an operator holds and what it subscribes are the same set, stated from its
+/// fields, with one exception — a source is not an operator, so a read of one is
+/// recorded rather than subscribed.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorEdge {
@@ -538,19 +539,13 @@ fn build_operator_table(
     )
 }
 
-/// The rewrite tag as it ships, or `None` for a
-/// [`Nature::Source`](crate::ccl::provenance::Nature::Source) tag — the root of a
-/// lowered source expression. The validators guard that `"source"` never ships.
 /// An attribution's spans as they ship: **narrowest first**, deduplicated.
 ///
 /// Both node shapes carry this channel on the same terms — see
 /// [`IrNode::spans`] and [`OperatorNode::spans`] — so both get it from here.
 /// `fold` unions blame spans in encounter order, which is not width order, so
 /// the ordering is this function's to establish rather than something the
-/// projection already holds. Writing it at each construction site instead left
-/// the two shapes to agree by convention, and they did not: the operator table
-/// shipped the union order verbatim, so a consumer reading `spans[0]` as the
-/// narrowest got the widest.
+/// projection already holds.
 ///
 /// The key is `(width, start, end)` rather than width alone, so two spans of
 /// equal width order by position and the payload stays byte-reproducible.
@@ -561,6 +556,9 @@ fn wire_spans(spans: &[Span]) -> Vec<Span> {
     spans
 }
 
+/// The rewrite tag as it ships, or `None` for a
+/// [`Nature::Source`](crate::ccl::provenance::Nature::Source) tag — the root of a
+/// lowered source expression. The validators guard that `"source"` never ships.
 fn rewrite_info(attr: &crate::ccl::provenance::SourceAttribution) -> Option<RewriteInfo> {
     let tag = &attr.rewritten;
     (!tag.nature.is_source()).then(|| RewriteInfo {

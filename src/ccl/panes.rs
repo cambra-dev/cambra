@@ -1,16 +1,18 @@
-//! The pipeline's **panes** — its retained AST snapshots — and what a fold
-//! between two adjacent ones produces.
+//! The pipeline's **panes** — its retained snapshots — and what a fold between
+//! two adjacent ones produces.
 //!
-//! A pane is one snapshot of the tree, taken at a named point in
-//! [`compile_program`](crate::ccl::context::compile_program). [`PANES`] declares
-//! the topology once: every pane, the phases that produced it from the pane
-//! before it, and whether its pair is gated.
+//! A pane is one snapshot taken at a named point in
+//! [`compile_program`](crate::ccl::context::compile_program): an expression tree
+//! through `post-planning`, and the operator graph at `post-conversion`.
+//! [`PANES`] declares the topology once: every pane, the phases that produced
+//! it from the pane before it, and whether its pair is gated.
 //!
 //! Split out of [`context`](crate::ccl::context) because it is the inspector's
 //! half of the seam. `context` owns the pipeline and the [`Phase`] axis; this
-//! module owns what a pane pair is and what folding one yields, and none of it
-//! runs in a release compile except [`gate_leaks`], which `compile_program`
-//! calls only under `CAMBRA_PROVENANCE_GATE`. The inherent `impl
+//! module owns what a pane pair is and what folding one yields. Only
+//! [`gate_leaks`] is asserted, and `compile_program` calls it under
+//! `CAMBRA_PROVENANCE_GATE` alone; the snapshots themselves are retained
+//! whatever the capture switch says. The inherent `impl
 //! CompiledProgram` below lives here rather than beside the struct for the same
 //! reason: the methods are the pane layer's, not the pipeline's. See
 //! `design/provenance.md`, "The seam".
@@ -110,11 +112,7 @@ impl CompiledProgram {
     }
 }
 
-/// One pane — a retained AST snapshot — and the phases that produced it from the
-/// pane before it.
-///
-/// [`PANES`] declares the whole topology in one place, so adding a pane is one
-/// entry there plus its tree in [`CompiledProgram::pane_trees`].
+/// What a pane holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PaneKind {
     /// An expression tree.
@@ -123,6 +121,12 @@ pub(crate) enum PaneKind {
     Operators,
 }
 
+/// One pane — one retained snapshot of the pipeline — and the phases that
+/// produced it from the pane before it.
+///
+/// [`PANES`] declares the whole topology in one place, so adding a pane is one
+/// entry there, plus its tree in [`CompiledProgram::pane_trees`] when it holds
+/// one.
 pub(crate) struct PaneSpec {
     /// The pane's name, e.g. `"post-channelize"`.
     pub(crate) name: &'static str,
@@ -164,9 +168,15 @@ pub(crate) struct PaneSpec {
     pub(crate) gated: bool,
 }
 
+/// How many panes hold an expression tree.
+///
+/// [`CompiledProgram::pane_trees`]' arity. The [`PaneKind::Ir`] entries of
+/// [`PANES`] match that array element for element, in order, and nothing
+/// enforces it.
+pub(crate) const IR_PANE_COUNT: usize = 6;
+
 /// The pipeline's panes, in pipeline order, each naming the phases that produced
-/// it from its predecessor. Order matches [`CompiledProgram::pane_trees`]
-/// element for element.
+/// it from its predecessor.
 ///
 /// The first entry is the anchor: it has no predecessor, so its `phases` is
 /// empty and its `gated` is unused — its projection is the lowering projection
@@ -176,13 +186,6 @@ pub(crate) struct PaneSpec {
 /// compiles. `pre-inference → post-inference` reaches that only because the fold's
 /// id domain was widened to the slot domain the passes rewrite and inference's
 /// per-instantiation predicate freshen took a copy recording.
-/// How many panes hold an expression tree.
-///
-/// [`CompiledProgram::pane_trees`]' arity, kept beside [`PANES`] so the two
-/// cannot disagree; `ir_panes_precede_operator_panes` checks it against the
-/// declared contents.
-pub(crate) const IR_PANE_COUNT: usize = 6;
-
 pub(crate) const PANES: [PaneSpec; 7] = [
     PaneSpec {
         name: "pre-inference",
@@ -1158,7 +1161,7 @@ mod tests {
     /// Each `Transact` writer's own ids — its source and its body — paired with a
     /// description for the failure message.
     fn collect_writer_domains(expr: &Expr, out: &mut Vec<(HashSet<NodeId>, String)>) {
-        if let crate::ccl::TypedExprNode::Transact { writers, .. } = &expr.node {
+        if let TypedExprNode::Transact { writers, .. } = &expr.node {
             for (i, w) in writers.iter().enumerate() {
                 let mut ids = collect_tree_ids(&w.source);
                 ids.extend(collect_tree_ids(&w.body));
@@ -1297,9 +1300,10 @@ mod tests {
             let mut best_fold = std::time::Duration::MAX;
             let mut rows = 0usize;
             let mut tags = 0usize;
-            // The three retained pane snapshots are unconditional — they are not
-            // part of what the capture switch turns off — so their size is the
-            // pane design's real memory floor, against which the logs are noise.
+            // The retained pane snapshots — every tree, and the operator graph —
+            // are not part of what the capture switch turns off, so their size
+            // is the pane design's real memory floor, against which the logs are
+            // noise.
             let mut panes_nodes = 0usize;
             for _ in 0..reps {
                 let t0 = std::time::Instant::now();

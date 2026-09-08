@@ -17,8 +17,8 @@ read.
 
 Every phase that rewrites expression nodes records, and every recording reaches
 a table: `compile_program` opens a `PhaseScope` around each. Operator conversion
-has no identity to record against, which is what stops the panes there; see
-[Known prerequisites for panes past `post-planning`](#known-prerequisites-for-panes-past-post-planning).
+records too, against the `NodeId` each operator carries; see
+[Panes past `post-planning`](#panes-past-post-planning).
 
 ## Mechanism at a glance
 
@@ -329,9 +329,9 @@ the pane.
 
 Ids inside refinement predicates are rows like any other. Lowering's projection
 covers every id `collect_tree_ids` enumerates, and `PredMemo::rebuild` records a
-derived predicate against the one it was built from. What is **not** recorded is
-planning raising a predicate back into the main tree; see
-[Known prerequisites for panes past `post-planning`](#known-prerequisites-for-panes-past-post-planning).
+derived predicate against the one it was built from. Planning raising a predicate
+back into the main tree keeps the predicate's own parentage; see
+[Panes past `post-planning`](#panes-past-post-planning).
 
 The backing store is a `HashMap`; the paged, delta-encoded form is a later pure
 re-encoding behind the same accessors.
@@ -922,37 +922,32 @@ bit is what says so until every phase in the pair records.
   catch a defect.
 
   Where it stands: **every pair is gated**, from `pre-inference → post-inference`
-  down to `post-lambda-elim → post-planning`. Capture is total across the whole
+  down to `post-planning → post-conversion`. Capture is total across the whole
   pipeline.
 
-## Known prerequisites for panes past `post-planning`
+## Panes past `post-planning`
 
-A pane may be issued at **any** point during compilation — the current adoption
-point is an artifact of what has been built, not a statement about the design.
-Every pair that exists is gated. Four things stand between the panes and the rest
-of the pipeline, and the first is the one usually named:
+A pane may be issued at any point during compilation, and the panes run through
+operator conversion: `Phase::Convert` records, `post-conversion` holds the
+operator graph, and its pair is gated like every pair above it.
 
-- **Operator conversion has no identity.** `TileOperator` carries none, so a pane
-  there has nothing to resolve against.
-- **`CompiledProgram::pane_trees` returns `[&Expr; PANES.len()]`.** Every pane is
-  an expression tree by type, so a pane whose content is an operator graph cannot
-  be declared. Only `InspectedProgram` needs the content; `materialize_panes`
-  uses the trees to build id sets and nothing else, so the two wants separate.
-- **Nothing enumerates the operator graph.** `fold` needs an output id set, and
-  `collect_tree_ids` is the only enumeration there is. `TileOperator::inspect`
-  renders a display tree rather than identities, so it cannot supply one.
-- **`CycleSlot` cannot be read without consuming it.** Its only accessor is
-  `take`, which `subscribe` calls, so `CommitOperator`'s writers and
-  `InductionStore`'s body are invisible to any traversal. Both edges have to be
-  recorded when the slot is filled rather than walked afterwards.
+Four properties carry a pane past the last expression tree, each independent of
+the others:
 
-The three below the first are why "give operators an id" is not the whole of the
-work; each is independent of the others.
+- An operator carries a `NodeId` drawn from the same counter as an expression
+  node's (`OperatorBase`), so a row has something to resolve against.
+- `PaneSpec::content` declares what a pane holds, and `CompiledProgram::pane_ids`
+  is all the fold reads from a pane — never its content — so a pane holding an
+  operator graph costs the fold nothing.
+- `OperatorGraph` enumerates its own nodes, which is the output id set `fold`
+  needs.
+- A `CycleSlot`'s edge is recorded when the slot is filled. `subscribe` consumes
+  the slot, so no traversal of a finished `CompiledProgram` can recover it.
 
-Planning's raising crossing was a second entry here and is resolved. The three
-sites that lift a term out of a type — `planning/iterate`'s `fn_of_bare_predicate`
+Planning's raising crossing was an entry here and is resolved. The three sites
+that lift a term out of a type — `planning/iterate`'s `fn_of_bare_predicate`
 lift, the group-by key extraction, and the hash-join key morphisms — each keep the
-*predicate's* parentage, because a clone's copy names the node it was freshened
+predicate's parentage, because a clone's copy names the node it was freshened
 from rather than the node the recording named. What had looked like a missing
 re-rooting channel was the predicate ids being outside the enumerated domain,
 which the binder-slot widening fixed;
