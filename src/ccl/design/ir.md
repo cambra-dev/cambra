@@ -238,6 +238,8 @@ CHL aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Aggreg
 
 `AggregateKind` enumerates the supported operations; each variant's typing rule is the operator scheme selected by `OperatorSchemes::aggregate`. New variants (`Count : ∀α. (α ⇒ γ) ⇒ Int`, …) add a scheme there without touching the `Aggregate` inference branch.
 
+Four laws are per-variant, and a variant states each: the output extent, the accumulator's identity, the fold, and whether the fold is **partial** (`AggregateKind::is_partial`). Partiality is what stops "aggregate" meaning "total fold" — `Sole`'s accumulator law is `Option(𝐴)`'s, where merging two `some` values has no result — and it is stated rather than left in a fold's arm, so a consumer can ask whether an aggregate can fault on data. It also decides the presence convention: a total fold seeds an in-band identity of the element type, a partial one seeds an empty column and carries presence in its length, and `initial_accumulator` asserts the two agree.
+
 ---
 
 ## Source injection

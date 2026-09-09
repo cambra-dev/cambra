@@ -245,8 +245,33 @@ here so the shortcut is explicit:
   is its whole point) — so the error is *enforced*, just later than the spec wants.
   Moving it to compile time needs the key *values*, which only a constant fold
   has; so the compile-time-ness (not the enforcement) rides on constant-folding.
-  (`set` has no `sole`, so duplicates there are absorbed by the group — set
-  semantics — no error either way.)
+
+**The collapse aggregate is the whole difference between absorbing a duplicate and
+faulting on one.** `set([1,2,2,3])` and `map([(1,10),(1,20)])` are one [`lower_rekeyed`] over
+one input condition, a repeated key, and the constructors pick different aggregates to
+collapse the group. `Drain` is total, so a group of any size yields the one `unit` a `Set`
+holds; `Sole` is partial, and a group of two has no value to yield
+([`AggregateKind::is_partial`]). A set absorbing duplicates is set semantics, so both
+answers are right, and neither is a property of the key.
+
+#### A duplicate key is a process fault today
+
+`Sole`'s rejection is an `assert!` in `AggregateKind::accumulate`, and the engine has no
+channel for a fault raised by a query's **data**. Every other assertion in the tile
+operators is about a shape no pass should have produced, where stopping is right. This one
+is decided by user values, so one duplicate key fails every request the process is serving
+rather than the one that carried it.
+
+What it should become is a fault the failing query reports. That is a runtime channel and
+not a change to this check: the alternative to the assertion is silent corruption, so the
+assertion stays until the channel exists.
+
+Literals are not the boundary. A map comprehension `[k -> v for …]` reads as a `Map` exactly
+as a map literal does
+([chl-spec §3.12](../../../docs/chl-spec.md#312-comprehensions)),
+and [`lower_rekeyed`] is the one shape both re-keyings take, so a map built from request data
+inherits the fault on the same path unless the comprehension's lowering decides otherwise.
+The comprehension is decided as surface and unimplemented, so that decision is still open.
 
 ## Operations: how the trait layer dispatches [Planned]
 

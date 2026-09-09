@@ -32,6 +32,25 @@ pub enum AggregateKind {
 }
 
 impl AggregateKind {
+    /// Whether folding a group can **fault** — the accumulator's merge is partial.
+    ///
+    /// Every other law here is per-variant and read off a `match` arm; this one was
+    /// implicit in [`accumulate`](Self::accumulate)'s `Sole` arm, where a consumer asking
+    /// "can this aggregate fail on user data" had nothing to read. It decides the presence
+    /// convention as well: a total fold seeds an in-band identity of the element type, and
+    /// a partial one has none, so its accumulator carries presence in its length
+    /// ([`initial_accumulator`](Self::initial_accumulator) asserts the two agree).
+    ///
+    /// A fault today stops the process, which is a gap in the engine rather than in this
+    /// law (`src/ccl/design/collections.md`, "A duplicate key is a process fault today").
+    pub fn is_partial(&self) -> bool {
+        match self {
+            AggregateKind::Sum | AggregateKind::Max | AggregateKind::Drain => false,
+            // `Option(𝐴)`'s partial monoid: merging two `some` values has no result.
+            AggregateKind::Sole => true,
+        }
+    }
+
     pub fn output_extent(&self, input_extent: &Extent) -> Option<Extent> {
         match (self, input_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
@@ -49,6 +68,21 @@ impl AggregateKind {
     /// Used to seed the [`Tile::Aggregation`](crate::interpreter::tiling::Tile::Aggregation)
     /// accumulator before the first batch of values arrives.
     pub fn initial_accumulator(&self, accumulator_extent: &Extent) -> ColumnValue {
+        let seed = self.seed(accumulator_extent);
+        // **Presence is in-band exactly when the fold is total.** A total aggregate has an
+        // identity of the element type to seed with, so its accumulator is a column of one;
+        // a partial one has none, and its length is what carries presence. The two halves
+        // are written in different arms, so a new partial aggregate seeding a value —
+        // making its own empty group indistinguishable from a group of one — is caught here.
+        assert_eq!(
+            seed.is_empty(),
+            self.is_partial(),
+            "an accumulator seed is empty exactly for a partial aggregate: {self:?}"
+        );
+        seed
+    }
+
+    fn seed(&self, accumulator_extent: &Extent) -> ColumnValue {
         match (self, accumulator_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0]),
             (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
