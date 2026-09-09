@@ -486,8 +486,8 @@ fn lower_rekeyed(
 ///
 /// Every re-keying producer stamps its own key binder with this, because the gate on keyed
 /// entry runs at constraint-emission time and a domain that only became concrete at
-/// coalesce could not discharge it (same doc, "Keyed entry needs the key domain written
-/// down at lowering").
+/// coalesce could not discharge it (same doc, "The key domain is the key morphism's
+/// image").
 fn present_key_domain(
     collection: &Expr,
     key_fn: &Expr,

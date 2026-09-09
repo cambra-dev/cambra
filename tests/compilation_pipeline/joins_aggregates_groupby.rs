@@ -322,8 +322,8 @@ fn test_rekeying_over_a_singleton_literal(#[case] code: &str) {
 // program tail (`test_set` above) and let-bound-then-consumed (`s = set(…)` …
 // `[k for k in s]`), but inlined into a comprehension source the underlying list
 // literal reaches op-conversion with no `iterate` before it. Pins the gap recorded in
-// `src/ccl/design/collections.md`, "Runtime realization: nothing new for construction +
-// value iteration"; this is the acceptance test for it.
+// `src/ccl/design/collections.md`, "Runtime realization and its limits"; this is the
+// acceptance test for it.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[ignore = "a set value nested as a comprehension source is not driven by planning"]
