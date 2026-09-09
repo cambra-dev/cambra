@@ -2281,8 +2281,8 @@ Decided consequences:
   element-wise, `c[i] = v`, with the compiler checking that multiple
   definitions of one collection do not overlap; append is the feed operator
   `c << v` (§3.7). A mutable collection is written `c[i] := v`.
-- **A mutable collection is a keyed register.** It is the keyed generalization
-  of a `Mut(…)` register whose value is a collection (§8.1) — `store[k] := v`
+- **A mutable collection is keyed.** It is the keyed generalization
+  of a `Mut(…)` mutable variable whose value is a collection (§8.1) — `store[k] := v`
   writes one key — and it gets the standard mutation operations. Immutable
   collections remain the encouraged default.
 

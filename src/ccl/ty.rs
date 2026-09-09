@@ -548,10 +548,6 @@ pub fn fun_kind_vars() -> Vec<Rc<FunKindVar>> {
     KIND_VARS.with(|ks| ks.borrow().clone())
 }
 
-/// A one-line rendering of every kind variable minted on this thread. Diagnostic only.
-///
-/// Debug-only with the register it reads: nothing outside a diagnostic consults it, and a
-/// release build has no register to render.
 /// Which inference variable owns each kind variable, for the dump — the reverse of
 /// [`crate::ccl::InferVar::fun_kind`].
 #[cfg(debug_assertions)]
@@ -565,6 +561,10 @@ fn kind_var_owners() -> std::collections::HashMap<u32, Vec<String>> {
     out
 }
 
+/// A one-line rendering of every kind variable minted on this thread. Diagnostic only.
+///
+/// Debug-only along with `KIND_VARS`, the thread-local it reads: nothing outside a
+/// diagnostic consults it, and a release build mints no entries to render.
 #[cfg(debug_assertions)]
 pub fn dump_kind_vars() -> String {
     fun_kind_vars()

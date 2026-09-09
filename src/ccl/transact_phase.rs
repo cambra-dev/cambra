@@ -428,7 +428,7 @@ fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, String)> {
 fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
     let b = trigger.ty.domain()?;
     // One sampled value per position of the trigger: the trigger read through the
-    // register, so a collection at the trigger's kind.
+    // mutable variable, so a collection at the trigger's kind.
     let out = Type::fun_like(&trigger.ty, b, codomain);
     let arg_ty = Type::Tuple(vec![trigger.ty.clone(), source.ty.clone()]);
     let arg = Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), source.clone()]))

@@ -201,8 +201,8 @@ replaces](type-inference.md#planning-asserts-the-type-it-replaces)).
 
 **A conditional collection is the only Σ-typed term the runtime can currently evaluate.**
 Its candidates are statically enumerable and the gates pick one. Every other Σ — a
-`Collection(𝑇)` whose producer is not statically known, a collection in a `Mut` register or
-crossing a source boundary — waits on a runtime witness that does not exist yet, and a Σ
+`Collection(𝑇)` whose producer is not statically known, a collection in a mutable variable
+or crossing a source boundary — waits on a runtime witness that does not exist yet, and a Σ
 that reaches op-conversion with no concrete domain has no extent and is reported as a
 compiler bug.
 
