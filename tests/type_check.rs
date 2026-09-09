@@ -1550,6 +1550,11 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
 /// discharge through a higher-order parameter — so one rejection covers them and the
 /// programs are carried here rather than each keeping a test of a value it cannot produce.
 /// What returns them is `g[k]?`, a different program with `Option` handling.
+///
+/// The discharge two of them tested is re-expressed rather than dropped: a filtered
+/// comprehension over the parameter is dependent for the ordinary reason and needs no
+/// membership proof ([`dependent_application_discharges_the_binder`],
+/// [`higher_order_dependent_application_discharges_the_binder`]).
 #[test]
 fn a_bare_key_lookup_on_a_groupby_is_refused() {
     for program in [
@@ -2401,6 +2406,70 @@ fn a_lookup_at_the_wrong_key_type_is_refused_for_membership() {
         !msgs.iter().any(|m| m.contains("String")),
         "the key type is not yet what refuses this; if it is, the doc comment above and \
          the membership assertion are both stale: {errs:?}"
+    );
+}
+
+/// **Dependent application discharges the binder to the argument.** The headline case
+/// the Pi-type + substitution machinery unlocks: a function whose *result type mentions
+/// its parameter*, applied at a concrete value, must have that value substituted into the
+/// result — before it, the predicate kept the unbound binder.
+///
+/// The vehicle is a filtered comprehension over the parameter, which is dependent for the
+/// ordinary reason (the body's type mentions `k`) and needs **no membership proof**. A
+/// group-by key lookup would not serve: it couples this machinery to whether a bare key can
+/// be shown present in a `Map`, an unrelated question that the proven operator
+/// answers "no" by design (`src/ccl/design/collections.md`, "Lookup: membership
+/// discharge").
+#[test]
+fn dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    // The function is genuinely dependent: its codomain refinement mentions the binder.
+    assert!(
+        infer_program(&format!("{f}f"))
+            .to_string()
+            .starts_with("((k: Int) ⇒ "),
+        "the vehicle must be a dependent function"
+    );
+    assert_predicate_discharged(&infer_program(&format!("{f}f(0)")), "k");
+}
+
+/// O3 (**higher-order** dependent application): apply a dependent function through a
+/// function-typed *parameter* whose type is still an inference variable at emit time.
+/// `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply` cannot peek its Pi
+/// binder to build the identity correspondence — the discharge `[k ↦ 0]` must instead be
+/// resolved at coalesce, once `g` resolves to the dependent function.
+///
+/// `apply0(f)` must therefore land on exactly what the *direct* `f(0)` yields.
+#[test]
+fn higher_order_dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    let direct = infer_program(&format!("{f}f(0)"));
+    let through = infer_program(&format!("{f}apply0 = \\g -> g(0)\napply0(f)"));
+    assert_predicate_discharged(&through, "k");
+    assert_eq!(
+        through, direct,
+        "applying through a function-typed parameter must give the same type as applying \
+         directly"
+    );
+}
+
+/// Shared assertion for the two discharge tests: `ty` is a data function whose domain
+/// refinement mentions the discharged argument `0` and no longer references `binder`.
+fn assert_predicate_discharged(ty: &Type, binder: &str) {
+    let Type::Fun { domain: dom, .. } = ty else {
+        panic!("expected a refined data function, got {ty}");
+    };
+    let [r] = dom.refinements() else {
+        panic!("expected a singly-refined domain, got {ty}");
+    };
+    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
+    assert!(
+        !pred.contains(binder),
+        "binder `{binder}` should be discharged, but the predicate still has it: {pred}"
+    );
+    assert!(
+        pred.contains('0'),
+        "discharged predicate should mention the argument 0: {pred}"
     );
 }
 
