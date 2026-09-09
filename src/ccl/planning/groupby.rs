@@ -229,7 +229,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
     };
     // head.ty = (k: K) ⇒ ({I | pred} ⇒ V) — read the types name-agnostically. The
     // outer arrow's domain is the key domain `{K | k ▷ (𝑚 ▷ collection_contains)}` when the source
-    // came through `reify` (the keyed-collection `groupby` realization).
+    // came through `reify` (the `groupby` realization).
     // `Converse`'s key-extraction morphism `c ≫ key` produces plain keys, so strip
     // refinements here: the group key type is the bare `K`, the "present" identity
     // being emergent from `Converse` rather than carried on the extracted key. (The

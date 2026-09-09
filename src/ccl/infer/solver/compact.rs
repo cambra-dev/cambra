@@ -299,8 +299,7 @@ impl CompactTypeKind {
             // survives either way and op-conversion rejects it by name. What the least answer
             // buys is the *type* — `Map(𝐾′, 𝑉)` where the universe gives `Collection(𝑉)` — and
             // since a kind is covariant with the function it kinds, the second is the
-            // supertype. A consumer demanding a keyed collection accepts the first and rejects
-            // the second.
+            // supertype. A consumer demanding a `Map` accepts the first and rejects the second.
             (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) if pol => {
                 SubtypesOf(Box::new(
                     xs.into_iter()

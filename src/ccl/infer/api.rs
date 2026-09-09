@@ -2498,12 +2498,12 @@ mod tests {
         );
     }
 
-    /// `λ (m: Map(Int, Str)) → m` and the `Set` analog: the keyed Σ
+    /// `λ (m: Map(Int, Str)) → m` and the `Set` analog: the `Map` Σ
     /// (`Σ (𝐷: SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`) is accepted as a parameter annotation and
     /// round-trips through the compact/coalesce carrier with its witness **kind**
     /// (including the key type) and codomain preserved.
     #[test]
-    fn test_infer_keyed_collection_param_round_trips() {
+    fn test_infer_map_param_round_trips() {
         for ann in [
             Type::map_of(Type::Base(BaseType::Int), Type::Base(BaseType::String)),
             Type::set_of(Type::Base(BaseType::Int)),
@@ -2517,14 +2517,14 @@ mod tests {
                 },
                 body: Box::new(Expr::var("m")),
             });
-            let ty = infer(&mut expr, &mut ctx).expect("keyed collection param round-trips");
+            let ty = infer(&mut expr, &mut ctx).expect("a `Map` param round-trips");
             let Type::Fun {
                 domain, codomain, ..
             } = &ty
             else {
                 panic!("expected a function type, got {ty}");
             };
-            // Both the param and the returned body re-form the keyed Σ with the
+            // Both the param and the returned body re-form the Σ with the
             // `SubtypesOf` witness kind — carrying its key type — not a plain data
             // function and not some other kind.
             for slot in [domain.as_ref(), codomain.as_ref()] {
@@ -2536,7 +2536,7 @@ mod tests {
                         Some(crate::ccl::ty::TypeKind::SubtypesOf(k))
                             if *k == Type::Base(BaseType::Int)
                     )),
-                    "keyed collection should stay a SubtypesOf(Int) Σ, got {slot}"
+                    "a `Map` param should stay a SubtypesOf(Int) Σ, got {slot}"
                 );
             }
         }

@@ -127,7 +127,7 @@ pub struct OperatorSchemes {
     /// `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)` — [`Builtin::CollectionContains`], the
     /// characteristic predicate of a collection's outputs. Inline-built because `κ` is
     /// shared between the argument's codomain and the result's domain, and that sharing
-    /// is what pins a keyed collection's key type from inside its own domain
+    /// is what pins a key domain's key type from inside that domain's own
     /// refinement.
     collection_contains: PolyScheme,
 }
@@ -183,7 +183,7 @@ impl OperatorSchemes {
         // domain is the data, so the `⤇` rejects a capability here rather than leaving
         // that to a convention. `κ` is shared between the morphism's codomain and the
         // predicate's domain, which is what resolves the refinement base at the use
-        // site — a keyed collection's domain `{κ | __elem ▷ (𝑚 ▷ collection_contains)}`
+        // site — a key domain `{κ | __elem ▷ (𝑚 ▷ collection_contains)}`
         // takes its key type from `𝑚` and needs nothing outside the predicate to pin it.
         let iota = fresh_var(BODY_LEVEL);
         let kappa = fresh_var(BODY_LEVEL);

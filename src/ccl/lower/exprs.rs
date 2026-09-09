@@ -55,7 +55,7 @@ pub(super) fn lower_call(
     };
 
     match name {
-        // groupby(c: I ⤇ A, key: A → K) lowers to a keyed collection over this site's
+        // groupby(c: I ⤇ A, key: A → K) lowers to a data function over this site's
         // key domain (`src/ccl/design/collections.md`, "Lowering realization: the key
         // binder states its domain"):
         //
@@ -135,7 +135,7 @@ pub(super) fn lower_call(
                 crate::ccl::ty::FunKind::fresh_data(),
             );
             let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
-            // A group-by is a **data function** (a keyed collection), and the
+            // A group-by is a **data function**, and the
             // `data_fun` annotation is what says so: `emit_node` stamps that kind onto
             // the arrow `emit_lambda` builds, which already carries the binder and this
             // domain. So the kind is provenance, not a guess from the (scalar key)
@@ -297,19 +297,20 @@ pub(super) fn lower_call(
 }
 
 /// The **present-key domain** of a re-keying: `{𝐾 | __elem ▷ ((c ≫ key) ▷
-/// collection_contains)}` — the keys the key morphism produces, which is how a keyed
-/// collection states its domain (`src/ccl/design/collections.md`, "Representation: the key
-/// domain is the key morphism's image").
+/// collection_contains)}` — the keys the key morphism produces, which is how a re-keying
+/// producer states its key domain (`src/ccl/design/collections.md`, "The key domain is the
+/// key morphism's image").
 ///
 /// `key` is the [`Type::SharedHole`] naming the key type, written into both the
 /// refinement's base and the morphism's codomain. The builtin's scheme alone does not pin
-/// it — `__elem` is *applied* to the characteristic predicate, so the shared variable takes
-/// the base as a lower bound only, and `Map(String, _)` over `Int` keys would be accepted.
+/// it: the refinement applies `__elem` to the characteristic predicate rather than equating
+/// the two, so the shared variable takes the base as a lower bound only, and
+/// `Map(String, _)` over `Int` keys would be accepted.
 ///
-/// Every re-keying producer stamps its own key binder with this, because the gate on
-/// entering a keyed Σ runs at constraint-emission time and a domain that only became
-/// concrete at coalesce could not discharge it (same doc, "Keyed entry needs the key domain
-/// written down at lowering").
+/// Every re-keying producer stamps its own key binder with this, because the gate on keyed
+/// entry runs at constraint-emission time and a domain that only became concrete at
+/// coalesce could not discharge it (same doc, "Keyed entry needs the key domain written
+/// down at lowering").
 fn present_key_domain(
     collection: &Expr,
     key_fn: &Expr,

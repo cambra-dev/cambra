@@ -2249,10 +2249,7 @@ and how the checker carries the distinction, is
 A `FullMap`'s totality is earned by refining the key type down to keys known to
 exist rather than by promising it over an open type:
 `FullMap({String where _ in ks}, Int)` is total because its domain says which
-strings it holds (§6.4). That makes "the lookup hits" an obligation on whatever
-builds the map. **[Open]**: what that obligation is — a literal must cover the
-domain, and a domain that grows must extend the map. Nothing checks it yet, so
-the annotation is accepted over an open key type and has no inhabitants there.
+strings it holds (§6.4).
 
 Decided consequences:
 

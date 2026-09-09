@@ -1455,7 +1455,7 @@ fn lower_type_application(
                 lower_type_expr(v, ctx)?,
             ))
         }
-        // `Set(K)` = `Map(K, unit)` — a keyed collection whose codomain is `unit`, so the
+        // `Set(K)` = `Map(K, unit)` — a map whose codomain is `unit`, so the
         // key domain is the payload (`Type::set_of`).
         "Set" => {
             let [k] = args else {

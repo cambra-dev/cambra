@@ -1417,7 +1417,7 @@ fn test_list_map_reseals_to_list() {
 /// pins is that the two routes into a map's values agree today — see
 /// [`test_map_consumption_is_kind_blind_interim`] for the direct one.
 #[test]
-fn test_keyed_collection_widens_to_collection_like_any_other() {
+fn test_a_map_widens_to_collection_like_any_other() {
     assert_eq!(
         infer_program(
             "def f(c: Collection(Int)):\n    sum(c)\ndef g(m: Map(Int, Int)):\n    f(m)\ng"
@@ -1624,7 +1624,7 @@ fn keyed_entry_checks_the_annotated_key_type() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
     assert!(
         !infer_program_err(&format!("g <: Map(String, Collection(Int)) = {gb}\ng")).is_empty(),
-        "an Int-keyed collection must not satisfy Map(String, _)"
+        "an Int-keyed group-by must not satisfy Map(String, _)"
     );
     // The same rejection with the value slot **elided**, which is the shape that reaches
     // the key-parameter obligation rather than failing on the value edge first. It is
@@ -1635,7 +1635,7 @@ fn keyed_entry_checks_the_annotated_key_type() {
     // and this annotation would be accepted.
     assert!(
         !infer_program_err(&format!("g <: Map(String, _) = {gb}\ng")).is_empty(),
-        "an Int-keyed collection must not satisfy Map(String, _) with the value elided"
+        "an Int-keyed group-by must not satisfy Map(String, _) with the value elided"
     );
     // Positive control: the right key type still reaches the annotation. The value type
     // is left elided — a group is a bare data function, and `Collection(Int)` is a sum
@@ -1651,7 +1651,7 @@ fn keyed_entry_checks_the_annotated_key_type() {
     );
 }
 
-/// `Set(𝐾)` lowers to `Map(𝐾, unit)` — a keyed collection whose payload is the single
+/// `Set(𝐾)` lowers to `Map(𝐾, unit)` — a map whose payload is the single
 /// `unit` a present key carries (`src/ccl/design/collections.md`, "The six collection
 /// types"). The annotation is the only surface naming one here; the `set(…)` constructor
 /// that *produces* one arrives later in the stack, so this pins the lowering arm on the
@@ -1660,11 +1660,11 @@ fn keyed_entry_checks_the_annotated_key_type() {
 /// The key type is carried rather than elided, which is what makes the arm more than a
 /// shape: `Set(String)` and `Set(Int)` are different annotations.
 #[test]
-fn a_set_annotation_is_a_unit_valued_keyed_collection() {
+fn a_set_annotation_is_a_unit_valued_map() {
     let int_keyed = infer_program("def f(s: Set(Int)):\n    s\nf").to_string();
     assert!(
         int_keyed.contains("SubtypesOf(Int)") && int_keyed.contains("⤇ Unit"),
-        "`Set(Int)` is a keyed collection over `Int` whose values are `unit`, got {int_keyed}"
+        "`Set(Int)` is a map over `Int` whose values are `unit`, got {int_keyed}"
     );
     let str_keyed = infer_program("def f(s: Set(String)):\n    s\nf").to_string();
     assert!(
@@ -1688,7 +1688,7 @@ fn a_set_annotation_is_a_unit_valued_keyed_collection() {
 /// The **other** route by which a map can be read as its values — direct
 /// consumption — is still open, and deliberately so: `Σ`-elimination (`Σ <: Fun`)
 /// is kind-blind, because that is the same arm that makes `sum(xs)` work for a
-/// `List` and `[f(g) for g in groupby(…)]` work for a keyed collection. So
+/// `List` and `[f(g) for g in groupby(…)]` work for a group-by. So
 /// `sum(m)` type-checks today and sums the values.
 ///
 /// That is the [Interim] "`for`-in binds the codomain for every kind" state, not a

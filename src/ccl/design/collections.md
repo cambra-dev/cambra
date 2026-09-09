@@ -45,9 +45,10 @@ With `𝐷` a witness domain and `𝑛` a length:
 - **`Set(𝐾)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ unit` — a key domain with trivial codomain;
   the domain is the payload. Unordered. Membership `𝑒 in 𝑠` discharges `𝑒`'s
   presence in the domain.
-- **`Map(𝐾, 𝑉)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` — a key domain; a *concrete* one's keys are
-  typed `{𝑘: 𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`. Unordered. Lookup `𝑚[𝑘] : Option(𝑉)` in
-  general, `: 𝑉` when presence discharges (see
+- **`Map(𝐾, 𝑉)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` — a key domain; a concrete one's keys are
+  typed `{𝑘: 𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`
+  ([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)).
+  Unordered. Lookup `𝑚[𝑘] : Option(𝑉)` in general, `: 𝑉` when presence discharges (see
   [Lookup](#lookup-membership-discharge)). Membership `𝑘 in 𝑚`.
 - **`FullMap(𝐾, 𝑉)`** = `(𝑘: 𝐾) ⤇ 𝑉` — a value for **every** key of `𝐾`, so the key set is
   readable from the type and `𝑚[𝑘] : 𝑉` needs no proof. Unordered. `𝑉` may depend on `𝑘`,
@@ -128,10 +129,31 @@ entry is `(𝐾, unit)` and the projection to `𝐾` is lossless, so `Map` gets 
 iteration without the distinction existing. That is surface-visible — `for k in s` would
 bind a pair — so it is a spec decision, not a silent one.
 
-## Representation: the key domain is the key morphism's image
+## `groupby`'s exact type
 
-A concrete keyed collection's domain is `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` — the
-keys its key morphism `𝑚` produces.
+For `c: 𝐼 ⤇ 𝐴` and `key: 𝐴 → 𝐾`:
+
+```
+groupby(c, key) : (𝑘: {𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}) ⤇ ({𝑖: 𝐼 | key(c(𝑖)) == 𝑘} ⤇ 𝐴)
+```
+
+The outer domain is this group-by's present keys and no other collection's, and it is the
+group-by's own keys rather than all of `𝐾` because a data function's domain is its data — a
+domain of `𝐾` would claim one row per inhabitant. The codomain is the group, and it **depends
+on `𝑘`**.
+
+That dependency decides what the type is: a [`FullMap`](#the-six-collection-types), not a
+`Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
+annotation or consumer converts one into the other, so a group-by is consumed at the type
+it has.
+
+### The key domain is the key morphism's image
+
+A key domain is spelled as the image of a named morphism term:
+`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` is the keys `𝑚` produces.
+`present_key_domain` in `src/ccl/lower/exprs.rs` builds every one, so a domain of this shape
+came from a re-keying producer ([Keyed entry needs the key domain written down at
+lowering](#keyed-entry-needs-the-key-domain-written-down-at-lowering)).
 
 **Naming the morphism is what makes membership provable.** A domain that said only "the keys
 of this collection" would have no introduction rule: nothing could produce a value at it
@@ -140,22 +162,68 @@ rather than for want of a rule — and refinements relate by structural predicat
 rather than implication, so there is no entailment step for a proof to land in instead.
 Naming it supplies the rule: a key produced by `𝑚` is a key of the collection `𝑚` keys.
 
-Naming a term is also what fixes when two key domains are the *same* domain: refinements
-compare by structural predicate equality, so two domains agree exactly when they name the
-same morphism term. That is a fact about terms rather than about collections — a domain
-naming a parameter is one type over every collection that parameter is bound to, and
-distinct spellings of one collection (a `let`-bound source and its inlined literal) are
-distinct domains. Membership therefore reads "in the image of *this* morphism", under
-whatever the morphism's free variables are bound to where the fact is used.
+**Naming a term is also what fixes domain identity.** Refinements compare by structural
+predicate equality, so two key domains are the same domain exactly when they name the same
+morphism term. That is a fact about terms rather than about collections — a domain naming a
+parameter is one type over every collection that parameter is bound to, and two spellings of
+one collection (a `let`-bound source and its inlined literal) are two domains. Membership
+therefore reads "in the image of the morphism named here", under whatever the morphism's free
+variables are bound to where the fact is used.
 
-**A join of two keyed collections over different sources is not supported.** Their group
-domains conflict, `box` does not help, and what the sum would need is a witness ranging over
-both key domains.
+**Two group-bys over different sources do not join.** Their key domains name different
+morphisms, `box` does not help, and what the sum would need is a witness ranging over both.
 
 A `Type::SharedHole` equates the refinement's base with the morphism's codomain. The
 builtin's scheme relates those two positions without equating them: `__elem` is applied to
 the characteristic predicate, so the application contributes a lower bound only, and a key
 type contradicting the morphism's would join with it rather than conflict.
+
+### Consuming a group: discharge, not point-free compose
+
+A group's domain `{𝑖 | key(𝑖) == 𝑘}` names `𝑘`, the group-by's own key binder, so the
+group-by's codomain depends on `𝑘` and every consumer of a group is typed outside `𝑘`'s
+scope. Cambra **discharges** the binder rather than packing it under an existential, and can
+always do so because it controls every composition it emits — there is no surface compose
+operator.
+
+So a consumption lowers η-expanded: `producer ≫ consumer ⤳ λ 𝑥 → consumer(producer(𝑥))`,
+where `producer(𝑥)` is a dependent application substituting `𝑥` for the key binder. A
+comprehension is already in that form. A bare point-free `groupby(c, key) ≫ collapse` is
+never emitted, because its consumer's parameter would resolve with `𝑘` free.
+
+A stored dependent codomain spells its binder reference as an **index**
+([type-inference.md, A binder reference is stored in one of two
+forms](type-inference.md#a-binder-reference-is-stored-in-one-of-two-forms)), and two asserts
+hold that form. `subst::open_codomain` asserts that an unnamed function's codomain does not
+reference that function, since an index there has no binder to open at and nothing
+downstream can discharge it. `check_scope_valid_go` in `src/ccl/infer/solve.rs` asserts that
+no stored function's codomain references its own binder by name, which is what a type built
+field-wise instead of through `Type::pi`/`pi_kinded`/`fun_like` produces.
+
+### Lowering realization: the key binder states its domain
+
+Lowering emits, with the inner group a cast:
+
+```
+groupby(c, key)  ⟶  λ (__gb_k : {𝐾 | __elem ▷ ((c ≫ key) ▷ collection_contains)}) → cast(λ __gb_i → __gb_i ▷ c, {𝐼 | key(c(__elem)) == __gb_k} ⤇ 𝐴)
+```
+
+which enters `Map(𝐾, …)` by the Σ rule once `box` has made it a one-candidate sum. Two
+things say what it is: the binder is declared at the present-key domain
+(`present_key_domain`), and a `data_fun(_, _)` annotation on the lambda stamps `Data` onto
+the arrow. Nothing derives the kind from the key domain, which is scalar.
+
+**`Converse` discharges the present-key domain.** Planning rebuilds the site as
+`converse ≫ map`, and the two halves are typed at different domains: the key-extraction
+morphism `c ≫ key` yields plain keys and is typed at the bare `𝐾`, while the partition
+`Converse` builds holds exactly the keys that occur and is stamped at the present-key
+domain. One key type serving both roles either rejects the extraction or understates the
+partition.
+
+The predicate rides to op-conversion on **types**, never as a term. Point-free compilation
+applies to the predicates planning reifies into a `Restrict`, and this one it never
+reaches — a membership evaluation would be a keyed lookup or an `x in s` filter, neither of
+which exists.
 
 ## Operations: how the trait layer is realized [Planned]
 
@@ -218,21 +286,6 @@ become the per-type standard-library instances with no semantic change. Everythi
   Withholding that edge is what a declared type constructor would be for. Until either
   lands, `sum(m)` means `sum(values(m))`.
 
-## Consuming a keyed collection: discharge, not point-free compose
-
-A `groupby`'s per-key group `{𝑖 | key(𝑖) == 𝑘} ⤇ 𝑉` has a **dependent** codomain, so
-anything consuming it must not let `𝑘` escape into the consumer, which is bound outside
-`𝑘`'s scope. Cambra **discharges** the binder rather than packing it under an existential,
-and can always do so because it controls every composition it emits — there is no surface
-compose operator.
-
-So a consumption lowers η-expanded: `producer ≫ consumer ⤳ λ 𝑥 → consumer(producer(𝑥))`,
-where `producer(𝑥)` is a dependent application substituting `𝑥` for the key binder. A
-comprehension is already in that form. A bare point-free `keyed ≫ collapse` is never
-emitted — its consumer's parameter would resolve with `𝑘` free, which the scope check
-rejects — and a `debug_assert` in `coalesce_node`'s `Compose` arm holds the invariant: no
-`Compose` morphism's codomain may reference that morphism's own Pi binder.
-
 ## Lookup: membership discharge
 
 > **[Planned]** — `c[k]` lowers as the lookup `c(k)`, but no rule discharges the index's
@@ -264,49 +317,6 @@ a consumed sum's witness, and the membership has nothing to discharge against. T
 apparatus is there — `𝑘 : σ` alongside `𝑚 : σ` is the pairing a discharge needs — but which
 shape closes it is open, and it lands before the `[]` / `[]?` surface rather than with it.
 
-## `groupby`'s exact type
-
-For `c: 𝐼 ⤇ 𝐴` and `key: 𝐴 → 𝐾`:
-
-```
-groupby(c, key) : (𝑘: {𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}) ⤇ ({𝑖: 𝐼 | key(c(𝑖)) == 𝑘} ⤇ 𝐴)
-```
-
-The outer domain is *this* group-by's present keys, so it is not confusable with any other
-collection's, and it is the group-by's own keys rather than all of `𝐾` because a data
-function's domain is its data — a domain of `𝐾` would claim one row per inhabitant. The
-codomain is the group, and it **depends on `𝑘`**.
-
-That dependency decides what the type is: a [`FullMap`](#the-six-collection-types), not a
-`Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
-annotation or consumer converts one into the other, so a group-by is consumed at the type
-it has.
-
-### Lowering realization: the key binder states its domain
-
-Lowering emits, with the inner group a cast:
-
-```
-groupby(c, key)  ⟶  λ (__gb_k : {𝐾 | __elem ▷ ((c ≫ key) ▷ collection_contains)}) → cast(λ __gb_i → __gb_i ▷ c, {𝐼 | key(c(__elem)) == __gb_k} ⤇ 𝐴)
-```
-
-which enters `Map(𝐾, …)` by the Σ rule once `box` has made it a one-candidate sum. Two
-things say what it is: the binder is declared at the present-key domain
-(`present_key_domain`), and a `data_fun(_, _)` annotation on the lambda stamps `Data` onto
-the arrow. Nothing derives the kind from the key domain, which is scalar.
-
-**`Converse` discharges the present-key domain.** Planning rebuilds the site as
-`converse ≫ map`, and the two halves are typed at different domains: the key-extraction
-morphism `c ≫ key` yields plain keys and is typed at the bare `𝐾`, while the partition
-`Converse` builds holds exactly the keys that occur and is stamped at the present-key
-domain. One key type serving both roles either rejects the extraction or understates the
-partition.
-
-The predicate rides to op-conversion on **types**, never as a term. Point-free compilation
-applies to the predicates planning reifies into a `Restrict`, and this one it never
-reaches — a membership evaluation would be a keyed lookup or an `x in s` filter, neither of
-which exists.
-
 ## Keyed entry needs the key domain written down at lowering
 
 An entry term runs a membership predicate on the entering side, so it decides at
@@ -315,7 +325,7 @@ a kinding constraint on the domain variable. Whether a producer satisfies that i
 property of the collection type but of whether lowering wrote the domain down. So the rule
 for every re-keying producer is: **stamp your own key binder with the present-key domain**
 `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`
-([Representation](#representation-the-key-domain-is-the-key-morphisms-image)). Get
+([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)). Get
 it wrong and the failure is an `AnnotationMismatch` on the Σ witness rather than anything
 naming the cause, because the gate had nothing concrete to test.
 

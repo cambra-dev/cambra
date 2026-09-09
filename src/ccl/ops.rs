@@ -613,9 +613,9 @@ pub enum Builtin {
 
     /// `collection_contains : (𝐼 ⤇ 𝐾) ⇒ (𝐾 ⇒ Bool)` — the **characteristic predicate of a
     /// collection's outputs**. Applied to a key morphism it yields the predicate testing
-    /// membership in what that morphism produces, which is how a concrete keyed collection
-    /// states its domain (`src/ccl/design/collections.md`, "Representation: the key domain is
-    /// the key morphism's image"). Nothing enumerates the set; the image is tested.
+    /// membership in what that morphism produces, which is how a re-keying producer states
+    /// its key domain (`src/ccl/design/collections.md`, "The key domain is the key morphism's
+    /// image"). Nothing enumerates the set; the image is tested.
     ///
     /// The `⤇` is load-bearing — membership in a collection's outputs is defined only where
     /// the domain is the data. Unlike the other type-carried builtins this one has an

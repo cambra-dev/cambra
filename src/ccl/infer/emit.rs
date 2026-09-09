@@ -703,7 +703,7 @@ pub(super) fn emit_lambda<C: Typing>(
     let declared = param.user_annotation.clone().unwrap_or(param.ty.clone());
     let mut param_simple = ctx.normalize(&declared);
     // A refinement riding `param.ty` rather than a `user_annotation` — the shape
-    // lowering gives a keyed collection's key binder,
+    // lowering gives a re-keying producer's key binder,
     // `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}` — has its predicate typed
     // here, in the enclosing scope, because its terms reference the collection bound
     // outside the param.
