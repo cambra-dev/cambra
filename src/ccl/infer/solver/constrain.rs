@@ -953,9 +953,31 @@ fn constrain_go_impl(
                 // against the consumer's raw domain as though the two were one domain rather
                 // than corresponding binders of two sums.
                 let (b0, b1) = (k0.binder_ids(), k1.binder_ids());
+                // **A position left uncorresponded is silent**, which is why it is asserted
+                // rather than tested: the domain premise still runs, and it compares an arm's
+                // witness against whatever the other side put at that position. Nothing
+                // downstream reports the difference, and no oracle sees this rule — the
+                // model's `CompactTy` has no binder slot
+                // (`src/ccl/design/type-inference.md`, "What checks each premise"). Each
+                // side states one identity per position of its own arity, so a side stating
+                // fewer is a kind answering its width and its binders differently.
+                for (k, ids) in [(k0, &b0), (k1, &b1)] {
+                    assert!(
+                        k.arity().is_none_or(|n| ids.len() == n),
+                        "the Σ rule pairs binders positionally, so a kind states one binder \
+                         identity per position: {ids:?} against arity {:?}",
+                        k.arity()
+                    );
+                }
                 if b0.is_empty() || b1.is_empty() {
                     sl
                 } else {
+                    assert_eq!(
+                        b0.len(),
+                        b1.len(),
+                        "two sums meeting at one edge pair every binder, so their arities \
+                         agree by the time the kind premise has passed"
+                    );
                     corresponding = b0
                         .iter()
                         .zip(b1.iter())

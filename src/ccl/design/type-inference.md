@@ -1666,6 +1666,25 @@ where a keyed one was demanded — the domain edge is discharged by `𝜌`, so t
 only thing that looked at the kinds ([One rule for the solve and the
 check](#one-rule-for-the-solve-and-the-check)).
 
+##### What checks each premise
+
+Tests are what stands behind `𝜌`, the domain premise and the codomain premise. The kind
+premise has an independent implementation behind it as well.
+
+No sum reaches a differential oracle. The model's `CompactTy` gives a function a kind, a
+domain and a codomain and no binders (`formal/CclFormal/Merge.lean`), so the wire drops a
+`CompactType` whose slot carries binders, and drops a witness atom for the same reason
+(`tests/differential_oracle.rs`). What does cross is the kind lattice the kind premise reads:
+`TypeKind::refuses` runs against the model's `refuses`
+(`differential_refuses_vs_lean_model`), `CompactTypeKind::merge_kinds` against
+`mergeTypeKind` (`differential_type_kind_merge_vs_lean_model`), and
+`formal/CclFormal/TypeKindIsALattice.lean` proves the lattice laws the model's containment
+relation obeys.
+
+A missing `𝜌` is silent, so the Fun/Fun arm asserts the pairing instead: each side states one
+binder identity per position of its own arity, and two sums pair every binder. Nothing
+downstream would report its absence — the domain premise runs whether or not the rename was
+drawn, and compares an arm's witness against whatever stands at the other side's position.
 
 ##### Type kind containment
 
