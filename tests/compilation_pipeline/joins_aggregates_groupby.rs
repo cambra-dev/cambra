@@ -299,10 +299,15 @@ fn map_rejects_a_duplicate_key() {
 
 // A re-keying constructor over a literal whose elements share **one** singleton type does
 // not compile, and neither constructor causes it: a plain `groupby` over the same literal
-// fails identically, on `main` as well
-// ([`a_groupby_over_a_singleton_element_literal`] carries the diagnosis). `set` and `map`
-// reach it through the group-by their shared shape is built on, and both spellings are
-// listed because both do.
+// fails identically ([`a_groupby_over_a_singleton_element_literal`] carries the diagnosis).
+// `set` and `map` reach it through the group-by their shared shape is built on, and both
+// spellings are listed because both do.
+//
+// The parameter's domain resolves to `Int` while every occurrence of that domain's binder
+// resolves to `Int@1`, and a data function's domain is invariant, so `post-lambda-elim`
+// rejects the tree. A fix for that — meeting both sides when a negative position is read —
+// is in flight and is not under this stack, so the pin is on the failure: it reports the day
+// a base carrying the fix arrives, which an `#[ignore]` could not.
 //
 // It blocks the single-entry seed a mutable map wants (`map([("tee", 5)])`), so it is
 // recorded here rather than left to be rediscovered.
@@ -311,8 +316,9 @@ fn map_rejects_a_duplicate_key() {
 #[case("set([1])")]
 #[case("set([1, 1])")]
 #[case("map([(1, 10)])")]
-#[ignore = "inherited from the group-by underneath: a data-function parameter drops the \
-            refinement its occurrences keep"]
+#[should_panic(
+    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
+)]
 fn test_rekeying_over_a_singleton_literal(#[case] code: &str) {
     run_pipeline(code);
 }
