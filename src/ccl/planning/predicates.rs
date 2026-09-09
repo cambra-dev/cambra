@@ -179,8 +179,8 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 /// Fast-pathed when the bare predicate is already that single application;
 /// otherwise η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
 ///
-/// The function is a **collection**: one `Bool` per element of what the refinement refines,
-/// the column the runtime `Restrict` evaluates over the extent
+/// The function is a **collection**: it yields one `Bool` per element of what the refinement
+/// refines, and the runtime `Restrict` evaluates it over the extent
 /// (`src/ccl/design/type-inference.md`, "A refinement predicate is a data function"). The
 /// η-expanded form is where that is said, the binder being the one place a kind is written,
 /// and it is said for every predicate — nothing declares the kind of a function synthesized
