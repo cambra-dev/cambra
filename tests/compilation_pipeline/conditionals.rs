@@ -796,7 +796,7 @@ sum([y for y in (box([x for x in [1, 2]]) if c else box([x for x in [1, 2, 3]]))
 )]
 // A **mapping** body. The identity comprehension above simplifies to a bare `cast`, so the
 // `Case` still carries the sum when realization reaches it; composing a map onto the site
-// opens the sum, leaving the `Case` typed by the *arrow view* `σ ⤇ Int`. Both spellings name
+// opens the sum, leaving the `Case` typed by the body `σ ⤇ Int`. Both spellings name
 // the same witness and owe the same restriction.
 #[case(
     r"

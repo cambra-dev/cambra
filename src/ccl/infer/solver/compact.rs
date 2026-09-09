@@ -877,7 +877,7 @@ impl CompactType {
         Self::merge(pol, lhs, rhs)
     }
 
-    /// How many **shapes** this position names: an atom, a record, a variant, an arrow, a
+    /// How many **shapes** this position names: an atom, a record, a variant, a function, a
     /// history.
     ///
     /// [`coalesce_compact_go`](super::coalesce) materializes a position from exactly one of
@@ -893,7 +893,7 @@ impl CompactType {
     ///
     /// Two more things that look like a second shape are not. Refinements ride the one shape
     /// there is, so `{Int | p}` names one; and a disagreeing pair of data domains sits inside
-    /// the arrow, which materializes as a Σ over the operands rather than as an error.
+    /// the function, which materializes as a Σ over the operands rather than as an error.
     fn shapes(&self) -> usize {
         let CompactType {
             vars: _,

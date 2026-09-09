@@ -1531,7 +1531,7 @@ Two rules follow rather than being stated separately:
 was written under its own binder, since a binder is minted where a scope needs one, and its
 references are classified by its context rather than by the occurrence's. Discharging it
 renames its binders to the occurrence's — the direction that leaves every type above the
-position alone. A `Compose` is where omitting the rename shows: it recomputes its arrow's
+position alone. A `Compose` is where omitting the rename shows: it recomputes its function's
 ends from its elements, so the domain becomes the replacement's witness while the binder
 stays its own, and the reference is then classified by neither context
 (`at_own_witnesses` in `src/ccl/subst.rs`).

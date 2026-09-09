@@ -1233,7 +1233,7 @@ fn test_conditional_collection_heterogeneous_domains() {
     // collection: were it miscategorized as a `Compute` capability, the join
     // would take the contravariant meet and collide at coalesce. Regression for
     // that source-categorization invariant (`register_source_type` constructs the
-    // `Data` arrow; the kind is intrinsic, not caller-supplied).
+    // `Data` function; the kind is intrinsic, not caller-supplied).
     // Modulo binder identity: two derivations, so the binders differ by construction.
     assert_eq!(
         infer_program_with_sources(
@@ -1319,7 +1319,7 @@ fn test_conditional_collection_consumed_at_concrete_domain_is_rejected() {
 /// that should accept it.
 ///
 /// The arms' domains arrive as atoms on the parameter's one domain position rather than
-/// as two arrow shapes, and reading that position is `denoted_domains` — the single
+/// as two function shapes, and reading that position is `denoted_domains` — the single
 /// reading shared by coalesce's materialization and the domain lattice. Both consumers
 /// have to agree, because an annotation adds a second contribution at the same position
 /// (`Described(Any)` for `Collection`, `Described(UIntRanges)` for `List`) and so routes
@@ -1507,7 +1507,7 @@ f(box([1,2]),box([3,4,5]))"
 /// domain variable rides into the result rather than collapsing under a scalar. This
 /// is the other half of the domain meet: the comprehension's fresh domain variable
 /// meets the annotation's `UIntRanges`, and the sum is what survives — so the
-/// result is a `List`, not an arrow over an unresolved domain.
+/// result is a `List`, not a function over an unresolved domain.
 #[test]
 fn list_param_under_a_domain_preserving_consumer() {
     assert_eq!(
@@ -2972,7 +2972,7 @@ mod letrec_typing {
 
 /// A conditional collection reaching a **collapsing** consumer through a variable — a
 /// `let` binding or a UDF parameter — rather than directly. The arms' domains then
-/// arrive as bounds on one domain position instead of as two arrow shapes meeting, and
+/// arrive as bounds on one domain position instead of as two function shapes meeting, and
 /// reading that position as a *join* rather than a collision is what makes it work
 /// (`denoted_domains`, in `src/ccl/infer/solver/compact.rs`).
 #[test]
@@ -2997,7 +2997,7 @@ f({c})"
         )),
         int()
     );
-    // Directly, which reaches the consumer as two arrow shapes and was already fine —
+    // Directly, which reaches the consumer as two function shapes and was already fine —
     // kept so a regression cannot hide behind the cases above.
     assert_eq!(infer_program(&format!("sum({c})")), int());
 }
@@ -4064,7 +4064,7 @@ fn a_udf_call_arm_joins_through_the_bound_graph() {
 /// A use of a **lambda parameter** takes its type from the parameter slot when resolving the
 /// shared variable standalone has no answer.
 ///
-/// A binder's type is fixed by the contravariant domain of the arrow it binds — the reason
+/// A binder's type is fixed by the contravariant domain of the function it binds — the reason
 /// `refresh_lambda_param_slot` derives `param.ty` from the coalesced domain instead of
 /// resolving the slot. A *use* of that binder carries the same variable, and reading it bare
 /// loses the same context; for a data-function domain the loss is not mere imprecision, since
@@ -4280,7 +4280,7 @@ b = box([10, 20, 30, 40]) if d else box([10, 20, 30, 40, 50])
     // passes just as happily on the distributed `((Σ (𝜎 : 𝐾₁). 𝜎, Σ (𝜎 : 𝐾₂). 𝜎) ⤇ Int)`,
     // where each index is quantified independently of the collection it indexes.
     let Some([outer, inner]) = ty.sum() else {
-        panic!("expected one arrow binding both sources' witnesses, got {ty}")
+        panic!("expected one function binding both sources' witnesses, got {ty}")
     };
     assert_eq!(
         candidates_of(&outer.type_kind()).as_deref(),
@@ -4695,7 +4695,7 @@ f(box([1, 2]) if c else box([1, 2, 3]))"
 /// is `box`ed: `Σ (σ : [𝐾]). (𝑘: σ) ⤇ 𝑉[𝑘]`. That is what the binder meant, since it ranges
 /// over elements of whichever domain the witness picked, and a body written `σ ⤇ 𝑉[𝑘]`
 /// would leave `𝑘` free — reported as an out-of-scope binder rather than as anything about
-/// sums. `box`'s scheme names the binder on both of its arrows, which is what carries the
+/// sums. `box`'s scheme names the binder on both of its functions, which is what carries the
 /// argument's onto it.
 #[test]
 fn a_boxed_dependent_collection_declares_its_binder_on_the_witness() {
@@ -4813,9 +4813,9 @@ x = a if c else box([1, 2, 3])
 y = a if d else box([1, 2, 3, 4, 5])
 [p + q for p in x for q in y]",
     );
-    // Two sources, two witnesses on one arrow, each over its own candidates.
+    // Two sources, two witnesses on one function, each over its own candidates.
     let Some([outer, inner]) = ty.sum() else {
-        panic!("expected one arrow binding both sources' witnesses, got {ty}")
+        panic!("expected one function binding both sources' witnesses, got {ty}")
     };
     assert_eq!(
         candidates_of(&outer.type_kind()).as_deref(),
@@ -4882,8 +4882,8 @@ fn no_sum_quantifies_an_index() {
             _ => false,
         }
     }
-    // A sum is an arrow, so an index — a bare witness tuple or record — can never be
-    // one. What this guards is an arrow whose *codomain* is an index record: a sum
+    // A sum is a function, so an index — a bare witness tuple or record — can never be
+    // one. What this guards is a function whose *codomain* is an index record: a sum
     // "quantifying an index" rather than a collection.
     fn quantifies_an_index(ty: &Type) -> bool {
         let mut found = ty.sum().is_some()

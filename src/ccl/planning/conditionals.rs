@@ -1151,7 +1151,7 @@ mod tests {
     /// path silently shifts the enclosing composition's domain from the witness to the
     /// realized union.
     #[test]
-    fn realizing_an_arrow_view_case_keeps_the_witness_in_its_type() {
+    fn realizing_a_body_fun_case_keeps_the_witness_in_its_type() {
         let int = Type::Base(BaseType::Int);
         let w = fresh_witness_binder_id();
         let wv = Witness::bound_to(w, TypeKind::Type);
@@ -1180,13 +1180,13 @@ mod tests {
         };
         // The **function view**: the sum opened, the witness still named. Not a `Type::Sigma`,
         // which is the whole point — the old condition tested the constructor.
-        let arrow_view = Type::data_fun(witness.clone(), int.clone());
-        let mut expr = Expr::new(case).with_ty(arrow_view.clone());
+        let body_fun = Type::data_fun(witness.clone(), int.clone());
+        let mut expr = Expr::new(case).with_ty(body_fun.clone());
 
         realize_conditional_collections(&mut expr);
 
         assert_eq!(
-            expr.ty, arrow_view,
+            expr.ty, body_fun,
             "realization must assert the pre-realization type, not the union's: {}",
             expr.ty
         );
