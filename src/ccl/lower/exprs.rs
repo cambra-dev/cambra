@@ -55,21 +55,10 @@ pub(super) fn lower_call(
     };
 
     match name {
-        // groupby(c: I ⤇ A, key: A → K) lowers to a data function over this site's
-        // key domain (`src/ccl/design/collections.md`, "The key domain is the key
-        // morphism's image"):
-        //
-        //   λ (k : {K | __elem ▷ ((c ≫ key) ▷ collection_contains)}) →
-        //     cast(λ i → c(i), {I | key(c(__elem)) == k} ⤇ A)
-        //
-        // The inner cast is the dependent-refinement site, unchanged; the outer binder's
-        // domain names the same `c` and `key` the inner predicate does, so the key type
-        // resolves from the morphism's codomain rather than from outside.
-        // The arrow is a collection because the `data_fun` annotation says so, which
-        // `emit_node` stamps onto the arrow `emit_lambda` builds. Planning rewrites the
-        // shape to `Converse`, which discharges the present-key domain: the extraction
-        // morphism is typed at the bare `K` and the partition at the present-key domain,
-        // so the predicate rides on types and never reaches op-conversion as a term.
+        // groupby(c: I ⤇ A, key: A → K) lowers to a data function over this site's key
+        // domain — [`lower_groupby`] builds the shape and says why it has two layers. The
+        // key domain it returns is unused here, the surface call having no second position
+        // over the same keys.
         "groupby" => {
             if args.len() != 2 {
                 return Err(LoweringError::unsupported(
@@ -79,8 +68,8 @@ pub(super) fn lower_call(
             }
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
-            let kd = KeyDomain::fresh(ctx, &collection, &key_fn, func.span);
-            Ok(lower_groupby(collection, key_fn, &kd, func.span, ctx))
+            let (keyed, _key_domain) = lower_groupby(collection, key_fn, func.span, ctx);
+            Ok(keyed)
         }
         // set(xs) is a re-keying constructor ([`lower_rekeyed`];
         // `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
@@ -321,54 +310,37 @@ pub(super) fn lower_call(
     }
 }
 
-/// The **key domain of one re-keying site** — everything lowering must write into
-/// every position that ranges over those keys.
-///
-/// Built **once** per re-keying site and shared by every position that ranges over
-/// those keys, which is load-bearing twice over. The `key` [`Type::SharedHole`] inside
-/// it names the key *type*, written into both the domain's base and the key morphism's
-/// codomain ([`present_key_domain`] says why the morphism's own scheme cannot pin it).
-/// And cloning one `Type` keeps the predicate's `Rc` shared, so the positions are one
-/// predicate to `PredMemo` rather than two structurally-equal copies inferred apart —
-/// `set`'s iteration binder and the group-by key binder underneath it are the same key
-/// domain in that stronger sense.
-#[derive(Clone)]
-struct KeyDomain {
-    domain: Type,
-}
-
-impl KeyDomain {
-    /// The key domain of one re-keying of `collection` by `key_fn`. Minted through the
-    /// context so the shared hole's id is unique within the lowering.
-    fn fresh(ctx: &mut LoweringContext, collection: &Expr, key_fn: &Expr, span: Span) -> Self {
-        let key = ctx.fresh_shared_hole();
-        KeyDomain {
-            domain: present_key_domain(collection, key_fn, key, span, ctx),
-        }
-    }
-}
-
-/// Lower a group-by of `collection` by `key_fn` to the key-domain encoding
+/// Lower a group-by of `collection` by `key_fn`, with the key domain it stamps on the key
+/// binder:
 ///
 /// ```text
 /// λ (k : {key | __elem ▷ ((collection ≫ key_fn) ▷ collection_contains)}) →
 ///   cast(λ i → collection(i), {I | key_fn(collection(__elem)) == k} ⤇ A)
 /// ```
 ///
-/// `kd` is the caller's [`KeyDomain`], which names the key type. A caller that builds
-/// further positions over the same keys (`set`'s iteration binder) passes the *same*
-/// [`KeyDomain`] and derives the domain from the same two terms.
+/// The inner cast is the dependent-refinement site; the outer binder's domain names the
+/// same `collection` and `key_fn` the inner predicate does, so the key type resolves from
+/// the morphism's codomain rather than from outside
+/// (`src/ccl/design/collections.md`, "The key domain is the key morphism's image").
 ///
-/// See the `"groupby"` arm of [`lower_call`] for the two-layer rationale and
-/// `src/ccl/design/collections.md`, "The key domain is the key morphism's image". Shared by
-/// the surface `groupby(c, key)` call and the `set`/`map` constructors.
+/// A caller that builds further positions over the same keys — `set`'s iteration binder —
+/// takes the returned domain rather than minting its own, because the value carries two
+/// identities: the [`Type::SharedHole`] naming the key type, written into both the domain's
+/// base and the morphism's codomain, and the refinement predicate's `Rc`, which keeps the
+/// positions one predicate to `PredMemo` instead of two structurally-equal copies inferred
+/// apart.
+///
+/// Shared by the surface `groupby(c, key)` call and the `set`/`map` constructors.
 fn lower_groupby(
     collection: Expr,
     key_fn: Expr,
-    kd: &KeyDomain,
     span: Span,
     ctx: &mut LoweringContext,
-) -> Expr {
+) -> (Expr, Type) {
+    let key_domain = {
+        let key = ctx.fresh_shared_hole();
+        present_key_domain(&collection, &key_fn, key, span, ctx)
+    };
     // `bare_pred` (and the `collection` clone inside it) lives in the cast target's
     // refinement predicate — a type slot outside the `walk_children` domain, swept by
     // `tag_predicate` below because `collect_tree_ids` reaches refinement predicates and
@@ -376,8 +348,6 @@ fn lower_groupby(
     // makes that load-bearing here: `Clone` freshens, so the clone does not alias an
     // already-tagged main-tree id. Everything on the main tree below is recorded — an
     // unrecorded lowering mint is a `Leak::Unexplained` at the boundary.
-    //
-    // Inner group: cast(λ i → c(i), {I | key(c(__elem)) == k} ⇒ A).
     let bare_pred = Expr::binop(
         Expr::apply(
             Expr::apply(Expr::var(Name::elem()), collection.clone()),
@@ -412,12 +382,13 @@ fn lower_groupby(
     // The arrow is a collection because the `data_fun` annotation says so, which
     // `emit_node` stamps onto the arrow `emit_lambda` builds — an arrow already carrying
     // this binder and its domain.
-    ctx.tag_machinery(
-        Expr::lambda("__gb_k", kd.domain.clone(), inner)
+    let keyed = ctx.tag_machinery(
+        Expr::lambda("__gb_k", key_domain.clone(), inner)
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
         span,
         gb,
-    )
+    );
+    (keyed, key_domain)
 }
 
 /// A re-keying constructor: `groupby` on `key_fn`, each group collapsed by `collapse`.
@@ -429,9 +400,9 @@ fn lower_groupby(
 ///
 /// Three things are load-bearing here, none local to either constructor:
 ///
-/// * **One key domain.** The group-by's key binder and the iteration binder range over the
-///   same keys, so [`KeyDomain::fresh`] mints it once and both derive from it. A second
-///   mint would leave their key types unrelated and the application between them ill-typed.
+/// * **One key domain.** The iteration binder ranges over the group-by's own keys, so it
+///   takes the domain [`lower_groupby`] returns. A separate mint would leave the two key
+///   types unrelated and the application between them ill-typed.
 /// * **The η-expanded shape** `λ __iter_record → __iter_record ▷ keyed ▷ collapse`, rather
 ///   than a bare `keyed ≫ collapse`, which would pin the collapse lambda's parameter to a
 ///   type with the key binder free. Emitting one is what `subst::open_codomain` and
@@ -454,8 +425,7 @@ fn lower_rekeyed(
     sc: &'static str,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let kd = KeyDomain::fresh(ctx, &elements, &key_fn, span);
-    let keyed = lower_groupby(elements, key_fn, &kd, span, ctx);
+    let (keyed, key_domain) = lower_groupby(elements, key_fn, span, ctx);
 
     let group_var = ctx.tag_machinery(Expr::var(group_binder), span, sc);
     let collapsed = collapse(group_var, span, ctx);
@@ -466,7 +436,7 @@ fn lower_rekeyed(
     let read = ctx.tag_machinery(Expr::apply(idx_var, keyed), span, sc);
     let iter_record = ctx.tag_machinery(Expr::apply(read, collapse_fn), span, sc);
     ctx.tag_machinery(
-        Expr::lambda("__iter_record", kd.domain, iter_record)
+        Expr::lambda("__iter_record", key_domain, iter_record)
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
         span,
         sc,
