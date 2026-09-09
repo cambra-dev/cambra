@@ -22,8 +22,7 @@ pub enum AggregateKind {
     /// The singleton aggregate: a group's one element, a group holding more
     /// rejected. The accumulator law is `Option(𝐴)`'s — identity `none`, and
     /// merging two `some` values faults, two elements under one key being the
-    /// duplicate a map literal forbids (`src/ccl/design/collections.md`,
-    /// "`sole` is an `Option`-accumulator aggregate").
+    /// duplicate a map literal forbids.
     ///
     /// Presence is out-of-band: `none` is the empty accumulator column and
     /// `some` a column of length one. Any element is a valid value, so there is
