@@ -1,4 +1,4 @@
-//! Differential oracles: three solver operations diffed against the Lean model
+//! Differential oracles: five solver operations diffed against the Lean model
 //! (plan and adjudications in `formal/design.md`).
 //!
 //! - **Subtyping.** `constrain_subtype`'s verdict on type pairs carrying no
@@ -28,7 +28,7 @@
 //!
 //! Each oracle generates cases with a seeded PRNG, serializes them to the wire
 //! schema the Lean codec defines (`formal/CclFormal/Json.lean`), and streams
-//! them through the oracle binary. All three **skip loudly** when it is
+//! them through the oracle binary. All five **skip loudly** when it is
 //! not built (`cd formal && lake build`) so the suite stays green on machines
 //! without a Lean toolchain — except under `CI`, where a skipped differential is
 //! a gate reporting a pass without having compared anything, so it fails

@@ -316,6 +316,6 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 }
 
 // A conditional collection consumed by `sum` (`sum([1,2] if c else [1,2,3])`)
-// type-checks as a Σ (via the `Σ <: Fun` subtyping rule) and *compiles* via
+// type-checks as a Σ (the consumer's kind variable pinned by it) and *compiles* via
 // value-`Case` fan-out — see `conditionals.rs` for the end-to-end
 // compile-and-run coverage.

@@ -279,7 +279,7 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-// Distinct-domain arms — the `Case` types as a Σ; `sum` consumes it via `Σ <: Fun`.
+// Distinct-domain arms — the `Case` types as a Σ; `sum`'s kind variable pins to it.
 #[case(
     r"
 c: Bool = True
@@ -571,7 +571,7 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 // `[f(x) for x in (xs if c else ys)]` floats the source `Case` out of the map
 // (`lower::comprehension`) — `Case{gᵢ → [f(x) for x in srcᵢ]}` — with each arm
 // built as a `Compose` (`src ≫ λx→body`) so it carries the source's *data* kind.
-// The arms then `sigma_join` into the Σ and compile via the gate fan-out,
+// The arms then join into the Σ at coalesce and compile via the gate fan-out,
 // rather than colliding as compute-kinded lambdas over distinct index domains.
 // ---------------------------------------------------------------------------
 
@@ -890,8 +890,8 @@ fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] exp
 // (`([x for x in xs]) if c else ([y for y in ys])`). This is the case
 // kind inference unblocks: a comprehension used as a
 // value is a lambda whose kind var resolves to `Data` from its collection domain, so
-// the two `Case` arms `sigma_join` into the Σ instead of colliding as
-// compute meets. (`sum` consumes the Σ via `Σ <: Fun`.)
+// the two `Case` arms join into the Σ instead of colliding as
+// compute meets. (`sum`'s kind variable pins to the Σ the arms formed.)
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(

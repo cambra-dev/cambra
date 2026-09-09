@@ -1436,7 +1436,7 @@ reflexive case, and the compute counterpart that still relates contravariantly.
 variable is a join like any other, and it has the same answer as anywhere else: none,
 unless the program wrote a `box`. A domain position is not privileged — it does not get
 an implicit sum that a `Case` result would not get. So `[0,1]` and `[0,2]` meeting at a
-domain variable is a `JoinTypeError`, and the same program can be diagnosed from the edge
+domain variable is a `CoalesceError::DomainJoinConflict`, and the same program can be diagnosed from the edge
 or from coalesce depending on whether a consumer forces the question early (see
 [The domain join needs `box`](#the-domain-join-needs-box)).
 
@@ -1747,12 +1747,12 @@ capability, row-destroying for a collection
 ([4.6 Data vs compute functions](#46-data-vs-compute-functions)).
 
 A sum is never formed to make a join succeed, so two unboxed collections over distinct
-domains have no upper bound and their join is a `JoinTypeError`. What the program can ask
+domains have no upper bound and their join is a `CoalesceError::DomainJoinConflict`. What the program can ask
 for instead:
 
 | written | type | what it keeps |
 |---|---|---|
-| `xs if c else ys` | `JoinTypeError` | — no upper bound exists |
+| `xs if c else ys` | `CoalesceError::DomainJoinConflict` | — no upper bound exists |
 | `box(xs) if c else box(ys)` | `Σ (σ : [𝐷ₓ, 𝐷ᵧ]). σ ⤇ 𝑉` | both domains, and the discriminant |
 | `list(xs) if c else list(ys)` | `List(𝑉)` | the rows, not which range — so lookup is partial |
 
@@ -1849,7 +1849,7 @@ stops a demand narrowing a conditional collection to one arm.
 A function is a scope, and a sum reaching one is written in a different scope: its body
 names its own binder, which is bound at the sum and denotes nothing at the consumer. So a
 sum relating to a kind variable records its kind below the variable's own binders, picked
-where the variable's arity becomes known ([`FunKindVar::binders`]), and the edge carries the
+where the variable's arity becomes known ([`FunKindVar::binder_ids`]), and the edge carries the
 **change of scope** between them — the witness half of [`Subst`], extended where the
 `Fun`/`Fun` rule already extends it with a Pi binder correspondence. Every bound the edges
 then record carries it, so a reference arriving at a variable is already spelled in that
@@ -1868,7 +1868,7 @@ written spelling alone.
 Several references reach one domain position: a consumption's arms, each renamed onto the
 same binders, and several functions consuming one collection, each with binders of its own.
 The position is where they have merged, so it is where the index is named. A kind variable
-mints a binder so its edges have a rename target ([`FunKindVar::binders`]), and a route that
+mints a binder so its edges have a rename target ([`FunKindVar::binder_ids`]), and a route that
 crossed no such edge arrives spelling the index in the scope it left; `named_by_domain`
 gives the binder the name its domain answers with, position for position, so the function
 does not bind a name its own domain no longer says.
@@ -1957,9 +1957,9 @@ emitted with fresh kind variables and no binders; a sum relating to one mints th
 as the scope its edges rename into ([A consumer's binders are a scope, not a
 name](#a-consumers-binders-are-a-scope-not-a-name)).
 
-**Compaction.** A sum lands in its own `sigma` slot beside `vars`/`atoms`/`rec`/`variant`/
-`fun`, holding a compact kind and the body **whole**, its occurrences opened to the named
-form — compaction takes types apart, and a position inside the carrier is what a bound
+**Compaction.** A sum lands in the **`fun` slot**, the single carrier every function-shaped
+type reaches, with its binders on [`CompactFun::binders`] and the body held **whole**, its
+occurrences opened to the named form — compaction takes types apart, and a position inside the carrier is what a bound
 already is: detached. `Type::WitnessRef` compacts to an atom, so an occurrence merges by
 the law atoms already have: it matches its own binder and nothing else, and meeting a
 concrete type is the collision `Int` meeting `String` is. Holding the whole body rather
@@ -1968,7 +1968,8 @@ position — a consumer's `?d ⤇ 𝑉` meeting `σ ⤇ 𝑉` is the merge that 
 and a residue has nowhere to put it.
 
 Merging two sums merges kinds and bodies slot against slot over a **fresh** binder both
-contributions α-convert onto ([`CompactSigma::merge`]). Neither side's binder wins: a merge
+contributions α-convert onto ([`CompactFun::merge`], whose `merge_binders` reconciles the
+positions). Neither side's binder wins: a merge
 is a comparison across two scopes, and minting the one they are brought into is the same
 act the domain position performs when several references meet there ([The index is named at
 the domain position](#the-index-is-named-at-the-domain-position)). A pairing the merge has
@@ -1976,7 +1977,7 @@ no answer for rides the merged sum and is reported at materialization, rather th
 by keeping the left contribution — a slot merge returns a value and has no graph to fail
 into.
 
-**The merge laws are the lattice bounds** (`CompactType::distribute_sigma`), so each is
+**The merge laws are the lattice bounds** ([`CompactType::merge_bounds`]), so each is
 derived from the subtyping rules rather than declared. Neither cross-constructor merge
 has an answer — no edge relates a sum to a plain data function in either direction
 ([Subtyping for sums](#subtyping-for-sums)) — so both cross rows keep both contributions
@@ -2220,7 +2221,7 @@ from](#where-the-candidates-come-from)).
   taken, not both.
   Distributing a position's refinement over its atoms produces exactly that wrong type, which
   is why `denoted_domains` refuses a position carrying refinements. Per-candidate association
-  is what `CompactWitnessKind::Enumerated` carries.
+  is what `CompactTypeKind::Enumerated` carries.
 
   Two sites make that survivable today: `compact_go` and `extrude` walk candidates at
   `!pol`, and the ground-candidate `debug_assert!` in `coalesce_compact_go` forbids a free
