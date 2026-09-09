@@ -2473,7 +2473,7 @@ fn assert_predicate_discharged(ty: &Type, binder: &str) {
     );
 }
 
-/// `set(xs)` infers the keyed collection `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ unit` — this
+/// `set(xs)` infers `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ unit` — this
 /// site's key domain, deduplicated, each key mapped to `unit` (the
 /// `Set(K) = Map(K, unit)` payload). The function is **Data** (`⤇`): a `set` *is* a
 /// data collection, so its
@@ -2524,7 +2524,7 @@ fn set_injects_into_nominal_set_annotation() {
 /// where `set`'s is the identity, and that is the whole difference in the type: both
 /// constructors are one re-keying shape at two collapses ([`lower_rekeyed`]).
 #[test]
-fn map_infers_a_keyed_collection_over_the_value() {
+fn map_infers_a_key_domain_over_the_value() {
     assert_eq!(
         infer_program("map([(1, 10), (2, 20)])").to_string(),
         "({Int | __elem ▷ (([(1, 10), (2, 20)] ≫ (λ __map_kv : (Int, Int) → __map_kv.0)) ▷ collection_contains)} ⤇ Int)"

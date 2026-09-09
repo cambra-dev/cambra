@@ -222,7 +222,7 @@ annotation-driven implicit insertion). Their **value construction is a runtime
 §3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)): `map([𝑘𝑣…])` groups the pairs by
 `.0` and collapses each group to its `.1`; `set([𝑒…])` groups by the element,
 codomain `unit`; `list([𝑒…])` keeps the positional domain (`Array` widened to
-`List`). The result is the keyed Σ (`Map`/`Set`) or `List`.
+`List`). The result is the `Map`/`Set` Σ or `List`.
 
 Two consequences are **deferred to a future constant-folding pass**, recorded
 here so the shortcut is explicit:
@@ -272,7 +272,7 @@ Two realization details separate `sole` from the scalar aggregates. Both follow 
 
 #### Runtime realization: nothing new for construction + value iteration
 
-A keyed collection is **already a first-class runtime tile**: `groupby`'s
+A `Map` or `Set` value is **already a first-class runtime tile**: `groupby`'s
 `λ 𝑘 → cast(…)` eliminates to a Pi-const source that planning recognizes as
 `Converse` (see [Lowering realization](#lowering-realization-the-key-binder-states-its-domain)),
 and `Converse` emits a `CurriedFunction` tile whose outer domain column *is* the
@@ -300,17 +300,17 @@ widens to `Int`, and the two meet at the cast as a domain conflict, so `set([1])
 compile (`test_rekeying_over_a_singleton_literal`). The single-entry seed a mutable
 map wants is that shape.
 
-Where a keyed collection value is and is not **driven** is a planning property, not
+Where a `Map` or `Set` value is and is not **driven** is a planning property, not
 a constructor one, and the boundary is narrower than it looks. Planning inserts the
 driving `iterate` at a *chain head*, so a `set(…)` reaches the runtime when it is
 the program tail (`set([1,2,3])`), when it is a bare `groupby(…)`
 (`a_bare_groupby_tail_is_driven`), or when it is let-bound and then consumed
-(`s = set([…])` … `[k for k in s]`). What fails is a keyed collection **nested as
+(`s = set([…])` … `[k for k in s]`). What fails is such a value **nested as
 the source of another comprehension** (`[1 for k in set([1,2,3])]`), which surfaces as
 *"list literal reached op-conversion without an input"*: the underlying source is never
-given an iteration site. `test_undriven_keyed_collection` records it, and fixing it is a
-planning change rather than part of the constructor surface. Separately, a keyed collection
-cannot yet **yield its keys under iteration** — the deferred `items` view above, itself
+given an iteration site. `test_undriven_set_as_a_comprehension_source` records it, and
+fixing it is a planning change rather than part of the constructor surface. Separately, such
+a value cannot yet **yield its keys under iteration** — the deferred `items` view above, itself
 blocked on the
 [kind-representation question](#the-collection-type-is-declared-not-read-off-the-shape).
 

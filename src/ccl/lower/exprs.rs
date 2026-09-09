@@ -348,7 +348,7 @@ impl KeyDomain {
     }
 }
 
-/// Lower a group-by of `collection` by `key_fn` to the keyed-collection encoding
+/// Lower a group-by of `collection` by `key_fn` to the key-domain encoding
 ///
 /// ```text
 /// λ (k : {key | __elem ▷ ((collection ≫ key_fn) ▷ collection_contains)}) →
@@ -440,7 +440,7 @@ fn lower_groupby(
 ///   without which the lambda is a `Compute` capability and `Compute ⊀ Data`. The
 ///   key-domain refinement is what the iteration binder needs because it *is* the key:
 ///   left off, the result domain is still an inference variable at constraint-emission
-///   time and the keyed Σ witness cannot discharge (see [`present_key_domain`]).
+///   time and the `Map` Σ witness cannot discharge (see [`present_key_domain`]).
 ///
 /// `collapse` must consume its group, and not for typing — planning gives a source its
 /// driving `iterate` through its consumer, so a group-ignoring `λ 𝑔 → unit` leaves the

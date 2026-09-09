@@ -201,7 +201,7 @@ fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
     run_pipeline(code);
 }
 
-// `set([…])` is a deduplicating keyed-collection constructor: the distinct
+// `set([…])` is a deduplicating re-keying constructor: the distinct
 // elements become the present keys, each mapped to `unit` (the `Set(K) =
 // Map(K, unit)` payload). Duplicate elements collapse via the `Drain` aggregate.
 // See `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
@@ -317,7 +317,7 @@ fn test_rekeying_over_a_singleton_literal(#[case] code: &str) {
     run_pipeline(code);
 }
 
-// A keyed collection **nested as another comprehension's source** is not driven:
+// A `set(…)` value **nested as another comprehension's source** is not driven:
 // planning inserts the iteration site at a chain head, so `set(…)` compiles as the
 // program tail (`test_set` above) and let-bound-then-consumed (`s = set(…)` …
 // `[k for k in s]`), but inlined into a comprehension source the underlying list
@@ -326,8 +326,8 @@ fn test_rekeying_over_a_singleton_literal(#[case] code: &str) {
 // value iteration"; this is the acceptance test for it.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[ignore = "a keyed collection nested as a comprehension source is not driven by planning"]
-fn test_undriven_keyed_collection() {
+#[ignore = "a set value nested as a comprehension source is not driven by planning"]
+fn test_undriven_set_as_a_comprehension_source() {
     // Asserting only that compilation succeeds: the point is that planning gives
     // the source an iteration site at all.
     run_pipeline("[1 for k in set([1,2,2,3])]");
