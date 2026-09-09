@@ -222,7 +222,10 @@ substitution reaching two occurrences.
 This is β, not a pushdown. Nothing weighs running the filter inside the leg against running
 it after the union: a leg is the site with the witness instantiated, and an occurrence left
 uninstantiated names a witness that no longer exists. A cost model has nothing to decide
-here, and no ordering of the two gates is available to choose between.
+here, and no ordering of the two gates is available to choose between. The duplication the
+same substitution forces stands on the same ground, and stays an obligation until a runtime
+witness exists ([A `let`-bound conditional is copied to each
+consumer](#a-let-bound-conditional-is-copied-to-each-consumer)).
 
 The instantiated form is also the only expressible one. A predicate may name a plain arm,
 but it may not name the gated union: reading the union needs the `iterate`/`restrict`
@@ -237,13 +240,14 @@ site's own binders ([type-inference.md, The index is named at the domain
 position](type-inference.md#the-index-is-named-at-the-domain-position)) — so a source is
 matched by the sum's kind and the index reading it together.
 
-**So a `let`-bound conditional is copied to each consumer.** Realization needs the `Case`
-below the site, because a leg *is* the site with the `Case` replaced by one arm; a binding
-precedes its body in scope, so a `Case` left there is above every site that reads it. The
-site then names a witness no term has materialized, and op-conversion rejects the domain.
-The copy is also what lets each consumer's substitution differ: two consumers filtering one
-conditional instantiate the same witness into two different predicates, which one set of
-legs cannot hold.
+#### A `let`-bound conditional is copied to each consumer
+
+Realization needs the `Case` below the site, because a leg is the site with the `Case`
+replaced by one arm; a binding precedes its body in scope, so a `Case` left there is above
+every site that reads it. The site then names a witness no term has materialized, and
+op-conversion rejects the domain. The copy is also what lets each consumer's substitution
+differ: two consumers filtering one conditional instantiate the same witness into two
+different predicates, which one set of legs cannot hold.
 
 Only an **undetermined** witness is copied — a kind naming more than one candidate. A
 determined one has no realization to feed, since the candidate is already its domain and the
