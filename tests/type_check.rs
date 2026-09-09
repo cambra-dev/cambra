@@ -5670,7 +5670,7 @@ fn a_keyed_write_checks_key_and_value_separately(#[case] write: &str, #[case] ex
     );
 }
 
-/// Writing a key of something that is not a keyed collection needs the target's type,
+/// Writing a key of something that is not a `Map` needs the target's type,
 /// and a mutable variable's value type is still open where the rule runs. So the
 /// diagnostic names the missing resolution rather than reporting a shape mismatch —
 /// the same boundary the checked lookup has through a parameter

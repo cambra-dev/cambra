@@ -341,8 +341,8 @@ Typing:
 
 #### A mutable collection's key set varies with the position
 
-`Mut(𝐶, 𝑆)` for a keyed collection denotes `𝑆 ⇒ Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, the sum sitting in
-the codomain. A value of a sum is a domain paired with a map over it, so the history yields a
+`Mut(𝐶, 𝑆)` for a `Map` denotes `𝑆 ⇒ Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, the sum sitting in the
+codomain. A value of a sum is a domain paired with a map over it, so the history yields a
 different pair at each position and the key set varies with the position. This is the
 quantifier order `∀s. ∃𝐷`, and it admits exactly the histories a register has.
 

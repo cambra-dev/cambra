@@ -365,7 +365,7 @@ pub enum AssignTarget {
     Name(SmolStr),
     /// A tuple destructuring pattern: `(a, b), c = ...`. May nest.
     Tuple(Vec<Spanned<AssignTarget>>),
-    /// One key of a keyed collection: `m[k] := v`.
+    /// One key of a `Map`: `m[k] := v`.
     ///
     /// Not a binding position, unlike the other two: the collection is not being
     /// bound, one of its keys is being written. Only `:=` accepts it, a keyed write

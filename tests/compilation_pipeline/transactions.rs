@@ -3094,7 +3094,7 @@ fn a_keyed_write_reaches_an_induction_store() {
 /// == 1, __elem ▷ (… ▷ collection_contains)}` and fails the invariance check on a
 /// collection domain downstream; the arity is the workaround, not part of what this pins.
 ///
-/// Two adjacent shapes are absent because neither is about a keyed collection. A
+/// Two adjacent shapes are absent because neither is about a `Map`. A
 /// *constant* whole-collection write through a parameter (`m := box(map(…))`) reaches
 /// `letrec recognition: decision is not a compose`, which a scalar `c := 5` through a
 /// parameter does too. Transactional pass-by-reference is refused at lowering: a `with
