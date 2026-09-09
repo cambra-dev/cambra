@@ -2034,9 +2034,11 @@ by. Nothing in subtyping depends on it, because a candidate set is a set and the
 premise quantifies over its members.
 
 Nested conditionals **flatten**. A Σ re-entering compaction lands in the same slot with its
-candidates enumerated, so `box(box(xs) if p else box(ys)) if q else box(zs)` forms one flat
-three-candidate sum. A candidate domain is therefore always a ground data-function domain,
-never itself a Σ.
+candidates enumerated, so `(box(xs) if p else box(ys)) if q else box(zs)` forms one flat
+three-candidate sum. A candidate is therefore a data function's domain, never itself a Σ,
+and `Witness::formed` asserts it. Nesting the boxes instead reaches nothing: `box` takes a
+plain collection, so `box` of a sum is the plain-versus-sum kind conflict
+([Only a term builds a sum](#only-a-term-builds-a-sum)).
 
 #### Which `Case` a site realizes, and what a leg instantiates
 

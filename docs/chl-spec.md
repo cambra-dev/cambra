@@ -2699,9 +2699,9 @@ directly; an operation valid for only one is a compile-time error rather than a 
 one. Where the alternatives are the same type there is one alternative, and
 `box(xs) if c else box(xs)` is `xs`.
 
-`box` is **idempotent** — `box(box(x))` is `box(x)` — because the pair already records
-which type the value is, so pairing it again records the same thing. A program may
-therefore box freely without tracking whether a value arrived boxed.
+`box` takes an unboxed value, so `box(box(x))` is a compile-time error. Alternatives
+combine by nesting the conditionals rather than the boxes: `box(a) if c else (box(b) if d
+else box(e))` has three alternatives at one level, one per arm.
 
 The alternatives are anonymous: the pair records the types themselves, not names chosen
 by the program. Where the choice is meaningful to the reader, a variant (§6.5) names its
