@@ -73,25 +73,47 @@ ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc -p cambra --no-deps
 }
-# The web frontend: typecheck + vitest, plus a freshness check on the committed
-# single-file bundle (R7 — `dist/index.html` is `include_str!`'d so `cargo build`
-# needs no Node). Requires npm; skipped (not failed) when npm is absent so the
-# Rust-only local path still works.
+# The frontend's correctness checks: typecheck and vitest. `ci_web` and
+# `ci_fast` both call this, so the fast tier's web coverage is a subset of the
+# full gate's rather than a second list that drifts from it. Requires npm;
+# skipped (not failed) when npm is absent so the Rust-only local path still
+# works.
+ci_web_tests() {
+  if ! command -v npm > /dev/null 2>&1; then
+    echo "ci_web_tests: npm not found; skipping web frontend checks" >&2
+    return 0
+  fi
+  (
+    # Every step is `|| exit 1` rather than relying on `set -e`: both callers
+    # invoke this on the left of a `||`, which disables errexit for the whole
+    # dynamic extent — including this subshell. Without the explicit exits a
+    # failing `npm run typecheck` would fall through to the test run and the
+    # subshell would report that run's status instead.
+    cd cambra-inspector/web || exit 1
+    # Installs only what is missing, where `ci_web` runs `npm ci`: this gate
+    # runs on every inner-loop iteration, and `npm ci` deletes and reinstalls
+    # the whole tree each time.
+    [[ -d node_modules ]] || npm install --prefer-offline --no-audit || exit 1
+    npm run typecheck || exit 1
+    npm run test || exit 1
+  )
+}
+# The web frontend: `ci_web_tests` over a lockfile-exact install, plus a
+# freshness check on the committed single-file bundle (R7 — `dist/index.html`
+# is `include_str!`'d so `cargo build` needs no Node). Requires npm; skipped
+# (not failed) when npm is absent so the Rust-only local path still works.
 ci_web() {
   if ! command -v npm > /dev/null 2>&1; then
     echo "ci_web: npm not found; skipping web frontend checks" >&2
     return 0
   fi
+  # The lockfile's exact tree, which `ci_web_tests` does not install on its own.
+  ( cd cambra-inspector/web && npm ci ) || return 1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_web_tests || return 1
   (
-    # Every step is `|| exit 1` rather than relying on `set -e`: `ci_all` calls
-    # this function on the left of a `||`, which disables errexit for the whole
-    # dynamic extent — including this subshell. Without the explicit exits a
-    # failing `npm run test` would fall through to the build below and the
-    # subshell would report the *build's* status, so red tests passed the gate.
     cd cambra-inspector/web || exit 1
-    npm ci || exit 1
-    npm run typecheck || exit 1
-    npm run test || exit 1
     # Rebuild the bundle and fail if it drifted from the committed copy.
     # Deliberately a file comparison against the pre-build copy, not
     # `git diff`: in a colocated jj repo git HEAD can sit below the working
@@ -188,14 +210,20 @@ ci_shared_state() {
 }
 
 # Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
-# and test. Deliberately skips the phases whose cost is compile-bound and rarely
-# relevant mid-iteration — the *release* clippy pass (~2x the debug one; only
-# catches `cfg(debug_assertions)`-gated breakage), the doc build, shellcheck, and
-# the doc-ref check — and drops clippy's `--all-targets` (see `ci_clippy`: it
-# doubles the debug clippy time to check test targets `cargo test` then rebuilds
-# anyway). Roughly a third of a full `./ci.sh` after a one-file edit. Run the
-# full `./ci.sh` before pushing — CI gates on everything, and the release clippy
-# pass in particular fails there if skipped locally. `--fix` still applies.
+# the frontend's typecheck and tests, and the Rust suite. Skips the phases whose
+# cost is compile-bound and rarely relevant mid-iteration — the release clippy
+# pass (~2x the debug one; only catches `cfg(debug_assertions)`-gated
+# breakage), the doc build, shellcheck, and the doc-ref check — and drops
+# clippy's `--all-targets` (see `ci_clippy`: it doubles the debug clippy time to
+# check test targets `cargo test` then rebuilds anyway). Roughly a third of a
+# full `./ci.sh` after a one-file edit. Run the full `./ci.sh` before pushing —
+# CI gates on everything, and the release clippy pass in particular fails there
+# if skipped locally. `--fix` still applies.
+#
+# The web half is `ci_web_tests` rather than `ci_web`: the bundle-freshness
+# check rewrites `dist/index.html` in place, and in a colocated jj repo the
+# working copy is a commit, so a gate that runs on every edit would snapshot
+# rebuilt bundles into whatever commit is checked out.
 ci_fast() {
   local failed=0
   # shellcheck disable=SC2310
@@ -204,6 +232,10 @@ ci_fast() {
   # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
   # shellcheck disable=SC2310
   { cargo clippy -p cambra -- -D warnings; } || failed=1
+  # Ahead of `ci_test`: the frontend checks are the cheapest in the set, so a
+  # broken `.ts` reports in seconds rather than after the Rust suite.
+  # shellcheck disable=SC2310
+  ci_web_tests || failed=1
   # shellcheck disable=SC2310
   ci_test || failed=1
   exit "${failed}"
