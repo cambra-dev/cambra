@@ -605,6 +605,22 @@ fn try_pairwise_in_compose(
     if !(collapsed && expr.ty.sum().is_some() && ty.sum().is_none()) {
         expr.ty = ty;
     }
+    // A chain's domain is its **head's**, and a rewrite can put a term there that was typed
+    // at an unnarrowed element — the projection a predicate compiled at a narrowed base
+    // carries, whose own type inference stamped before the narrowing existed. Restoring the
+    // chain's recorded domain therefore has to reach the head as well, or the node
+    // contradicts its own first step: harmless while the domain was a capability's and
+    // contravariant, reported at the next wall once it is a collection's and invariant.
+    if let (TypedExprNode::Compose(elts), Some(chain_dom)) = (&mut expr.node, expr.ty.domain())
+        && let Some(head) = elts.first_mut()
+        && let Some(head_dom) = head.ty.domain()
+        && head_dom != chain_dom
+        && crate::ccl::ccl_utils::strip_refinements(&head_dom)
+            == crate::ccl::ccl_utils::strip_refinements(&chain_dom)
+        && let Some(head_cod) = head.ty.codomain()
+    {
+        head.ty = Type::fun_like(&head.ty, chain_dom, head_cod);
+    }
     // Nor may the collapsed node inherit the chain's interface type wholesale: a
     // cast's refinements are term-determined (its type is the value's domain refinements ∪
     // the target's born refinements), while the chain's recorded type was derived from

@@ -964,9 +964,8 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 ///
 /// A cast re-views its value **at the target**, so the data-vs-capability answer comes from
 /// `born` — `emit_cast` reads it there, and a view rebuilt from a neighbour's type states
-/// whatever that neighbour was. A predicate's chain is a capability (`base ⇒ Bool`), so a
-/// collection cast collapsing inside one is where the two part company. Only that answer
-/// travels: the binder slot is named at each type's own domain position
+/// whatever that neighbour was. Only that answer travels: the binder slot is named at each
+/// type's own domain position
 /// (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"), so a view keeps
 /// the slot it has.
 pub(crate) fn canonical_cast_ty(born: &Type, value_ty: Option<&Type>, view: Type) -> Type {

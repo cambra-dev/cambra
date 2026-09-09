@@ -1751,7 +1751,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 298,
@@ -1777,7 +1777,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 299,
@@ -1803,7 +1803,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -1820,7 +1820,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 301,
@@ -1846,7 +1846,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -1863,7 +1863,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 303,
@@ -1889,7 +1889,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {
@@ -2005,7 +2005,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 320,
@@ -2031,7 +2031,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 321,
@@ -2057,7 +2057,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -2074,7 +2074,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 323,
@@ -2100,7 +2100,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -2117,7 +2117,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 325,
@@ -2143,7 +2143,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {
@@ -2259,7 +2259,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 342,
@@ -2285,7 +2285,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 343,
@@ -2311,7 +2311,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -2328,7 +2328,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 345,
@@ -2354,7 +2354,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -2371,7 +2371,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 347,
@@ -2397,7 +2397,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {
@@ -2513,7 +2513,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 364,
@@ -2539,7 +2539,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 365,
@@ -2565,7 +2565,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -2582,7 +2582,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 367,
@@ -2608,7 +2608,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -2625,7 +2625,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 369,
@@ -2651,7 +2651,7 @@
             "nature": "machinery",
             "label": "predicate.rebuild"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {

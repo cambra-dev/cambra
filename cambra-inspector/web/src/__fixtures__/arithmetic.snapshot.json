@@ -2790,7 +2790,7 @@
             "nature": "machinery",
             "label": "simplify.const_apply"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 237,
@@ -2816,7 +2816,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 238,
@@ -2842,7 +2842,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -2859,7 +2859,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 240,
@@ -2885,7 +2885,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -2902,7 +2902,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 242,
@@ -2928,7 +2928,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {
@@ -3152,7 +3152,7 @@
             "nature": "machinery",
             "label": "simplify.const_apply"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 282,
@@ -3178,7 +3178,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 283,
@@ -3204,7 +3204,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -3221,7 +3221,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 285,
@@ -3247,7 +3247,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -3264,7 +3264,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 287,
@@ -3290,7 +3290,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {
@@ -3384,7 +3384,7 @@
             "nature": "machinery",
             "label": "simplify.const_apply"
           },
-          "type": "(Int ⇒ Bool)",
+          "type": "(Int ⤇ Bool)",
           "children": [
             {
               "id": 327,
@@ -3410,7 +3410,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ (Int, Int))",
+          "type": "(Int ⤇ (Int, Int))",
           "children": [
             {
               "id": 328,
@@ -3436,7 +3436,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(((Int ⇒ Int), (Int ⇒ Int)) ⇒ (Int ⇒ (Int, Int)))",
+          "type": "(((Int ⤇ Int), (Int ⤇ Int)) ⇒ (Int ⤇ (Int, Int)))",
           "children": []
         },
         {
@@ -3453,7 +3453,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Int ⇒ Int), (Int ⇒ Int))",
+          "type": "((Int ⤇ Int), (Int ⤇ Int))",
           "children": [
             {
               "id": 330,
@@ -3479,7 +3479,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": []
         },
         {
@@ -3496,7 +3496,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ Int)",
+          "type": "(Int ⤇ Int)",
           "children": [
             {
               "id": 332,
@@ -3522,7 +3522,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Int ⇒ (Int ⇒ Int))",
+          "type": "(Int ⇒ (Int ⤇ Int))",
           "children": []
         },
         {
