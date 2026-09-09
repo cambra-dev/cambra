@@ -475,14 +475,14 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 );
                 // The value type comes off the history binding, not off the seed it
                 // recovers alongside. A seed is one contribution to the value type —
-                // a keyed register seeded at two keys and written at a third has a
+                // a keyed mutable variable seeded at two keys and written at a third has a
                 // seed narrower than what it holds — and the binding `reg_k : Txn ⇒ 𝑉`
                 // carries the join `transact_phase` stamped.
                 let value_ty =
                     b.ty.codomain()
                         .expect("letrec recognition: history binding is a stream");
                 // The join is unrefined, so nothing is peeled here. A refinement is a fact
-                // about one value and a register holds a different value at each commit, so
+                // about one value and a mutable variable holds a different value at each commit, so
                 // the join over its contributions carries none — the reason reading the seed
                 // needed a `strip_refinements` and reading the binding does not. Stated
                 // rather than re-normalized: a refinement surviving to here would ride into
@@ -490,7 +490,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 // mis-stamped history to fix at the stamp.
                 assert!(
                     value_ty.refinements().is_empty(),
-                    "letrec recognition: a register's joined value type carries no \
+                    "letrec recognition: a mutable variable's joined value type carries no \
                      refinement, got {value_ty} for `{}`",
                     b.name
                 );

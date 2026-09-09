@@ -117,7 +117,7 @@ pub fn convert_record_fields_to_operators(
             bound_expr,
             body,
         } => {
-            // `let __hist = Transact{…}`: build the shared store and register it
+            // `let __hist = Transact{…}`: build the shared store and mutable variable it
             // (the reads `__hist.k` in the fields project off it), the same as
             // the `convert_impl` `Let` arm. Multi-sink programs (a trailing
             // `Record`) reach the store binding through here.
@@ -299,7 +299,7 @@ pub struct OpConversionContext {
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
-    /// `let __hist = Transact{…}` builds the shared store once and registers
+    /// `let __hist = Transact{…}` builds the shared store once and mutable variables
     /// it here; each variable read `__hist.k` projects key `k` off the shared
     /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
     /// (unscoped) map suffices.
@@ -340,7 +340,7 @@ impl OpConversionContext {
         Self::default()
     }
 
-    /// Register a data-source implementation under `name`.
+    /// Mutable variable a data-source implementation under `name`.
     ///
     /// After registration, [`Type::DataSource`] resolves to
     /// [`Extent::DataSourceDomain`] in [`Self::extent_of`].
@@ -362,7 +362,7 @@ impl OpConversionContext {
             .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}")))
     }
 
-    /// Register an output sink under `name`.
+    /// Mutable variable an output sink under `name`.
     ///
     /// Enter a fresh lexical scope, returning a guard that pops it on drop.
     ///
@@ -388,7 +388,7 @@ impl OpConversionContext {
         self.scopes.lookup(name)
     }
 
-    /// Register a built transactional store under its `__hist` binder.
+    /// Mutable variable a built transactional store under its `__hist` binder.
     fn register_store(&mut self, name: Name, info: StoreReadInfo) {
         self.transactional_stores.insert(name, info);
     }
@@ -1671,13 +1671,13 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         .collect()
 }
 
-/// The store key of register `reg` at data key `at`.
+/// The store key of mutable variable `reg` at data key `at`.
 ///
-/// A store's key space is a tagged sum over its registers, each arm carrying that
-/// register's own key type: `Σ reg. K_reg`. A scalar register's key type is `Unit`,
+/// A store's key space is a tagged sum over its mutable variables, each arm carrying that
+/// mutable variable's own key type: `Σ reg. K_reg`. A scalar mutable variable's key type is `Unit`,
 /// so it occupies the single key `` `reg(unit) ``. The tag is what keeps one
-/// register's keys disjoint from another's — without it a keyed register holding
-/// the string `"pool"` would alias the scalar register spelled `pool`.
+/// mutable variable's keys disjoint from another's — without it a keyed mutable variable holding
+/// the string `"pool"` would alias the scalar mutable variable spelled `pool`.
 fn store_key(reg: &str, at: Value) -> Value {
     Value::Union {
         tag: FieldKey::Name(reg.into()),
@@ -1685,13 +1685,13 @@ fn store_key(reg: &str, at: Value) -> Value {
     }
 }
 
-/// The extent of a store's key space — one arm per register, plus one per reply tap (a tap
+/// The extent of a store's key space — one arm per mutable variable, plus one per reply tap (a tap
 /// occupies a write-only arm of its own).
 ///
-/// Every arm is `Unit`, a keyed register included: `desugar_keyed_writes` rewrites `m[k] :=
-/// v` into the whole-value write `m := insert(m, k, v)`, so a register holds its whole
+/// Every arm is `Unit`, a keyed mutable variable included: `desugar_keyed_writes` rewrites `m[k] :=
+/// v` into the whole-value write `m := insert(m, k, v)`, so a mutable variable holds its whole
 /// collection at the single key `` `reg(unit) `` and the data key never reaches this key
-/// space. The tag is what would keep two registers' keys disjoint if one ever did.
+/// space. The tag is what would keep two mutable variables' keys disjoint if one ever did.
 fn store_key_extent(arms: Vec<(String, Extent)>) -> Extent {
     Extent::Union(TagMap::from_arms(
         arms.into_iter()
@@ -1958,7 +1958,7 @@ fn build_induction_store(
 /// [`InductionDriver`] reads the changelog back to produce the body's
 /// `(prev…, item)` input. Mirrors [`build_commit_store`]'s writer setup, but
 /// driven by iteration position — one writer, no conflict, no retry. Reads
-/// register as [`StoreReadKind::InductionChangelog`]:
+/// mutable variable as [`StoreReadKind::InductionChangelog`]:
 /// each `__hist.k` folds the changelog densely over the loop extent via
 /// [`StoreDenseRead`], serving both a scalar-final read (`ExtractFinal` over it)
 /// and a co-iterated read (the dense `Fun(D, V)` itself).
@@ -2361,7 +2361,7 @@ fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
 /// operator searches the domain column to decide presence and carries one codomain value as
 /// the `` `some `` payload, so a codomain of any other shape — a `CurriedFunction`'s
 /// collection-valued rows, a `Record`'s several columns — has nothing to put there. A
-/// **materialized** collection is one map value, as a mutable collection's register holds
+/// **materialized** collection is one map value, as a mutable collection's mutable variable holds
 /// it; it carries its own bindings, and any value can be the payload.
 ///
 /// Typing rejects the one producer of a key-dependent codomain today, so this is the

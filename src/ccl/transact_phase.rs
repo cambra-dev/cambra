@@ -365,7 +365,7 @@ fn build_zip_read(
 
     // reply: λ p:(req, snap) → e[param ↦ p.0, reads ↦ p.1 (bare) / p.1.field].
     let p = Name::fresh("__zp");
-    // The request binder and every register read are discharged *simultaneously*:
+    // The request binder and every mutable variable read are discharged *simultaneously*:
     // they are independent reads of the one new pair binder, and one traversal
     // is both cheaper and the honest reading (a sequential fold would re-enter
     // each replacement it had already installed).
@@ -554,9 +554,9 @@ pub fn collect_txn_mut_vars(expr: &Expr) -> HashSet<Name> {
 /// derives from it) is `Mut`-free by construction, never feeding a `Mut` type
 /// into the commit engine.
 ///
-/// Untouched includes a non-`Mut` type's refinements. A register holds a different value at
+/// Untouched includes a non-`Mut` type's refinements. A mutable variable holds a different value at
 /// each position of its domain, so inference stamps the binder's value type without the
-/// refinements any one contribution carries: a register seeded at `Int@100` binds
+/// refinements any one contribution carries: a mutable variable seeded at `Int@100` binds
 /// `Mut(Int, _)`, and a keyed one seeded at a concrete map binds
 /// `Mut(Σ (σ : SubtypesOf(𝐾)). (σ ⤇ 𝑉), _)`.
 fn mut_var_value_ty(ty: &Type) -> Type {
@@ -2480,7 +2480,7 @@ struct MutVarDecl {
     ///
     /// Off the **binder**, not off the seed. A seed is one contribution to the value
     /// type and the binder carries the join over the seed and every write, so the two
-    /// differ wherever a write widens the seed — a keyed register seeded with two keys
+    /// differ wherever a write widens the seed — a keyed mutable variable seeded with two keys
     /// and written at a third is the case where reading the seed rejects the program
     /// (`src/ccl/expr.rs`, [`TypedExprNode::MutDecl`]).
     value_ty: Type,

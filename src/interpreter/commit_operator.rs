@@ -322,7 +322,7 @@ fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDra
         let cv = match producer.get(guard.clone()) {
             Tile::Scalar(cv) => cv,
             tile @ Tile::Record(_) => scalar_tile_to_column_value(tile),
-            // A **collection** init — a keyed register's seed. It arrives as the
+            // A **collection** init — a keyed mutable variable's seed. It arrives as the
             // function it is rather than as a scalar, and one store value is one
             // map, so it seeds as a single [`map_to_value`] cell. The seed is
             // acyclic and sealed, so the whole map is present on the pull that

@@ -346,7 +346,7 @@ Typing:
 `Mut(𝐶, 𝑆)` for a `Map` denotes `𝑆 ⇒ Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, the sum sitting in the
 codomain. A value of a sum is a domain paired with a map over it, so the history yields a
 different pair at each position and the key set varies with the position. This is the
-quantifier order `∀s. ∃𝐷`, and it admits exactly the histories a register has.
+quantifier order `∀s. ∃𝐷`, and it admits exactly the histories a mutable variable has.
 
 Every contribution injects by kind containment: the seed names one key domain, each write
 names another, and both are members of `SubtypesOf(𝐾)`. So the single value type on `Mut` needs no
@@ -364,7 +364,7 @@ family**, `Σ (𝐷 : 𝑆 ⇒ SubtypesOf(𝐾)). ((s: 𝑆) ⇒ 𝐷(s) ⤇ �
 functions from positions to domains, so it needs type-level functions and their application.
 A **refinement naming the position**, `(s: 𝑆) ⇒ ({𝐾 | present(s)} ⤇ 𝑉)`, needs only machinery
 that exists — the Pi binder and a refinement carrying a term — but needs a position term in
-scope where the register is typed, and `with begin():` binds none. The
+scope where the mutable variable is typed, and `with begin():` binds none. The
 [transaction handle](#with-t--begin-transaction-handle) is the binder that would supply one.
 
 #### No aliasing: `Mut` values are second-class (downward-only)
@@ -919,8 +919,8 @@ affordable by that complete compile-time knowledge.
   commit stream being the collection's history. A keyed write overwrites; an append needs the
   domain to grow with the history.
 - **Per-key store keys for a mutable collection** — `m[k] := v` commits today by writing the
-  register's whole collection to one store key, so two transactions touching one map conflict
-  whatever keys they touch. The write is recoverable per key: its decision slot is
+  mutable variable's whole collection to one store key, so two transactions touching one
+  map conflict whatever keys they touch. The write is recoverable per key: its decision slot is
   `` (.i, key, value) ▷ zip ≫ insert ``, whose key and value legs each compile on their own.
   Narrowing the read footprint alongside it needs `Proposal.reads` to record *absence*, since
   a transaction that read a missing key must conflict with a concurrent insert. Correctness

@@ -1422,7 +1422,7 @@ fn run_passes(
         return Ok(expr);
     }
 
-    // Register every source (pre-registered + discovered during lowering) with
+    // Mutable variable every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
@@ -1566,7 +1566,7 @@ fn run_passes(
     // reachable.
     expr = recorded(capture_provenance, Phase::Transact, || {
         let mut expr = expr;
-        // A register's seed enters the value type its binder declares — a concrete
+        // A mutable variable's seed enters the value type its binder declares — a concrete
         // collection reaches an abstract one only through an introduction.
         mut_elim::view_seeds_at_value_type(&mut expr);
         // `m[k] := v` becomes the whole-value write it denotes, `m := insert(m, k, v)`, so

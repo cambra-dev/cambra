@@ -3014,14 +3014,14 @@ fn a_variant_match_inside_a_block_releases_per_commit() {
     assert_eq!(value, Value::Int(3));
 }
 
-/// A `Map`-valued transactional register, read inside a block and never written.
+/// A `Map`-valued transactional mutable variable, read inside a block and never written.
 ///
-/// The register's value type is the abstract map `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, so the whole path
-/// from seed to store runs on a sum: the seed's introduction states that type and survives
-/// realization, entering the sum compiles to the identity, and the seed drains to one map
+/// The mutable variable's value type is the abstract map `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, so the
+/// whole path from seed to store runs on a sum: the seed's introduction states that type and
+/// survives realization, entering the sum compiles to the identity, and the seed drains to one map
 /// cell rather than to a scalar.
 #[test]
-fn a_map_valued_register_reads_inside_a_block() {
+fn a_map_valued_mut_var_reads_inside_a_block() {
     let value = final_mut_var_value(indoc! {r#"
         m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
         n: Mut(Int, Txn) := 0
@@ -3037,7 +3037,7 @@ fn a_map_valued_register_reads_inside_a_block() {
 /// A keyed write `m[k] := v` reaching a transactional store.
 ///
 /// The write denotes the whole-value write `m := insert(m, k, v)`
-/// ([`cambra::ccl::Builtin::Insert`]), so the register's history stays an ordinary
+/// ([`cambra::ccl::Builtin::Insert`]), so the mutable variable's history stays an ordinary
 /// overwrite one and the store holds the collection it names. Asserting the *value* is what
 /// makes this more than a compile check: the seed's two keys survive and the written key
 /// joins them, so neither the seed nor the write replaced the other.
@@ -3087,43 +3087,6 @@ fn keyed_writes_at_distinct_keys_compose_across_transactions() {
     );
 }
 
-/// A keyed write whose **key and value are both computed**, on the transactional domain.
-///
-/// Every other keyed write in these tests has a literal right-hand side, and the
-/// transactional ones a literal key besides — which matters because the `Txn` path is where
-/// the value type is read off the binder rather than the seed (`transact_phase`,
-/// `plan_loops::recognize_txn_group`), so a constant key and a constant value exercise
-/// neither half of that. Here the key is the loop binder and the value reads another mutable
-/// variable written earlier in the same transaction, so the write's key slot and its value
-/// slot both carry a type nothing else in the program states.
-///
-/// It is also the shape that survives constant folding. A program whose seed, key and value
-/// are all literals can be settled at compile time, and when that pass lands
-/// (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
-/// constant-folding later") the all-literal cases stop reaching the runtime path while
-/// staying green. This one cannot be folded.
-///
-/// The key still ranges over a literal extent. A key off a request stream — the storefront's
-/// `inventory[req.body.sku] := stock - qty` — has none, and no test reaches that yet.
-#[test]
-fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
-    let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
-        n: Mut(Int, Txn) := 0
-        for x in [3, 4]:
-            with begin():
-                n := n + 1
-                m[x] := n + 1
-        await_final(m)
-    "#});
-    // `n` advances with the loop and the write reads it after its own update in the same
-    // transaction, so the two keys take different values.
-    assert_eq!(
-        map_entries_int(&value),
-        vec![(1, 10), (2, 20), (3, 2), (4, 3)]
-    );
-}
-
 /// A keyed write over an **induction** domain.
 ///
 /// The key is the **loop binder**, which is what makes this more than the transactional
@@ -3145,10 +3108,10 @@ fn a_keyed_write_reaches_an_induction_store() {
 }
 
 /// A keyed write through a `Mut` **parameter**: `fw(m, x)` writes one key of the caller's
-/// register, the pass-by-reference shape `def fw(c: Mut(Int))` already supports for a
+/// mutable variable, the pass-by-reference shape `def fw(c: Mut(Int))` already supports for a
 /// scalar accumulator.
 ///
-/// The write crosses a function boundary, so the register's own value type is what the
+/// The write crosses a function boundary, so the mutable variable's own value type is what the
 /// write is typed against — the parameter binder carries `Mut(Σ (σ : SubtypesOf(Int)). (σ
 /// ⤇ Int), _)`, not the seed's concrete key domain — and `desugar_keyed_writes` reads that
 /// binder as well as the `MutDecl`, both being binders of a mutable variable.
@@ -3215,7 +3178,7 @@ fn map_entries_int(v: &Value) -> Vec<(i64, i64)> {
 /// A keyed write and a keyed read, round trip: `m[k] := v` commits and `m[k]?` reads it
 /// back. This is the pair that makes a mutable collection usable rather than write-only.
 ///
-/// The read goes through the **materialized** path in `CheckedLookup`: a register holds its
+/// The read goes through the **materialized** path in `CheckedLookup`: a mutable variable holds its
 /// collection as one map value at one store key, so the lookup searches that value's
 /// bindings rather than a domain column. A map value carries its own bindings, so it is
 /// complete wherever it is present and absence needs no terminality wait.
@@ -3238,10 +3201,10 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
     );
 }
 
-/// A key the register never held answers `` `none `` — the seed's keys and the written one
+/// A key the mutable variable never held answers `` `none `` — the seed's keys and the written one
 /// are what it has, and nothing else.
 #[test]
-fn a_checked_lookup_on_a_register_answers_none_for_an_absent_key() {
+fn a_checked_lookup_on_a_mut_var_answers_none_for_an_absent_key() {
     check_scalar(
         indoc! {r#"
             m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
@@ -3259,14 +3222,14 @@ fn a_checked_lookup_on_a_register_answers_none_for_an_absent_key() {
     );
 }
 
-/// A keyed read at the **loop item** inside a block — the register's snapshot is a per-row
+/// A keyed read at the **loop item** inside a block — the mutable variable's snapshot is a per-row
 /// column, so the lookup's collection varies by position.
 ///
-/// This is the shape only a transaction produces: `transact_phase` applies the writer body
-/// to a snapshot tuple, so the register arrives as a projection of that tuple rather than as
-/// a free variable, and no eta-reduction makes it closed again. The collection leg being a
-/// projection is what distinguishes it from the same source expression in a comprehension,
-/// where the collection is closed in the loop binder and read once.
+/// This is the shape only a transaction produces: `transact_phase` applies the writer body to a
+/// snapshot tuple, so the mutable variable arrives as a projection of that tuple rather than as a
+/// free variable, and no eta-reduction makes it closed again. The collection leg being a projection
+/// is what distinguishes it from the same source expression in a comprehension, where the
+/// collection is closed in the loop binder and read once.
 #[test]
 fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
     let value = final_mut_var_value(indoc! {r#"
@@ -3284,4 +3247,41 @@ fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
         await_final(n)
     "#});
     assert_eq!(value, Value::Int(30));
+}
+
+/// A keyed write whose **key and value are both computed**, on the transactional domain.
+///
+/// Every other keyed write in these tests has a literal right-hand side, and the
+/// transactional ones a literal key besides — which matters because the `Txn` path is where
+/// the value type is read off the binder rather than the seed (`transact_phase`,
+/// `plan_loops::recognize_txn_group`), so a constant key and a constant value exercise
+/// neither half of that. Here the key is the loop binder and the value reads another mutable
+/// variable written earlier in the same transaction, so the write's key slot and its value
+/// slot both carry a type nothing else in the program states.
+///
+/// It is also the shape that survives constant folding. A program whose seed, key and value
+/// are all literals can be settled at compile time, and when that pass lands
+/// (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
+/// constant-folding later") the all-literal cases stop reaching the runtime path while
+/// staying green. This one cannot be folded.
+///
+/// The key still ranges over a literal extent. A key off a request stream — the storefront's
+/// `inventory[req.body.sku] := stock - qty` — has none, and no test reaches that yet.
+#[test]
+fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        n: Mut(Int, Txn) := 0
+        for x in [3, 4]:
+            with begin():
+                n := n + 1
+                m[x] := n + 1
+        await_final(m)
+    "#});
+    // `n` advances with the loop and the write reads it after its own update in the same
+    // transaction, so the two keys take different values.
+    assert_eq!(
+        map_entries_int(&value),
+        vec![(1, 10), (2, 20), (3, 2), (4, 3)]
+    );
 }

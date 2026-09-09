@@ -224,7 +224,7 @@ fn none() -> Value {
 ///
 /// A map value is a binding list, so it carries its own keys: it is complete wherever it is
 /// present, and absence needs no terminality wait. This is how a mutable collection's
-/// register holds its collection, at one store key.
+/// mutable variable holds its collection, at one store key.
 fn answer_in_value(key: &Value, m: &Value) -> Value {
     match m {
         Value::Function(bindings) => bindings
@@ -272,7 +272,7 @@ enum RowCollection<'a> {
     /// One collection shared by every row — the collection leg was closed in the iteration,
     /// so `zip` fanned it in as a constant and it arrives as a nested function tile.
     Shared(&'a Tile),
-    /// One materialized map value per row, as a mutable collection's register gives.
+    /// One materialized map value per row, as a mutable collection's mutable variable gives.
     PerRow(&'a ColumnValue),
 }
 

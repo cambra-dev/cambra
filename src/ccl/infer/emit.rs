@@ -1096,7 +1096,7 @@ fn emit_keyed_write<C: Typing>(
     // A **dependent** codomain has no write. The read discharges the key binder to the key
     // term and answers `Option` of the result; a write would have to state the obligation
     // on the value at a key the write itself is what makes present, and a `Mut(Map(𝐾, 𝑉))`
-    // register holds a fixed `𝑉` besides, so no register reaches this.
+    // mutable variable holds a fixed `𝑉` besides, so no mutable variable reaches this.
     if let Some(binder) = binder.as_ref()
         && crate::ccl::subst::codomain_depends_on(binder, &value)
     {
@@ -1409,7 +1409,7 @@ pub(super) fn read_through(ty: &Type) -> Type {
 ///
 /// Every tail is walked, [`TypedExprNode::MutDecl`] included: a mutable variable does not
 /// escape its introduction either, so a function whose body ends in a read of a
-/// register it declared is the same escape as one that returns a parameter. Each of
+/// mutable variable it declared is the same escape as one that returns a parameter. Each of
 /// these nodes reports its continuation's value, and none of them is a place a
 /// handle stops being one.
 fn denoted_expr(e: &Expr) -> &Expr {

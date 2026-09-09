@@ -444,8 +444,8 @@ is a morphism from a zip, `⟨𝑐, 𝑘⟩ ≫ lookup?`, and a collection reach
   optimization: a streamed collection cannot be replicated into every row, because
   broadcasting copies a single present value and a collection is a tile.
 - **One collection per position**, where the leg is a projection of the row. A mutable
-  collection's register read inside a transaction is the only producer: `transact_phase`
-  applies the writer body to a snapshot tuple, so the register arrives as `.n` of that tuple
+  collection's mutable variable read inside a transaction is the only producer: `transact_phase`
+  applies the writer body to a snapshot tuple, so the mutable variable arrives as `.n` of that tuple
   and no eta-reduction makes it closed again. Each row's cell is one materialized map value,
   and the lookup searches that value's bindings.
 

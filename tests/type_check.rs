@@ -5633,7 +5633,7 @@ fn checked_lookup_on_a_map_answers_the_value() {
 /// A keyed write is **application on the left of the assignment**: the collection at
 /// the key names the codomain the written value must satisfy, so `m[k]` means the same
 /// type whether it is read or written. Both sequencing domains take one, the domain
-/// being a property of the register rather than of the write.
+/// being a property of the mutable variable rather than of the write.
 #[rstest]
 #[case::induction(indoc! {r#"
     m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))

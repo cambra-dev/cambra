@@ -811,17 +811,17 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
 ///
 /// A concrete collection is a value of an abstract collection type only through an
 /// introduction: entering a sum is a term and not a subtyping edge
-/// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). A register annotated
+/// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). A mutable variable annotated
 /// `Mut(Map(𝐾, 𝑉), _)` holds the abstract map, whose key domain grows with every write,
-/// while its seed names one key domain — so the seed reaches the register's type through
+/// while its seed names one key domain — so the seed reaches the mutable variable's type through
 /// [`Builtin::Box`].
 ///
-/// Stating the register's value type on that introduction is also what keeps it. `unbox`
+/// Stating the mutable variable's value type on that introduction is also what keeps it. `unbox`
 /// erases a box whose **stated** sum lists one candidate, reading the kind off `box`'s own
 /// function type, and a described kind lists none
 /// (`src/ccl/planning/conditionals.rs`). So a seed built by a conditional still realizes —
 /// the fan-out acts on the inner, multi-candidate sum — while the introduction that states
-/// the register's type survives realization and carries the value into it.
+/// the mutable variable's type survives realization and carries the value into it.
 ///
 /// Runs after inference, so it stamps the types it builds and the CHECK-mode `typecheck`
 /// behind it validates them: the reconcile there is `derived <: recorded`, and the derived
@@ -864,12 +864,12 @@ fn view_at(e: &mut Expr, target: Type) {
 /// Rewrite every **keyed write** `m[k] := v` to the whole-value write it denotes:
 /// `m := insert(m, k, v)` ([`Builtin::Insert`]).
 ///
-/// A keyed register's history is `Txn ⇒ Map(𝐾, 𝑉)` under the overwrite law, like any
+/// A keyed mutable variable's history is `Txn ⇒ Map(𝐾, 𝑉)` under the overwrite law, like any
 /// other mutable variable, so a write replaces the whole collection. Every phase below
 /// therefore sees one kind of `MutWrite` and needs no notion of a key.
 ///
-/// **The whole collection is what commits.** The register's collection goes to one store
-/// key, and the rewritten value reads `m`, so the register is in its writer's read
+/// **The whole collection is what commits.** The mutable variable's collection goes to one store
+/// key, and the rewritten value reads `m`, so the mutable variable is in its writer's read
 /// footprint as well as its write set even where the source only wrote one key. Two
 /// transactions touching one map therefore conflict whatever keys they touch. Narrowing
 /// either footprint to the key is unbuilt and is scoped in

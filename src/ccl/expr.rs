@@ -533,7 +533,7 @@ pub enum TypedExprNode {
         /// The key written, for a write to one key of a mutable collection
         /// (`m[k] := v`); [`None`] for a whole-variable write (`x := v`).
         ///
-        /// A scalar register's key is its variable name, which `name` already
+        /// A scalar mutable variable's key is its variable name, which `name` already
         /// carries, so the two write forms differ in whether a *second* key sits
         /// below that one — which is what this option says. The store the write
         /// eliminates to is keyed either way.

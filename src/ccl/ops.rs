@@ -667,7 +667,7 @@ pub enum Builtin {
     /// absent. Applied as a tupled argument, the convention [`Self::GetPrevTxn`]
     /// shares: `Apply(Tuple([collection, key, value]), Builtin(Insert))`.
     ///
-    /// This is what a keyed write `m[k] := v` denotes; the register's history stays
+    /// This is what a keyed write `m[k] := v` denotes; the mutable variable's history stays
     /// `Txn ⇒ Map(𝐾, 𝑉)` under the overwrite law and the value written is the whole
     /// collection ([`crate::ccl::mut_elim::desugar_keyed_writes`]).
     ///
