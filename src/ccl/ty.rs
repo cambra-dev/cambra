@@ -1721,15 +1721,35 @@ impl Type {
 }
 
 impl Witness {
+    /// A binder and what it ranges over — the one place a [`Witness`] is formed, so the
+    /// invariant a candidate list rests on is stated once rather than at each constructor.
+    fn formed(id: WitnessId, range: Rc<TypeKind>) -> Witness {
+        // **A candidate is a domain, never itself a Σ.** Nested conditionals flatten into
+        // one candidate list at the slot the outer sum binds
+        // (`src/ccl/design/type-inference.md`, "Materialization"), which is what lets
+        // realization enumerate the list and lets kind containment compare two lists
+        // memberwise. A sum among the candidates binds a second witness one level down,
+        // where neither of those reads it.
+        if let TypeKind::Enumerated(domains) = &*range {
+            for d in domains {
+                assert!(
+                    d.witness_kind().is_none(),
+                    "a candidate domain is never itself a Σ: {d}"
+                );
+            }
+        }
+        Witness { id, range }
+    }
+
     /// The binder a written sum introduces — the only origination, and it happens where a
     /// sum is *built* ([`Type::sum_over`]) or where a kind variable picks its names
     /// ([`FunKindVar::binder_ids`]). A binder minted anywhere else is a second name for
     /// something that already had one.
     pub(crate) fn mint(type_kind: TypeKind) -> Witness {
-        Witness {
-            id: WitnessId(crate::ccl::infer_var::fresh_witness_binder_id()),
-            range: Rc::new(type_kind),
-        }
+        Witness::formed(
+            WitnessId(crate::ccl::infer_var::fresh_witness_binder_id()),
+            Rc::new(type_kind),
+        )
     }
 
     /// A settled binder re-formed from a name already in circulation and what it ranges
@@ -1741,19 +1761,13 @@ impl Witness {
         binder: crate::ccl::infer_var::WitnessBinderId,
         type_kind: TypeKind,
     ) -> Witness {
-        Witness {
-            id: WitnessId(binder),
-            range: Rc::new(type_kind),
-        }
+        Witness::formed(WitnessId(binder), Rc::new(type_kind))
     }
 
     /// A binder re-formed from an id already in circulation and what it ranges over — for a
     /// rename, which carries the binder to another id without changing what it stands for.
     pub fn with_id(id: WitnessId, type_kind: TypeKind) -> Witness {
-        Witness {
-            id,
-            range: Rc::new(type_kind),
-        }
+        Witness::formed(id, Rc::new(type_kind))
     }
 
     /// **Which binder this is.** The whole of identity; a caller that needs a name matches
@@ -1788,18 +1802,12 @@ impl Witness {
 
     /// This binder under another name, ranging over the same thing — an α-conversion.
     pub fn renamed(&self, id: WitnessId) -> Witness {
-        Witness {
-            id,
-            range: Rc::clone(&self.range),
-        }
+        Witness::formed(id, Rc::clone(&self.range))
     }
 
     /// This binder with `f` applied to each of its kind's children.
     pub fn map_types(&self, f: impl FnMut(&Type) -> Type) -> Witness {
-        Witness {
-            id: self.id,
-            range: Rc::new(self.range.map_children(f)),
-        }
+        Witness::formed(self.id, Rc::new(self.range.map_children(f)))
     }
 }
 
