@@ -33,7 +33,7 @@ one, so the operation layer has nothing to dispatch on between them.
 With `𝐷` a witness domain and `𝑛` a length. Each entry gives the type's semantics rather
 than its status: which lookups type-check today is in
 [Lookup: membership discharge](#lookup-membership-discharge), and `in` is [Planned] with the
-rest of the [operation layer](#operations-how-the-trait-layer-is-realized-planned).
+rest of the [operation layer](#operations-how-the-trait-layer-dispatches-planned).
 
 - **`Array(𝑛, 𝑇)`** = `[0, 𝑛) ⤇ 𝑇` — domain `UIntRange(n)`, length static.
   Ordered. Lookup `arr[𝑖] : 𝑇` is total, the index bound being static. This is the shape the
@@ -365,7 +365,7 @@ to search.
 
 1. **Take the key domain, the key binder and the codomain off the collection**
    (`keyed_access_types`). An abstract `Map(𝐾, 𝑉)` is a Σ over `SubtypesOf(𝐾)`, so the sum
-   is instantiated at `𝐾` by the ordinary Σ rule; a concrete `Map` is already the arrow.
+   is instantiated at `𝐾` by the ordinary Σ rule; a concrete `Map` is already the function.
 2. **Substitute the key term for the key binder** in the codomain (`keyed_value_at`), so a
    group-by's `𝑔[𝑘]` answers the group refined at `𝑘`
    (`a_key_dependent_lookup_discharges_the_key_binder`).

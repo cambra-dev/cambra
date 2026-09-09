@@ -1549,7 +1549,11 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
 /// Every spelling is one situation — a single lookup, a lookup beside an iteration, a
 /// discharge through a higher-order parameter — so one rejection covers them and the
 /// programs are carried here rather than each keeping a test of a value it cannot produce.
-/// What returns them is `g[k]?`, a different program with `Option` handling.
+/// What returns them is `g[k]?`, a different program with `Option` handling, and it needs
+/// two things that do not exist: a **dependent** lookup, because a group-by's codomain
+/// names its key binder, and then a materialization for a collection-valued `some` payload
+/// (`src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`";
+/// `a_group_valued_lookup_is_rejected_by_name` is the second one as a whole program).
 ///
 /// The discharge two of them tested is re-expressed rather than dropped: a filtered
 /// comprehension over the parameter is dependent for the ordinary reason and needs no
