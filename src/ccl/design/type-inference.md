@@ -706,7 +706,7 @@ predicate re-stamping pass; with no rewrite-only pass left to wrap, the
 end-to-end assertion is the whole guard. `ccl_utils::distinct_predicate_rcs`
 remains available for one, should a future pass need wrapping.)
 
-A predicate *function* `p : 𝐷 ⇒ Bool` never lives in a refinement type — only in
+A predicate *function* `p : 𝐷 ⤇ Bool` never lives in a refinement type — only in
 a *term* (an `Apply(p, Iterate/Restrict)` argument). In a type it is represented
 bare as `__elem ▷ p` (`ccl_utils::bare_predicate_of_fn`; its inverse
 `planning::fn_of_bare_predicate` recovers `p` when a term needs the function,
