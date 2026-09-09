@@ -1502,6 +1502,23 @@ impl OpenRecording {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many nodes the predicate sweep has skipped on this thread.
+    ///
+    /// A skip is one node the sweep would otherwise have clobbered, so the count
+    /// is the size of the damage the skip prevents. No leak class can see it — a
+    /// clobbered node is still explained — which is why it is counted rather than
+    /// asserted away.
+    static PREDICATE_SWEEP_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the predicate-sweep skip count and reset it.
+#[cfg(test)]
+pub(crate) fn take_predicate_sweep_skips() -> usize {
+    PREDICATE_SWEEP_SKIPS.with(|n| n.replace(0))
+}
+
 /// Record one node of a **refinement predicate**, unless it is already
 /// explained.
 ///
@@ -1514,9 +1531,10 @@ impl OpenRecording {
 /// The skip is the whole point. A node the main-tree walk already explained has
 /// a precise span and label; re-recording it here would replace both with this
 /// sweep's coarse ones, because the fold is last-write-wins. Without the skip
-/// the sweep clobbers nodes the main-tree walk already explained, and no leak
-/// class reports anything, since a clobbered node is still explained.
-/// `the_predicate_sweep_skips_already_recorded_nodes` pins the skip.
+/// the sweep clobbers 30 nodes over the pipeline corpus, and no leak class
+/// reports anything, since a clobbered node is still explained.
+/// `the_predicate_sweep_skips_already_recorded_nodes` pins the skip and
+/// `the_predicate_sweep_skips_this_many_nodes_over_the_corpus` pins its size.
 pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
     if id == NodeId::PLACEHOLDER {
         return;
@@ -1524,6 +1542,8 @@ pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, la
     ACTIVE_LOWERING_LOG.with(|slot| {
         if let Some(rec) = slot.borrow_mut().as_mut() {
             if !rec.recorded.insert(id) {
+                #[cfg(test)]
+                PREDICATE_SWEEP_SKIPS.with(|n| n.set(n.get() + 1));
                 return;
             }
             rec.log.push(LoweringStep::Leaf {
@@ -3084,12 +3104,42 @@ mod tests {
         table.into_table()
     }
 
+    /// The skip's size, over the pipeline corpus.
+    ///
+    /// The unit test above pins that the skip happens; this pins how much it is
+    /// worth. Both matter because no leak class can see the difference: a node
+    /// the sweep clobbers is still explained, so without this number a
+    /// regression that removed the skip would show up nowhere.
+    ///
+    /// The number moves when the corpus does. It is a measurement, not a bound —
+    /// update it and say what changed.
+    #[test]
+    fn the_predicate_sweep_skips_this_many_nodes_over_the_corpus() {
+        use crate::ccl::context::{GlobalContext, compile_program};
+        use crate::ccl::test_corpus::pipeline_corpus;
+        use crate::interpreter::Consumer;
+
+        let _ = take_predicate_sweep_skips();
+        let mut total = 0usize;
+        for (name, code) in pipeline_corpus() {
+            let mut ctx = GlobalContext::default();
+            let consumer: Box<dyn Consumer> = Box::new(|| {});
+            compile_program(&mut ctx, &code, consumer)
+                .unwrap_or_else(|e| panic!("{name}: expected a successful compile, got {e:?}"));
+            total += take_predicate_sweep_skips();
+        }
+        assert_eq!(
+            total, 30,
+            "the predicate sweep skipped {total} nodes over the corpus",
+        );
+    }
+
     /// The predicate sweep must not overwrite attribution a node already has.
     ///
     /// This is the one property of `lowering_predicate_leaf` that **no leak class
     /// can see**: the fold is last-write-wins, so a node re-recorded by the sweep
     /// is still explained — it has swapped its real span and label for the
-    /// sweep's coarse ones. A blanket sweep clobbers nodes across the pipeline
+    /// sweep's coarse ones. A blanket sweep clobbers 30 nodes over the pipeline
     /// corpus and every gate stays green.
     #[test]
     fn the_predicate_sweep_skips_already_recorded_nodes() {

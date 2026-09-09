@@ -49,12 +49,13 @@ relation a consumer walks.
 
 A node carries `role` (`operator`, `source`, `sink`), a `tiling` for an operator
 and none for a boundary, and `inputs`: `{ role, kind, deferred, subscribed }`. An
-edge's `kind` is `value` for an exclusively owned input, `share` for one several
-consumers may reach, `feedback` for a share that closes a cycle. These are
-construction edges — which operator holds which — stored on the consumer, so
-`subscribed` names the node read and the recorded relation runs against dataflow.
-Runtime dataflow follows `get` and `notify`, a different relation, and nothing on
-this wire says the two coincide.
+edge's `kind` is `value` for an exclusively owned input and `share` for one
+several consumers may reach; `deferred` marks a `value` edge wired through a
+`CycleSlot` after its consumer was constructed, which is when rather than how it
+is held. An edge is a
+subscription, stored on the consumer: `subscribed` names the operator it holds and
+calls `get` on, so the relation runs against dataflow. `notify` runs the other
+way.
 
 ## Regenerating
 

@@ -17,9 +17,14 @@
 //! installs around conversion. Outside a session every record is a no-op, which
 //! is what keeps the operator constructions in engine tests from accumulating.
 //!
-//! What the edges mean: they are **construction** edges — which operator holds
-//! which, and how. Runtime dataflow follows `get` and `notify`, which is a
-//! different relation, and nothing here asserts the two coincide.
+//! What the edges mean: an edge is a **subscription** — the consumer holds the
+//! operator it names and calls `get` on it. `notify` runs the other way, so an
+//! edge is the pull direction rather than dataflow as a whole.
+//!
+//! Two edges are held without being subscribed. A read of a data source names a
+//! node that is not an operator, so there is nothing to subscribe. A
+//! `FanOutBranch` that loses `should_subscribe` holds the fan input like its
+//! siblings while one branch drives the subscribe for all of them.
 //!
 //! Degrees are counted in dataflow direction — a source has in-degree 0, a sink
 //! out-degree 0 — while a recorded edge is stored on the consumer and names the
@@ -254,10 +259,11 @@ impl OperatorGraph {
 /// Two invariants, neither type-enforced:
 ///
 /// * **The value edges form a forest.** Ownership is single because every owned
-///   input is a `Box`. Acyclicity is separate: a cycle needs an input wired after
-///   its owner existed, and every such cycle also runs through a fan branch's
-///   `Share` hop, so no cycle is made of value edges alone. The renderer's
-///   absence of a cycle guard rests on this.
+///   input is a `Box`. Acyclicity follows from the other two assertions rather
+///   than standing on its own: a value cycle's members each have their only
+///   value parent inside the cycle, so none is a walk start and no value edge
+///   enters from outside, which the reachability check reports as stranded. The
+///   renderer's absence of a cycle guard rests on this.
 /// * **Every node is reachable from [`OperatorGraph::walk_starts`] along the `Value`
 ///   edges.** That relation is the one every consumer walks — the renderer draws
 ///   value edges as the child relation and share edges as reference leaves — so a

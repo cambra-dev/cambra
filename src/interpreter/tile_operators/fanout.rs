@@ -244,7 +244,7 @@ impl TileOperator for FanOutBranch {
             let mut shared = self.shared.borrow_mut();
             let index = shared.consumers.len();
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
-            shared.release_guards.push(self.base.tiling.empty_guard());
+            shared.release_guards.push(self.tiling().empty_guard());
             index
         }; // borrow released here before we might call input.subscribe
 
@@ -305,7 +305,7 @@ impl TileOperator for FanOutBranch {
         }
 
         Box::new(FanOutProducer {
-            base: ProducerBase::new(self.shared.borrow().id, &self.base.tiling),
+            base: ProducerBase::new(self.shared.borrow().id, self.tiling()),
             shared: self.shared.clone(),
             index,
         })
@@ -474,7 +474,7 @@ impl TileOperator for Memo {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MemoProducer {
-            base: ProducerBase::new(MemoProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(MemoProducer::alloc_id(), self.tiling()),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             cached_tile: self.tiling().empty_tile(),
             upstream_drained: false,

@@ -14,8 +14,8 @@ compile reads the lowering projection alone.
 
 | | |
 |---|---|
-| Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table and the ids a walk of it starts from), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
+| Input | a `CompiledProgram`: the pane trees, the operator graph, the provenance table, the lowering projection, the parsed surface AST, the source text |
+| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table, and a tree pane's root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | `src/inspector_server`, which serves the payload, and the `cambra-inspector/web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
@@ -52,7 +52,7 @@ payload built at compile time.
 That path needs node identity in operator conversion and a tick channel. The first exists —
 conversion records, and `post-conversion` is a pane — and the tick channel does not. On the first,
 see
-[provenance.md](../ccl/design/provenance.md#panes-past-post-planning).
+[provenance.md](../ccl/design/provenance.md#operator-conversion).
 
 It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.
@@ -79,9 +79,10 @@ node is that pane's own answer.
 
 ### A node on the wire
 
-A tree pane ships `nodes`, every node of that pane exactly once, and `root`, the id its walk starts
-from — one id, since a tree has one by construction. The operator pane names no start at all, and
-carries neither key.
+A tree pane ships `nodes`, every node of that pane exactly once, and `root`, the root of the
+expression the pane is. The producer hands `root` over rather than deriving it. The operator pane
+has no root and ships none; where a walk of it begins is derived from its edges, which the
+producer does not ship either.
 
 A node reached from several places — a shared refinement predicate, most often — is one entry that
 several children name. The order is first-visit pre-order, so the payload is byte-reproducible.
@@ -251,7 +252,7 @@ name is a field rather than a node, so the only span available is the whole node
 covering a statement would contain the narrower uses inside it, and a consumer takes the first
 containing row, so a broad row would shadow them. Those uses contribute none: `out` in
 `out << value` does not resolve to its declaration. Closing it needs a span on the name field, which
-is a `ccl` change. Over the fixture corpus a small minority of rows.
+is a `ccl` change.
 
 This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
 and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a

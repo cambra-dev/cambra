@@ -282,24 +282,15 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     expect(() => validateSnapshot(missing)).toThrow(/panes\[0\]\.root.*number/);
   });
 
-  it("throws when a pane carries a walk-start key it has no business with", () => {
+  it("throws when an operator pane ships a walk start", () => {
     // A tree's start is singular by type, so nothing has to assert that it is
-    // one id. What has to be pinned is that a tree does not carry the retired
-    // `unowned`, and that an operator pane carries neither key.
-    const treeWithUnowned = minimalSuccess();
-    (treeWithUnowned.panes as Record<string, unknown>[])[0].unowned = [0];
-    expect(() => validateSnapshot(treeWithUnowned)).toThrow(
-      /panes\[0\]\.unowned.*absent on a tree pane/,
+    // one id. What has to be pinned is that an operator pane, whose starts are
+    // derived from the edges, ships none for them to disagree with.
+    const graphWithRoot = minimalSuccess();
+    (graphWithRoot.panes as Record<string, unknown>[])[OPERATORS].root = 0;
+    expect(() => validateSnapshot(graphWithRoot)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.root.*absent on an operator pane`),
     );
-
-    for (const retired of ["root", "unowned"] as const) {
-      const graphWithKey = minimalSuccess();
-      (graphWithKey.panes as Record<string, unknown>[])[OPERATORS][retired] =
-        retired === "root" ? 0 : [0];
-      expect(() => validateSnapshot(graphWithKey)).toThrow(
-        new RegExp(`panes\\[${OPERATORS}\\]\\.${retired}.*absent on an operator pane`),
-      );
-    }
   });
 
   it("accepts an operator pane where several nodes are subscribed by nothing", () => {

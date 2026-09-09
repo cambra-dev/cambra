@@ -53,7 +53,7 @@ impl TileOperator for Constant {
     ) -> Box<dyn TileProducer> {
         consumer.notify();
         Box::new(ConstantProducer {
-            base: ProducerBase::new(ConstantProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling()),
             value: self.value.clone(),
             released: false,
         })
@@ -106,8 +106,7 @@ impl TileProducer for ConstantProducer {
 pub struct ToScalar {
     /// The `SealedFunction`-typed input to unwrap.
     input: Box<dyn TileOperator>,
-    /// Identity and the output tiling: the codomain of the input's
-    /// `SealedFunction` tiling.
+    /// Output tiling: the codomain of the input's `SealedFunction` tiling.
     base: OperatorBase<ToScalar>,
 }
 
@@ -147,7 +146,7 @@ impl TileOperator for ToScalar {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(ToScalarProducer {
-            base: ProducerBase::new(ToScalarProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(ToScalarProducer::alloc_id(), self.tiling()),
             input: input_producer,
         })
     }
@@ -178,7 +177,7 @@ pub struct VariantWrap {
     tag: FieldKey,
     /// Per-variant extents of the full union; `input` feeds the `tag` arm.
     variant_extents: TagMap<Extent>,
-    /// Identity and the output tiling — `Scalar(Union)` for a scalar payload, or
+    /// Output tiling — `Scalar(Union)` for a scalar payload, or
     /// `SealedFunction { D ⇒ Scalar(Union) }` for a payload stream.
     base: OperatorBase<VariantWrap>,
 }
@@ -256,7 +255,7 @@ impl TileOperator for VariantWrap {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantWrapProducer {
-            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(VariantWrapProducer::alloc_id(), self.tiling()),
             input,
             tag: self.tag.clone(),
             variant_extents: self.variant_extents.clone(),
@@ -392,7 +391,7 @@ pub struct VariantProject {
     /// alongside the tiling so an empty result can be built at the right column
     /// shape without destructuring it back out.
     payload_extent: Extent,
-    /// Identity and the output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
+    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
     base: OperatorBase<VariantProject>,
 }
 
@@ -452,7 +451,7 @@ impl TileOperator for VariantProject {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantProjectProducer {
-            base: ProducerBase::new(VariantProjectProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(VariantProjectProducer::alloc_id(), self.tiling()),
             input,
             tag: self.tag.clone(),
             payload_extent: self.payload_extent.clone(),

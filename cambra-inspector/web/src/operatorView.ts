@@ -10,10 +10,11 @@
 // - **Share edges are reference rows.** A leaf naming its target, clickable, so
 //   a reader follows sharing without the subtree being drawn twice.
 //
-// Every cycle in the graph runs through a value edge wired late — the `late`
-// marker — so following the value edges from the walk starts terminates without a
-// cycle guard only because those late edges each land on a node already drawn
-// above them.
+// Following the value edges from the walk starts terminates without a cycle
+// guard, including across a value edge wired late — the `late` marker. A cycle
+// among the value edges would have every member's only value parent inside the
+// cycle, so no member is a walk start and no value edge enters from outside;
+// `assert_graph_invariants` rejects that as unreachable from the starts.
 //
 // The walk starts at the nodes no value edge subscribes: a sink per
 // compiled output, a fan input per share point, and a source per registered data
@@ -23,6 +24,7 @@
 // one-node tree.
 
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
+import { isChildEdge, walkStarts } from "./types";
 import type { Resolved, Store } from "./store";
 
 // Depth to expand to on first render, matching the tree panes'.
@@ -35,26 +37,6 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
-}
-
-// An edge the child relation follows, as against one it renders as a reference.
-function isChildEdge(edge: OperatorEdge): boolean {
-  return edge.kind === "value";
-}
-
-/**
- * The nodes no value edge subscribes, in table order — where each tree of the
- * forest starts.
- *
- * Derived rather than shipped: a node's owner is the one value edge naming it,
- * so the table already answers this. `wireValidate.ts` pins that these reach
- * every node.
- */
-function walkStarts(pane: OperatorPane): number[] {
-  const subscribed = new Set(
-    pane.nodes.flatMap((n) => n.inputs.filter(isChildEdge).map((e) => e.subscribed)),
-  );
-  return pane.nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
 }
 
 // `Restrict [0,100] #4021`, or `Sink(main) #4103` for a boundary node, which has
@@ -88,7 +70,7 @@ export class OperatorView {
     this.nodeById = new Map(pane.nodes.map((n) => [n.nodeId, n]));
 
     const renderRoot = el("div", "tree-root");
-    for (const id of walkStarts(pane)) {
+    for (const id of walkStarts(pane.nodes)) {
       const node = this.nodeById.get(id);
       if (node) renderRoot.appendChild(this.renderNode(node, null, 0, null));
     }
@@ -264,6 +246,6 @@ export function serializeOperatorGraph(pane: OperatorPane): string {
       }
     }
   };
-  for (const start of walkStarts(pane)) walk(start, null, 0);
+  for (const start of walkStarts(pane.nodes)) walk(start, null, 0);
   return lines.join("\n");
 }

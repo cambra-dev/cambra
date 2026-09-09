@@ -17,8 +17,7 @@ use crate::{
 /// `input` must be a `SealedFunction` or `CurriedFunction` tile, with the appropriate level
 /// of nesting.
 pub struct MapResult {
-    /// Identity and the output tiling, which matches `input` tiling with the
-    /// codomain transformed according to `function`.
+    /// Output tiling matches `input` tiling, transforming the codomain according to `function`.
     base: OperatorBase<MapResult>,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
@@ -170,7 +169,7 @@ impl TileOperator for MapResult {
             scheduler,
         );
         Box::new(MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling()),
             input: input_producer,
             function: function_producer,
         })
@@ -520,8 +519,7 @@ impl TileProducer for MapResultProducer {
 ///
 /// `input` must be a `SealedFunction` or `CurriedFunction` tile; `constant` must be a Scalar.
 pub struct MapResultToConst {
-    /// Identity and the output tiling, which matches `input` tiling with the
-    /// codomain transformed to `constant`.
+    /// Output tiling matches `input` tiling, transforming the codomain to `constant`.
     base: OperatorBase<MapResultToConst>,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
@@ -598,7 +596,7 @@ impl TileOperator for MapResultToConst {
             scheduler,
         );
         Box::new(MapResultToConstProducer {
-            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), self.tiling()),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -727,8 +725,7 @@ pub struct MapResultWithSource {
     input: Box<dyn TileOperator>,
     /// The data source providing both domain keys and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    /// Identity and the output tiling:
-    /// `SealedFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
+    /// Output tiling: `SealedFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
     base: OperatorBase<MapResultWithSource>,
 }
 

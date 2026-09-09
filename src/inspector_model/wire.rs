@@ -107,9 +107,11 @@ pub struct PaneEntry {
     /// [`nodes`](Self::nodes) holds: `"holes"` for a tree inference has not run
     /// on yet, `"typed"` for one it has, `"operators"` for the dataflow graph.
     pub kind: &'static str,
-    /// The id a consumer starts walking [`nodes`](Self::nodes) from, on a tree
-    /// pane. A tree has exactly one by construction, so the field is singular
-    /// and absent on an operator pane.
+    /// The root node of a tree pane's expression, shipped because the compiler
+    /// hands it over — it is the pane's own `Expr`, not something read back off
+    /// the node table. An operator graph has no root, so this is absent there;
+    /// where that pane's walk begins is derived from its edges instead, which is
+    /// a different question with a different answer set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<u64>,
     /// Every node of this pane exactly once, in first-visit pre-order for a
@@ -133,30 +135,18 @@ pub enum PaneNodes {
     Operators(Vec<OperatorNode>),
 }
 
+#[cfg(test)]
 impl PaneNodes {
     /// Every node's id, in table order.
-    pub fn ids(&self) -> Vec<u64> {
+    pub(crate) fn ids(&self) -> Vec<u64> {
         match self {
             PaneNodes::Ir(nodes) => nodes.iter().map(|n| n.node_id).collect(),
             PaneNodes::Operators(nodes) => nodes.iter().map(|n| n.node_id).collect(),
         }
     }
 
-    /// How many nodes the pane holds.
-    pub fn len(&self) -> usize {
-        match self {
-            PaneNodes::Ir(nodes) => nodes.len(),
-            PaneNodes::Operators(nodes) => nodes.len(),
-        }
-    }
-
-    /// Whether the pane holds no nodes.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// The expression nodes, or `None` for an operator pane.
-    pub fn ir(&self) -> Option<&[IrNode]> {
+    pub(crate) fn ir(&self) -> Option<&[IrNode]> {
         match self {
             PaneNodes::Ir(nodes) => Some(nodes),
             PaneNodes::Operators(_) => None,
@@ -1202,7 +1192,7 @@ mod tests {
                     PaneNodes::Ir(nodes) => {
                         assert!(
                             pane.root.is_some(),
-                            "a tree pane ships the one root its walk starts from; {} ships none",
+                            "a tree pane ships the root of its expression; {} ships none",
                             pane.id
                         );
                         for node in nodes {

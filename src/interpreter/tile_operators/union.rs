@@ -26,7 +26,6 @@ use crate::{
 /// already computed, by inference, and stamped on the union node as its value
 /// type. It is passed in rather than re-derived here (see [`new`](Self::new)).
 pub struct UnionOperator {
-    /// Identity and the output tiling: a `SealedFunction` over the arms' domains.
     base: OperatorBase<UnionOperator>,
     /// Input operators; each must have a `SealedFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
@@ -308,7 +307,7 @@ impl TileOperator for UnionOperator {
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling()),
             inputs: input_producers,
             flat: self.flat,
         })

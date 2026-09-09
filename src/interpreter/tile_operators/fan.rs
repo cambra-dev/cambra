@@ -18,10 +18,9 @@ use crate::{
 /// All inputs must have `SealedFunction` tilings with compatible domains.
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct FanIn {
-    /// Identity and the output tiling: either a
-    /// `SealedFunction { domain, codomain: Record { … } }` or a
-    /// `CurriedFunction { domain1, domain2, codomain: Record { … } }`, depending
-    /// on the input operators.
+    /// Output tiling: either a `SealedFunction { domain, codomain: Record { … } }`
+    /// or a `CurriedFunction { domain1, domain2, codomain: Record { … } }`,
+    /// depending on the input operators.
     base: OperatorBase<FanIn>,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
@@ -214,7 +213,7 @@ impl TileOperator for FanIn {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(FanInProducer {
-            base: ProducerBase::new(FanInProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(FanInProducer::alloc_id(), self.tiling()),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -457,7 +456,6 @@ impl TileProducer for FanInProducer {
 /// each input must produce a `Tile::Scalar` and the output is a
 /// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
 pub struct ScalarFanIn {
-    /// Identity and the output tiling: a `Record` of the inputs' scalar tilings.
     base: OperatorBase<ScalarFanIn>,
     /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<String>,
@@ -531,7 +529,7 @@ impl TileOperator for ScalarFanIn {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(ScalarFanInProducer {
-            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), self.tiling()),
             names: self.names.clone(),
             inputs: self
                 .inputs

@@ -75,8 +75,8 @@ impl CompiledProgram {
     }
 
     /// The retained pane trees, in pipeline order, element for element with
-    /// [`PANES`]. The length is [`PANES`]' own, so the two cannot disagree about
-    /// how many panes there are.
+    /// [`PANES`]' leading [`PaneKind::Ir`] entries. [`IR_PANE_COUNT`] is pinned
+    /// against [`PANES`], so the two cannot disagree about how many there are.
     ///
     /// The inspector model reads this alongside [`PANES`] to build one snapshot
     /// pane per entry.
@@ -135,8 +135,8 @@ pub(crate) struct PaneSpec {
     /// The fold reads id sets rather than content, so this distinction reaches
     /// only the consumers that render a pane. Declaration order is pipeline
     /// order and conversion runs last, so every [`PaneKind::Ir`] pane precedes
-    /// every [`PaneKind::Operators`] one — asserted by
-    /// `ir_panes_precede_operator_panes`.
+    /// every [`PaneKind::Operators`] one, which the assertion under
+    /// [`IR_PANE_COUNT`] pins.
     pub(crate) content: PaneKind,
     /// The phases that ran between the previous pane and this one — the set
     /// [`CompiledProgram::materialize_panes`] restricts the whole-compile table
@@ -170,9 +170,8 @@ pub(crate) struct PaneSpec {
 
 /// How many panes hold an expression tree.
 ///
-/// [`CompiledProgram::pane_trees`]' arity. The [`PaneKind::Ir`] entries of
-/// [`PANES`] match that array element for element, in order, and nothing
-/// enforces it.
+/// [`CompiledProgram::pane_trees`]' arity. The assertion below pins it against
+/// [`PANES`], so the trees zip against the [`PaneKind::Ir`] entries in order.
 pub(crate) const IR_PANE_COUNT: usize = 6;
 
 /// The pipeline's panes, in pipeline order, each naming the phases that produced
@@ -235,6 +234,22 @@ pub(crate) const PANES: [PaneSpec; 7] = [
         gated: true,
     },
 ];
+
+/// [`PANES`]' [`PaneKind::Ir`] entries are exactly its leading [`IR_PANE_COUNT`].
+///
+/// [`CompiledProgram::pane_ids`] zips the trees against them in declaration
+/// order, so both the count and the position are load-bearing. Counting is O(1)
+/// at compile time, which is what keeps the two declarations from drifting.
+const _: () = {
+    let mut i = 0;
+    while i < PANES.len() {
+        assert!(
+            matches!(PANES[i].content, PaneKind::Ir) == (i < IR_PANE_COUNT),
+            "PANES' `Ir` entries must be exactly its leading `IR_PANE_COUNT` entries",
+        );
+        i += 1;
+    }
+};
 
 /// One adjacent pair of panes and everything the fold derives for it.
 // Consumed by the inspector model; the compiler reads only `leaks` and `gated`.
@@ -342,81 +357,8 @@ mod tests {
         provenance_capture_enabled,
     };
     use crate::ccl::provenance::Link;
+    use crate::ccl::test_corpus::pipeline_corpus as corpus;
     use crate::interpreter::Consumer;
-
-    /// The pane-measurement corpus: every demo-gallery program that compiles
-    /// today, plus four inline programs covering the phases the gallery does not
-    /// reach (a `with begin():` transaction, a group-by, a UDF chain, and a
-    /// nested comprehension).
-    ///
-    /// The gallery's remaining programs are excluded for reasons unrelated to
-    /// provenance: most are deliberate *failure* fixtures (`while`, record-term
-    /// syntax, `Feed(_)` types) that pin errors and so have no panes to fold,
-    /// and the three HTTP demos bind a real listening socket during lowering,
-    /// which collides with itself under a parallel test runner.
-    fn corpus() -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "arithmetic",
-                include_str!("../../tests/programs/arithmetic/program.cambra").to_string(),
-            ),
-            (
-                "filter_and_aggregate",
-                include_str!("../../tests/programs/filter_and_aggregate/program.cambra").to_string(),
-            ),
-            (
-                "for_accumulator",
-                include_str!("../../tests/programs/for_accumulator/program.cambra").to_string(),
-            ),
-            (
-                "generator_pipeline",
-                include_str!("../../tests/programs/generator_pipeline/program.cambra").to_string(),
-            ),
-            (
-                "inner_join",
-                include_str!("../../tests/programs/inner_join/program.cambra").to_string(),
-            ),
-            (
-                "join_then_groupby",
-                include_str!("../../tests/programs/join_then_groupby/program.cambra").to_string(),
-            ),
-            (
-                "prefix_lines",
-                include_str!("../../tests/programs/prefix_lines/program.cambra").to_string(),
-            ),
-            (
-                "streaming_echo",
-                include_str!("../../tests/programs/streaming_echo/program.cambra").to_string(),
-            ),
-            (
-                "transaction",
-                "out = defer()\n\
-                 pool: Mut(Int, Txn) := 100\n\
-                 for r in [10, 20, 30]:\n\
-                 \x20   with begin():\n\
-                 \x20       pool := pool - r\n\
-                 with begin():\n\
-                 \x20   out << pool\n\
-                 out\n"
-                    .to_string(),
-            ),
-            (
-                "group_by",
-                "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]\n"
-                    .to_string(),
-            ),
-            (
-                "udf_chain",
-                "def double(x):\n    x * 2\ndef bump(x):\n    double(x) + 1\n\
-                 xs = [1, 2, 3]\n[bump(x) for x in xs]\n"
-                    .to_string(),
-            ),
-            (
-                "feed_loop",
-                "out = defer()\nfor x in [1, 2, 3]:\n    out << x * 2\nout\n".to_string(),
-            ),
-        ]
-    }
 
     /// Compile `code` through the full pipeline, panicking on error.
     fn compile_ok(code: &str) -> CompiledProgram {
@@ -1301,12 +1243,14 @@ mod tests {
                 cyclic_programs += 1;
                 assert!(
                     deferred > 0,
-                    "{name}: the graph has a cycle and no deferred edge, so a construct closed a                      cycle without a `CycleSlot` and the cycle set no longer names it",
+                    "{name}: the graph has a cycle and no deferred edge, so a construct closed a \
+                     cycle without a `CycleSlot` and the cycle set no longer names it",
                 );
             }
             assert!(
                 subscription_relation_is_acyclic(graph, true),
-                "{name}: a cycle survives with the {deferred} deferred edge(s) removed, so the                  deferred edges are not the cycle set a layout can cut",
+                "{name}: a cycle survives with the {deferred} deferred edge(s) removed, so the \
+                 deferred edges are not the cycle set a layout can cut",
             );
         }
         assert!(

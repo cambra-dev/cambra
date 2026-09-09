@@ -13,9 +13,9 @@
 // their kinds and the adjacent paneLinks windows (dense — self-edges legal,
 // every edge endpoint a live node id in its pane); a degraded
 // (`payloadKind: "failed"`) payload ships empty panes/paneLinks; each pane's
-// node table is closed under its own edges, and reachable from where its walk
-// starts — the one `root` a tree pane names, and on an operator pane the nodes
-// no `value` edge subscribes, derived; and every node's `rewritten` tag stays inside the pinned
+// node table is closed under its own edges, and reachable from where a walk of it
+// begins — a tree pane's shipped `root`, and on an operator pane the nodes no
+// `value` edge subscribes, derived; and every node's `rewritten` tag stays inside the pinned
 // vocabulary. Extend both validators together.
 //
 // One contract, no relaxations: a committed fixture is a whole payload document,
@@ -31,6 +31,7 @@ import type {
   Snapshot,
   Span,
 } from "./types";
+import { walkStarts } from "./types";
 
 class WireError extends Error {
   constructor(path: string, expected: string, got: unknown) {
@@ -181,11 +182,6 @@ function validateNode(v: unknown, path: string): IrNode {
   return v as IrNode;
 }
 
-// One entry of the operator pane's node table: an operator, or one of the two
-// program boundaries. It shares an id, a span table and a rewrite tag with a
-// tree node and nothing else, so the two fields that carry a tree node's
-// content are asserted absent here exactly as `tiling` is asserted absent
-// there.
 // Every span a node's attribution records, narrowest first and each once — the
 // table the spatial queries scan. Both node shapes carry the channel and both
 // carry the same contract, so both read it here.
@@ -207,6 +203,11 @@ function validateSpans(v: unknown, path: string): void {
   });
 }
 
+// One entry of the operator pane's node table: an operator, or one of the two
+// program boundaries. It shares an id, a span table and a rewrite tag with a
+// tree node and nothing else, so the two fields that carry a tree node's
+// content are asserted absent here exactly as `tiling` is asserted absent
+// there.
 function validateOperatorNode(v: unknown, path: string): OperatorNode {
   const o = obj(v, path);
   str(o.label, `${path}.label`);
@@ -262,10 +263,10 @@ function validateChild(v: unknown, path: string): IrChild {
 // The closure check is what the table buys over the nested tree it replaced — an
 // edge a consumer follows always lands on an entry the pane holds.
 //
-// A tree pane ships `root`, one id by construction. An operator pane ships no
-// start set: the nodes no `value` edge subscribes are what a walk starts from,
-// and the `inputs` already say which those are, so shipping them could only add
-// a channel that disagrees. This derives them and checks they reach every node.
+// A tree pane ships `root`, the expression the pane is. An operator graph has no
+// root; the nodes no `value` edge subscribes are where a walk of it begins, and
+// the `inputs` already say which those are, so shipping them could only add a
+// channel that disagrees. This derives them and checks they reach every node.
 // A node outside that closure is one the pane holds, that pane links land on,
 // and that no view draws; only a whole-graph walk sees it, since every
 // individual edge and id resolves.
@@ -284,27 +285,23 @@ function validatePane(v: unknown, path: string): PaneEntry {
   if (o.spanIndex !== undefined) throw new WireError(`${path}.spanIndex`, "absent", o.spanIndex);
   const operators = kind === "operators";
 
-  // A tree pane's one walk start. An operator pane names none, and both keys are
-  // pinned absent on it so a stale producer says what happened.
-  let starts: number[] = [];
+  // A tree pane ships the root of its expression; an operator pane has no root
+  // and derives where a walk of it begins from the edges, so `root` is pinned
+  // absent there. The two are different questions, so only this one is a field.
+  let rootId: number | null = null;
   if (operators) {
-    for (const retired of ["root", "unowned"] as const) {
-      if (o[retired] !== undefined) {
-        throw new WireError(`${path}.${retired}`, "absent on an operator pane", o[retired]);
-      }
+    if (o.root !== undefined) {
+      throw new WireError(`${path}.root`, "absent on an operator pane", o.root);
     }
   } else {
-    if (o.unowned !== undefined) {
-      throw new WireError(`${path}.unowned`, "absent on a tree pane", o.unowned);
-    }
-    starts = [num(o.root, `${path}.root`)];
+    rootId = num(o.root, `${path}.root`);
   }
 
   const rawNodes = arr(o.nodes, `${path}.nodes`);
   const ids = new Set<number>();
 
-  // The table holds each node once, and the walk starts name entries of it. Both
-  // hold whichever shape the nodes are, so they run off the ids alone.
+  // The table holds each node once, and a tree pane's root is an entry of it.
+  // Both hold whichever shape the nodes are, so they run off the ids alone.
   const closeOverIds = (validated: readonly { nodeId: number }[]): void => {
     validated.forEach((n, i) => {
       if (ids.has(n.nodeId)) {
@@ -316,10 +313,8 @@ function validatePane(v: unknown, path: string): PaneEntry {
       }
       ids.add(n.nodeId);
     });
-    for (const start of starts) {
-      if (!ids.has(start)) {
-        throw new WireError(`${path}.root`, "an id present in this pane's nodes", start);
-      }
+    if (rootId !== null && !ids.has(rootId)) {
+      throw new WireError(`${path}.root`, "an id present in this pane's nodes", rootId);
     }
   };
 
@@ -343,11 +338,8 @@ function validatePane(v: unknown, path: string): PaneEntry {
     // closure is one no view draws and no selection can reach. A `value` cycle
     // fails it too: its members are all subscribed, so no walk enters them.
     const inputsById = new Map(nodes.map((n) => [n.nodeId, n.inputs]));
-    const subscribed = new Set(
-      nodes.flatMap((n) => n.inputs.filter((e) => e.kind === "value").map((e) => e.subscribed)),
-    );
     const reached = new Set<number>();
-    const stack = nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
+    const stack = walkStarts(nodes);
     while (stack.length > 0) {
       const id = stack.pop()!;
       if (reached.has(id)) continue;

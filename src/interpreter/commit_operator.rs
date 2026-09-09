@@ -910,13 +910,13 @@ impl TileOperator for CommitOperator {
             .collect::<Vec<_>>();
         let n = writer_producers.len();
         Box::new(CommitProducer {
-            base: ProducerBase::new(CommitProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(CommitProducer::alloc_id(), self.tiling()),
             writer_producers,
             consumed: vec![0; n],
             writer_terminal: vec![false; n],
             writer_write_keys: self.writer_write_keys.clone(),
             engine: CommitEngine::new(init),
-            output_tiling: self.base.tiling.clone(),
+            output_tiling: self.tiling().clone(),
             drain_start: 0,
         })
     }
@@ -1348,7 +1348,7 @@ impl TileOperator for InductionStore {
             body_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
         };
         Box::new(InductionStoreProducer {
-            base: ProducerBase::new(InductionStoreProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(InductionStoreProducer::alloc_id(), self.tiling()),
             // Seed tick 0 with the accumulators' inits, so the changelog is
             // self-describing: `read_as_of`/`store_value_at` fold to the init below
             // the first *iteration* change (a leading carry) without an external
@@ -1358,7 +1358,7 @@ impl TileOperator for InductionStore {
             body_producer,
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
-            output_tiling: self.base.tiling.clone(),
+            output_tiling: self.tiling().clone(),
         })
     }
 }
@@ -1625,7 +1625,7 @@ impl TileOperator for StoreValueStream {
             .store_op
             .subscribe(g, forwarding_consumer(&consumer), scheduler);
         Box::new(StoreValueStreamProducer {
-            base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), self.tiling()),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -1824,7 +1824,7 @@ impl TileOperator for StoreFinalRead {
             .store_op
             .subscribe(g, forwarding_consumer(&consumer), scheduler);
         Box::new(StoreFinalReadProducer {
-            base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), self.tiling()),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -1997,7 +1997,7 @@ impl TileOperator for StoreDenseRead {
                 .subscribe(g, forwarding_consumer(&consumer), scheduler)
         };
         Box::new(StoreDenseReadProducer {
-            base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), self.tiling()),
             trigger_producer,
             store_producer,
             key: self.key.clone(),
@@ -2369,12 +2369,12 @@ impl TileOperator for AsOf {
         let source = self
             .source
             .subscribe(sg, forwarding_consumer(&consumer), scheduler);
-        let b_extent = match &self.base.tiling {
+        let b_extent = match self.tiling() {
             Tiling::SealedFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiling is SealedFunction"),
         };
         Box::new(AsOfProducer {
-            base: ProducerBase::new(AsOfProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(AsOfProducer::alloc_id(), self.tiling()),
             trigger,
             source,
             output: self.output.clone(),
@@ -2873,7 +2873,7 @@ impl TileOperator for InductionDriver {
             scheduler,
         );
         Box::new(InductionDriverProducer {
-            base: ProducerBase::new(InductionDriverProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(InductionDriverProducer::alloc_id(), self.tiling()),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -3171,7 +3171,7 @@ impl TileOperator for TransactDriver {
             scheduler,
         );
         Box::new(TransactDriverProducer {
-            base: ProducerBase::new(TransactDriverProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(TransactDriverProducer::alloc_id(), self.tiling()),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -3630,7 +3630,7 @@ impl TileOperator for TransactWriter {
             self.driver_op
                 .subscribe(dg, forwarding_consumer(&consumer), scheduler);
         Box::new(TransactWriterProducer {
-            base: ProducerBase::new(TransactWriterProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(TransactWriterProducer::alloc_id(), self.tiling()),
             store_producer,
             body_producer,
             driver_producer,

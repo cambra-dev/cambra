@@ -71,7 +71,7 @@ impl TileOperator for IterateExtent {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let mut producer = Box::new(IterateExtentProducer {
-            base: ProducerBase::new(IterateExtentProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(IterateExtentProducer::alloc_id(), self.tiling()),
             extent: self.extent.clone(),
             released: Predicate::False,
         });

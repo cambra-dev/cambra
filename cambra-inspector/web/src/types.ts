@@ -150,8 +150,9 @@ interface PaneCommon {
 // post-inference on).
 export interface IrPane extends PaneCommon {
   kind: "holes" | "typed";
-  // The id the walk starts from — an entry of `nodes`. A tree has exactly one
-  // by construction, which is why the field is singular.
+  // The root node of this pane's expression, shipped by the producer. Not a
+  // derived walk start: the operator pane's starts are read off its edges, this
+  // is the tree the pane is.
   root: number;
   // Every node of this pane exactly once, in first-visit pre-order.
   nodes: IrNode[];
@@ -184,6 +185,30 @@ export type PaneEntry = IrPane | OperatorPane;
  */
 export function isIrPane(pane: PaneEntry): pane is IrPane {
   return pane.kind !== "operators";
+}
+
+/**
+ * An edge the child relation follows, as against one a view renders as a
+ * reference.
+ */
+export function isChildEdge(edge: OperatorEdge): boolean {
+  return edge.kind === "value";
+}
+
+/**
+ * The nodes no value edge subscribes, in table order — where each tree of the
+ * operator forest starts.
+ *
+ * Derived rather than shipped: a node's owner is the one value edge naming it,
+ * so the table already answers this, and a shipped copy could only disagree.
+ * Both the renderer and the validator read it here, so the derivation the
+ * validator pins is the one the renderer walks.
+ */
+export function walkStarts(nodes: readonly OperatorNode[]): number[] {
+  const subscribed = new Set(
+    nodes.flatMap((n) => n.inputs.filter(isChildEdge).map((e) => e.subscribed)),
+  );
+  return nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
 }
 
 // The dense node->node links between two adjacent panes — each adjacent pane

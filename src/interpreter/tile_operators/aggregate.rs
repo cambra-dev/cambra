@@ -20,8 +20,7 @@ use crate::{
 pub struct Aggregate {
     /// The `SealedFunction`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
-    /// Identity and the output tiling — always
-    /// `Tiling::Aggregation { accumulator: <output extent> }`.
+    /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
     base: OperatorBase<Aggregate>,
 }
 
@@ -65,7 +64,7 @@ impl TileOperator for Aggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(AggregateProducer::new(
-            self.base.tiling.clone(),
+            self.tiling().clone(),
             input_producer,
         ))
     }
@@ -167,7 +166,6 @@ impl TileProducer for AggregateProducer {
 
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
-    /// Identity and the output tiling.
     base: OperatorBase<ExtractAggregate>,
     kind: AggregateKind,
     only_terminal: bool,
@@ -275,8 +273,7 @@ pub struct MapExtractAggregate {
     input: Box<dyn TileOperator>,
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
-    /// Identity and the output tiling:
-    /// `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
+    /// Output tiling: `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
     base: OperatorBase<MapExtractAggregate>,
 }
 
@@ -324,7 +321,7 @@ impl TileOperator for MapExtractAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapExtractAggregateProducer {
-            base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), self.tiling()),
             input: input_producer,
             kind: self.kind,
         })
@@ -404,8 +401,7 @@ pub struct MapAggregate {
     input: Box<dyn TileOperator>,
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
-    /// Identity and the output tiling:
-    /// `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
+    /// Output tiling: `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
     base: OperatorBase<MapAggregate>,
 }
 
@@ -457,7 +453,7 @@ impl TileOperator for MapAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapAggregateProducer {
-            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), self.tiling()),
             input: input_producer,
             kind: self.kind,
             accumulators: HashMap::new(),

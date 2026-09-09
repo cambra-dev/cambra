@@ -25,6 +25,8 @@ pub mod scope;
 pub mod simplify;
 pub mod subst;
 pub mod symbolic;
+#[cfg(test)]
+pub(crate) mod test_corpus;
 pub mod transact_phase;
 pub mod uniquify;
 

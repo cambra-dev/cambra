@@ -362,22 +362,16 @@ fn assert_node_table(pane: &Value, at: &str) {
         );
     }
     if kind == OPERATOR_PANE_KIND {
-        // Superseded by the derivation below: a shipped start set could only
-        // repeat, or contradict, what the edges say.
-        for retired in ["root", "unowned"] {
-            assert!(
-                pane.get(retired).is_none(),
-                "{at} is an operator pane, which ships no `{retired}`; got {}",
-                pane[retired]
-            );
-        }
+        // A start set is derived from the edges, so an operator pane names none:
+        // a shipped one could only repeat, or contradict, what the edges say.
+        assert!(
+            pane.get("root").is_none(),
+            "{at} is an operator pane, whose walk starts are derived from the \
+             edges, so it ships no `root`; got {}",
+            pane["root"]
+        );
         assert_value_edges_reach_every_node(pane, at, &ids);
     } else {
-        assert!(
-            pane.get("unowned").is_none(),
-            "{at} is a tree pane, which ships `root` and no `unowned`; got {}",
-            pane["unowned"]
-        );
         let root = pane["root"]
             .as_u64()
             .unwrap_or_else(|| panic!("{at}.root is a number"));

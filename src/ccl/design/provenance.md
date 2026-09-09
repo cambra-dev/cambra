@@ -5,8 +5,8 @@ source the user wrote.
 
 `src/ccl/provenance.rs` holds all of it — the node id, the phase tag, the
 recorder, the table, and the folds. `src/ccl/context.rs` is where the pipeline
-opens the sessions, and `src/ccl/panes.rs` is where the retained AST snapshots
-are declared and folded ([The seam](#the-seam)).
+opens the sessions, and `src/ccl/panes.rs` is where the panes are declared and
+folded ([The seam](#the-seam)).
 
 **Status markers.** The provenance model, the recorder, every phase's adoption of
 it, the lowering projection, the [`NodeId`-keyed table](#the-provenance-model),
@@ -18,7 +18,7 @@ read.
 Every phase that rewrites expression nodes records, and every recording reaches
 a table: `compile_program` opens a `PhaseScope` around each. Operator conversion
 records too, against the `NodeId` each operator carries; see
-[Panes past `post-planning`](#panes-past-post-planning).
+[Operator conversion](#operator-conversion).
 
 ## Mechanism at a glance
 
@@ -44,8 +44,9 @@ Folding the rows of a chosen set of phases produces a **`ProvenanceMap`**: a
 relation between the trees at each end of those phases, labelling every edge and
 reporting the ids it could not explain.
 
-A retained AST snapshot the inspector displays is a **pane**, materialized after a
-set of phases. The provenance map joining two panes is the durable, gated artifact
+A retained snapshot of the pipeline that the inspector displays is a **pane**,
+materialized after a set of phases. A pane holds an expression tree or the
+operator graph. The provenance map joining two panes is the durable, gated artifact
 — the leak classes are asserted on it on every compile. A `ProvenanceAudit` can fold
 between two chosen points against the live tree rather than a snapshot, and
 measures instead of gating: it can check a phase's recording before any pane spans
@@ -62,7 +63,9 @@ errors are zero at the snapshots.
 
 | term | what it is |
 |---|---|
-| **pane** | A retained AST snapshot the inspector displays, materialized after a set of phases. Each one costs a retained full-tree clone. **Below** a pane means later in the pipeline, on a more lowered tree; it is neither tree depth nor a layering. |
+| **pane** | A retained snapshot of the pipeline the inspector displays, materialized after a set of phases. A pane holds an expression tree, which costs a retained full-tree clone, or the operator graph, which the compile already retains. **Below** a pane means later in the pipeline, on a more lowered tree; it is neither tree depth nor a layering. |
+| **walk start** | A node of the operator pane that no `value` edge subscribes, and so where one tree of a consumer's walk of it begins: one per sink, per share point and per registered source. Derived from the edges on both sides of the wire, never shipped. Distinct from a tree pane's **root**, which the producer ships because it is the pane's own expression rather than something read back off the table. |
+| **boundary node** | A node of the operator pane that is not an operator: a source read by the program, or a sink it writes. It carries a label and an identity like any node and no tiling, because only an operator has one. |
 | **recording** | The scope `provenance::enter` opens over one rewrite, held as a `RecordingGuard`. Every node minted while it is the innermost open one takes the node it names as a parent. Prose here says "a recording" for the scope, "the recording site" for the code location, and "records against X"; the guard is the RAII value that closes it. |
 
 > This file is the reference for the shipped shape and wins on what the code
@@ -331,7 +334,7 @@ Ids inside refinement predicates are rows like any other. Lowering's projection
 covers every id `collect_tree_ids` enumerates, and `PredMemo::rebuild` records a
 derived predicate against the one it was built from. Planning raising a predicate
 back into the main tree keeps the predicate's own parentage; see
-[Panes past `post-planning`](#panes-past-post-planning).
+[Operator conversion](#operator-conversion).
 
 The backing store is a `HashMap`; the paged, delta-encoded form is a later pure
 re-encoding behind the same accessors.
@@ -925,7 +928,7 @@ bit is what says so until every phase in the pair records.
   down to `post-planning → post-conversion`. Capture is total across the whole
   pipeline.
 
-## Panes past `post-planning`
+## Operator conversion
 
 A pane may be issued at any point during compilation, and the panes run through
 operator conversion: `Phase::Convert` records, `post-conversion` holds the

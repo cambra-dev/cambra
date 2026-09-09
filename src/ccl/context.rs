@@ -579,7 +579,7 @@ pub struct CompiledProgram {
     /// explain them, and `PredMemo::rebuild` records a derived predicate against
     /// the one it was built from. Planning raising a predicate back into the main
     /// tree keeps the predicate's own parentage; see `design/provenance.md`,
-    /// "Panes past `post-planning`".
+    /// "Operator conversion".
     ///
     /// Empty when capture is switched off — no phase scope is opened then, so
     /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
@@ -1748,13 +1748,12 @@ pub fn compile_program(
     code: &str,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    // The frontend is [], shared with []: parse through
-    // join planning, every check between, and every pane but `post-conversion`
-    // — each of which is a captured phase output.
+    // `run_frontend` runs parse through join planning, every check between, and
+    // every pane but `post-conversion` — each of which is a captured phase
+    // output. `compile_to` runs the same frontend, stopping earlier.
     //
-    // Phase-internal consistency checks (, )
-    // keep their  inside the frontend because firing them means the
-    // compiler itself is wrong, not the user's input.
+    // Phase-internal consistency checks stay inside the frontend: firing one
+    // means the compiler itself is wrong, not the user's input.
     const PANES: [Phase; 5] = [
         Phase::Uniquify,
         Phase::Infer,

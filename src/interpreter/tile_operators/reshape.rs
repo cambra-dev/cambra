@@ -15,8 +15,6 @@ use crate::{
 /// be extended if needed.
 pub struct PermuteRecordDomain {
     input: Box<dyn TileOperator>,
-    /// Identity and the output tiling: the input's `SealedFunction` with its
-    /// `Record` domain permuted.
     base: OperatorBase<PermuteRecordDomain>,
     permutation: Vec<usize>,
 }
@@ -72,7 +70,7 @@ impl TileOperator for PermuteRecordDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(PermuteRecordDomainProducer {
-            base: ProducerBase::new(PermuteRecordDomainProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(PermuteRecordDomainProducer::alloc_id(), self.tiling()),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             permutation: self.permutation.clone(),
         })
@@ -314,8 +312,7 @@ fn flatten_result_correlation(
 /// For example, with domain `(_0: (_0: A, (_0: B, _1: C)), _1: (_0: D), _2: E)` and `indices_to_flatten = [0, 1]`,
 /// the output domain is `(_0: A, _1: (_0: B, _1: C), _2: D, _3: E)`.
 pub struct FlattenTupleDomain {
-    /// Identity and the output tiling: `SealedFunction` with a single-level
-    /// `Record` domain.
+    /// Output tiling: `SealedFunction` with a single-level `Record` domain.
     base: OperatorBase<FlattenTupleDomain>,
     /// Input operator whose domain is a `Record`.
     input: Box<dyn TileOperator>,
@@ -401,7 +398,7 @@ impl TileOperator for FlattenTupleDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(FlattenTupleDomainProducer {
-            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), self.tiling()),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),

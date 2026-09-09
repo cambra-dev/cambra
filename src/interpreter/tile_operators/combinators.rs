@@ -19,8 +19,7 @@ use crate::{
 /// `CurriedFunction { domain: codomain, codomain: domain }`.  Each codomain
 /// value maps to the list of domain values that produce it.
 pub struct Converse {
-    /// Identity and the output tiling:
-    /// `CurriedFunction { domain: input.codomain, codomain: input.domain }`.
+    /// Output tiling: `CurriedFunction { domain: input.codomain, codomain: input.domain }`.
     base: OperatorBase<Converse>,
     /// The sealed-function input to invert.
     input: Box<dyn TileOperator>,
@@ -242,8 +241,7 @@ impl TileProducer for ConverseProducer {
 /// Takes a `SealedFunction(domain → codomain)` and produces `SealedFunction(domain → Scalar(domain))`.
 /// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
 pub struct MapDomain {
-    /// Identity and the output tiling:
-    /// `SealedFunction { domain, codomain: Scalar(domain) }`.
+    /// Output tiling: `SealedFunction { domain, codomain: Scalar(domain) }`.
     base: OperatorBase<MapDomain>,
     /// The sealed-function input.
     input: Box<dyn TileOperator>,
@@ -345,8 +343,7 @@ impl TileProducer for MapDomainProducer {
 /// The two domain extents are packed into a record domain with fields `_0` (outer domain) and `_1` (inner domain),
 /// while the codomain becomes a scalar version of the original codomain.
 pub struct Uncurry {
-    /// Identity and the output tiling:
-    /// `SealedFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
+    /// Output tiling: `SealedFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
     base: OperatorBase<Uncurry>,
     /// The curried-function input.
     input: Box<dyn TileOperator>,
@@ -520,8 +517,7 @@ impl TileProducer for UncurryProducer {
 /// TODO we should replace this with a Restrict node that filters based on a function of the domain,
 /// rather than this which filters based on a function of the codomain.
 pub struct Filter {
-    /// Identity and the output tiling, equal to the input tiling (filtering
-    /// preserves the type).
+    /// Output tiling, equal to the input tiling (filtering preserves the type).
     base: OperatorBase<Filter>,
     /// The sealed-function input to filter.
     input: Box<dyn TileOperator>,
@@ -570,7 +566,7 @@ impl TileOperator for Filter {
             scheduler,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling()),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -692,8 +688,7 @@ impl TileProducer for FilterProducer {
 /// and `domain1` are untouched, and [`Tile::retain`] rebuilds `offsets` for the
 /// surviving rows.
 pub struct MapFilter {
-    /// Identity and the output tiling, equal to the input's — filtering removes
-    /// rows, not structure.
+    /// Output tiling, equal to the input's — filtering removes rows, not structure.
     base: OperatorBase<MapFilter>,
     /// The curried-function input whose inner collections are filtered.
     input: Box<dyn TileOperator>,
@@ -755,7 +750,7 @@ impl TileOperator for MapFilter {
             scheduler,
         );
         Box::new(MapFilterProducer {
-            base: ProducerBase::new(MapFilterProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(MapFilterProducer::alloc_id(), self.tiling()),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -837,8 +832,7 @@ impl TileProducer for MapFilterProducer {
 /// `Restrict` returns `SealedFunction { domain: D', codomain: D' }` where D' ⊆ D is the
 /// subset of domain elements for which the predicate is `true`.
 pub struct Restrict {
-    /// Identity and the output tiling — `SealedFunction(D, D)` mirroring an
-    /// [`IterateExtent`] over D.
+    /// Output tiling — `SealedFunction(D, D)` mirroring an [`IterateExtent`] over D.
     base: OperatorBase<Restrict>,
     /// The boolean predicate over the domain to restrict.
     predicate: Box<dyn TileOperator>,
@@ -883,7 +877,7 @@ impl TileOperator for Restrict {
             scheduler,
         );
         Box::new(RestrictProducer {
-            base: ProducerBase::new(RestrictProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(RestrictProducer::alloc_id(), self.tiling()),
             predicate: predicate_producer,
         })
     }
