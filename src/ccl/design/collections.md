@@ -170,49 +170,6 @@ one collection (a `let`-bound source and its inlined literal) are two domains. M
 therefore reads "in the image of the morphism named here", under whatever the morphism's free
 variables are bound to where the fact is used.
 
-**Two group-bys over different sources do not join.** Their key domains name different
-morphisms, `box` does not help, and what the sum would need is a witness ranging over both.
-
-A `Type::SharedHole` equates the refinement's base with the morphism's codomain. The
-builtin's scheme relates those two positions without equating them: `__elem` is applied to
-the characteristic predicate, so the application contributes a lower bound only, and a key
-type contradicting the morphism's would join with it rather than conflict.
-
-### Consuming a group: discharge, not point-free compose
-
-A group's domain `{𝑖 | key(𝑖) == 𝑘}` names `𝑘`, the group-by's own key binder, so the
-group-by's codomain depends on `𝑘` and every consumer of a group is typed outside `𝑘`'s
-scope. Cambra **discharges** the binder rather than packing it under an existential, and can
-always do so because it controls every composition it emits — there is no surface compose
-operator.
-
-So a consumption lowers η-expanded: `producer ≫ consumer ⤳ λ 𝑥 → consumer(producer(𝑥))`,
-where `producer(𝑥)` is a dependent application substituting `𝑥` for the key binder. A
-comprehension is already in that form. A bare point-free `groupby(c, key) ≫ collapse` is
-never emitted, because its consumer's parameter would resolve with `𝑘` free.
-
-A stored dependent codomain spells its binder reference as an **index**
-([type-inference.md, A binder reference is stored in one of two
-forms](type-inference.md#a-binder-reference-is-stored-in-one-of-two-forms)), and two asserts
-hold that form. `subst::open_codomain` asserts that an unnamed function's codomain does not
-reference that function, since an index there has no binder to open at and nothing
-downstream can discharge it. `check_scope_valid_go` in `src/ccl/infer/solve.rs` asserts that
-no stored function's codomain references its own binder by name, which is what a type built
-field-wise instead of through `Type::pi`/`pi_kinded`/`fun_like` produces.
-
-### Lowering realization: the key binder states its domain
-
-Lowering emits, with the inner group a cast:
-
-```
-groupby(c, key)  ⟶  λ (__gb_k : {𝐾 | __elem ▷ ((c ≫ key) ▷ collection_contains)}) → cast(λ __gb_i → __gb_i ▷ c, {𝐼 | key(c(__elem)) == __gb_k} ⤇ 𝐴)
-```
-
-which enters `Map(𝐾, …)` by the Σ rule once `box` has made it a one-candidate sum. Two
-things say what it is: the binder is declared at the present-key domain
-(`present_key_domain`), and a `data_fun(_, _)` annotation on the lambda stamps `Data` onto
-the arrow. Nothing derives the kind from the key domain, which is scalar.
-
 **`Converse` discharges the present-key domain.** Planning rebuilds the site as
 `converse ≫ map`, and the two halves are typed at different domains: the key-extraction
 morphism `c ≫ key` yields plain keys and is typed at the bare `𝐾`, while the partition

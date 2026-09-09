@@ -56,8 +56,8 @@ pub(super) fn lower_call(
 
     match name {
         // groupby(c: I ⤇ A, key: A → K) lowers to a data function over this site's
-        // key domain (`src/ccl/design/collections.md`, "Lowering realization: the key
-        // binder states its domain"):
+        // key domain (`src/ccl/design/collections.md`, "The key domain is the key
+        // morphism's image"):
         //
         //   λ (k : {K | __elem ▷ ((c ≫ key) ▷ collection_contains)}) →
         //     cast(λ i → c(i), {I | key(c(__elem)) == k} ⤇ A)
