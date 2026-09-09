@@ -272,18 +272,16 @@ Two realization details separate `sole` from the scalar aggregates. Both follow 
 
 #### Runtime realization: nothing new for construction + value iteration
 
-A `Map` or `Set` value is **already a first-class runtime tile**: `groupby`'s
-`λ 𝑘 → cast(…)` eliminates to a Pi-const source that planning recognizes as
-`Converse` (see [Lowering realization](#lowering-realization-the-key-binder-states-its-domain)),
-and `Converse` emits a `CurriedFunction` tile whose outer domain column *is* the
-present keys. The `map`/`set` codomain map runs over that
-`Converse` (as the group-consuming body of a comprehension-shaped iteration; see
-[Consuming a
-group](#consuming-a-group-discharge-not-point-free-compose) for why
-it is not a bare `Compose`). So construction and **value-iteration** consumption (`for v in m`)
-reuse the existing operator set with **no new `Domain` and no hash store**. A keyed domain
-dispatching `extent_of` to a hash store is for *lookup* (`𝑚[𝑘]`), which arrives with that
-feature — not for immutable construction.
+A `Map` or `Set` value is **already a first-class runtime tile**: `groupby`'s `λ 𝑘 → cast(…)`
+eliminates to a Pi-const source that planning recognizes as `Converse`
+([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)),
+and `Converse` emits a `CurriedFunction` tile whose outer domain column is the present keys.
+The `map`/`set` codomain map runs over that `Converse` as the group-consuming body of a
+comprehension-shaped iteration, η-expanded rather than a bare `Compose` so the key binder is
+discharged instead of escaping into the collapse. So construction and **value-iteration**
+consumption (`for v in m`) reuse the existing operator set with **no new `Domain` and no hash
+store**. A keyed domain dispatching `extent_of` to a hash store is what a lookup (`𝑚[𝑘]`)
+needs, and it arrives with that feature rather than with immutable construction.
 
 `set([𝑒…])` lowers to the group-by on an identity key, collapsed by the terminal
 aggregate [`AggregateKind::Drain`] — `(𝐷 ⤇ 𝛾) ⇒ unit`, accumulator `Units(1)`,

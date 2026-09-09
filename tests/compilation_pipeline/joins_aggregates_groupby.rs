@@ -251,8 +251,8 @@ fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usi
 // `map([…])` is the value-carrying re-keying constructor: the distinct first
 // components become the present keys, each mapped to its entry's second component
 // via the `Sole` collapse. Same shape as `set` above at a different collapse
-// (`src/ccl/design/collections.md`, "Lowering realization: the key binder states its
-// domain").
+// (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
+// constant-folding later").
 //
 // Key order is hash-nondeterministic, so compare entries sorted by key — sorting the
 // key column alone would break its pairing with the value column, which is the thing

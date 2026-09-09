@@ -360,8 +360,8 @@ impl KeyDomain {
 /// [`KeyDomain`] and derives the domain from the same two terms.
 ///
 /// See the `"groupby"` arm of [`lower_call`] for the two-layer rationale and
-/// `src/ccl/design/collections.md`, "Lowering realization: the key binder states its
-/// domain". Shared by the surface `groupby(c, key)` call and the `set`/`map` constructors.
+/// `src/ccl/design/collections.md`, "The key domain is the key morphism's image". Shared by
+/// the surface `groupby(c, key)` call and the `set`/`map` constructors.
 fn lower_groupby(
     collection: Expr,
     key_fn: Expr,
@@ -434,8 +434,8 @@ fn lower_groupby(
 ///   mint would leave their key types unrelated and the application between them ill-typed.
 /// * **The η-expanded shape** `λ __iter_record → __iter_record ▷ keyed ▷ collapse`, rather
 ///   than a bare `keyed ≫ collapse`, which would pin the collapse lambda's parameter to a
-///   type with the key binder free (`src/ccl/design/collections.md`, "Consuming a group:
-///   discharge, not point-free compose").
+///   type with the key binder free. Emitting one is what `subst::open_codomain` and
+///   `check_scope_valid_go` assert against.
 /// * **Two stamps on the iteration lambda.** The `data_fun` annotation is the kind stamp,
 ///   without which the lambda is a `Compute` capability and `Compute ⊀ Data`. The
 ///   key-domain refinement is what the iteration binder needs because it *is* the key:
