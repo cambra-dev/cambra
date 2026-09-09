@@ -31,7 +31,8 @@ intent. Until a row says otherwise, a component's only coverage is ordinary Rust
 
 | Solver component | Model | Differential | Proofs |
 |---|---|---|---|
-| `constrain_subtype`, concrete pairs | `Subtyping` / `subtypeCheck` | yes | reflexivity, transitivity, decidability |
+| `constrain_subtype`, concrete pairs with no sum among them | `Subtyping` / `subtypeCheck` | yes | reflexivity, transitivity, decidability |
+| `constrain_subtype`'s Σ arm | `SigmaBelow`, the kind premise alone | no — `CompactTy` has no binder slot, so the wire refuses a slot carrying binders and drops every witness atom | the premise is the elementwise reading of what a Σ denotes, which is what fixes its direction (`sigma_below_iff_elementwise`), and the swapped premise is a different relation (`swapped_premise_is_unsound`); the binder correspondence `𝜌` has neither model nor differential |
 | `CompactType::merge` | `merge` | yes, every fold step | commutativity, idempotence, associativity, congruence, lub, uniqueness |
 | `TypeKind::refuses` | `refuses` | yes, on the concrete fragment | a refusal never lands on a member (`not_admits_of_refuses`); the pair the bound arm's equality test refused while admitting it |
 | `CompactTypeKind::merge` | `mergeTypeKind` | yes, every fold step | commutativity, idempotence, associativity at the join; the meet checked exhaustively over a bounded universe |
@@ -381,14 +382,27 @@ third theorem, subordinate to the two above.
 
 ### Σ types and `FunKind` inference
 
-Model kind variables resolved at coalesce ([type-inference.md, "4.6 Data vs compute
-functions"](../src/ccl/design/type-inference.md#46-data-vs-compute-functions)), Σ formation over
-candidate domains, and the witness discipline — **one value = one witness**, arms α-converted onto
-the value's witness (adopt if unanimous, mint on disagreement, sticky), with the join deferred to
-compaction. That invariant was established only after a constraint-time-join defect was root-caused
-at some expense, which is the reason to freeze it as a theorem before the next refactor disturbs it.
+What a witness ranges over is modelled: `TypeKind`, its containment order and its lattice, the
+`refuses` test, and `CompactTypeKind`'s merge, each with a differential. `SigmaBelow` states the
+kind premise and proves it is the elementwise reading of what a Σ denotes.
 
-Σ would also supply the bound `DataAgree` currently excludes, and would let the lattice statement
+The Σ is not. `Ty` carries no witness and `CompactTy`'s function slot no binders, so a Σ is a rule
+over a candidate list rather than a type, and no sum crosses the wire. The binder correspondence
+`𝜌` is where that costs the most: it is the premise a var-to-sum edge was found missing, its
+absence raises no error because the domain premise runs either way, and an assert in
+`constrain_subtype`'s Fun/Fun arm plus the Rust tests are the whole of what stands behind it
+([type-inference.md, "What checks each
+premise"](../src/ccl/design/type-inference.md#what-checks-each-premise)). A binder slot on
+`CompactTy` is what would put the Σ rule behind the merge differential, and it is the cheaper half
+of this step.
+
+The rest is the witness discipline — **one value = one witness**, arms α-converted onto the value's
+witness (adopt if unanimous, mint on disagreement, sticky), with the join deferred to compaction —
+and kind variables resolved at coalesce ([type-inference.md, "4.6 Data vs compute
+functions"](../src/ccl/design/type-inference.md#46-data-vs-compute-functions)). The discipline was
+established only after a constraint-time-join defect was root-caused at some expense, which is the
+reason to freeze it as a theorem before the next refactor disturbs it. Modelling the kind variables
+would also supply the bound `DataAgree` currently excludes, and would let the lattice statement
 above say which join Σ represents. **If Σ comes to materialize multi-domain joins, the merge's
 "alternatives beyond one" adjudication has to be revisited.**
 
