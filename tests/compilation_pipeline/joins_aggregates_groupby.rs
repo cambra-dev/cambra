@@ -651,50 +651,6 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// The same sharing where at least one use is a **lookup**, split out because those are
-/// rejected with every other `g(k)` (see `test_grouping_lookup_edges`). The sharing
-/// claim is the same one; only how the grouping is used differs.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-// A grouping iterated *and* looked up.
-#[case(
-    "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
-    Value::Int(13)
-)]
-// Several lookups into one grouping, all served by the one partition.
-#[case(
-    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
-    Value::Int(9)
-)]
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see `test_grouping_lookup_edges`)"]
-fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
-}
-
-/// A key with **no group**, and one whose group is a single element.
-///
-/// A lookup walks the grouping for the key and slices out its rows; a key the
-/// grouping settled without ever seeing yields the empty group, which sums to
-/// zero rather than failing.
-// **The lookup cases are rejected, and stay rejected.** `groupby` infers the keyed type
-// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`, so `g(k)` at a plain key demands
-// proving the key is in that key domain, which a bare key does not carry
-// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). They return
-// restated as a checked lookup. A total function type admitted any key and gave the
-// empty group for an absent one, which is why they read as passing.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))", Value::Int(0))]
-#[case(
-    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(9))",
-    Value::Int(2)
-)]
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
-fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
-}
-
 /// The sharing [`test_shared_grouping`] *describes*, pinned.
 ///
 /// Those value assertions hold whether the partition is bucketized once or
@@ -712,31 +668,18 @@ fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
 /// no such shape is reachable while a grouping's type is fully monomorphic.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
+// Two uses.
 #[case(
     "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])"
 )]
+// Three, including a repeat of the first, so a second bucketize would show as a second
+// `converse` whether or not the extra use aggregates differently.
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"
+)]
+// A grouping whose keys are its own elements, the shape the lookup spellings used.
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])")]
 fn test_grouping_built_once(#[case] code: &str) {
-    use cambra::ccl::symbolic::symbolic;
-
-    let mut ctx = GlobalContext::default();
-    let (expr, _result) = run_pipeline_with_ctx(&mut ctx, code);
-    let ccl = symbolic(&expr);
-    assert_eq!(
-        ccl.matches("converse").count(),
-        1,
-        "the grouping should be bucketized once however many uses it has; got:\n{ccl}"
-    );
-}
-
-/// The same claim where the uses are **lookups**, rejected with every other `g(k)`
-/// (see `test_grouping_lookup_edges`). One `converse` per program is the property
-/// either way; only how the grouping is used differs.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))")]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))")]
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see `test_grouping_lookup_edges`)"]
-fn test_grouping_built_once_through_a_lookup(#[case] code: &str) {
     use cambra::ccl::symbolic::symbolic;
 
     let mut ctx = GlobalContext::default();
@@ -767,30 +710,5 @@ fn test_grouping_built_once_through_a_lookup(#[case] code: &str) {
     Value::Int(10)
 )]
 fn an_exact_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
-}
-
-/// A keyed annotation that types and cannot be **consumed**. Both shapes reach an assertion
-/// the compiler labels its own bug, and neither is reachable from an inference test: the
-/// type tests beside these annotate and return `g`, where consuming it is what fails.
-///
-/// - the **bounded** form records an open bound — the group-by's `__gb_k` free in a lower
-///   bound whose holder's telescope does not carry it (`infer_var.rs`). Its exact
-///   counterpart above compiles, so the strength is the whole difference;
-/// - the **boxed exact `Map`** form raises a scope violation, the `box` referencing the
-///   comprehension's `__iter_record` from outside its scope.
-#[rstest]
-#[timeout(Duration::from_secs(30))]
-#[case(
-    "g <: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
-    Value::Int(3)
-)]
-#[case(
-    "g: Map(_, _) = box(groupby([1,2,3], \\x -> x))\nsum([sum(v) for v in g])",
-    Value::Int(6)
-)]
-#[ignore = "a keyed annotation types but cannot be consumed: the bounded form records an \
-            open bound, the boxed exact form a scope violation"]
-fn a_consumed_keyed_annotation_does_not_compile(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

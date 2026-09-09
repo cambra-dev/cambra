@@ -117,26 +117,3 @@ fn test_multi_arg_param_in_filter_predicate() {
                 pick(8, 0)";
     check_scalar(code, Value::Int(30));
 }
-
-// Dependent application end-to-end: a single-key group-by lookup `g(k)` filters
-// the collection by the key-discharged partition predicate at the iteration
-// boundary, exercising the dependent type through to runtime values.
-//
-// REJECTED, and staying so: `groupby` infers the keyed type
-// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`
-// (`src/ccl/design/collections.md`, "`groupby`'s exact type"), so a direct lookup `g(k)`
-// at a plain key demands proving the key is in that key domain, which a bare key does
-// not carry (`src/ccl/design/collections.md`, "Lookup: membership discharge"). These
-// cases return restated as a checked lookup. A total function type admitted any key and
-// gave the empty group for an absent one, which is why they read as passing.
-#[rstest]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1))", Value::Int(2))] // {1,1}
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(2))", Value::Int(4))] // {2,2}
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))] // {3}
-#[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(0))", Value::Int(1))] // {1}
-#[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(1))", Value::Int(5))] // {2,3}
-#[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(2))", Value::Int(9))] // {4,5}
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
-fn test_dependent_groupby_lookup(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
-}

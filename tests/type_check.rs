@@ -1538,6 +1538,76 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     }
 }
 
+/// A **bare-key** lookup `g(k)` on a group-by is refused, and stays refused.
+///
+/// `groupby`'s domain is the present-key domain `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`,
+/// so applying it at a plain key demands a membership proof the key does not carry
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). The value-level
+/// spellings these programs came from read as passing under the older total function type,
+/// which admitted any key and answered an absent one with the empty group.
+///
+/// Every spelling is one situation — a single lookup, a lookup beside an iteration, a
+/// discharge through a higher-order parameter — so one rejection covers them and the
+/// programs are carried here rather than each keeping a test of a value it cannot produce.
+/// What returns them is `g[k]?`, a different program with `Option` handling.
+#[test]
+fn a_bare_key_lookup_on_a_groupby_is_refused() {
+    for program in [
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1))",
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))",
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
+        "groups = groupby([1, 2, 3], \\x -> x)\ngroups(0)",
+        "groups = groupby([1, 2, 3], \\x -> x)\napply0 = \\g -> g(0)\napply0(groups)",
+    ] {
+        let errs = infer_program_err(program);
+        assert!(
+            errs.iter()
+                .map(|e| format!("{e:?}"))
+                .any(|m| m.contains("collection_contains")),
+            "the rejection must name the present-key domain the key fails to carry, \
+             got {errs:?} for {program}"
+        );
+    }
+}
+
+/// A **boxed exact `Map`** annotation on a group-by types and cannot be consumed: the `box`
+/// references the comprehension's `__iter_record` from outside its scope.
+///
+/// A compiler bug rather than a rule, pinned so its fix is visible. Its exact `FullMap`
+/// counterpart compiles and runs
+/// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation form is the whole
+/// difference.
+#[test]
+fn a_consumed_boxed_map_annotation_escapes_its_scope() {
+    let errs = infer_program_err(indoc! {r#"
+        g: Map(_, _) = box(groupby([1,2,3], \x -> x))
+        sum([sum(v) for v in g])
+    "#});
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|m| m.contains("out-of-scope binder") && m.contains("__iter_record")),
+        "expected the box to escape the comprehension's binder, got {errs:?}"
+    );
+}
+
+/// A **bounded** keyed annotation on a group-by records an open bound: `__gb_k` is free in a
+/// lower bound whose holder's telescope does not carry it.
+///
+/// A compiler bug rather than a rule, and it trips the record-time invariant rather than
+/// returning an error, so the pin is on the panic. Its exact counterpart compiles and runs
+/// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation strength is the whole
+/// difference.
+#[test]
+#[should_panic(expected = "open bound recorded")]
+fn a_consumed_bounded_keyed_annotation_records_an_open_bound() {
+    infer_program(indoc! {r#"
+        g <: FullMap(_, _) = groupby([1,2], \v -> v)
+        sum([sum(v) for v in g])
+    "#});
+}
+
 /// A `groupby` **is** a `FullMap`, at either annotation strength, and only with its key
 /// type elided.
 ///
@@ -2304,134 +2374,33 @@ fn test_groupby_key_relation_is_per_occurrence(#[case] code: &str) {
     assert_eq!(groupby_key_types(code), (int(), string()), "for {code}");
 }
 
-// The tests above pin what a group-by's key type *resolves to*; this one pins
-// that the key type is still **enforced** at a lookup. Stating the relation on
-// the `data_fun` annotation makes the edge directional (`key_ty <: ⟨domain⟩` —
-// contravariance), and a directional edge is exactly the kind that can go slack
-// without any test noticing: every case above would still pass if a lookup at an
-// unrelated key type were silently accepted.
-//
-// Asserted on the rendered message rather than the error *variant*: which check
-// catches this is a property of how `==` is typed, not of the key relation, so
-// pinning the variant would make the test fail on any change to that — it says
-// only that the two types met and were refused.
+/// A lookup at the wrong key type is refused, and **membership is the reason**.
+///
+/// The key-type edge (`key_ty <: ⟨domain⟩`, contravariant) is directional, and a
+/// directional edge can go slack without a resolution test noticing. It is not what
+/// catches this today: the group-by's domain is the present-key domain, so a bare key
+/// fails to carry the membership refinement before its base type is ever compared. This
+/// pins the rejection that fires, so a change in which check catches it shows up here
+/// rather than passing silently.
+///
+/// The key-type edge gets its own failure to stand on once a lookup discharges membership
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). Until then the
+/// `String` key type is unenforced at a lookup, and no test claims otherwise.
 #[test]
-#[ignore = "on a group-by the membership rejection fires before the key-type edge, so \
-            the reason this pins is not the one reported (see the note below); it \
-            tightens back when a checked lookup gives the key type an edge to fail on"]
-fn test_groupby_lookup_at_wrong_key_type_rejected() {
+fn a_lookup_at_the_wrong_key_type_is_refused_for_membership() {
     let errs = infer_program_err(indoc! {r#"
         groups = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
         groups(1)
     "#});
+    let msgs: Vec<String> = errs.iter().map(|e| format!("{e:?}")).collect();
     assert!(
-        errs.iter()
-            .map(|e| format!("{e:?}"))
-            .any(|msg| msg.contains("Int") && msg.contains("String")),
-        "expected the Int key to be rejected against the String key type, got {errs:?}"
-    );
-}
-
-// NOTE: a direct key lookup on a group-by (`g = groups(k)`) is rejected, and stays
-// rejected. `groupby` infers the keyed type
-// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group` (`src/ccl/design/collections.md`,
-// "`groupby`'s exact type"), so applying it at a plain key demands proving the key is in
-// that key domain, which a bare key does not carry
-// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What returns these
-// cases is a checked lookup at the surface, restating them rather than un-ignoring them.
-// A total function type admitted any key, which is why they read as passing.
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
-#[test]
-fn test_groupby_aggregate() {
-    // groups = groupby([1, 2, 3], \x -> x)
-    // g = groups(1)
-    // sum(g)
-    // Expected: Int (sum of a group of integers)
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-g = groups(1)
-sum(g)
-"#
-        .trim(),
-    );
-    assert_eq!(ty, int(), "expected Int, got {ty}");
-}
-
-/// Dependent application: looking up one partition of a group-by applies the
-/// key function `(k) ⇒ {i | key(i) == k} ⇒ V` at a concrete key, and the
-/// surviving partition predicate must reflect that key — the binder is
-/// *discharged* to the argument (design §5 / Appendix A). This is the headline
-/// case the Pi-type + substitution machinery unlocks: before it, the predicate
-/// kept the unbound group-by key.
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
-#[test]
-fn test_groupby_dependent_application_discharges_key() {
-    // groups : (k) ⇒ ({i | i ▷ xs ▷ key_fn == k} ⇒ Int); groups(0) discharges
-    // k ↦ 0, so the partition predicate must mention the literal 0 and no
-    // longer reference the group-by key binder `__gb_k`.
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-groups(0)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
-    };
-    let [r] = dom.refinements() else {
-        panic!("expected a singly-refined partition domain, got {ty}");
-    };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
-    assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged, but predicate still has it: {pred}"
+        msgs.iter().any(|m| m.contains("collection_contains")),
+        "the rejection must name the present-key domain the key fails to carry, got {errs:?}"
     );
     assert!(
-        pred.contains('0'),
-        "discharged predicate should mention the argument 0: {pred}"
-    );
-}
-
-// O3 (higher-order dependent application): apply a dependent function through a
-// function-typed *parameter* whose type is still an inference variable at emit
-// time. `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply`
-// cannot peek its Pi binder to build the identity correspondence — the discharge
-// `[k ↦ 0]` must instead be resolved at coalesce, once `g` resolves to the
-// group-by partition function. The result of `apply0(groups)` must be the same
-// `{i | key(i) == 0} ⇒ Int` partition the *direct* `groups(0)` yields: predicate
-// mentions `0`, not the group-by key binder `__gb_k`.
-//
-// Was blocked on O3 until the apply discharge moved to coalesce: `coalesce_node`
-// re-derives each application's type from its already-resolved function child,
-// discharging on the function's *real* binder rather than the fresh `__arg`
-// binder `emit_apply` peeks when the function is still an inference variable.
-#[ignore = "a bare-key `g(k)` demands a membership proof the key does not carry, and that rejection is by design; these cases return as a checked lookup rather than by un-ignoring (see the comment above)"]
-#[test]
-fn test_higher_order_dependent_application_discharges_key() {
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-apply0 = \g -> g(0)
-apply0(groups)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
-    };
-    let [r] = dom.refinements() else {
-        panic!("expected a singly-refined partition domain, got {ty}");
-    };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
-    assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged through the higher-order apply, but: {pred}"
-    );
-    assert!(
-        pred.contains('0'),
-        "discharged predicate should mention the argument 0: {pred}"
+        !msgs.iter().any(|m| m.contains("String")),
+        "the key type is not yet what refuses this; if it is, the doc comment above and \
+         the membership assertion are both stale: {errs:?}"
     );
 }
 
