@@ -15,9 +15,24 @@
 // neighbours. Neither may cost addressability. Every operator id in the pane is
 // a possible cross-pane selection target, so suppression records where the id
 // went and [`viewItem`](DrawGraph.viewItem) answers it.
+//
+// At the `steps` detail level the rules in `./rules` merge what survives into
+// composites, which carries the same obligation one level up: a composite lists
+// its members, and an operator suppressed onto an edge that a merge made
+// internal is answered for by the composite that swallowed the edge.
 
+import { Merge, applyRules } from "./rules";
 import type { OperatorEdge, OperatorNode, OperatorPane } from "../types";
 import { isNamedRole, roleLabel } from "../types";
+
+/**
+ * How much of the graph to draw.
+ *
+ * `operators` is the wire's own drawing — one box per operator the two
+ * suppressions leave. `steps` merges the recurring plumbing shapes into
+ * composites.
+ */
+export type Detail = "operators" | "steps";
 
 /** One drawn box. */
 export interface DrawNode {
@@ -27,12 +42,18 @@ export interface DrawNode {
   role: string;
   /** Constants drawn inside this node. Each keeps its own id. */
   chips: DrawChip[];
+  /** Operators this box stands for, the representative first. */
+  members: number[];
+  /** `FanOutBranch` operators suppressed onto this box's outgoing edges. */
+  fanOuts: number[];
 }
 
 export interface DrawChip {
   id: number;
   /** The constant's type, which is the only thing its node carried. */
   text: string;
+  /** The member that reads it, which is what makes a chip attributable. */
+  owner: number;
 }
 
 /** One drawn edge, standing in for any nodes suppressed along it. */
@@ -45,24 +66,28 @@ export interface DrawEdge {
   deferred: boolean;
   /** Operators this edge replaced, producer-side first. */
   suppressed: number[];
+  /** Drawn edges this one stands for. More than one only under merging. */
+  count: number;
 }
 
 /**
  * Where one operator id is drawn.
  *
  * A suppressed node has no box, so the element that answers for it is the edge
- * that replaced it or the node that absorbed it. Named after yFiles'
- * `IFoldingView.getViewItem`, which is the same lookup.
+ * that replaced it, the node that absorbed it, or the composite it belongs to.
+ * Named after yFiles' `IFoldingView.getViewItem`, which is the same lookup.
  */
 export type ViewItem =
   | { kind: "node"; id: number }
   | { kind: "chip"; id: number; host: number }
-  | { kind: "glyph"; id: number; edge: string };
+  | { kind: "glyph"; id: number; edge: string }
+  | { kind: "member"; id: number; host: number };
 
 export class DrawGraph {
   constructor(
     readonly nodes: DrawNode[],
     readonly edges: DrawEdge[],
+    readonly detail: Detail,
     private readonly view: Map<number, ViewItem>,
   ) {}
 
@@ -73,9 +98,17 @@ export class DrawGraph {
 
   /** Every operator id an element answers for, the element's own id first. */
   masterItems(item: ViewItem): number[] {
-    if (item.kind !== "glyph") return [item.id];
-    const edge = this.edges.find((e) => e.id === item.edge);
-    return edge ? [item.id, ...edge.suppressed.filter((s) => s !== item.id)] : [item.id];
+    if (item.kind === "glyph") {
+      const edge = this.edges.find((e) => e.id === item.edge);
+      return edge ? [item.id, ...edge.suppressed.filter((s) => s !== item.id)] : [item.id];
+    }
+    if (item.kind === "node") {
+      const node = this.nodes.find((n) => n.id === item.id);
+      if (!node) return [item.id];
+      const rest = [...node.members, ...node.fanOuts].filter((x) => x !== item.id);
+      return [item.id, ...rest];
+    }
+    return [item.id];
   }
 }
 
@@ -88,7 +121,18 @@ export function constantText(node: OperatorNode): string {
   return t.startsWith("Scalar(") && t.endsWith(")") ? t.slice(7, -1) : t;
 }
 
-export function drawGraphOf(pane: OperatorPane): DrawGraph {
+export function drawGraphOf(pane: OperatorPane, detail: Detail = "operators"): DrawGraph {
+  const base = suppressedGraph(pane);
+  return detail === "steps" ? merged(base) : addressed(base.nodes, base.edges, "operators");
+}
+
+interface Base {
+  nodes: DrawNode[];
+  edges: DrawEdge[];
+}
+
+/** The wire's own drawing: the two vertex suppressions, and nothing merged. */
+function suppressedGraph(pane: OperatorPane): Base {
   const byId = new Map(pane.nodes.map((n) => [n.nodeId, n]));
   const consumers = new Map<number, number[]>();
   for (const n of pane.nodes) {
@@ -125,6 +169,8 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
       tiling: n.tiling ?? null,
       role: n.role,
       chips: [],
+      members: [n.nodeId],
+      fanOuts: [],
     };
     nodes.push(d);
     nodeById.set(n.nodeId, d);
@@ -132,7 +178,7 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
   for (const n of pane.nodes) {
     const host = chipOf.get(n.nodeId);
     if (host === undefined) continue;
-    nodeById.get(host)?.chips.push({ id: n.nodeId, text: constantText(n) });
+    nodeById.get(host)?.chips.push({ id: n.nodeId, text: constantText(n), owner: host });
   }
 
   // Follow a suppressed branch back to the producer it stood in front of,
@@ -176,19 +222,118 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
         role: roleLabel(e.role),
         deferred: e.deferred,
         suppressed: replaced,
+        count: 1,
       });
     }
   }
+  return { nodes, edges };
+}
 
+/** Run the rules, then rebuild boxes and edges over the classes they leave. */
+function merged(base: Base): DrawGraph {
+  const m = new Merge(base.nodes, base.edges);
+  applyRules(m);
+
+  const byId = new Map(base.nodes.map((n) => [n.id, n]));
+  const nodes: DrawNode[] = m.classes().map((c) => {
+    // The representative leads: it is the box the others merged into, and the
+    // one whose tiling is what the composite emits.
+    const rest = m.members(c).filter((x) => x !== c);
+    rest.sort((a, b) => a - b);
+    const members = [c, ...rest];
+    const rep = byId.get(c)!;
+    return {
+      id: c,
+      label: m.name(c),
+      tiling: rep.tiling,
+      role: rep.role,
+      chips: members.flatMap((x) => byId.get(x)!.chips),
+      members,
+      fanOuts: [],
+    };
+  });
+
+  // An edge with both ends in one class is internal and is not drawn, so the
+  // operators suppressed onto it have nowhere left to go. The composite that
+  // swallowed the edge answers for them, which is what keeps every wire id
+  // addressable. They are fan-outs rather than members: `members` counts
+  // operators the rules merged and is bounded by `MAX_MEMBERS`.
+  const swallowed = new Map<number, number[]>();
+  const edges: DrawEdge[] = [];
+  const byKey = new Map<string, DrawEdge>();
+  for (const e of base.edges) {
+    const from = m.find(e.from);
+    const to = m.find(e.to);
+    if (from === to) {
+      if (e.suppressed.length) {
+        (swallowed.get(from) ?? swallowed.set(from, []).get(from)!).push(...e.suppressed);
+      }
+      continue;
+    }
+    const id = `${from}>${to}|${e.role}`;
+    const prior = byKey.get(id);
+    if (prior) {
+      prior.count += 1;
+      // Join rather than keep the first: a merged edge is a `share` if any
+      // constituent is and a back edge if any constituent is, so a recurrence
+      // into a collapsed store still reads as one.
+      if (e.kind === "share") prior.kind = "share";
+      prior.deferred = prior.deferred || e.deferred;
+      prior.suppressed.push(...e.suppressed);
+      continue;
+    }
+    const drawn: DrawEdge = {
+      id,
+      from,
+      to,
+      kind: e.kind,
+      role: e.role,
+      deferred: e.deferred,
+      suppressed: [...e.suppressed],
+      count: 1,
+    };
+    byKey.set(id, drawn);
+    edges.push(drawn);
+  }
+
+  for (const n of nodes) {
+    const extra = swallowed.get(n.id);
+    if (extra) n.fanOuts.push(...extra);
+  }
+  return addressed(nodes, edges, "steps");
+}
+
+/**
+ * Attach every operator id to the element that draws it.
+ *
+ * At `steps` a suppressed branch draws as one mark on its producer rather than
+ * as a diamond per branch along the wires, so the producer's box answers for it.
+ */
+function addressed(nodes: DrawNode[], edges: DrawEdge[], detail: Detail): DrawGraph {
   const view = new Map<number, ViewItem>();
   for (const d of nodes) {
     view.set(d.id, { kind: "node", id: d.id });
     for (const c of d.chips) view.set(c.id, { kind: "chip", id: c.id, host: d.id });
+    for (const x of d.members) if (x !== d.id) view.set(x, { kind: "member", id: x, host: d.id });
+  }
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  if (detail === "steps") {
+    for (const d of nodes) {
+      for (const s of d.fanOuts) view.set(s, { kind: "member", id: s, host: d.id });
+    }
   }
   for (const e of edges) {
-    for (const s of e.suppressed) view.set(s, { kind: "glyph", id: s, edge: e.id });
+    if (detail === "steps") {
+      const producer = nodeById.get(e.from);
+      for (const s of e.suppressed) {
+        producer?.fanOuts.push(s);
+        view.set(s, { kind: "member", id: s, host: e.from });
+      }
+    } else {
+      for (const s of e.suppressed) view.set(s, { kind: "glyph", id: s, edge: e.id });
+    }
   }
-  return new DrawGraph(nodes, edges, view);
+  return new DrawGraph(nodes, edges, detail, view);
 }
 
 /**

@@ -16,7 +16,14 @@
 
 import { ElkLayout } from "./graph/elk";
 import type { GraphLayout, Placed, Point } from "./graph/layout";
-import { type DrawEdge, type DrawGraph, drawGraphOf, isBackEdge } from "./graph/model";
+import {
+  type Detail,
+  type DrawEdge,
+  type DrawGraph,
+  type DrawNode,
+  drawGraphOf,
+  isBackEdge,
+} from "./graph/model";
 import type { Resolved, Store } from "./store";
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
 import { isChildEdge, roleLabel, walkStarts } from "./types";
@@ -28,6 +35,68 @@ const LAYER_GAP = 28;
 const PAD = 12;
 const MIN_WIDTH = 66;
 const MAX_WIDTH = 240;
+/**
+ * The box that carries a tiling: two lines, and wider.
+ *
+ * A tiling is 41 characters at the median against a box holding about 36, so it
+ * does not fit beside a label. On its own line the box is as wide as its wider
+ * line rather than as wide as their sum, which is worth about 1100px of canvas
+ * on `order_ledger`. 300px and 40 characters is the knee — past it the width
+ * grows faster than the prefix does.
+ */
+const TILED_MAX_WIDTH = 300;
+const TILED_HEIGHT = 34;
+const TILING_CHARS = 40;
+const DETAIL_KEY = "cambra.inspector.operatorDetail.v1";
+
+const DETAIL_TEXT: Record<Detail, string> = {
+  steps: "Steps",
+  operators: "Operators",
+};
+
+/** A bounded prefix of the tiling; the card carries all of it. */
+function clipTiling(tiling: string): string {
+  return tiling.length <= TILING_CHARS ? tiling : `${tiling.slice(0, TILING_CHARS - 1)}…`;
+}
+
+/**
+ * What a tiling's constructor means.
+ *
+ * `SF(...)` and `Store(...)` print in the same shape and mean opposite things —
+ * read one position, or fold a changelog — which is the misreading this names.
+ */
+function tilingGloss(tiling: string): string {
+  if (tiling.startsWith("SF(")) return "a sealed function: one value per position of the domain";
+  if (tiling.startsWith("Store(")) {
+    return "a changelog: fold the ticks to read a value, never index one";
+  }
+  if (tiling.startsWith("CF(")) return "curried: two domains before the value";
+  if (tiling.startsWith("agg(")) return "an accumulator, not a stream";
+  return "a single cell";
+}
+
+/**
+ * The reader's detail level, remembered per browser.
+ *
+ * A reading preference rather than a property of the program, so it survives a
+ * recompile. Storage can throw outright where site data is blocked, which is why
+ * both halves are guarded.
+ */
+function readDetail(): Detail {
+  try {
+    return localStorage.getItem(DETAIL_KEY) === "operators" ? "operators" : "steps";
+  } catch {
+    return "steps";
+  }
+}
+
+function writeDetail(detail: Detail): void {
+  try {
+    localStorage.setItem(DETAIL_KEY, detail);
+  } catch {
+    // A preference that cannot be stored is still a preference for this session.
+  }
+}
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -83,20 +152,39 @@ interface Handle {
 export class OperatorView {
   private readonly store: Store;
   private readonly paneId: string;
-  private readonly graph: DrawGraph;
+  private readonly pane: OperatorPane;
+  private graph: DrawGraph;
+  private detail: Detail;
   private readonly layout: GraphLayout;
   private readonly canvas: HTMLElement;
   private readonly handles = new Map<number, Handle>();
   private marked: HTMLElement[] = [];
   private pending: Resolved | null = null;
   private drawn = false;
+  /** Rising with each `draw`, so a slower layout cannot paint over a newer one. */
+  private generation = 0;
+  private card: HTMLElement | null = null;
+  private cardPinned = false;
 
-  constructor(parent: HTMLElement, store: Store, pane: OperatorPane, layout?: GraphLayout) {
+  /**
+   * `detail` pins the level; without it the pane opens at the reader's
+   * remembered one. A test that asserts on a particular drawing passes it.
+   */
+  constructor(
+    parent: HTMLElement,
+    store: Store,
+    pane: OperatorPane,
+    layout?: GraphLayout,
+    detail?: Detail,
+  ) {
     this.store = store;
     this.paneId = pane.id;
-    this.graph = drawGraphOf(pane);
+    this.pane = pane;
+    this.detail = detail ?? readDetail();
+    this.graph = drawGraphOf(pane, this.detail);
     this.layout = layout ?? new ElkLayout();
 
+    parent.appendChild(this.detailControl());
     this.canvas = el("div", "graph-canvas");
     parent.appendChild(this.canvas);
 
@@ -111,22 +199,60 @@ export class OperatorView {
     void this.draw();
   }
 
+  /** Whether this box draws its tiling on a second line. */
+  private showsTiling(node: DrawNode): boolean {
+    return this.detail === "steps" && node.tiling !== null;
+  }
+
+  /** The header control: how much of the graph to draw. */
+  private detailControl(): HTMLElement {
+    const bar = el("div", "graph-detail");
+    bar.appendChild(el("span", "graph-detail-label", "Detail"));
+    for (const level of ["steps", "operators"] as const) {
+      const button = el("button", "graph-detail-option", DETAIL_TEXT[level]);
+      button.dataset.detail = level;
+      button.setAttribute("aria-pressed", String(level === this.detail));
+      button.addEventListener("click", () => void this.setDetail(level, bar));
+      bar.appendChild(button);
+    }
+    return bar;
+  }
+
+  /** Redraw at another level. A relayout is full: ELK layered has no incremental mode. */
+  private async setDetail(detail: Detail, bar: HTMLElement): Promise<void> {
+    if (detail === this.detail) return;
+    this.detail = detail;
+    writeDetail(detail);
+    for (const b of bar.querySelectorAll<HTMLElement>("[data-detail]")) {
+      b.setAttribute("aria-pressed", String(b.dataset.detail === detail));
+    }
+    this.graph = drawGraphOf(this.pane, detail);
+    this.hideCard(true);
+    this.drawn = false;
+    await this.draw();
+    this.renderSelection(this.store.getResolved());
+  }
+
   /** Lay the graph out and draw it. Resolves when the pane is on screen. */
   async draw(): Promise<void> {
-    const sized = this.graph.nodes.map((n) => ({
-      id: String(n.id),
-      width: Math.min(
-        MAX_WIDTH,
-        Math.max(
-          MIN_WIDTH,
-          measure(n.label) +
-            measure(`#${n.id}`) +
-            n.chips.reduce((a, c) => a + Math.min(64, measure(c.text)) + 9, 0) +
-            26,
-        ),
-      ),
-      height: NODE_HEIGHT,
-    }));
+    const generation = ++this.generation;
+    const sized = this.graph.nodes.map((n) => {
+      const head = measure(n.label) + measure(`#${n.id}`) + 26;
+      if (!this.showsTiling(n)) {
+        const chips = n.chips.reduce((a, c) => a + Math.min(64, measure(c.text)) + 9, 0);
+        return {
+          id: String(n.id),
+          width: Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, head + chips)),
+          height: NODE_HEIGHT,
+        };
+      }
+      const type = measure(clipTiling(n.tiling!)) + 18;
+      return {
+        id: String(n.id),
+        width: Math.min(TILED_MAX_WIDTH, Math.max(MIN_WIDTH, Math.max(head, type))),
+        height: TILED_HEIGHT,
+      };
+    });
     const forward = this.graph.edges.filter((e) => !isBackEdge(e));
     const placed = await this.layout.run({
       nodes: sized,
@@ -134,12 +260,78 @@ export class OperatorView {
       nodeGap: NODE_GAP,
       layerGap: LAYER_GAP,
     });
+    // A level changed while this layout ran; the newer one owns the canvas.
+    if (generation !== this.generation) return;
     this.paint(placed, forward);
     this.drawn = true;
     if (this.pending) {
       this.renderSelection(this.pending);
       this.pending = null;
     }
+  }
+
+  /**
+   * Expand a box: everything it could not fit.
+   *
+   * A box is 22 or 34 pixels tall and at most 300 wide, so it truncates — a long
+   * tiling, a `Filter` carrying four constants, the fan-out branches suppressed
+   * onto its outgoing edges. Hover shows all of it and double-click pins it,
+   * because reading a six-member list means moving the pointer.
+   */
+  private describe(node: DrawNode): HTMLElement {
+    const card = el("div", "graph-card");
+    const line = (text: string, cls?: string) => card.appendChild(el("div", cls, text));
+    if (node.members.length > 1) {
+      line(`${node.label} — stands for ${node.members.length} operators`, "graph-card-head");
+      node.members.forEach((id, i) => {
+        const own = this.graph.nodes.find((n) => n.id === id);
+        const kind = own ? own.label : (this.labelOf(id) ?? "?");
+        line(`  #${id} ${kind}${i === 0 ? "   (representative)" : ""}`, "graph-card-member");
+        // A constant is an operand of one operator, so it hangs off the member
+        // that reads it rather than sitting in one list nobody can attribute.
+        for (const chip of node.chips.filter((c) => c.owner === id)) {
+          line(`      #${chip.id} ${chip.text}`, "graph-card-chip");
+        }
+      });
+    } else {
+      line(`${node.label} #${node.id}`, "graph-card-head");
+      for (const chip of node.chips) line(`  #${chip.id} ${chip.text}`, "graph-card-chip");
+    }
+    if (node.tiling !== null) {
+      // The tiling is the shape of the tile every consumer receives, so it is
+      // also the payload type of every edge leaving this box.
+      line(`emits ${node.tiling}`, "graph-card-tiling");
+      line(`  ${tilingGloss(node.tiling)}`, "graph-card-note");
+    }
+    if (node.fanOuts.length) {
+      line(`fans out to ${node.fanOuts.map((f) => `#${f}`).join(", ")}`, "graph-card-note");
+    }
+    return card;
+  }
+
+  private labelOf(id: number): string | undefined {
+    return this.pane.nodes.find((n) => n.nodeId === id)?.label;
+  }
+
+  private showCard(node: DrawNode, x: number, y: number, pin: boolean): void {
+    this.hideCard(true);
+    const card = this.describe(node);
+    if (pin) card.classList.add("pinned");
+    document.body.appendChild(card);
+    const rect = card.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    card.style.left = `${Math.max(4, Math.min(x + 14, vw - rect.width - 8))}px`;
+    card.style.top = `${Math.max(4, Math.min(y + 14, vh - rect.height - 8))}px`;
+    this.card = card;
+    this.cardPinned = pin;
+  }
+
+  private hideCard(force = false): void {
+    if (this.cardPinned && !force) return;
+    this.card?.remove();
+    this.card = null;
+    this.cardPinned = false;
   }
 
   private paint(placed: Placed, forward: DrawEdge[]): void {
@@ -174,6 +366,7 @@ export class OperatorView {
     for (const node of this.graph.nodes) {
       const box = at.get(String(node.id));
       if (!box) continue;
+      const rank = order.get(String(node.id)) ?? 0;
       const div = el("div", "graph-node selectable");
       div.dataset.nodeId = String(node.id);
       div.dataset.role = node.role;
@@ -181,23 +374,45 @@ export class OperatorView {
       div.style.top = `${box.y + PAD}px`;
       div.style.width = `${box.width}px`;
       div.style.height = `${box.height}px`;
+      if (node.members.length > 1) {
+        // "Stands for N operators", drawn as a stack of cards rather than a
+        // multiplier: "x2" beside a name reads as two of that name. It sits
+        // outside the flow, so it never takes width from the label.
+        div.classList.add("composite");
+        div.appendChild(el("span", "graph-count", String(node.members.length)));
+      }
       div.appendChild(el("span", "graph-strip"));
-      div.appendChild(el("span", "node-label", node.label));
+      const head = el("span", "graph-head");
+      head.appendChild(el("span", "node-label", node.label));
       for (const chip of node.chips) {
         const c = el("span", "graph-chip", chip.text);
         c.dataset.nodeId = String(chip.id);
-        div.appendChild(c);
-        this.handles.set(chip.id, { element: c, order: order.get(String(node.id)) ?? 0 });
+        head.appendChild(c);
+        this.handles.set(chip.id, { element: c, order: rank });
       }
-      div.appendChild(el("span", "node-id", `#${node.id}`));
-      div.title = node.tiling === null ? node.label : `${node.label}\n${node.tiling}`;
+      head.appendChild(el("span", "node-id", `#${node.id}`));
+      if (this.showsTiling(node)) {
+        const body = el("span", "graph-body");
+        body.appendChild(head);
+        body.appendChild(el("span", "graph-tiling", clipTiling(node.tiling!)));
+        div.appendChild(body);
+      } else {
+        div.appendChild(head);
+      }
+      // A fan-out happens at the producer, so one mark on the producer names
+      // every branch reading it.
+      if (node.fanOuts.length) div.appendChild(el("span", "graph-fan"));
       this.canvas.appendChild(div);
-      this.handles.set(node.id, { element: div, order: order.get(String(node.id)) ?? 0 });
+      this.handles.set(node.id, { element: div, order: rank });
+      for (const member of node.members) this.handles.set(member, { element: div, order: rank });
+      for (const fan of node.fanOuts) this.handles.set(fan, { element: div, order: rank });
     }
 
-    // A suppressed node draws as a glyph on the edge that replaced it. The edge
-    // itself is a two-pixel target; the glyph is one a reader can hit.
-    for (const edge of this.graph.edges) {
+    // At `operators` a suppressed node draws as a glyph on the edge that
+    // replaced it — the edge itself is a two-pixel target and the glyph is one a
+    // reader can hit. At `steps` its producer's box carries the mark instead,
+    // so the glyphs would be a second, scattered answer to the same question.
+    for (const edge of this.graph.detail === "steps" ? [] : this.graph.edges) {
       const points = isBackEdge(edge) ? this.backEdge(edge, at) : routed.get(edge.id);
       if (!points || !edge.suppressed.length) continue;
       const mid = midpoint(points);
@@ -215,6 +430,9 @@ export class OperatorView {
     }
 
     this.canvas.addEventListener("click", (event) => this.onClick(event));
+    this.canvas.addEventListener("pointerover", (event) => this.onHover(event));
+    this.canvas.addEventListener("pointerleave", () => this.hideCard());
+    this.canvas.addEventListener("dblclick", (event) => this.onPin(event));
     void forward;
   }
 
@@ -238,6 +456,32 @@ export class OperatorView {
     const to = { x: b.x + b.width / 2, y: b.y + b.height / 2 };
     const bow = Math.max(a.x + a.width, b.x + b.width) + 26;
     return [from, { x: bow, y: from.y }, { x: bow, y: to.y }, to];
+  }
+
+  private nodeUnder(event: Event): DrawNode | undefined {
+    const owner = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-node-id]");
+    if (!owner) return undefined;
+    // A chip or a member is drawn inside a box; a glyph rides an edge and has
+    // no box to expand.
+    const own = Number(owner.dataset.nodeId);
+    const item = this.graph.viewItem(own);
+    const id = item && (item.kind === "chip" || item.kind === "member") ? item.host : own;
+    return this.graph.nodes.find((n) => n.id === id);
+  }
+
+  private onHover(event: PointerEvent): void {
+    if (this.cardPinned) return;
+    const node = this.nodeUnder(event);
+    if (!node) return this.hideCard();
+    this.showCard(node, event.clientX, event.clientY, false);
+  }
+
+  // Double-click also fires a `click`, so it moves the selection — which is the
+  // selection that click would have made anyway, so the reader loses nothing.
+  private onPin(event: MouseEvent): void {
+    const node = this.nodeUnder(event);
+    if (!node) return this.hideCard(true);
+    this.showCard(node, event.clientX, event.clientY, true);
   }
 
   private onClick(event: MouseEvent): void {

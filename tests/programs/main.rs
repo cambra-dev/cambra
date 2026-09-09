@@ -35,6 +35,7 @@ mod join_then_groupby;
 mod ledger_balance;
 mod list_min;
 mod nonneg_inventory;
+mod order_ledger;
 mod polymorphic;
 mod prefix_lines;
 mod reachability;

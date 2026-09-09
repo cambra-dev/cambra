@@ -346,6 +346,38 @@ body {
   stroke-dasharray: 1.5 3.5;
   opacity: 0.9;
 }
+/* How much of the graph to draw. A reading preference, so it sits in the pane's
+   own header rather than in the pane menu. */
+.graph-detail {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.3em 0.5em;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-header);
+  font-size: 11px;
+}
+.graph-detail-label {
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 9.5px;
+}
+.graph-detail-option {
+  font: inherit;
+  font-family: var(--mono);
+  padding: 0.1em 0.6em;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+.graph-detail-option[aria-pressed="true"] {
+  background: var(--edge);
+  border-color: var(--edge);
+  color: var(--bg);
+}
 .graph-node {
   position: absolute;
   display: flex;
@@ -892,4 +924,101 @@ button.live-group-head:hover {
 .live-menu-empty {
   color: var(--fg-muted);
   padding: 2px 4px;
+}
+
+/* A box that carries a tiling draws two lines, so its width is that of its
+   wider line rather than of their sum. */
+.graph-node:has(.graph-body) {
+  align-items: stretch;
+}
+.graph-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  flex: 1;
+}
+.graph-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.3em;
+  min-width: 0;
+}
+.graph-tiling {
+  color: var(--type);
+  font-size: 9.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* "Stands for N operators", as a stack of cards rather than a multiplier: an
+   "x2" beside a name reads as two of that name. */
+.graph-count {
+  position: absolute;
+  top: -7px;
+  right: -5px;
+  z-index: 2;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 3.5px;
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--edge);
+  border: 1px solid var(--edge);
+  box-shadow:
+    2px -2px 0 -0.5px var(--bg),
+    3px -3px 0 -0.5px var(--edge);
+}
+.graph-node.composite {
+  border-color: var(--edge);
+}
+.graph-node.composite .graph-strip {
+  background: var(--edge);
+}
+/* A fan-out happens at the producer, so the mark sits on the producer's
+   downstream edge and its branches are named on the card. */
+.graph-fan {
+  position: absolute;
+  left: 50%;
+  bottom: -4px;
+  transform: translateX(-50%);
+  width: 16px;
+  height: 5px;
+  border-radius: 0 0 3px 3px;
+  background: var(--node-id);
+  opacity: 0.85;
+}
+/* Hover expands a box: what it could not fit. Appended to the body so the
+   pane's own scrolling does not clip it. */
+.graph-card {
+  position: fixed;
+  z-index: 40;
+  max-width: 460px;
+  pointer-events: none;
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--fg-muted);
+  border-radius: 4px;
+  padding: 0.5em 0.7em;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+}
+.graph-card.pinned {
+  border-color: var(--edge);
+}
+.graph-card-head {
+  font-weight: 600;
+  color: var(--edge);
+}
+.graph-card-chip,
+.graph-card-tiling {
+  color: var(--type);
+}
+.graph-card-note {
+  color: var(--fg-muted);
 }

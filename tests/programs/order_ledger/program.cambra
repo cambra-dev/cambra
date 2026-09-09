@@ -1,0 +1,51 @@
+# An order ledger, written so that one program carries every shape the operator
+# graph draws differently: a UDF called from three sites, a generator UDF fused
+# into its consumer, a loop-carried mutable variable over a concrete induction
+# extent, two transactional mutable variables over `Txn`, a feed written from
+# inside a transaction, and a declarative aggregate over a filtered
+# comprehension.  Returns 7750.
+
+orders = [
+    (id=1, sku="widget", qty=3, unit=250),
+    (id=2, sku="gizmo",  qty=1, unit=1200),
+    (id=3, sku="widget", qty=4, unit=250),
+]
+
+def line_total(qty, unit):
+    qty * unit
+
+# A generator UDF: inlining fuses its filter into whatever consumes it.
+def bulk(os):
+    for o in os:
+        if o.qty > 2:
+            yield o
+
+# A loop-carried mutable variable.  Its domain is the concrete extent of
+# `orders`, so mutability elimination turns it into a `LetRec` recurrence and
+# loop planning into a `Transact` over that extent.
+revenue := 0
+for o in orders:
+    revenue := revenue + line_total(o.qty, o.unit)
+
+# The same total as a declarative aggregate over a filtered comprehension —
+# no mutable state, a different operator shape for the same arithmetic.
+bulk_revenue = sum([line_total(o.qty, o.unit) for o in bulk(orders)])
+
+# Transactional state.  `Txn` is the sequencing domain, so these two writes and
+# the feed below all commit or roll back together, once per order.
+receipts = defer()
+closing = defer()
+inventory: Mut(Int, Txn) := 100
+shipped: Mut(Int, Txn) := 0
+
+for o in orders:
+    with begin():
+        inventory := inventory - o.qty
+        shipped := shipped + o.qty
+        receipts << line_total(o.qty, o.unit)
+
+# A read of both transactional variables in one block, after the writer loop.
+with begin():
+    closing << inventory + shipped
+
+revenue + bulk_revenue + sum(receipts) + sum(closing)
