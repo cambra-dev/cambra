@@ -74,8 +74,9 @@ const FEED_LABEL: RewriteLabel = "letrec.feed";
 /// The shadowing `let` a mutable write outside any loop normalizes to.
 const BARE_WRITE_LABEL: RewriteLabel = "letrec.bare_write";
 
-/// The two nodes one statement occupies: the `ExprStmt` holding it and the
-/// marker that is its effect (`For`, `MutWrite`, `Feed`).
+/// The two nodes one statement occupies: the marker that *is* the statement
+/// (`For`, `MutWrite`, `Feed`) and the `ExprStmt` holding it and the statements
+/// after it.
 ///
 /// A recording names a single node, and a statement's expansion is about both
 /// of these. [`StmtSite::enter`] names the `ExprStmt` — the outermost node the
@@ -84,14 +85,18 @@ const BARE_WRITE_LABEL: RewriteLabel = "letrec.bare_write";
 /// products.
 #[derive(Clone, Copy)]
 pub(crate) struct StmtSite {
-    stmt: NodeId,
+    /// The `For`/`MutWrite`/`Feed` marker: the statement itself.
     effect: NodeId,
+    /// The `ExprStmt` holding `effect` and the statements after it. Equal to
+    /// `effect` for a marker reached off any statement chain, where the marker
+    /// stands as the whole site (see [`collect_writes_in`]).
+    expr_stmt: NodeId,
 }
 
 impl StmtSite {
     /// Both ids are read before the destructure that moves the statement.
-    fn new(stmt: NodeId, effect: NodeId) -> Self {
-        StmtSite { stmt, effect }
+    fn new(expr_stmt: NodeId, effect: NodeId) -> Self {
+        StmtSite { effect, expr_stmt }
     }
 
     /// Open a recording over what this statement became.
@@ -101,8 +106,8 @@ impl StmtSite {
     /// otherwise put one pair in both the ancestry and the blame relation,
     /// which says nothing the ancestry edge does not already say.
     fn enter(self, label: RewriteLabel, nature: provenance::Nature) -> RecordingGuard {
-        let g = provenance::enter(self.stmt, label, nature);
-        if self.effect != self.stmt {
+        let g = provenance::enter(self.expr_stmt, label, nature);
+        if self.effect != self.expr_stmt {
             g.blame(&[self.effect]);
         }
         g
@@ -116,7 +121,7 @@ impl StmtSite {
     /// [`transform_feed_only_loop`], where every product belongs to a feed and
     /// the `for` around them would otherwise reach nothing at all.
     fn blamed_in(self, g: &RecordingGuard) {
-        g.blame(&[self.stmt, self.effect]);
+        g.blame(&[self.expr_stmt, self.effect]);
     }
 }
 
@@ -1026,8 +1031,9 @@ fn transform_loop(
     // read) or downstream of it (the trailing final read), so these two trees
     // carry every `Mut(V, D)` this loop's mutable variables have.
     let value_tys = mut_var_value_tys([&loop_body, &cont]);
-    // Accumulators in first-write order, with their value types and write sites.
-    let mut accs: Vec<Accumulator> = Vec::new();
+    // Accumulating variables in first-write order, with their value types and
+    // every write to each.
+    let mut accs: Vec<AccumulatorVariable> = Vec::new();
     collect_writes(&loop_body, &value_tys, &mut accs);
     if accs.is_empty() {
         // A loop with no accumulator. If its body feeds — a stateless generator,
@@ -1098,17 +1104,50 @@ fn transform_loop(
     )
 }
 
-/// One accumulator of an induction loop: the mutable variable, the value type its
-/// recurrence slot carries, and the write statement that made it an accumulator.
+/// One accumulating mutable variable of an induction loop: the variable, the value
+/// type its recurrence slot carries, and every write to it in the loop body.
 ///
-/// The site is what the slot's products are recorded against — the snapshot
-/// projection, the guard's seed, the trailing final read — so each accumulator
-/// of a two-accumulator loop resolves to the line that writes it rather than
-/// both resolving to the loop.
-pub(crate) struct Accumulator {
+/// One entry per variable, not per write. The entry's position in
+/// [`InductionFold::accs`] is the variable's slot index in the decision write set
+/// (`writes.i`), so a variable the body writes five times holds one slot and one
+/// entry, and [`collect_writes`]'s traversal order fixes both the index and the
+/// order of `writes`.
+pub(crate) struct AccumulatorVariable {
     pub name: Name,
     pub ty: Type,
-    site: StmtSite,
+    /// Every write to the variable, in [`collect_writes`]'s pre-order walk order:
+    /// source order along the flattened statement spine, branch order inside a
+    /// `Case`. Non-empty — an entry exists because a write created it.
+    writes: Vec<StmtSite>,
+}
+
+impl AccumulatorVariable {
+    /// Open a recording over one of the slot's products, named on the first write
+    /// and blaming the rest.
+    ///
+    /// The slot belongs to the variable rather than to any one write, so every
+    /// write answers with the slot's products. Only the first is ancestry: a later
+    /// write mints nothing, because [`transform_chain`] inlines its value into the
+    /// read-your-writes environment and its marker and `ExprStmt` die.
+    ///
+    /// TODO: blaming every write says which writes a product is about and not
+    /// which one it came from. Two of the five products — the guard's seed and the
+    /// trailing final read's default — are the variable's pre-loop binding, so they
+    /// belong to its `MutDecl`, and the rest belong to the slot as a whole. Naming
+    /// the `MutDecl` needs its `NodeId` threaded down from [`rewrite`]'s `MutDecl`
+    /// arm, which is an ancestor of the loop statement and outside the body
+    /// [`collect_writes`] walks.
+    fn enter(&self, label: RewriteLabel, nature: provenance::Nature) -> RecordingGuard {
+        let (first, rest) = self
+            .writes
+            .split_first()
+            .expect("an accumulating variable has at least the write that created it");
+        let g = first.enter(label, nature);
+        for w in rest {
+            w.blamed_in(&g);
+        }
+        g
+    }
 }
 
 /// An induction loop folded into a single decision-factored history binding,
@@ -1137,8 +1176,8 @@ pub(crate) struct InductionFold {
     pub domain_ty: Type,
     pub writes_ty: Type,
     pub decision_ty: Type,
-    /// Accumulators in first-write order (index `i` ↦ `writes.i`).
-    pub accs: Vec<Accumulator>,
+    /// Accumulating variables in first-write order (index `i` ↦ `writes.i`).
+    pub accs: Vec<AccumulatorVariable>,
 }
 
 impl InductionFold {
@@ -1147,17 +1186,15 @@ impl InductionFold {
     /// applied at `pos`; the transaction phase uses it to resolve a `commits(r)`
     /// decision that reads an induction accumulator at its request position.
     ///
-    /// The view is the accumulator's product, so the recording is the
-    /// accumulator's: one slot's stream, named on the statement that writes it.
+    /// The view is the slot's product, so the recording is the accumulating
+    /// variable's: one slot's stream, named on the statement that writes it.
     /// Opening it here rather than at the call site is what puts it on the write
     /// statement at all — the caller is `transact_phase`, which holds the
-    /// enclosing `transact.cross_domain_fold` recording on the *loop* statement
-    /// and has no access to [`Accumulator`]'s site.
+    /// enclosing `transact.cross_domain_fold` recording on the loop statement and
+    /// has no access to [`AccumulatorVariable`]'s writes.
     pub(crate) fn acc_view(&self, i: usize) -> Expr {
         let acc = &self.accs[i];
-        let _g = acc
-            .site
-            .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+        let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         writes_index_view(
             &self.hist,
             &self.hist_ty,
@@ -1182,7 +1219,7 @@ pub(crate) fn fold_induction_loop(
     loop_body: Expr,
     value_tys: &HashMap<Name, Type>,
 ) -> InductionFold {
-    let mut accs: Vec<Accumulator> = Vec::new();
+    let mut accs: Vec<AccumulatorVariable> = Vec::new();
     collect_writes(&loop_body, value_tys, &mut accs);
     assert!(
         !accs.is_empty(),
@@ -1211,9 +1248,7 @@ pub(crate) fn fold_induction_loop(
     // `__p ▷ .i`, the loop binder reads the item slot `__p ▷ .k`.
     let mut env: HashMap<Name, Expr> = HashMap::new();
     for (i, acc) in accs.iter().enumerate() {
-        let _g = acc
-            .site
-            .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+        let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         env.insert(acc.name.clone(), proj_of(&p, &p_ty, i, &acc.ty));
     }
     env.insert(
@@ -1269,9 +1304,7 @@ pub(crate) fn fold_induction_loop(
     let seeds: Vec<Expr> = accs
         .iter()
         .map(|a| {
-            let _g = a
-                .site
-                .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+            let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
             tvar(&a.name, a.ty.clone())
         })
         .collect();
@@ -1296,9 +1329,7 @@ pub(crate) fn fold_induction_loop(
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            let _g = a
-                .site
-                .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+            let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
             proj_of(&prev, &writes_ty, i, &acc_tys[i])
         })
         .collect();
@@ -1321,9 +1352,7 @@ pub(crate) fn fold_induction_loop(
     let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
     let mut renames: Vec<(Name, Name)> = Vec::new();
     for (i, acc) in accs.iter().enumerate() {
-        let _g = acc
-            .site
-            .enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+        let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         let vty = &acc.ty;
         let view = writes_index_view(&h, &hist_ty, &domain_ty, &writes_ty, &decision_ty, i, vty);
         let view_ty = view.ty.clone();
@@ -1505,15 +1534,15 @@ pub(crate) fn mut_var_value_tys<'a>(
     out
 }
 
-/// Collect the loop's accumulators in first-write order, each with its value type
-/// taken from `value_tys` — the join inference recorded on the mutable variable's
-/// `Mut(V, D)` — and the write statement its recurrence slot is recorded against.
+/// Collect the loop's accumulating variables in first-write order, each with its
+/// value type taken from `value_tys` — the join inference recorded on the mutable
+/// variable's `Mut(V, D)` — and the statements of every write to it.
 ///
-/// One accumulator has one slot however many times the body writes it, so the
-/// recording goes to the first write and a later write to the same variable takes
-/// none. What the later statement contributes is not a mint: [`transform_chain`]
-/// inlines its value into the read-your-writes environment by id, and its marker
-/// and `ExprStmt` die, which the boundary difference reports.
+/// One variable is one recurrence slot however many times the body writes it, so a
+/// repeat write extends that variable's entry rather than adding one; the entry
+/// order is the order of first writes, which is the slot order
+/// ([`AccumulatorVariable`]). The value type comes from the first write, whose
+/// `value.ty` is the fallback below.
 ///
 /// A mutable variable with no entry is one no reference types as a `Mut`: either nothing
 /// reads it (only writes mention it, so its value type is unobservable), or the
@@ -1522,7 +1551,11 @@ pub(crate) fn mut_var_value_tys<'a>(
 /// mutable variable takes no refinement from any single contribution, and an unstripped
 /// one would be a refinement acquired by erasure rather than by `cast`
 /// (`src/ccl/design/type-inference.md`, "Refinements on the lattice").
-fn collect_writes(expr: &Expr, value_tys: &HashMap<Name, Type>, out: &mut Vec<Accumulator>) {
+fn collect_writes(
+    expr: &Expr,
+    value_tys: &HashMap<Name, Type>,
+    out: &mut Vec<AccumulatorVariable>,
+) {
     collect_writes_in(expr, None, value_tys, out);
 }
 
@@ -1534,21 +1567,25 @@ fn collect_writes_in(
     expr: &Expr,
     stmt: Option<NodeId>,
     value_tys: &HashMap<Name, Type>,
-    out: &mut Vec<Accumulator>,
+    out: &mut Vec<AccumulatorVariable>,
 ) {
-    if let TypedExprNode::MutWrite { name, value } = &expr.node
-        && !out.iter().any(|a| a.name == *name)
-    {
-        let ty = value_tys
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| strip_refinements(&value.ty));
+    if let TypedExprNode::MutWrite { name, value } = &expr.node {
         let write = expr.node_id();
-        out.push(Accumulator {
-            name: name.clone(),
-            ty,
-            site: StmtSite::new(stmt.unwrap_or(write), write),
-        });
+        let site = StmtSite::new(stmt.unwrap_or(write), write);
+        match out.iter_mut().find(|a| a.name == *name) {
+            Some(acc) => acc.writes.push(site),
+            None => {
+                let ty = value_tys
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| strip_refinements(&value.ty));
+                out.push(AccumulatorVariable {
+                    name: name.clone(),
+                    ty,
+                    writes: vec![site],
+                });
+            }
+        }
     }
     if let TypedExprNode::ExprStmt { expr: effect, body } = &expr.node {
         collect_writes_in(effect, Some(expr.node_id()), value_tys, out);
@@ -1679,7 +1716,7 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
 fn transform_chain(
     expr: Expr,
     env: &mut HashMap<Name, Expr>,
-    accs: &[Accumulator],
+    accs: &[AccumulatorVariable],
     writes_ty: &Type,
     entering: &[Expr],
     path: &Expr,
@@ -2168,6 +2205,12 @@ mod tests {
     /// `x := 0; for i in [1,2,3]: x += i; x` as lowering + inference
     /// leave it: `let x = 0 in ExprStmt(For{i, [1,2,3], x := x+i}, x)`.
     fn direct_mirror_sum() -> (Expr, Name, Name) {
+        mirror_sum_writing(1)
+    }
+
+    /// [`direct_mirror_sum`] with the body's `x += i` repeated `writes` times, so
+    /// the loop has one accumulating variable holding several write statements.
+    fn mirror_sum_writing(writes: usize) -> (Expr, Name, Name) {
         let int = Type::Base(BaseType::Int);
         let list_ty = Type::data_fun(Type::UIntRange(3), int.clone());
         let x = Name::fresh("x");
@@ -2185,18 +2228,21 @@ mod tests {
         ));
         list.ty = list_ty;
 
-        let mut sum = Expr::new(TypedExprNode::BinOp {
-            left: Box::new(tvar(&x, int.clone())),
-            op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
-            right: Box::new(tvar(&i, int.clone())),
-        });
-        sum.ty = int.clone();
-        let mut write = Expr::mut_write(x.clone(), sum);
-        write.ty = Type::Base(BaseType::Unit);
         let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
         unit.ty = Type::Base(BaseType::Unit);
-        let mut body = Expr::expr_stmt(write, unit);
-        body.ty = Type::Base(BaseType::Unit);
+        let mut body = unit;
+        for _ in 0..writes {
+            let mut sum = Expr::new(TypedExprNode::BinOp {
+                left: Box::new(tvar(&x, int.clone())),
+                op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+                right: Box::new(tvar(&i, int.clone())),
+            });
+            sum.ty = int.clone();
+            let mut write = Expr::mut_write(x.clone(), sum);
+            write.ty = Type::Base(BaseType::Unit);
+            body = Expr::expr_stmt(write, body);
+            body.ty = Type::Base(BaseType::Unit);
+        }
 
         let mut for_node = Expr::new(TypedExprNode::For {
             target: TypedBinding {
@@ -2411,6 +2457,93 @@ mod tests {
                 table.tag(id).map(|t| t.label),
                 Some(ACCUMULATOR_LABEL),
                 "under the accumulator's own label",
+            );
+        }
+    }
+    /// **Every write to an accumulating variable answers with its slot's
+    /// products.** The slot belongs to the variable, so a body that writes it
+    /// twice records the products against the first write and blames the second.
+    /// Only the first is ancestry: a later write mints nothing, because
+    /// [`transform_chain`] inlines its value into the read-your-writes
+    /// environment. Blame is the relation for a node a product is about rather
+    /// than descended from (`src/ccl/design/provenance.md`, "Where to open a
+    /// recording").
+    #[test]
+    fn a_repeat_write_blames_the_slot_it_shares() {
+        use crate::ccl::context::Phase;
+        use crate::ccl::provenance::{PhaseScope, TableSession};
+
+        let (tree, ..) = mirror_sum_writing(2);
+        let TypedExprNode::MutDecl { body: stmt, .. } = tree.node else {
+            unreachable!("`mirror_sum_writing` is a `MutDecl`")
+        };
+        let loop_stmt_id = stmt.node_id();
+        let TypedExprNode::ExprStmt {
+            expr: effect,
+            body: cont,
+        } = stmt.node
+        else {
+            unreachable!("the introduction's body is the loop statement")
+        };
+        let TypedExprNode::For { target, iter, body } = effect.node else {
+            unreachable!("the statement's effect is the loop")
+        };
+        // Both write statements, in spine order — the order `collect_writes`
+        // walks, so the first is the one the recording names.
+        let TypedExprNode::ExprStmt {
+            expr: first_write,
+            body: rest,
+        } = &body.node
+        else {
+            unreachable!("the loop body is a write statement")
+        };
+        let (first_stmt_id, first_write_id) = (body.node_id(), first_write.node_id());
+        let TypedExprNode::ExprStmt {
+            expr: second_write, ..
+        } = &rest.node
+        else {
+            unreachable!("the loop body's second statement is the repeat write")
+        };
+        let (second_stmt_id, second_write_id) = (rest.node_id(), second_write.node_id());
+        let value_tys = mut_var_value_tys([&*body, &*cont]);
+
+        let session = TableSession::install();
+        let view_ids = {
+            let _scope = PhaseScope::enter(Phase::Transact);
+            let _enclosing = provenance::enter(
+                loop_stmt_id,
+                "transact.cross_domain_fold",
+                provenance::Nature::Expansion,
+            );
+            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            assert_eq!(fold.accs.len(), 1, "two writes to one variable is one slot");
+            assert_eq!(
+                fold.accs[0].writes.len(),
+                2,
+                "and the variable holds both write statements"
+            );
+            let view = fold.acc_view(0);
+            let mut ids = Vec::new();
+            fn collect(e: &Expr, out: &mut Vec<NodeId>) {
+                out.push(e.node_id());
+                e.walk_children(|c| collect(c, out));
+            }
+            collect(&view, &mut ids);
+            ids
+        };
+        let table = session.into_table();
+
+        assert!(!view_ids.is_empty(), "the view is a tree of minted nodes");
+        for id in view_ids {
+            assert_eq!(
+                table.parents(id),
+                [first_stmt_id],
+                "a view node descends from the first write statement alone",
+            );
+            assert_eq!(
+                table.blame(id),
+                [first_write_id, second_stmt_id, second_write_id],
+                "and blames the first write's marker and both of the second's nodes",
             );
         }
     }

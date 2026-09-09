@@ -554,9 +554,15 @@ Four refinements the shapes above do not cover:
   Open a **nested recording per construct** inside the enclosing one. The inner
   recording is innermost while it runs, so the mint hook attaches to it and the
   outer one keeps only what it built itself: `mut_elim` opens
-  `letrec.accumulator` on each write statement and `letrec.feed` on each feed
+  `letrec.accumulator` per accumulating variable and `letrec.feed` on each feed
   statement inside `letrec.loop`, and `planning/loops` opens `planning.txn_read`
   on each continuation read inside `planning.recognize`.
+
+  A construct the split names can be several source statements. A recurrence slot
+  belongs to its accumulating variable, so a body that writes one variable twice
+  gets one recording, named on the first write with the later ones on its blame
+  column — every write answers with the slot's products, and only the write that
+  created the slot claims ancestry (`mut_elim`'s `AccumulatorVariable::enter`).
 
   Two shapes bound the split. An expansion with **one product covering several
   constructs** cannot be split at all: a conditional feed rides a single lambda
