@@ -1651,6 +1651,40 @@ fn keyed_entry_checks_the_annotated_key_type() {
     );
 }
 
+/// `Set(𝐾)` lowers to `Map(𝐾, unit)` — a keyed collection whose payload is the single
+/// `unit` a present key carries (`src/ccl/design/collections.md`, "The six collection
+/// types"). The annotation is the only surface naming one here; the `set(…)` constructor
+/// that *produces* one arrives later in the stack, so this pins the lowering arm on the
+/// parameter form, which needs no producer.
+///
+/// The key type is carried rather than elided, which is what makes the arm more than a
+/// shape: `Set(String)` and `Set(Int)` are different annotations.
+#[test]
+fn a_set_annotation_is_a_unit_valued_keyed_collection() {
+    let int_keyed = infer_program("def f(s: Set(Int)):\n    s\nf").to_string();
+    assert!(
+        int_keyed.contains("SubtypesOf(Int)") && int_keyed.contains("⤇ Unit"),
+        "`Set(Int)` is a keyed collection over `Int` whose values are `unit`, got {int_keyed}"
+    );
+    let str_keyed = infer_program("def f(s: Set(String)):\n    s\nf").to_string();
+    assert!(
+        str_keyed.contains("SubtypesOf(String)"),
+        "`Set(String)` must carry its own key type, got {str_keyed}"
+    );
+    let elided = infer_program("def f(s: Set(_)):\n    s\nf").to_string();
+    assert!(
+        elided.contains("⤇ Unit"),
+        "an elided key leaves the payload stated, got {elided}"
+    );
+    // A list is `Int`-valued, so it is no set of `Int`s at either annotation strength.
+    for code in ["s: Set(Int) = [1,2,3]\ns", "s <: Set(Int) = [1,2,3]\ns"] {
+        assert!(
+            !infer_program_err(code).is_empty(),
+            "an `Int`-valued collection must not satisfy `Set(Int)`: {code}"
+        );
+    }
+}
+
 /// The **other** route by which a map can be read as its values — direct
 /// consumption — is still open, and deliberately so: `Σ`-elimination (`Σ <: Fun`)
 /// is kind-blind, because that is the same arm that makes `sum(xs)` work for a

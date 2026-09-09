@@ -748,3 +748,49 @@ fn test_grouping_built_once_through_a_lookup(#[case] code: &str) {
         "the grouping should be bucketized once however many uses it has; got:\n{ccl}"
     );
 }
+
+/// A keyed annotation on a group-by, **compiled and run**. The annotation tests in
+/// `tests/type_check.rs` pin what one types as; these pin that an annotated program
+/// produces a value, which no type test sees.
+///
+/// `FullMap(_, _)` with the key elided is the only form a group-by satisfies — its domain
+/// is the present-key domain and the surface cannot spell that refinement
+/// (`src/ccl/design/collections.md`, "`groupby`'s exact type").
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case(
+    "g: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
+    Value::Int(3)
+)]
+#[case(
+    "g: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
+    Value::Int(10)
+)]
+fn an_exact_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A keyed annotation that types and cannot be **consumed**. Both shapes reach an assertion
+/// the compiler labels its own bug, and neither is reachable from an inference test: the
+/// type tests beside these annotate and return `g`, where consuming it is what fails.
+///
+/// - the **bounded** form records an open bound — the group-by's `__gb_k` free in a lower
+///   bound whose holder's telescope does not carry it (`infer_var.rs`). Its exact
+///   counterpart above compiles, so the strength is the whole difference;
+/// - the **boxed exact `Map`** form raises a scope violation, the `box` referencing the
+///   comprehension's `__iter_record` from outside its scope.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case(
+    "g <: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
+    Value::Int(3)
+)]
+#[case(
+    "g: Map(_, _) = box(groupby([1,2,3], \\x -> x))\nsum([sum(v) for v in g])",
+    Value::Int(6)
+)]
+#[ignore = "a keyed annotation types but cannot be consumed: the bounded form records an \
+            open bound, the boxed exact form a scope violation"]
+fn a_consumed_keyed_annotation_does_not_compile(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
