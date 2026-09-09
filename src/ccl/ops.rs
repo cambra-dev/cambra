@@ -643,7 +643,7 @@ pub enum Builtin {
     ///
     /// **Not an application**, so the key owes the collection's key *base* and presence is
     /// what the operator decides at runtime (`src/ccl/design/collections.md`,
-    /// "`𝑐[𝑘]?` is not an application"). A dependent codomain answers at the key, its
+    /// "The checked lookup `𝑐[𝑘]?`"). A dependent codomain answers at the key, its
     /// binder discharging to the key term.
     ///
     /// Applied as a tupled argument, the convention [`Self::GetPrevTxn`] shares:

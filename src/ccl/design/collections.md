@@ -154,7 +154,7 @@ That dependency decides what the type is: a [`FullMap`](#the-six-collection-type
 `Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
 annotation or consumer converts one into the other, so a group-by is consumed at the type
 it has. A checked lookup answers at the key, the binder discharging to the key term
-([`𝑐[𝑘]?` is not an application](#𝑐𝑘-is-not-an-application)); what it cannot do is
+([The checked lookup `𝑐[𝑘]?`](#the-checked-lookup-𝑐𝑘)); what it cannot do is
 materialize, a group being a collection.
 
 ### The key domain is the key morphism's image
@@ -354,10 +354,14 @@ become the per-type standard-library instances with no semantic change. Everythi
 the argument's type is a subtype of the function's domain — subscript and call are the same
 operation ([chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)).
 
-### `𝑐[𝑘]?` is not an application
+### The checked lookup `𝑐[𝑘]?`
 
-`𝑐[𝑘]?` is its own total operation, and its rule reads the collection's type apart instead
-of applying it. Four steps, in `emit_lookup_checked`:
+`𝑐[𝑘]?` is its own total operation, answering `Option(𝑉)` for any key. A collection is a
+total function on its own domain and says nothing about keys outside it, so neither half of
+the operation is a reading: the typing rule cannot be an application, and the operator has
+to search.
+
+**The rule**, four steps in `emit_lookup_checked`:
 
 1. **Take the key domain, the key binder and the codomain off the collection**
    (`keyed_access_types`). An abstract `Map(𝐾, 𝑉)` is a Σ over `SubtypesOf(𝐾)`, so the sum
@@ -390,20 +394,13 @@ distinguishes the two cases. The binder's declared domain is where the binder wa
 introduced, not something the key has to satisfy.
 
 [`Builtin::CollectionContains`] is the same rule one payload lighter — `∀ι κ. (ι ⤇ κ) ⇒
-(κ ⇒ Bool)`, a runtime-decided question behind a total function — and `𝑐[𝑘]?` answers it
-with the value instead of a tag.
+(κ ⇒ Bool)`, a runtime-decided question behind a total function. It names the key set
+`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` at the type level and is never executed; `𝑐[𝑘]?`
+answers the same question with the value instead of a tag.
 
-### How `𝑐[𝑘]?` compiles
-
-**A `CheckedLookup` operator, which decides the membership.** It takes the collection and
-the key as separate sources, searches the collection's domain for the key, and emits
-`` `some(𝑐(𝑘)) `` or `` `none ``.
-
-The search is the operator's whole content. A collection is a total function on its own
-domain, `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ 𝑉`, and says nothing about keys outside
-it, so a tagged answer comes from answering the membership predicate rather than from
-reading the function. [`Builtin::CollectionContains`] names that key set at the type level
-and is never executed.
+**The operator.** Lowering emits `(𝑐, 𝑘) ▷ lookup?`, which op-conversion compiles to a
+[`CheckedLookup`] taking the collection and the key as separate sources: it searches the
+collection's domain for the key and emits `` `some(𝑐(𝑘)) `` or `` `none ``.
 
 **Absence is decided, not read off an empty tile.** An empty tile means "no rows known
 here", which covers both a key genuinely absent and a producer that has not converged.
@@ -413,12 +410,7 @@ run rather than of the collection's value, so the same lookup on a live source w
 is therefore the **readiness** condition: `CheckedLookup` withholds until the domain is
 decided, and only then answers `` `none ``.
 
-**Applied to a pair.** The lowering emits `(𝑐, 𝑘) ▷ lookup?`. Inference relates the key to
-the collection's key **base** and discharges a dependent binder to the key term. Nothing is
-applied at the key, so the domain's membership refinement is not an obligation for the rule
-to relax.
-
-Emission computes that discharge; a check reads it back off the operator's stamped type
+Emission computes step 2's discharge; a check reads it back off the operator's stamped type
 rather than re-running it. Planning compiles a refinement's predicate to point-free form,
 and compilation records the binder's type on the `const` minted to carry it — a place
 substituting the binder's occurrence does not reach — so a discharge re-run after planning
@@ -433,7 +425,7 @@ answered against it. The rewrite is not an optimization: a streamed collection c
 replicated into every row, because broadcasting copies a single present value and a
 collection is a tile.
 
-**A collection-valued collection is not supported.** A group-by's rows are themselves
+**A collection-valued answer does not materialize.** A group-by's rows are themselves
 collections, so the answer would carry a collection as its `` `some `` payload, and a
 variant payload that is a collection has no materialization. Op-conversion rejects that
 shape by name (`a_group_valued_lookup_is_rejected_by_name`). It is also the case where
