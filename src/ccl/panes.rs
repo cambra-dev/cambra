@@ -272,11 +272,17 @@ pub(crate) fn gate_leaks(leaks: &[Leak], pair: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use indoc::indoc;
+
     use super::*;
+    use crate::ccl::TypedExprNode;
     use crate::ccl::context::{
         GlobalContext, PERF_REPS_ENV, compile_program, predicate_id_collisions,
         provenance_capture_enabled,
     };
+    use crate::ccl::provenance::Link;
     use crate::interpreter::Consumer;
 
     /// The pane-measurement corpus: every demo-gallery program that compiles
@@ -479,7 +485,7 @@ mod tests {
     /// pinning that turns every corpus edit into a list edit.
     #[test]
     fn the_pane_folds_derive_a_non_vacuous_provenance_map() {
-        let mut exercised: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut exercised: HashSet<usize> = HashSet::new();
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let panes = program.materialize_panes();
@@ -591,6 +597,212 @@ mod tests {
         );
     }
 
+    /// One mutation statement's image across the `post-inference →
+    /// post-channelize` pair, split by what the edge asserts: the nodes that
+    /// descend from it, and the nodes merely related to it.
+    ///
+    /// The two are kept apart because the claims are different. "This statement
+    /// reaches its own products" is ancestry; blame relates without claiming
+    /// ancestry, and two statements are legitimately blamed on one node
+    /// (`planning.hash_join` blames both of a join's conditions). Folding blame
+    /// in would let a statement that was only mentioned pass for one that
+    /// produced something, and would make disjointness reject a correct pair of
+    /// blame edges.
+    struct StatementImage {
+        kind: &'static str,
+        descendants: HashSet<NodeId>,
+        blamed: HashSet<NodeId>,
+    }
+
+    /// The mutation statements of `program`, in tree order, each with its image.
+    /// `expected` is the statements the fixture is meant to have, named by the
+    /// marker each holds, so a program that stops exercising the shape fails
+    /// here rather than passing vacuously.
+    fn statement_images(program: &str, expected: &[&'static str]) -> Vec<StatementImage> {
+        let program = compile_ok(program);
+        let panes = program.materialize_panes();
+        let pair = panes.pair("post-inference → post-channelize");
+
+        // The statements of interest, found by the marker each holds.
+        let mut sites: Vec<(&'static str, NodeId)> = Vec::new();
+        fn find(e: &Expr, sites: &mut Vec<(&'static str, NodeId)>) {
+            if let TypedExprNode::ExprStmt { expr: effect, .. } = &e.node {
+                let kind = match &effect.node {
+                    TypedExprNode::For { .. } => Some("loop"),
+                    TypedExprNode::MutWrite { .. } => Some("write"),
+                    TypedExprNode::Feed { .. } => Some("feed"),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    sites.push((kind, e.node_id()));
+                }
+            }
+            e.walk_children(|c| find(c, sites));
+        }
+        find(&program.post_inference_ir, &mut sites);
+        assert_eq!(
+            sites.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            expected,
+            "the fixture no longer has the statements the test is about",
+        );
+
+        sites
+            .iter()
+            .map(|(kind, id)| {
+                let links = pair.map.downstream(id);
+                let of = |f: fn(&Link<NodeId>) -> bool| -> HashSet<NodeId> {
+                    links
+                        .iter()
+                        .filter(|l| l.id != *id && f(l))
+                        .map(|l| l.id)
+                        .collect()
+                };
+                StatementImage {
+                    kind,
+                    descendants: of(|l| l.labels.has_ancestry()),
+                    blamed: of(|l| !l.labels.has_ancestry() && l.labels.has_blame()),
+                }
+            })
+            .collect()
+    }
+
+    /// No two statements produced the same node.
+    fn assert_disjoint(images: &[StatementImage]) {
+        for (i, a) in images.iter().enumerate() {
+            for b in &images[i + 1..] {
+                let shared: Vec<NodeId> = a
+                    .descendants
+                    .intersection(&b.descendants)
+                    .copied()
+                    .collect();
+                assert!(
+                    shared.is_empty(),
+                    "the {} and {} statements both claim {shared:?}",
+                    a.kind,
+                    b.kind,
+                );
+            }
+        }
+    }
+
+    /// **A loop-body statement reaches its own products, not the loop's.**
+    /// `mut_elim` turns one `For` statement into a recurrence carrying a slot
+    /// per accumulator and a tap per feed. One recording on the loop statement
+    /// claims all of it, which leaves every write and every feed in the body
+    /// with no descendants: the inspector then has nothing to answer with for
+    /// the lines that do the mutating. The nested `letrec.accumulator` and
+    /// `letrec.feed` recordings are what split it.
+    ///
+    /// Disjointness is the other half of the claim. A product belongs to one of
+    /// the three statements, so a recording that widened instead of splitting —
+    /// blaming the body statements on the loop's own recording — passes the
+    /// non-emptiness check and fails here.
+    #[test]
+    fn a_loop_body_statement_reaches_its_own_products() {
+        let images = statement_images(
+            indoc! {"
+                out = defer()
+                total := 0
+                for n in [1, 2, 3]:
+                    total := total + n
+                    out << total
+                max(out)
+            "},
+            &["loop", "write", "feed"],
+        );
+        for image in &images {
+            assert!(
+                !image.descendants.is_empty(),
+                "the {} statement reaches nothing in `post-channelize`",
+                image.kind,
+            );
+        }
+        assert_disjoint(&images);
+    }
+
+    /// **Two accumulators resolve to two write statements.** One recurrence
+    /// carries a slot per accumulator, and the slots differ only by the index
+    /// they project — so a recording that named the loop, or that named the
+    /// first write for both slots, produces exactly the same tree and is
+    /// visible only here.
+    #[test]
+    fn each_accumulator_reaches_the_statement_that_writes_it() {
+        let images = statement_images(
+            indoc! {"
+                out = defer()
+                total := 0
+                count := 0
+                for n in [1, 2, 3]:
+                    total := total + n
+                    count := count + 1
+                    out << total
+                max(out) + count
+            "},
+            &["loop", "write", "write", "feed"],
+        );
+        for image in &images {
+            assert!(
+                !image.descendants.is_empty(),
+                "the {} statement reaches nothing in `post-channelize`",
+                image.kind,
+            );
+        }
+        assert_disjoint(&images);
+    }
+
+    /// **A feed reaches its own products whether or not the loop accumulates,
+    /// and the loop it sits in is blamed for them.** An accumulator-free loop
+    /// takes the plain-map path (`mut_elim::transform_feed_only_loop`), which
+    /// mints one mapped source per feed instead of a recurrence. Every product
+    /// there belongs to a feed — the loop mints nothing beyond them, and with
+    /// two feeds it mints two maps — so the split is the whole expansion moving
+    /// to the feed statements, not a slice of it.
+    ///
+    /// That leaves the `for` line answering with nothing of its own, which is
+    /// why the map blames it: the iteration is what the map is about, and blame
+    /// is how a site widens attribution to a node it did not produce. The
+    /// asymmetry with the accumulator path — where the loop keeps its history
+    /// binder and its guard — is the point being pinned, so the loop's empty
+    /// descent is asserted rather than tolerated.
+    ///
+    /// The read-only `with begin():` block is what reaches that path: a
+    /// non-transactional `for n in xs: out << n` is already a `Compose` by
+    /// `post-inference`, lowered without ever reaching `mut_elim`.
+    #[test]
+    fn a_feed_in_an_accumulator_free_loop_reaches_its_own_products() {
+        let images = statement_images(
+            indoc! {"
+                out = defer()
+                pool: Mut(Int, Txn) := 100
+                for r in [10, 20, 30]:
+                    with begin():
+                        out << pool
+                max(out)
+            "},
+            &["loop", "feed"],
+        );
+        let [loop_stmt, feed] = &images[..] else {
+            unreachable!("two statements, asserted above")
+        };
+        assert!(
+            !feed.descendants.is_empty(),
+            "the feed statement reaches nothing in `post-channelize`",
+        );
+        assert!(
+            loop_stmt.descendants.is_empty(),
+            "the loop statement produced {:?} of its own, so the products no \
+             longer all belong to the feed",
+            loop_stmt.descendants,
+        );
+        assert!(
+            feed.descendants.is_subset(&loop_stmt.blamed),
+            "the loop is not blamed for the feed's products: blamed {:?}, feed produced {:?}",
+            loop_stmt.blamed,
+            feed.descendants,
+        );
+        assert_disjoint(&images);
+    }
+
     /// **Both of a nested join's conditions reach the map**, as blame edges from
     /// `planning.hash_join`.
     ///
@@ -614,7 +826,7 @@ mod tests {
                 .iter()
                 .find(|p| p.name == "post-lambda-elim → post-planning")
                 .expect("the planning pane pair");
-            let blamed: std::collections::HashSet<NodeId> = pair
+            let blamed: HashSet<NodeId> = pair
                 .map
                 .edges()
                 .into_iter()

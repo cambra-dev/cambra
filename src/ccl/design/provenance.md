@@ -479,17 +479,20 @@ snapshots: `infer/solve` (`mono.specialize`,
 (`infer.require_trait`), `infer/solver/scheme` (`infer.freshen_predicate`),
 `infer/solver/traits` (`infer.freshen_obligation`), `inline`
 (`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
-`letrec.bare_write`, `letrec.hoist_writer_body`, `letrec.terminalize_write`),
+`letrec.accumulator`, `letrec.feed`, `letrec.bare_write`,
+`letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
 key rebind, key-init stash, carrier, the cross-domain and await-final rules), and
 `channelize` (`channelize.cluster`, `channelize.defer_lift`,
 `channelize.defer_collapse`), `transact_phase`'s as-of-read rewrite
 (`transact.as_of_read`), and `lambda_elim` (`lambda_elim.abstract`,
-`lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Two
-shared helpers record under whichever phase
-scope is open around them: `subst` (`subst.vacuous`, `subst.transport`,
-`subst.force_refinement`) and `ccl_utils`' `PredMemo::rebuild`
-(`predicate.rebuild`).
+`lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Three
+shared helpers record under whichever phase scope is open around them: `subst`
+(`subst.vacuous`, `subst.transport`, `subst.force_refinement`), `ccl_utils`'
+`PredMemo::rebuild` (`predicate.rebuild`), and `mut_elim`'s induction fold —
+`fold_induction_loop` and `InductionFold::acc_view` (`letrec.accumulator`,
+`letrec.feed`), which `transact_phase` calls for a cross-domain loop and so
+records a `letrec.*` label under `Transact`.
 
 Every phase that rewrites expression nodes runs under a `PhaseScope`, so no
 recording is inert: `simplify`'s rule combinator and `planning/iterate` both sit
@@ -532,7 +535,7 @@ recordings are one per rewrite it performs. A recording takes only an
 **id**, so a site that has already moved `expr.node` out can still open one —
 read `expr.node_id()` before the destructure.
 
-Three refinements the shapes above do not cover:
+Four refinements the shapes above do not cover:
 
 - **A product spanning several nodes** — the transaction carrier is what a set of
   scattered `with begin():` blocks and register declarations collectively became.
@@ -545,6 +548,31 @@ Three refinements the shapes above do not cover:
   the same node** inside the arm. The two write disjoint sets of rows on one
   parent, which is what two rewrites attributed to one node should look like. A
   recording carries one label and one nature for its whole extent by design.
+- **An expansion whose products belong to several source constructs** — a
+  mutation loop's `LetRec` carries one recurrence slot per accumulator and one
+  tap per feed, and a single recording on the loop statement claims all of them.
+  Open a **nested recording per construct** inside the enclosing one. The inner
+  recording is innermost while it runs, so the mint hook attaches to it and the
+  outer one keeps only what it built itself: `mut_elim` opens
+  `letrec.accumulator` per accumulating variable and `letrec.feed` on each feed
+  statement inside `letrec.loop`, and `planning/loops` opens `planning.txn_read`
+  on each continuation read inside `planning.recognize`.
+
+  A construct the split names can be several source statements. A recurrence slot
+  belongs to its accumulating variable, so a body that writes one variable twice
+  gets one recording, named on the first write with the later ones on its blame
+  column — every write answers with the slot's products, and only the write that
+  created the slot claims ancestry (`mut_elim`'s `AccumulatorVariable::enter`).
+
+  Two shapes bound the split. An expansion with **one product covering several
+  constructs** cannot be split at all: a conditional feed rides a single lambda
+  over the whole loop body, so no per-feed recording has anything to adopt, and
+  the products stay on the enclosing recording. An expansion where the **enclosing
+  construct mints nothing** inverts it: every product of an accumulator-free
+  mutation loop belongs to one of its feeds, so the inner recordings take the
+  whole expansion and the `for` around them rides their blame column
+  (`mut_elim`'s `StmtSite::blamed_in`). Blame is what a construct that produced
+  nothing gets, rather than an ancestry edge it did not earn or no edge at all.
 
 #### Choosing between `Expansion` and `Machinery`
 
