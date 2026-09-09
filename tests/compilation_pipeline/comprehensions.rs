@@ -180,15 +180,32 @@ fn test_generator_expression_filtered(#[case] code: &str, #[case] expected: Tile
     check_tile(code, expected);
 }
 
-/// Two filtered-comprehension shapes that do not compile. Both **predate the dependent-sum
-/// work** — each reproduces unchanged on `main` — and neither involves a `box`, a `Σ`, or a
-/// witness. They are recorded here because they are otherwise easy to re-diagnose as sum
-/// fallout when they surface beside `sums.rs`'s
-/// `a_filter_over_a_boxed_source_is_applied`, which they resemble and are unrelated to.
+/// A **filtered comprehension as a loop source**. Recorded here as a shape that failed the
+/// post-planning typecheck on the `Transact` it becomes; it compiles now that a compiled
+/// refinement predicate is declared the column it is, the `Transact`'s own filter having
+/// been the predicate that met its source at the incomparable kind.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_filtered_comprehension_drives_a_mutation_loop() {
+    check_scalar(
+        indoc! {r"
+            x = [1, 2, 3]
+            total := 0
+            for y in [z for z in x if z > 1]:
+                total += y
+            total"},
+        Value::Int(5),
+    );
+}
+
+/// A filtered-comprehension shape that does not compile. It **predates the dependent-sum
+/// work** — it reproduces unchanged on `main` — and involves no `box`, `Σ`, or witness. It
+/// is recorded here because it is otherwise easy to re-diagnose as sum fallout when it
+/// surfaces beside `sums.rs`'s `a_filter_over_a_boxed_source_is_applied`, which it resembles
+/// and is unrelated to.
 ///
-/// Each fails loudly, which is why they are recorded rather than fixed here:
-///
-/// - a **filter over a same-domain conditional** fails the post-planning typecheck: the
+/// It fails loudly, which is why it is recorded rather than fixed here: a **filter over a
+/// same-domain conditional** fails the post-planning typecheck: the
 ///   `cast` above the realized union still says `[0, 1]`, where the union's domain is
 ///   `{[0, 1] | π̂₀} | {[0, 1] | π̂₁}`. Wrapping the realization in a `Realize` that asserts
 ///   the pre-realization type gets past that — and then reaches the *second* wall, which is
@@ -200,30 +217,18 @@ fn test_generator_expression_filtered(#[case] code: &str, #[case] expected: Tile
 ///   missing is a way to identify the source without a witness to name it. Asserting
 ///   unconditionally is *not* the fix on its own — it breaks
 ///   `test_value_case_same_domain_collection_result`, where the realized union is the
-///   program's own result and the assertion re-imposes a domain the result no longer has;
-/// - a **filtered comprehension as a loop source** fails the post-planning typecheck on the
-///   `Transact` it becomes.
+///   program's own result and the assertion re-imposes a domain the result no longer has.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case(
-    r"
-c: Bool = True
-sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])",
-    Value::Int(5)
-)]
-#[case(
-    r"
-x = [1, 2, 3]
-total := 0
-for y in [z for z in x if z > 1]:
-    total += y
-total",
-    Value::Int(5)
-)]
 #[ignore = "pre-existing on main, unrelated to sums: a filter over a same-domain \
-            conditional, and a filtered loop source; measured 2026-08-11"]
-fn filtered_comprehension_shapes_that_do_not_compile(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
+            conditional has no witness to key the per-leg discharge on"]
+fn a_filter_over_a_same_domain_conditional_does_not_compile() {
+    check_scalar(
+        indoc! {r"
+            c: Bool = True
+            sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])"},
+        Value::Int(5),
+    );
 }
 
 /// A **let-bound filtered comprehension, filtered again.** Recorded above as a shape that
