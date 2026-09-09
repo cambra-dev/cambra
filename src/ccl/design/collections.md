@@ -53,8 +53,13 @@ With `𝐷` a witness domain and `𝑛` a length:
 - **`FullMap(𝐾, 𝑉)`** = `(𝑘: 𝐾) ⤇ 𝑉` — a value for **every** key of `𝐾`, so the key set is
   readable from the type and `𝑚[𝑘] : 𝑉` needs no proof. Unordered. `𝑉` may depend on `𝑘`,
   which is why `groupby` returns one and no `Map` describes it
-  ([`groupby`'s exact type](#groupbys-exact-type)). Totality is claimed rather than checked:
-  nothing verifies the annotation against whatever built the map.
+  ([`groupby`'s exact type](#groupbys-exact-type)). **Totality is claimed rather than checked
+  where the key is elided [Interim]**: `FullMap(_, 𝑉)` asks only for a data function, so a list
+  literal satisfies it (`full_map_annotations_are_satisfiable`). A *written* key is an ordinary
+  obligation on an invariant domain, which is why `FullMap(Int, 𝑉)` is uninhabited — no producer
+  has an unrefined `Int` domain (`full_map_lookup_needs_no_presence_proof`). What would let a
+  group-by carry one is a surface spelling for the present-key domain, which is the same gap
+  `keys(…)` names below.
 - **`Collection(𝑇)`** = `Σ (𝐷 : Type). 𝐷 ⤇ 𝑇` — the witness ranges over *every*
   domain; the domain rides along **in the value** (retained, not sealed — a
   domain-generic consumer holds it abstract). Unordered. The ⊤ of the kind order, and
@@ -80,7 +85,7 @@ Which side of `𝐷 ⤇ 𝑉` holds the payload is not fixed by the shape. `Set(
 of the same function — and `Map(UInt, 𝑉)` and a filtered `List` can share a shape while one
 must iterate entries and the other values. So which side is the payload is a fact about
 the collection's *type*, and operations (`Iterable`, `Index`, `Membership`, `Ordering` —
-[Operations](#operations-how-the-trait-layer-is-realized-planned)) dispatch on the declared
+[Operations](#operations-how-the-trait-layer-dispatches-planned)) dispatch on the declared
 type rather than reading it back from the function. For the same reason **"keyed-ness" is not
 a primitive**: there is no structural keyed property, only a per-type choice of what
 `for ... in` surfaces.
@@ -115,7 +120,7 @@ document:
   constructor exists to withhold, and reaching `Collection(𝑉)` takes the explicit
   `values(m)`. `Array <: List <: Collection` is untouched either way. The answer decides
   what rejects `sum(m)` — a missing edge, or the iteration element (see
-  [Views](#operations-how-the-trait-layer-is-realized-planned)).
+  [Views](#operations-how-the-trait-layer-dispatches-planned)).
 - **The variance of `𝐾` and `𝑉` in `Map(𝐾, 𝑉)`.** A structural Σ reads variance off its
   body; a declared constructor states it once per parameter.
 
@@ -162,6 +167,15 @@ rather than for want of a rule — and refinements relate by structural predicat
 rather than implication, so there is no entailment step for a proof to land in instead.
 Naming it supplies the rule: a key produced by `𝑚` is a key of the collection `𝑚` keys.
 
+**That is the current answer, and implication is what retires it.** Reasoning about refinements
+by implication rather than by structural equality is planned and unbuilt
+([type-inference.md, Roadmap and Current Prototype
+Status](type-inference.md#roadmap-and-current-prototype-status)). With it, an opaque named key
+set — "the keys of this collection", carrying no producer — is dischargeable from an axiom, and
+it wins on every count that decides between the two: it is smaller, it is independent of how the
+producer is spelled, and it keeps a producer out of a type. So the transparent form is what the
+absence of an entailment step forces, and the opaque form is its successor.
+
 **Naming a term is also what fixes domain identity.** Refinements compare by structural
 predicate equality, so two key domains are the same domain exactly when they name the same
 morphism term. That is a fact about terms rather than about collections — a domain naming a
@@ -169,6 +183,24 @@ parameter is one type over every collection that parameter is bound to, and two 
 one collection (a `let`-bound source and its inlined literal) are two domains. Membership
 therefore reads "in the image of the morphism named here", under whatever the morphism's free
 variables are bound to where the fact is used.
+
+Implication does not close that gap, because the obligation the two spellings need is the
+definition `c = [1,1,2]` rather than an entailment between predicates over values. Relating them
+is canonicalization work, and nothing does it today.
+
+**A morphism is spelled the same way at every position.** Planning compiles a refinement's
+predicate to the point-free form the restrict pipeline consumes, and a key domain is born in
+that form: `fn_of_bare_predicate` returns `f` verbatim from a bare `__elem ▷ f`, so compilation
+is the identity on `__elem ▷ (𝑚 ▷ collection_contains)` and the morphism inside `𝑚` is never
+rewritten. That is what keeps the spellings from splitting — a morphism point-freed at one
+position and pointful at another would be two structurally unequal domains, and the membership
+fact would stop transferring between them.
+
+Two things follow from naming a term at all. A key domain embeds its whole producer, so the type
+grows with the producer and shows up wherever the key type does. And a type's identity now rests
+on a term's, which is the same identity-by-shape exposure the Σ rule's `𝜌` substitution has
+([type-inference.md, What checks each
+premise](type-inference.md#what-checks-each-premise)).
 
 **`Converse` discharges the present-key domain.** Planning rebuilds the site as
 `converse ≫ map`, and the two halves are typed at different domains: the key-extraction
@@ -182,7 +214,7 @@ applies to the predicates planning reifies into a `Restrict`, and this one it ne
 reaches — a membership evaluation would be a keyed lookup or an `x in s` filter, neither of
 which exists.
 
-## Operations: how the trait layer is realized [Planned]
+## Operations: how the trait layer dispatches [Planned]
 
 > The **user-facing semantics** of `for`-in, `[]` / `[]?`, `in`, and ordering —
 > what each collection type binds and returns — are specified in the spec

@@ -1588,7 +1588,7 @@ collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
 > collection — so a map iterates its values (as `groupby` results do) and a set
 > iterates `unit`. Entry/key iteration is the [Planned] work; it only *adds* the
 > type-directed element choice, so `for k -> v in m` is the form to write once it
-> lands. Design: [collections.md, "Operations: how the trait layer is realized [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-is-realized-planned).
+> lands. Design: [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
 
 **Iterations are unordered and may run in parallel** (§3): unless the
 body introduces a data dependency from one iteration to the next, the
