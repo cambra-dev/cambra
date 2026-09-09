@@ -371,7 +371,10 @@ pub enum AssignTarget {
     /// bound, one of its keys is being written. Only `:=` accepts it, a keyed write
     /// being a write to a mutable collection (`src/ccl/design/mutability.md`,
     /// "Surface-marker nodes: `For`, `MutWrite`, `Begin`, `Feed`"); every other
-    /// statement form rejects it at lowering.
+    /// statement form rejects it at lowering, where the message can name the binder
+    /// the form wanted. The checked spelling `m[k]? := v` is refused earlier, in
+    /// [`expr_to_assign_target`](crate::chl_parser::parser), because it is not a
+    /// target this enum can hold rather than a target used in the wrong statement.
     ///
     /// The target is an arbitrary expression rather than a name so that a write
     /// through a path (`a.b[k] := v`) has somewhere to land; lowering accepts only

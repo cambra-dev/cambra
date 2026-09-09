@@ -236,9 +236,11 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   collection — and `None` for a write of the whole variable. Its rule is application on the
   left of the assignment: the key is checked against the collection's key type and the value
   against the codomain that key names, a dependent codomain being discharged to the key term.
-  So `m[k]` denotes one type whether it is read or written. The membership refinement is
-  dropped as it is for `m[k]?`, because a write is what makes a key present; any other domain
-  refinement stands, an inadmissible key being an error rather than an insertion.
+  So `m[k]` denotes one type whether it is read or written. The key owes the key domain's
+  base, its refinements peeled as they are for `m[k]?` — a write is what makes a key present,
+  so demanding a presence proof of the key being written would be backwards. Peeling takes
+  the domain's whole refinement set, membership predicate and any other alike, so a domain
+  refinement that is not about presence is not enforced at a write either.
   `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it denotes,
   `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
   needs a key.
@@ -357,12 +359,12 @@ The proven lookup `m[k]` and read-your-writes as a type fact both need `𝐷(s�
 has no subject here. Reaching them replaces this type rather than extending it. Reads are the
 checked `m[k]?`, answering `Option(𝑉)` with no membership proof.
 
-Two forms that would name it were measured and rejected. A **position-indexed family**,
-`Σ (𝐷 : 𝑆 ⇒ SubtypesOf(𝐾)). ((s: 𝑆) ⇒ 𝐷(s) ⤇ 𝑉)`, needs the witness to range over functions from
-positions to domains, so it needs type-level functions and their application. A **refinement
-naming the position**, `(s: 𝑆) ⇒ ({𝐾 | present(s)} ⤇ 𝑉)`, needs only machinery that exists —
-the Pi binder and a refinement carrying a term — but needs a position term in scope where the
-register is typed, and `with begin():` binds none. The
+Two forms that would name it are rejected on what they require. A **position-indexed
+family**, `Σ (𝐷 : 𝑆 ⇒ SubtypesOf(𝐾)). ((s: 𝑆) ⇒ 𝐷(s) ⤇ 𝑉)`, needs the witness to range over
+functions from positions to domains, so it needs type-level functions and their application.
+A **refinement naming the position**, `(s: 𝑆) ⇒ ({𝐾 | present(s)} ⤇ 𝑉)`, needs only machinery
+that exists — the Pi binder and a refinement carrying a term — but needs a position term in
+scope where the register is typed, and `with begin():` binds none. The
 [transaction handle](#with-t--begin-transaction-handle) is the binder that would supply one.
 
 #### No aliasing: `Mut` values are second-class (downward-only)
@@ -923,8 +925,10 @@ affordable by that complete compile-time knowledge.
   Narrowing the read footprint alongside it needs `Proposal.reads` to record *absence*, since
   a transaction that read a missing key must conflict with a concurrent insert. Correctness
   does not depend on the narrowing — an unrecovered write keeps whole-collection footprints —
-  so it is an optimization with a silent failure mode, and the unrecovered path needs its own
-  coverage.
+  so it is an optimization whose failure mode is silent: a narrowed writer that reads too
+  little still commits, from a stale collection.
+  `keyed_writes_at_distinct_keys_compose_across_transactions` is what the whole-collection
+  footprint buys, and has to keep passing across the change.
 - **First-class `Mut`** (returning or storing references) — needs mutable variable identity in
   types, a sigma/index-types question; until then the second-class discipline is the aliasing
   firewall.

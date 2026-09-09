@@ -2475,7 +2475,8 @@ struct MutVarDecl {
     /// type — [`StorePlan::reads`], [`final_key`] — borrow it rather than
     /// placing it.
     init: Expr,
-    /// The type of one committed value — the binder's, refinements stripped.
+    /// The type of one committed value, read off the binder by [`mut_var_value_ty`] —
+    /// so refinements above the `Mut` are peeled and the value type's own are kept.
     ///
     /// Off the **binder**, not off the seed. A seed is one contribution to the value
     /// type and the binder carries the join over the seed and every write, so the two

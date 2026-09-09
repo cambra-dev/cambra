@@ -866,14 +866,14 @@ fn view_at(e: &mut Expr, target: Type) {
 ///
 /// A keyed register's history is `Txn ⇒ Map(𝐾, 𝑉)` under the overwrite law, like any
 /// other mutable variable, so a write replaces the whole collection. Every phase below
-/// therefore sees one kind of `MutWrite` and needs no notion of a key; op-conversion
-/// recovers the per-key store write from the emitted shape, which is a tiling choice and
-/// not a change of meaning (`src/ccl/design/mutability.md`, "The idea in one line").
+/// therefore sees one kind of `MutWrite` and needs no notion of a key.
 ///
-/// The rewritten value reads `m`, so the register joins its writer's read footprint even
-/// where the source only wrote it. That is what the denotation says — the new collection
-/// is a function of the old one — and it is what op-conversion's per-key recovery narrows
-/// again.
+/// **The whole collection is what commits.** The register's collection goes to one store
+/// key, and the rewritten value reads `m`, so the register is in its writer's read
+/// footprint as well as its write set even where the source only wrote one key. Two
+/// transactions touching one map therefore conflict whatever keys they touch. Narrowing
+/// either footprint to the key is unbuilt and is scoped in
+/// `src/ccl/design/mutability.md`, "Future work".
 ///
 /// Runs after inference, so it stamps the types it builds and the CHECK-mode `typecheck`
 /// behind it validates them.

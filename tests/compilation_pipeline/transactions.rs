@@ -3060,6 +3060,33 @@ fn a_keyed_write_reaches_a_transactional_store() {
     );
 }
 
+/// Two transactions writing **different** keys of one map, both landing.
+///
+/// The sibling above rewrites one key, so a transaction computing its write from the seed
+/// instead of from the previous transaction's collection would produce the same answer
+/// there. Here it would not: `m` is in each writer's read footprint because
+/// `desugar_keyed_writes` rewrote the write to `m := insert(m, k, v)`, and that is what
+/// carries key `3` past the transaction that writes key `4`.
+///
+/// This is the whole-collection footprint's own coverage. Narrowing it to the written key
+/// is future work (`src/ccl/design/mutability.md`, "Future work"), and its failure mode is
+/// silent — a narrowed writer that reads too little still commits, just from a stale
+/// collection — so this case has to keep passing across that change.
+#[test]
+fn keyed_writes_at_distinct_keys_compose_across_transactions() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        for x in [3, 4]:
+            with begin():
+                m[x] := 99
+        await_final(m)
+    "#});
+    assert_eq!(
+        map_entries_int(&value),
+        vec![(1, 10), (2, 20), (3, 99), (4, 99)]
+    );
+}
+
 /// A keyed write over an **induction** domain.
 ///
 /// The key is the **loop binder**, which is what makes this more than the transactional
