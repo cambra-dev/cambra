@@ -928,11 +928,34 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > (below) states it as a `Bool`. A `FullMap` (§6.3) discharges every key by construction,
 > so `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
 > *Partiality*, §3). **Partly implemented** — `c[k]?` answers on a `map` and a `set`; on a
-> `groupby` it is rejected, because a group's type names the key it was looked up at, and
+> `groupby` it types (the group's type names the key it was looked up at) and is rejected
+> when compiled, because nothing materializes a collection as an `` `some `` payload; and
 > on a list it is rejected, because a range domain carries no membership to decide.
 > `c[k]` lowers as the lookup `c(k)`, so a `FullMap` subscript answers `V` today, its key
 > set being the key type itself; for every other collection nothing discharges the index's
 > membership, so the proven subscript is a type error whatever the index.
+
+> **Direction [Open] — `c[k]?` decides absence at a cut.** Answering `` `none ``
+> requires knowing the collection's domain has a definite value, and today's condition
+> for that is **termination**: the operator withholds `` `none `` until the domain is
+> terminal. A live source never terminates, so a lookup over one answers `` `some `` or
+> never answers.
+>
+> Termination is standing in for the property actually needed, which is that the domain is
+> **pinned at a cut**. `orders.filter(\o -> o.time < txn.current_time())` is a pinned view
+> of a feed that never ends, and it is decided; a `Mut(…, Txn)` store read inside `with
+> begin():` is pinned by the transaction the same way. The condition should be the pin, so
+> that both of those answer and only a bare unpinned feed does not.
+>
+> Unboundedness is the wrong predicate: it would reject the north-star `txn_kv`, which does
+> an `Option` lookup on a live transactional store. Two alternatives are declined. A
+> provisional `` `none `` corrected later is a cut with better ergonomics rather than a
+> separate design, and arrives with incremental view maintenance. A timeout or watermark
+> makes the answer a function of wall-clock, which is the nondeterminism this operator
+> already refuses when it declines to read absence off an empty tile.
+>
+> Until a pin is expressible, a lookup on an unpinned live domain never decides absence
+> ([collections.md, The checked lookup](../src/ccl/design/collections.md#the-checked-lookup-𝑐𝑘)).
 
 ### 3.10 Lambda
 

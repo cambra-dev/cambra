@@ -382,6 +382,16 @@ Peeling the refinement instead leaves the key owing `𝐾` and nothing more, whi
 because the refinement is what says which keys are present, and deciding presence is the
 operator's job at runtime.
 
+**Not an application, typed where applications are.** The category is a claim about the
+rule and not about the term: lowering emits `(𝑐, 𝑘) ▷ lookup?`, an ordinary application of
+a builtin, so `emit_apply` is where the node arrives and the rule is reached by intercepting
+it there. Giving the rule its own emission path would mean giving `𝑐[𝑘]?` its own
+`TypedExprNode`, which buys nothing the interception does not: the four steps above run
+whole, and no application rule runs on the way past. A scheme is what cannot express it —
+a scheme would have to name the key type, only a `SubtypesOf(𝐾)` kind states one, and every
+concrete collection would then need an entry term first, which only a typed pass can decide
+to insert.
+
 Step 3 is an edge in one direction, and that is load-bearing. Relating the key and the
 collection's keys to a common supertype — the literal reading of `SubtypesOf` — is satisfied
 by any join, so a `String` key against an `Int`-keyed map would widen the key type rather
@@ -409,6 +419,14 @@ run rather than of the collection's value, so the same lookup on a live source w
 `` `none `` and later `` `some `` — and a live source is the ordinary case here. Terminality
 is therefore the **readiness** condition: `CheckedLookup` withholds until the domain is
 decided, and only then answers `` `none ``.
+
+**A lookup on an unpinned live domain never decides absence.** Terminality stands in for
+"the domain has a definite value", and a live feed has one only where something pins it —
+a filter against `txn.current_time()`, or a store read inside `with begin():`. Neither
+terminates, so the present condition withholds `` `none `` from both, and a lookup over a
+bare live feed withholds it forever. The condition a pin would state, and why unboundedness
+is the wrong predicate for it, is
+[chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
 
 Emission computes step 2's discharge; a check reads it back off the operator's stamped type
 rather than re-running it. Planning compiles a refinement's predicate to point-free form,
