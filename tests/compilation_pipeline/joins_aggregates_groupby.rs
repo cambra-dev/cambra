@@ -149,6 +149,21 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
         deleted: BitSet::new(),
     }
 )]
+// A filter over an **unmapped** source, keyed by the identity. `case_2` above filters too,
+// but its comprehension maps (`y + 10`) and its key computes (`x // 2`), and either is
+// enough to keep the group predicate off the shape this reaches: the predicate compiled at
+// a base another refinement narrowed, whose own reads are the source collection. Declaring
+// a compiled predicate the data function it is fixed it; before that, this met its own
+// source at the incomparable kind at the post-planning wall.
+#[case(
+    "[sum(x) for x in groupby([x for x in [1,2,3] if x > 1], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![2, 3]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
