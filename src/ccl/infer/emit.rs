@@ -1085,14 +1085,14 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
     }
 }
 
-/// The **key type and value type** a keyed collection reads at — what `𝑐[𝑘]?` and
-/// `𝑚[𝑘] := 𝑣` both need. `None` when `collection` is not a keyed collection.
+/// The **key type and value type** a `Map` reads at — what `𝑐[𝑘]?` and `𝑚[𝑘] := 𝑣` both
+/// need. `None` when `collection` is not a `Map`.
 ///
 /// An **abstract** `Map(𝐾, 𝑉)` states its key type in its kind: `SubtypesOf(𝐾)` says
 /// "some domain over `𝐾`", so instantiating the sum there is the Σ elimination rule
 /// (`src/ccl/design/type-inference.md`, "How a sum flows through the solver") and `𝐾`
-/// comes back without anything being taken apart. A **concrete** keyed collection states
-/// its own present-key domain instead, and the key type is what that domain and the
+/// comes back without anything being taken apart. A **concrete** `Map` states its own
+/// present-key domain instead, and the key type is what that domain and the
 /// looked-up key have in common — recovered by the caller's edges, not by this function.
 ///
 /// A **dependent** codomain comes back with its key binder, for

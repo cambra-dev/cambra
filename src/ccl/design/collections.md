@@ -152,11 +152,10 @@ on `𝑘`**.
 That dependency decides what the type is: a [`FullMap`](#the-six-collection-types), not a
 `Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
 annotation or consumer converts one into the other, so a group-by is consumed at the type
-it has. A checked lookup answers at the key, the binder discharging to the key term
-([`𝑐[𝑘]?` is not an application](#𝑐𝑘-is-not-an-application)); what it cannot do is
-materialize, a group being a collection. A checked lookup answers at the key, the binder discharging to the key term
-([`𝑐[𝑘]?` is not an application](#𝑐𝑘-is-not-an-application)); what it cannot do is
-materialize, a group being a collection.
+it has. A checked lookup answers at the key, the binder
+discharging to the key term ([`𝑐[𝑘]?` is not an
+application](#𝑐𝑘-is-not-an-application)); what it cannot do is materialize, a group being a
+collection.
 
 ### The key domain is the key morphism's image
 
@@ -345,7 +344,7 @@ become the per-type standard-library instances with no semantic change. Everythi
 > **[Partly implemented]** — the two surface operators, proven `c[k] : 𝑇` and checked
 > `c[k]? : Option(𝑇)`, are specified in
 > [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
-> `c[k]?` types today for a keyed collection whose type is known at the lookup
+> `c[k]?` types today for a `Map` or `Set` whose type is known at the lookup
 > ([`Builtin::LookupChecked`]); `c[k]` is still rejected, with a hint naming `c[k]?`, and
 > that is the design — what is missing is not a rule but a *source*, since no expression
 > yields a key carrying its collection's key domain while iteration binds the codomain.
@@ -376,8 +375,8 @@ The rule instead relates the key to what the collection's keys *are*:
   are present — the membership predicate a re-keying constructor writes, the filter a
   comprehension writes — and deciding presence is the operator's job at runtime, so none of
   it is the key's obligation. An abstract `Map(𝐾, 𝑉)` arrives at `𝐾` already, its kind
-  having stated it; a concrete keyed collection carries its own present-key domain, whose
-  base is `𝐾`.
+  having stated it; a concrete `Map` carries its own present-key domain, whose base is
+  `𝐾`.
 - **The answer is `Option` of the value.** Nothing is applied and nothing is discharged.
 
 [`Builtin::CollectionContains`] is the same shape one payload lighter — `∀ι κ. (ι ⤇ κ) ⇒

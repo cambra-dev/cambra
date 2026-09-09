@@ -763,11 +763,11 @@ fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     }
 }
 
-/// The hint for an application whose **domain is a keyed collection's** and whose argument
+/// The hint for an application whose **domain is a `Map`'s** and whose argument
 /// cannot be shown to lie in it — i.e. an attempted lookup.
 ///
-/// A collection's domain is not a type an ordinary value inhabits: a keyed collection's is
-/// that collection's own present-key domain. So a bare `Int` index, literal or not, fails
+/// A collection's domain is not a type an ordinary value inhabits: a `Map`'s is that
+/// collection's own present-key domain. So a bare `Int` index, literal or not, fails
 /// the edge — and the raw mismatch reads as an internal confusion rather than as what it
 /// is, a lookup whose proof obligation cannot be discharged. An `Array(3, 𝑇)`'s range
 /// domain `[0, 3)` is left to its own message, which already says it wanted an index in the

@@ -487,8 +487,8 @@ fn present_key_domain(
 /// Subscript and application are the *same* operation — evaluate a finite function at a
 /// point (`docs/chl-spec.md`, "3.9 Subscript and attribute access") — so the plain form
 /// lowers to exactly what the application `target(index)` does, and inherits its proof
-/// obligation: the index must be in the collection's domain, which for a keyed collection
-/// means the key's type carries that collection's key domain.
+/// obligation: the index must be in the collection's domain, which for a `Map` means the
+/// key's type carries that collection's key domain.
 ///
 /// `[…]` is therefore **only** collection lookup, with no case on the index's shape. A
 /// tuple is a heterogeneous product rather than a finite function, so projecting one is a
