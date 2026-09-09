@@ -1406,18 +1406,22 @@ fn test_list_map_reseals_to_list() {
     );
 }
 
-/// The edge to ⊤ (`Σ <: Collection`) holds for **every** type kind, keyed included —
-/// `Type` is ⊤ structurally rather than by a row per kind
-/// (`src/ccl/design/type-inference.md`, "Type kind containment"). A `Map(𝐾, 𝑉)` is a data
-/// function with codomain `𝑉`, so there is nothing for the kind lattice to withhold, and a
-/// map handed to a `Collection(𝑉)` slot is read as its values.
+/// **[Interim]** `Map(𝐾, 𝑉) <: Collection(𝑉)` holds today, and this pins that state rather
+/// than a property. The edge is a consequence of `Type` being ⊤ structurally rather than by
+/// a row per kind (`src/ccl/design/type-inference.md`, "Type kind containment"), so nothing
+/// in the kind lattice withholds it and a map handed to a `Collection(𝑉)` slot is read as
+/// its values.
 ///
-/// Whether that edge *should* hold is the open nominal question
-/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"); what this
-/// pins is that the two routes into a map's values agree today — see
-/// [`test_map_consumption_is_kind_blind_interim`] for the direct one.
+/// Whether the edge should exist is undecided
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"). Withholding it
+/// is what a declared type constructor would be for, and nothing in [`Type`] carries one, so
+/// neither side is implemented. Answering the question that way turns the first assertion
+/// into a rejection pointing at `values(m)`; the `List` assertion is not interim, being the
+/// same structural arm at a positional kind, where no nominal question arises.
+///
+/// [`test_map_consumption_is_kind_blind_interim`] pins the other route into a map's values.
 #[test]
-fn test_a_map_widens_to_collection_like_any_other() {
+fn test_a_map_widens_to_collection_interim() {
     assert_eq!(
         infer_program(
             "def f(c: Collection(Int)):\n    sum(c)\ndef g(m: Map(Int, Int)):\n    f(m)\ng"
@@ -1685,15 +1689,18 @@ fn a_set_annotation_is_a_unit_valued_map() {
     }
 }
 
-/// The **other** route by which a map can be read as its values — direct
-/// consumption — is still open, and deliberately so: `Σ`-elimination (`Σ <: Fun`)
-/// is kind-blind, because that is the same arm that makes `sum(xs)` work for a
-/// `List` and `[f(g) for g in groupby(…)]` work for a group-by. So
-/// `sum(m)` type-checks today and sums the values.
+/// **[Interim]** `sum(m)` type-checks today and sums a map's values, and this pins that
+/// state rather than a rule. `Σ`-elimination (`Σ <: Fun`) is kind-blind, and it is the same
+/// arm that makes `sum(xs)` work for a `List` and `[f(g) for g in groupby(…)]` work for a
+/// group-by, so the map takes it too.
 ///
-/// That is the [Interim] "`for`-in binds the codomain for every kind" state, not a
-/// second subtyping hole: closing it means giving `Map` a per-kind `Iterable`
-/// instance, which needs the kind to be *represented*
+/// Direct consumption is the second route into a map's values, beside the widening
+/// [`test_a_map_widens_to_collection_interim`] pins, and the same open question covers which
+/// of the two rejects `sum(m)`
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"). This route is
+/// the [Interim] "`for`-in binds the codomain for every kind" state rather than a second
+/// subtyping hole: closing it means giving `Map` a per-kind `Iterable` instance, which needs
+/// the kind represented
 /// (`src/ccl/design/collections.md`, "The collection type is declared, not read off the shape").
 /// When the operation layer lands this assertion flips to a rejection pointing at
 /// `values(m)`.
