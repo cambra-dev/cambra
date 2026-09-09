@@ -350,48 +350,48 @@ become the per-type standard-library instances with no semantic change. Everythi
 > is the design rather than a missing rule, since no expression yields a key carrying its
 > collection's key domain while iteration binds the codomain.
 
-Lookup is uniform across ranges and keys: `𝑐[𝑥]` is well-typed exactly when `𝑥`'s type
-proves `𝑥 ∈ dom(𝑐)`, and it is total wherever it is well-typed — an index without the proof
-is a type error rather than an `Option`. Membership rides on the **element's** type, not the
-collection's, so iterating a collection's own domain hands the proof over and `m[k]` is
-total there, while a key from outside takes the checked `m[k]?`.
-
-That uniformity is a claim about the **rule**, not yet about the representation. A keyed
-domain is a refinement, so a key interoperates with `𝐾` by refinement drop and the
-discharge has ordinary machinery to work with. A range domain is the primitive
-`UIntRange(𝑛)`, which relates only by equality, so nothing lets `{𝑖 | 𝑖 < 𝑛}` discharge
-against it — realizing the range case means either a subtyping arm relating the two or
-making a range domain a refinement like the keyed one.
+`𝑐[𝑘]` is application. It lowers to `𝑐(𝑘)` and carries an application's one obligation, that
+the argument's type is a subtype of the function's domain — subscript and call are the same
+operation ([chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)).
 
 ### `𝑐[𝑘]?` is not an application
 
-`𝑐[𝑘]?` types as `Option(𝑉)`, and it is its own total operation rather than an application
-of `𝑐`. An application requires its argument to lie in the function's domain, and a checked
-lookup is reached exactly when that is not known — so typing it as one would first have to
-relax `𝑐`'s domain, and a collection type with its domain relaxed is a type no value has.
+`𝑐[𝑘]?` is its own total operation, and its rule reads the collection's type apart instead
+of applying it. Four steps, in `emit_lookup_checked`:
 
-**The key owes the collection's key base, and nothing else.** A data function's domain
-refinement describes which keys are present — the membership predicate a re-keying
-constructor writes, the filter a comprehension writes — and deciding presence is the
-operator's job at runtime, so none of it is the key's obligation. An abstract `Map(𝐾, 𝑉)`
-arrives at `𝐾` already, its kind having stated it; a concrete `Map` carries its own
-present-key domain, whose base is `𝐾`.
+1. **Take the key domain, the key binder and the codomain off the collection**
+   (`keyed_access_types`). An abstract `Map(𝐾, 𝑉)` is a Σ over `SubtypesOf(𝐾)`, so the sum
+   is instantiated at `𝐾` by the ordinary Σ rule; a concrete `Map` is already the arrow.
+2. **Substitute the key term for the key binder** in the codomain (`keyed_value_at`), so a
+   group-by's `𝑔[𝑘]` answers the group refined at `𝑘`
+   (`a_key_dependent_lookup_discharges_the_key_binder`).
+3. **Require the key's type below the key domain's base**, the membership refinement peeled
+   off (`keyed_access_value`).
+4. **Answer `Option`** of step 2's value, and stamp the builtin with the pair it is applied
+   to and that result, so later passes read one type off the node.
 
-[`Builtin::CollectionContains`] is the same shape one payload lighter — `∀ι κ. (ι ⤇ κ) ⇒
-(κ ⇒ Bool)`, a runtime-decided question behind a total function — and `𝑐[𝑘]?` is that
-question answering with the value instead of a tag.
+Step 3 is the whole of the key's obligation, and it is what an application cannot express.
+An application requires its argument to lie in the function's domain, and a checked lookup
+is reached exactly where that is unknown, so typing it as one would first have to relax
+`𝑐`'s domain — and a collection type with its domain relaxed is a type no value has.
+Peeling the refinement instead leaves the key owing `𝐾` and nothing more, which is right
+because the refinement is what says which keys are present, and deciding presence is the
+operator's job at runtime.
 
-Reading the key type off the collection alone is load-bearing. Relating the key and the
+Step 3 is an edge in one direction, and that is load-bearing. Relating the key and the
 collection's keys to a common supertype — the literal reading of `SubtypesOf` — is satisfied
-by any join, so a `String` key against an `Int`-keyed map widens the key type instead of
-failing (`a_checked_lookup_is_not_an_application`).
+by any join, so a `String` key against an `Int`-keyed map would widen the key type rather
+than fail (`a_checked_lookup_is_not_an_application`).
 
-**A key-dependent codomain answers at the key.** A group-by's group is refined by the key
-binder, and `𝑔[𝑘]` reads the group refined at `𝑘`, the binder discharged to the key term
-(`a_key_dependent_lookup_discharges_the_key_binder`). The substituted type stands for any
-key of the key type — the empty group where the key is absent — which is sound for exactly
-the reason above: nothing is applied, so the binder's declared domain is where the binder
-was introduced rather than an obligation the key owes.
+Step 2 is sound because step 3 asks nothing of the key beyond `𝐾`. `𝑘` is only maybe
+present, and the substituted type stands for any key of the key type, denoting the empty
+group where the key is absent — `` `none `` against `` `some `` of an empty group is what
+distinguishes the two cases. The binder's declared domain is where the binder was
+introduced, not something the key has to satisfy.
+
+[`Builtin::CollectionContains`] is the same rule one payload lighter — `∀ι κ. (ι ⤇ κ) ⇒
+(κ ⇒ Bool)`, a runtime-decided question behind a total function — and `𝑐[𝑘]?` answers it
+with the value instead of a tag.
 
 ### How `𝑐[𝑘]?` compiles
 

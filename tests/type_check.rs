@@ -5552,10 +5552,10 @@ fn a_key_dependent_lookup_discharges_the_key_binder() {
 /// rather than a surprise.
 ///
 /// A **range** domain has no membership refinement to drop: `UIntRange(𝑛)` is a primitive
-/// relating only by equality, not an index type refined by a bound, so no integer
-/// discharges against it and there is nothing for the relaxation to strip. Closing this is
-/// the representation question in `src/ccl/design/collections.md`, "Lookup: membership
-/// discharge" — deciding it is what makes `lst[𝑖]?` work, not a missing case in the rule.
+/// relating only by equality (`src/ccl/design/type-inference.md`, "Data domains are
+/// invariant"), not an index type refined by a bound, so no integer discharges against it
+/// and there is nothing for the relaxation to strip. What makes `lst[𝑖]?` work is giving a
+/// range domain a relation an index can satisfy, not a missing case in this rule.
 ///
 /// A **bounded** parameter target is unresolved at emit, where the relaxation runs: a use
 /// of the binder carries the binder's variable rather than its annotation, so there is no
