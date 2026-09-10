@@ -21,7 +21,7 @@ pub struct FanIn {
     /// Output tiling: either a `SealedFunction { domain, codomain: Record { … } }`
     /// or a `CurriedFunction { domain1, domain2, codomain: Record { … } }`,
     /// depending on the input operators.
-    base: OperatorBase<FanIn>,
+    base: OperatorBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
     /// The input function operators to zip together (either all `SealedFunction` or all `CurriedFunction`).
@@ -147,13 +147,8 @@ impl FanIn {
                 "FanIn: all inputs must have function tilings (SealedFunction or CurriedFunction)"
             ),
         };
-        let edges: Vec<InputEdgeSpec> = ops
-            .iter()
-            .enumerate()
-            .map(|(i, op)| value_at(i, &**op))
-            .collect();
         Self {
-            base: OperatorBase::new(tiling, &edges),
+            base: OperatorBase::new(tiling),
             names,
             inputs: ops,
         }
@@ -198,11 +193,10 @@ pub fn fan_in_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn Til
 impl TileOperator for FanIn {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         for (i, input) in self.inputs.iter().enumerate() {
-            node = node.child(format!("{i}"), input.inspect(opts));
+            visit(value_at(i, &**input));
         }
-        node
     }
 
     fn subscribe(
@@ -456,7 +450,7 @@ impl TileProducer for FanInProducer {
 /// each input must produce a `Tile::Scalar` and the output is a
 /// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
 pub struct ScalarFanIn {
-    base: OperatorBase<ScalarFanIn>,
+    base: OperatorBase,
     /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<String>,
     inputs: Vec<Box<dyn TileOperator>>,
@@ -498,13 +492,8 @@ impl ScalarFanIn {
                 .map(|(name, op)| (name.clone(), op.tiling().clone()))
                 .collect(),
         );
-        let edges: Vec<InputEdgeSpec> = inputs
-            .iter()
-            .enumerate()
-            .map(|(i, op)| value_at(i, &**op))
-            .collect();
         Self {
-            base: OperatorBase::new(tiling, &edges),
+            base: OperatorBase::new(tiling),
             names,
             inputs,
         }
@@ -514,11 +503,10 @@ impl ScalarFanIn {
 impl TileOperator for ScalarFanIn {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         for (i, input) in self.inputs.iter().enumerate() {
-            node = node.child(format!("{i}"), input.inspect(opts));
+            visit(value_at(i, &**input));
         }
-        node
     }
 
     fn subscribe(

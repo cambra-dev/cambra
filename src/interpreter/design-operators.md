@@ -161,6 +161,60 @@ Each `TileOperator` is a static (compile-time) node in the dataflow graph. It kn
 [`Tiling`] and can instantiate a live `TileProducer` via `subscribe`. Operators are constructed
 during compilation; producers are created on demand at runtime.
 
+### Operator identity and the graph the inspector reads
+
+Every operator carries an `OperatorBase`, holding a `NodeId` minted at construction and the output
+tiling. The id is drawn from the same counter as an expression node's, which is what lets a
+provenance row resolve an operator against the expression it came from
+(`src/ccl/design/provenance.md`, "Operator conversion").
+
+`OperatorGraph` is the static graph of one compiled program, and it is the content of the
+`post-conversion` pane. It is built by walking the operators from the program's outputs, not
+recorded while they are constructed. The walk runs in `compile_program` between conversion and the
+subscribe loop, which is the only window where it is total: `subscribe` takes every `CycleSlot` and
+every store's `init_ops`, so an operator asked for its inputs afterwards answers without them.
+
+`TileOperator::visit_inputs` is the single statement of what an operator holds, and it has two
+readers: the graph walk, and `TileOperator::inspect`, which renders an operator's children from the
+same answer rather than from a second hand-written list. An input stated nowhere is an edge the pane
+does not have, and — when it is the only path to a subtree — a subtree the pane loses, so the method
+is required rather than defaulted. It is a visitor rather than a returned list because two inputs
+sit behind a `RefCell`: a fan branch's input and a `CycleSlot`'s contents both borrow for the extent
+of the call. What an operator adds beyond its inputs — a constant's value, a variant arm's tag —
+is `inspect_annotation`, so the two questions stay apart.
+
+`inspect` follows `Value` edges only. A `Share` edge would draw the shared subtree once per branch,
+and restricting to `Value` is also what makes the recursion terminate without a cycle guard, since
+those edges are acyclic.
+
+An edge is a **subscription**: the consumer holds the operator the edge names and calls `get` on it.
+`notify` runs the other way along the same edges. Three properties ride each edge:
+
+- **Kind.** `Value` for an exclusively owned `Box`, `Share` for a node several consumers may reach —
+  a fan branch's edge to its fan input, or a read of a data source. The value edges form a forest,
+  which is what lets a renderer follow them with no cycle guard.
+- **`deferred`.** Set on a `Value` edge wired through a `CycleSlot` after its consumer was built.
+  This is a property of the field rather than of the run: a slot is the only way an operator
+  receives an input its constructor did not give it, so every slot-held input is deferred and no
+  other input is. Removing the deferred edges makes every graph acyclic, which is what a layout
+  cuts.
+- **Role.** A field name, a position in a `Vec`, or a store key. The three stay distinct on the
+  wire, because a field named `0` and the first element of a `Vec` render alike.
+
+**What the walk cannot produce.** A source and a sink are graph nodes and not operators, so neither
+has an identity a walk could read off an operator. A source node's provenance row names every
+expression that reads it, which only conversion knows — the walk sees reader operators, not the
+expressions they came from. Conversion therefore records boundary identity alone
+(`record_source_read`, `record_sink`, `materialize_sources`), and everything else about the graph —
+every operator, and every edge including the edges into those two node kinds — comes from the walk.
+A reader's edge to a source names it through `DataSourceDomainExtentImpl::get_id`, the same string
+the source was registered under.
+
+**Serialization.** `src/inspector_model/design.md`, "A node on the wire" owns the payload shape. An
+operator node ships its label, its tiling, and its `inputs`; a boundary node ships no tiling,
+because only an operator has one. Where a walk of the pane begins is derived on both sides of the
+wire from the edges rather than shipped, so no second channel can disagree with them.
+
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
 | `Constant` | None | `Scalar` | Produces a fixed scalar `Value`. |

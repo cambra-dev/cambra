@@ -16,9 +16,8 @@ use crate::interpreter::{
 pub struct IterateExtent {
     /// The extent to iterate over.
     pub extent: Extent,
-    /// Identity and the tiling — always
-    /// `Tiling::SealedFunction { domain: extent, codomain: extent }`.
-    base: OperatorBase<IterateExtent>,
+    /// The tiling — always `Tiling::SealedFunction { domain: extent, codomain: extent }`.
+    base: OperatorBase,
 }
 
 impl IterateExtent {
@@ -28,7 +27,7 @@ impl IterateExtent {
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
         Self {
-            base: OperatorBase::new(tiling, &[]),
+            base: OperatorBase::new(tiling),
             extent,
         }
     }
@@ -63,6 +62,8 @@ impl IterateExtent {
 
 impl TileOperator for IterateExtent {
     impl_operator_base!();
+
+    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
     fn subscribe(
         &mut self,

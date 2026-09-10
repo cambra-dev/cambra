@@ -118,14 +118,6 @@ pub struct FanOut {
     // passed between operators — the same reason `CycleSlot` is legitimate.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
-    /// The fan input's identity.
-    ///
-    /// Cached here because [`FanOut::branch`] cannot reach it afterwards: the
-    /// input sits behind an `Rc<RefCell>`. Every branch records its edge to the
-    /// fan input from this, and that edge is the only place a share is
-    /// distinguishable from an owned input — at a consumer the two have the same
-    /// field type.
-    input_id: Option<NodeId>,
     /// All mutable shared state.  Created eagerly so that branches produced by
     /// [`FanOut::branch`] always share the same object.
     shared: Rc<RefCell<FanOutShared>>,
@@ -169,7 +161,6 @@ impl FanOut {
         reentrancy: Option<FanOutReentrancy>,
     ) -> Self {
         let tiling = input.tiling().clone();
-        let input_id = input.operator_id();
         let shared = Rc::new(RefCell::new(FanOutShared {
             id: FanOutProducer::alloc_id(),
             producer: None,
@@ -180,7 +171,6 @@ impl FanOut {
         Self {
             input: Rc::new(RefCell::new(input)),
             tiling,
-            input_id,
             shared,
             used: RefCell::new(false),
         }
@@ -192,7 +182,7 @@ impl FanOut {
     pub fn branch(&self) -> Box<dyn TileOperator> {
         let result = FanOutBranch {
             input: self.input.clone(),
-            base: OperatorBase::new(self.tiling.clone(), &[share(self.input_id)]),
+            base: OperatorBase::new(self.tiling.clone()),
             shared: self.shared.clone(), // shares the Rc — always connected
             primary: !*self.used.borrow(),
         };
@@ -209,8 +199,8 @@ struct FanOutBranch {
     // shared-state-ok: the same operator handle as [`FanOut::input`] — a branch is
     // a view of one fan-out, not a second one. An operator, not a value.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
-    /// Identity and the tiling, forwarded from the fan-out this branches.
-    base: OperatorBase<FanOutBranch>,
+    /// The tiling is the fan-out's, forwarded to every branch of it.
+    base: OperatorBase,
     /// All mutable shared state.  Created eagerly so that branches produced by
     /// [`FanOut::branch`] always share the same object.
     shared: Rc<RefCell<FanOutShared>>,
@@ -221,6 +211,11 @@ struct FanOutBranch {
 
 impl TileOperator for FanOutBranch {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        let input = self.input.borrow();
+        visit(share(&**input));
+    }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         let id = self.shared.borrow().id;
@@ -446,15 +441,15 @@ impl TileProducer for FanOutProducer {
 /// and immediately releasing upstream according to the received Tiles.
 pub struct Memo {
     pub input: Box<dyn TileOperator>,
-    /// Identity and the tiling, forwarded from `input`.
-    base: OperatorBase<Memo>,
+    /// The tiling is `input`'s, forwarded unchanged.
+    base: OperatorBase,
 }
 
 impl Memo {
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
         }
     }
@@ -463,8 +458,8 @@ impl Memo {
 impl TileOperator for Memo {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(

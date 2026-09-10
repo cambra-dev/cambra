@@ -3,10 +3,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::ccl::provenance::NodeId;
-use crate::interpreter::operator_graph::{EdgeRole, record_deferred_edge};
-use crate::interpreter::tile_operators::TileOperator;
-
 /// An operator input filled once construction is done, so a cycle can be built.
 ///
 /// A cyclic graph cannot be assembled bottom-up: the store must exist before the
@@ -35,30 +31,24 @@ impl<T: ?Sized> CycleSlot<T> {
     /// so the caller can build the rest of the cycle first. `FnOnce` because a
     /// slot is wired exactly once: a second fill would silently replace a live
     /// input.
-    ///
-    /// `owner` and `role` name the edge this fill creates, for the operator
-    /// graph. They are taken here rather than read from the closure because the
-    /// owner is already gone by the time the setter runs — the commit store is
-    /// moved into its cyclic `FanOut` between `setter` and the fill — so this is
-    /// the last point at which both ends of the edge are in hand.
-    pub(crate) fn setter(
-        &self,
-        owner: Option<NodeId>,
-        role: EdgeRole,
-    ) -> impl FnOnce(Box<T>) + use<T>
-    where
-        T: TileOperator,
-    {
+    pub(crate) fn setter(&self) -> impl FnOnce(Box<T>) + use<T> {
         let slot = self.0.clone();
         move |op: Box<T>| {
             debug_assert!(
                 slot.borrow().is_none(),
                 "a cycle slot is wired once; refilling it would drop a live input"
             );
-            if let Some(owner) = owner {
-                record_deferred_edge(owner, role, op.operator_id());
-            }
             *slot.borrow_mut() = Some(op);
+        }
+    }
+
+    /// Run `f` on the wired operator, if the slot has been filled.
+    ///
+    /// How the graph walk reads a late-wired edge. It runs before `subscribe`,
+    /// which is the only other reader and which empties the slot.
+    pub(crate) fn peek(&self, f: &mut dyn FnMut(&T)) {
+        if let Some(op) = self.0.borrow().as_deref() {
+            f(op);
         }
     }
 

@@ -37,7 +37,7 @@ use crate::{
             convert_to_operators,
         },
         operator_graph::{
-            GraphSession, OperatorGraph, assert_graph_invariants, materialize_sources,
+            BoundarySession, OperatorGraph, assert_graph_invariants, materialize_sources,
         },
         sinks::{DoneNotifier, SinkConsumer},
         tile_operators::{TileOperator, TileProducer},
@@ -587,12 +587,12 @@ pub struct CompiledProgram {
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
     /// pair.
     pub(crate) provenance_table: ProvenanceTable,
-    /// The static structure of the operator graph, captured as conversion built
-    /// it.
+    /// The static structure of the operator graph.
     ///
-    /// Recorded rather than walked: an edge's kind is not recoverable from the
-    /// operators, and `subscribe` empties the `CycleSlot`s before this struct
-    /// exists. See [`operator_graph`](crate::interpreter::operator_graph).
+    /// Walked from the compiled outputs before they are subscribed, which is the
+    /// last point at which every operator still holds its inputs: `subscribe`
+    /// takes each `CycleSlot` and each store's `init_ops`. See
+    /// [`operator_graph`](crate::interpreter::operator_graph).
     ///
     /// Retained unconditionally, unlike
     /// [`provenance_table`](Self::provenance_table): `CAMBRA_PROVENANCE`
@@ -1804,7 +1804,7 @@ pub fn compile_program(
     // graph is a pane's content, and a pane's content is retained whatever
     // `CAMBRA_PROVENANCE` says. Gating it would ship an empty pane, which both
     // wire validators reject.
-    let graph_session = GraphSession::install();
+    let boundary_session = BoundarySession::install();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
         let ops = if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
@@ -1819,7 +1819,10 @@ pub fn compile_program(
         ops
     })
     .errs()?;
-    let operator_graph = graph_session.into_graph();
+    // Before the subscribe loop below: `subscribe` takes every `CycleSlot` and
+    // every store's `init_ops`, so an operator asked for its inputs afterwards
+    // would answer without them.
+    let operator_graph = boundary_session.into_graph(&per_field_ops);
     assert_graph_invariants(&operator_graph);
 
     let sink_count = per_field_ops

@@ -90,14 +90,33 @@ export interface OperatorNode {
   inputs: OperatorEdge[];
 }
 
+// What names an input at its consumer, carrying the shape that named it. A
+// field called `0` and the first element of a `Vec` render alike, so the wire
+// keeps the shape rather than flattening both to a string.
+export type OperatorEdgeRole =
+  | { kind: "named"; name: string }
+  | { kind: "positional"; index: number }
+  | { kind: "storeKey"; key: string };
+
+// How a role reads in a row label.
+export function roleLabel(role: OperatorEdgeRole): string {
+  switch (role.kind) {
+    case "named":
+      return role.name;
+    case "positional":
+      return String(role.index);
+    case "storeKey":
+      return role.key;
+  }
+}
+
 // One input edge of an operator node.
 //
 // A *construction* edge — which operator holds which, and how. Runtime dataflow
 // follows a different relation, and nothing here asserts the two coincide.
 export interface OperatorEdge {
-  // What names this input at its consumer: a field name, a position, or a store
-  // key, rendered.
-  role: string;
+  // What names this input at its consumer.
+  role: OperatorEdgeRole;
   // "value" for an exclusively owned input, "share" for one several consumers
   // may reach.
   //

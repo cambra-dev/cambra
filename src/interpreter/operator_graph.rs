@@ -1,42 +1,44 @@
-//! The static structure of the dataflow operator graph, captured as it is built.
+//! The static structure of the dataflow operator graph.
 //!
-//! The graph is recorded rather than walked, for two reasons that are facts about
-//! the operators rather than choices:
+//! The graph is built by walking the operators from the program's outputs, in
+//! [`BoundarySession::into_graph`]. Each operator states what it holds through
+//! [`TileOperator::visit_inputs`], which is the single statement of its inputs:
+//! the walk reads it, and so does `TileOperator::inspect`, which renders an
+//! operator's children from the same answer.
 //!
-//! * **An edge's kind is not recoverable from the operator.** [`FanOut::branch`]
-//!   returns a `Box<dyn TileOperator>` and `FanOutBranch` is private, so a shared
-//!   input's field type is identical to an owned one. Whether a fan is cyclic
-//!   lives in `FanOutShared`, which a branch exposes no accessor for.
-//! * **A `CycleSlot`'s only accessor consumes it.** `subscribe` calls `take`, and
-//!   `compile_program` subscribes before it returns, so a walk of a finished
-//!   `CompiledProgram` has already lost the commit store's writers and the
-//!   induction store's body.
+//! The walk runs between conversion and the subscribe loop, which is the only
+//! window in which it is total. `subscribe` takes every [`CycleSlot`] and every
+//! store's `init_ops`, so an operator asked for its inputs after that answers
+//! without them.
 //!
-//! So the recording happens at construction, through [`OperatorBase::new`], and
-//! accumulates into a thread-local [`GraphSession`] that `compile_program`
-//! installs around conversion. Outside a session every record is a no-op, which
-//! is what keeps the operator constructions in engine tests from accumulating.
-//!
-//! What the edges mean: an edge is a **subscription** — the consumer holds the
-//! operator it names and calls `get` on it. `notify` runs the other way, so an
-//! edge is the pull direction rather than dataflow as a whole.
-//!
-//! Two edges are held without being subscribed. A read of a data source names a
-//! node that is not an operator, so there is nothing to subscribe. A
-//! `FanOutBranch` that loses `should_subscribe` holds the fan input like its
-//! siblings while one branch drives the subscribe for all of them.
+//! An edge is a **subscription**: the consumer holds the operator the edge names
+//! and calls `get` on it. `notify` runs the other way along the same edges, so an
+//! edge is the pull direction rather than dataflow as a whole. Two edges are held
+//! without being subscribed — a read of a data source, which is not an operator,
+//! and a fan branch that lost `should_subscribe` while its sibling drove the
+//! subscribe for all of them.
 //!
 //! Degrees are counted in dataflow direction — a source has in-degree 0, a sink
-//! out-degree 0 — while a recorded edge is stored on the consumer and names the
-//! node it subscribes, so the stored relation runs the other way.
+//! out-degree 0 — while an edge is stored on the consumer and names the node it
+//! subscribes, so the stored relation runs the other way.
 //!
-//! [`FanOut::branch`]: crate::interpreter::tile_operators::FanOut::branch
-//! [`OperatorBase::new`]: crate::interpreter::tile_operators::OperatorBase::new
+//! What the walk cannot produce is the two boundary node kinds. A source and a
+//! sink are graph nodes rather than operators, so neither has an identity to read
+//! off an operator, and a source's provenance row names every expression that
+//! reads it — which conversion knows and the walk does not. Conversion records
+//! that much and nothing else; see [`Boundaries`].
+//!
+//! `src/interpreter/design-operators.md`, "Operator identity and the graph the
+//! inspector reads" owns the design.
+//!
+//! [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
+//! [`TileOperator::visit_inputs`]: crate::interpreter::tile_operators::TileOperator::visit_inputs
 
 use std::cell::RefCell;
 
 use crate::ccl::provenance::NodeId;
 use crate::interpreter::tile_operators::TileOperator;
+use crate::interpreter::tiling::Tiling;
 
 /// How a downstream operator holds one of its inputs.
 ///
@@ -77,6 +79,18 @@ pub enum EdgeRole {
     StoreKey(String),
 }
 
+/// How a role reads as a label — the same rendering the wire's
+/// `OperatorEdgeRole` ships, and what `inspect` names a child by.
+impl std::fmt::Display for EdgeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EdgeRole::Named(name) => f.write_str(name),
+            EdgeRole::Positional(index) => write!(f, "{index}"),
+            EdgeRole::StoreKey(key) => f.write_str(key),
+        }
+    }
+}
+
 /// One recorded input edge.
 #[derive(Clone, Debug)]
 pub struct InputEdge {
@@ -85,44 +99,66 @@ pub struct InputEdge {
     pub(crate) subscribed: NodeId,
 }
 
-/// An input edge as a constructor states it, before the session resolves it.
+/// What an input edge points at.
 ///
-/// `subscribed` is an `Option` because a test double carries no [`OperatorBase`]
-/// and so answers no id. Such an edge is dropped rather than recorded: a graph
-/// is only ever assembled under a session, and nothing installs one around a
-/// test that builds operators by hand.
-///
-/// [`OperatorBase`]: crate::interpreter::tile_operators::OperatorBase
-pub(crate) struct InputEdgeSpec {
-    role: EdgeRole,
-    kind: EdgeKind,
-    subscribed: Option<NodeId>,
+/// A source is the one target that is not an operator, so it is the one target a
+/// walk stops at rather than descends into.
+pub enum InputTarget<'a> {
+    /// Another operator.
+    Operator(&'a dyn TileOperator),
+    /// A registered data source, under the name it was registered with.
+    Source(&'a str),
+}
+
+/// One input edge, as the operator holding it states it.
+pub struct InputEdgeSpec<'a> {
+    pub(crate) role: EdgeRole,
+    pub(crate) kind: EdgeKind,
+    pub(crate) target: InputTarget<'a>,
 }
 
 /// An owned input held under a named field.
-pub(crate) fn value(role: &'static str, op: &dyn TileOperator) -> InputEdgeSpec {
+pub(crate) fn value<'a>(role: &'static str, op: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::Named(role),
         kind: EdgeKind::Value { deferred: false },
-        subscribed: op.operator_id(),
+        target: InputTarget::Operator(op),
     }
 }
 
 /// An owned input at a position in a `Vec`.
-pub(crate) fn value_at(index: usize, op: &dyn TileOperator) -> InputEdgeSpec {
+pub(crate) fn value_at<'a>(index: usize, op: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::Positional(index),
         kind: EdgeKind::Value { deferred: false },
-        subscribed: op.operator_id(),
+        target: InputTarget::Operator(op),
     }
 }
 
 /// An owned input keyed by a store key, as both stores' `init_ops` are.
-pub(crate) fn value_keyed(key: impl Into<String>, op: &dyn TileOperator) -> InputEdgeSpec {
+pub(crate) fn value_keyed<'a>(
+    key: impl Into<String>,
+    op: &'a dyn TileOperator,
+) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::StoreKey(key.into()),
         kind: EdgeKind::Value { deferred: false },
-        subscribed: op.operator_id(),
+        target: InputTarget::Operator(op),
+    }
+}
+
+/// An owned input wired through a [`CycleSlot`] after its holder was built.
+///
+/// Deferred is a property of the field rather than of the run: a slot is the only
+/// way an operator receives an input it did not get from its constructor, so
+/// every slot-held input is deferred and no other input is.
+///
+/// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
+pub(crate) fn value_late<'a>(role: EdgeRole, op: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
+    InputEdgeSpec {
+        role,
+        kind: EdgeKind::Value { deferred: true },
+        target: InputTarget::Operator(op),
     }
 }
 
@@ -131,11 +167,23 @@ pub(crate) fn value_keyed(key: impl Into<String>, op: &dyn TileOperator) -> Inpu
 /// Whether the fan closes a cycle is not this edge's business. Every cycle in
 /// the graph runs through an input wired late — see [`EdgeKind::Value`]'s
 /// `deferred` — and a store's remaining branches serve its downstream reads.
-pub(crate) fn share(fan_input: Option<NodeId>) -> InputEdgeSpec {
+pub(crate) fn share<'a>(fan_input: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::Named("fan"),
         kind: EdgeKind::Share,
-        subscribed: fan_input,
+        target: InputTarget::Operator(fan_input),
+    }
+}
+
+/// A read of a registered data source.
+///
+/// Shared, not owned: one registered source may be read by several expressions,
+/// and each reader holds it through an `Rc` the way a fan branch holds its fan.
+pub(crate) fn source(name: &str) -> InputEdgeSpec<'_> {
+    InputEdgeSpec {
+        role: EdgeRole::Named("source"),
+        kind: EdgeKind::Share,
+        target: InputTarget::Source(name),
     }
 }
 
@@ -150,7 +198,7 @@ pub enum GraphNode {
     Operator {
         id: NodeId,
         kind: &'static str,
-        tiling: String,
+        tiling: Tiling,
         inputs: Vec<InputEdge>,
     },
     /// A registered data source. In-degree 0, and where a path through the graph
@@ -170,31 +218,16 @@ pub enum GraphNode {
 
 /// The static operator graph of one compiled program.
 ///
-/// Nodes are in conversion order, which is deterministic: no construction loop
-/// iterates a `HashMap`.
+/// Sources first, then each output's operators with a holder after everything it
+/// holds, then that output's sink. Deterministic: the walk visits an operator's
+/// inputs in the order the operator states them.
 #[derive(Clone, Debug, Default)]
 pub struct OperatorGraph {
     nodes: Vec<GraphNode>,
-    /// Read sites per registered source, accumulated during the walk and spent by
-    /// [`materialize_sources`].
-    ///
-    /// A source node cannot be minted at the first read site: its row names every
-    /// site that reads it, and a row's parents are fixed when its recording
-    /// closes. So the sites are collected and the node minted once the walk is
-    /// done.
-    pending_sources: Vec<(String, Vec<SourceRead>)>,
-}
-
-/// One read of a registered data source: the expression that read it, and the
-/// operator that read reached.
-#[derive(Clone, Copy, Debug)]
-struct SourceRead {
-    expr: NodeId,
-    reader: NodeId,
 }
 
 impl OperatorGraph {
-    /// Every node, in conversion order.
+    /// Every node, in walk order.
     pub fn nodes(&self) -> &[GraphNode] {
         &self.nodes
     }
@@ -343,107 +376,184 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
     );
 }
 
-// The accumulating graph, live only while a `GraphSession` is installed.
+// The program's boundary nodes, live only while a `BoundarySession` is installed.
 //
 // shared-state-ok: a recorder, mirroring `provenance::ACTIVE_TABLE`. What crosses
-// it is graph structure, never a value passed between operators.
+// it is boundary identity, never a value passed between operators.
 thread_local! {
     // shared-state-ok: the recorder cell itself, for the reason on the macro
     // above. The declaration matches the checker's ambient-state shape twice —
     // once at the macro, once at the `static` — and its upward scan stops at
     // `thread_local! {`, which is neither a comment nor an attribute, so the
     // note above does not reach this line.
-    static ACTIVE_GRAPH: RefCell<Option<OperatorGraph>> = const { RefCell::new(None) };
+    static BOUNDARIES: RefCell<Option<Boundaries>> = const { RefCell::new(None) };
 }
 
-/// RAII installer for the per-compile [`OperatorGraph`].
+/// The program's boundary nodes, which no walk of the operators can produce.
 ///
-/// A session is needed because [`OperatorBase::new`] is called from inside
-/// operator constructors, which take no context parameter — threading one would
-/// change every constructor call site, including the ones in tests, which is the
-/// cost this design exists to avoid.
+/// A source and a sink are graph nodes rather than operators, so neither has an
+/// identity or a provenance row that a walk could read off an operator. A
+/// source's row names every expression that reads it, which only conversion
+/// knows: the walk sees reader operators, not the expressions they came from.
 ///
-/// [`OperatorBase::new`]: crate::interpreter::tile_operators::OperatorBase::new
-#[must_use = "a dropped GraphSession takes the graph with it — bind it and call `into_graph`"]
-pub(crate) struct GraphSession;
+/// Everything else comes from the walk — every operator, and every edge,
+/// including the edges into these nodes.
+#[derive(Default)]
+struct Boundaries {
+    /// The expressions that read each registered source, in first-read order.
+    source_reads: Vec<(String, Vec<NodeId>)>,
+    /// Each read source's node, once [`materialize_sources`] has minted it.
+    sources: Vec<(String, NodeId)>,
+    /// Each compiled output field's node.
+    sinks: Vec<(String, NodeId)>,
+}
 
-impl GraphSession {
-    /// Install a fresh graph for the extent of this value.
+/// RAII installer for the per-compile boundary record.
+///
+/// A session is needed because the recording points are inside operator
+/// conversion, which takes no context parameter for this.
+#[must_use = "a dropped BoundarySession takes the boundaries with it — bind it and call `into_graph`"]
+pub(crate) struct BoundarySession;
+
+impl BoundarySession {
+    /// Install a fresh boundary record for the extent of this value.
     pub(crate) fn install() -> Self {
-        ACTIVE_GRAPH.with(|slot| {
+        BOUNDARIES.with(|slot| {
             let mut slot = slot.borrow_mut();
             debug_assert!(
                 slot.is_none(),
-                "a graph session is already installed; sessions are per-compile and \
+                "a boundary session is already installed; sessions are per-compile and \
                  do not nest"
             );
-            *slot = Some(OperatorGraph::default());
+            *slot = Some(Boundaries::default());
         });
-        GraphSession
+        BoundarySession
     }
 
-    /// Take the accumulated graph, ending the session.
-    pub(crate) fn into_graph(self) -> OperatorGraph {
-        ACTIVE_GRAPH
+    /// Walk `outputs` into the graph, ending the session.
+    ///
+    /// Runs before `subscribe`, which is what makes the walk total: `subscribe`
+    /// takes every [`CycleSlot`] and every store's `init_ops`, so an operator
+    /// asked for its inputs afterwards would answer without them.
+    ///
+    /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
+    pub(crate) fn into_graph(self, outputs: &[(String, Box<dyn TileOperator>)]) -> OperatorGraph {
+        let boundaries = BOUNDARIES
             .with(|slot| slot.borrow_mut().take())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let mut nodes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (name, id) in &boundaries.sources {
+            nodes.push(GraphNode::Source {
+                id: *id,
+                name: name.clone(),
+            });
+        }
+        for (name, op) in outputs {
+            walk_operator(&**op, &boundaries, &mut seen, &mut nodes);
+            let (Some(id), Some(subscribed)) = (
+                boundaries
+                    .sinks
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, id)| *id),
+                op.operator_id(),
+            ) else {
+                continue;
+            };
+            nodes.push(GraphNode::Sink {
+                id,
+                name: name.clone(),
+                input: InputEdge {
+                    role: EdgeRole::Named("output"),
+                    kind: EdgeKind::Value { deferred: false },
+                    subscribed,
+                },
+            });
+        }
+        OperatorGraph { nodes }
     }
 }
 
-impl Drop for GraphSession {
+impl Drop for BoundarySession {
     fn drop(&mut self) {
-        ACTIVE_GRAPH.with(|slot| *slot.borrow_mut() = None);
+        BOUNDARIES.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
-/// Record an operator and the inputs it holds.
+/// Emit `op` and everything it holds, children before their holder.
 ///
-/// A no-op with no session installed, which is every engine test that builds an
-/// operator by hand.
-pub(crate) fn record_operator(
-    id: NodeId,
-    kind: &'static str,
-    tiling: &crate::interpreter::tiling::Tiling,
-    inputs: &[InputEdgeSpec],
+/// An operator answering no id is a test double, which the walk neither emits
+/// nor descends into — nothing installs a session around a test that builds
+/// operators by hand.
+fn walk_operator(
+    op: &dyn TileOperator,
+    boundaries: &Boundaries,
+    seen: &mut std::collections::HashSet<NodeId>,
+    nodes: &mut Vec<GraphNode>,
 ) {
-    ACTIVE_GRAPH.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(graph) = slot.as_mut() else {
-            return;
+    let Some(id) = op.operator_id() else {
+        return;
+    };
+    if !seen.insert(id) {
+        return;
+    }
+    let mut inputs = Vec::new();
+    op.visit_inputs(&mut |spec| {
+        let subscribed = match spec.target {
+            InputTarget::Operator(child) => {
+                walk_operator(child, boundaries, seen, nodes);
+                match child.operator_id() {
+                    Some(child_id) => child_id,
+                    None => return,
+                }
+            }
+            InputTarget::Source(name) => match boundaries.sources.iter().find(|(n, _)| n == name) {
+                Some((_, source_id)) => *source_id,
+                None => {
+                    debug_assert!(
+                        false,
+                        "operator graph: {name:?} is read but was never recorded as a \
+                             source, so its node was never minted"
+                    );
+                    return;
+                }
+            },
         };
-        graph.nodes.push(GraphNode::Operator {
-            id,
-            kind,
-            tiling: tiling.to_string(),
-            inputs: resolve(inputs),
+        inputs.push(InputEdge {
+            role: spec.role,
+            kind: spec.kind,
+            subscribed,
         });
+    });
+    nodes.push(GraphNode::Operator {
+        id,
+        kind: op.kind(),
+        tiling: op.tiling().clone(),
+        inputs,
     });
 }
 
-/// Note that `reader` reads the source registered under `name`, at expression
-/// `expr`.
+/// Note that the expression `expr` reads the source registered under `name`.
 ///
-/// The node itself is minted later, by [`materialize_sources`]; see
-/// [`OperatorGraph::pending_sources`].
-pub(crate) fn record_source_read(name: &str, expr: NodeId, reader: Option<NodeId>) {
-    let Some(reader) = reader else {
-        return;
-    };
-    ACTIVE_GRAPH.with(|slot| {
+/// The node itself is minted later, by [`materialize_sources`]: its row names
+/// every site that reads it, and a row's parents are fixed when its recording
+/// closes.
+pub(crate) fn record_source_read(name: &str, expr: NodeId) {
+    BOUNDARIES.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(graph) = slot.as_mut() else {
+        let Some(boundaries) = slot.as_mut() else {
             return;
         };
-        let read = SourceRead { expr, reader };
-        match graph.pending_sources.iter_mut().find(|(n, _)| n == name) {
-            Some((_, reads)) => reads.push(read),
-            None => graph.pending_sources.push((name.to_string(), vec![read])),
+        match boundaries.source_reads.iter_mut().find(|(n, _)| n == name) {
+            Some((_, reads)) => reads.push(expr),
+            None => boundaries.source_reads.push((name.to_string(), vec![expr])),
         }
     });
 }
 
-/// Mint one source node per registered source, and the edge from every operator
-/// that reads it.
+/// Mint one node per registered source that something read.
 ///
 /// Must run inside the conversion phase scope, since each node needs a provenance
 /// row like any other node of the pane. Each row names every read site: the first
@@ -451,10 +561,10 @@ pub(crate) fn record_source_read(name: &str, expr: NodeId, reader: Option<NodeId
 /// [`RecordingGuard::also_consumes`](crate::ccl::provenance::RecordingGuard::also_consumes),
 /// which is what a node consumed from several places is for.
 pub(crate) fn materialize_sources() {
-    let pending = ACTIVE_GRAPH.with(|slot| {
+    let pending = BOUNDARIES.with(|slot| {
         slot.borrow_mut()
             .as_mut()
-            .map(|graph| std::mem::take(&mut graph.pending_sources))
+            .map(|b| std::mem::take(&mut b.source_reads))
             .unwrap_or_default()
     });
     for (name, reads) in pending {
@@ -463,154 +573,32 @@ pub(crate) fn materialize_sources() {
         };
         let id = {
             let guard = crate::ccl::provenance::enter(
-                first.expr,
+                *first,
                 "opconv.source",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let rest: Vec<NodeId> = reads[1..].iter().map(|r| r.expr).collect();
-            for extra in &rest {
+            for extra in &reads[1..] {
                 guard.also_consumes(*extra);
             }
             let id = NodeId::fresh();
             crate::ccl::provenance::on_mint(id);
             id
         };
-        ACTIVE_GRAPH.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let Some(graph) = slot.as_mut() else {
-                return;
-            };
-            graph.nodes.push(GraphNode::Source {
-                id,
-                name: name.clone(),
-            });
-            for read in &reads {
-                // Shared, not owned: one registered source may be read by
-                // several expressions, and each reader holds it through an `Rc`
-                // the way a fan branch holds its fan.
-                push_edge(
-                    graph,
-                    read.reader,
-                    EdgeRole::Named("source"),
-                    EdgeKind::Share,
-                    id,
-                );
+        BOUNDARIES.with(|slot| {
+            if let Some(boundaries) = slot.borrow_mut().as_mut() {
+                boundaries.sources.push((name, id));
             }
         });
     }
 }
 
-/// Record a compiled output field, reading `subscribed`.
-pub(crate) fn record_sink(name: &str, subscribed: Option<NodeId>) -> Option<NodeId> {
-    let subscribed = subscribed?;
+/// Mint the node for a compiled output field.
+pub(crate) fn record_sink(name: &str) {
     let id = NodeId::fresh();
     crate::ccl::provenance::on_mint(id);
-    ACTIVE_GRAPH.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(graph) = slot.as_mut() else {
-            return;
-        };
-        graph.nodes.push(GraphNode::Sink {
-            id,
-            name: name.to_string(),
-            input: InputEdge {
-                role: EdgeRole::Named("output"),
-                kind: EdgeKind::Value { deferred: false },
-                subscribed,
-            },
-        });
-    });
-    Some(id)
-}
-
-/// Remove an operator a conversion arm built and then discarded.
-///
-/// Not a correctness fix: the discarded operator is unreachable, so nothing ever
-/// subscribes it and at runtime it does not exist. What it would leave behind is
-/// a phantom node in the graph — a node the pane renders leading nowhere, which
-/// a reader has no way to tell from a real operator whose consumer is missing.
-/// Dropping it here keeps the graph to operators the program actually has.
-///
-/// The provenance row the mint wrote is left alone. Its key is no longer a node
-/// of the pane, so the fold reads it as a transient born and consumed inside the
-/// phase and composes it away, which is what it is.
-pub(crate) fn drop_operator(op: &dyn TileOperator) {
-    let Some(id) = op.operator_id() else {
-        return;
-    };
-    ACTIVE_GRAPH.with(|slot| {
-        if let Some(graph) = slot.borrow_mut().as_mut() {
-            graph.nodes.retain(|n| match n {
-                GraphNode::Operator { id: node, .. } => *node != id,
-                GraphNode::Source { .. } | GraphNode::Sink { .. } => true,
-            });
+    BOUNDARIES.with(|slot| {
+        if let Some(boundaries) = slot.borrow_mut().as_mut() {
+            boundaries.sinks.push((name.to_string(), id));
         }
     });
-}
-
-/// Record an edge onto an operator already in the graph.
-///
-/// The deferred half of the `Value` kind: a [`CycleSlot`] is filled after its
-/// owner was constructed, so the edge cannot be stated at construction.
-///
-/// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
-pub(crate) fn record_deferred_edge(owner: NodeId, role: EdgeRole, subscribed: Option<NodeId>) {
-    let Some(subscribed) = subscribed else {
-        return;
-    };
-    ACTIVE_GRAPH.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if let Some(graph) = slot.as_mut() {
-            push_edge(
-                graph,
-                owner,
-                role,
-                EdgeKind::Value { deferred: true },
-                subscribed,
-            );
-        }
-    });
-}
-
-/// Append an edge onto an operator already in the graph.
-fn push_edge(
-    graph: &mut OperatorGraph,
-    owner: NodeId,
-    role: EdgeRole,
-    kind: EdgeKind,
-    subscribed: NodeId,
-) {
-    for node in &mut graph.nodes {
-        if let GraphNode::Operator { id, inputs, .. } = node
-            && *id == owner
-        {
-            inputs.push(InputEdge {
-                role,
-                kind,
-                subscribed,
-            });
-            return;
-        }
-    }
-    // Losing the edge here surfaces much later, as the subscribed node being
-    // unreachable from `walk_starts`, which names neither end of the edge that went
-    // missing.
-    debug_assert!(
-        false,
-        "operator graph: no operator {owner:?} to hang a {kind:?} edge on — its node was \
-         dropped, or the edge outlived it"
-    );
-}
-
-fn resolve(specs: &[InputEdgeSpec]) -> Vec<InputEdge> {
-    specs
-        .iter()
-        .filter_map(|s| {
-            s.subscribed.map(|subscribed| InputEdge {
-                role: s.role.clone(),
-                kind: s.kind,
-                subscribed,
-            })
-        })
-        .collect()
 }

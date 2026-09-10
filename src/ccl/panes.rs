@@ -1214,8 +1214,8 @@ mod tests {
     ///
     /// A `CycleSlot` is the only way an operator subscribes something built after
     /// it — every other input is handed to a constructor, so it names an operator
-    /// that already exists — and `record_deferred_edge` runs only when a slot is
-    /// filled. So the deferred edges are the set whose removal leaves the
+    /// that already exists — and a slot-held input is the only one stated
+    /// deferred. So the deferred edges are the set whose removal leaves the
     /// relation acyclic, which is the set a layered layout withholds from ranking
     /// and draws back as returns.
     ///

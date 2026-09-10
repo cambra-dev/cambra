@@ -24,7 +24,7 @@ use log::trace;
 pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
     ccl::provenance::NodeId,
-    interpreter::operator_graph::InputEdgeSpec,
+    interpreter::operator_graph::{EdgeKind, InputEdgeSpec, InputTarget},
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -84,6 +84,19 @@ pub trait TileOperator {
         None
     }
 
+    /// State this operator's inputs to `visit`, in the order the graph holds
+    /// them.
+    ///
+    /// The single statement of what an operator holds. The graph walk builds the
+    /// operator pane from it, so an input stated nowhere is an edge the pane
+    /// does not have and a subtree the pane may lose entirely.
+    ///
+    /// A visitor rather than a returned list because two inputs are reached
+    /// through an `RefCell`: the borrow lives for the call and cannot outlive
+    /// it. Required rather than defaulted so that a new operator states its
+    /// inputs or fails to compile.
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>));
+
     /// The concrete type's short name, e.g. `"MapResult"`.
     ///
     /// Split out of [`inspect`](Self::inspect) so a caller that wants only the
@@ -112,20 +125,35 @@ pub trait TileOperator {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer>;
 
-    /// Inspect this producer as an [`InspectNode`] for visualization.
+    /// Render this operator and what it holds as an [`InspectNode`].
     ///
-    /// Always includes name and tiling, and impls can add children with `add_inspect_children`
+    /// The children are [`visit_inputs`](Self::visit_inputs)' `Value` edges, so
+    /// an operator states what it holds once and this reads the same answer the
+    /// graph walk does. `Share` edges are left out: a fan branch's edge to its
+    /// fan input would draw the shared subtree once per branch, and following
+    /// only `Value` edges is what makes this terminate without a cycle guard —
+    /// they are acyclic, which `assert_graph_invariants` pins.
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let name: &'static str = self.kind();
-        self.add_inspect_children(
-            InspectNode::new(name).with_tiling(self.tiling().to_string()),
-            opts,
-        )
+        let mut node = InspectNode::new(self.kind()).with_tiling(self.tiling().to_string());
+        if let Some(annotation) = self.inspect_annotation() {
+            node = node.annotate(annotation);
+        }
+        let mut children = Vec::new();
+        self.visit_inputs(&mut |spec| {
+            if let (EdgeKind::Value { .. }, InputTarget::Operator(op)) = (spec.kind, spec.target) {
+                children.push((spec.role.to_string(), op.inspect(opts)));
+            }
+        });
+        children
+            .into_iter()
+            .fold(node, |n, (role, child)| n.child(role, child))
     }
 
-    /// Hook for adding any children to the InspectNode.
-    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-        node
+    /// An extra label beyond this operator's kind and tiling — a constant's
+    /// value, a variant arm's tag. What it holds is not this: that is
+    /// [`visit_inputs`](Self::visit_inputs).
+    fn inspect_annotation(&self) -> Option<String> {
+        None
     }
 
     /// If Some, represents an equality constraint between all or part of the domain
@@ -176,52 +204,32 @@ pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
 /// runs after every rewrite phase and mints no expression nodes, so every
 /// operator id is greater than every expression id in the same compile, and the
 /// two sets are disjoint. `src/ccl/design/provenance.md` owns why that matters.
-///
-/// `T` is the operator type that holds this base, and it is what the recorded
-/// label names. Declaring it in the field type (`base: OperatorBase<Filter>`)
-/// makes a label that disagrees with its holder a type error rather than a call
-/// site's convention.
-pub(crate) struct OperatorBase<T: ?Sized> {
+pub(crate) struct OperatorBase {
     /// Identity, minted at construction. See the type's own docs for why here.
     pub(crate) id: NodeId,
     /// Output tiling for this operator.
     pub(crate) tiling: Tiling,
-    /// `fn() -> T` rather than `T`: covariant, and neutral for auto traits.
-    _holder: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T: ?Sized> OperatorBase<T> {
-    /// Mint an identity for an operator, row it against the expression the
-    /// ambient conversion recording names, and record the inputs it holds.
+impl OperatorBase {
+    /// Mint an identity for an operator and row it against the expression the
+    /// ambient conversion recording names.
     ///
-    /// Construction is the recording point because it is the only place every
+    /// Construction is the minting point because it is the only place every
     /// operator type passes through: there is no shared constructor, so every
-    /// operator is built at its own call site. It is also the only point at which an
-    /// edge's kind is known — see [`operator_graph`](crate::interpreter::operator_graph).
+    /// operator is built at its own call site.
     ///
-    /// State the inputs with [`value`](crate::interpreter::operator_graph::value)
-    /// and its siblings. An input that answers no id is a test double and its
-    /// edge is dropped.
-    pub(crate) fn new(tiling: Tiling, inputs: &[InputEdgeSpec]) -> Self {
+    /// What the operator holds is not stated here. It is read off the built
+    /// operator by [`TileOperator::visit_inputs`], so the two cannot disagree.
+    pub(crate) fn new(tiling: Tiling) -> Self {
         let id = NodeId::fresh();
         crate::ccl::provenance::on_mint(id);
-        crate::interpreter::operator_graph::record_operator(
-            id,
-            short_type_name::<T>(),
-            &tiling,
-            inputs,
-        );
-        Self {
-            id,
-            tiling,
-            _holder: std::marker::PhantomData,
-        }
+        Self { id, tiling }
     }
 }
 
 /// Implement [`TileOperator::tiling`] and [`TileOperator::operator_id`] for a
-/// concrete operator that stores its shared state in a field named
-/// `base: OperatorBase<Self>`.
+/// concrete operator that stores its shared state in a field named `base`.
 ///
 /// Usage: place `impl_operator_base!();` inside the `impl TileOperator for Foo`
 /// block in place of the boilerplate accessors.
@@ -231,10 +239,7 @@ macro_rules! impl_operator_base {
             &self.base.tiling
         }
         fn operator_id(&self) -> Option<$crate::ccl::provenance::NodeId> {
-            // Binding through `OperatorBase<Self>` is what makes the label's
-            // subject the struct that holds it rather than a call-site choice.
-            let base: &$crate::interpreter::tile_operators::OperatorBase<Self> = &self.base;
-            Some(base.id)
+            Some(self.base.id)
         }
     };
 }

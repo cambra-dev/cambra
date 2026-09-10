@@ -25,7 +25,7 @@ use crate::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
         },
-        operator_graph::{drop_operator, record_sink, record_source_read},
+        operator_graph::{record_sink, record_source_read},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
@@ -96,7 +96,7 @@ pub fn convert_to_operators(
     // expression that produced it — the program root.
     {
         let _scope = crate::ccl::provenance::converting(expr.node_id());
-        record_sink("main", op.operator_id());
+        record_sink("main");
     }
     Ok(op)
 }
@@ -231,7 +231,7 @@ pub fn convert_record_fields_to_operators(
                 // The sink is the program's output boundary, so it belongs to the
                 // field expression rather than to the record or the program root.
                 let _scope = crate::ccl::provenance::converting(elt.node_id());
-                record_sink(name, op.operator_id());
+                record_sink(name);
                 Ok((name.clone(), op))
             })
             .collect(),
@@ -1275,18 +1275,11 @@ fn convert_impl_inner(
                 // Free bindings are standalone functions; under an
                 // iteration we apply them pointwise via `MapResult`.
                 match (kind, input) {
-                    // An aligned use reads its binding directly, so the branch the
-                    // enclosing `Let` fanned for this position is surplus. Take it
-                    // out of the graph: it is unreachable, nothing subscribes it,
-                    // and at runtime it does not exist — left in, it would render
-                    // as a node leading nowhere that a reader cannot tell from a
-                    // real operator with a missing consumer.
-                    (BindingKind::Aligned, input) => {
-                        if let Some(surplus) = input {
-                            drop_operator(&*surplus);
-                        }
-                        Ok(op)
-                    }
+                    // An aligned use reads its binding directly, so the branch
+                    // the enclosing `Let` fanned for this position is surplus.
+                    // Dropping it here is all it takes: the graph is walked from
+                    // the sinks, and nothing holds this branch.
+                    (BindingKind::Aligned, _) => Ok(op),
                     (BindingKind::Free, None) => Ok(op),
                     (BindingKind::Free, Some(input)) => Ok(Box::new(MapResult::new(input, op))),
                 }
@@ -1572,7 +1565,7 @@ fn convert_impl_inner(
             let input = expect_input(input, &format!("Source({name})"))?;
             let source = ctx.get_source(name)?;
             let reader = MapResultWithSource::new(source, input);
-            record_source_read(name, expr.node_id(), reader.operator_id());
+            record_source_read(name, expr.node_id());
             Ok(Box::new(reader))
         }
 
@@ -3225,11 +3218,14 @@ mod variant_ctor_tests {
     }
 
     impl TileOperator for FixedStreamOp {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(
+            &self,
+            _visit: &mut dyn FnMut(crate::interpreter::operator_graph::InputEdgeSpec<'_>),
+        ) {
+        }
         fn tiling(&self) -> &Tiling {
             &self.tiling
-        }
-        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-            node
         }
         fn subscribe(
             &mut self,

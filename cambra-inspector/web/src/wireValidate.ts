@@ -233,11 +233,31 @@ function validateOperatorNode(v: unknown, path: string): OperatorNode {
   return v as OperatorNode;
 }
 
+// What names an input at its consumer. Three shapes, each carrying its own
+// payload field, so a field called `0` stays distinct from position 0.
+function validateEdgeRole(v: unknown, path: string): void {
+  const o = obj(v, path);
+  const kind = str(o.kind, `${path}.kind`);
+  switch (kind) {
+    case "named":
+      str(o.name, `${path}.name`);
+      return;
+    case "positional":
+      num(o.index, `${path}.index`);
+      return;
+    case "storeKey":
+      str(o.key, `${path}.key`);
+      return;
+    default:
+      throw new WireError(`${path}.kind`, "one of {named, positional, storeKey}", kind);
+  }
+}
+
 // One input edge of an operator node. `subscribed` names a node of the same
 // pane's table; `validatePane` checks that once the table's ids are known.
 function validateOperatorEdge(v: unknown, path: string): OperatorEdge {
   const o = obj(v, path);
-  str(o.role, `${path}.role`);
+  validateEdgeRole(o.role, `${path}.role`);
   const kind = str(o.kind, `${path}.kind`);
   if (!ALLOWED_EDGE_KIND.includes(kind)) {
     throw new WireError(`${path}.kind`, `one of {${ALLOWED_EDGE_KIND.join(", ")}}`, kind);

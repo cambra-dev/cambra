@@ -3685,49 +3685,6 @@
       "nodes": [
         {
           "label": "Constant",
-          "nodeId": 374,
-          "role": "operator",
-          "tiling": "Int",
-          "spans": [
-            {
-              "start": 4,
-              "end": 6
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": []
-        },
-        {
-          "label": "Memo",
-          "nodeId": 375,
-          "role": "operator",
-          "tiling": "Int",
-          "spans": [
-            {
-              "start": 0,
-              "end": 6
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": [
-            {
-              "role": "input",
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 374
-            }
-          ]
-        },
-        {
-          "label": "Constant",
           "nodeId": 376,
           "role": "operator",
           "tiling": "Int",
@@ -3780,13 +3737,19 @@
           },
           "inputs": [
             {
-              "role": "0",
+              "role": {
+                "kind": "positional",
+                "index": 0
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 376
             },
             {
-              "role": "1",
+              "role": {
+                "kind": "positional",
+                "index": 1
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 377
@@ -3829,16 +3792,68 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 378
             },
             {
-              "role": "fn",
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 379
+            }
+          ]
+        },
+        {
+          "label": "Constant",
+          "nodeId": 374,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 4,
+              "end": 6
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "Memo",
+          "nodeId": 375,
+          "role": "operator",
+          "tiling": "Int",
+          "spans": [
+            {
+              "start": 0,
+              "end": 6
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
+              "kind": "value",
+              "deferred": false,
+              "subscribed": 374
             }
           ]
         },
@@ -3860,7 +3875,10 @@
           },
           "inputs": [
             {
-              "role": "fan",
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 375
@@ -3885,13 +3903,19 @@
           },
           "inputs": [
             {
-              "role": "0",
+              "role": {
+                "kind": "positional",
+                "index": 0
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 380
             },
             {
-              "role": "1",
+              "role": {
+                "kind": "positional",
+                "index": 1
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 381
@@ -3934,13 +3958,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 382
             },
             {
-              "role": "fn",
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 383
@@ -3965,7 +3995,10 @@
           },
           "inputs": [
             {
-              "role": "output",
+              "role": {
+                "kind": "named",
+                "name": "output"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 384

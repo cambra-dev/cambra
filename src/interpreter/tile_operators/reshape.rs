@@ -15,7 +15,7 @@ use crate::{
 /// be extended if needed.
 pub struct PermuteRecordDomain {
     input: Box<dyn TileOperator>,
-    base: OperatorBase<PermuteRecordDomain>,
+    base: OperatorBase,
     permutation: Vec<usize>,
 }
 
@@ -49,7 +49,7 @@ impl PermuteRecordDomain {
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
             permutation,
         }
@@ -59,8 +59,8 @@ impl PermuteRecordDomain {
 impl TileOperator for PermuteRecordDomain {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -313,7 +313,7 @@ fn flatten_result_correlation(
 /// the output domain is `(_0: A, _1: (_0: B, _1: C), _2: D, _3: E)`.
 pub struct FlattenTupleDomain {
     /// Output tiling: `SealedFunction` with a single-level `Record` domain.
-    base: OperatorBase<FlattenTupleDomain>,
+    base: OperatorBase,
     /// Input operator whose domain is a `Record`.
     input: Box<dyn TileOperator>,
     /// Maps output field index `i` to `(outer_field_key, inner_field_key_opt)`.
@@ -377,7 +377,7 @@ impl FlattenTupleDomain {
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
             field_map,
         }
@@ -387,8 +387,8 @@ impl FlattenTupleDomain {
 impl TileOperator for FlattenTupleDomain {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(

@@ -189,9 +189,8 @@ pub struct OperatorNode {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorEdge {
-    /// What names this input at its consumer: a field name, a position, or a
-    /// store key, rendered.
-    pub role: String,
+    /// What names this input at its consumer.
+    pub role: OperatorEdgeRole,
     /// `"value"` for an exclusively owned input, `"share"` for one several
     /// consumers may reach.
     ///
@@ -206,6 +205,34 @@ pub struct OperatorEdge {
     /// The id of the node this edge subscribes — an entry of the same pane's
     /// [`nodes`](PaneEntry::nodes).
     pub subscribed: u64,
+}
+
+/// What names an input at its consumer, carrying the shape that named it.
+///
+/// Three shapes rather than one rendered string, because two of them render
+/// alike: a field named `0` and the first element of a `Vec` both flatten to
+/// `"0"`, and a consumer that has to tell them apart cannot.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OperatorEdgeRole {
+    /// A field of the consumer, e.g. `"input"`, `"predicate"`.
+    Named { name: String },
+    /// A position in a `Vec` of inputs, as `FanIn` and `UnionOperator` have.
+    Positional { index: usize },
+    /// A store key, as both stores' `init_ops` are keyed by. Rendered from a
+    /// `Value`, so a string key arrives quoted.
+    StoreKey { key: String },
+}
+
+/// How a role reads in a row label — the Rust side of `roleLabel` in `types.ts`.
+impl std::fmt::Display for OperatorEdgeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperatorEdgeRole::Named { name } => f.write_str(name),
+            OperatorEdgeRole::Positional { index } => write!(f, "{index}"),
+            OperatorEdgeRole::StoreKey { key } => f.write_str(key),
+        }
+    }
 }
 
 /// One node of a pane's shipped node table.
@@ -480,7 +507,7 @@ fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) ->
                     *id,
                     (*kind).to_string(),
                     "operator",
-                    Some(tiling.clone()),
+                    Some(tiling.to_string()),
                     inputs.as_slice(),
                 ),
                 GraphNode::Source { id, name } => (
@@ -550,9 +577,11 @@ fn wire_edge(edge: &InputEdge) -> OperatorEdge {
     };
     OperatorEdge {
         role: match &edge.role {
-            EdgeRole::Named(name) => (*name).to_string(),
-            EdgeRole::Positional(i) => i.to_string(),
-            EdgeRole::StoreKey(key) => key.clone(),
+            EdgeRole::Named(name) => OperatorEdgeRole::Named {
+                name: (*name).to_string(),
+            },
+            EdgeRole::Positional(i) => OperatorEdgeRole::Positional { index: *i },
+            EdgeRole::StoreKey(key) => OperatorEdgeRole::StoreKey { key: key.clone() },
         },
         kind,
         deferred,
@@ -560,18 +589,6 @@ fn wire_edge(edge: &InputEdge) -> OperatorEdge {
     }
 }
 
-/// Build one pane's node table against its `projection`, returning the root
-/// node's id and every node reachable from `expr` exactly once, in first-visit
-/// pre-order.
-///
-/// The single source-linking node builder: every pane's payload nodes go
-/// through this one shape, parameterized only by its `(Expr, SourceProjection)`
-/// pair.
-///
-/// A node reached from several places — a refinement predicate shared by
-/// several type slots — is emitted once and named by id from each place that
-/// reaches it, so nothing repeats and the walk terminates on a shared term. The
-/// pre-order is what makes the emitted array byte-reproducible.
 fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrNode>) {
     fn visit(
         expr: &Expr,
@@ -1285,6 +1302,9 @@ mod tests {
         }
     }
 
+    /// No node claims one span twice. A node is visited once and its spans come
+    /// from that one attribution, so a repeat would mean the attribution itself
+    /// carries a duplicate.
     /// **An operator node's own fields**: `role` says which of the three node
     /// kinds it is, `tiling` is present for an operator and absent for a
     /// boundary, and `spans` is narrowest-first like an expression node's.
@@ -1328,9 +1348,6 @@ mod tests {
         }
     }
 
-    /// No node claims one span twice. A node is visited once and its spans come
-    /// from that one attribution, so a repeat would mean the attribution itself
-    /// carries a duplicate.
     #[test]
     fn no_node_repeats_a_span() {
         for code in corpus() {

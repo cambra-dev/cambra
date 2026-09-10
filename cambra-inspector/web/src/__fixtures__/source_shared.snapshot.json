@@ -4369,6 +4369,28 @@
       "kind": "operators",
       "nodes": [
         {
+          "label": "Source(stdin)",
+          "nodeId": 644,
+          "role": "source",
+          "tiling": null,
+          "spans": [
+            {
+              "start": 34,
+              "end": 41
+            },
+            {
+              "start": 77,
+              "end": 84
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.source"
+          },
+          "inputs": []
+        },
+        {
           "label": "IterateExtent",
           "nodeId": 626,
           "role": "operator",
@@ -4404,13 +4426,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 626
             },
             {
-              "role": "source",
+              "role": {
+                "kind": "named",
+                "name": "source"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 644
@@ -4453,13 +4481,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 627
             },
             {
-              "role": "constant",
+              "role": {
+                "kind": "named",
+                "name": "constant"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 628
@@ -4502,13 +4536,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 629
             },
             {
-              "role": "fn",
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 630
@@ -4533,10 +4573,41 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 631
+            }
+          ]
+        },
+        {
+          "label": "FanOutBranch",
+          "nodeId": 640,
+          "role": "operator",
+          "tiling": "SF(Source(stdin) → String)",
+          "spans": [
+            {
+              "start": 87,
+              "end": 93
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
+              "kind": "share",
+              "deferred": false,
+              "subscribed": 632
             }
           ]
         },
@@ -4576,13 +4647,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 633
             },
             {
-              "role": "source",
+              "role": {
+                "kind": "named",
+                "name": "source"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 644
@@ -4625,13 +4702,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 634
             },
             {
-              "role": "constant",
+              "role": {
+                "kind": "named",
+                "name": "constant"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 635
@@ -4674,13 +4757,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 636
             },
             {
-              "role": "fn",
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 637
@@ -4705,35 +4794,13 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 638
-            }
-          ]
-        },
-        {
-          "label": "FanOutBranch",
-          "nodeId": 640,
-          "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
-          "spans": [
-            {
-              "start": 87,
-              "end": 93
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": [
-            {
-              "role": "fan",
-              "kind": "share",
-              "deferred": false,
-              "subscribed": 632
             }
           ]
         },
@@ -4755,7 +4822,10 @@
           },
           "inputs": [
             {
-              "role": "fan",
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 639
@@ -4780,13 +4850,19 @@
           },
           "inputs": [
             {
-              "role": "0",
+              "role": {
+                "kind": "positional",
+                "index": 0
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 640
             },
             {
-              "role": "1",
+              "role": {
+                "kind": "positional",
+                "index": 1
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 641
@@ -4811,34 +4887,15 @@
           },
           "inputs": [
             {
-              "role": "output",
+              "role": {
+                "kind": "named",
+                "name": "output"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 642
             }
           ]
-        },
-        {
-          "label": "Source(stdin)",
-          "nodeId": 644,
-          "role": "source",
-          "tiling": null,
-          "spans": [
-            {
-              "start": 34,
-              "end": 41
-            },
-            {
-              "start": 77,
-              "end": 84
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.source"
-          },
-          "inputs": []
         }
       ]
     }

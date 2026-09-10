@@ -33,7 +33,7 @@ use crate::{
 /// input does.
 pub struct CheckedLookup {
     /// Identity and the answer's tiling, one `` {`none | `some{𝑉}} `` per key.
-    base: OperatorBase<CheckedLookup>,
+    base: OperatorBase,
     /// Where the collection and the keys come from — see [`LookupSource`].
     source: LookupSource,
 }
@@ -66,10 +66,7 @@ impl CheckedLookup {
     ) -> Self {
         let tiling = answer_tiling(keys.tiling(), option_extent);
         Self {
-            base: OperatorBase::new(
-                tiling,
-                &[value("collection", &*collection), value("keys", &*keys)],
-            ),
+            base: OperatorBase::new(tiling),
             source: LookupSource::Split { collection, keys },
         }
     }
@@ -121,7 +118,7 @@ impl CheckedLookup {
             codomain: Box::new(Tiling::Scalar(option_extent)),
         };
         Ok(Self {
-            base: OperatorBase::new(tiling, &[value("pairs", &*pairs)]),
+            base: OperatorBase::new(tiling),
             source: LookupSource::Paired(pairs),
         })
     }
@@ -142,12 +139,13 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
 impl TileOperator for CheckedLookup {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         match &self.source {
-            LookupSource::Split { collection, keys } => node
-                .child("collection", collection.inspect(opts))
-                .child("keys", keys.inspect(opts)),
-            LookupSource::Paired(pairs) => node.child("pairs", pairs.inspect(opts)),
+            LookupSource::Split { collection, keys } => {
+                visit(value("collection", &**collection));
+                visit(value("keys", &**keys));
+            }
+            LookupSource::Paired(pairs) => visit(value("pairs", &**pairs)),
         }
     }
 

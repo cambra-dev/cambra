@@ -404,12 +404,7 @@ fn assert_store_edge_shapes(example: &str) {
             if edge["deferred"] == Value::Bool(true) {
                 deferred += 1;
             }
-            // A store key is rendered as its `Value`, and a store key is a union
-            // tagged by the mutable variable — the one edge role that is neither
-            // a field name nor a position.
-            if let Some(role) = edge["role"].as_str()
-                && role.starts_with('`')
-            {
+            if edge["role"]["kind"] == "storeKey" {
                 store_keyed += 1;
             }
         }

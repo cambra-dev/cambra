@@ -19,7 +19,8 @@ import { OperatorView } from "./operatorView";
 import { Store } from "./store";
 import { TreeView } from "./treeView";
 import type { Selection } from "./store";
-import type { OperatorNode, OperatorPane, Snapshot } from "./types";
+import type { OperatorEdge, OperatorNode, OperatorPane, Snapshot } from "./types";
+import { roleLabel } from "./types";
 
 import { fixture, irPaneById, operatorPaneById, stubLayout } from "./__fixtures__/helpers";
 
@@ -145,11 +146,11 @@ describe("OperatorView: share edges as reference leaves", () => {
   beforeAll(stubLayout);
 
   // The consumers of a share edge, and the edge each holds.
-  const sharers = (pane: OperatorPane): [OperatorNode, { role: string; subscribed: number }][] =>
+  const sharers = (pane: OperatorPane): [OperatorNode, OperatorEdge][] =>
     pane.nodes.flatMap((node) =>
       node.inputs
         .filter((e) => e.kind === "share")
-        .map((e) => [node, e] as [OperatorNode, { role: string; subscribed: number }]),
+        .map((e) => [node, e] as [OperatorNode, OperatorEdge]),
     );
 
   it("renders a share input as an `.op-ref` leaf naming its target", () => {
@@ -165,7 +166,7 @@ describe("OperatorView: share edges as reference leaves", () => {
       expect(refs[0].classList.contains("op-ref-share")).toBe(true);
       expect(rowNodeId(refs[0])).toBe(edge.subscribed);
       expect(refs[0].querySelector(".op-ref-arrow")!.textContent).toBe("→");
-      expect(refs[0].querySelector(".edge-label")!.textContent).toBe(`${edge.role}:`);
+      expect(refs[0].querySelector(".edge-label")!.textContent).toBe(`${roleLabel(edge.role)}:`);
       // The subscribed node's label, so the reference reads without chasing
       // the id.
       const subscribed = pane.nodes.find((n) => n.nodeId === edge.subscribed)!;

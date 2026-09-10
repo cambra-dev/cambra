@@ -24,7 +24,7 @@
 // one-node tree.
 
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
-import { isChildEdge, walkStarts } from "./types";
+import { isChildEdge, roleLabel, walkStarts } from "./types";
 import type { Resolved, Store } from "./store";
 
 // Depth to expand to on first render, matching the tree panes'.
@@ -94,7 +94,7 @@ export class OperatorView {
     const twisty = el("span", `twisty${hasChildren ? "" : " leaf"}`);
     row.appendChild(twisty);
     if (edge !== null) {
-      row.appendChild(el("span", "edge-label", `${edge.role}:`));
+      row.appendChild(el("span", "edge-label", `${roleLabel(edge.role)}:`));
       if (edge.deferred) {
         // Wired through a `CycleSlot` after its consumer was constructed, which
         // is how the store complexes close their cycles. Ownership is exclusive
@@ -167,7 +167,7 @@ export class OperatorView {
     const container = el("div", "tree-node");
     const row = el("div", `tree-row selectable op-ref op-ref-${edge.kind}`);
     row.appendChild(el("span", "twisty leaf", "·"));
-    row.appendChild(el("span", "edge-label", `${edge.role}:`));
+    row.appendChild(el("span", "edge-label", `${roleLabel(edge.role)}:`));
     row.appendChild(el("span", "op-ref-arrow", "→"));
     const subscribed = this.nodeById.get(edge.subscribed);
     row.appendChild(el("span", "node-label", subscribed ? subscribed.label : "?"));
@@ -233,7 +233,7 @@ export function serializeOperatorGraph(pane: OperatorPane): string {
     const node = nodeById.get(id);
     if (!node) return;
     const prefix =
-      edge === null ? "" : `${edge.role}: ${edge.deferred ? "late " : ""}`;
+      edge === null ? "" : `${roleLabel(edge.role)}: ${edge.deferred ? "late " : ""}`;
     lines.push(INDENT.repeat(depth) + prefix + rowText(node));
     for (const input of node.inputs) {
       if (isChildEdge(input)) {

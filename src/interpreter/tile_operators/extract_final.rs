@@ -34,7 +34,7 @@ pub struct ExtractFinal {
     /// source with no default is an invariant violation, not a fallback.
     default: Option<Box<dyn TileOperator>>,
     /// Output tiling — the codomain of the source SealedFunction (always `Scalar`).
-    base: OperatorBase<ExtractFinal>,
+    base: OperatorBase,
 }
 
 impl ExtractFinal {
@@ -66,10 +66,7 @@ impl ExtractFinal {
             default.tiling(),
         );
         Self {
-            base: OperatorBase::new(
-                tiling,
-                &[value("source", &*source), value("default", &*default)],
-            ),
+            base: OperatorBase::new(tiling),
             source,
             default: Some(default),
         }
@@ -84,7 +81,7 @@ impl ExtractFinal {
     pub fn without_default(source: Box<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
         Self {
-            base: OperatorBase::new(tiling, &[value("source", &*source)]),
+            base: OperatorBase::new(tiling),
             source,
             default: None,
         }
@@ -101,11 +98,10 @@ impl ExtractFinal {
 impl TileOperator for ExtractFinal {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        let node = node.child("source", self.source.inspect(opts));
-        match &self.default {
-            Some(d) => node.child("default", d.inspect(opts)),
-            None => node.annotate("total (no default)".to_string()),
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("source", &*self.source));
+        if let Some(default) = &self.default {
+            visit(value("default", &**default));
         }
     }
 
@@ -315,6 +311,8 @@ mod tests {
     }
 
     impl TileOperator for PartialSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -366,6 +364,8 @@ mod tests {
     }
 
     impl TileOperator for TerminalSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }

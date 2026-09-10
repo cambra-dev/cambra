@@ -21,7 +21,7 @@ pub struct Aggregate {
     /// The `SealedFunction`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
     /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
-    base: OperatorBase<Aggregate>,
+    base: OperatorBase,
 }
 
 impl Aggregate {
@@ -41,7 +41,7 @@ impl Aggregate {
             accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
         };
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
         }
     }
@@ -50,8 +50,8 @@ impl Aggregate {
 impl TileOperator for Aggregate {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -166,7 +166,7 @@ impl TileProducer for AggregateProducer {
 
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
-    base: OperatorBase<ExtractAggregate>,
+    base: OperatorBase,
     kind: AggregateKind,
     only_terminal: bool,
 }
@@ -179,7 +179,7 @@ impl ExtractAggregate {
             todo!("functions on partial aggregates")
         };
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
             kind,
             only_terminal,
@@ -190,8 +190,8 @@ impl ExtractAggregate {
 impl TileOperator for ExtractAggregate {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -274,7 +274,7 @@ pub struct MapExtractAggregate {
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
     /// Output tiling: `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
-    base: OperatorBase<MapExtractAggregate>,
+    base: OperatorBase,
 }
 
 impl MapExtractAggregate {
@@ -297,7 +297,7 @@ impl MapExtractAggregate {
             t => panic!("MapExtractAggregate expected SealedFunction input, got {t:?}"),
         };
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
             kind,
         }
@@ -307,8 +307,8 @@ impl MapExtractAggregate {
 impl TileOperator for MapExtractAggregate {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -402,7 +402,7 @@ pub struct MapAggregate {
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
     /// Output tiling: `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
-    base: OperatorBase<MapAggregate>,
+    base: OperatorBase,
 }
 
 impl MapAggregate {
@@ -429,7 +429,7 @@ impl MapAggregate {
             }),
         };
         Self {
-            base: OperatorBase::new(tiling, &[value("input", &*input)]),
+            base: OperatorBase::new(tiling),
             input,
             kind,
         }
@@ -439,8 +439,8 @@ impl MapAggregate {
 impl TileOperator for MapAggregate {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(

@@ -4841,6 +4841,24 @@
       "nodes": [
         {
           "label": "IterateExtent",
+          "nodeId": 603,
+          "role": "operator",
+          "tiling": "SF(Unit → Unit)",
+          "spans": [
+            {
+              "start": 46,
+              "end": 53
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "IterateExtent",
           "nodeId": 599,
           "role": "operator",
           "tiling": "SF({[0, 3]} → {[0, 3]})",
@@ -4893,13 +4911,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 599
             },
             {
-              "role": "fn",
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 600
@@ -4924,30 +4948,15 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 601
             }
           ]
-        },
-        {
-          "label": "IterateExtent",
-          "nodeId": 603,
-          "role": "operator",
-          "tiling": "SF(Unit → Unit)",
-          "spans": [
-            {
-              "start": 46,
-              "end": 53
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": []
         },
         {
           "label": "FanOutBranch",
@@ -4967,7 +4976,10 @@
           },
           "inputs": [
             {
-              "role": "fan",
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 602
@@ -4992,7 +5004,10 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 604
@@ -5017,7 +5032,10 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 605
@@ -5042,13 +5060,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 603
             },
             {
-              "role": "constant",
+              "role": {
+                "kind": "named",
+                "name": "constant"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 606
@@ -5073,7 +5097,10 @@
           },
           "inputs": [
             {
-              "role": "fan",
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 602
@@ -5098,13 +5125,19 @@
           },
           "inputs": [
             {
-              "role": "0",
+              "role": {
+                "kind": "positional",
+                "index": 0
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 607
             },
             {
-              "role": "1",
+              "role": {
+                "kind": "positional",
+                "index": 1
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 608
@@ -5129,7 +5162,10 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 609
@@ -5154,7 +5190,10 @@
           },
           "inputs": [
             {
-              "role": "fan",
+              "role": {
+                "kind": "named",
+                "name": "fan"
+              },
               "kind": "share",
               "deferred": false,
               "subscribed": 610
@@ -5179,7 +5218,10 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 611
@@ -5204,7 +5246,10 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 612
@@ -5229,7 +5274,10 @@
           },
           "inputs": [
             {
-              "role": "output",
+              "role": {
+                "kind": "named",
+                "name": "output"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 613

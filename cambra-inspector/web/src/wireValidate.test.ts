@@ -282,6 +282,22 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     expect(() => validateSnapshot(missing)).toThrow(/panes\[0\]\.root.*number/);
   });
 
+  it("throws on an edge role that is not one of the three shapes", () => {
+    // The shape is what tells a field named `0` from position 0, so a role that
+    // names no shape is not a role a consumer can read.
+    const unknown = minimalSuccess();
+    operatorNodes(unknown)[0].inputs = [
+      { role: { kind: "field", name: "input" }, kind: "value", deferred: false, subscribed: 0 },
+    ];
+    expect(() => validateSnapshot(unknown)).toThrow(/role\.kind/);
+
+    const missing = minimalSuccess();
+    operatorNodes(missing)[0].inputs = [
+      { role: { kind: "positional" }, kind: "value", deferred: false, subscribed: 0 },
+    ];
+    expect(() => validateSnapshot(missing)).toThrow(/role\.index/);
+  });
+
   it("throws when an operator pane ships a walk start", () => {
     // A tree's start is singular by type, so nothing has to assert that it is
     // one id. What has to be pinned is that an operator pane, whose starts are
@@ -309,7 +325,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     pane.nodes = [
       {
         ...minimalOperatorNode(),
-        inputs: [{ role: "source", kind: "share", deferred: false, subscribed: 1 }],
+        inputs: [{ role: { kind: "named", name: "source" }, kind: "share", deferred: false, subscribed: 1 }],
       },
       { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
     ];
@@ -324,12 +340,12 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     pane.nodes = [
       {
         ...minimalOperatorNode(),
-        inputs: [{ role: "input", kind: "value", deferred: false, subscribed: 1 }],
+        inputs: [{ role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 1 }],
       },
       {
         ...minimalOperatorNode(),
         nodeId: 1,
-        inputs: [{ role: "input", kind: "value", deferred: false, subscribed: 0 }],
+        inputs: [{ role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 0 }],
       },
     ];
     expect(() => validateSnapshot(bad)).toThrow(
@@ -430,7 +446,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   it("throws when an operator input names an id the pane's table does not hold", () => {
     const bad = minimalSuccess();
     operatorNodes(bad)[0].inputs = [
-      { role: "0", kind: "value", deferred: false, subscribed: 99 },
+      { role: { kind: "positional", index: 0 }, kind: "value", deferred: false, subscribed: 99 },
     ];
     expect(() => validateSnapshot(bad)).toThrow(
       new RegExp(
@@ -442,7 +458,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   it("throws on an operator input's kind or deferred flag", () => {
     const wrongKind = minimalSuccess();
     operatorNodes(wrongKind)[0].inputs = [
-      { role: "0", kind: "owned", deferred: false, subscribed: 0 },
+      { role: { kind: "positional", index: 0 }, kind: "owned", deferred: false, subscribed: 0 },
     ];
     expect(() => validateSnapshot(wrongKind)).toThrow(
       new RegExp(
@@ -451,7 +467,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
 
     const noFlag = minimalSuccess();
-    operatorNodes(noFlag)[0].inputs = [{ role: "0", kind: "share", subscribed: 0 }];
+    operatorNodes(noFlag)[0].inputs = [{ role: { kind: "positional", index: 0 }, kind: "share", subscribed: 0 }];
     expect(() => validateSnapshot(noFlag)).toThrow(
       new RegExp(
         `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.deferred.*boolean`,
@@ -467,8 +483,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       {
         ...minimalOperatorNode(),
         inputs: [
-          { role: "input", kind: "value", deferred: false, subscribed: 1 },
-          { role: "acc", kind: "value", deferred: true, subscribed: 1 },
+          { role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 1 },
+          { role: { kind: "named", name: "acc" }, kind: "value", deferred: true, subscribed: 1 },
         ],
       },
     ];

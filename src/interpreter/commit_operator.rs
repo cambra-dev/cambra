@@ -58,7 +58,7 @@ use crate::interpreter::{
 use crate::pretty_graph::VizOptions;
 use crate::pretty_tree::InspectNode;
 
-use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed};
+use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
 use crate::interpreter::tile_operators::{OperatorBase, impl_operator_base, impl_producer_base};
 
 /// A commit timestamp — a position on the runtime's monotonic commit clock.
@@ -776,8 +776,7 @@ pub struct CommitOperator {
     /// trivial init operator; a collection key has no entry (its log starts
     /// empty). This is the op-conversion seeding path.
     init_ops: Vec<(Value, Box<dyn TileOperator>)>,
-    /// Identity and the store's output tiling.
-    base: OperatorBase<CommitOperator>,
+    base: OperatorBase,
     writer_inputs: Vec<CycleSlot<dyn TileOperator>>,
     /// Per writer, the keys it may write — its **static** footprint, so a
     /// conditionally-written key still counts. This is what lets the store close
@@ -788,13 +787,6 @@ pub struct CommitOperator {
 }
 
 /// Graph edges for a store's per-key tick-0 operators, keyed by the store key.
-fn init_op_edges(init_ops: &[(Value, Box<dyn TileOperator>)]) -> Vec<InputEdgeSpec> {
-    init_ops
-        .iter()
-        .map(|(key, op)| value_keyed(key.to_string(), &**op))
-        .collect()
-}
-
 impl CommitOperator {
     /// Create a commit operator whose store starts at `init` (the tick-0 state),
     /// with keys in `key_extent` and values in `value_extent`.
@@ -812,7 +804,7 @@ impl CommitOperator {
         Self {
             init,
             init_ops: Vec::new(),
-            base: OperatorBase::new(output_tiling, &[]),
+            base: OperatorBase::new(output_tiling),
             writer_inputs: (0..writer_write_keys.len())
                 .map(|_| CycleSlot::new())
                 .collect(),
@@ -834,11 +826,10 @@ impl CommitOperator {
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
-        let init_edges = init_op_edges(&init_ops);
         Self {
             init: HashMap::new(),
             init_ops,
-            base: OperatorBase::new(output_tiling, &init_edges),
+            base: OperatorBase::new(output_tiling),
             writer_inputs: (0..writer_write_keys.len())
                 .map(|_| CycleSlot::new())
                 .collect(),
@@ -849,12 +840,23 @@ impl CommitOperator {
     /// Wire writer `k`'s input. Call after the operator is boxed, so the writer
     /// can be built around a branch of the operator's store output (the cycle).
     pub fn writer_input_setter(&self, k: usize) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
-        self.writer_inputs[k].setter(Some(self.base.id), EdgeRole::Positional(k))
+        self.writer_inputs[k].setter()
     }
 }
 
 impl TileOperator for CommitOperator {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        for (key, op) in &self.init_ops {
+            visit(value_keyed(key.to_string(), &**op));
+        }
+        // A writer arrives through its slot after this store was built, which is
+        // what makes its edge the deferred one and the cycle cuttable there.
+        for (i, slot) in self.writer_inputs.iter().enumerate() {
+            slot.peek(&mut |op| visit(value_late(EdgeRole::Positional(i), op)));
+        }
+    }
 
     fn subscribe(
         &mut self,
@@ -1267,8 +1269,7 @@ pub struct InductionStore {
     /// Reply-tap decision fields, appended to each write set (see
     /// [`body_decision_at`]). Empty for a store with no feed.
     tap_fields: Vec<String>,
-    /// Identity and the store's output tiling.
-    base: OperatorBase<InductionStore>,
+    base: OperatorBase,
 }
 
 impl InductionStore {
@@ -1283,13 +1284,12 @@ impl InductionStore {
         value_extent: Extent,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
-        let init_edges = init_op_edges(&init_ops);
         Self {
             init_ops,
             body_input: CycleSlot::new(),
             write_keys,
             tap_fields,
-            base: OperatorBase::new(output_tiling, &init_edges),
+            base: OperatorBase::new(output_tiling),
         }
     }
 
@@ -1297,13 +1297,20 @@ impl InductionStore {
     /// `FanOut` — the same late wiring [`CommitOperator::writer_input_setter`]
     /// performs, and for the same reason.
     pub fn body_input_setter(&self) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
-        self.body_input
-            .setter(Some(self.base.id), EdgeRole::Named("body"))
+        self.body_input.setter()
     }
 }
 
 impl TileOperator for InductionStore {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        for (key, op) in &self.init_ops {
+            visit(value_keyed(key.to_string(), &**op));
+        }
+        self.body_input
+            .peek(&mut |op| visit(value_late(EdgeRole::Named("body"), op)));
+    }
 
     fn subscribe(
         &mut self,
@@ -1568,7 +1575,7 @@ impl TileProducer for InductionStoreProducer {
 /// [`AsOf`], sampling an arbitrary commit position. Which reader a program gets
 /// is selected by the term it wrote, never inferred from the reading loop.
 pub struct StoreValueStream {
-    base: OperatorBase<StoreValueStream>,
+    base: OperatorBase,
     store_op: Box<dyn TileOperator>,
     key: Value,
     value_extent: Extent,
@@ -1589,13 +1596,10 @@ impl StoreValueStream {
         carry_forward: bool,
     ) -> Self {
         Self {
-            base: OperatorBase::new(
-                Tiling::SealedFunction {
-                    domain: Extent::Base(BaseType::UInt),
-                    codomain: Box::new(Tiling::Scalar(value_extent.clone())),
-                },
-                &[value("store_op", &*store_op)],
-            ),
+            base: OperatorBase::new(Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(Tiling::Scalar(value_extent.clone())),
+            }),
             store_op,
             key,
             value_extent,
@@ -1606,6 +1610,10 @@ impl StoreValueStream {
 
 impl TileOperator for StoreValueStream {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("store_op", &*self.store_op));
+    }
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -1781,7 +1789,7 @@ impl TileProducer for StoreValueStreamProducer {
 /// changelog holds the seed.
 pub struct StoreFinalRead {
     /// Output tiling `Scalar(V)` — a terminal read is one value, not a stream.
-    base: OperatorBase<StoreFinalRead>,
+    base: OperatorBase,
     /// The commit store (a [`Tile::Store`] fan branch).
     store_op: Box<dyn TileOperator>,
     /// The key whose settled value this reads.
@@ -1792,10 +1800,7 @@ pub struct StoreFinalRead {
 impl StoreFinalRead {
     pub fn new(store_op: Box<dyn TileOperator>, key: Value, value_extent: Extent) -> Self {
         Self {
-            base: OperatorBase::new(
-                Tiling::Scalar(value_extent.clone()),
-                &[value("store_op", &*store_op)],
-            ),
+            base: OperatorBase::new(Tiling::Scalar(value_extent.clone())),
             store_op,
             key,
             value_extent,
@@ -1805,8 +1810,9 @@ impl StoreFinalRead {
 
 impl TileOperator for StoreFinalRead {
     impl_operator_base!();
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("store", self.store_op.inspect(opts))
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("store_op", &*self.store_op));
     }
     fn subscribe(
         &mut self,
@@ -1919,7 +1925,7 @@ impl TileProducer for StoreFinalReadProducer {
 /// `fan_in`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
     /// Output tiling `SealedFunction { domain: D, codomain: Scalar(V) }`.
-    base: OperatorBase<StoreDenseRead>,
+    base: OperatorBase,
     /// Enumerates the loop extent `D` (its positions drive the output domain, so
     /// it aligns with any co-iterated source over the same `D`).
     trigger: Box<dyn TileOperator>,
@@ -1961,10 +1967,7 @@ impl StoreDenseRead {
             codomain: Box::new(Tiling::Scalar(value_extent.clone())),
         };
         Self {
-            base: OperatorBase::new(
-                tiling,
-                &[value("trigger", &*trigger), value("store_op", &*store_op)],
-            ),
+            base: OperatorBase::new(tiling),
             trigger,
             store_op,
             key,
@@ -1976,6 +1979,11 @@ impl StoreDenseRead {
 
 impl TileOperator for StoreDenseRead {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("trigger", &*self.trigger));
+        visit(value("store_op", &*self.store_op));
+    }
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -2274,7 +2282,7 @@ impl AsOfOutput {
 pub struct AsOf {
     /// Output tiling: `SealedFunction { domain: B, codomain }` where `codomain`
     /// is `Scalar(V)` (single mutable variable) or `Record{field: Scalar(V)}` (snapshot).
-    base: OperatorBase<AsOf>,
+    base: OperatorBase,
     /// The trigger stream `Fun(B, _)` — drives one output position each.
     trigger: Box<dyn TileOperator>,
     /// The shared commit store (a [`Tile::Store`] fan branch) — the sampled
@@ -2330,10 +2338,7 @@ impl AsOf {
             codomain: Box::new(output.codomain_tiling()),
         };
         Self {
-            base: OperatorBase::new(
-                tiling,
-                &[value("trigger", &*trigger), value("source", &*source)],
-            ),
+            base: OperatorBase::new(tiling),
             trigger,
             source,
             output,
@@ -2344,9 +2349,9 @@ impl AsOf {
 impl TileOperator for AsOf {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("trigger", self.trigger.inspect(opts))
-            .child("source", self.source.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("trigger", &*self.trigger));
+        visit(value("source", &*self.source));
     }
 
     fn subscribe(
@@ -2816,7 +2821,7 @@ fn subscribe_driver_inputs(
 /// makes the cycle well-founded — the body is never asked for a position whose
 /// predecessor is undecided.
 pub struct InductionDriver {
-    base: OperatorBase<InductionDriver>,
+    base: OperatorBase,
     /// The store read back through the cyclic `FanOut`.
     store_op: Box<dyn TileOperator>,
     /// The iteration source `Fun(D, item)` — the loop extent's items in order.
@@ -2841,13 +2846,7 @@ impl InductionDriver {
             "each read key carries its own value extent"
         );
         Self {
-            base: OperatorBase::new(
-                body_input_tiling(&read_extents, &item_extent),
-                &[
-                    value("store_op", &*store_op),
-                    value("source_op", &*source_op),
-                ],
-            ),
+            base: OperatorBase::new(body_input_tiling(&read_extents, &item_extent)),
             store_op,
             source_op,
             read_keys,
@@ -2859,6 +2858,11 @@ impl InductionDriver {
 
 impl TileOperator for InductionDriver {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("store_op", &*self.store_op));
+        visit(value("source_op", &*self.source_op));
+    }
 
     fn subscribe(
         &mut self,
@@ -3114,7 +3118,7 @@ impl TileProducer for InductionDriverProducer {
 /// writer's supersession release still in place. Measured both ways by
 /// `a_contended_item_keeps_the_drive_window_flat`.
 pub struct TransactDriver {
-    base: OperatorBase<TransactDriver>,
+    base: OperatorBase,
     /// The store read back through the cyclic `FanOut`.
     store_op: Box<dyn TileOperator>,
     /// The transaction source — one item per transaction to attempt.
@@ -3139,13 +3143,7 @@ impl TransactDriver {
             "each read key carries its own value extent"
         );
         Self {
-            base: OperatorBase::new(
-                body_input_tiling(&read_extents, &item_extent),
-                &[
-                    value("store_op", &*store_op),
-                    value("source_op", &*source_op),
-                ],
-            ),
+            base: OperatorBase::new(body_input_tiling(&read_extents, &item_extent)),
             store_op,
             source_op,
             read_keys,
@@ -3157,6 +3155,11 @@ impl TransactDriver {
 
 impl TileOperator for TransactDriver {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("store_op", &*self.store_op));
+        visit(value("source_op", &*self.source_op));
+    }
 
     fn subscribe(
         &mut self,
@@ -3544,7 +3547,7 @@ fn body_decision_at(
 /// Releasing the driver row acks the attempt's finish, so the driver advances to the next
 /// item. Retries (a fresh attempt at a new frontier) append as new positions.
 pub struct TransactWriter {
-    base: OperatorBase<TransactWriter>,
+    base: OperatorBase,
     store_op: Box<dyn TileOperator>,
     body_op: Box<dyn TileOperator>,
     /// A second branch of the [`TransactDriver`] the body reads. The writer pulls
@@ -3581,14 +3584,7 @@ impl TransactWriter {
         value_extent: Extent,
     ) -> Self {
         Self {
-            base: OperatorBase::new(
-                proposal_stream_tiling(&key_extent, &value_extent),
-                &[
-                    value("store_op", &*store_op),
-                    value("body_op", &*body_op),
-                    value("driver_op", &*driver_op),
-                ],
-            ),
+            base: OperatorBase::new(proposal_stream_tiling(&key_extent, &value_extent)),
             store_op,
             body_op,
             driver_op,
@@ -3601,6 +3597,12 @@ impl TransactWriter {
 
 impl TileOperator for TransactWriter {
     impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("store_op", &*self.store_op));
+        visit(value("body_op", &*self.body_op));
+        visit(value("driver_op", &*self.driver_op));
+    }
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -4200,6 +4202,8 @@ mod tests {
     }
 
     impl TileOperator for ItemSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -4296,6 +4300,8 @@ mod tests {
     }
 
     impl TileOperator for AddIfBody {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -4676,6 +4682,8 @@ mod tests {
     }
 
     impl TileOperator for ReleaseRecorder {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
@@ -5171,6 +5179,8 @@ mod tests {
     }
 
     impl TileOperator for ProposalSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -5291,6 +5301,8 @@ mod tests {
     }
 
     impl TileOperator for CounterBody {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -5407,6 +5419,8 @@ mod tests {
     }
 
     impl TileOperator for DriverProbe {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
@@ -5683,6 +5697,8 @@ mod tests {
     }
 
     impl TileOperator for TokenWriter {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -5878,6 +5894,8 @@ mod tests {
     }
 
     impl TileOperator for StoreReadAsOf {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -5989,6 +6007,8 @@ mod tests {
     }
 
     impl TileOperator for BankWriter {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -6140,6 +6160,8 @@ mod tests {
         tile: Tile,
     }
     impl TileOperator for FixedSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }

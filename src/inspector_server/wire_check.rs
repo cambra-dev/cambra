@@ -483,7 +483,18 @@ fn assert_operator_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64
         .as_array()
         .unwrap_or_else(|| panic!("{at}.inputs is an array"));
     for (i, e) in inputs.iter().enumerate() {
-        assert!(e["role"].is_string(), "{at}.inputs[{i}].role is a string");
+        // Three shapes, each with its own payload field: a field named `0` and
+        // position 0 render alike, so the shape is what tells them apart.
+        let role_at = format!("{at}.inputs[{i}].role");
+        let role_kind = e["role"]["kind"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{role_at}.kind is a string"));
+        match role_kind {
+            "named" => assert!(e["role"]["name"].is_string(), "{role_at}.name is a string"),
+            "positional" => assert!(e["role"]["index"].is_u64(), "{role_at}.index is a number"),
+            "storeKey" => assert!(e["role"]["key"].is_string(), "{role_at}.key is a string"),
+            other => panic!("{role_at}.kind {other:?} is not one of named/positional/storeKey"),
+        }
         let kind = e["kind"]
             .as_str()
             .unwrap_or_else(|| panic!("{at}.inputs[{i}].kind is a string"));

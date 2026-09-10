@@ -2766,13 +2766,19 @@
           },
           "inputs": [
             {
-              "role": "input",
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 418
             },
             {
-              "role": "fn",
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 419
@@ -2797,7 +2803,10 @@
           },
           "inputs": [
             {
-              "role": "output",
+              "role": {
+                "kind": "named",
+                "name": "output"
+              },
               "kind": "value",
               "deferred": false,
               "subscribed": 420

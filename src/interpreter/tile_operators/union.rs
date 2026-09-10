@@ -26,7 +26,7 @@ use crate::{
 /// already computed, by inference, and stamped on the union node as its value
 /// type. It is passed in rather than re-derived here (see [`new`](Self::new)).
 pub struct UnionOperator {
-    base: OperatorBase<UnionOperator>,
+    base: OperatorBase,
     /// Input operators; each must have a `SealedFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
     /// Flat-merge mode (see [`new_flat`](Self::new_flat)): arms share one domain
@@ -48,13 +48,8 @@ impl UnionOperator {
     /// where the type layer said `{a: Int}`.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
         let tiling = Self::coproduct_tiling(&inputs, declared_codomain);
-        let edges: Vec<InputEdgeSpec> = inputs
-            .iter()
-            .enumerate()
-            .map(|(i, op)| value_at(i, &**op))
-            .collect();
         Self {
-            base: OperatorBase::new(tiling, &edges),
+            base: OperatorBase::new(tiling),
             inputs,
             flat: false,
         }
@@ -163,13 +158,8 @@ impl UnionOperator {
         // the tiling it keeps. Reaching into `base.tiling` afterwards would leave
         // the shape recorded at construction stale.
         let tiling = Self::flatten_domain(Self::coproduct_tiling(&inputs, declared_codomain));
-        let edges: Vec<InputEdgeSpec> = inputs
-            .iter()
-            .enumerate()
-            .map(|(i, op)| value_at(i, &**op))
-            .collect();
         Self {
-            base: OperatorBase::new(tiling, &edges),
+            base: OperatorBase::new(tiling),
             inputs,
             flat: true,
         }
@@ -281,11 +271,10 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
 impl TileOperator for UnionOperator {
     impl_operator_base!();
 
-    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         for (i, input) in self.inputs.iter().enumerate() {
-            node = node.child(format!("{i}"), input.inspect(opts));
+            visit(value_at(i, &**input));
         }
-        node
     }
 
     fn subscribe(
@@ -512,6 +501,8 @@ mod tests {
     struct TilingOnly(Tiling);
 
     impl TileOperator for TilingOnly {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.0
         }
