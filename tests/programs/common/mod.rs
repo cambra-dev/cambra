@@ -250,7 +250,7 @@ pub fn compile_sink(source: &str) -> GlobalContext {
 /// another version.
 ///
 /// [`compile_sink`] is the right helper when a test only runs one version. This
-/// one hands back the program, which [`LiveProgram::update`] needs and which the
+/// one hands back the program, which [`LiveProgram::reload`] needs and which the
 /// caller must keep alive alongside the context.
 pub fn start_sink(source: &str) -> (GlobalContext, LiveProgram) {
     let mut ctx = GlobalContext::default();

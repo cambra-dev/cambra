@@ -5,9 +5,9 @@
 //!
 //! The gallery entry is one program and the version that replaces it:
 //! `program.cambra` is a guestbook where `POST /sign` accumulates into a mutable
-//! variable and `GET /peek` holds no state, and `updated.cambra` is the same
+//! variable and `GET /peek` holds no state, and `reloaded.cambra` is the same
 //! program with the accumulating loop edited. That pair is what a reader should
-//! look at to see what an update does.
+//! look at to see what a reload does.
 //!
 //! Everything else the cases drive is scaffolding. [`fixtures`] holds every
 //! program the `{PORT}` substitution reaches — a base per shape, plus the
@@ -39,11 +39,11 @@
 //!
 //! Some cases pull a program's value itself instead
 //! (`drive_main_to_terminal`). A fold over a fixed collection needs no
-//! source, so pulling it is what makes the position an update lands on nameable:
+//! source, so pulling it is what makes the position a reload lands on nameable:
 //! one pull decides one position, where a socket lands wherever the notification
 //! round it arrives in reaches.
 //!
-//! # What an update may do
+//! # What a reload may do
 //!
 //! | Change | Expected |
 //! | --- | --- |
@@ -67,7 +67,7 @@
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | An endpoint is removed with a request already in flight to it | Accepted; that request is answered 404 too, rather than waiting for a reply no version will compute |
 //! | Repeats and reverts | Accepted; each takes effect |
-//! | An update after one that kept a stateful binding whole | Accepted; the variable under the kept binding is still carried and still guarded |
+//! | A reload after one that kept a stateful binding whole | Accepted; the variable under the kept binding is still carried and still guarded |
 //!
 //! # What it may not
 //!
@@ -84,17 +84,17 @@
 //!
 //! # Two properties worth stating
 //!
-//! How much an update reuses does not depend on how many updates came before it:
+//! How much a reload reuses does not depend on how many reloads came before it:
 //! a binding is named by what it computes, not by whether the compilation before
 //! this one happened to build it.
 //!
 //! A rebuilt store resumes rather than restarting, and resumes at the position
 //! its source has reached rather than replaying it. Most cases here drive two or
-//! three requests before updating, which is not enough to exercise a resuming
+//! three requests before reloading, which is not enough to exercise a resuming
 //! store's indexing — `a_store_resumes_however_far_its_source_has_advanced`
 //! drives six for that reason.
 //!
-//! Neither property weakens with the number of updates. Every `{PORT}` fixture
+//! Neither property weakens with the number of reloads. Every `{PORT}` fixture
 //! here binds its store at the top of the binding chain, where each compilation
 //! registers it again; the two cases over `nested_fold` put a store under another
 //! binding instead, which is the placement where keeping that binding is what
@@ -112,7 +112,7 @@ use rstest_log::rstest;
 use cambra::{
     ccl::context::{GlobalContext, Phase, ReuseTally},
     interpreter::{Consumer, Tile, Value},
-    live_program::{LiveProgram, UpdateReport},
+    live_program::{LiveProgram, ReloadReport},
 };
 
 use super::common::{
@@ -120,14 +120,14 @@ use super::common::{
 };
 
 /// Run a `stdin`-sourced program under `--control`, feeding it `before`, then
-/// swapping it for `updated` and feeding it `after`.
+/// swapping it for `reloaded` and feeding it `after`.
 ///
 /// Driven as a subprocess because a `main` output belongs to the binary's own
 /// loop, not to a sink a test can pump. Such a program is not short-lived: its
-/// source is unbounded, so it keeps running and is as updatable as any other.
-fn stdin_across_update(
+/// source is unbounded, so it keeps running and is as reloadable as any other.
+fn stdin_across_reload(
     program: &str,
-    updated: &str,
+    reloaded: &str,
     before: &str,
     after: &str,
 ) -> (String, String) {
@@ -136,7 +136,7 @@ fn stdin_across_update(
     let mut launched = launch_under_control(program);
     let control = launched.control;
     let v2 = launched.program.dir.join("v2.cambra");
-    std::fs::write(&v2, updated).expect("write v2");
+    std::fs::write(&v2, reloaded).expect("write v2");
     let mut input = launched.input.take().expect("piped stdin");
     let collected = launched.collected.clone();
     let reader = launched.reader.take().expect("reader thread");
@@ -149,7 +149,7 @@ fn stdin_across_update(
     let reply = raw_http(
         control,
         &format!(
-            "POST /update HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\nContent-Length: {}\r\n\
+            "POST /reload HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
             body.len()
         ),
@@ -167,7 +167,7 @@ fn stdin_across_update(
 
 /// A program running under `--control`, with its control port already answering.
 ///
-/// Split out of [`stdin_across_update`] because a test that only asks the control
+/// Split out of [`stdin_across_reload`] because a test that only asks the control
 /// port a question needs the launch and none of the feeding.
 struct Launched {
     program: RunningProgram,
@@ -272,10 +272,10 @@ impl Drop for RunningProgram {
 
 /// Wait for `port` to stop accepting connections.
 ///
-/// Releasing a port is not synchronous with the update that stopped serving it:
+/// Releasing a port is not synchronous with the reload that stopped serving it:
 /// dropping the last handle unblocks the dispatcher thread, and the socket closes
 /// when that thread notices. The contract is that the port *is* released, not that
-/// it is released before `update` returns.
+/// it is released before `reload` returns.
 fn assert_port_released(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -767,7 +767,7 @@ fn source(name: &str, port: u16) -> String {
         "guestbook-drops-route" => fixtures::GUESTBOOK_DROPS_ROUTE,
         "guestbook-drops-state" => fixtures::GUESTBOOK_DROPS_STATE,
         "guestbook-retypes-state" => fixtures::GUESTBOOK_RETYPES_STATE,
-        "guestbook-stateful-edit" => include_str!("updated.cambra"),
+        "guestbook-stateful-edit" => include_str!("reloaded.cambra"),
         "guestbook-stateless-edit" => fixtures::GUESTBOOK_STATELESS_EDIT,
         "latest-write" => fixtures::LATEST_WRITE,
         "latest-write-writer-edit" => fixtures::LATEST_WRITE_WRITER_EDIT,
@@ -802,7 +802,7 @@ where
     drive_until(ctx, &rx, Duration::from_secs(5))
 }
 
-/// An update replaces the edited logic and leaves the untouched logic running,
+/// A reload replaces the edited logic and leaves the untouched logic running,
 /// with everything that logic has accumulated.
 ///
 /// The guestbook is signed twice, `/peek` is edited, and the third signature
@@ -814,7 +814,7 @@ where
 /// same accumulation rather than by being re-derived.
 /// `an_edit_to_the_accumulating_loop_takes_effect` is the case that rebuilds it.
 #[test]
-fn an_update_keeps_the_state_of_logic_it_did_not_change() {
+fn a_reload_keeps_the_state_of_logic_it_did_not_change() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
@@ -830,8 +830,8 @@ fn an_update_keeps_the_state_of_logic_it_did_not_change() {
         vec!["alice: hi\n", "alice: hi\nbob: hello\n", "peek\n"],
     );
 
-    let report: UpdateReport = live
-        .update(
+    let report: ReloadReport = live
+        .reload(
             &mut ctx,
             &source("guestbook-stateless-edit", port),
             &no_main,
@@ -894,7 +894,7 @@ bob
         ]
     );
 
-    live.update(&mut ctx, &source("guestbook-stateful-edit", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook-stateful-edit", port), &no_main)
         .expect("editing a loop body is a change between existing endpoints");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/sign", "carol")]);
@@ -914,7 +914,7 @@ bob
 /// appends to, so a decision is indexed by the row that produced it — the *n*th
 /// position *this store* drove. A store resuming a running program starts at the
 /// source's frontier rather than at `0`, so looking a decision up by absolute
-/// position found nothing and the drive stalled, silently: the update was
+/// position found nothing and the drive stalled, silently: the reload was
 /// accepted, the program's other endpoints kept serving, and the resumed loop
 /// answered nothing.
 ///
@@ -935,7 +935,7 @@ fn a_store_resumes_however_far_its_source_has_advanced() {
     assert_eq!(before.len(), 6);
     assert_eq!(before[5], "e1\ne2\ne3\ne4\ne5\ne6\n");
 
-    live.update(&mut ctx, &source("guestbook-stateful-edit", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook-stateful-edit", port), &no_main)
         .expect("editing a loop body is a change between existing endpoints");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/sign", "e7")]);
@@ -965,7 +965,7 @@ fn reordering_two_accumulators_does_not_cross_their_state() {
     });
     assert_eq!(before[2], "aaa|BBB\n");
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("two-accumulators-reordered", port),
         &no_main,
@@ -995,7 +995,7 @@ fn a_loop_may_gain_an_accumulator() {
     });
     assert_eq!(before[1], "aa|BB\n");
 
-    live.update(&mut ctx, &source("two-accumulators-added", port), &no_main)
+    live.reload(&mut ctx, &source("two-accumulators-added", port), &no_main)
         .expect("adding an accumulator loses nothing");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
@@ -1023,7 +1023,7 @@ fn a_variable_that_moves_to_another_loop_takes_its_value_and_restarts() {
     });
     assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    live.update(&mut ctx, &source("one-stateful-loop-moved", port), &no_main)
+    live.reload(&mut ctx, &source("one-stateful-loop-moved", port), &no_main)
         .expect("`n` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || {
@@ -1057,7 +1057,7 @@ fn moving_a_program_to_another_port_keeps_its_state() {
     });
     assert_eq!(before, vec!["alice\n", "alice\nbob\n"]);
 
-    live.update(&mut ctx, &source("guestbook", new_port), &no_main)
+    live.reload(&mut ctx, &source("guestbook", new_port), &no_main)
         .expect("`entries` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || {
@@ -1094,7 +1094,7 @@ fn a_transactional_variable_survives_an_edit_to_its_writer() {
     });
     assert_eq!(before, vec!["ok\n", "bob"]);
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("latest-write-writer-edit", port),
         &no_main,
@@ -1126,7 +1126,7 @@ fn an_edit_to_one_accumulator_leaves_the_other_running() {
     assert_eq!(before, vec!["p\n", "q\n"]);
 
     let report = live
-        .update(&mut ctx, &source("two-loops-one-edited", port), &no_main)
+        .reload(&mut ctx, &source("two-loops-one-edited", port), &no_main)
         .expect("editing one loop is a change between existing endpoints");
     // Reuse is not observable in the values below: a rebuilt store resumes
     // from the value it carried, so it answers what a kept one answers. The
@@ -1135,7 +1135,7 @@ fn an_edit_to_one_accumulator_leaves_the_other_running() {
     let ReuseTally { kept, bound } = report.reuse;
     assert!(
         kept > 0 && kept < bound,
-        "one loop's subgraph is unchanged and the other's is edited, so an update \
+        "one loop's subgraph is unchanged and the other's is edited, so a reload \
          keeps some and rebuilds some, got {kept}/{bound}",
     );
 
@@ -1156,34 +1156,34 @@ fn an_edit_to_one_accumulator_leaves_the_other_running() {
     );
 }
 
-/// How much an update reuses does not depend on how many updates came before it.
+/// How much a reload reuses does not depend on how many reloads came before it.
 ///
 /// The regression this pins: while a binding's class was its identity hash when
 /// kept and a fresh value when built, a first compilation handed out classes
 /// that no later one reproduced, so every binding reading another was rebuilt on
-/// the first update and reuse only settled in on the second. A program is most
-/// likely to be updated exactly once, which is the case that lost the most.
+/// the first reload and reuse only settled in on the second. A program is most
+/// likely to be reloaded exactly once, which is the case that lost the most.
 #[test]
-fn reuse_does_not_depend_on_how_many_updates_came_before() {
+fn reuse_does_not_depend_on_how_many_reloads_came_before() {
     let first = {
         let port = reserve_test_port();
         let (mut ctx, mut live) = start_sink(&source("two-loops", port));
-        live.update(&mut ctx, &source("two-loops-one-edited", port), &no_main)
+        live.reload(&mut ctx, &source("two-loops-one-edited", port), &no_main)
             .expect("accepted")
             .reuse
     };
     let after_a_no_op = {
         let port = reserve_test_port();
         let (mut ctx, mut live) = start_sink(&source("two-loops", port));
-        live.update(&mut ctx, &source("two-loops", port), &no_main)
+        live.reload(&mut ctx, &source("two-loops", port), &no_main)
             .expect("accepted");
-        live.update(&mut ctx, &source("two-loops-one-edited", port), &no_main)
+        live.reload(&mut ctx, &source("two-loops-one-edited", port), &no_main)
             .expect("accepted")
             .reuse
     };
     assert_eq!(
         first, after_a_no_op,
-        "the same edit reused {first:?} as a program's first update and \
+        "the same edit reused {first:?} as a program's first reload and \
          {after_a_no_op:?} as its second",
     );
     let ReuseTally { kept, bound } = first;
@@ -1275,23 +1275,23 @@ fn the_control_port_answers_a_diff_request() {
     );
 }
 
-/// A program whose output is its `main` value rather than a sink updates too.
+/// A program whose output is its `main` value rather than a sink reloads too.
 ///
 /// Its source is `stdin`, which is unbounded, so the program keeps running and
 /// the binary's own driver loop services the control port between pulls. The
 /// line written before the swap is answered by the old version and the one after
 /// by the new.
 #[test]
-fn a_main_output_program_over_stdin_updates() {
-    let (reply, out) = stdin_across_update(
+fn a_main_output_program_over_stdin_reloads() {
+    let (reply, out) = stdin_across_reload(
         "[\"> \" + line for line in stdin()]\n",
         "[\">> \" + line for line in stdin()]\n",
         "one",
         "two",
     );
     assert!(
-        reply.contains("updated"),
-        "the update should be accepted: {reply}"
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
     );
     assert!(
         out.contains("\"> one\""),
@@ -1315,15 +1315,15 @@ fn a_main_output_program_over_stdin_updates() {
 /// through the new version nor has elements dropped at the handover.
 #[test]
 fn an_element_wise_transformation_splits_exactly_at_the_swap() {
-    let (reply, out) = stdin_across_update(
+    let (reply, out) = stdin_across_reload(
         "[\"A\" + line for line in stdin()]\n",
         "[\"B\" + line for line in stdin()]\n",
         "L1\nL2\nL3\nL4",
         "L5\nL6\nL7\nL8",
     );
     assert!(
-        reply.contains("updated"),
-        "the update should be accepted: {reply}"
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
     );
     for want in ["AL1", "AL2", "AL3", "AL4", "BL5", "BL6", "BL7", "BL8"] {
         assert!(out.contains(want), "missing {want} from: {out}");
@@ -1346,7 +1346,7 @@ fn an_element_wise_transformation_splits_exactly_at_the_swap() {
 /// when it is read, and reading it at the tail of the program means EOF.
 #[test]
 fn a_main_output_accumulator_carries_across_the_swap() {
-    let (reply, out) = stdin_across_update(
+    let (reply, out) = stdin_across_reload(
         indoc! {r#"
             n := 0
             for line in stdin():
@@ -1363,8 +1363,8 @@ fn a_main_output_accumulator_carries_across_the_swap() {
         "c\nd",
     );
     assert!(
-        reply.contains("updated"),
-        "the update should be accepted: {reply}"
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
@@ -1381,7 +1381,7 @@ fn a_main_output_accumulator_carries_across_the_swap() {
 /// then the swap, then two of `+2` continuing from `2` rather than restarting.
 #[test]
 fn a_fed_accumulator_is_observable_across_the_swap() {
-    let (reply, out) = stdin_across_update(
+    let (reply, out) = stdin_across_reload(
         indoc! {r#"
             out = defer()
             n := 0
@@ -1402,8 +1402,8 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
         "c\nd",
     );
     assert!(
-        reply.contains("updated"),
-        "the update should be accepted: {reply}"
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     // `4` is the step that can only happen if the swap resumed from `2`; a
@@ -1421,7 +1421,7 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
 /// the guard has to catch the change rather than leaving it to be noticed.
 #[test]
 fn the_state_guard_covers_a_stdin_sourced_loop() {
-    let (reply, _) = stdin_across_update(
+    let (reply, _) = stdin_across_reload(
         indoc! {r#"
             n := ""
             for line in stdin():
@@ -1449,14 +1449,14 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
 /// and one it does not is opened, in a replacement exactly as in a first
 /// version. The endpoints that were already there keep working, state included.
 #[test]
-fn an_update_may_add_an_endpoint() {
+fn a_reload_may_add_an_endpoint() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
     let before = exchange(&mut ctx, move || vec![http_post(port, "/sign", "alice")]);
     assert_eq!(before, vec!["alice\n"]);
 
-    live.update(&mut ctx, &source("guestbook-adds-route", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook-adds-route", port), &no_main)
         .expect("adding an endpoint is allowed");
 
     let after = exchange(&mut ctx, move || {
@@ -1476,7 +1476,7 @@ fn an_update_may_add_an_endpoint() {
 /// The regression this pins: a source handle outlived the version that opened it
 /// and nothing removed one, so re-opening the address minted a second source
 /// under the same id and `Scheduler::add_source_handle` refused to register it
-/// beside the stale one — a panic inside the second update, after the running
+/// beside the stale one — a panic inside the second reload, after the running
 /// program had already been torn down.
 #[test]
 fn a_route_a_version_retired_can_be_served_again() {
@@ -1487,9 +1487,9 @@ fn a_route_a_version_retired_can_be_served_again() {
         vec!["peek\n"],
     );
 
-    live.update(&mut ctx, &source("guestbook-drops-route", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook-drops-route", port), &no_main)
         .expect("dropping a route is allowed");
-    live.update(&mut ctx, &source("guestbook", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook", port), &no_main)
         .expect("re-adding the route it dropped is allowed");
 
     assert_eq!(
@@ -1514,11 +1514,11 @@ fn a_program_can_move_back_to_the_port_it_left() {
         vec!["alice\n"],
     );
 
-    live.update(&mut ctx, &source("guestbook", second), &no_main)
+    live.reload(&mut ctx, &source("guestbook", second), &no_main)
         .expect("moving to another port is allowed");
     assert_port_released(first);
 
-    live.update(&mut ctx, &source("guestbook", first), &no_main)
+    live.reload(&mut ctx, &source("guestbook", first), &no_main)
         .expect("moving back is allowed");
     assert_eq!(
         exchange(&mut ctx, move || vec![http_post(first, "/sign", "bob")]),
@@ -1543,7 +1543,7 @@ fn a_version_that_stops_serving_a_route_retires_it() {
     let before = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(before, vec!["peek\n"]);
 
-    live.update(&mut ctx, &source("guestbook-drops-route", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook-drops-route", port), &no_main)
         .expect("dropping a stateless route is allowed");
 
     let after = exchange(&mut ctx, move || {
@@ -1563,10 +1563,10 @@ fn a_version_that_stops_serving_a_route_retires_it() {
 /// The value cannot be the seed of a store built for another shape. Left to
 /// proceed, the store is constructed around a constant of the wrong extent and
 /// the process dies on the next pull (`Scalar(Strings([..])) vs Scalar(Int)`),
-/// taking every endpoint with it — the update is not recoverable at that point,
+/// taking every endpoint with it — the reload is not recoverable at that point,
 /// so it has to be refused before the swap.
 #[test]
-fn an_update_may_not_change_the_type_of_held_state() {
+fn a_reload_may_not_change_the_type_of_held_state() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
@@ -1574,7 +1574,7 @@ fn an_update_may_not_change_the_type_of_held_state() {
     assert_eq!(before, vec!["alice\n"]);
 
     let errors = live
-        .update(&mut ctx, &source("guestbook-retypes-state", port), &no_main)
+        .reload(&mut ctx, &source("guestbook-retypes-state", port), &no_main)
         .err()
         .expect("`entries` holds a String; the new version declares it an Int");
     let rendered = format!("{errors:?}");
@@ -1594,7 +1594,7 @@ fn an_update_may_not_change_the_type_of_held_state() {
 /// an author cannot see having happened, since the program carries on answering
 /// and only the accumulated history is gone.
 #[test]
-fn an_update_may_not_drop_state() {
+fn a_reload_may_not_drop_state() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
@@ -1602,7 +1602,7 @@ fn an_update_may_not_drop_state() {
     assert_eq!(before, vec!["alice\n"]);
 
     let errors = live
-        .update(&mut ctx, &source("guestbook-drops-state", port), &no_main)
+        .reload(&mut ctx, &source("guestbook-drops-state", port), &no_main)
         .err()
         .expect("a version that stops declaring `entries` would discard its value");
     let rendered = format!("{errors:?}");
@@ -1649,7 +1649,7 @@ fn a_version_naming_an_unbindable_port_is_refused() {
         .trim_end(),
     );
     let err = live
-        .update(&mut ctx, &adds_a_held_port, &no_main)
+        .reload(&mut ctx, &adds_a_held_port, &no_main)
         .err()
         .expect("the port is held, so the version cannot be installed");
     assert!(
@@ -1682,7 +1682,7 @@ fn retyping_one_field_of_a_record_variable_is_refused() {
     );
 
     let err = live
-        .update(
+        .reload(
             &mut ctx,
             &source("record-accumulator-retyped-field", port),
             &no_main,
@@ -1698,20 +1698,20 @@ fn retyping_one_field_of_a_record_variable_is_refused() {
     assert_eq!(
         exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]),
         vec!["ok\n"],
-        "the refused update left the program serving",
+        "the refused reload left the program serving",
     );
 }
 
 /// A version that does not compile is rejected before the running program is
 /// touched.""""""
 #[test]
-fn a_rejected_update_leaves_the_program_serving() {
+fn a_rejected_reload_leaves_the_program_serving() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
-    live.update(&mut ctx, "x = = 1", &no_main)
+    live.reload(&mut ctx, "x = = 1", &no_main)
         .err()
-        .expect("a syntax error is not an update");
+        .expect("a syntax error is not a reload");
 
     let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(still_serving, vec!["peek\n"]);
@@ -1752,7 +1752,7 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 }
 
 /// Two calls to one function, each carrying its own loop and its own accumulator,
-/// keep their state apart across an update.
+/// keep their state apart across a reload.
 ///
 /// Inlining clones the function body per call site, so both accumulators are the
 /// same source declaration — same spelling, same lexical position, no name of
@@ -1776,10 +1776,10 @@ fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
         "a * 1000 + b\n",
     );
     let v2 = v1.replace("total + step", "total + step * 2");
-    let (reply, out) = stdin_across_update(v1, &v2, "m\nn", "o\np");
+    let (reply, out) = stdin_across_reload(v1, &v2, "m\nn", "o\np");
     assert!(
-        reply.contains("updated"),
-        "the update should be accepted: {reply}"
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
@@ -1789,7 +1789,7 @@ fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
 }
 
 /// Two causally independent transaction groups keep their state apart across an
-/// update that rebuilds one of them.
+/// reload that rebuilds one of them.
 ///
 /// A program has one commit store per causal group, not one commit store, so `x`
 /// and `y` here live in different stores sequenced by the same `Txn` domain, and
@@ -1820,7 +1820,7 @@ fn two_transaction_groups_keep_their_state_apart() {
         vec!["ok\n", "ok\n", "ok\n", "ok\n", "ok\n", "1234", "9"],
     );
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("two-transactions-one-writer-edited", port),
         &no_main,
@@ -1848,7 +1848,7 @@ fn two_transaction_groups_keep_their_state_apart() {
 ///
 /// What this pins is the count, not which version answers: the request is
 /// accepted by the listener and nothing pumps the scheduler until after the
-/// update, so whether the retired version read it before going depends on the
+/// reload, so whether the retired version read it before going depends on the
 /// dispatcher, and either way it must be answered and counted once. A replay
 /// would read `alice` twice, which the second assertion catches.
 ///
@@ -1877,7 +1877,7 @@ fn a_request_that_arrived_before_the_swap_is_answered_after_it() {
     thread::sleep(Duration::from_millis(300));
     assert!(rx.try_recv().is_err(), "no reply before the swap");
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("guestbook-stateless-edit", port),
         &no_main,
@@ -1930,7 +1930,7 @@ fn a_request_that_arrived_before_its_route_was_retired_is_answered() {
     thread::sleep(Duration::from_millis(300));
     assert!(rx.try_recv().is_err(), "no reply before the swap");
 
-    live.update(&mut ctx, &source("guestbook-drops-route", port), &no_main)
+    live.reload(&mut ctx, &source("guestbook-drops-route", port), &no_main)
         .expect("dropping a stateless route is allowed");
 
     let answered = drive_until(&mut ctx, &rx, Duration::from_secs(5));
@@ -1943,7 +1943,7 @@ fn a_request_that_arrived_before_its_route_was_retired_is_answered() {
 
 /// Diffing against a version that stops serving a route leaves the route serving.
 ///
-/// A diff answers a question; only an update changes what the program serves. The
+/// A diff answers a question; only a reload changes what the program serves. The
 /// two compile against the same registry, so the compile that answers the
 /// question must not act on the difference it finds — the route it would retire
 /// belongs to the running program, and its listener is shared.
@@ -1968,7 +1968,7 @@ fn diffing_against_a_version_that_drops_a_route_does_not_retire_it() {
     assert_eq!(
         still_serving,
         vec!["peek\n"],
-        "`/peek` is still the running program's route; only an update retires it",
+        "`/peek` is still the running program's route; only a reload retires it",
     );
 }
 
@@ -2012,7 +2012,7 @@ fn a_port_whose_last_route_goes_is_released() {
         vec!["a\n", "b\n"],
     );
 
-    live.update(&mut ctx, &one_port, &no_main)
+    live.reload(&mut ctx, &one_port, &no_main)
         .expect("dropping routes declares no state, so it is accepted");
 
     // `/c` shared the kept port, so its address is a 404 rather than a refusal:
@@ -2045,10 +2045,10 @@ fn every_offered_phase_is_a_diff_point() {
     }
 }
 
-/// Repeated updates keep working, including switching back to a version that
+/// Repeated reloads keep working, including switching back to a version that
 /// already ran.
 #[test]
-fn a_program_can_be_updated_repeatedly() {
+fn a_program_can_be_reloaded_repeatedly() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
@@ -2056,21 +2056,21 @@ fn a_program_can_be_updated_repeatedly() {
         ("guestbook-stateless-edit", "peek edited\n"),
         ("guestbook", "peek\n"),
         ("guestbook-stateless-edit", "peek edited\n"),
-        // Twice in a row: an update to the version already running is a no-op
+        // Twice in a row: a reload to the version already running is a no-op
         // that must still leave it serving.
         ("guestbook-stateless-edit", "peek edited\n"),
     ] {
-        live.update(&mut ctx, &source(name, port), &no_main)
-            .unwrap_or_else(|e| panic!("update to {name} rejected: {e:?}"));
+        live.reload(&mut ctx, &source(name, port), &no_main)
+            .unwrap_or_else(|e| panic!("reload to {name} rejected: {e:?}"));
         let served = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
-        assert_eq!(served, vec![expected], "after updating to {name}");
+        assert_eq!(served, vec![expected], "after reloading to {name}");
     }
 }
 
-/// A second update does not replay what the first one's version committed.
+/// A second reload does not replay what the first one's version committed.
 ///
 /// The regression this pins: a source's release records were keyed by producer
-/// name and never removed, so the producers an update dropped went on
+/// name and never removed, so the producers a reload dropped went on
 /// constraining the agreement from wherever they stopped. The agreement handed to
 /// the next version's producers was pinned there, and the request the middle
 /// version had committed was offered again — visible here because each `/set`
@@ -2084,16 +2084,16 @@ fn a_program_can_be_updated_repeatedly() {
 /// (`FanHold`). `a_retired_producer_stops_holding_the_agreement` pins the
 /// bookkeeping itself.
 #[test]
-fn a_second_update_does_not_replay_what_the_first_committed() {
+fn a_second_reload_does_not_replay_what_the_first_committed() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("running-log", port));
     let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "1")]);
 
-    live.update(&mut ctx, &source("running-log-writer-edit", port), &no_main)
+    live.reload(&mut ctx, &source("running-log-writer-edit", port), &no_main)
         .expect("editing the writer is allowed");
     let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "2")]);
 
-    live.update(&mut ctx, &source("running-log", port), &no_main)
+    live.reload(&mut ctx, &source("running-log", port), &no_main)
         .expect("editing it back is allowed");
     let after = exchange(&mut ctx, move || {
         vec![http_post(port, "/set", "3"), http_get(port, "/get")]
@@ -2148,7 +2148,7 @@ fn a_transaction_over_a_fixed_collection_does_not_replay() {
         ctx.scheduler().check_for_notifications();
     }
 
-    live.update(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
+    live.reload(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
         .expect("`log` is still declared, at the same type");
     let value = drive_main_to_terminal(&mut ctx, &mut live);
 
@@ -2160,7 +2160,7 @@ fn a_transaction_over_a_fixed_collection_does_not_replay() {
 }
 
 /// Two writers to one transactional variable each keep their own place across an
-/// update.
+/// reload.
 ///
 /// The coverage this adds: every transaction test above has one writer, and the
 /// handover carried a drive's position per *variable*. A store with two writer
@@ -2206,7 +2206,7 @@ fn two_writers_to_one_variable_each_keep_their_place() {
         ctx.scheduler().check_for_notifications();
     }
 
-    live.update(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
+    live.reload(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
         .expect("`log` is still declared, at the same type");
     let value = drive_main_to_terminal(&mut ctx, &mut live);
 
@@ -2225,7 +2225,7 @@ fn two_writers_to_one_variable_each_keep_their_place() {
 /// The regression this pins: the drive named the item it was attempting by its
 /// index among the source's *offered columns* and never released a finished one,
 /// so the source went on offering every request and the replacement's drive
-/// started again from the first. Six commits before the update were committed a
+/// started again from the first. Six commits before the reload were committed a
 /// second time after it, under the new rule — visible here because each append
 /// leaves a mark, and invisible to a last-write-wins variable however deep the
 /// history.
@@ -2243,7 +2243,7 @@ fn a_transaction_writer_does_not_replay_what_it_committed() {
     let logged = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
     assert_eq!(logged, vec!["123456"]);
 
-    live.update(&mut ctx, &source("running-log-writer-edit", port), &no_main)
+    live.reload(&mut ctx, &source("running-log-writer-edit", port), &no_main)
         .expect("editing a transactional writer is a change between existing endpoints");
 
     let after = exchange(&mut ctx, move || {
@@ -2275,7 +2275,7 @@ fn two_loops_may_swap_which_source_they_read() {
     });
     assert_eq!(before, vec!["1\n", "1\n2\n", "9\n"]);
 
-    live.update(&mut ctx, &source("two-loops-swapped", port), &no_main)
+    live.reload(&mut ctx, &source("two-loops-swapped", port), &no_main)
         .expect("both variables are still declared, at the same types");
 
     // `/a` now writes `b` and answers on `a_resps`; `/b` now writes `a`.
@@ -2312,7 +2312,7 @@ fn a_stateless_route_may_gain_a_transactional_writer_over_an_advanced_source() {
     });
     assert_eq!(before, vec!["b\n"; 6], "`/b` answers, and holds nothing");
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("one-transactional-loop-both", port),
         &no_main,
@@ -2360,7 +2360,7 @@ fn two_transactions_may_swap_which_source_they_read() {
         (&"123456".to_string(), &"987654".to_string()),
     );
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("two-transactions-swapped", port),
         &no_main,
@@ -2400,7 +2400,7 @@ fn a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source() {
     });
     assert_eq!(before, vec!["a\n", "q\n"]);
 
-    live.update(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
+    live.reload(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
         .expect("`n` is unchanged and `m` is new");
 
     let after = exchange(&mut ctx, move || {
@@ -2430,7 +2430,7 @@ fn changing_a_declared_init_leaves_a_carried_value_alone() {
     });
     assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("bump-over-source-reseeded", port),
         &no_main,
@@ -2462,7 +2462,7 @@ fn a_variable_that_moves_to_a_fixed_collection_keeps_its_value() {
     });
     assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    live.update(&mut ctx, &source("bump-over-a-fixed-list", port), &no_main)
+    live.reload(&mut ctx, &source("bump-over-a-fixed-list", port), &no_main)
         .expect("`n` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
@@ -2488,7 +2488,7 @@ fn a_fold_over_a_fixed_collection_resumes_where_it_stopped() {
     let before = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
     assert_eq!(before, vec!["yz\n"]);
 
-    live.update(&mut ctx, &source("bump-over-a-marked-list", port), &no_main)
+    live.reload(&mut ctx, &source("bump-over-a-marked-list", port), &no_main)
         .expect("`n` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
@@ -2578,48 +2578,77 @@ fn decided_by_the_new_version(reply: &str) -> Vec<bool> {
     out
 }
 
-/// A fold caught partway resumes at the position it had reached: the elements
-/// below it keep what the retired version decided, and the new rule governs the
-/// rest.
+/// A fold caught partway resumes at the position it had reached, at every cut the
+/// fold admits.
+///
+/// `docs/operational-semantics/semantics.md`, "What a reload computes" gives a
+/// reloaded term's terminal tile as each version restricted to the part of the
+/// extent it decided.
+/// Sweeping the cut pins that equation rather than one instance of it: at every
+/// one, each element is folded exactly once, the retired version decided a prefix,
+/// and the new version decided the rest.
 ///
 /// Drives the program's value directly rather than through a sink, because that
-/// is what makes the position the update lands on nameable: one pull decides one
+/// is what makes the position the reload lands on nameable: one pull decides one
 /// position, so pulling `k` times and then swapping puts the cut at `k - 1`
 /// rather than wherever a socket happened to be serviced.
+///
+/// The sweep reaches both ends. Below two pulls nothing is decided and the new
+/// version governs the whole list; past twenty every position is decided and it
+/// governs none. Those two are the only cuts an unsplittable tiling admits on its
+/// own, and the ones between are reachable because the cut is taken on the fold's
+/// input, whose function tiling denotes a position as a `Domain` guard.
 #[test]
 fn a_fold_interrupted_partway_resumes_at_the_position_it_reached() {
-    const PULLS: usize = 8;
-    let mut ctx = GlobalContext::default();
-    let mut live =
-        LiveProgram::start(&mut ctx, &fold_to_main("n := n + x"), &no_main).expect("compiles");
-    for _ in 0..PULLS {
-        let producer = live
-            .main_producer_mut()
-            .expect("the program's value is `n`");
-        let guard = producer.tiling().universal_guard();
-        let _ = producer.get(guard);
-        ctx.scheduler().check_for_notifications();
+    // One past the twenty elements, so the sweep covers a fold already finished
+    // when the reload arrives.
+    const CUTS: usize = 22;
+    let mut wrong: Vec<String> = Vec::new();
+    for pulls in 0..CUTS {
+        let mut ctx = GlobalContext::default();
+        let mut live =
+            LiveProgram::start(&mut ctx, &fold_to_main("n := n + x"), &no_main).expect("compiles");
+        for _ in 0..pulls {
+            let producer = live
+                .main_producer_mut()
+                .expect("the program's value is `n`");
+            let guard = producer.tiling().universal_guard();
+            let _ = producer.get(guard);
+            ctx.scheduler().check_for_notifications();
+        }
+
+        live.reload(&mut ctx, &fold_to_main(r#"n := n + x + "!""#), &no_main)
+            .expect("`n` is still declared, at the same type");
+
+        let value = drive_main_to_terminal(&mut ctx, &mut live);
+        let decided = decided_by_the_new_version(&value);
+        // `k` pulls decide `k - 1` positions, and a fold whose every position is
+        // decided leaves the new version governing nothing.
+        let decided_before = pulls.saturating_sub(1);
+        let want = (decided_before < 20).then_some(decided_before);
+        let resumed_at = decided.iter().position(|marked| *marked);
+        if decided.len() != 20 {
+            wrong.push(format!(
+                "{pulls} pulls: {} elements, so one was folded twice or not at all: {value}",
+                decided.len()
+            ));
+        } else if resumed_at != want {
+            wrong.push(format!(
+                "{pulls} pulls: cut at {resumed_at:?} rather than {want:?}: {value}"
+            ));
+        } else if !decided[decided_before.min(20)..]
+            .iter()
+            .all(|marked| *marked)
+        {
+            wrong.push(format!(
+                "{pulls} pulls: the new rule governs only part of the suffix: {value}"
+            ));
+        }
     }
-
-    live.update(&mut ctx, &fold_to_main(r#"n := n + x + "!""#), &no_main)
-        .expect("`n` is still declared, at the same type");
-
-    let value = drive_main_to_terminal(&mut ctx, &mut live);
-    let decided = decided_by_the_new_version(&value);
-    assert_eq!(
-        decided.len(),
-        20,
-        "every element is folded exactly once: {value}"
-    );
-    let resumed_at = decided.iter().position(|marked| *marked);
-    assert_eq!(
-        resumed_at,
-        Some(PULLS - 1),
-        "the elements below the frontier are the retired version's, and the rest are the new one's: {value}",
-    );
     assert!(
-        decided[PULLS - 1..].iter().all(|marked| *marked),
-        "the new rule governs every element from the frontier on: {value}",
+        wrong.is_empty(),
+        "the composite is not each version over the part it decided:\n  {}",
+        wrong.join("\n  "),
     );
 }
 
@@ -2653,7 +2682,7 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
         "twenty elements outlast the round that starts them, so the reply is still pending",
     );
 
-    live.update(
+    live.reload(
         &mut ctx,
         &fold_behind_a_route(r#"n := n + x + "!""#, port),
         &no_main,
@@ -2727,7 +2756,7 @@ fn a_filtered_fold_resumes_at_a_position_of_the_collection_it_filters() {
         ctx.scheduler().check_for_notifications();
     }
 
-    live.update(
+    live.reload(
         &mut ctx,
         &filtered_fold_to_main(r#"n := n + x + "!""#),
         &no_main,
@@ -2757,7 +2786,7 @@ fn a_fold_over_another_fixed_collection_starts_it_from_the_beginning() {
     let before = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
     assert_eq!(before, vec!["yz\n"]);
 
-    live.update(
+    live.reload(
         &mut ctx,
         &source("bump-over-another-fixed-list", port),
         &no_main,
@@ -2795,7 +2824,7 @@ fn nested_fold(step: &str) -> String {
     )
 }
 
-/// A variable keeps its value across an update that kept the binding holding
+/// A variable keeps its value across a reload that kept the binding holding
 /// its store.
 ///
 /// The regression this pins: keeping a binding does not walk the bound term, so
@@ -2803,23 +2832,23 @@ fn nested_fold(step: &str) -> String {
 /// the handover. The version after that one had no value to seed the variable
 /// from and reseeded it from the declared init, silently — the one outcome the
 /// state guard exists to prevent, arrived at by way of the guard not seeing the
-/// variable either (`the_state_guard_survives_an_update_that_kept_the_binding`).
+/// variable either (`the_state_guard_survives_a_reload_that_kept_the_binding`).
 ///
-/// The middle update is the whole point. Without it the same edit resumes
+/// The middle reload is the whole point. Without it the same edit resumes
 /// correctly, which `a_fold_over_a_fixed_collection_resumes_where_it_stopped`
 /// already covers.
 #[test]
-fn a_variable_survives_an_update_that_kept_its_binding() {
+fn a_variable_survives_a_reload_that_kept_its_binding() {
     let mut ctx = GlobalContext::default();
     let mut live =
         LiveProgram::start(&mut ctx, &nested_fold("+ \"x\""), &no_main).expect("compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.update(&mut ctx, &nested_fold("+ \"x\""), &no_main)
-        .expect("an update to the running version is a no-op");
+    live.reload(&mut ctx, &nested_fold("+ \"x\""), &no_main)
+        .expect("a reload to the running version is a no-op");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.update(&mut ctx, &nested_fold("+ \"y\""), &no_main)
+    live.reload(&mut ctx, &nested_fold("+ \"y\""), &no_main)
         .expect("`n` is still declared, at the same type");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -2828,21 +2857,21 @@ fn a_variable_survives_an_update_that_kept_its_binding() {
     );
 }
 
-/// The state guard still names a variable whose binding an earlier update
+/// The state guard still names a variable whose binding an earlier reload
 /// kept.
 ///
-/// The other side of `a_variable_survives_an_update_that_kept_its_binding`: a
+/// The other side of `a_variable_survives_a_reload_that_kept_its_binding`: a
 /// variable absent from the handover is one `state_conflicts` does not walk, so
 /// dropping it was accepted rather than refused.
 #[test]
-fn the_state_guard_survives_an_update_that_kept_the_binding() {
+fn the_state_guard_survives_a_reload_that_kept_the_binding() {
     let mut ctx = GlobalContext::default();
     let mut live =
         LiveProgram::start(&mut ctx, &nested_fold("+ \"x\""), &no_main).expect("compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.update(&mut ctx, &nested_fold("+ \"x\""), &no_main)
-        .expect("an update to the running version is a no-op");
+    live.reload(&mut ctx, &nested_fold("+ \"x\""), &no_main)
+        .expect("a reload to the running version is a no-op");
 
     let dropped = indoc! {r#"
         def fold_by(items) => String:
@@ -2852,7 +2881,7 @@ fn the_state_guard_survives_an_update_that_kept_the_binding() {
         a + ""
     "#};
     let err = live
-        .update(&mut ctx, dropped, &no_main)
+        .reload(&mut ctx, dropped, &no_main)
         .err()
         .expect("`n` is no longer declared, so its value has nowhere to be seeded");
     assert!(
@@ -2886,7 +2915,7 @@ fn two_instantiations(order: bool, step_a: &str, step_z: &str) -> String {
     }
 }
 
-/// A stateful loop the update adds ahead of an existing one starts at its init,
+/// A stateful loop the reload adds ahead of an existing one starts at its init,
 /// and the existing one keeps its value.
 ///
 /// The regression this pins: state was addressed by the variable's spelling plus
@@ -2909,12 +2938,12 @@ fn a_loop_added_ahead_of_a_same_spelled_one_starts_at_its_init() {
     let mut live = LiveProgram::start(&mut ctx, only_a, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.update(&mut ctx, &two_instantiations(false, "x", "z"), &no_main)
+    live.reload(&mut ctx, &two_instantiations(false, "x", "z"), &no_main)
         .expect("`a` is unchanged and `z` is new");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
         "xx|zzz",
-        "`a` keeps its value and the loop the update added folds its own list",
+        "`a` keeps its value and the loop the reload added folds its own list",
     );
 }
 
@@ -2931,7 +2960,7 @@ fn reordering_two_same_spelled_variables_keeps_their_state_apart() {
         .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|yyy");
 
-    live.update(&mut ctx, &two_instantiations(false, "X", "Y"), &no_main)
+    live.reload(&mut ctx, &two_instantiations(false, "X", "Y"), &no_main)
         .expect("both are still declared, at the same type");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -2970,10 +2999,10 @@ fn two_instantiations_with_equal_arguments_keep_their_accumulators_apart() {
     let mut live = LiveProgram::start(&mut ctx, &twin("x"), &no_main).expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|xx");
 
-    live.update(&mut ctx, &twin("x"), &no_main)
-        .expect("an update to the running version is a no-op");
+    live.reload(&mut ctx, &twin("x"), &no_main)
+        .expect("a reload to the running version is a no-op");
 
-    live.update(&mut ctx, &twin("y"), &no_main)
+    live.reload(&mut ctx, &twin("y"), &no_main)
         .expect("both are still declared, at the same type");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -3047,7 +3076,7 @@ fn a_variable_may_move_out_of_a_transaction() {
         .expect("a transactional fold compiles");
     drive_two_positions(&mut ctx, &mut live);
 
-    live.update(
+    live.reload(
         &mut ctx,
         &boundary_pair(false, BOUNDARY_ITEMS, "!"),
         &no_main,
@@ -3076,7 +3105,7 @@ fn a_variable_may_move_into_a_transaction() {
     .expect("an induction fold compiles");
     drive_two_positions(&mut ctx, &mut live);
 
-    live.update(
+    live.reload(
         &mut ctx,
         &boundary_pair(true, BOUNDARY_ITEMS, "!"),
         &no_main,
@@ -3104,7 +3133,7 @@ fn a_variable_leaving_a_transaction_for_another_collection_keeps_its_value() {
         .expect("a transactional fold compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "abc");
 
-    live.update(
+    live.reload(
         &mut ctx,
         &boundary_pair(false, r#"["p", "q", "r"]"#, "!"),
         &no_main,
@@ -3188,7 +3217,7 @@ fn swapping_two_anonymous_call_sites_is_refused() {
     .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|zzz");
 
-    let rendered = match live.update(
+    let rendered = match live.reload(
         &mut ctx,
         &anonymous_sites((THREE_ITEMS, "z"), (TWO_ITEMS, "x")),
         &no_main,
@@ -3208,7 +3237,7 @@ fn swapping_two_anonymous_call_sites_is_refused() {
     let served = drive_main_to_terminal(&mut ctx, &mut live);
     assert_eq!(
         served, "xx|zzz",
-        "the refused update left the program running"
+        "the refused reload left the program running"
     );
 }
 
@@ -3243,12 +3272,12 @@ fn inserting_ahead_of_an_anonymous_call_site_is_refused() {
         three = THREE_ITEMS,
     );
     assert!(
-        live.update(&mut ctx, &with_insertion, &no_main).is_err(),
+        live.reload(&mut ctx, &with_insertion, &no_main).is_err(),
         "the insertion shifts both existing declarations",
     );
 }
 
-/// An update that leaves the anonymous call sites where they are is accepted.
+/// A reload that leaves the anonymous call sites where they are is accepted.
 ///
 /// The refusal is about the state moving between two indistinguishable
 /// declarations, not about a program having them: a version that edits one site's
@@ -3269,7 +3298,7 @@ fn editing_anonymous_call_sites_in_place_is_accepted(#[case] first: &str, #[case
     .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|zzz");
 
-    live.update(
+    live.reload(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, first), (THREE_ITEMS, second)),
         &no_main,
@@ -3286,7 +3315,7 @@ fn editing_anonymous_call_sites_in_place_is_accepted(#[case] first: &str, #[case
 ///
 /// Sites that hash equal are the same computation over the same inputs, so their
 /// accumulators hold the same value at every position and which one holds which
-/// does not matter. `site_moved` returns nothing for them and the update is
+/// does not matter. `site_moved` returns nothing for them and the reload is
 /// accepted, which keeps the refusal to the case where it changes an answer.
 #[test]
 fn reordering_two_identical_anonymous_call_sites_is_accepted() {
@@ -3299,7 +3328,7 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
     .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|xx");
 
-    live.update(
+    live.reload(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, "x"), (TWO_ITEMS, "x")),
         &no_main,

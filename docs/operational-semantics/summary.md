@@ -1,7 +1,7 @@
 # Operational Semantics: Overview
 
 See also:
-- [semantics.md](semantics.md) — formal definitions of tilings, guards, and operators
+- [semantics.md](semantics.md) — formal definitions of tilings, guards, operators, and reload
 - [example.md](example.md) — end-to-end worked example
 - [deprecation.md](deprecation.md) — transition from yield guards
 - [src/interpreter/design-operators.md](/src/interpreter/design-operators.md) — per-operator specifications
@@ -45,6 +45,14 @@ independently transformed and combined into the output. Operators can also termi
 producing a terminal output before their input is complete. When consumers release portions of an
 operator's output, the operator may **compact** the released portion into a summary, retaining
 enough information to produce correct future output without keeping the full tile history.
+
+A **reload** replaces a running program's operators with those of a new program while its tiles are
+non-`⊥`. Each term then keeps the tile it holds and combines it with the part of the new version's
+answer that a `split` puts outside it, so what a reload computes depends on the tiles the program
+held when it happened. Three properties make one well defined: every tile the replacement produces
+combines with the tile its term already holds, the guard that `split` needs exists in the term's
+guard algebra, and a rebuilt operator's future output is a function of its seed and its remaining
+input alone.
 
 The three terms to keep distinct:
 

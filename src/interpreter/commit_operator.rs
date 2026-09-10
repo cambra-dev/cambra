@@ -3378,7 +3378,7 @@ impl TileProducer for TransactDriverProducer {
             // just finished has finished too. Releasing it is what makes the
             // source's own release state this drive's progress record, so a
             // replacement drive is offered what this one did not finish and
-            // nothing it did — see `src/ccl/design/live-update.md`, "3. Build the
+            // nothing it did — see `src/ccl/design/hot-reload.md`, "3. Build the
             // rest and wire it to its input".
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(

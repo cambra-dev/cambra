@@ -451,7 +451,7 @@ pub struct Inheritance {
     /// still accumulating into carries none — only the one it hands on.
     ///
     /// A value and nothing else. Where the recurrence had reached is a property
-    /// of the input it was reading rather than of the variable, and the update
+    /// of the input it was reading rather than of the variable, and the reload
     /// carries that input across itself
     /// ([`OpConversionContext::iteration_input`]), so a position travelling here
     /// would be a second, independently-derived answer to a question the graph
@@ -681,10 +681,9 @@ impl OpConversionContext {
     /// Build the store `bound_expr` describes, or keep the one the previous
     /// version built at the node it corresponds to, and register it under `name`.
     ///
-    /// The store-shaped counterpart of [`bind_let`](Self::bind_let), and reuse
-    /// matters more here than anywhere else: the store *is* the program's
-    /// mutable state, so keeping one is what carries an accumulator across an
-    /// update.
+    /// The store-shaped counterpart of [`bind_let`](Self::bind_let). A store holds
+    /// the program's mutable state, so keeping one is what carries an accumulator
+    /// across a reload.
     fn bind_store(
         &mut self,
         name: &Name,
@@ -880,7 +879,7 @@ records one and the only site a `Transact` reaches"
         let node = term.node_id();
         self.reuse.bound += 1;
         // Reading a rebuilt binding makes the progress meaningless: the positions
-        // this got through are positions of something the update replaced.
+        // this got through are positions of something the reload replaced.
         if self.reads_only_kept(term)
             && let Some(kept) = self.keepable(term, true)
         {
@@ -934,7 +933,7 @@ records one and the only site a `Transact` reaches"
     /// for that is what lets an entry carry no list of what sits under it: a list
     /// has to be assembled at every bind site, kept in step with the map, and
     /// re-keyed on the way across, and the omission of any one of those is
-    /// silent until the update after next.
+    /// silent until the reload after next.
     ///
     /// The kept operators are rowed here too, and for the same reason: nothing
     /// mints them, so without a row they reach the `post-conversion` pane
@@ -2693,7 +2692,7 @@ fn induction_extent_is_positional(extent: &Extent) -> bool {
 /// spelling, which is only ever more than one where the source supplies no name
 /// to tell them apart: two anonymous call sites of one stateful function in one
 /// expression. An edit to either body leaves the index alone. Reordering them,
-/// or inserting a third ahead, moves it — and that update is refused rather than
+/// or inserting a third ahead, moves it — and that reload is refused rather than
 /// carried onto the wrong variable, which is [`site_moved`]'s job.
 ///
 /// This is not derived from anything the program computes. Two instantiations of
@@ -2769,18 +2768,18 @@ pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
 /// reordered or one is inserted ahead of another, taking each variable's value
 /// onto its neighbour.
 ///
-/// The site's own content is what catches that. A site whose body an update
+/// The site's own content is what catches that. A site whose body a reload
 /// edited is *gone* from the new version, so its variable stays where the
 /// position puts it and the edit carries as it should. A site still present
 /// under a different variable is the other case: the source has two
 /// interchangeable positions and has moved the state between them, which nothing
-/// here can follow, so the update is refused rather than carried wrong.
+/// here can follow, so the reload is refused rather than carried wrong.
 ///
 /// Two limits, both of which fall back on the position rather than misreporting:
 ///
 /// - Sites that hash equal are the same computation reading the same spellings,
 ///   so which of them holds which value does not matter. This returns `None` for
-///   them, and the update is accepted.
+///   them, and the reload is accepted.
 /// - A reorder that also edits both bodies leaves neither site present, so it
 ///   reads as two edits and the position decides. That is the one shape this does
 ///   not address.
@@ -2828,7 +2827,7 @@ struct MutableVariable<'e> {
     declared_by: NodeId,
     /// That node's [`content_hash`] — free variables by spelling, so the same
     /// site hashes the same in either version. Not an identity: a site whose body
-    /// an update edits hashes differently, which is why the chain and the index
+    /// a reload edits hashes differently, which is why the chain and the index
     /// name a variable and this only says whether two versions' sites are the
     /// same one. See [`site_moved`].
     site: ContentHash,

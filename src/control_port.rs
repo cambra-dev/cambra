@@ -5,7 +5,7 @@
 //!
 //! - `/diff` — how the new version differs from the running one, rendered as an
 //!   annotated tree. Answers the question without changing anything.
-//! - `/update` — replace the running program with the new version.
+//! - `/reload` — replace the running program with the new version.
 //!
 //! The source may be the whole query string, percent-decoded, or a `POST` body.
 //! The query form is percent-encoded rather than form-encoded: `+` stands for
@@ -36,7 +36,7 @@ pub enum ControlRequest {
     /// Report how `code` differs from the running program, comparing at `phase`.
     Diff { code: String, phase: Phase },
     /// Replace the running program with `code`.
-    Update { code: String },
+    Reload { code: String },
 }
 
 /// The answer to one [`ControlRequest`], as an HTTP status and a plain-text body.
@@ -228,7 +228,7 @@ fn split_url(url: &str) -> (&str, &str) {
 /// reply to send when it is not one.
 fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> {
     let (path, query) = split_url(url);
-    // Only `/diff` takes a phase, so only `/diff` peels one. On `/update` a
+    // Only `/diff` takes a phase, so only `/diff` peels one. On `/reload` a
     // leading `phase=` is the program's own first characters.
     let (phase_name, rest) = if path == "/diff" {
         split_phase_param(query)
@@ -258,13 +258,13 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
             require_code(&code)?;
             Ok(ControlRequest::Diff { code, phase })
         }
-        "/update" => {
+        "/reload" => {
             require_code(&code)?;
-            Ok(ControlRequest::Update { code })
+            Ok(ControlRequest::Reload { code })
         }
         _ => Err(ControlReply {
             status: 404,
-            body: "endpoints: /diff?<source>, /update?<source>\n".to_string(),
+            body: "endpoints: /diff?<source>, /reload?<source>\n".to_string(),
         }),
     }
 }
@@ -353,7 +353,7 @@ mod tests {
     fn diff_of(url: &str) -> (String, Phase) {
         match parse_request(url, "").expect("parses") {
             ControlRequest::Diff { code, phase } => (code, phase),
-            ControlRequest::Update { .. } => panic!("expected a diff request"),
+            ControlRequest::Reload { .. } => panic!("expected a diff request"),
         }
     }
 
@@ -396,13 +396,13 @@ mod tests {
         assert_eq!(phase, DEFAULT_PHASE);
     }
 
-    /// `/update` takes no phase, so a leading `phase=` there is source.
+    /// `/reload` takes no phase, so a leading `phase=` there is source.
     #[test]
-    fn update_does_not_peel_a_phase() {
-        let request = parse_request("/update?phase=1; phase", "").expect("parses");
+    fn reload_does_not_peel_a_phase() {
+        let request = parse_request("/reload?phase=1; phase", "").expect("parses");
         match request {
-            ControlRequest::Update { code } => assert_eq!(code, "phase=1; phase"),
-            ControlRequest::Diff { .. } => panic!("expected an update request"),
+            ControlRequest::Reload { code } => assert_eq!(code, "phase=1; phase"),
+            ControlRequest::Diff { .. } => panic!("expected a reload request"),
         }
     }
 
@@ -414,10 +414,10 @@ mod tests {
 
     #[test]
     fn a_body_supplies_the_source_when_the_query_does_not() {
-        let request = parse_request("/update", "y = 2; y").expect("parses");
+        let request = parse_request("/reload", "y = 2; y").expect("parses");
         match request {
-            ControlRequest::Update { code } => assert_eq!(code, "y = 2; y"),
-            ControlRequest::Diff { .. } => panic!("expected an update request"),
+            ControlRequest::Reload { code } => assert_eq!(code, "y = 2; y"),
+            ControlRequest::Diff { .. } => panic!("expected a reload request"),
         }
     }
 
@@ -441,7 +441,7 @@ mod tests {
         let (tx, rx) = sync_channel::<ControlReply>(0);
         let waiter = thread::spawn(move || rx.recv().expect("a reply").status);
         drop(ControlMessage {
-            request: ControlRequest::Update {
+            request: ControlRequest::Reload {
                 code: "x".to_string(),
             },
             reply: Some(tx),

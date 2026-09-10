@@ -80,7 +80,7 @@ impl ProducerReleases {
     /// now on.
     ///
     /// Called when a running program is replaced
-    /// ([`LiveProgram::update`](crate::live_program::LiveProgram::update)). The
+    /// ([`LiveProgram::reload`](crate::live_program::LiveProgram::reload)). The
     /// operators the replacement rebuilds register as new producers, and a source
     /// hands a newly-registered one everything it has retained, so without this
     /// the replacement recomputes the program's history instead of continuing it

@@ -289,7 +289,7 @@ pub trait DataSourceDomainExtentImpl {
     /// oldest value it still holds.
     ///
     /// Called when a running program is replaced
-    /// ([`LiveProgram::update`](crate::live_program::LiveProgram::update)). The
+    /// ([`LiveProgram::reload`](crate::live_program::LiveProgram::reload)). The
     /// operators the replacement rebuilds register as new producers, and a source
     /// hands a newly-registered one everything it has retained, so without this
     /// the replacement recomputes the program's history instead of continuing it
@@ -337,7 +337,7 @@ pub trait DataSourceDomainExtentImpl {
     ///
     /// Called when the endpoint behind the source is retired
     /// ([`SourceSinkRegistry::retire_routes_absent_from`](crate::ccl::context::SourceSinkRegistry))
-    /// — see `src/ccl/design/live-update.md`, "A route a version stops serving is retired".
+    /// — see `src/ccl/design/hot-reload.md`, "A route a version stops serving is retired".
     /// A request that arrived before the retirement has no version left to
     /// compute its reply, and the source holding it is kept alive past the route
     /// by the handover a retired version's operators sit in, so nothing else ends
@@ -360,7 +360,7 @@ pub trait DataSourceDomainExtentImpl {
     /// requests it answered two versions ago.
     ///
     /// Called from the producer's own `Drop`, so the record lasts exactly as long
-    /// as the producer does. An operator carried across an update keeps its
+    /// as the producer does. An operator carried across a reload keeps its
     /// producer and so keeps its record, which is what stops the source dropping
     /// data that operator has not finished with.
     ///

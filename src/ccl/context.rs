@@ -363,7 +363,7 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
     }
 }
 
-/// The live-update surface a caller of [`GlobalContext::reuse`] and
+/// The hot-reload surface a caller of [`GlobalContext::reuse`] and
 /// [`GlobalContext::state_conflicts`] reads their answers as. Both are produced
 /// by operator conversion and returned from here, so this is the path a consumer
 /// of the compilation API imports them by.
@@ -2269,7 +2269,7 @@ fn compile_version(
             // already available when a version is installed needs a notification
             // of its own. A first compile is carried by the source reporting its
             // data as new; a *replacement* is not, because the version it replaces
-            // has already taken that report, so without this an update lands with
+            // has already taken that report, so without this a reload lands with
             // unfinished work and nothing pulls it until the next arrival.
             consumer_rc.borrow_mut().notify();
             outputs.push(CompiledOutput {

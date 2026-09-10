@@ -462,3 +462,116 @@ would use a different, less aggressive compaction strategy.
 
 This is exactly what database vacuum does: old row versions are reclaimed once no active
 transaction can read them, i.e., once all consumers have released their interest.
+
+---
+
+## 4. Reload
+
+A **reload** replaces the operators of a running program `P₁` with those of a new program `P₂`
+while the tiles of `P₁` are non-`⊥`. Sections 1–3 give a running program's state as one tile per
+term. This section says which tile each term of `P₂` starts from, what the composite computes, and
+what must hold for the answer to be defined.
+
+The model is stated per term, so it presupposes a **correspondence**: a partial injection from the
+terms of `P₁` to the terms of `P₂` pairing terms that compute the same function.
+[hot-reload.md](/src/ccl/design/hot-reload.md) derives one structurally and specifies which of a
+program's terms it covers. A term of `P₂` with no correspondent starts at `⊥`.
+
+### What a reload computes
+
+Fix a term the correspondence pairs across the two programs, of type `T`, computed by an operator
+correct for `f₁` in `P₁` and for `f₂` in `P₂`. Let `y₁` be the tile that term holds at the moment
+of the reload.
+
+Separating what `P₁` decided from what `P₂` will decide is a `split`, so it needs a guard. Write
+`g₁` for one with `y₁ ∈ g₁` that satisfies `split(y₁ ⊕ h, g₁) = (y₁, h)` for every `h` the
+replacement produces. Property 2 below is that the guard algebra has such a guard. Given it, the
+reloaded term's terminal tile, when it is reached, is
+
+```
+y₁  ⊕  split(inject(f₂), g₁).outside
+```
+
+The first operand is what `P₁` produced and the second is the part of `P₂`'s own answer lying
+outside it. Under `n` reloads the equation composes: the tile carried into version `i` stands where
+`y₁` stands, and the guard denoting everything decided before it stands where `g₁` does, so each
+version contributes the part of its answer inside what it decided and outside what its predecessors
+had. Property 1 makes those contributions pairwise compatible, so no part of the terminal tile is
+contributed twice. "Each part of the answer is decided once, by whichever version was running when
+it was determined" is that equation, not a separate claim about reloads.
+
+The equation is about an operator that streams. A homomorphism's output is the image of the input
+it has seen (Section 3), so `y₁` is `split(inject(f₁), g₁).inside` — what `f₁` itself says about
+the part `P₁` decided. An operator that is monotone without being a homomorphism carries no such
+commitment: the operator contract binds it only at terminal input, and a re-applied
+early-terminating operator replaces its output rather than combining into it. Such a term is either
+kept with its tile whole or rebuilt from `⊥`.
+
+The composite is correct for neither `f₁` nor `f₂`. It is correct for a function assembled from
+both, and which one that is depends on `y₁` — the runtime state at the swap, not a property of
+either program. A reload is therefore quantified by the tiles its program holds when it happens,
+and one edit applied at two moments with different `y₁` computes two different functions.
+
+### Integrity properties
+
+**1. Compatibility.** Every tile the replacement produces for a term combines with the tile that
+term already holds. `⊕` is partial (Section 1), so this is a requirement and not a consequence: a
+replacement that re-offers information the term holds asks for a combination the algebra does not
+define.
+
+What that forbids is per tiling, and the instances of Section 1 say it. On a function tiling
+`f ⊕ g` is defined iff the domains are disjoint, so the replacement is confined to a `Domain` guard
+disjoint from what was delivered, which is what registering the new subscription's intent guard at
+the input's released frontier achieves. On a scalar tiling `x ⊕ y` is defined iff one of them is
+`⊥`, so a decided scalar admits no revision. On `Count_N × Sum` it is defined iff `n₁ + n₂ ≤ N`, so
+a fold that consumed its whole input admits no further tile at all: a rebuilt iteration offering
+that input again from `0` takes the count past `N` on its first increment.
+
+**2. Boundary expressibility.** The guard `g₁` above must exist in the term's own guard algebra.
+`split` is the only operation that separates what one version decided from what the next will
+(Section 2), so a boundary the algebra cannot denote cannot be taken there.
+
+Section 2's classification then says where a boundary can be taken at all. A term whose tiling is
+unsplittable offers only `nothing` and `everything`, and neither is a `g₁` for a tile that is
+neither `⊥` nor terminal: `split(t, everything)` leaves the replacement nothing to contribute, and
+`split(t, nothing)` claims the term decided nothing. So a partly-grown unsplittable tile has no
+boundary of its own, and the reload takes one on the term's **input** instead while that tile
+travels whole. An aggregate is the case in hand — a fold caught partway cannot be divided at the
+point it reached, and it is reloadable because its input is function-tiled and denotes that point,
+while the accumulator itself is carried and re-seeded (property 3). A value and a position are
+carried by separate mechanisms for this reason: a value is an unsplittable tile that has to travel,
+and a position is a guard on a tiling that can express one.
+
+**3. Seed sufficiency.** A rebuilt operator starts at `⊥`, and the composite equation asks its term
+to end up holding `y₁` as well as what the replacement contributes. Where a `g₁` exists, nothing
+has to travel: `y₁` is already in the term's tile, the rebuilt operator's input is confined to the
+complement, and `⊕` combines the two. Where no `g₁` exists — the tiling is unsplittable, by
+property 2 — the rebuilt operator is **seeded** with a tile summarizing what it did not see, and
+its future output must be a function of that seed and its remaining input alone.
+
+That is compaction's semantic sufficiency (Section 3) with the seed standing where
+`compact(obsolete)` stands. For an aggregate the seed is the retired operator's tile unchanged, so
+the compact map is the identity and the condition reduces to the operator being a homomorphism over
+its input, which `sum` and `max` are. The compact-map requirements otherwise transfer unaltered: a
+seed is a homomorphic image of what it summarizes, it is `⊥` only for `⊥`, and it is terminal
+exactly when the summarized tile was. A tile of a different tiling satisfies none of them, which is
+why a reload that changes a stateful term's type is refused rather than reseeded.
+
+**Corollary — no retraction.** A tile carried across a reload only grows. Positivity (Section 1)
+makes `⊕` add information only, so compatibility gives this for every term whose tile is carried,
+and a consumer of one never sees progress it was given taken away. A term whose tile is not carried
+restarts from `⊥`, and every consumer of it is rebuilt along with it, so nothing observes the drop.
+
+### What the properties do not settle
+
+Two things about a reload are outside this model, and the mechanism decides both.
+
+**Which terms correspond.** The correspondence is an input here. Two programs can agree on every
+tiling and still admit several injections between their terms, and the choice decides which tile
+each seed carries. [hot-reload.md](/src/ccl/design/hot-reload.md) specifies the one the compiler
+takes and what it refuses where the source does not determine it.
+
+**When the boundary is taken.** `y₁` is whatever the term held at the instant the swap ran.
+Nothing here constrains that instant, so a reload is reproducible only against a stated schedule of
+pulls, which is what makes a reload over an unbounded source a different observation each time it
+is performed.

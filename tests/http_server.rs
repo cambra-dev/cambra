@@ -398,7 +398,7 @@ fn test_http_serve_wrong_path_gets_404() {
 /// accepts without replying, where pumping a compiled program's scheduler
 /// answers a one-step route outright.
 /// `a_request_that_arrived_before_its_route_was_retired_is_answered` covers the
-/// other stage, a request still in the channel, through a real update.
+/// other stage, a request still in the channel, through a real reload.
 #[test]
 fn a_retired_route_answers_a_request_it_had_accepted() {
     let port = reserve_test_port();

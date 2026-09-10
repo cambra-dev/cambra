@@ -33,7 +33,7 @@ CHL source
 | [collections.md](collections.md) | Collections as data functions `𝐷 ⤇ 𝑉`: the five surface types as domain shapes, the referenceable opaque domain (Σ-witness activation) behind maps/sets and runtime-length lists, membership-discharge lookup, keyed feeds, and mutable collections. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Phase` identity primitives, the `ProvenanceTable` model and its fold, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
 | [diffing.md](diffing.md) | Program diffing: α-invariant content addressing of CCL terms and the GumTree correspondence between two compiled programs. |
-| [live-update.md](live-update.md) | Replacing a running program with a new version: the endpoint set a version inherits, operator reuse keyed by the node a structural diff pairs each of the new version's nodes with, and the weak subscriptions that let one graph be swapped for another. |
+| [hot-reload.md](hot-reload.md) | Replacing a running program with a new version: the endpoint set a version inherits, operator reuse keyed by the node a structural diff pairs each of the new version's nodes with, and the weak subscriptions that let one graph be swapped for another. |
 
 Provenance is the one cross-cutting concern in the table: every pass above both
 preserves node identity and records what it rewrote, so

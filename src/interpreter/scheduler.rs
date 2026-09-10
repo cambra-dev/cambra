@@ -139,7 +139,7 @@ other's subscribers",
             .values_mut()
             .for_each(|(source, consumers)| {
                 // Prune first, so a source whose every subscriber is gone stops
-                // accumulating dead registrations across program updates.
+                // accumulating dead registrations across program reloads.
                 consumers.retain(|c| c.strong_count() > 0);
                 if source.borrow_mut().check_for_new_data() {
                     for consumer in consumers.iter().filter_map(Weak::upgrade) {

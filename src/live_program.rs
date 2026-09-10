@@ -4,12 +4,12 @@
 //! another. The new version inherits the running one's sources and sinks and
 //! whichever of its operators compute the same thing; everything else is rebuilt.
 //!
-//! # What an update may change
+//! # What a reload may change
 //!
 //! Its logic freely, and its sources and sinks by addition: a version may open a
 //! source or a sink the running program does not have and serves it as soon as
 //! the swap completes, and one it stops serving is retired. What it may not do is
-//! break the continuity of state — see [`update`](LiveProgram::update).
+//! break the continuity of state — see [`reload`](LiveProgram::reload).
 //!
 //! # What survives it
 //!
@@ -19,18 +19,18 @@
 //! ([`diff`](crate::ccl::diff::diff)) says which node of the new tree stands
 //! where each node of the old one did, and conversion keeps the operator
 //! recorded at a corresponding node rather than building a second one — so an
-//! accumulator the update did not touch keeps its accumulation, and a fold
+//! accumulator the reload did not touch keeps its accumulation, and a fold
 //! partway through a collection keeps its place. Reuse is hereditary: an
 //! operator is kept only when every binding it reads was kept too, so a
-//! carried-forward operator is never left reading a subgraph the update rebuilt.
+//! carried-forward operator is never left reading a subgraph the reload rebuilt.
 //!
 //! A variable keeps its value even where its logic was edited. Its store is
 //! rebuilt, and each variable it still declares is seeded from what the retired
 //! version left it holding, so the new rule governs from the swap onwards without
-//! discarding what came before. Neither how much an update reuses nor what it
-//! carries depends on how many updates preceded it: a kept binding hands on
+//! discarding what came before. Neither how much a reload reuses nor what it
+//! carries depends on how many reloads preceded it: a kept binding hands on
 //! everything recorded under it, which is what keeps a variable declared inside a
-//! function body carried across an update that rebuilt nothing around it.
+//! function body carried across a reload that rebuilt nothing around it.
 //!
 //! A binding compiled under an iteration is rebuilt regardless. Its operator is
 //! parameterized by an iteration input that is not part of the term, so the term
@@ -63,8 +63,8 @@ pub struct LiveProgram {
     main_producer: Option<Box<dyn TileProducer>>,
 }
 
-/// What one accepted [`LiveProgram::update`] did.
-pub struct UpdateReport {
+/// What one accepted [`LiveProgram::reload`] did.
+pub struct ReloadReport {
     /// The rendered difference between the two versions.
     pub diff: String,
     /// How much of the replaced version's graph the new one kept.
@@ -176,8 +176,8 @@ impl LiveProgram {
     /// The guard's tree is compiled separately from the one that gets built.
     /// `run_frontend` goes from source to a stop phase and nothing continues a
     /// stopped tree into operator conversion, so checking before tearing down
-    /// means compiling twice — see `src/ccl/design/live-update.md`, "Order of an
-    /// update".
+    /// means compiling twice — see `src/ccl/design/hot-reload.md`, "Order of a
+    /// reload".
     ///
     /// # Panics
     ///
@@ -187,12 +187,12 @@ impl LiveProgram {
     /// disagreement is a compiler bug — and one that has already taken the
     /// program down, which is not a state to hand back to a caller as a
     /// rejection.
-    pub fn update(
+    pub fn reload(
         &mut self,
         ctx: &mut GlobalContext,
         code: &str,
         main_consumer: MainConsumerFactory<'_>,
-    ) -> Result<UpdateReport, Vec<CompileError>> {
+    ) -> Result<ReloadReport, Vec<CompileError>> {
         let diff = self.diff_against(ctx, code, Phase::AsOfRead)?;
         // This compile opens the endpoints the new version adds and keeps them,
         // because binding is the one step it and the compile that installs the
@@ -221,7 +221,7 @@ impl LiveProgram {
                 .any(|c| matches!(c, StateConflict::Moved { .. }))
             {
                 "\nBind each of those declarations to its own name — `a = f(…)` rather than a \
-                 bare `f(…)` — and an update can follow them wherever they move."
+                 bare `f(…)` — and a reload can follow them wherever they move."
             } else {
                 ""
             };
@@ -245,7 +245,7 @@ may move between loops.{remedy}",
                 .expect("a version that compiled to Planned must compile to operators"),
         );
         *self = next;
-        Ok(UpdateReport {
+        Ok(ReloadReport {
             diff,
             reuse: ctx.reuse(),
         })

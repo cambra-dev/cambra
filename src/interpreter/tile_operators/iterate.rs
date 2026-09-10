@@ -153,7 +153,7 @@ struct IterateExtentProducer {
     /// a `Weak` to it.
     ///
     /// Owning it here ties the registration's lifetime to the producer's: a
-    /// producer carried across a program update keeps waking, and one the update
+    /// producer carried across a program reload keeps waking, and one the reload
     /// dropped is pruned on the next
     /// [`check_for_notifications`](Scheduler::check_for_notifications).
     /// `None` when the extent needs no source subscription.
@@ -361,8 +361,8 @@ impl Drop for IterateExtentProducer {
     /// every version reading it, and its release agreement is an intersection
     /// over the records it holds, so one left behind pins that agreement where a
     /// dropped producer stopped. Dropping it here rather than at the version
-    /// handover is what distinguishes the two cases — an operator the update
-    /// rebuilt goes and takes its record with it, and one the update carried
+    /// handover is what distinguishes the two cases — an operator the reload
+    /// rebuilt goes and takes its record with it, and one the reload carried
     /// forward keeps both, which is what stops the source dropping data that
     /// operator has not finished with.
     fn drop(&mut self) {

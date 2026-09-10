@@ -485,7 +485,7 @@ mod tests {
     /// A producer that is gone stops constraining the agreement.
     ///
     /// The regression this pins: a record was keyed by producer name and never
-    /// removed, so a producer an update dropped held the agreement at wherever it
+    /// removed, so a producer a reload dropped held the agreement at wherever it
     /// stopped — the buffer could free nothing above that, and every later
     /// producer was handed a starting point below what its predecessor had
     /// already handled.
@@ -496,7 +496,7 @@ mod tests {
         buf.release("p1", covering(0, 2));
         buf.releases.carry_to_new_producers();
 
-        // The update drops `p1`'s operator, so its producer hands the record back.
+        // The reload drops `p1`'s operator, so its producer hands the record back.
         buf.releases.retire("p1");
         buf.release("p2", Predicate::False);
         buf.push(SmolStr::new("e3"));

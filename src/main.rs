@@ -35,7 +35,7 @@ fn snapshot(live: &LiveProgram, inspector: Option<&WebInspector>, tick: u64) {
 
 /// Service at most one pending control request.
 ///
-/// One request per call rather than draining the queue: an accepted `/update`
+/// One request per call rather than draining the queue: an accepted `/reload`
 /// replaces the program, so the requests behind it would be answered against a
 /// version that no longer exists.
 fn poll_control(
@@ -52,14 +52,14 @@ fn poll_control(
             Ok(rendered) => ControlReply::ok(rendered),
             Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
         },
-        ControlRequest::Update { code } => match live.update(ctx, code, main_consumer) {
+        ControlRequest::Reload { code } => match live.reload(ctx, code, main_consumer) {
             Ok(report) => {
                 // The new graph has subscribed but nothing has pulled it, so arm
                 // the driver for one pass.
                 *new_data.borrow_mut() = true;
                 let ReuseTally { kept, bound } = report.reuse;
                 ControlReply::ok(format!(
-                    "updated: {kept}/{bound} operators kept\n\n{}",
+                    "reloaded: {kept}/{bound} operators kept\n\n{}",
                     report.diff
                 ))
             }
@@ -142,7 +142,7 @@ fn run_program(
         }
         *new_data.borrow_mut() = false;
 
-        // Re-read the producer each pass: an update between ticks replaces it.
+        // Re-read the producer each pass: a reload between ticks replaces it.
         let Some(producer) = live.main_producer_mut() else {
             break;
         };
@@ -218,7 +218,7 @@ const DEFAULT_CONTROL_PORT: u16 = 8081;
 enum Mode {
     /// Run the program. With an inspect port, attach [`WebInspector`]'s live
     /// runtime dashboard to the run; with a control port, accept `/diff` and
-    /// `/update` against the running program.
+    /// `/reload` against the running program.
     Run {
         inspect_port: Option<u16>,
         control_port: Option<u16>,

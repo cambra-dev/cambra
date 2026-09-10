@@ -59,10 +59,14 @@ Concretely:
   emit a different value at `d` later.  Recomputing because "the
   upstream changed" is not a thing — upstream tiles only grow.
 - `Tile::merge` is `⊕` from the semantics: it combines disjoint
-  information.  Merging the same position twice with different values
-  is a bug.  Merging the same position with the *same* value is
-  allowed if you can't easily avoid it (idempotent), but prefer
-  releasing before re-emitting if you find yourself doing this.
+  information.  Merging a position the tile already holds is a bug
+  whether or not the value matches, and `merge` closes with a
+  `debug_assert!` on `validate_tile` that rejects it for every shape
+  that can see it — a duplicate domain entry in a function tile, a
+  repeated commit tick in a store's changelog.  Release before
+  re-emitting.  A tile's join-shaped components combine idempotently
+  and that is `∨`, not `⊕`: a store's frontier, its terminality and
+  its closed keys, and a `Max` or `Drain` accumulator.
 - `release` is the *only* operation that shrinks a tile.  It removes
   data from the producer's view (and the consumer's), but the
   consumer has already extracted whatever value it needed before

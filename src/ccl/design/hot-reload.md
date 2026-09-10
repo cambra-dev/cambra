@@ -1,10 +1,14 @@
-# Live update: replacing a running program
+# Hot reload: replacing a running program
 
 `--control` (default 8081) serves two endpoints against a running program. `/diff` reports how a new
 version of the source differs from the running one, at a pipeline phase the caller names, and
-changes nothing. `/update` replaces the program with that version: the endpoints stay bound, every
+changes nothing. `/reload` replaces the program with that version: the endpoints stay bound, every
 operator whose computation is unchanged is kept along with what it has accumulated, and every
 mutable variable the new version still declares is seeded with the value it was holding.
+
+What a reload means, and the three properties that make one well defined, are
+[Reload](/docs/operational-semantics/semantics.md#4-reload) in the operational semantics. This doc
+is the mechanism that realizes them.
 
 Three questions decide the design:
 
@@ -12,24 +16,24 @@ Three questions decide the design:
   version may declare a variable the running program does not have, and it starts at its init.
 - **What may not.** The continuity of a value that already exists. A variable the running program
   holds a value for must be one the new version still declares, at the same type, and one the source
-  tells apart from its siblings; otherwise the update is refused and the running program is left
+  tells apart from its siblings; otherwise the reload is refused and the running program is left
   serving. See [The one guard](#the-one-guard-a-version-must-be-able-to-take-over-the-state).
 - **What survives.** Every `Let` binding, `Transact` store and iteration input whose computation is
   unchanged, and every variable's value whether or not its store was rebuilt.
 
-The entry point is `LiveProgram::update` in `src/live_program.rs`. Computing the difference between
-two programs is [diffing.md](diffing.md); this doc covers what an update does with it.
+The entry point is `LiveProgram::reload` in `src/live_program.rs`. Computing the difference between
+two programs is [diffing.md](diffing.md); this doc covers what a reload does with it.
 
-## How an update works
+## How a reload works
 
-An update drops the running version's subscriptions and then builds the replacement's, so one
+A reload drops the running version's subscriptions and then builds the replacement's, so one
 version's graph is subscribed at a time and nothing observes a half-swapped one. The swap sits
-between two pulls: the driver services the control port between them, and `LiveProgram::update`
+between two pulls: the driver services the control port between them, and `LiveProgram::reload`
 takes `&mut self`. What crosses the swap is what the teardown does not reach — the process and its
 listeners, the requests buffered behind a route, every mutable variable's value, and the operators
 the handover holds.
 
-Building the replacement is three steps. [Order of an update](#order-of-an-update) is the full
+Building the replacement is three steps. [Order of a reload](#order-of-a-reload) is the full
 sequence, including the guard and the endpoint bookkeeping either side of these.
 
 ### 1. Say which nodes of the two programs correspond
@@ -61,15 +65,19 @@ A fan-out is what carries a producer across a version, and it is the only thing 
 the producer it subscribed and re-points the notification to the new version's branch, whereas a
 producer's consumer is fixed at `TileOperator::subscribe` — one lifted out of a retired graph would
 go on waking a consumer that no longer exists. So an operator is reusable only where a fan-out
-already sits, which is what decides the three places above: [What an update does not
-do](#what-an-update-does-not-do) says why they are not everywhere.
+already sits, which is what decides the three places above: [What a reload does not
+do](#what-a-reload-does-not-do) says why they are not everywhere.
 
 Keeping an operator keeps the whole subgraph under it, including its stores and their accumulated
 values. Two conditions bound that: every binding the term reads must have been kept too ([Reuse is
 hereditary](#reuse-is-hereditary)), and the operator must not have been released in full by its
 subscribers, since it can then only answer empty (`OpConversionContext::keepable`). An iteration
-input is the exception to the second — released in full is what a finished collection looks like,
-and a fold that reached the end of its list is meant to read nothing further.
+input is the exception to the second, and it is kept for its position rather than for its data.
+`FanOut::released_position` is where a drive reads how far the fold got, so keeping a
+released-in-full iteration is what says the fold is finished and leaves the replacement asking for
+nothing. Building a fresh one instead offers every position of the collection again and folds the
+whole list onto the carried value
+(`a_fold_over_a_fixed_collection_resumes_where_it_stopped`).
 
 ### 3. Build the rest and wire it to its input
 
@@ -91,7 +99,7 @@ Two things a subscription cannot supply have to be computed and handed to the op
   under the variable's `VarPath`.
 - **The position a rebuilt recurrence starts at.** This is derived from the input rather than
   carried, but a store and a drive are told it at construction rather than discovering it: one past
-  `FanOut::released_position` for an iteration the update kept, `first_position_for_a_new_producer`
+  `FanOut::released_position` for an iteration the reload kept, `first_position_for_a_new_producer`
   for one built fresh over a source, and `0` for one over a collection.
 
 [Rebuilding a store resumes it](#rebuilding-a-store-resumes-it) is both of those in full.
@@ -105,14 +113,14 @@ Where each part of a program stands after a swap:
 | A rebuilt map or feed over a source | What the source's retired producers released | `carry_release_to_new_producers` |
 | A rebuilt recurrence over a kept iteration | One past what that iteration's readers released | `FanOut::released_position` |
 | A rebuilt recurrence over a rebuilt iteration | Where that iteration begins — a source's carried release, or `0` for a collection | `first_position_for_a_new_producer` |
-| A transaction writer's drive | Its writer's iteration input where the update kept it, and `0` over a rebuilt one | Absolute item positions, released on the commit-ack |
+| A transaction writer's drive | Its writer's iteration input where the reload kept it, and `0` over a rebuilt one | Absolute item positions, released on the commit-ack |
 | A rebuilt store's commit clock | `0`, seeded from the carried value | Private and restartable |
 | A route, its listener, and the requests behind it | Where they were, while any version still binds a route on the port | `SourceSinkRegistry` |
 
 ## Reuse is hereditary
 
 An operator is kept only when every binding its term reads was kept too, so a carried-forward
-operator is never left reading a subgraph the update rebuilt. The correspondence cannot answer this
+operator is never left reading a subgraph the reload rebuilt. The correspondence cannot answer this
 on its own — `content_hash` matches a term's free variables by spelling, so an unchanged term can
 read a binding that changed. `OpConversionContext::rebuilt` records the bindings this compilation
 built, and `reads_only_kept` declines any term with a free name among them (`ccl_utils::free_names`,
@@ -120,11 +128,11 @@ which counts occurrences inside refinement predicates as well as in the term). B
 dependency order, so the check is transitive: a binding that reads a rebuilt one is itself recorded
 as rebuilt.
 
-How much an update reuses does not depend on how many updates preceded it. The correspondence
+How much a reload reuses does not depend on how many reloads preceded it. The correspondence
 relates this version's tree to the running version's tree, and neither is derived from how those
-trees were built, so an unchanged part of a program is recognized on the first update.
-`reuse_does_not_depend_on_how_many_updates_came_before` pins that, comparing one edit applied
-directly against the same edit applied after a no-op update.
+trees were built, so an unchanged part of a program is recognized on the first reload.
+`reuse_does_not_depend_on_how_many_reloads_came_before` pins that, comparing one edit applied
+directly against the same edit applied after a no-op reload.
 
 That test is also what catches a kept region losing what it holds. Keeping a region does not walk
 into it, so nothing inside reaches `bind_let`, `bind_store` or `iteration_input` to be recorded, and
@@ -138,7 +146,7 @@ A program's mutable variables live in a `Transact` store bound to `__hist`, and 
 a projection `__hist.k` off that binding, where `k` is the variable's own spelling. The store is
 bound by `OpConversionContext::bind_store` on the same terms as any other binding: it is keyed by
 the node of its `Transact` term, and a corresponding one is kept whole. Keeping a store is what
-carries an accumulator across an update, because the store is where the accumulation lives.
+carries an accumulator across a reload, because the store is where the accumulation lives.
 
 One store covers one causal group, so an edit anywhere in a group rebuilds that group's store; two
 independent mutable variables get two stores and are independently reusable.
@@ -147,11 +155,11 @@ independent mutable variables get two stores and are independently reusable.
 
 A store below a kept binding is handed on rather than bound again, by that same walk. Without it a
 store declared inside a function body — where the `Transact` sits under the `Let` binding the call's
-result, rather than at the top of the binding chain — leaves the handover on the first update that
-keeps its binding, and the next update reseeds its variable from the declared init while the guard,
+result, rather than at the top of the binding chain — leaves the handover on the first reload that
+keeps its binding, and the next reload reseeds its variable from the declared init while the guard,
 reading the same map, no longer refuses dropping it.
-`a_variable_survives_an_update_that_kept_its_binding` and
-`the_state_guard_survives_an_update_that_kept_the_binding` pin the two halves.
+`a_variable_survives_a_reload_that_kept_its_binding` and
+`the_state_guard_survives_a_reload_that_kept_the_binding` pin the two halves.
 
 ## What is never reused
 
@@ -178,7 +186,7 @@ fail.
 
 ## The one guard: a version must be able to take over the state
 
-`LiveProgram::update` compares the variables the running program holds against those the new version
+`LiveProgram::reload` compares the variables the running program holds against those the new version
 declares, read off its planned tree (`OpConversionContext::state_conflicts`). Three things are
 refused:
 
@@ -191,12 +199,12 @@ refused:
 - **A value that would move between two declarations the source does not distinguish.** Two
   anonymous call sites of one stateful function are told apart by position alone, so reordering
   them, or inserting a third ahead, hands each variable its neighbour's value. The site's own
-  content is what catches it: a site whose body the update edited is gone from the new version,
+  content is what catches it: a site whose body the reload edited is gone from the new version,
   while one still present under a different variable has moved (`site_moved`). Refused rather than
   followed, because nothing in the source says which declaration the value belongs to — the refusal
   names both and says that binding each call site to a name is what makes the edit carry.
 
-The check runs before anything is torn down, so a refused update leaves the program whole.
+The check runs before anything is torn down, so a refused reload leaves the program whole.
 
 Nothing else is refused. Adding an `http_serve` works: the added route serves as soon as the swap
 completes, and what was already there keeps its state.
@@ -251,7 +259,7 @@ holds a weak reference.
   on. A producer addresses its guard by slot number, so the number lives in a `Cell` the producer
   and the registry share: `FanOut::reopen` drops the dead slots and writes each survivor its new
   number. Without that renumbering the slot list would grow by one dead entry per replaced
-  subscriber on every update and never shrink, and both the notify walk and the release intersection
+  subscriber on every reload and never shrink, and both the notify walk and the release intersection
   scan it — `reopening_a_fan_out_drops_dead_slots_and_renumbers_the_rest` pins that the survivor
   keeps the guard it released.
 - **Scheduler wake-ups.** `Scheduler::add_source_handle` records a `Weak<RefCell<dyn Consumer>>`,
@@ -285,9 +293,9 @@ This is what frees a retired version's operators, and the release bookkeeping de
 freed: a source hands back a producer's release record from that producer's `Drop`, so one that
 outlives its version goes on constraining the agreement from where it stopped, and the next version
 is offered what the retired one already committed —
-`a_second_update_does_not_replay_what_the_first_committed` pins it.
+`a_second_reload_does_not_replay_what_the_first_committed` pins it.
 
-## Order of an update
+## Order of a reload
 
 1. Render the difference between the running source and the new one, which compiles both to
    `Phase::AsOfRead`.
@@ -309,7 +317,7 @@ Step 6 is not redundant with the notifications `subscribe` raises. An operator n
 exist until `subscribe` returns, so those notifications reach a consumer with nothing to pull and
 are dropped. A first compile does not notice: a source holding data reports it as new on the next
 poll, which drives everything. A replacement is not covered by that, because the version it replaces
-already took the report. Without step 6 an update installed while work is outstanding — a fold
+already took the report. Without step 6 a reload installed while work is outstanding — a fold
 caught partway, a request accepted and not yet answered — sits until the next arrival
 (`a_version_installed_mid_fold_is_pulled_without_a_new_arrival`).
 
@@ -330,10 +338,10 @@ released, and one whose routes never materialize is dropped by `release_unrouted
 Steps 3 and 4 come after step 2 so that a rejection is never destructive, and before step 5 so that
 what the new version inherits is held by the inheritance and not also by a graph still running.
 
-An accepted update therefore compiles four times: twice for the diff, once to `Planning` for the
+An accepted reload therefore compiles four times: twice for the diff, once to `Planning` for the
 guard, and once for real. `run_frontend` goes from source to a stop phase and there is no way to
 continue a stopped tree into operator conversion, so the guard's tree cannot be the one that gets
-built — which is why `LiveProgram::update` documents a panic for the two compiles disagreeing.
+built — which is why `LiveProgram::reload` documents a panic for the two compiles disagreeing.
 
 Reuse is keyed on step 5's own tree, not on step 1's or step 2's. Step 1 renders a difference for a
 reader and step 2's tree is thrown away, while a node's identity is its address, so a correspondence
@@ -363,7 +371,7 @@ Three things decide where a rebuilt store picks up, and only two of them are han
   `reordering_two_same_spelled_variables_keeps_their_state_apart`).
 
   The index is left for the one shape the source names nothing in: two anonymous call sites of one
-  stateful function in one expression. An edit to either body leaves it alone, and an update that
+  stateful function in one expression. An edit to either body leaves it alone, and a reload that
   would move a value between them is refused (`swapping_two_anonymous_call_sites_is_refused`). What
   is left unaddressed is narrower: a reorder that edits both bodies at once leaves neither site
   present to recognise, so the position decides and the values cross.
@@ -382,7 +390,7 @@ Three things decide where a rebuilt store picks up, and only two of them are han
   drive's cursors come from that one number, and they must agree — `InductionDriver` asserts that a
   decision cannot precede the input it decides.
 
-  The position is not carried. It is a fact about one operator, and that operator is what the update
+  The position is not carried. It is a fact about one operator, and that operator is what the reload
   hands over, so there is no second answer to reconcile and no sequence for two versions to compare.
   A variable whose new version reads a different iteration seeds its value and takes that
   iteration's position instead. That is a variable moving between loops, or a program moving to
@@ -443,10 +451,10 @@ prefix its predecessor released.
 Getting that wrong stalls the drive rather than misreading it — the decision lookup finds no row at
 the absolute position and the drive stops without advancing, so the resumed loop answers nothing
 while the rest of the program keeps serving. `a_store_resumes_however_far_its_source_has_advanced`
-pins it, driving six positions before the update; at one or two the two indexings overlap enough to
+pins it, driving six positions before the reload; at one or two the two indexings overlap enough to
 mask it.
 
-## What an update does not do
+## What a reload does not do
 
 - **Start a rebuilt store empty.** It resumes instead — see [Rebuilding a store resumes
   it](#rebuilding-a-store-resumes-it).
@@ -478,7 +486,7 @@ Everything that leaves the state takeable. Measured across the shapes an edit ca
 | A variable's type changes, records included | Refused, naming both types |
 | A variable is added whose name another already has | Accepted; the bindings enclosing each declaration tell them apart, so the existing one resumes and the added one starts at its init |
 | Two anonymous call sites of one stateful function are reordered, or a third is inserted ahead | Refused, naming both declarations and saying to bind each call site to a name. Their state is told apart by position alone, and the source does not say which declaration a value belongs to |
-| The same, with both bodies edited in the one update | Their state crosses. Neither site is left for `site_moved` to recognise, so the position decides — the one shape the identity does not address |
+| The same, with both bodies edited in the one reload | Their state crosses. Neither site is left for `site_moved` to recognise, so the position decides — the one shape the identity does not address |
 | A variable moves to another loop | Accepted; it seeds with the value it held and decides the positions its new loop's iteration still has |
 | A variable moves to or from a transaction | Accepted, both directions; the value carries and the position comes from whatever the variable now iterates. A commit clock hands on no position, and over an unchanged collection both sides read the same kept iteration, so a fold caught partway resumes where it stopped rather than committing an element twice |
 | A loop reads another source, a port change say | Accepted; same as above, and the port it left is released |
@@ -489,13 +497,13 @@ Everything that leaves the state takeable. Measured across the shapes an edit ca
 
 A request a surviving route delivers is therefore answered by exactly one version, and a request
 buffered before the swap is answered after it: the buffer belongs to the source rather than to
-either graph (`a_request_that_arrived_before_the_swap_is_answered_after_it`). A route the update
+either graph (`a_request_that_arrived_before_the_swap_is_answered_after_it`). A route the reload
 retires is the case where that runs out — the source behind it is unreachable from the new graph, so
 retirement answers those requests itself ([A route a version stops serving is
 retired](#a-route-a-version-stops-serving-is-retired)). Behaviour under concurrent load is not
 measured.
 
-A program whose output is its `main` value rather than a sink updates the same way. Such a program
+A program whose output is its `main` value rather than a sink reloads the same way. Such a program
 is not short-lived — `stdin` is unbounded, so the binary's own driver loop keeps running and
 services the control port between pulls. Its loops are identified by their source like any other, so
 the guard names one by the address the source gives it — a bare `` `n` `` where the program declares
@@ -514,4 +522,4 @@ Its state is as live as a sink program's, and reads the same way:
 
 What a value like a bare trailing `n` reports is decided by the position it is read at, and reading
 it at the tail of the program means EOF. That is a property of that program rather than a limit on
-what an update can carry.
+what a reload can carry.

@@ -103,7 +103,7 @@ struct FanOutShared {
     /// producer reads its index out of the cell it shares with this entry, so
     /// dropping dead slots stays compatible with addressing a guard by index:
     /// the survivors are told their new numbers. Without that the list would
-    /// grow by one dead slot per replaced subscriber on every update, forever,
+    /// grow by one dead slot per replaced subscriber on every reload, forever,
     /// and both the notify walk and the release intersection scan it.
     ///
     /// [`release_guards`]: FanOutShared::release_guards
@@ -383,12 +383,12 @@ impl FanOut {
     /// Reopen this fan-out for a fresh set of branches, keeping the inner
     /// producer and everything it has accumulated.
     ///
-    /// For carrying one operator across a program update. Only the
+    /// For carrying one operator across a program reload. Only the
     /// [`inspect`](TileOperator::inspect) bookkeeping resets: which branch
     /// renders the input subtree and which renders a back-reference. The
     /// subscriptions need no attention, because each is tied to the life of the
     /// producer it handed out ([`FanOutShared::subscribers`]) — a subscriber the
-    /// update dropped stops counting on its own, and one the update carried
+    /// reload dropped stops counting on its own, and one the reload carried
     /// forward keeps its guard.
     pub fn reopen(&self) {
         *self.used.borrow_mut() = false;
@@ -403,7 +403,7 @@ impl FanOut {
 /// operator doing the reading sits *inside* the input chain the fan-out owns —
 /// a store's body reading the store's own prior value. Owning it from there
 /// closes a cycle through `FanOutShared::producer` that keeps the whole
-/// subgraph alive for the life of the process, which across a program update
+/// subgraph alive for the life of the process, which across a program reload
 /// means every retired version's operators are retained and the release
 /// records their producers hold are never handed back.
 ///
@@ -742,6 +742,18 @@ impl TileProducer for FanOutProducer {
                 acc.intersect(&shared.release_guards[i])
             });
         trace!("{} releasing: {intersection:?}", self.name());
+        // The match is total for a fan-out a recurrence reads, rather than a
+        // shape test with a fallthrough. Every function tiling's empty and
+        // universal guards are `Function(Domain(_))` (`Tiling::empty_guard`,
+        // including the curried case), which supplies both the seed each
+        // `release_guards` entry starts at and this fold's identity; `Domain` is
+        // closed under the union and intersection applied to it; and both drives
+        // release only `Domain` to an iteration source — `InductionDriver`
+        // constructs it at each of its two release sites, and `TransactDriver`
+        // forwards to its trigger only inside the same match. A `Codomain` guard
+        // arriving here would fail the intersect rather than land in the `else`
+        // ([`FunctionGuard::intersect`] has no mixed arm), so the position cannot
+        // be silently lost.
         if let TileGuard::Function(FunctionGuard::Domain(pred)) = &intersection
             && let Some(position) = pred.max_released_position()
         {
