@@ -3366,6 +3366,7 @@ mod tests {
         );
     }
 
+    /// Corrupting a `BoolLogic` operand type away from `Bool` is caught by `typecheck`.
     #[test]
     fn test_typecheck_bool_logic_wrong_operand_type() {
         let mut ctx = TypeInferenceContext::new();

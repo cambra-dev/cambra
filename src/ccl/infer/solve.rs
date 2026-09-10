@@ -2137,6 +2137,13 @@ fn recovered_input(domain: &Type, input: &Type) -> Type {
     }
 }
 
+/// Specialize a projection morphism's domain to the value flowing into it — the
+/// projection sibling of [`specialize_lambda_domain`].
+///
+/// A projection's domain coalesces to what the projection reads, which is
+/// narrower than the value the use site supplies, so the domain is recovered
+/// structurally once that value is known. A morphism that is not a `Proj` keeps
+/// the type it has.
 pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
         && let Some(dom) = morphism.ty.domain()

@@ -611,7 +611,9 @@ o";
     );
 }
 
-/// `MapAggregate`.  Verifies that the induction cycle correctly:
+/// Mutation loop summing values from an incremental source, semantically
+/// equivalent to `sum(source1())` but exercising the induction cycle instead of
+/// `MapAggregate`. Verifies that the induction cycle correctly:
 /// - Re-reads its `domain` input as the source grows in batches.
 /// - Holds back the final emission until the source signals it's done.
 /// - Fires notifications when each batch arrives and again on terminal.
