@@ -1463,9 +1463,12 @@ fn elim_lambda_impl(
         //
         // Unreachable from source today: nothing puts a `match` inside a lambda that
         // survives to here — a UDF body is inlined at its call sites, a comprehension
-        // element cannot hold a statement, and a for-loop body rejects `match` at
-        // lowering. Named rather than left to the catch-all below, so that whichever
-        // of those opens up first reports this instead of a debug dump.
+        // element cannot hold a statement, and a for-loop body's `match` is a
+        // statement-position tag-`Case` that
+        // [`tag_case_to_guard_case`](crate::ccl::ccl_utils::tag_case_to_guard_case)
+        // has already turned into guards. Named rather than left to the catch-all
+        // below, so that whichever of those opens up first reports this instead of a
+        // debug dump.
         TypedExprNode::Case {
             scrutinee: Some(_),
             branches,
