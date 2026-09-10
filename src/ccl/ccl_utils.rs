@@ -321,6 +321,37 @@ pub fn commit_project(decision_ty: &Type) -> Expr {
     ))
 }
 
+/// Rewrite every tag-dispatching `Case` in `expr` into the guard-`Case` its
+/// consumers read ([`tag_case_to_guard_case`]).
+///
+/// Applied to a whole body when that body has more than one consumer, rather than
+/// at each consumption point: the induction writer converts as it walks
+/// ([`crate::ccl::mut_elim`]'s `transform_chain`), but a feed-only loop body goes
+/// to `channelize`'s fan-out and a transaction block goes to both a footprint scan
+/// and a decision walk, and a consumer left un-taught reads a `Pattern` it has no
+/// arm for.
+///
+/// **Statement position only**, which the `Unit` type identifies: an arm in
+/// statement position is a chain of effects ending in `unit`, and a `match`
+/// without a `case _:` gains a `true → unit` arm in the rewrite, which types only
+/// against arms that are themselves `unit`. A value-position `match` keeps the
+/// projection fan-out `lambda_elim` compiles it to.
+pub(crate) fn statement_tag_cases_to_guards(expr: Expr) -> Expr {
+    let mut expr = expr;
+    expr.map_children(statement_tag_cases_to_guards);
+    if matches!(
+        &expr.node,
+        TypedExprNode::Case {
+            scrutinee: Some(_),
+            ..
+        }
+    ) && matches!(expr.ty, Type::Base(BaseType::Unit))
+    {
+        return tag_case_to_guard_case(expr);
+    }
+    expr
+}
+
 /// The point-free one-arm eliminator ``variant_project(`fired) : {`fired{𝑉} |
 /// `idle} ⇒ 𝑉`` reading a tap stream's fed value — appended after a `.to_<defer>`
 /// read so the channel carries the positions the tap fired at.

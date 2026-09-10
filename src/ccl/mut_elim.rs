@@ -1205,7 +1205,7 @@ fn transform_loop(
                 // paths that split per feed. One lambda carries the whole body
                 // here, however many arms feed, so there is no product to hand to
                 // any one feed statement.
-                let body = guard_cases_only(strip_trailing_unit(loop_body.clone()));
+                let body = strip_trailing_unit(loop_body.clone());
                 let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), body);
                 lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
                 let map = typed_compose(vec![iter, lambda]);
@@ -1800,33 +1800,15 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
 /// feed/write. Distinguishes a conditional feed loop (fanned out by `channelize`)
 /// from a straight-line feed loop (hoisted by `transform_feed_only_loop`). Ignores
 /// *value*-position `Case`s (a ternary in a feed value is straight-line).
-/// Rewrite every tag-dispatching `Case` in a generator body into the guard-`Case`
-/// [`channelize::try_extract_fanout_feed`](crate::ccl::channelize) fans out.
-///
-/// The feed-only path hands its body to `channelize` rather than to
-/// [`transform_chain`], so the rewrite that walker performs at its own
-/// consumption point has to happen here too: the fan-out matches a boolean guard
-/// against a bare `Feed`, and a `match` arm carries a `Pattern` and a tag until
-/// [`tag_case_to_guard_case`] turns them into a `variant_is` test and a
-/// substituted `variant_project`.
-fn guard_cases_only(expr: Expr) -> Expr {
-    let mut expr = expr;
-    expr.map_children(guard_cases_only);
-    if matches!(
-        &expr.node,
-        TypedExprNode::Case {
-            scrutinee: Some(_),
-            ..
-        }
-    ) {
-        return crate::ccl::ccl_utils::tag_case_to_guard_case(expr);
-    }
-    expr
-}
-
 fn body_has_statement_case(expr: &Expr) -> bool {
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
-        && matches!(&effect.node, TypedExprNode::Case { .. })
+        && matches!(
+            &effect.node,
+            TypedExprNode::Case {
+                scrutinee: None,
+                ..
+            }
+        )
     {
         return true;
     }

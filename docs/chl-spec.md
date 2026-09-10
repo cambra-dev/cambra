@@ -2846,12 +2846,17 @@ for req in incr_reqs:
   (a disguised nested transaction).
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
-- **Deny guard.** A block may carry a single bare `if p:` guard; the
-  transaction commits iff `p` holds over its snapshot, and a denied
-  transaction contributes no write and no reply. An `elif`, an `else` that
-  writes, or more than one `if` guard in one block is **[Planned]**
-  (rejected today with a diagnostic) — the general path-based conditional
-  model is worked through in the design doc.
+- **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
+  guards, more than one of them, and `match` dispatch. Each branch's
+  writes are scoped to its own path and the transaction commits on the
+  disjunction of the writing paths, so a write on the spine beside a
+  guard commits unconditionally. A bare `if p:` with no `else` is the
+  deny idiom: where `p` fails over the snapshot the transaction
+  contributes no write and no reply.
+- **An induction accumulator may not be written under a branch inside a
+  block** (rejected with a diagnostic). Write it after the block, or, if
+  it should be shared across the transaction, declare it `Mut(…, Txn)`
+  and write it on the spine.
 - **Transaction handle — `with t = begin():` [Decided].** Binds `t` to the
   transaction's commit time (a `Txn` value); designed but rejected at
   lowering today.

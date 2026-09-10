@@ -1152,6 +1152,26 @@ fn strip(
         let TypedExprNode::Begin { body: block } = effect.node else {
             unreachable!("guarded above")
         };
+        // ``match m: case `tag(w): <writes>`` in the block reaches here as a
+        // statement-position tag-`Case`. Convert the whole block once rather than
+        // at each consumer: `collect_footprint` separates a guard's spine reads
+        // from an arm's conditional ones, and `walk_block` scopes each arm's
+        // writes to its path — neither reads a `Pattern`, and after the rewrite an
+        // arm's scrutinee test sits in the guard where the footprint scan wants it
+        // ([`statement_tag_cases_to_guards`](crate::ccl::ccl_utils::statement_tag_cases_to_guards)).
+        let block = {
+            // The rewrite duplicates the scrutinee once per arm, so it needs a
+            // recording of its own: it runs before either block path opens one,
+            // and it applies to both (a writing block and a read-only one may each
+            // dispatch on a tag).
+            let g = provenance::enter(
+                stmt_id,
+                "transact.tag_guards",
+                provenance::Nature::Expansion,
+            );
+            g.blame(&[begin_id]);
+            Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
+        };
         if block_writes_txn(&block, txn_mut_vars) {
             // A writing block → a commit-record site keyed on the *enclosing*
             // loop. Partition it by mutable variable domain: the transactional remainder is
@@ -1505,10 +1525,10 @@ pub fn check_no_guarded_induction_write_in_block(
         && let Some(name) = guarded_non_txn_write(body, txn_mut_vars, false)
     {
         return Err(format!(
-            "`{name}` is written under an `if` inside a `with begin():` block. A guarded \
-             induction write in a transaction block is not supported — move the write outside \
-             the block, or (if it should be shared across the transaction) declare it \
-             `Mut(…, Txn)` and write it directly, not under a branch"
+            "`{name}` is written under an `if` or a `match` arm inside a `with begin():` \
+             block. A branch-guarded induction write in a transaction block is not supported \
+             — move the write outside the block, or (if it should be shared across the \
+             transaction) declare it `Mut(…, Txn)` and write it directly, not under a branch"
         ));
     }
     let mut result = Ok(());
@@ -1826,9 +1846,9 @@ fn contains_await_final(e: &Expr) -> bool {
 }
 
 /// The first non-txn `MutWrite` target that appears **inside a statement-`Case`**
-/// (an `if` arm) within `block` — a guarded induction write. `in_case` marks
-/// whether the walk is currently under such an arm; a guard is spine-evaluated,
-/// so only arm *bodies* set it.
+/// (an `if` or `match` arm) within `block` — a guarded induction write. `in_case`
+/// marks whether the walk is currently under such an arm; a guard is
+/// spine-evaluated, so only arm *bodies* set it.
 fn guarded_non_txn_write(
     block: &Expr,
     txn_mut_vars: &HashSet<Name>,
@@ -1838,10 +1858,10 @@ fn guarded_non_txn_write(
         TypedExprNode::MutWrite { name, .. } if in_case && !txn_mut_vars.contains(name) => {
             return Some(name.clone());
         }
-        TypedExprNode::Case {
-            scrutinee: None,
-            branches,
-        } => {
+        // Both `Case` forms: an `if` arm and a `match` arm are equally
+        // conditional, and this walk runs before the tag-to-guard rewrite, so it
+        // has to recognize the tag form as it stands.
+        TypedExprNode::Case { branches, .. } => {
             for b in branches {
                 if let Some(n) = guarded_non_txn_write(&b.body, txn_mut_vars, true) {
                     return Some(n);
