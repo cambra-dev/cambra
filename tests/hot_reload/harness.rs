@@ -638,6 +638,52 @@ pub(crate) mod fixtures {
             with begin():
                 out_b << y
     "#};
+
+    /// A loop folding a view over its own request source: `seen` is a
+    /// comprehension over `bump_reqs`, so its elements are gone once answered.
+    /// The base for the two cases about a loop that cannot read its collection
+    /// from the start.
+    pub(crate) const VIEW_FOLD: &str = indoc! {r#"
+        bump_reqs, bump_resps = http_serve("{PORT}", "POST", "/bump")
+        seen = [r + "!" for r in bump_reqs]
+        n := ""
+        for x in seen:
+            n := n + x
+            bump_resps << n
+    "#};
+
+    /// [`VIEW_FOLD`] with `n` moved to a loop of its own and the `seen` loop
+    /// carrying a new variable instead. The `seen` loop then carries nothing, so
+    /// it would read `seen` from the beginning — which is the refusal.
+    pub(crate) const VIEW_FOLD_REVARIABLED: &str = indoc! {r#"
+        bump_reqs, bump_resps = http_serve("{PORT}", "POST", "/bump")
+        tick_reqs, tick_resps = http_serve("{PORT}", "POST", "/tick")
+        seen = [r + "!" for r in bump_reqs]
+        m := ""
+        for x in seen:
+            m := m + x
+            bump_resps << m
+        n := ""
+        for z in tick_reqs:
+            n := n + z
+            tick_resps << n
+    "#};
+
+    /// [`VIEW_FOLD`] plus a loop over a second route. The added loop reads a
+    /// source rather than a collection, so it starts where that source is.
+    pub(crate) const VIEW_FOLD_SECOND_ROUTE: &str = indoc! {r#"
+        bump_reqs, bump_resps = http_serve("{PORT}", "POST", "/bump")
+        tick_reqs, tick_resps = http_serve("{PORT}", "POST", "/tick")
+        seen = [r + "!" for r in bump_reqs]
+        n := ""
+        for x in seen:
+            n := n + x
+            bump_resps << n
+        t := ""
+        for z in tick_reqs:
+            t := t + z
+            tick_resps << t
+    "#};
 }
 
 pub(crate) fn source(name: &str, port: u16) -> String {
@@ -674,6 +720,9 @@ pub(crate) fn source(name: &str, port: u16) -> String {
         "two-transactions" => fixtures::TWO_TRANSACTIONS,
         "two-transactions-one-writer-edited" => fixtures::TWO_TRANSACTIONS_ONE_WRITER_EDITED,
         "two-transactions-swapped" => fixtures::TWO_TRANSACTIONS_SWAPPED,
+        "view-fold" => fixtures::VIEW_FOLD,
+        "view-fold-revariabled" => fixtures::VIEW_FOLD_REVARIABLED,
+        "view-fold-second-route" => fixtures::VIEW_FOLD_SECOND_ROUTE,
         other => panic!("no such program: {other}"),
     };
     text.replace("{PORT}", &port.to_string())

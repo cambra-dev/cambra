@@ -17,6 +17,230 @@ use crate::serving::{
     reserve_test_port, start_sink,
 };
 
+/// A loop the reload adds over a collection an existing loop folded reads that
+/// collection whole.
+///
+/// The added loop starts at the value it declares, which summarizes no position,
+/// so the elements the running program has read are elements it still has to
+/// read. The collection is a list literal, so a fresh iteration over it is the
+/// same collection and the reload builds one.
+///
+/// The regression this pins: the binding under `items` is spent once the first
+/// fold finishes, so the reload rebuilds it for a live operator, and while that
+/// rebuild was recorded as a *change* to what `items` computes the existing loop
+/// lost its own kept iteration too and re-folded the whole list on top of the
+/// value it was carrying. `n` came back `"abcabc"` — a value silently doubled by
+/// a reload that changed nothing about it.
+#[test]
+fn a_loop_added_over_a_folded_collection_reads_it_whole() {
+    let fold = |added: &str, result: &str| {
+        format!(
+            indoc! {r#"
+                items = ["a", "b", "c"]
+                n := ""
+                for x in items:
+                    n := n + x
+                {added}{result}
+            "#},
+            added = added,
+            result = result,
+        )
+    };
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &fold("", "n"), &no_main).expect("v1 compiles");
+    assert_eq!(
+        drive_main_to_terminal(&mut ctx, &mut live),
+        "abc",
+        "the fold runs to the end, so `items` is spent"
+    );
+
+    live.reload(
+        &mut ctx,
+        &fold(
+            "p := \"\"
+for y in items:
+    p := p + y
+",
+            "n + p",
+        ),
+        &no_main,
+    )
+    .expect("a second loop over a list literal is a collection this version can build again");
+
+    assert_eq!(
+        drive_main_to_terminal(&mut ctx, &mut live),
+        "abcabc",
+        "`n` carries and folds nothing more; `p` starts at its init and folds the list whole",
+    );
+}
+
+/// A loop the reload adds over a collection it cannot read again begins above
+/// that collection, and the report says so.
+///
+/// `seen` is a view over a request source, so the elements the first loop read
+/// are gone: its readers released them, and a source offers a new producer only
+/// what its retired producers had not released — the same condition read off two
+/// mechanisms. Rebuilding `seen` recovers neither, and `m` declares its own init
+/// rather than carrying one, so there is no position it can start at that is the
+/// beginning of what it reads.
+///
+/// Accepted rather than refused, because there is nothing better available: the
+/// elements are gone, so folding from where the input starts is all that is
+/// left. What the source does not say is whether the author meant a running
+/// total from here or a view of history, so the report names the loop and how
+/// much it will not see. `interpreter-hot-reload-persisted-annotation` is where
+/// the declaration comes to state it.
+#[test]
+fn a_loop_that_cannot_read_its_collection_from_the_start_is_reported() {
+    let port = reserve_test_port();
+    let (v1, v2) = (
+        source("view-fold", port),
+        source("view-fold-revariabled", port),
+    );
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &v1, &no_main).expect("v1 compiles");
+    let before: Vec<String> = exchange(&mut ctx, move || {
+        (1..=3)
+            .map(|i| http_post(port, "/bump", &i.to_string()))
+            .collect()
+    });
+    assert_eq!(before, vec!["1!", "1!2!", "1!2!3!"]);
+
+    let report = live
+        .reload(&mut ctx, &v2, &no_main)
+        .expect("the elements are gone, so this is a fact about the reload rather than a refusal");
+    let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        rendered.len(),
+        1,
+        "one loop begins above its input: {rendered:?}"
+    );
+    assert!(
+        rendered[0].contains("`m`") && rendered[0].contains("element 3"),
+        "the report names the variable and where it begins: {rendered:?}",
+    );
+
+    let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "4")]);
+    assert_eq!(
+        after,
+        vec!["4!"],
+        "`m` folds from where `seen` starts, which is the fourth request",
+    );
+}
+
+/// A reload that adds no loop over a consumed input reports none.
+///
+/// The complement of the case above, and what keeps the report from reading as
+/// noise: a loop whose collection this version can build again is rebuilt and
+/// folds it whole, so nothing is unreadable.
+#[test]
+fn a_loop_added_over_a_buildable_collection_reports_nothing() {
+    let mut ctx = GlobalContext::default();
+    let v1 = indoc! {r#"
+        items = ["a", "b", "c"]
+        n := ""
+        for x in items:
+            n := n + x
+        n
+    "#};
+    let v2 = indoc! {r#"
+        items = ["a", "b", "c"]
+        n := ""
+        for x in items:
+            n := n + x
+        p := ""
+        for y in items:
+            p := p + y
+        n + p
+    "#};
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "abc");
+
+    let report = live.reload(&mut ctx, v2, &no_main).expect("accepted");
+    assert!(
+        report.unreadable.is_empty(),
+        "`items` is a list literal, so `p`'s loop reads it whole: {:?}",
+        report.unreadable,
+    );
+}
+
+/// A stateless loop that gains an accumulator over an advanced source is
+/// reported, though nothing corresponded at its input.
+///
+/// The complement of
+/// `a_loop_that_cannot_read_its_collection_from_the_start_is_reported`, and what
+/// keeps the report from being incidental. There the previous version had a
+/// store folding that input, so a correspondence names how far it got. Here it
+/// had a stateless loop over `/q`, which records nothing at that node — and the
+/// request already answered is just as gone. The report reads where the loop
+/// will begin off the source itself in that case ([`source_start`]), so which
+/// shape the previous version had does not decide whether the author is told.
+///
+/// `a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source` is the same
+/// reload, asserting what the two variables come to hold.
+#[test]
+fn a_stateless_loop_gaining_an_accumulator_over_an_advanced_source_is_reported() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("one-stateful-loop", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![http_post(port, "/p", "x"), http_post(port, "/q", "x")]
+    });
+    assert_eq!(before, vec!["a\n", "q\n"]);
+
+    let report = live
+        .reload(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
+        .expect("`n` is unchanged and `m` is new");
+    let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        rendered.len(),
+        1,
+        "`m` begins above `/q`, and `n` carries so it does not: {rendered:?}",
+    );
+    assert!(
+        rendered[0].contains("`m`") && rendered[0].contains("element 1"),
+        "the report names the variable and where it begins: {rendered:?}",
+    );
+}
+
+/// A loop the reload adds over a source nothing has read begins at that source's
+/// first element, and is not reported.
+///
+/// The ordinary added-endpoint case, and the lower bound on the report: `/tick`
+/// is a route this version opens, so its first position is `0` and the loop over
+/// it reads everything it will ever be offered.
+#[test]
+fn a_loop_added_over_an_unread_source_reports_nothing() {
+    let port = reserve_test_port();
+    let mut ctx = GlobalContext::default();
+    let mut live =
+        LiveProgram::start(&mut ctx, &source("view-fold", port), &no_main).expect("v1 compiles");
+    let before: Vec<String> = exchange(&mut ctx, move || {
+        (1..=3)
+            .map(|i| http_post(port, "/bump", &i.to_string()))
+            .collect()
+    });
+    assert_eq!(before, vec!["1!", "1!2!", "1!2!3!"]);
+
+    let report = live
+        .reload(&mut ctx, &source("view-fold-second-route", port), &no_main)
+        .expect("a loop over a second route reads a source of its own");
+    assert!(
+        report.unreadable.is_empty(),
+        "nothing has posted to `/tick`, so `t` begins at its first element: {:?}",
+        report.unreadable,
+    );
+
+    let after = exchange(&mut ctx, move || {
+        vec![http_post(port, "/bump", "4"), http_post(port, "/tick", "z")]
+    });
+    assert_eq!(
+        after,
+        vec!["1!2!3!4!", "z"],
+        "`n` carries and continues; `t` folds from its own first request",
+    );
+}
+
 /// A reload replaces the edited logic and leaves the untouched logic running,
 /// with everything that logic has accumulated.
 ///
@@ -165,8 +389,23 @@ fn a_loop_may_gain_an_accumulator() {
     });
     assert_eq!(before[1], "aa|BB\n");
 
-    live.reload(&mut ctx, &source("two-accumulators-added", port), &no_main)
+    let report = live
+        .reload(&mut ctx, &source("two-accumulators-added", port), &no_main)
         .expect("adding an accumulator loses nothing");
+
+    // One loop drives one position sequence, so the added variable begins where
+    // the loop is rather than at the first element. The two that were there
+    // carry, so only the added one is reported.
+    let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        rendered.len(),
+        1,
+        "one variable begins above the loop's input: {rendered:?}"
+    );
+    assert!(
+        rendered[0].contains("`extra`") && rendered[0].contains("element 2"),
+        "the report names the added variable and the two elements it will not see: {rendered:?}",
+    );
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
     assert_eq!(
@@ -777,7 +1016,7 @@ fn a_reload_may_not_drop_state() {
         .expect("a version that stops declaring `entries` would discard its value");
     let rendered = format!("{errors:?}");
     assert!(
-        rendered.contains("cannot take over state") && rendered.contains("`entries`"),
+        rendered.contains("cannot take over") && rendered.contains("`entries`"),
         "the rejection should name the variable: {rendered}",
     );
 
@@ -1482,12 +1721,22 @@ fn a_stateless_route_may_gain_a_transactional_writer_over_an_advanced_source() {
     });
     assert_eq!(before, vec!["b\n"; 6], "`/b` answers, and holds nothing");
 
-    live.reload(
-        &mut ctx,
-        &source("one-transactional-loop-both", port),
-        &no_main,
-    )
-    .expect("`x` is unchanged and `y` is new");
+    let report = live
+        .reload(
+            &mut ctx,
+            &source("one-transactional-loop-both", port),
+            &no_main,
+        )
+        .expect("`x` is unchanged and `y` is new");
+    // The writer begins above `/b`, and the report says so: a commit drive is
+    // based at `0` and scans up to the first position its source still offers,
+    // which is not the same as reading from `0`.
+    let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
+    assert_eq!(rendered.len(), 1, "`y` begins above `/b`: {rendered:?}");
+    assert!(
+        rendered[0].contains("`y`") && rendered[0].contains("element 6"),
+        "the report names the writer and the six requests it will not see: {rendered:?}",
+    );
 
     let after = exchange(&mut ctx, move || {
         vec![http_post(port, "/b", "Z"), http_get(port, "/gb")]
@@ -2510,10 +2759,10 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
 /// A store this reload builds does not seed an accumulator from a binding the
 /// retired version released in full.
 ///
-/// `OpConversionContext::keepable` declines a correspondent whose subscribers
-/// released it in full, and this is the case that decline is for. `base` is read
-/// by the accumulator's init and by the trailing read's default, so a completed
-/// fold leaves both done with it and the `Memo` under it drops what it held.
+/// `bind_let` rebuilds a binding whose subscribers released it in full, and this is
+/// the case that rebuild is for. `base` is read by the accumulator's init and by
+/// the trailing read's default, so a completed fold leaves both done with it and
+/// the `Memo` under it drops what it held.
 /// `p` is new in the replacement, so its init is compiled rather than seeded from
 /// a carried value, and compiling it reaches `base`. Keeping `base` there hands
 /// the store a branch that answers empty, and `InductionStore::subscribe` drains
@@ -2522,8 +2771,7 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
 ///
 /// The iteration input at the same node is kept in the same reload, released in
 /// full and correctly so: it is reused for the position it reached, not for what
-/// it can still supply. That is the whole of the asymmetry between
-/// `keepable` and `correspondent`.
+/// it can still supply. One correspondence, two questions asked of it.
 #[test]
 fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
     let fold = |extra_decl: &str, extra_write: &str, result: &str| {
@@ -2548,22 +2796,31 @@ fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
         "the fold runs to the end, so every reader of `base` is done with it"
     );
 
-    live.reload(
-        &mut ctx,
-        &fold(
-            "p := base
+    let report = live
+        .reload(
+            &mut ctx,
+            &fold(
+                "p := base
 ",
-            "    p := p + x
+                "    p := p + x
 ",
-            "n + p",
-        ),
-        &no_main,
-    )
-    .expect("adding an accumulator is accepted, and its init must still resolve");
+                "n + p",
+            ),
+            &no_main,
+        )
+        .expect("adding an accumulator is accepted, and its init must still resolve");
 
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
         "abc",
         "`p` seeds from its own init and folds nothing, the source being spent"
+    );
+    // Folding nothing is what the report is for: `n` carries, so the loop resumes
+    // past the end of the list, and `p` begins there.
+    let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
+    assert_eq!(rendered.len(), 1, "`p` begins past the end: {rendered:?}");
+    assert!(
+        rendered[0].contains("`p`") && rendered[0].contains("element 3"),
+        "the report names it and the three elements it will not see: {rendered:?}",
     );
 }

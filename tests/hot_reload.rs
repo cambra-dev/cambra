@@ -23,7 +23,7 @@
 //! | `bump-over-source` | The smallest one: `POST /bump` accumulates into `n`. Varied by its declared init, for the rule that a carried value wins over one. |
 //! | `record-accumulator` | A record-valued accumulator, varied by the type of one field — a retype no single program can express. |
 //! | `bump-over-a-fixed-list` | A fold over `["y", "z"]` read by `POST /bump`. Varied by the body and by the collection, which are the two edits a fold tells apart. |
-//! | `two-loops` | `POST /a` and `POST /b` each accumulate into their own variable. Independent, so a store each — one stays keepable while the other is rebuilt. |
+//! | `two-loops` | `POST /a` and `POST /b` each accumulate into their own variable. Independent, so a store each — one is kept while the other is rebuilt. |
 //! | `two-accumulators` | One loop carrying two variables (`left` and `right`), for the cases about telling them apart. |
 //! | `one-stateful-loop` | `POST /p` accumulates, `POST /q` does not — the pair a variable can move between. |
 //! | `latest-write` | A transactional variable (`Mut(String, Txn)`) that `POST /set` overwrites and `GET /get` reads. |
@@ -50,8 +50,10 @@
 //! | Logic outside a store's recurrence | Accepted; the store is kept and its variables are untouched |
 //! | Logic inside one | Accepted; the store is rebuilt and each variable resumes from the value it held, so what was recorded stands and the new rule governs from here |
 //! | An edit to one of two independent loops | Accepted; the other's store is kept |
-//! | A loop gains an accumulator under a new name | Accepted; the others resume, the new one starts at its init |
-//! | A route serving statelessly gains a transactional writer | Accepted; the writer commits from the next request rather than replaying the ones the route already answered |
+//! | A loop gains an accumulator under a new name | Accepted and reported; the others resume, and the new one starts at its init and folds from where the loop has got to, since one loop drives one position sequence |
+//! | A route serving statelessly gains a transactional writer | Accepted and reported; the writer commits from the next request, replaying none the route already answered |
+//! | A loop is added over a collection an existing loop folded | Accepted; the collection is built again for it and folded whole, and the existing loop keeps its own iteration and folds nothing twice |
+//! | A loop is added over an input this version cannot build again | Accepted; it folds from where that input starts, and the report names it and how much it will not see |
 //! | A variable is added whose name another already has | Accepted; the bindings enclosing each declaration tell them apart, so the existing one resumes and the added one starts at its init |
 //! | A variable moves to another loop | Accepted; it seeds with the value it held and decides the positions its new loop's iteration still has |
 //! | A variable moves to or from a transaction | Accepted either direction; the value carries, and a fold caught partway resumes at the cut so no element is folded twice |

@@ -70,8 +70,10 @@ do](#what-a-reload-does-not-do) says why they are not everywhere.
 
 Keeping an operator keeps the whole subgraph under it, including its stores and their accumulated
 values. Two conditions bound that: every binding the term reads must have been kept too ([Reuse is
-hereditary](#reuse-is-hereditary)), and the operator must not have been released in full by its
-subscribers, since it can then only answer empty (`OpConversionContext::keepable`).
+hereditary](#reuse-is-hereditary)), and a site that needs the operator to still *supply* something
+must find it not released in full by its subscribers, since it can then only answer empty
+([A binding whose operator is spent is rebuilt, not
+changed](#a-binding-whose-operator-is-spent-is-rebuilt-not-changed)).
 
 The second condition bounds the two sites that reuse an operator for what it supplies. A binding is
 what a name reads and a store seeds its accumulators from, so a spent one hands on nothing
@@ -167,6 +169,23 @@ reading the same map, no longer refuses dropping it.
 `a_variable_survives_a_reload_that_kept_its_binding` and
 `the_state_guard_survives_a_reload_that_kept_the_binding` pin the two halves.
 
+## A binding whose operator is spent is rebuilt, not changed
+
+An operator whose subscribers released it in full can only answer empty: it has told its input that
+nothing will be read again, and a `Memo` input drops what it holds in response
+(`FanOut::released_in_full`). A binding standing behind one hands its readers nothing, so the reload
+rebuilds it — where the term is recomputable, which is what makes the rebuilt operator hold what the
+spent one held.
+
+Rebuilding for that reason is not a change to what the binding computes, and `bind_let` does not
+record it as one. The distinction is load-bearing: `reads_only_kept` declines to keep an operator
+that reads a binding this version **rebuilt**, on the grounds that progress through something the
+reload replaced means nothing. A binding rebuilt only because its operator was spent computes what
+the retired one computed, so a recurrence over it may still take the retired iteration and continue.
+Recorded as a change, the recurrence loses its iteration, restarts at `0`, and folds its whole input
+on top of the value it is carrying — the doubling
+`a_loop_added_over_a_folded_collection_reads_it_whole` pins.
+
 ## What is never reused
 
 A binding compiled under an iteration (`BindingKind::Aligned`) is rebuilt. Its operator is
@@ -215,9 +234,12 @@ The check runs before anything is torn down, so a refused reload leaves the prog
 Nothing else is refused. Adding an `http_serve` works: the added route serves as soon as the swap
 completes, and what was already there keeps its state.
 
-Losing a value is refused because it is the one failure an author cannot observe: the program
-carries on answering, and only the accumulated history is gone. Every other change either works or
-fails visibly.
+Losing a value is refused because the program carries on answering afterwards and only the
+accumulated history is gone, so an author has nothing to notice. One other outcome is silent in the
+same way and is **reported** rather than refused, off the same tree at the same moment: a loop that
+begins above the beginning of what it reads
+([A variable that begins above its loop's input](#a-variable-that-begins-above-its-loops-input)). Everything else either
+works or fails visibly.
 
 ### A route a version stops serving is retired
 
@@ -420,10 +442,12 @@ Three things decide where a rebuilt store picks up, and only two of them are han
   reading has nothing carried and still cannot start at `0`
   (`a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source`).
 
-  A collection needs none of that, and gets its continuity from the kept iteration instead. A fold
-  over one resumes at the position it had reached, so an edit inside the loop governs the elements
-  that are left rather than replaying the ones already folded, and a fold over another collection is
-  a different node, which rebuilds the iteration and starts that collection from its first element.
+  A collection needs none of that, and a fold that carries a value gets its continuity from the kept
+  iteration instead. Such a fold resumes at the position it had reached, so an edit inside the loop
+  governs the elements that are left rather than replaying the ones already folded, and a fold over
+  another collection is a different node, which rebuilds the iteration and starts that collection
+  from its first element. A fold carrying nothing takes the other answer — see "A recurrence reads
+  its input from the position it starts at".
   The positions the predecessor decided are not re-decided and are not re-read: the resumed store
   seeds tick `0` with the value handed over, so a reader enumerating the whole collection reads that
   value for them. A fold caught partway is where this is visible — the elements below the swap keep
@@ -460,6 +484,47 @@ while the rest of the program keeps serving. `a_store_resumes_however_far_its_so
 pins it, driving six positions before the reload; at one or two the two indexings overlap enough to
 mask it.
 
+## A variable that begins above its loop's input
+
+A recurrence starts at a position and folds upward from it, so which position it starts at and what
+its input can offer are one question. The answer is per variable rather than per store: one loop
+drives one position sequence, and a store's variables share it.
+
+A variable **carrying a value** has had every position that value summarizes folded into it. Its
+loop takes the iteration the retired version was running and starts one above what that iteration
+released (`FanOut::released_position`), so no element is folded twice — which is compatibility,
+[semantics.md](/docs/operational-semantics/semantics.md#4-reload), property 1.
+
+A variable **carrying nothing** starts at the value it declares, which summarizes no position, so it
+wants its loop's input from the beginning. It gets that only where the loop's input is rebuilt,
+which happens where nothing in the store carries and the input's term can be built again: a fresh
+iteration over a collection of literals starts at `0` and folds it whole. Otherwise the loop is the
+retired one continued, and the variable begins wherever that loop resumes — including a variable
+added to a loop whose other variables carry, which is the ordinary case and just as silent.
+
+**A source and a collection are not two cases.** A source offers a new producer what its retired
+producers had not released — `StreamBuffer::first_index_for_a_new_producer` is a released prefix
+plus one — and a kept operator holds what its retired consumers had not released. One condition,
+read off two mechanisms. What separates a term that can be built again from one that cannot is
+whether it reads a source at all, which is what `unrecomputable_nodes` answers.
+
+`unreadable_inputs` reports every variable that begins above its loop's input, in the reload's
+report and in `/diff` before that. Reported rather than refused, because there is nothing better
+available: the elements are gone, so folding from here is all that is left. What the source does not
+say is which was meant — an accumulator added to a live endpoint intends a running total from here,
+and a view over a retained feed intends the whole, and the two are the same term. Refusing would
+refuse the first along with the second. The declaration is where that belongs, and until it can say
+so the report is what makes the choice visible.
+
+The cases, in the order they get harder to see: `a_loop_may_gain_an_accumulator` (the added variable
+begins where its loop is, though the loop's other variables carry),
+`a_stateless_route_may_gain_a_transactional_writer_over_an_advanced_source` (a commit drive is based
+at `0` and scans up, so where it begins is its source's answer rather than its own),
+`a_loop_that_cannot_read_its_collection_from_the_start_is_reported` (nothing in the store carries and
+the input reads a source), and
+`a_loop_added_over_a_buildable_collection_reports_nothing` with
+`a_loop_added_over_a_folded_collection_reads_it_whole` for the case that is rebuilt instead.
+
 ## What a reload does not do
 
 - **Start a rebuilt store empty.** It resumes instead — see [Rebuilding a store resumes
@@ -482,10 +547,10 @@ Everything that leaves the state takeable. Measured across the shapes an edit ca
 | Change | Outcome |
 | --- | --- |
 | Logic of a loop or a transaction writer | Accepted; the variable resumes |
-| A loop gains an accumulator under a new name | Accepted; the others resume, the new one starts at its init |
+| A loop gains an accumulator under a new name | Accepted and reported; the others resume, and the new one starts at its init and folds from where the loop has got to, since one loop drives one position sequence |
 | A variable's declared init changes, type unchanged | Accepted; the carried value wins, the init is only for a fresh start |
-| A whole stateful loop is added under new names | Accepted; existing state untouched, and the new store starts where its source has got to |
-| A route serving statelessly gains a transactional writer | Accepted; the writer commits from the next request and replays none the route already answered |
+| A whole stateful loop is added under new names | Accepted; existing state untouched. It folds its input whole where this version can build that input again, and from where that input starts where it cannot — reported in the second case |
+| A route serving statelessly gains a transactional writer | Accepted and reported; the writer commits from the next request, replaying none the route already answered |
 | A route is added | Accepted; it serves as soon as the swap completes |
 | A route is removed | Accepted; the route is retired and answers 404 |
 | A loop loses an accumulator | Refused, naming it |

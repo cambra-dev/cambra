@@ -475,7 +475,8 @@ what must hold for the answer to be defined.
 The model is stated per term, so it presupposes a **correspondence**: a partial injection from the
 terms of `P₁` to the terms of `P₂` pairing terms that compute the same function.
 [hot-reload.md](/src/ccl/design/hot-reload.md) derives one structurally and specifies which of a
-program's terms it covers. A term of `P₂` with no correspondent starts at `⊥`.
+program's terms it covers. A term of `P₂` with no correspondent starts at `⊥`, which property 4
+below qualifies: starting at `⊥` is not the same as starting with the whole input.
 
 ### What a reload computes
 
@@ -557,10 +558,31 @@ seed is a homomorphic image of what it summarizes, it is `⊥` only for `⊥`, a
 exactly when the summarized tile was. A tile of a different tiling satisfies none of them, which is
 why a reload that changes a stateful term's type is refused rather than reseeded.
 
+**4. Input availability.** An operator rebuilt from `⊥` computes `inject(f₂)` only where the input
+it reads is still the whole of what it reads. A term built from `P₂`'s own literals and terms
+satisfies that by construction, since everything below it is rebuilt with it. A term reading
+anything a consumer has **released** does not.
+
+Compaction (Section 3) lets an operator discard the part of its tile every consumer has released,
+so an operator `P₂` keeps holds only what `P₁`'s consumers had not released. Those consumers do not
+exist in `P₂`, and one `P₂` adds made no such promise, so what the added consumer can read is
+`split(inject(f), r).outside` for the released guard `r`. A data source is the same condition rather
+than an exception to it: it offers a new reader what its retired readers had not released, and
+`inject(source)` at the moment of the reload is what is left.
+
+Where the added consumer's own tiling expresses `r` — a per-position map over the input — that
+suffix is its part of the answer and the equation holds. Where it does not, by property 2 the
+consumer is an aggregate and its answer is a function of the whole input, so the reload is defined
+only if the whole is reachable: the input has to be rebuilt from `P₂`'s own terms rather than kept.
+Where it cannot be, the composite computes a value neither program denotes, and nothing in either
+program says whether that is what was meant — an aggregate declared over a stream may intend the
+whole or intend "from here", and the two are the same term.
+
 **Corollary — no retraction.** A tile carried across a reload only grows. Positivity (Section 1)
 makes `⊕` add information only, so compatibility gives this for every term whose tile is carried,
 and a consumer of one never sees progress it was given taken away. A term whose tile is not carried
-restarts from `⊥`, and every consumer of it is rebuilt along with it, so nothing observes the drop.
+restarts from `⊥`, and every consumer of it is rebuilt along with it, so nothing observes the drop,
+provided the rebuilt term reaches the same input — property 4.
 
 ### What the properties do not settle
 

@@ -46,7 +46,7 @@ use crate::ccl::{
 };
 use crate::interpreter::{
     Consumer,
-    operator_conversion::{ReuseTally, StateConflict},
+    operator_conversion::{ReuseTally, StateConflict, UnreadablePrefix},
     tile_operators::TileProducer,
 };
 
@@ -69,6 +69,11 @@ pub struct ReloadReport {
     pub diff: String,
     /// How much of the replaced version's graph the new one kept.
     pub reuse: ReuseTally,
+    /// The loops this version adds that begin above the beginning of what they
+    /// read. Empty for a reload that adds no loop over a consumed input, which
+    /// is every reload of a program whose collections are built rather than
+    /// read.
+    pub unreadable: Vec<UnreadablePrefix>,
 }
 
 impl LiveProgram {
@@ -142,10 +147,33 @@ impl LiveProgram {
             return Ok(format!("no difference at phase {phase:?}\n"));
         }
         Ok(format!(
-            "phase {phase:?}: {} divergence(s), {} shared root(s)\n\n{d}",
+            "phase {phase:?}: {} divergence(s), {} shared root(s)\n{}\n{d}",
             d.divergences().len(),
             d.shared_roots().len(),
+            self.unreadable_report(ctx, code)?,
         ))
+    }
+
+    /// The loops `code` adds that would begin above the beginning of what they
+    /// read, rendered for a diff, or the empty string when there are none.
+    ///
+    /// Answered by `/diff` as well as `/reload` so an author sees it before the
+    /// swap rather than in the report of one that already happened. It needs the
+    /// planned tree whatever phase the diff was asked at, so it compiles to
+    /// `Phase::Planning` itself — without opening ports, which is what separates
+    /// asking from doing.
+    fn unreadable_report(
+        &self,
+        ctx: &GlobalContext,
+        code: &str,
+    ) -> Result<String, Vec<CompileError>> {
+        let planned = ctx.sources_and_sinks().compile_to(code, Phase::Planning)?;
+        let unreadable = ctx.unreadable_inputs(&self.program.ast, &planned);
+        if unreadable.is_empty() {
+            return Ok(String::new());
+        }
+        let lines: Vec<String> = unreadable.iter().map(ToString::to_string).collect();
+        Ok(format!("\n{}\n", lines.join("\n")))
     }
 
     /// Replace this program with the version `code` describes.
@@ -235,6 +263,10 @@ may move between loops.{remedy}",
             ))]);
         }
 
+        // Read before teardown, off the same planned tree the guard used, so this
+        // and `/diff` answer alike and neither has to walk a graph that is gone.
+        let unreadable = ctx.unreadable_inputs(&self.program.ast, &planned);
+
         self.tear_down();
         ctx.retire_version();
         // The tree the running graph was built from is still here — `tear_down`
@@ -248,6 +280,7 @@ may move between loops.{remedy}",
         Ok(ReloadReport {
             diff,
             reuse: ctx.reuse(),
+            unreadable,
         })
     }
 

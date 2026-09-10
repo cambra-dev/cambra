@@ -416,6 +416,10 @@ pub struct OpConversionContext {
     /// Installed by [`set_var_paths`](Self::set_var_paths) before conversion
     /// begins; empty for a context converting no `Transact`.
     var_paths: HashMap<NodeId, Vec<VarPath>>,
+    /// The nodes of that tree a fresh compilation would not reproduce, from
+    /// [`unrecomputable_nodes`]. Installed by the same call, because both answer
+    /// about the tree rather than about the compilation.
+    unrecomputable: HashSet<NodeId>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
     /// `let __hist = Transact{…}` builds the shared store once and mutable variables
     /// it here; each variable read `__hist.k` projects key `k` off the shared
@@ -603,13 +607,16 @@ impl OpConversionContext {
         Self::default()
     }
 
-    /// Install the identities the tree about to be converted declares.
+    /// Install what the tree about to be converted says about itself: the
+    /// identities it declares, and which of its terms a rebuild would reproduce.
     ///
     /// Read off the tree once, before conversion, so a store is built under the
     /// identity the guard checked it against rather than under a second
-    /// derivation of one.
+    /// derivation of one, and so a rebuild is declined against the same reading
+    /// of the tree the guard refused against.
     pub fn set_var_paths(&mut self, expr: &Expr) {
         self.var_paths = mutable_variable_paths(expr);
+        self.unrecomputable = unrecomputable_nodes(expr);
     }
 
     /// Install where each node of the tree about to be converted stood in the
@@ -658,6 +665,15 @@ impl OpConversionContext {
     /// Look up `name` from innermost scope outward.
     pub(crate) fn lookup(&self, name: &Name) -> Option<&LetBinding> {
         self.scopes.lookup(name)
+    }
+
+    /// Whether a fresh compilation of `term` reproduces the value it holds.
+    ///
+    /// Read off the walk [`set_var_paths`](Self::set_var_paths) runs, so the
+    /// answer is the same one the guard checked this version against. Every term
+    /// is recomputable outside a reload, since nothing has been released.
+    fn recomputable(&self, term: &Expr) -> bool {
+        !self.unrecomputable.contains(&term.node_id())
     }
 
     /// Whether the operator behind `bound_expr` may be kept — that is, whether
@@ -709,12 +725,20 @@ impl OpConversionContext {
             "the identity walk and conversion disagree about how many variables this store declares"
         );
 
-        let keepable = self
+        let correspondent = self
             .reads_only_kept(bound_expr)
-            .then(|| self.keepable(bound_expr))
+            .then(|| self.correspondent(bound_expr))
             .flatten();
-        let info = match keepable {
-            Some(Recorded::Store(info)) => {
+        // A spent store answers its variable reads with nothing, so it is rebuilt
+        // and reseeded from the value it is still holding — the handover carries
+        // that value whatever the operator can produce
+        // ([`live_state`](Self::live_state)). Rebuilding for that reason does not
+        // change what the store computes, so it is not recorded as rebuilt.
+        let spent = correspondent
+            .as_ref()
+            .is_some_and(|e| e.fan().released_in_full());
+        let info = match correspondent {
+            Some(Recorded::Store(info)) if !spent => {
                 self.reuse.kept += 1;
                 trace!("keeping store for binding {name}");
                 // The store's own iteration inputs stay in the running graph and
@@ -727,9 +751,11 @@ impl OpConversionContext {
                 "a `Transact` node's entry is a store: `bind_store` is the only site that \
 records one and the only site a `Transact` reaches"
             ),
-            None => {
+            correspondent => {
                 trace!("building store for binding {name}");
-                self.rebuilt.insert(name.clone());
+                if correspondent.is_none() {
+                    self.rebuilt.insert(name.clone());
+                }
                 build_transact_store(keys, writers, domain, &paths, self)?
             }
         };
@@ -757,8 +783,19 @@ records one and the only site a `Transact` reaches"
     /// What it still holds is not everything it ever produced. A `Memo` drops
     /// what its consumers release, so what a new version inherits is bounded by
     /// what the retired one had finished with, and the new subscriber's release
-    /// guard starts at what the fan-out has already released. A binding released
-    /// in full is not kept at all ([`keepable`](Self::keepable)).
+    /// guard starts at what the fan-out has already released. An operator
+    /// released in full holds nothing at all
+    /// ([`FanOut::released_in_full`]), so the binding is rebuilt — which
+    /// reproduces what the spent one held only where the term is recomputable
+    /// ([`unrecomputable_nodes`]), and where it is not the spent operator is
+    /// still the whole of what this version can have.
+    ///
+    /// A rebuild for that reason is not a change to what the binding computes,
+    /// and is not recorded as one: a recurrence reading it may still take the
+    /// retired iteration and continue where it had got to. `rebuilt` names the
+    /// bindings whose value this version changed, which is what makes reading one
+    /// make progress meaningless
+    /// ([`reads_only_kept`](Self::reads_only_kept)).
     ///
     /// Reuse is declined for a binding compiled under an iteration
     /// ([`BindingKind::Aligned`]). Such an operator is parameterized by the
@@ -777,10 +814,15 @@ records one and the only site a `Transact` reaches"
         };
         let node = bound_expr.node_id();
         self.reuse.bound += 1;
-        let keepable = (kind == BindingKind::Free && self.reads_only_kept(bound_expr))
-            .then(|| self.keepable(bound_expr))
+        let correspondent = (kind == BindingKind::Free && self.reads_only_kept(bound_expr))
+            .then(|| self.correspondent(bound_expr))
             .flatten();
-        if let Some(entry) = keepable {
+        let spent_but_rebuildable = correspondent
+            .as_ref()
+            .is_some_and(|e| e.fan().released_in_full() && self.recomputable(bound_expr));
+        if let Some(entry) = correspondent
+            && !spent_but_rebuildable
+        {
             self.reuse.kept += 1;
             trace!("keeping operator for binding {name}");
             // What is under this binding stays in the running graph, and this
@@ -802,7 +844,9 @@ records one and the only site a `Transact` reaches"
         // iteration use-driven (lazy `Let` compilation / DCE) so this eager
         // compile is no longer forced.
         trace!("building operator for binding {name}");
-        self.rebuilt.insert(name.clone());
+        if !spent_but_rebuildable {
+            self.rebuilt.insert(name.clone());
+        }
         let bound_op = convert_impl(bound_expr, bound_input, self)?;
         let fan = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
         // An `Aligned` operator is offered to the next version even though it
@@ -816,10 +860,12 @@ records one and the only site a `Transact` reaches"
     /// What the previous version holds at the node `term` corresponds to, or
     /// `None` when the two versions do not correspond there.
     ///
-    /// The lookup and nothing else. A caller that needs the entry to still
-    /// *supply* something wants [`keepable`](Self::keepable) instead; this one
-    /// answers for a caller that reuses a fan-out for the progress it recorded,
-    /// which a spent operator reports as well as a live one.
+    /// The lookup and nothing else: it says the two versions compute the same
+    /// thing here, and says nothing about whether the operator can still supply
+    /// it. Both callers care about that and neither reads it the same way — a
+    /// recurrence continuing over an input wants the progress a spent operator
+    /// records as much as a live one's, while a binding wants an operator its
+    /// readers can pull — so each asks its own question of what this returns.
     fn correspondent(&self, term: &Expr) -> Option<Recorded> {
         self.inherited
             .entries
@@ -827,34 +873,34 @@ records one and the only site a `Transact` reaches"
             .cloned()
     }
 
-    /// The operator the previous version bound at the node `term` corresponds to
-    /// and that can still produce, or `None`.
-    ///
-    /// [`correspondent`](Self::correspondent) plus the one condition that
-    /// separates reuse-for-what-it-supplies from reuse-for-where-it-got-to: an
-    /// operator whose subscribers released it in full has told its input that
-    /// nothing will be read again, a [`Memo`] input drops what it holds in
-    /// response, and it can then only answer empty
-    /// ([`FanOut::released_in_full`]). Binding a name to it, or seeding a store
-    /// from it, hands on nothing —
-    /// `a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding`
-    /// is the case, and it panics inside `InductionStore::subscribe` without
-    /// this.
-    ///
-    /// The decline happens where the operator would be taken rather than by
-    /// withholding it from the handover, because the handover is also the ledger
-    /// [`live_state`](Self::live_state) and
-    /// [`state_conflicts`](Self::state_conflicts) read: a store that can no
-    /// longer produce still holds the value its variables hand on.
-    fn keepable(&self, term: &Expr) -> Option<Recorded> {
-        self.correspondent(term)
-            .filter(|e| !e.fan().released_in_full())
-    }
-
     /// The operator a recurrence iterates, and the first position it will offer:
     /// `term` built behind a fan-out this compilation records, or a branch off
     /// the fan-out the previous version recorded at the node `term` corresponds
     /// to.
+    ///
+    /// The seam a `Let` gets from being a sharing point, made available at a node
+    /// that is not one. A fan-out is what carries a producer across a version: it
+    /// owns the producer it subscribed and re-points the notification to the new
+    /// version's branch, which is why a producer cannot be moved between graphs
+    /// any other way — a producer's consumer is fixed at
+    /// [`subscribe`](TileOperator::subscribe) and a moved one would go on waking
+    /// the retired version's. An iteration is where that matters most:
+    /// `IterateExtentProducer` holds the extent it has left as an interval set
+    /// that shrinks when a position is released, so how far a drive has got is in
+    /// that producer and nowhere else, and a rebuilt one offers every position
+    /// again.
+    ///
+    /// **Which input the recurrence may read.** `continues` says whether it
+    /// carries a value from the version being replaced. One that does has folded
+    /// every position that value summarizes, so the kept iteration holds exactly
+    /// what it has left and the recurrence starts one above its release. One that
+    /// carries nothing starts at the value it declares, which summarizes no
+    /// position, so it reads its input from the beginning — and a kept iteration
+    /// cannot offer one, having released the prefix on behalf of consumers the
+    /// new version does not have. Rebuilding recovers those positions where the
+    /// term is recomputable ([`unrecomputable_nodes`]) and nothing recovers them
+    /// where it is not, which the guard refuses before teardown
+    /// ([`unreadable_inputs`](Self::unreadable_inputs)).
     ///
     /// `fresh_start` is where a freshly-built iteration begins, and the caller
     /// picks it. An induction store passes [`source_start`], which is `0` for a
@@ -863,55 +909,52 @@ records one and the only site a `Transact` reaches"
     /// source still offers rather than the one it is based at
     /// ([`TransactDriver`](crate::interpreter::commit_operator::TransactDriver)).
     ///
-    /// The seam a `Let` gets from being a sharing point, made available at a node
-    /// that is not one. A fan-out is what carries a producer across a version: it
-    /// owns the producer it subscribed and re-points the notification to the new
-    /// version's branch, which is why a producer cannot be moved between graphs
-    /// any other way — a producer's consumer is fixed at
-    /// [`subscribe`](TileOperator::subscribe) and a moved one would go on waking
-    /// the retired version's.
-    ///
-    /// Placed where a rebuild would lose progress that cannot be recomputed. An
-    /// iteration is that case: `IterateExtentProducer` holds the extent it has
-    /// left as an interval set that shrinks when a position is released, so how
-    /// far a drive has got through its source is in that producer and nowhere
-    /// else, and a rebuilt one offers every position again.
-    ///
     /// Two things differ from [`bind_let`](Self::bind_let):
     ///
-    /// - The lookup is [`correspondent`](Self::correspondent) rather than
-    ///   [`keepable`](Self::keepable), so a released-in-full operator is taken.
-    ///   Released in full is what a finished iteration looks like, and a branch
-    ///   off it yields nothing further, which is the state the drive is in.
-    ///   Declining it would restart the iteration.
+    /// - A released-in-full operator is taken rather than rebuilt, for a
+    ///   recurrence that continues over it. Released in full is what a finished
+    ///   iteration looks like, and a branch off it yields nothing further, which
+    ///   is the state the drive is in.
     /// - No [`Memo`] is interposed. One reader pulls this, so there is nothing to
     ///   share, and a memo would drop what a full release told it to drop.
     fn iteration_input(
         &mut self,
         term: &Expr,
         fresh_start: usize,
+        continues: bool,
         build: impl FnOnce(&mut Self) -> Result<Box<dyn TileOperator>, ConversionError>,
     ) -> Result<IterationInput, ConversionError> {
         let node = term.node_id();
         self.reuse.bound += 1;
         // Reading a rebuilt binding makes the progress meaningless: the positions
         // this got through are positions of something the reload replaced.
-        if self.reads_only_kept(term)
-            && let Some(kept) = self.correspondent(term)
-        {
-            self.reuse.kept += 1;
-            self.keep_region(term, kept.fan());
-            let fan = kept.fan().clone();
-            // Where the kept iteration has got to, read off the fan rather than
-            // carried alongside the values: what a recurrence may start on is a
-            // property of the input it reads, and the input is right here.
-            let first_position = fan.released_position().map_or(fresh_start, |p| p + 1);
-            trace!("keeping iteration operator: first_position={first_position}");
-            self.record(node, kept);
-            return Ok(IterationInput {
-                op: fan.branch(),
-                first_position,
-            });
+        let kept = self
+            .reads_only_kept(term)
+            .then(|| self.correspondent(term))
+            .flatten();
+        if let Some(kept) = kept {
+            let released = kept.fan().released_position();
+            // A recurrence that carries nothing reads its input from the
+            // beginning, which a rebuild supplies for a recomputable term. Where
+            // it is not recomputable the kept iteration is the whole of what is
+            // available, so it is taken and the loop is reported as beginning
+            // above its input ([`unreadable_inputs`](Self::unreadable_inputs)).
+            if continues || released.is_none() || !self.recomputable(term) {
+                self.reuse.kept += 1;
+                self.keep_region(term, kept.fan());
+                let fan = kept.fan().clone();
+                // Where the kept iteration has got to, read off the fan rather
+                // than carried alongside the values: what a recurrence may start
+                // on is a property of the input it reads, and the input is right
+                // here.
+                let first_position = released.map_or(fresh_start, |p| p + 1);
+                trace!("keeping iteration operator: first_position={first_position}");
+                self.record(node, kept);
+                return Ok(IterationInput {
+                    op: fan.branch(),
+                    first_position,
+                });
+            }
         }
         let op = build(self)?;
         let fan = Rc::new(FanOut::new(op));
@@ -1040,6 +1083,98 @@ in it has a correspondent",
         out
     }
 
+    /// Every variable `planned` declares whose loop begins above the beginning of
+    /// what it reads.
+    ///
+    /// A variable that carries a value has had every position that value
+    /// summarizes folded into it, so its loop resumes above them and asks its
+    /// input for nothing it has given away. A variable that carries none starts
+    /// at the value it declares, which summarizes no position, so it wants its
+    /// loop's input from the beginning. The two travel together — one loop drives
+    /// one position sequence — so a variable added to a loop that carries another
+    /// begins wherever that loop resumes, which is why this answers per variable
+    /// rather than per store.
+    /// The beginning is available only where the input can be built again: an
+    /// operator this version keeps holds what the retired program's readers had
+    /// not released, and a source offers a new producer what its retired
+    /// producers had not released, which is the same condition read off two
+    /// mechanisms.
+    ///
+    /// Rebuilding recovers those positions where the term is recomputable
+    /// ([`unrecomputable_nodes`]) and nothing recovers them where it is not. This
+    /// reports the second case. It does not refuse it, because there is nothing
+    /// better available: the elements are gone, so folding from where the input
+    /// starts is all that is left, and whether the author meant a running total
+    /// from here or a view of history is not something the source says. The
+    /// intended answer is for the declaration to state which
+    /// (`src/ccl/design/hot-reload.md`, "A variable that begins above its loop's input"),
+    /// and naming it is what makes the choice visible until then.
+    ///
+    /// Read off the planned tree before anything is torn down, so `/diff` answers
+    /// it as well as `/reload`.
+    pub fn unreadable_inputs(&self, previous: &Expr, planned: &Expr) -> Vec<UnreadablePrefix> {
+        let correspondence = Correspondence::of(&crate::ccl::diff::diff(previous, planned));
+        let unrecomputable = unrecomputable_nodes(planned);
+        let carried = self.live_state();
+        let sources = writer_sources(planned);
+        let mut out = Vec::new();
+
+        for (node, paths) in mutable_variable_paths(planned) {
+            // Per variable, not per store: one loop drives one position sequence,
+            // so a variable this version adds to a loop that carries another
+            // begins wherever that loop resumes.
+            let fresh: Vec<&VarPath> = paths
+                .iter()
+                .filter(|path| !carried.contains_key(*path))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            let continues = fresh.len() < paths.len();
+            let Some(writer_sources) = sources.get(&node) else {
+                continue;
+            };
+            for source in writer_sources {
+                // A store where nothing carries and whose input this version can
+                // build again gets a fresh iteration, which starts at `0`.
+                if !continues && !unrecomputable.contains(&source.node_id()) {
+                    continue;
+                }
+                // Where the loop will begin, by the same two answers
+                // `iteration_input` chooses between. The kept iteration's
+                // release is read from this version's own ledger, which is still
+                // `minted` here: `retire_version` has not run.
+                let kept = correspondence
+                    .previous(source.node_id())
+                    .and_then(|prev| self.minted.entries.get(&prev))
+                    .and_then(|entry| entry.fan().released_position());
+                let begins = match kept {
+                    Some(released) => released + 1,
+                    // Read off the input's own domain rather than the store's,
+                    // because the two store kinds are told this differently and
+                    // both read the same elements. An induction drive is based at
+                    // the source's first offered position; a commit drive is
+                    // based at `0` and scans up to it. Where the loop begins is
+                    // the source's answer either way.
+                    None => source
+                        .ty
+                        .domain()
+                        .map_or(0, |d| source_start(&strip_refinements(&d), self)),
+                };
+                if begins == 0 {
+                    continue;
+                }
+                out.extend(fresh.iter().map(|path| UnreadablePrefix {
+                    path: (*path).clone(),
+                    positions: begins,
+                }));
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out.dedup();
+        out
+    }
+
     /// The value each mutable variable currently holds, by the identity state is
     /// carried under. Readable before the version is retired, so a replacement
     /// can be checked against what it would inherit.
@@ -1093,9 +1228,10 @@ identities is not distinguishing them",
     /// replacement to subscribe to it.
     ///
     /// Hands on every entry, including ones whose subscribers released them in
-    /// full. Those can no longer produce, and [`keepable`](Self::keepable)
-    /// declines them for that reason at every site but an iteration input, but
-    /// the value a store's variables hand on is still readable off its fan.
+    /// full. Those can no longer produce, so a binding standing behind one is
+    /// rebuilt where its term is recomputable ([`bind_let`](Self::bind_let)), but
+    /// the value a store's variables hand on is still readable off its fan and
+    /// the progress a recurrence continues from is still recorded on it.
     pub fn into_inheritance(mut self) -> Inheritance {
         for entry in self.minted.entries.values() {
             entry.fan().reopen();
@@ -2486,6 +2622,14 @@ fn build_commit_store(
     // distinct per-key extents, not whichever key was iterated last. A
     // homogeneous store collapses the union to its single extent (the common
     // case, unchanged).
+    // Whether this store continues a recurrence the retired version was running.
+    // A store carrying a value has folded the positions that value summarizes, so
+    // its drive resumes above them; one carrying none starts at its declared init
+    // and has folded nothing, so its drive needs its source from the beginning.
+    let continues = paths
+        .iter()
+        .any(|path| ctx.inherited.mutable_state.contains_key(path));
+
     let mut value_extents: Vec<Extent> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
@@ -2583,7 +2727,9 @@ fn build_commit_store(
         let IterationInput {
             op: source_op,
             first_position: drive_resume,
-        } = ctx.iteration_input(&w.source, 0, |ctx| convert_impl(&w.source, None, ctx))?;
+        } = ctx.iteration_input(&w.source, 0, continues, |ctx| {
+            convert_impl(&w.source, None, ctx)
+        })?;
         // The body's input is the driver's tile, `(snap_{k₀}, …, item)`; the
         // snapshot columns carry each read key's per-commit value extent.
         let read_extents: Vec<Extent> = w
@@ -2834,6 +2980,83 @@ pub fn mutable_variable_paths(expr: &Expr) -> HashMap<NodeId, Vec<VarPath>> {
     out
 }
 
+/// Each `Transact` in `expr`, by its node, with the iteration source of every
+/// writer it has.
+///
+/// Keyed the way [`mutable_variable_paths`] is, so the two read together. That
+/// walk carries a store's identities and this one carries its inputs; both are
+/// one pass, because a lookup per store over the whole tree is quadratic in a
+/// program's stores.
+fn writer_sources(expr: &Expr) -> HashMap<NodeId, Vec<&Expr>> {
+    fn go<'e>(e: &'e Expr, out: &mut HashMap<NodeId, Vec<&'e Expr>>) {
+        if let TypedExprNode::Transact { writers, .. } = &e.node {
+            out.insert(e.node_id(), writers.iter().map(|w| &w.source).collect());
+        }
+        e.walk_children(|child| go(child, out));
+    }
+    let mut out = HashMap::new();
+    go(expr, &mut out);
+    out
+}
+
+/// Every node of `expr` whose value a fresh compilation would **not** reproduce.
+///
+/// A term is **recomputable** when building it again yields what it held. A
+/// literal is, and so is any term built only from recomputable terms. A term
+/// that reads a data source is not: a source hands a new producer only what its
+/// retired ones had not finished
+/// (`src/interpreter/producer_releases.rs`), so a rebuild
+/// sees a suffix where the term's own meaning names the whole.
+///
+/// This is what a reload needs in order to decide between rebuilding a term and
+/// refusing. Deriving it from the tree is what keeps the decision off the
+/// author: reading a source is a syntactic property of a term, and every other
+/// term's answer is its children's.
+///
+/// A `Var` answers for what its binding was bound to, so a term reading a
+/// mutable variable is unrecomputable through the `Transact` that declares it —
+/// the store folds a source, and a rebuilt store folding the suffix holds a
+/// different value. A name the walk never saw bound is treated as recomputable:
+/// a free name at this point is a builtin, and the tree reaching planning is
+/// point-free.
+pub fn unrecomputable_nodes(expr: &Expr) -> HashSet<NodeId> {
+    fn go(e: &Expr, bound: &mut Vec<(Name, bool)>, out: &mut HashSet<NodeId>) -> bool {
+        let mut unrecomputable = match &e.node {
+            TypedExprNode::Source(_) => true,
+            TypedExprNode::Var(name) => bound
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .is_some_and(|(_, u)| *u),
+            _ => false,
+        };
+        // A `Let`'s binding is in scope for its body and not for its bound
+        // expression, so the two halves are walked either side of the push.
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = &e.node
+        {
+            let bound_is = go(bound_expr, bound, out);
+            bound.push((binding.name.clone(), bound_is));
+            let body_is = go(body, bound, out);
+            bound.pop();
+            unrecomputable |= bound_is | body_is;
+        } else {
+            e.walk_children(|child| unrecomputable |= go(child, bound, out));
+        }
+        if unrecomputable {
+            out.insert(e.node_id());
+        }
+        unrecomputable
+    }
+
+    let mut out = HashSet::new();
+    go(expr, &mut Vec::new(), &mut out);
+    out
+}
+
 /// One mutable variable as the identity walk sees it.
 struct MutableVariable<'e> {
     path: VarPath,
@@ -2947,6 +3170,33 @@ pub enum StateConflict {
     Moved { path: VarPath, now: VarPath },
 }
 
+/// A loop this version declares that begins above the beginning of what it
+/// reads.
+///
+/// Reported rather than refused: the elements are gone, so folding from where
+/// the input starts is the only thing left to do, and whether that is what the
+/// author meant is not something the source says. Naming it is what makes the
+/// choice visible until the source can state it — see
+/// [`unreadable_inputs`](OpConversionContext::unreadable_inputs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadablePrefix {
+    /// The variable the loop accumulates into.
+    pub path: VarPath,
+    /// How many positions of its input it will not see.
+    pub positions: usize,
+}
+
+impl std::fmt::Display for UnreadablePrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} starts at the value it declares and reads its input from element {}: the first {} \
+             were released before this version existed, so they are not in its value",
+            self.path, self.positions, self.positions,
+        )
+    }
+}
+
 impl std::fmt::Display for StateConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3044,6 +3294,14 @@ fn build_induction_store_single(
     let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
     let domain = strip_refinements(domain);
 
+    // Whether this store continues a recurrence the retired version was running.
+    // A store carrying a value has folded the positions that value summarizes, so
+    // its drive resumes above them; one carrying none starts at its declared init
+    // and has folded nothing, so its drive needs its source from the beginning.
+    let continues = paths
+        .iter()
+        .any(|path| ctx.inherited.mutable_state.contains_key(path));
+
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
     // leading-carry fold default.
@@ -3138,7 +3396,7 @@ resolves to the other's value",
     let IterationInput {
         op: source_op,
         first_position: resume_at,
-    } = ctx.iteration_input(&w.source, source_start(&domain, ctx), |ctx| {
+    } = ctx.iteration_input(&w.source, source_start(&domain, ctx), continues, |ctx| {
         convert_impl(&w.source, None, ctx)
     })?;
     let read_extents: Vec<Extent> = w
@@ -3889,6 +4147,72 @@ fn convert_flatten_domain(
         convert_impl(argument, None, ctx)?,
         flatten_indices,
     )))
+}
+
+#[cfg(test)]
+mod recomputability_tests {
+    use super::*;
+    use crate::ccl::{Lit, TypedExpr};
+
+    fn source(name: &str) -> TypedExpr {
+        TypedExpr::new(TypedExprNode::Source(name.to_string()))
+    }
+
+    #[test]
+    fn a_term_built_from_literals_is_recomputable() {
+        let e = TypedExpr::let_bind(
+            "a",
+            TypedExpr::lit(Lit::Int(1)),
+            TypedExpr::let_bind("b", TypedExpr::var("a"), TypedExpr::var("b")),
+        );
+        assert!(
+            unrecomputable_nodes(&e).is_empty(),
+            "nothing here reads a source"
+        );
+    }
+
+    #[test]
+    fn reading_a_source_reaches_every_term_above_it_and_every_use_of_its_binding() {
+        let bound = source("orders");
+        let use_in_body = TypedExpr::var("a");
+        let (bound_id, use_id) = (bound.node_id(), use_in_body.node_id());
+        let e = TypedExpr::let_bind("a", bound, use_in_body);
+
+        let out = unrecomputable_nodes(&e);
+        assert!(out.contains(&bound_id), "the source itself");
+        assert!(
+            out.contains(&use_id),
+            "a `Var` answers for what it is bound to"
+        );
+        assert!(out.contains(&e.node_id()), "and the term above both");
+    }
+
+    #[test]
+    fn a_binding_is_out_of_scope_in_its_own_bound_expression_and_after_its_body() {
+        // `let a = <source> in a` sits under `let a = 1 in …`, so the outer `a`
+        // and the inner one are different bindings that share a spelling. The
+        // walk must answer for the innermost one in the inner body and for the
+        // outer one everywhere else — a scope stack rather than a map.
+        let outer_use = TypedExpr::var("a");
+        let inner_use = TypedExpr::var("a");
+        let (outer_id, inner_id) = (outer_use.node_id(), inner_use.node_id());
+        let inner = TypedExpr::let_bind("a", source("orders"), inner_use);
+        let e = TypedExpr::let_bind(
+            "a",
+            TypedExpr::lit(Lit::Int(1)),
+            TypedExpr::tuple(vec![inner, outer_use]),
+        );
+
+        let out = unrecomputable_nodes(&e);
+        assert!(
+            out.contains(&inner_id),
+            "the inner `a` is the source-bound one"
+        );
+        assert!(
+            !out.contains(&outer_id),
+            "the outer `a` is bound to a literal, and the inner binding is out of scope for it"
+        );
+    }
 }
 
 #[cfg(test)]

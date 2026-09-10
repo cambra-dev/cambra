@@ -58,8 +58,10 @@ fn poll_control(
                 // the driver for one pass.
                 *new_data.borrow_mut() = true;
                 let ReuseTally { kept, bound } = report.reuse;
+                let unreadable: String =
+                    report.unreadable.iter().map(|u| format!("\n{u}")).collect();
                 ControlReply::ok(format!(
-                    "reloaded: {kept}/{bound} operators kept\n\n{}",
+                    "reloaded: {kept}/{bound} operators kept{unreadable}\n\n{}",
                     report.diff
                 ))
             }

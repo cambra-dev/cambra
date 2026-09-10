@@ -3104,12 +3104,12 @@ pub struct TransactDriver {
     base: OperatorBase,
     /// The first source position this drive attempts.
     ///
-    /// `0` for a drive that starts with its source. A drive over a *source* needs
-    /// no more than that: the source outlives the version and offers a
-    /// replacement only what its retired producers had not finished, so the
-    /// prefix this drive committed is already withdrawn. A drive over a
-    /// collection has no such cut — the collection is rebuilt with the version —
-    /// so a replacement is told where its predecessor had reached.
+    /// `0` for a drive that starts with its source, whatever that source has
+    /// already delivered: this drive finds its next item by scanning up from its
+    /// cursor rather than being based at a position, so a position the source no
+    /// longer offers costs it a comparison where an induction drive's window
+    /// would stall. A drive continuing a retired one is told where its
+    /// predecessor had reached, so it commits no position twice.
     resume_at: usize,
     /// The store read back through the cyclic `FanOut`.
     store_op: Box<dyn TileOperator>,

@@ -49,10 +49,12 @@ enough information to produce correct future output without keeping the full til
 A **reload** replaces a running program's operators with those of a new program while its tiles are
 non-`⊥`. Each term then keeps the tile it holds and combines it with the part of the new version's
 answer that a `split` puts outside it, so what a reload computes depends on the tiles the program
-held when it happened. Three properties make one well defined: every tile the replacement produces
+held when it happened. Four properties make one well defined: every tile the replacement produces
 combines with the tile its term already holds, the guard that `split` needs exists in the term's
-guard algebra, and a rebuilt operator's future output is a function of its seed and its remaining
-input alone.
+guard algebra, a rebuilt operator's future output is a function of its seed and its remaining input
+alone, and a rebuilt operator reaches the whole of the input its term names — which one over a
+released input does not, the release having been a promise made by consumers the new version does
+not have.
 
 The three terms to keep distinct:
 
