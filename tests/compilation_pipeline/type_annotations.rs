@@ -718,3 +718,30 @@ fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
         "No Equatable instance for BinOp",
     )
 }
+
+/// A refinement in a `Map` key type that no key satisfies. The plain annotation reports it,
+/// and the `Mut` form reaches a pass boundary instead.
+///
+/// Neither program is well-typed today: a literal key carries `__elem == "a"`, and a
+/// refinement is discharged by matching the predicate rather than by proving it, so
+/// `__elem != ""` is not satisfied. What differs is the report. The plain
+/// annotation is an `Annotation mismatch` against the whole `Σ`, which names the
+/// annotation the program wrote; the mutable one panics at the post-inference boundary as
+/// an invalid tree, which reads as a compiler bug for a program that is simply rejected.
+///
+/// Pinned on both, so the day the `Mut` form reports a user error the pin says so.
+#[test]
+fn a_refined_map_key_no_key_satisfies() {
+    check_compile_error(
+        "m: Map({String where _ != \"\"}, Int) = map([(\"a\", 1), (\"z\", 2)])\nm\n",
+        "Annotation mismatch: annotated as \u{3a3} (\u{3c3} : SubtypesOf({String | __elem != \"\"}))",
+    )
+}
+
+#[test]
+fn a_refined_map_key_in_a_mut_annotation_reaches_the_boundary() {
+    check_compile_error(
+        "m: Mut(Map({String where _ != \"\"}, Int)) := box(map([(\"a\", 1), (\"z\", 2)]))\nm\n",
+        "produced an invalid tree: [Type mismatch for collection domain",
+    )
+}
