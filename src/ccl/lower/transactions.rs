@@ -265,8 +265,8 @@ fn lower_tx_block_inner(
             // `out << e` inside the block — a per-commit feed. Its value reads
             // the read-your-writes snapshot at this point (a bare mutable variable read
             // resolves to the just-written value); `transact_phase` collects it
-            // as a `to_<defer>` tap on the writer decision and hoists a
-            // `Feed(defer, __hist ▷ .to_<defer>)` into the mutable variable body, so each
+            // as a `__to_<defer>` tap on the writer decision and hoists a
+            // `Feed(defer, __hist ▷ .__to_<defer>)` into the mutable variable body, so each
             // emission carries *its own* commit's value. Mirrors the induction
             // phase's in-loop feeds (see `src/ccl/mut_elim.rs`).
             ChlStmt::Expr(value) if matches!(&value.node, ChlExpr::Feed { .. }) => {

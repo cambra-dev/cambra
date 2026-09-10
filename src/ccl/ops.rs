@@ -399,7 +399,7 @@ pub enum Builtin {
     ///
     /// Used by `lower_mutation_loop` to expose the scalar final
     /// accumulator of a Record-bodied loop, whose external type is
-    /// `Fun(D, Record({step, to_<defer>*}))`: the after-loop scalar acc is
+    /// `Fun(D, Record({step, __to_<defer>*}))`: the after-loop scalar acc is
     /// `(acc_stream ▷ Proj("step"), init) ▷ FinalOrDefault`.  The
     /// default is the pre-loop accumulator binding, so an
     /// empty-source loop (`for i in []: x += 1; x`) yields `init`

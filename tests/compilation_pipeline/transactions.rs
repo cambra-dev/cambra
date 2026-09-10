@@ -588,7 +588,7 @@ fn string_valued_store() {
 
 /// One writer feeds *two* distinct reply streams inside the same block; the
 /// program returns both as a tuple. Each rides the writer decision as its own
-/// `to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
+/// `__to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
 /// of squares) = 1,5,14 over commit ticks 1,2,3.
 #[test]
 fn two_reply_feeds_one_transaction() {

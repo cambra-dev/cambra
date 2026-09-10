@@ -435,7 +435,7 @@ fn scalar_define_into_defer_is_rejected() {
 
 /// Type errors in defer programs are reported against the *user's* program
 /// shape: inference now runs before `channelize`, so the rendered
-/// message must not leak channelize artifacts (floated parameters, `to_<defer>`
+/// message must not leak channelize artifacts (floated parameters, `__to_<defer>`
 /// record fields, channel unions, scope-out bindings).
 #[rstest]
 #[timeout(Duration::from_secs(1))]

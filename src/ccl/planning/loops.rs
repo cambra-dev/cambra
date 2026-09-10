@@ -279,7 +279,7 @@ enum TxnBinding {
     History,
     /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩ ▷ zip`.
     Commit,
-    /// `to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field`.
+    /// `__to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field`.
     Tap,
 }
 
@@ -514,7 +514,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         }
     }
 
-    // Variable record `{key.field_key(): Fun(Txn, V), …, to_<defer>: Fun(Txn, V)}`
+    // Variable record `{key.field_key(): Fun(Txn, V), …, __to_<defer>: Fun(Txn, V)}`
     // — mutable variable keys (key order) then tap virtual keys (feed order), the exact
     // field order op-conversion\'s `emit_transact`/`build_commit_store` produce.
     let mut hist_field_tys: Vec<(String, Type)> = key_ty
@@ -643,9 +643,10 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
 /// ```
 ///
 /// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
-/// defaults tuple; the source off the snapshot\'s trailing slot. Reads of
-/// `__hist` in the letrec body (`__hist ≫ .writes ≫ .i` extracts and
-/// `__hist ≫ .to_<feed>` taps) become history-record projections.
+/// defaults record, under the accumulators\' own labels; the source off the
+/// snapshot\'s trailing slot. Reads of `__hist` in the letrec body
+/// (`__hist ≫ .writes ≫ .acc` extracts and `__hist ≫ .__to_<feed>` taps) become
+/// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
     // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
@@ -777,8 +778,8 @@ fn hist_field_read(hist: &Name, hist_ty: &Type, field: String, field_ty: Type) -
 
 /// Rewrite every `__hist` view in the letrec body to a history-record
 /// projection `__hist.field`. The phase builds accumulator reads as the flat
-/// compose `__hist ≫ .writes ≫ .acc` and feed reads as `__hist ≫ .to_<feed>`;
-/// downstream normalization may extend those composes (`__hist ≫ .to ≫ f`),
+/// compose `__hist ≫ .writes ≫ .acc` and feed reads as `__hist ≫ .__to_<feed>`;
+/// downstream normalization may extend those composes (`__hist ≫ .__to ≫ f`),
 /// so the match is on the *prefix*, keeping any tail elements.
 fn rewrite_hist_reads(
     e: &mut Expr,
@@ -792,7 +793,7 @@ fn rewrite_hist_reads(
     if let TypedExprNode::Compose(elts) = &e.node
         && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
         // The phase now interposes a ``variant_project(`commit)`` step between the
-        // history var and the `.writes`/`.to_<feed>` reads, eliminating the
+        // history var and the `.writes`/`.__to_<feed>` reads, eliminating the
         // `` {`commit{𝑃} | `abort} `` decision to its dense payload. Skip it, then
         // match the payload-field prefix as before (`elts[2]`/`elts[3]`).
         && matches!(
@@ -831,7 +832,7 @@ fn rewrite_hist_reads(
                     Some((hist_field_read(hist, hist_ty, acc.clone(), field_ty), 4))
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-                    // A tap read ``__hist ≫ variant_project(`commit) ≫ .to_<feed>``:
+                    // A tap read ``__hist ≫ variant_project(`commit) ≫ .__to_<feed>``:
                     // its stream type is the history record\'s field type.
                     let field = f.clone();
                     let field_ty = hist_ty_field(hist_ty, &field);

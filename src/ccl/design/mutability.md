@@ -961,8 +961,8 @@ verbatim (a `zip` is opaque to its shape parser), so no recognition change is ne
   input (rather than fanning the shared iteration input into it, which it would reject); `fan_in`
   then co-aligns the leaf accumulator stream with the input-driven request stream by domain position.
 - *Source decoding.* The co-iterated source's codomain is a `Record` (the `(item, acc(𝑟))` tuple);
-  `decode_source_items` decodes each position into a `Value::Record`, which the writer body reads off
-  its `._0` / `._𝑖` slots.
+  `decode_source_positioned` decodes each position into a `Value::Record` (`source_value_at`
+  descends the record's scalar columns), which the writer body reads off its `._0` / `._𝑖` slots.
 
 The accumulator stream is on the writer's own request domain, so it is position-aligned and needs no
 as-of latch. The `balance ↔ incr_commits` cycle is unchanged (`get_prev_txn`-guarded); `𝑐𝑛𝑡` sits
@@ -1022,7 +1022,7 @@ Three shapes:
   (the same `is_leaf_zip_arm` path as the commit-decision read above) — no new operator.
 
 **commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
-rides the writer decision as a `to_<defer>` tap, committed atomically with the mutable variable write and
+rides the writer decision as a `__to_<defer>` tap, committed atomically with the mutable variable write and
 read back as a per-commit value-stream (commit-tick-indexed). So it is **sequenced after the commit**
 and **gated**: a denied transaction (`if 𝑝:` false) proposes no write and emits no tap, replying
 nothing. The tap may read an induction accumulator (`resp << cnt`), which composes with the
@@ -1252,7 +1252,7 @@ one decision variant, whose `` `commit ``/`` `abort `` tag is a path condition, 
 over the local branch guards — so every path is evaluated in
 one straight-line writer body and one transaction is still one decision. Walking a block threads
 `(path, env)` (read-your-writes) and the block denotes
-`` snapshot ⇒ {`commit{writes, to_<defer>*} | `abort} `` — a decision **variant**
+`` snapshot ⇒ {`commit{writes, __to_<defer>*} | `abort} `` — a decision **variant**
 (`ccl_utils::wrap_decision_variant`) where:
 
 - **the `` `commit ``/`` `abort `` tag is chosen by the disjunction of the path-conditions of every

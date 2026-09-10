@@ -23,9 +23,9 @@
 //!
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
 //!    (its read/write footprint, its loop source, and a
-//!    `` {`commit{writes, to_<defer>*} | `abort} `` decision lambda built from the
+//!    `` {`commit{writes, __to_<defer>*} | `abort} `` decision lambda built from the
 //!    block by read-your-writes substitution — each in-block `<<` feed rides the
-//!    `` `commit `` payload as a `to_<defer>` tap). This is the **same** writer/key
+//!    `` `commit `` payload as a `__to_<defer>` tap). This is the **same** writer/key
 //!    building the direct fold used; only the assembly below differs.
 //! 2. **partitions** the keys into commit stores ([`partition_keys`]) and
 //!    **assembles** one `LetRec` per store (see [`plan_store`]): one **history** binding
@@ -57,7 +57,7 @@
 //! [`Builtin::FinalRead`] over the key's history binding. The two reads are **different
 //! terms** over the same history — [`Builtin::AsOfRead`] and [`Builtin::FinalRead`] — so
 //! neither pass can claim the other's read whatever the tree around it looks like. Each
-//! `to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
+//! `__to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
 //! ([`crate::ccl::mut_elim`]).
 //!
@@ -595,7 +595,7 @@ struct RawSite {
     source: Expr,
     /// The `with begin():` block body — a `Let`/`MutWrite`/`Case`/`Feed` chain
     /// ending in `Unit`, from which the decision lambda is built (feeds become
-    /// `to_<defer>` taps).
+    /// `__to_<defer>` taps).
     block: Expr,
     /// Variable keys read (snapshot) in the block, first-read order — the body's
     /// snapshot parameters.
@@ -613,10 +613,10 @@ struct RawSite {
 }
 
 /// A per-transaction feed (`out << e`) collected from a `with begin():` block:
-/// the target defer, the fresh `to_<defer>` tap field the writer decision's
+/// the target defer, the fresh `__to_<defer>` tap field the writer decision's
 /// `` `commit `` payload carries beside `writes`, and the tap value's type. The writer
 /// decision computes the tap value alongside the write set (read-your-writes at
-/// the feed's position); the phase hoists `Feed(defer, __hist ▷ .to_<defer>)`
+/// the feed's position); the phase hoists `Feed(defer, __hist ▷ .__to_<defer>)`
 /// into the mutable variable body so `channelize` routes it as an ordinary channel
 /// contribution — mirroring `mut_elim`'s in-loop induction feeds. The tap
 /// commits with the transaction (a denied `` `abort `` contributes no reply, since
@@ -808,7 +808,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
 
     // A monotone counter across **all** sites gives each tap field a name unique
     // within its mutable variable — two writers feeding the same defer contribute distinct
-    // `to_<defer>_k` keys, unioned by `channelize`. It stays global rather than
+    // `__to_<defer>_k` keys, unioned by `channelize`. It stays global rather than
     // per-store so two stores' taps cannot collide either. Feeds are kept *per site*
     // (parallel to `writers`) so each tap binding reads its own commit-record stream.
     let mut feed_counter = 0usize;
@@ -2028,7 +2028,7 @@ fn build_writer(
     //  - **Co-indexed** (`site_accs`) — written by this site's *own* loop, so the
     //    read is request-indexed. Threaded through the writer *source*: it becomes
     //    a `zip` of the loop iter and each accumulator's per-position view, so the
-    //    item the body sees is `(loop_item, acc0(r), …)` and the commit engine
+    //    item the body sees is `(loop_item, acc(r), …)` and the commit engine
     //    co-iterates the accumulator streams.
     //  - **Broadcast** (`broadcasts`) — written by a *different*, completed loop,
     //    so the read is that accumulator's final value: bind the body's reference
@@ -2076,7 +2076,7 @@ fn build_writer(
     if site_accs.is_empty() {
         env.insert(site.target.name.clone(), item);
     } else {
-        // The item is `(loop_item, acc0(r), …)`: the loop var reads slot 0, each
+        // The item is `(loop_item, acc(r), …)`: the loop var reads slot 0, each
         // threaded accumulator its own slot.
         env.insert(
             site.target.name.clone(),
@@ -2106,7 +2106,7 @@ fn build_writer(
     // own arm's writes) — the path-scoped deny semantics.
     let mut commit_paths: Vec<Expr> = Vec::new();
     // In-block `<<` feeds, each resolved to its read-your-writes value at its
-    // position in the block. Collected as `(defer, to_<defer>_k field, value,
+    // position in the block. Collected as `(defer, __to_<defer>_k field, value,
     // path)` — the control-flow path is the tap's fire condition.
     let mut collected_feeds: Vec<(Name, String, Expr, Expr)> = Vec::new();
     // The legal `MutWrite` targets inside this block: exactly the site's write
@@ -2147,10 +2147,10 @@ fn build_writer(
             .collect(),
     );
 
-    // Decision record `{commit, writes, to_<defer>*}` — built by the shared
+    // Decision record `{commit, writes, __to_<defer>*}` — built by the shared
     // `writer_decision_record` (the one place the tap encoding lives, so the
     // induction writer and this transaction writer stay in lockstep). The in-block
-    // feeds ride as `to_<defer>` taps, each holding its read-your-writes value
+    // feeds ride as `__to_<defer>` taps, each holding its read-your-writes value
     // under `` `fired `` on the positions its own path admits; `feed_sites` records
     // the defer/field/type the phase hoists.
     let feed_sites: Vec<FeedSite> = collected_feeds
@@ -2166,7 +2166,7 @@ fn build_writer(
         .map(|(_, field, val, fpath)| (field, val, fpath))
         .collect();
     let decision = crate::ccl::ccl_utils::writer_decision_record(commit.clone(), writes, &feeds);
-    // Wrap the `{commit, writes, to_<defer>*}` record into the decision **variant**
+    // Wrap the `{commit, writes, __to_<defer>*}` record into the decision **variant**
     // `` Case[commit → `commit(⟨writes, taps⟩); true → `abort] ``: the whole-transaction
     // grant/deny is the tag, the (dense) payload rides `commit`.
     let decision = crate::ccl::ccl_utils::wrap_decision_variant(decision);
@@ -2244,7 +2244,7 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
 /// applies its (unconditionally-evaluated) branch writes, gated at runtime by
 /// `commit` (a denied transaction proposes nothing). Each `<<` feed resolves its
 /// value in the current (post-write) `env` and records it into `feeds` as a
-/// `to_<defer>_k` tap contribution — `feed_counter` names it uniquely across the
+/// `__to_<defer>_k` tap contribution — `feed_counter` names it uniquely across the
 /// shared mutable variable's writers.
 fn walk_block(
     block: &Expr,
@@ -2321,7 +2321,7 @@ fn walk_block(
                     allowed_writes,
                 ),
                 // `out << e` — a per-commit reply. Resolve `e` at this position
-                // (read-your-writes) and record it as a `to_<defer>_k` tap on the
+                // (read-your-writes) and record it as a `__to_<defer>_k` tap on the
                 // decision. NB the tap value is emitted for *every* commit record,
                 // including a denied one (`commit: false`): the phase output does
                 // not itself gate the reply. "A denied transaction replies
@@ -2849,7 +2849,7 @@ fn plan_store(
         snap_tuple.ty = Type::Tuple(snap_tys);
 
         // decision = snapshot ▷ body — the writer's
-        // `` {`commit{writes, to_<defer>*} | `abort} `` decision, body embedded verbatim.
+        // `` {`commit{writes, __to_<defer>*} | `abort} `` decision, body embedded verbatim.
         let decision = apply_ty(snap_tuple, body, decision_ty.clone());
 
         // write_targets: the write-set keys' history bindings, in write order —
@@ -2965,7 +2965,7 @@ fn plan_store(
         // ("multiple writer sites for one variable merge their commit
         // streams... before the search"). Each view projects the site's
         // commit stream pointwise to `{time, write}` — the commit clock and
-        // this key's proposed value `decision.writes.i`. There is no grant/deny
+        // this key's proposed value `decision.writes.k`. There is no grant/deny
         // bit: the commit stream carries only committed transactions
         // (allocate-on-commit), so `get_prev_txn` searches the latest write
         // `≤ t` with no filter (matching its declared `{time, write}` codomain).

@@ -2360,9 +2360,9 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
     product(dom)
 }
 
-/// The per-position `to_<defer>` output fields a writer's decision carries beyond
+/// The per-position `__to_<defer>` output fields a writer's decision carries beyond
 /// `writes`, read off the writer body's codomain — `(field, value_ty)`. Each
-/// becomes a virtual history-record key `to_<defer>: Fun(domain, value_ty)` (the
+/// becomes a virtual history-record key `__to_<defer>: Fun(domain, value_ty)` (the
 /// per-position feed output stream). The decision codomain is the variant
 /// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
 /// record `𝑃`, so peel `commit` and drop the `writes` field.
@@ -2392,11 +2392,11 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// Type one transaction writer against the mutable variable's per-key value types.
 ///
 /// `key_types` maps each mutable variable key to the type of one committed value. The body
-/// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {`commit{writes:
-/// Tuple(new_{w₀}, …), to_<defer>*} | `abort})``, where snapshot position `i` is
+/// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {`commit{writes: {w₀:
+/// new_{w₀}, …}, __to_<defer>*} | `abort})``, where snapshot position `i` is
 /// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
 /// value type. The `` `commit ``/`` `abort `` tag is the whole-transaction grant/deny;
-/// any extra `to_<defer>` fields ride the `` `commit `` payload as width-subtyped taps.
+/// any extra `__to_<defer>` fields ride the `` `commit `` payload as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
     key_types: &std::collections::HashMap<Name, Type>,
@@ -2435,7 +2435,7 @@ fn emit_transact_writer<C: Typing>(
     }
     // Decision codomain: the variant `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense)
     // payload record carrying at least `writes: {k_j: new_j…}` — the body's real
-    // `commit` payload width-subtypes to it (its `to_<defer>` taps are extra
+    // `commit` payload width-subtypes to it (its `__to_<defer>` taps are extra
     // fields). Tag order is `commit`=0, `abort`=1, matching
     // `ccl_utils::decision_variant_ty` and the runtime `body_decision_at` decode;
     // variant subtyping matches tags by name, so the order is not load-bearing
@@ -2510,7 +2510,7 @@ pub(super) fn emit_transact<C: Typing>(
     }
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, ctx)?;
-        // A `to_<defer>` field on the writer's decision record becomes a
+        // A `__to_<defer>` field on the writer's decision record becomes a
         // virtual mutable variable key the consumer reads as `__hist.to_…`. Its stream
         // is **site-domained** — one tap value per iteration of *this
         // writer's* source (the channel unions channelize assembled reference

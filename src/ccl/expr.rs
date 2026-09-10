@@ -8,7 +8,7 @@ use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, Un
 
 /// The `commit` tag of a writer **decision variant** —
 /// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
-/// (`{writes, to_<defer>*}`); a committing position carries it. Both the
+/// (`{writes, __to_<defer>*}`); a committing position carries it. Both the
 /// transaction writer and the induction writer build the same variant through
 /// [`crate::ccl::ccl_utils::wrap_decision_variant`], and the runtime
 /// (`body_decision_at`) decodes the tag: `commit` proposes the payload's writes,
@@ -17,11 +17,13 @@ pub const V_COMMIT: &str = "commit";
 /// The `abort` tag of a writer **decision variant** — the nullary
 /// whole-transaction deny (nothing fired). See [`V_COMMIT`].
 pub const V_ABORT: &str = "abort";
-/// The `writes` field of a [`WriterSite`] decision record — the positional
-/// tuple of proposed per-key new values (`writes.i` for `write_keys[i]`), one
-/// element even for a single-key write set.
+/// The `writes` field of a [`WriterSite`] decision record — the proposed new
+/// values keyed by the mutable variable each is for (`writes.k` for the key
+/// spelled `k`, via [`Name::field_key`](crate::ccl::Name::field_key)). A slot
+/// therefore carries which variable it belongs to, which is what lets a second
+/// compilation of one program match a store's contents back to its declarations.
 pub const F_WRITES: &str = "writes";
-// Tags of a **reply tap** on a decision record. A tap `to_<defer>_k` has a value
+// Tags of a **reply tap** on a decision record. A tap `__to_<defer>_k` has a value
 // exactly at the positions it fires, and its type says so: `` {`fired{𝑉} | `idle}
 // ``. A feed under one arm of cross-key routing fires on its own route only, so a
 // sibling route's commit leaves the tap `` `idle `` rather than appending a value
@@ -44,7 +46,7 @@ pub const V_IDLE: &str = "idle";
 // per `with begin():` site carries: the commit time `begin(r)` (`time`), the
 // history bindings of the write-set keys (`write_targets`, so recognition can
 // recover the writer's `write_keys` without a per-key merge), and the writer's
-// verbatim `` {`commit{writes, to_<defer>*} | `abort} `` decision variant applied to
+// verbatim `` {`commit{writes, __to_<defer>*} | `abort} `` decision variant applied to
 // the mutable variable snapshot at that time (`decision`). Only `write_targets`/`decision`
 // reach recognition; `time` records the commit clock for the model's honesty.
 /// The `time` field of a commit-record binding — the transaction's commit time
@@ -55,12 +57,12 @@ pub const F_TIME: &str = "time";
 /// `write_keys[i]`), the encoding recognition reads a site's `write_keys` off.
 pub const F_WRITE_TARGETS: &str = "write_targets";
 /// The `decision` field of a commit-record binding — the writer's verbatim
-/// `` {`commit{writes, to_<defer>*} | `abort} `` decision variant, applied to the
+/// `` {`commit{writes, __to_<defer>*} | `abort} `` decision variant, applied to the
 /// mutable variable snapshot at the commit time. Recognition lifts the writer body out of it.
 pub const F_DECISION: &str = "decision";
 /// The `write` field of a **per-key commit view** — the single value a site's
 /// commit proposes for one mutable variable key (`decision ▷ variant_project(`commit) ▷
-/// .writes.i`, re-projected). A key's history binding searches the `⧺`-merged
+/// .writes.k`, re-projected). A key's history binding searches the `⧺`-merged
 /// per-key views of every site writing it: `{time, write}` per *committing*
 /// transaction (the ``variant_project(`commit)`` eliminator drops `` `abort ``
 /// positions), the exact record shape the design doc gives `get_prev_txn`'s
@@ -2079,16 +2081,17 @@ pub struct WriterSite {
     /// shadowing (the accumulator pattern, generalized to several keys).
     pub read_keys: Vec<Name>,
     /// The writer's **write-set**: the mutable variable keys the body proposes new values
-    /// for, in the order of the decision's `writes` tuple (`writes.i` is the
-    /// new value for `write_keys[i]`).
+    /// for. The decision's `writes` is keyed by these keys' `field_key`
+    /// spellings, so `writes.k` is the new value for the key spelled `k` and this
+    /// order fixes only the layout, not the correspondence.
     pub write_keys: Vec<Name>,
     /// Iteration source — a `Fun(D, item)` whose domain drives this writer and
     /// whose codomain elements are passed to [`Self::body`]. Sits *outside* the
     /// snapshot-parameter scope.
     pub source: TypedExpr,
-    /// The per-position decision — ``Fun(Tuple(snap…, item), {`commit{writes: Tuple(new…), to_<defer>*} | `abort})``: reads the mutable variable snapshot and returns
+    /// The per-position decision — ``Fun(Tuple(snap…, item), {`commit{writes: {k: new…}, __to_<defer>*} | `abort})``: reads the mutable variable snapshot and returns
     /// a grant/deny variant — `` `commit `` carries the (dense) per-key write set and
-    /// any per-position `to_<defer>` feed taps; `` `abort `` is the whole-transaction
+    /// any per-position `__to_<defer>` feed taps; `` `abort `` is the whole-transaction
     /// deny (carry, no proposal). An induction (`mut`-loop) position `` `commit ``s
     /// unless every branch carries (a full non-writing position `` `abort ``s).
     pub body: TypedExpr,

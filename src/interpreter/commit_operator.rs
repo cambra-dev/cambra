@@ -864,7 +864,7 @@ impl TileOperator for CommitOperator {
     ) -> Box<dyn TileProducer> {
         // Wake this operator's consumer whenever any writer's (live) source
         // delivers a new item: the arrival drives a commit, and that commit must
-        // propagate to a downstream reader of a store key or `to_<defer>` tap (a
+        // propagate to a downstream reader of a store key or `__to_<defer>` tap (a
         // live cross-endpoint read — a read-only transaction's reply). This is the
         // same both-inputs-wake wiring `AsOf` uses; without it the sink reading a
         // tap off a live commit store would never be notified and would hang.
@@ -1220,14 +1220,14 @@ pub struct InductionStore {
     /// its tick-0 fold default (the accumulator's init; read once at subscribe,
     /// like [`CommitOperator::with_init_ops`]). Written in `write_keys` order.
     init_ops: Vec<(Value, Box<dyn TileOperator>)>,
-    /// The writer body `` λ (prev…, item) → {`commit{writes(, to_<defer>…)} | `abort} ``,
+    /// The writer body `` λ (prev…, item) → {`commit{writes(, __to_<defer>…)} | `abort} ``,
     /// compiled around an [`InductionDriver`]. Filled after construction through
     /// [`body_input_setter`](Self::body_input_setter): the body reads the driver,
     /// which reads this store back through the cycle, so it cannot exist yet
     /// when the store is built.
     body_input: CycleSlot<dyn TileOperator>,
     /// Keys written, in decision-`writes` order: the accumulator mutable variables, then
-    /// any reply-tap (`to_<defer>`) keys.
+    /// any reply-tap (`__to_<defer>`) keys.
     write_keys: Vec<Value>,
     /// The tick this store's seed sits at, and so the first position it decides.
     /// `0` for a store that starts with its source; the resume position for one
@@ -3477,7 +3477,7 @@ fn next_decided_position(tile: &Tile, pos: usize) -> Option<usize> {
 /// `Scalar(Union)` column, one `Value::Union { tag, inner }` per position.
 /// `abort` (any tag but `commit` — see [`is_commit_tag`]) is a whole-transaction deny — no writes, no
 /// taps (carry / no proposal). `commit` carries the dense payload record `𝑃 =
-/// {writes: (new₀, …), to_<defer>*}`, each tap holding `` {`fired{𝑉} | `idle} ``.
+/// {writes: {k: new…}, __to_<defer>*}`, each tap holding `` {`fired{𝑉} | `idle} ``.
 ///
 /// Returns `(commit, writes, tap_fired)`: `commit` gates grant vs deny; `writes[j]`
 /// is the new value for `write_keys[j]` (carry writes then tap values, in that
@@ -3509,7 +3509,7 @@ fn body_decision_at(
     if !is_commit_tag(&tag) {
         return Some((false, Vec::new(), Vec::new()));
     }
-    // `commit` — the payload record `{writes, to_<defer>*}`. The union column
+    // `commit` — the payload record `{writes, __to_<defer>*}`. The union column
     // already carried the values materialized at this row, so they are read
     // straight off the record with no per-column extraction step.
     let Value::Record(payload) = *inner else {
@@ -3606,7 +3606,7 @@ pub struct TransactWriter {
     read_keys: Vec<Value>,
     /// Runtime keys the body writes, aligned with the decision's `writes` tuple
     /// followed by the `tap_fields` taps (`write_keys[j]` ↦ the `j`-th committed
-    /// value). A reply (`resps << e`) rides the writer body as a `to_<defer>`
+    /// value). A reply (`resps << e`) rides the writer body as a `__to_<defer>`
     /// decision field (a *tap*); op-conversion folds each tap into the committed
     /// write set as a write-only key, so the reply is committed atomically with
     /// the transaction and read back as a `Fun(Txn, V)` value-stream.
@@ -3661,7 +3661,7 @@ impl TileOperator for TransactWriter {
         // in flight while its item is unacked, so the driver's cursor has not
         // passed it). What the writer does need is for the driver's wakeups and
         // live arrivals to *reach* it, and through it the commit cycle and any
-        // sink reading a store key or `to_<defer>` tap — that is the forwarding
+        // sink reading a store key or `__to_<defer>` tap — that is the forwarding
         // consumer on its driver branch below. The store and body inputs need no
         // notification: the writer pulls them on demand, and forwarding the
         // cyclic store would loop.

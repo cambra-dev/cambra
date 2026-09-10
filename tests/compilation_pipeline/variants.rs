@@ -1543,7 +1543,7 @@ fn test_feed_inside_a_match_arm_fans_out_per_arm(#[case] code: &str, #[case] exp
 }
 
 // A feed and an accumulator in the same `match`. The accumulator makes the loop a
-// single writer and the feed becomes a `to_<defer>` tap on its decision record,
+// single writer and the feed becomes a `__to_<defer>` tap on its decision record,
 // gated by the arm's own `variant_is` test — so the tap fires on its arm's
 // positions only, while the record commits on every arm's.
 #[rstest]

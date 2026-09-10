@@ -1441,7 +1441,7 @@ bad";
     /// `Loop` whose body contains a raw `Feed(__result_*, …)` followed by
     /// a `(step: …)` Record, with the surrounding `let __result = defer`
     /// collecting the yields.  [`crate::ccl::channelize`] absorbs
-    /// the raw `Feed` into a `to_<defer>` field on the same Record
+    /// the raw `Feed` into a `__to_<defer>` field on the same Record
     /// before inference.
     #[test]
     fn test_generator_with_loop_carried_mutation_lowers() {

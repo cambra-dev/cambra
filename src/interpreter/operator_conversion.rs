@@ -2508,7 +2508,7 @@ fn build_transact_store(
     build_commit_store(keys, writers, paths, ctx)
 }
 
-/// The reply taps on a writer body's `` {`commit{writes, to_<defer>*} | `abort} ``
+/// The reply taps on a writer body's `` {`commit{writes, __to_<defer>*} | `abort} ``
 /// decision — every field of the (dense) `commit` payload record other than
 /// `writes`, with its per-commit value type. A tap is a reply (`out << e`) that
 /// channelize folded onto the writer body; for a commit store, op-conversion commits
@@ -2762,7 +2762,7 @@ fn build_commit_store(
         // attempt still in flight.
         let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
         let body_op = convert_impl(&w.body, Some(driver_fan.branch()), ctx)?;
-        // A reply (`out << e`) rides this writer body as `to_<defer>` decision
+        // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
         // `Fun(Txn, V)` value-stream off the shared log. A tap takes no `init_op` —
@@ -2786,7 +2786,7 @@ fn build_commit_store(
                 },
             );
             // A tap shares this map with the mutable-variable keys, so its
-            // `to_<base>_<n>` spelling must not collide with a variable's.
+            // `__to_<base>_<n>` spelling must not collide with a variable's.
             debug_assert!(
                 prior.is_none(),
                 "commit-store key labels are distinct within one store; `Name::field_key` \
@@ -3415,7 +3415,7 @@ resolves to the other's value",
                 })
         })
         .collect::<Result<_, _>>()?;
-    // A reply (`out << e`) rides this loop body as `to_<defer>` decision taps —
+    // A reply (`out << e`) rides this loop body as `__to_<defer>` decision taps —
     // the same shape a commit writer carries (see `build_commit_store`). Each tap
     // becomes a write-only changelog key (appended after the accumulator keys), so
     // its per-position value rides the committing change and is read back densely.
