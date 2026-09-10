@@ -233,17 +233,29 @@ fn test_unions(#[case] code: &str, #[case] expected: Tile) {
 /// This is the capability per-combination realization of a conditional collection
 /// exists to avoid needing: it copies the whole site per arm-tuple so that every
 /// generator's domain is a plain range, and no union is ever looked up.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case("sum([x + y for x in ([1, 2] ++ [3, 4]) for y in [10, 20]])")]
-#[case(indoc! {r"
-    xs = [1, 2] ++ [3, 4]
-    sum([x + y for x in xs for y in [10, 20]])"})]
-#[ignore = "a union-domained collection cannot be read at a projected index: inline, \
-            a fed copairing has no tagged form; let-bound, transform_by_map has no \
-            union-key case. Pre-existing on main, measured 2026-09-01"]
-fn a_union_generator_beside_a_second_generator(#[case] code: &str) {
-    check_scalar(code, Value::Int(140));
+// The two spellings hit **different** walls, so each is pinned on its own rather than
+// deferred together: an `#[ignore]` would report the same green whichever one closed.
+#[test]
+#[should_panic(expected = "a fed copairing: its arms are over distinct index sets")]
+fn an_inline_union_generator_beside_a_second_generator() {
+    check_scalar(
+        "sum([x + y for x in ([1, 2] ++ [3, 4]) for y in [10, 20]])",
+        Value::Int(140),
+    );
+}
+
+/// The `let`-bound spelling of [`an_inline_union_generator_beside_a_second_generator`],
+/// which reaches the runtime instead: the product's key column is union-tagged on both
+/// sides and `transform_by_map` has no case relating two of them.
+#[test]
+#[should_panic(expected = "transform_by_map: key type mismatch or unsupported")]
+fn a_let_bound_union_generator_beside_a_second_generator() {
+    check_scalar(
+        indoc! {r"
+            xs = [1, 2] ++ [3, 4]
+            sum([x + y for x in xs for y in [10, 20]])"},
+        Value::Int(140),
+    );
 }
 
 // ---------------------------------------------------------------------------

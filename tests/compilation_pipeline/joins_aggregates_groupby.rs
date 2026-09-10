@@ -188,8 +188,15 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(30))]
 #[case("[sum(x) for x in groupby([1], \\x -> x)]")]
 #[case("[sum(x) for x in groupby([1, 1], \\x -> x)]")]
-#[ignore = "a data-function parameter drops the refinement its occurrences keep, and a data \
-            domain is invariant"]
+// Pinned on the failure: it reports the day a base carrying the fix arrives, which an
+// `#[ignore]` could not. The parameter's domain resolves to `Int` while its occurrences
+// resolve to `Int@1`, and a data domain is invariant.
+//
+// The **pass** that catches it is not part of the claim, and it moves: `post-lambda-elim`
+// rejects the collection domain here, while the keyed-collection branches above reach
+// `post-planning` and an `Apply` mismatch on the same program. So the pin is on the
+// post-pass tree check rather than on either message.
+#[should_panic(expected = "produced an invalid tree: [Type mismatch")]
 fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
     run_pipeline(code);
 }

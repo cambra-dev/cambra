@@ -220,8 +220,9 @@ fn a_filtered_comprehension_drives_a_mutation_loop() {
 ///   program's own result and the assertion re-imposes a domain the result no longer has.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[ignore = "pre-existing on main, unrelated to sums: a filter over a same-domain \
-            conditional has no witness to key the per-leg discharge on"]
+// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether
+// the gap closed, regressed, or went away, and nothing runs ignored tests here.
+#[should_panic(expected = "CCL node Case")]
 fn a_filter_over_a_same_domain_conditional_does_not_compile() {
     check_scalar(
         indoc! {r"
