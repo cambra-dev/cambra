@@ -459,22 +459,6 @@ pub(crate) mod fixtures {
             resps << left + "|" + right + "\n"
     "#};
 
-    pub const TWO_LOOPS_SWAPPED: &str = indoc! {r#"
-        a := ""
-        b := ""
-
-        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
-        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
-
-        for y in b_reqs:
-            a := a + y + "\n"
-            b_resps << a
-
-        for x in a_reqs:
-            b := b + x + "\n"
-            a_resps << b
-    "#};
-
     pub const TWO_LOOPS: &str = indoc! {r#"
         a := ""
         b := ""
@@ -505,6 +489,24 @@ pub(crate) mod fixtures {
         for y in b_reqs:
             b := b + "* " + y + "\n"
             b_resps << b
+    "#};
+
+    /// `TWO_LOOPS` with each loop reading the other's route, so both
+    /// variables keep their values and continue on the source they moved to.
+    pub const TWO_LOOPS_SWAPPED: &str = indoc! {r#"
+        a := ""
+        b := ""
+
+        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
+        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+
+        for y in b_reqs:
+            a := a + y + "\n"
+            b_resps << a
+
+        for x in a_reqs:
+            b := b + x + "\n"
+            a_resps << b
     "#};
 
     pub const ONE_TRANSACTIONAL_LOOP: &str = indoc! {r#"

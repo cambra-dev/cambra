@@ -9,13 +9,17 @@
 //! program with the accumulating loop edited. That pair is what a reader should
 //! look at to see what a reload does.
 //!
-//! Everything else the cases drive is scaffolding. [`fixtures`] holds every
-//! program the `{PORT}` substitution reaches — a base per shape, plus the
-//! variants that differ from one by the single edit their case is about. A
-//! program a case cannot express that way stays in the case: the `stdin`-sourced
-//! ones, the two-port one in
-//! `a_port_whose_last_route_goes_is_released`, and `nested_fold`, which is a
-//! function because its two cases vary the step rather than the shape. The bases:
+//! Everything else the cases drive is scaffolding. [`fixtures`] holds the ones
+//! that are a program a case names — a base per shape, plus the variants that
+//! differ from one by the single edit their case is about. A program a case
+//! builds rather than names stays in the case, and there are three reasons to
+//! build one: it varies by more than an edit, so a function takes the varying
+//! part (`fold_to_main`, `filtered_fold_to_main`, `fold_behind_a_route`,
+//! `nested_fold`, `boundary_pair`, `two_instantiations`, `anonymous_sites`); it
+//! needs a second port, which `source` does not substitute
+//! (`a_port_whose_last_route_goes_is_released`,
+//! `a_version_naming_an_unbindable_port_is_refused`); or it is `stdin`-sourced
+//! and has no `{PORT}` to substitute at all. The bases:
 //!
 //! | Base | Shape |
 //! | --- | --- |
