@@ -532,8 +532,12 @@ impl SourceSinkRegistry {
         compile_to_in(lowering, code, phase)
     }
 
-    /// Compile `code` through `phase`, opening any endpoint this registry does not
-    /// hold and keeping it.
+    /// Compile `code` through `phase`, binding any port this registry does not
+    /// hold and keeping the listener.
+    ///
+    /// The listener and nothing else: a route is registered by the compile that
+    /// installs the version, so a version refused after this one leaves none
+    /// behind.
     ///
     /// For the compile that precedes installing a version, and the reason it
     /// opens is that binding is the one step the two compiles do not share.

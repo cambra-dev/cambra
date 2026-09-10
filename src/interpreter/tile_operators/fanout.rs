@@ -354,10 +354,16 @@ impl FanOut {
     /// Such a fan-out answers empty from here on: it has told its input that
     /// nothing will be read again, and a `Memo` input drops what it holds in
     /// response. A version replacing another reads this where it would take an
-    /// operator over, and declines one that can only answer empty, since keeping
-    /// it binds a name to nothing. The handover itself carries such an operator
-    /// anyway — a store that can no longer produce still holds the value its
-    /// variables hand on.
+    /// operator over, and what it does with the answer depends on what it wants
+    /// the operator for. A binding is what a name reads, so one standing behind a
+    /// spent operator is rebuilt: keeping it binds the name to nothing. An
+    /// iteration input is taken instead — a recurrence continuing over it wants
+    /// the position it reached, which
+    /// [`released_position`](Self::released_position) reports as well from a
+    /// spent operator as from a live one, and a spent one is what a finished
+    /// iteration looks like. The handover carries such an operator either way: a
+    /// store that can no longer produce still holds the value its variables hand
+    /// on.
     pub fn released_in_full(&self) -> bool {
         self.shared.borrow().released.is_universal()
     }

@@ -899,8 +899,10 @@ records one and the only site a `Transact` reaches"
     /// cannot offer one, having released the prefix on behalf of consumers the
     /// new version does not have. Rebuilding recovers those positions where the
     /// term is recomputable ([`unrecomputable_nodes`]) and nothing recovers them
-    /// where it is not, which the guard refuses before teardown
-    /// ([`unreadable_inputs`](Self::unreadable_inputs)).
+    /// where it is not, which
+    /// [`unreadable_inputs`](Self::unreadable_inputs) reports before teardown
+    /// rather than refusing: the elements are gone, so folding from here is all
+    /// that is left, and the source does not say whether it was meant.
     ///
     /// `fresh_start` is where a freshly-built iteration begins, and the caller
     /// picks it. An induction store passes [`source_start`], which is `0` for a

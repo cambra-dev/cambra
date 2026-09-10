@@ -236,7 +236,7 @@ impl LiveProgram {
     ///
     /// On `Err` the running program is untouched and still serving: both the
     /// compile to [`Phase::Planning`] and this check run before anything is torn
-    /// down. That compile opens the endpoints the new version adds, so an address
+    /// down. That compile binds the ports the new version adds, so an address
     /// it cannot bind is one of the errors raised here rather than a failure of
     /// the compile that installs the version — which runs after the teardown and
     /// has nothing to reject to. A refusal hands those ports back.
@@ -316,7 +316,7 @@ may move between loops.{remedy}",
         // which of its nodes this version already has an operator for.
         let next = Self::driving(
             compile_replacement(ctx, code, main_consumer(), &self.program.ast)
-                .expect("a version that compiled to Planned must compile to operators"),
+                .expect("a version that compiled to Planning must compile to operators"),
         );
         *self = next;
         Ok(ReloadReport {
