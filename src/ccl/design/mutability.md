@@ -1206,8 +1206,14 @@ The value-`Case` positions ride the same union-of-restricts:
 - **Source-less conditional feeds** (`if c: o << 1 else: o << 2` outside any loop) — *implemented*
   (`channelize`): each feeding arm becomes a gated one-shot lift `λ __unused : {Unit | π̂ᵢ} → 𝑣ᵢ`,
   one channel per arm — replacing `PartialFeedCaseUnsupported` for guard-only `Case`s. A
-  scrutinee / pattern feed stays rejected; a no-else partial feed is still blocked earlier at
-  lowering (bare `if` as a value expression).
+  scrutinee / pattern feed stays rejected there; a no-else partial feed is still blocked earlier
+  at lowering (bare `if` as a value expression).
+
+  A conditional feed **inside a loop** takes the per-arm refined-source channels instead, and a
+  pattern arm is admitted there: the fan-out converts the tag test to a guard at its own
+  consumption point. One `Case` fans out once per deferred collection it feeds, each pass
+  leaving the arms it did not take (`channelize`'s `residual_after_fanout`), so two defers fed
+  from complementary arms are two channels over one conditional.
 - **Comprehension over / with a conditional** — *implemented*. A conditional **element**
   (`[a if g(x) else b for x in xs]`) fans the source out by each arm's *element-dependent* gate —
   `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of filtered maps (`fan_out_element_case` in

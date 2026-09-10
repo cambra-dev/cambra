@@ -394,6 +394,55 @@ o"#;
     );
 }
 
+/// Two deferred collections fed from **complementary arms** of one conditional, in a
+/// loop with no accumulator. The `Case` fans out once per defer: each pass extracts
+/// its own arms into refined-source channels and leaves the sibling's arms standing
+/// ([`residual_after_fanout`] in `channelize`), so an arm feeding the *other* defer
+/// is a non-feeding arm for this one.
+///
+/// Both spellings are listed because the failure differed by spelling and the cause
+/// did not. A `match`'s arms carry patterns, so the whole `Case` reached the
+/// source-less path and was reported as `PartialFeedCaseUnsupported`; an `if`'s arms
+/// are guards, so the same path built a `Unit` gate whose predicate references the
+/// loop binder, which lambda elimination rejected as a non-dependent arrow over a
+/// dependent codomain.
+///
+/// The loop with an accumulator compiles either way — the tap on the writer decision
+/// is a different representation of a conditional feed — so these are the cases the
+/// per-arm channel representation owes.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {r#"
+        good = defer()
+        bad = defer()
+        for m in [`a(2), `b(3)]:
+            match m:
+                case `a(n):
+                    good << n
+                case `b(k):
+                    bad << k
+        sum(good) + sum(bad)
+    "#},
+    Value::Int(5)
+)]
+#[case(
+    indoc! {r#"
+        good = defer()
+        bad = defer()
+        for i in [1, 2]:
+            if i > 1:
+                good << i
+            else:
+                bad << i
+        sum(good) + sum(bad)
+    "#},
+    Value::Int(3)
+)]
+fn two_defers_fed_from_complementary_arms(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// Two feeds into **one** deferred collection, in a loop body with no accumulator.
 /// The body's statements have one grammar at every position
 /// ([`lower_for_body_stmt`]), so the first feed is an effect sequenced before the

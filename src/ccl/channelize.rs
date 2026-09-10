@@ -213,6 +213,53 @@ impl fmt::Display for DeferError {
     }
 }
 
+/// What is left of a fanned-out `Case` once `defer_name`'s feeds are extracted: the
+/// same `Case` with that defer's feed arms replaced by `Unit`, and every other arm
+/// left alone.
+///
+/// A `Case` is fanned out once per defer it feeds, and each pass leaves the arms it
+/// did not take for the pass that will. Collapsing the whole body to `Unit` instead
+/// dropped a sibling defer's feeds, which the cluster then reported as
+/// [`DeferError::NoFeedOrDefine`].
+///
+/// Rebuilt from the **original** body rather than from the guard form
+/// [`try_extract_fanout_feed`] matched on, so a `match` keeps its scrutinee and its
+/// arm patterns for the next pass to convert at its own consumption point.
+fn residual_after_fanout(body: &Expr, defer_name: &Name) -> Expr {
+    let TypedExpr {
+        node: TypedExprNode::Case {
+            scrutinee,
+            branches,
+        },
+        ty,
+        user_annotation,
+        node_id,
+    } = body.clone()
+    else {
+        return Expr::lit(Lit::Unit);
+    };
+    let branches = branches
+        .into_iter()
+        .map(|b| Branch {
+            body: match &b.body.node {
+                TypedExprNode::Feed { name, .. } if name == defer_name => Expr::lit(Lit::Unit),
+                _ => b.body,
+            },
+            pattern: b.pattern,
+            guard: b.guard,
+        })
+        .collect();
+    TypedExpr {
+        node: TypedExprNode::Case {
+            scrutinee,
+            branches,
+        },
+        ty,
+        user_annotation,
+        node_id,
+    }
+}
+
 /// Recognize a guard-only `Case` that feeds `defer_name` in one or more arms —
 /// the channelize-stage counterpart of `lambda_elim`'s `is_filter_case_body`.
 ///
@@ -224,13 +271,21 @@ impl fmt::Display for DeferError {
 /// ordinary arms here, so an `else` that feeds fans out just like a guard arm
 /// (its first-match predicate is `¬⋁ⱼ gⱼ`).
 ///
+/// **An arm feeding a *different* deferred collection is a non-feeding arm here.**
+/// One `Case` fans out once per defer it feeds, each pass extracting its own arms
+/// and leaving the others standing ([`residual_after_fanout`]), so `if c: good << i
+/// else: bad << i` becomes one refined-source channel per defer. Reading such an arm
+/// as unfannable instead sent the whole `Case` to the generic handling, which reports
+/// [`DeferError::PartialFeedCaseUnsupported`] for a `match` and builds a source-less
+/// gate for an `if` — a gate whose predicate references the loop binder, which
+/// lambda elimination then rejects.
+///
 /// Returns each arm's `(guard, feed_value?)` in source order — `feed_value` is
 /// `None` for a non-feeding arm, whose guard still participates in later arms'
 /// predicate synthesis ([`synthesize_arm_predicate`]). Returns `None` (not
-/// fannable) if the trailing guard is not `true` or an arm body is neither this
-/// defer's feed nor `Unit` — so a `Case` mixing this defer's feeds with other
-/// effects falls through to the generic handling rather than being silently
-/// collapsed.
+/// fannable) if the trailing guard is not `true` or an arm body is neither a feed
+/// nor `Unit` — so a `Case` mixing feeds with other effects falls through to the
+/// generic handling rather than being silently collapsed.
 fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Option<Expr>)>> {
     // A `match` arm dispatches on a tag, so it reaches the fan-out as a
     // `Pattern` against a scrutinee. Convert it to the guard form first — the
@@ -273,7 +328,11 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
                 any_feed = true;
                 arms.push((b.guard.clone(), Some((**value).clone())));
             }
-            TypedExprNode::Lit(Lit::Unit) => arms.push((b.guard.clone(), None)),
+            // Another defer's feed, and `Unit`: neither contributes a value to this
+            // defer's channel, and both leave their guard in the predicate synthesis.
+            TypedExprNode::Feed { .. } | TypedExprNode::Lit(Lit::Unit) => {
+                arms.push((b.guard.clone(), None))
+            }
             _ => return None,
         }
     }
@@ -2499,14 +2558,16 @@ fn extract_for_defer_impl(
                                 }
                                 prior.push(guard);
                             }
-                            // Every feed for this defer is extracted; the
-                            // original lambda body collapses to `Unit` (after
-                            // lambda elim it composes with the unrefined source
-                            // to a no-op iteration).
+                            // Every feed for this defer is extracted, so its arms
+                            // are what the residual drops. A `Case` feeding another
+                            // defer keeps that arm for the pass that extracts it;
+                            // one feeding only this defer residues to arms that are
+                            // all `Unit`, which after lambda elim composes with the
+                            // unrefined source to a no-op iteration.
                             let new_lambda = TypedExpr {
                                 node: TypedExprNode::Lambda {
                                     param,
-                                    body: Box::new(Expr::lit(Lit::Unit)),
+                                    body: Box::new(residual_after_fanout(&body, defer_name)),
                                 },
                                 ty: elt_ty,
                                 user_annotation: elt_user_ann,
