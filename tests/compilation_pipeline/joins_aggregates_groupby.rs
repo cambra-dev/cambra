@@ -205,7 +205,7 @@ fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
 #[timeout(Duration::from_secs(30))]
 // A literal's type is its singleton, and by this point planning has compiled the
 // predicate to point-free form — so it renders as the operator chain rather than the
-// `__elem == 1` the type layer wrote. Nothing executes it (see the `keydom` note on
+// `__elem == 1` the type layer wrote. Nothing executes it (see the key-domain note on
 // `case_21`); it is a carried refinement that happens to survive to here.
 #[case(
     "1",
@@ -400,7 +400,14 @@ fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
 // across instead of rebuilding the type as a bare combinator `⇒`.
 #[case(
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⤇ Int)",
+    // The final `sum`'s domain is the honest present-key domain — the key type refined
+    // by membership in what this group-by's key morphism produces, rather than the old
+    // imprecise total `Int` (see `src/ccl/design/collections.md`, "`groupby`'s exact
+    // type"). It rides this type annotation only; it is never executed (the group-by
+    // is realized as `converse`), and the compiled tile below is unchanged. The
+    // morphism inside it stays **pointful** — planning point-frees the predicates it
+    // reifies into a `Restrict`, and this one it never reaches.
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ (([1, 2, 3, 4] ≫ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![0, 1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),
@@ -640,34 +647,7 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])",
     Value::Int(28)
 )]
-// A grouping iterated *and* looked up.
-#[case(
-    "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
-    Value::Int(13)
-)]
-// Several lookups into one grouping, all served by the one partition.
-#[case(
-    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
-    Value::Int(9)
-)]
 fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
-}
-
-/// A key with **no group**, and one whose group is a single element.
-///
-/// A lookup walks the grouping for the key and slices out its rows; a key the
-/// grouping settled without ever seeing yields the empty group, which sums to
-/// zero rather than failing.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))", Value::Int(0))]
-#[case(
-    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(9))",
-    Value::Int(2)
-)]
-fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
@@ -688,11 +668,17 @@ fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
 /// no such shape is reachable while a grouping's type is fully monomorphic.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))")]
+// Two uses.
 #[case(
     "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])"
 )]
-#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))")]
+// Three, including a repeat of the first, so a second bucketize would show as a second
+// `converse` whether or not the extra use aggregates differently.
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"
+)]
+// A grouping whose keys are its own elements, the shape the lookup spellings used.
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])")]
 fn test_grouping_built_once(#[case] code: &str) {
     use cambra::ccl::symbolic::symbolic;
 
@@ -704,4 +690,25 @@ fn test_grouping_built_once(#[case] code: &str) {
         1,
         "the grouping should be bucketized once however many uses it has; got:\n{ccl}"
     );
+}
+
+/// A keyed annotation on a group-by, **compiled and run**. The annotation tests in
+/// `tests/type_check.rs` pin what one types as; these pin that an annotated program
+/// produces a value, which no type test sees.
+///
+/// `FullMap(_, _)` with the key elided is the only form a group-by satisfies — its domain
+/// is the present-key domain and the surface cannot spell that refinement
+/// (`src/ccl/design/collections.md`, "`groupby`'s exact type").
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case(
+    "g: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
+    Value::Int(3)
+)]
+#[case(
+    "g: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
+    Value::Int(10)
+)]
+fn an_exact_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }

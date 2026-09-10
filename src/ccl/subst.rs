@@ -566,6 +566,27 @@ impl Subst {
         out
     }
 
+    /// This substitution extended with the [`extended_rename`](Self::extended_rename)
+    /// aligning two functions' binders, for a codomain crossing from `from`'s scope
+    /// into `to`'s.
+    ///
+    /// Two functions related at a position have one binder under two names, so a
+    /// codomain read out of one and read under the other must be respelled. Unnamed on
+    /// either side leaves the substitution alone: there is no binder to align, and a
+    /// codomain that does not reference one needs no alignment either way.
+    ///
+    /// Both users of the rule call this rather than building the rename themselves.
+    /// [`constrain_go`](crate::ccl::infer::solver) draws the codomain edge under it;
+    /// `complete_annotation` copies an initializer's codomain under an annotation's
+    /// binder, and copying it unaligned binds nothing and captures the initializer's
+    /// name (`src/ccl/design/type-inference.md`, "The invariant").
+    pub fn aligned(&self, from: &Option<Name>, to: &Option<Name>) -> Subst {
+        match (from, to) {
+            (Some(k), Some(x)) => self.extended_rename(k, x),
+            _ => self.clone(),
+        }
+    }
+
     /// The **licensed correspondence view** of this substitution: every
     /// `Rename` entry kept, and every discharge whose argument is a bare
     /// variable reference (`[x ↦ k0]`, the dependent application at a

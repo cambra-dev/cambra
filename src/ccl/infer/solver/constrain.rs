@@ -990,10 +990,7 @@ fn constrain_go_impl(
             // and the reverse obligation a variable's domain owes is discharged where every
             // contribution to it meets.
             let invariant_domains = k0.resolved().is_data() || k1.resolved().is_data();
-            let cod_sl = match (n0, n1) {
-                (Some(k), Some(x)) => sl.extended_rename(k, x),
-                _ => sl.clone(),
-            };
+            let cod_sl = sl.aligned(n0, n1);
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
             // conversions run"): a *closed* codomain — one whose refinements
             // reference this function's binder as indices — opens at its own
@@ -3449,7 +3446,7 @@ mod tests {
                 "a capability reaching a collection position is caught at {derivation:?}"
             );
             // **The Σ kind premise, at every derivation.** The universe is not contained in
-            // a key bound, so a collection where a keyed collection is demanded is a
+            // a key bound, so a `Collection` where a `Map` is demanded is a
             // rejection — and it is the only premise that looks at the kinds, the domain edge
             // being discharged by the binder correspondence.
             assert!(
@@ -3471,7 +3468,7 @@ mod tests {
                 .is_err(),
                 "a sum with an extra candidate is not below one without it at {derivation:?}"
             );
-            // What must still be accepted: a keyed collection *is* a collection.
+            // What must still be accepted: a `Map` is below `Collection`.
             assert!(
                 constrain_subtype(
                     &Type::map_of(prim(BaseType::Int), prim(BaseType::Int)),

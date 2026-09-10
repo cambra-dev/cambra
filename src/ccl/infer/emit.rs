@@ -580,6 +580,7 @@ fn apply_unary_scheme<C: Typing>(
 /// Positions where the two shapes disagree keep the annotation's: a value that
 /// cannot flow into its annotation at all is already an `AnnotationMismatch`, so
 /// there is no second diagnosis to make here.
+///
 fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
     match (ann, inferred) {
         (Type::Hole, _) => inferred.clone(),
@@ -597,20 +598,34 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
         // fill in.
         (
             Type::Fun {
+                name: an,
                 domain: ad,
                 codomain: ac,
                 ..
             },
             Type::Fun {
+                name: inn,
                 domain: id,
                 codomain: ic,
                 ..
             },
-        ) => Type::fun_like(
-            ann,
-            complete_annotation(ad, id),
-            complete_annotation(ac, ic),
-        ),
+        ) => {
+            // The codomain is filled under `an`, so the initializer's binder aligns to
+            // it first ([`Subst::aligned`], the alignment `constrain_go` draws its own
+            // codomain edge under). `fun_like` then closes over `an`, which reaches only
+            // a reference already spelled `an` — so an unaligned copy would leave the
+            // initializer's name free rather than bound. Binders are uid-unique, so a
+            // nested arm's alignment targets a disjoint name and the two commute.
+            let aligned = crate::ccl::subst::Subst::id().aligned(inn, an);
+            let cod = complete_annotation(ac, &aligned.apply_type(ic));
+            debug_assert!(
+                inn.as_ref()
+                    .is_none_or(|i| !crate::ccl::subst::type_free_vars(&cod).contains(i)),
+                "a filled codomain still references the initializer's binder {inn:?}, so \
+                 the alignment did not reach it: {cod}",
+            );
+            Type::fun_like(ann, complete_annotation(ad, id), cod)
+        }
         (Type::Tuple(ats), Type::Tuple(its)) if ats.len() == its.len() => Type::Tuple(
             ats.iter()
                 .zip(its)
@@ -686,7 +701,22 @@ pub(super) fn emit_lambda<C: Typing>(
     // the type lattice (introduced by `cast`), not the lambda node, so the param
     // binds under its bare type here.
     let declared = param.user_annotation.clone().unwrap_or(param.ty.clone());
-    let param_simple = ctx.normalize(&declared);
+    let mut param_simple = ctx.normalize(&declared);
+    // A refinement riding `param.ty` rather than a `user_annotation` — the shape
+    // lowering gives a re-keying producer's key binder,
+    // `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}` — has its predicate typed
+    // here, in the enclosing scope, because its terms reference the collection bound
+    // outside the param.
+    //
+    // The annotated param is covered by the call above and must not be typed twice:
+    // `normalize` preserves the refinement's `Rc`, and `TermMemo::rebuild_always` keys
+    // on the current one, so a second pass re-emits the predicate against a fresh copy
+    // rather than hitting the memo. Routed through the mode because `check` trusts a
+    // resolved predicate and would mistype planning's function predicates (`D ⇒ Bool`)
+    // as bare `__elem`-Bool ones. A no-op for the ordinary unrefined param.
+    if param.user_annotation.is_none() {
+        ctx.type_annotation_predicates(&mut param_simple)?;
+    }
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
     // `Var(param)` body references stay bare; restriction refinements decorate only

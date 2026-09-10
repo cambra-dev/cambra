@@ -9,7 +9,7 @@ This document gives each surface type — those four spellings and the abstract 
 What a program writes, and what each collection type means to it, is
 [chl-spec, Direction: collection types](../../../docs/chl-spec.md#63-direction-collection-types-decided).
 Start there if the question is about the language rather than the checker;
-[The five collection types](#the-five-collection-types) below is the same list with its
+[The six collection types](#the-six-collection-types) below is the same list with its
 domains.
 
 The type-level machinery is the sum — a data function carrying its Σ binders — and the
@@ -30,7 +30,7 @@ that is `unit` for one, so the operation layer has nothing to dispatch on betwee
 > `[Planned]` (e.g. the operation layer). Where a `[Planned]` feature has an interim
 > behavior in today's code, that is tagged `[Interim]`.
 
-## The five collection types
+## The six collection types
 
 With `𝐷` a witness domain and `𝑛` a length:
 
@@ -45,8 +45,21 @@ With `𝐷` a witness domain and `𝑛` a length:
 - **`Set(𝐾)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ unit` — a key domain with trivial codomain;
   the domain is the payload. Unordered. Membership `𝑒 in 𝑠` discharges `𝑒`'s
   presence in the domain.
-- **`Map(𝐾, 𝑉)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` — a key domain. Unordered. Lookup
-  `𝑚[𝑘] : Option(𝑉)` in general, `: 𝑉` when presence discharges. Membership `𝑘 in 𝑚`.
+- **`Map(𝐾, 𝑉)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` — a key domain; a concrete one's keys are
+  typed `{𝑘: 𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`
+  ([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)).
+  Unordered. Lookup `𝑚[𝑘] : Option(𝑉)` in general, `: 𝑉` when presence discharges (see
+  [Lookup](#lookup-membership-discharge)). Membership `𝑘 in 𝑚`.
+- **`FullMap(𝐾, 𝑉)`** = `(𝑘: 𝐾) ⤇ 𝑉` — a value for **every** key of `𝐾`, so the key set is
+  readable from the type and `𝑚[𝑘] : 𝑉` needs no proof. Unordered. `𝑉` may depend on `𝑘`,
+  which is why `groupby` returns one and no `Map` describes it
+  ([`groupby`'s exact type](#groupbys-exact-type)). **Totality is claimed rather than checked
+  where the key is elided [Interim]**: `FullMap(_, 𝑉)` asks only for a data function, so a list
+  literal satisfies it (`full_map_annotations_are_satisfiable`). A *written* key is an ordinary
+  obligation on an invariant domain, which is why `FullMap(Int, 𝑉)` is uninhabited — no producer
+  has an unrefined `Int` domain (`full_map_lookup_needs_no_presence_proof`). What would let a
+  group-by carry one is a surface spelling for the present-key domain, which is the same gap
+  `keys(…)` names below.
 - **`Collection(𝑇)`** = `Σ (𝐷 : Type). 𝐷 ⤇ 𝑇` — the witness ranges over *every*
   domain; the domain rides along **in the value** (retained, not sealed — a
   domain-generic consumer holds it abstract). Unordered. The ⊤ of the kind order, and
@@ -57,10 +70,13 @@ With `𝐷` a witness domain and `𝑛` a length:
   parameter has no static domain to read
   ([Compiling a conditional collection](#compiling-a-conditional-collection)).
 
-Each is a sum over the named kind, and every rule they obey is the general Σ
+Four of the six are sums over the named kind, and every rule they obey is the general Σ
 rule at that kind — entry by a term, subtyping, and consumption
-([type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums)). Only
-`Array` is not a sum: its domain is one concrete range, so it needs no witness.
+([type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums)). `Array` and
+`FullMap` are the two that are not: their domains are written in the type, so they need no
+witness, and each is the unboxed form of the sum below it in the list. Crossing from either
+to its sum is `box`, and that `box` is where the domain stops being available to reason
+with.
 
 ## The collection type is declared, not read off the shape
 
@@ -118,6 +134,86 @@ entry is `(𝐾, unit)` and the projection to `𝐾` is lossless, so `Map` gets 
 iteration without the distinction existing. That is surface-visible — `for k in s` would
 bind a pair — so it is a spec decision, not a silent one.
 
+## `groupby`'s exact type
+
+For `c: 𝐼 ⤇ 𝐴` and `key: 𝐴 → 𝐾`:
+
+```
+groupby(c, key) : (𝑘: {𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}) ⤇ ({𝑖: 𝐼 | key(c(𝑖)) == 𝑘} ⤇ 𝐴)
+```
+
+The outer domain is this group-by's present keys and no other collection's, and it is the
+group-by's own keys rather than all of `𝐾` because a data function's domain is its data — a
+domain of `𝐾` would claim one row per inhabitant. The codomain is the group, and it **depends
+on `𝑘`**.
+
+That dependency decides what the type is: a [`FullMap`](#the-six-collection-types), not a
+`Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
+annotation or consumer converts one into the other, so a group-by is consumed at the type
+it has.
+
+### The key domain is the key morphism's image
+
+A key domain is spelled as the image of a named morphism term:
+`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` is the keys `𝑚` produces.
+`present_key_domain` in `src/ccl/lower/exprs.rs` builds every one, so a domain of this shape
+came from a re-keying producer ([Keyed entry needs the key domain written down at
+lowering](#keyed-entry-needs-the-key-domain-written-down-at-lowering)).
+
+**Naming the morphism is what makes membership provable.** A domain that said only "the keys
+of this collection" would have no introduction rule: nothing could produce a value at it
+except a term already stamped there, so `𝑚[𝑘] : 𝑉` would be unprovable by construction
+rather than for want of a rule — and refinements relate by structural predicate equality
+rather than implication, so there is no entailment step for a proof to land in instead.
+Naming it supplies the rule: a key produced by `𝑚` is a key of the collection `𝑚` keys.
+
+**That is the current answer, and implication is what retires it.** Reasoning about refinements
+by implication rather than by structural equality is planned and unbuilt
+([type-inference.md, Roadmap and Current Prototype
+Status](type-inference.md#roadmap-and-current-prototype-status)). With it, an opaque named key
+set — "the keys of this collection", carrying no producer — is dischargeable from an axiom, and
+it wins on every count that decides between the two: it is smaller, it is independent of how the
+producer is spelled, and it keeps a producer out of a type. So the transparent form is what the
+absence of an entailment step forces, and the opaque form is its successor.
+
+**Naming a term is also what fixes domain identity.** Refinements compare by structural
+predicate equality, so two key domains are the same domain exactly when they name the same
+morphism term. That is a fact about terms rather than about collections — a domain naming a
+parameter is one type over every collection that parameter is bound to, and two spellings of
+one collection (a `let`-bound source and its inlined literal) are two domains. Membership
+therefore reads "in the image of the morphism named here", under whatever the morphism's free
+variables are bound to where the fact is used.
+
+Implication does not close that gap, because the obligation the two spellings need is the
+definition `c = [1,1,2]` rather than an entailment between predicates over values. Relating them
+is canonicalization work, and nothing does it today.
+
+**A morphism is spelled the same way at every position.** Planning compiles a refinement's
+predicate to the point-free form the restrict pipeline consumes, and a key domain is born in
+that form: `fn_of_bare_predicate` returns `f` verbatim from a bare `__elem ▷ f`, so compilation
+is the identity on `__elem ▷ (𝑚 ▷ collection_contains)` and the morphism inside `𝑚` is never
+rewritten. That is what keeps the spellings from splitting — a morphism point-freed at one
+position and pointful at another would be two structurally unequal domains, and the membership
+fact would stop transferring between them.
+
+Two things follow from naming a term at all. A key domain embeds its whole producer, so the type
+grows with the producer and shows up wherever the key type does. And a type's identity now rests
+on a term's, which is the same identity-by-shape exposure the Σ rule's `𝜌` substitution has
+([type-inference.md, What checks each
+premise](type-inference.md#what-checks-each-premise)).
+
+**`Converse` discharges the present-key domain.** Planning rebuilds the site as
+`converse ≫ map`, and the two halves are typed at different domains: the key-extraction
+morphism `c ≫ key` yields plain keys and is typed at the bare `𝐾`, while the partition
+`Converse` builds holds exactly the keys that occur and is stamped at the present-key
+domain. One key type serving both roles either rejects the extraction or understates the
+partition.
+
+The predicate rides to op-conversion on **types**, never as a term. Point-free compilation
+applies to the predicates planning reifies into a `Restrict`, and this one it never
+reaches — a membership evaluation would be a keyed lookup or an `x in s` filter, neither of
+which exists.
+
 ## Operations: how the trait layer dispatches [Planned]
 
 > The **user-facing semantics** of `for`-in, `[]` / `[]?`, `in`, and ordering —
@@ -172,11 +268,70 @@ become the per-type standard-library instances with no semantic change. Everythi
   write, because `for x in m` binds entries while `for x in (m : Collection(𝑉))`
   binds values, and the explicit projection is what makes which one is meant
   visible — matching [chl-spec §6.3](../../../docs/chl-spec.md#63-direction-collection-types-decided).
-  What *enforces* that depends on the open subtyping question
-  ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-open)): with the Σ edge
-  to `Collection(𝑉)` present, `sum(m)` is rejected only once `sum` lowers through
-  iteration, because a `Map` yields `(𝐾, 𝑉)` entries and entries cannot be summed; without
-  it, `sum(m)` has no edge to take. Until either lands `sum(m)` means `sum(values(m))`.
+  What *enforces* that turns on the open subtyping question ([Telling `Set` and `Map`
+  apart](#telling-set-and-map-apart-open)). Structurally the `Map <: Collection(𝑉)` edge
+  holds today, ⊤ absorbing every kind, and `sum(m)` is then rejected once `sum` lowers
+  through iteration, because a `Map` yields `(𝐾, 𝑉)` entries and entries cannot be summed.
+  Withholding that edge is what a declared type constructor would be for. Until either
+  lands, `sum(m)` means `sum(values(m))`.
+
+## Lookup: membership discharge
+
+> **[Planned]** — `c[k]` lowers as the lookup `c(k)`, but no rule discharges the index's
+> membership, so it is a type error at the `Apply` for every index. The surface operators are
+> specified in [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access);
+> this is the mechanic that decides which one type-checks.
+
+Lookup is uniform across ranges and keys: `𝑐[𝑥]` is well-typed when `𝑥`'s type proves
+`𝑥 ∈ dom(𝑐)`, and its totality is *whether that proof discharges*. Membership rides on the
+**element's** type, not the collection's, so iterating a collection's own domain hands the
+proof over and `m[k]` is total there, while a key from outside carries no proof and takes
+the checked `m[k]?`. The range case is the same rule at a different domain: `arr[𝑖] : 𝑇`
+where `{𝑖 | 𝑖 < 𝑛}` discharges, `lst[𝑖]? : Option(𝑇)` where it cannot. One mechanic covers
+all four collection types rather than one per type.
+
+### Prerequisite: the proof has to survive being consumed
+
+Two routes produce a key carrying a collection's key domain, and only one of them works.
+
+**Applying the key morphism** is direct: `(c ≫ key)(𝑖)` is a key of the collection
+`c ≫ key` keys, because that is what `{𝑘 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}` says.
+This is what makes `for o in orders: g[key(o)]` provable, and it is what naming the
+morphism bought — an opaque domain admits no such rule.
+
+**Iterating the collection** does not, and the gap is in consumption rather than in the
+surface. Consuming a sum deliberately presents the sum `σ` rather than the refined domain,
+so that the witness cannot escape into the consumer's result; an iterated key is therefore
+a consumed sum's witness, and the membership has nothing to discharge against. The
+apparatus is there — `𝑘 : σ` alongside `𝑚 : σ` is the pairing a discharge needs — but which
+shape closes it is open, and it lands before the `[]` / `[]?` surface rather than with it.
+
+## Keyed entry needs the key domain written down at lowering
+
+An entry term runs a membership predicate on the entering side, so it decides at
+constraint-emission time only for a domain that is already concrete, and otherwise becomes
+a kinding constraint on the domain variable. Whether a producer satisfies that is not a
+property of the collection type but of whether lowering wrote the domain down. So the rule
+for every re-keying producer is: **stamp your own key binder with the present-key domain**
+`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`
+([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)). Get
+it wrong and the failure is an `AnnotationMismatch` on the Σ witness rather than anything
+naming the cause, because the gate had nothing concrete to test.
+
+A re-keying producer knows its key image syntactically, so it needs no deferred obligation
+of the kind a comprehension's range domain takes. One comes due for a producer whose key
+domain is unknowable until coalesce — a map comprehension, a keyed feed — and none exists
+today.
+
+## Iterating a `Set`/`Map` binds the codomain, not the keys [Interim]
+
+`for g in groupby(xs, key)` binds `g` to the **codomain** — each group, not each key. The
+semantic decision is made and kind-directed
+([chl-spec §4.6](../../../docs/chl-spec.md#46-for--iteration)); what blocks it is narrower
+than the operation layer being unbuilt. The element choice has to distinguish `Set` from
+`Map`, and those are currently the same type, so there is nothing to dispatch on
+([Telling `Set` and `Map` apart](#telling-set-and-map-apart-open)).
+
 
 ## Compiling a conditional collection
 
@@ -191,12 +346,13 @@ The arms' domains are `[0, 1]` and `[0, 2]`, so the `Case` types as
 Nothing reads a witness off a value at runtime, so that type on its own gives `sum` no
 extent to iterate.
 
-Planning (`planning/conditionals.rs`) replaces it with the gated union `⧺ᵢ (armᵢ | π̂ᵢ)` over
-the same domains, each leg gated by the path condition its `if`/`elif` compiled to. The
-gates are exclusive and exhaustive, so exactly one leg is non-empty and the union's extent
-is the domain the witness selected — which is what makes the union and the Σ the same
-collection. The pass asserts the type it is replacing rather than relating the two by a
-typing rule ([type-inference.md, Planning asserts the type it
+**Realization** replaces the Σ with a term that has one. The `Case` becomes the gated union
+`⧺ᵢ (armᵢ | π̂ᵢ)` over the same domains, each leg gated by the path condition its `if`/`elif`
+compiled to. The gates are exclusive and exhaustive, so exactly one leg is non-empty and the
+union's extent is the domain the witness selected — which is what makes the union and the Σ
+the same collection. It runs in planning (`planning/conditionals.rs`) and asserts its
+pre-realization type rather than relating the two by a typing rule
+([type-inference.md, Planning asserts the type it
 replaces](type-inference.md#planning-asserts-the-type-it-replaces)).
 
 **A conditional collection is the only Σ-typed term the runtime can currently evaluate.**
@@ -206,7 +362,7 @@ or crossing a source boundary — waits on a runtime witness that does not exist
 that reaches op-conversion with no concrete domain has no extent and is reported as a
 compiler bug.
 
-**One union per site, at the node whose type carries the choice**: the outermost `Σ`
+**One realization per site, at the node whose type carries the choice**: the outermost `Σ`
 binding the witness. Arms sharing a domain form no Σ at all, and substituting the arm for
 the conditional at the site leaves the arm.
 

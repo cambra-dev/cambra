@@ -436,6 +436,9 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // no `Hole` reaches a use's instantiation type in the first place. The
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
+        // A `SharedHole` joins the `Hole` arm, mirroring `compact_go`: its id is a
+        // lowering-time linkage and not part of the type, so there is nothing here to
+        // key on either.
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
         // A witness reference contributes an **anonymous** marker: enough to tell a position
         // that is a witness from one that is an ordinary domain, and nothing more. Which

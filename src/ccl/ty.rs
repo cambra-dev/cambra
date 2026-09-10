@@ -2585,8 +2585,52 @@ impl Type {
     /// ([`TypeKind::SubtypesOf`]). Contrast [`list_of`](Self::list_of), whose
     /// [`UIntRanges`](TypeKind::UIntRanges) takes no parameter, and a conditional collection,
     /// whose candidates are named.
+    ///
+    /// **The witness arrow is a Pi**, for the reason [`full_map_of`](Self::full_map_of)
+    /// is one: a map's value may depend on its key, so the type declares the binder that
+    /// dependence names. `box` puts the same binder on the same position
+    /// (`a_boxed_dependent_collection_declares_its_binder_on_the_witness`), so without it
+    /// an initializer's dependent codomain has no name here to correspond with and lands
+    /// as a bound naming a binder the holder's telescope does not hold
+    /// (`src/ccl/design/type-inference.md`, "The invariant"). Coalesce strips a binder the
+    /// codomain does not reference, so a non-dependent map renders and compares as
+    /// `𝜎 ⤇ 𝑉` either way.
     pub fn map_of(key: Type, value: Type) -> Self {
-        Type::sum_over(TypeKind::SubtypesOf(Box::new(key)), None, value)
+        Type::sum_over(
+            TypeKind::SubtypesOf(Box::new(key)),
+            Some(crate::ccl::Name::fresh("__map_k")),
+            value,
+        )
+    }
+
+    /// The type of a **set**: [`map_of`](Self::map_of) at a `unit` value, so the key domain
+    /// is the payload and the codomain carries nothing.
+    pub fn set_of(key: Type) -> Self {
+        Type::map_of(key, Type::Base(BaseType::Unit))
+    }
+
+    /// The type of a **full map**: the data function `(𝑘: 𝐾) ⤇ 𝑉`, holding a value for
+    /// every key of `𝐾` so a lookup needs no proof of presence. Not a sum
+    /// (`src/ccl/design/collections.md`, "The six collection types").
+    ///
+    /// **A Pi, always.** A full map's value may depend on its key — a `groupby`'s group is
+    /// `{𝐼 | key(𝑖) == 𝑘} ⤇ 𝑉` — so the type declares the binder that dependence names.
+    /// Without one the codomain edge has no name to align the initializer's binder to
+    /// ([`crate::ccl::subst::Subst::aligned`]), and the dependent codomain lands as a
+    /// bound naming a binder the holder's telescope does not hold
+    /// (`src/ccl/design/type-inference.md`, "The invariant"). A codomain that does not
+    /// reference the binder is an ordinary function either way, so the Pi costs a
+    /// non-dependent full map nothing.
+    ///
+    /// The binder is **freshly minted**: two annotation sites are two binding sites and the
+    /// closure check is a lookup by uid.
+    pub fn full_map_of(key: Type, value: Type) -> Self {
+        Type::pi_kinded(
+            crate::ccl::Name::fresh("__map_k"),
+            key,
+            value,
+            FunKind::Data(None),
+        )
     }
 
     /// The type of a **collection**: the dependent sum `Σ (𝐷: Any). 𝐷 ⤇ elem` — a

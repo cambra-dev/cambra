@@ -1406,6 +1406,387 @@ fn test_list_map_reseals_to_list() {
     );
 }
 
+/// **[Interim]** `Map(𝐾, 𝑉) <: Collection(𝑉)` holds today, and this pins that state rather
+/// than a property. The edge is a consequence of `Type` being ⊤ structurally rather than by
+/// a row per kind (`src/ccl/design/type-inference.md`, "Type kind containment"), so nothing
+/// in the kind lattice withholds it and a map handed to a `Collection(𝑉)` slot is read as
+/// its values.
+///
+/// Whether the edge should exist is undecided
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"). Withholding it
+/// is what a declared type constructor would be for, and nothing in [`Type`] carries one, so
+/// neither side is implemented. Answering the question that way turns the first assertion
+/// into a rejection pointing at `values(m)`; the `List` assertion is not interim, being the
+/// same structural arm at a positional kind, where no nominal question arises.
+///
+/// [`test_map_consumption_is_kind_blind_interim`] pins the other route into a map's values.
+#[test]
+fn test_a_map_widens_to_collection_interim() {
+    assert_eq!(
+        infer_program(
+            "def f(c: Collection(Int)):\n    sum(c)\ndef g(m: Map(Int, Int)):\n    f(m)\ng"
+        )
+        .to_string(),
+        "(Σ (σ : SubtypesOf(Int)). (σ ⤇ Int) ⇒ Int)"
+    );
+    // A positional collection widens by the same arm, so the edge is kind-blind rather
+    // than keyed-specific.
+    assert_eq!(
+        infer_program("def f(c: Collection(Int)):\n    sum(c)\ndef g(l: List(Int)):\n    f(l)\ng")
+            .to_string(),
+        "(Σ (σ : UIntRanges). (σ ⤇ Int) ⇒ Int)"
+    );
+}
+
+/// A `FullMap` lookup needs no proof of presence, and this pins the **rule** on a function
+/// nothing can call.
+///
+/// `FullMap(Int, Int)` claims a value for every `Int`, and no producer has an unrefined
+/// base type as its domain — a list literal's is a `UIntRange`, a group-by's is the
+/// present-key refinement — so the annotation has no inhabitants. That is a fact about this
+/// key type rather than the annotation form: `FullMap(_, Int)` is satisfied by a list
+/// literal (`full_map_annotations_are_satisfiable`). The lookup itself is unreachable for
+/// two unrelated reasons, a keyed domain needing the key to acquire its membership
+/// refinement and a range domain needing `UIntRange` to stop relating only by equality
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge").
+#[test]
+fn full_map_lookup_needs_no_presence_proof() {
+    let f = "def f(m: FullMap(Int, Int)):\n";
+    assert_eq!(
+        infer_program(&format!("{f}    m\nf")).to_string(),
+        "((Int ⤇ Int) ⇒ (Int ⤇ Int))",
+        "the annotation is a data function, not a sum"
+    );
+    // The lookup yields the value type outright. An `Option` here would mean the
+    // membership question was asked, which is exactly what totality removes.
+    assert_eq!(
+        infer_program(&format!("{f}    m[1]\nf")).to_string(),
+        "((Int ⤇ Int) ⇒ Int)"
+    );
+    // Total does not mean unchecked: the key still has to be a key.
+    assert!(
+        !infer_program_err(&format!("{f}    m[\"a\"]\nf")).is_empty(),
+        "a String key must not reach an Int-keyed full map"
+    );
+    // The storefront shape — totality earned by refining the key type — keeps the
+    // refinement on the domain rather than erasing it into a witness.
+    assert!(
+        infer_program("def f(m: FullMap({Int where _ > 0}, Int)):\n    m\nf")
+            .to_string()
+            .contains("{Int | __elem > 0} ⤇ Int"),
+        "a refined key type is the domain"
+    );
+}
+
+/// A `FullMap` annotation is satisfiable with the key elided, as a binding and as a
+/// parameter — so the uninhabited `FullMap(Int, Int)` above is a property of that key type
+/// and not of the form.
+///
+/// `Array(𝑛, 𝑇)` is the control: it is already a `FullMap` over `[0, 𝑛)`, so a bare
+/// data-function parameter is nothing new. What the elided key buys over it is that the
+/// domain need not be written, which is what a producer whose domain has no surface
+/// spelling requires.
+#[test]
+fn full_map_annotations_are_satisfiable() {
+    assert_eq!(
+        infer_program("x: FullMap(_, Int) = [1,2,3]\nx").to_string(),
+        "([0, 2] ⤇ Int)",
+        "a binding takes the producer's own domain"
+    );
+    assert_eq!(
+        infer_program("def f(m: FullMap(_, Int)):\n    sum(m)\nf([1,2,3])"),
+        int(),
+        "and so does a parameter, at a call site"
+    );
+    assert_eq!(
+        infer_program("def f(m: Array(3, Int)):\n    sum(m)\nf([1,2,3])"),
+        int(),
+        "control: Array is the same shape with the range written out"
+    );
+}
+
+/// A key drawn from the source does **not** yet carry its collection's key domain, so a
+/// lookup into a `groupby` is rejected.
+///
+/// This is a missing rule and not a refused one. The argument edge already relates
+/// refinements in the *dropping* direction — `Int@1` reaches a domain of `Int`
+/// ([`full_map_lookup_needs_no_presence_proof`]) — and what a proven lookup needs is the
+/// other direction: a key produced by the key morphism from an element of the source
+/// *acquires* `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, because that predicate says
+/// exactly which keys the morphism produces. Nothing in the type system stands against it
+/// (`src/ccl/design/collections.md`, "Prerequisite: the proof has to survive being
+/// consumed"), so this pins today's rejection to make its arrival visible rather than
+/// asserting the rejection is right.
+///
+/// All three spellings fail identically, which is the point: the source element, the
+/// morphism applied to it, and a projected field are one situation.
+#[test]
+fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
+    for program in [
+        "c = [1,1,2]\ng = groupby(c, \\v -> v)\nsum([sum(g[x]) for x in c])",
+        "k = \\v -> v\nc = [1,1,2]\ng = groupby(c, k)\nsum([sum(g[k(x)]) for x in c])",
+        "c = [(a=1,b=2),(a=2,b=3)]\ng = groupby(c, \\r -> r.a)\nsum([sum([y.b for y in g[r.a]]) for r in c])",
+    ] {
+        let errs = infer_program_err(program);
+        assert!(
+            errs.iter()
+                .map(|e| format!("{e:?}"))
+                .any(|m| m.contains("collection_contains")),
+            "the rejection must name the present-key domain the key fails to carry, \
+             got {errs:?} for {program}"
+        );
+    }
+}
+
+/// A **bare-key** lookup `g(k)` on a group-by is refused, and stays refused.
+///
+/// `groupby`'s domain is the present-key domain `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`,
+/// so applying it at a plain key demands a membership proof the key does not carry
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). The value-level
+/// spellings these programs came from read as passing under the older total function type,
+/// which admitted any key and answered an absent one with the empty group.
+///
+/// Every spelling is one situation — a single lookup, a lookup beside an iteration, a
+/// discharge through a higher-order parameter — so one rejection covers them and the
+/// programs are carried here rather than each keeping a test of a value it cannot produce.
+/// What returns them is `g[k]?`, a different program with `Option` handling.
+///
+/// The discharge two of them tested is re-expressed rather than dropped: a filtered
+/// comprehension over the parameter is dependent for the ordinary reason and needs no
+/// membership proof ([`dependent_application_discharges_the_binder`],
+/// [`higher_order_dependent_application_discharges_the_binder`]).
+#[test]
+fn a_bare_key_lookup_on_a_groupby_is_refused() {
+    for program in [
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1))",
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))",
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
+        "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
+        "groups = groupby([1, 2, 3], \\x -> x)\ngroups(0)",
+        "groups = groupby([1, 2, 3], \\x -> x)\napply0 = \\g -> g(0)\napply0(groups)",
+    ] {
+        let errs = infer_program_err(program);
+        assert!(
+            errs.iter()
+                .map(|e| format!("{e:?}"))
+                .any(|m| m.contains("collection_contains")),
+            "the rejection must name the present-key domain the key fails to carry, \
+             got {errs:?} for {program}"
+        );
+    }
+}
+
+/// A **boxed exact `Map`** annotation on a group-by types and cannot be consumed: the `box`
+/// references the comprehension's `__iter_record` from outside its scope.
+///
+/// A compiler bug rather than a rule, pinned so its fix is visible. Its exact `FullMap`
+/// counterpart compiles and runs
+/// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation form is the whole
+/// difference.
+#[test]
+fn a_consumed_boxed_map_annotation_escapes_its_scope() {
+    let errs = infer_program_err(indoc! {r#"
+        g: Map(_, _) = box(groupby([1,2,3], \x -> x))
+        sum([sum(v) for v in g])
+    "#});
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|m| m.contains("out-of-scope binder") && m.contains("__iter_record")),
+        "expected the box to escape the comprehension's binder, got {errs:?}"
+    );
+}
+
+/// A **bounded** keyed annotation on a group-by records an open bound: `__gb_k` is free in a
+/// lower bound whose holder's telescope does not carry it.
+///
+/// A compiler bug rather than a rule, and it trips the record-time invariant rather than
+/// returning an error, so the pin is on the panic. Its exact counterpart compiles and runs
+/// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation strength is the whole
+/// difference.
+#[test]
+#[should_panic(expected = "open bound recorded")]
+fn a_consumed_bounded_keyed_annotation_records_an_open_bound() {
+    infer_program(indoc! {r#"
+        g <: FullMap(_, _) = groupby([1,2], \v -> v)
+        sum([sum(v) for v in g])
+    "#});
+}
+
+/// A `groupby` **is** a `FullMap`, at either annotation strength, and only with its key
+/// type elided.
+///
+/// Its domain is the present-key domain `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, and
+/// a data function's domain is invariant, so an annotation has to name that refinement
+/// rather than the bare key type. Naming it needs the key morphism's image at the surface
+/// — `keys(…)`, which does not exist — so `FullMap(_, _)` is the only form a group-by
+/// satisfies. The elided form is not a workaround: it is the honest statement that the
+/// checker knows the key set and the surface cannot spell it.
+///
+/// The **exact** form binds `g` at the annotation, so its filled codomain lands under the
+/// annotation's own binder and the group's predicate names that one
+/// ([`an_exact_keyed_annotation_aligns_the_filled_binder`]). The bounded form leaves `g`
+/// the initializer's type, binder included.
+#[test]
+fn a_groupby_is_a_full_map_at_either_strength() {
+    let gb = "groupby([1,2], \\v -> v)";
+    // Bounded: `g` keeps the initializer's type, so the group-by's own binder survives.
+    let bounded = infer_program(&format!("g <: FullMap(_, _) = {gb}\ng")).to_string();
+    assert!(
+        bounded.starts_with("((__gb_k: {Int | ") && bounded.contains("collection_contains"),
+        "a group-by satisfies FullMap and keeps its present-key domain, got {bounded}"
+    );
+    // Exact: `g` binds at the annotation, whose binder the filled codomain names.
+    let exact = infer_program(&format!("g: FullMap(_, _) = {gb}\ng")).to_string();
+    assert!(
+        exact.starts_with("((__map_k: {Int | ") && exact.contains("== __map_k"),
+        "the exact form binds at the annotation's binder, got {exact}"
+    );
+    // And it is usable, not merely inhabited: consuming the groups sums them.
+    assert_eq!(
+        infer_program(&format!(
+            "g: FullMap(_, _) = {gb}\nsum([sum(v) for v in g])"
+        )),
+        int(),
+        "an exact keyed annotation is consumable"
+    );
+    assert!(
+        !infer_program_err(&format!("g <: FullMap(Int, _) = {gb}\ng")).is_empty(),
+        "the bare key type is not the present-key domain, so it must not match"
+    );
+}
+
+/// An **exact** keyed annotation fills its codomain from the initializer, and the fill
+/// lands under the *annotation's* binder — so a reference to the initializer's binder is
+/// respelled on the way in ([`Subst::aligned`], the alignment `constrain_go` draws its
+/// codomain edge under).
+///
+/// Copying the codomain unaligned binds nothing: `Type::fun_like` closes over the
+/// annotation's binder, which reaches no reference spelled as the initializer's, leaving
+/// that name free in a stored type (`src/ccl/design/type-inference.md`, "The invariant").
+/// That is unobservable in the result — both spellings *print* a bound-looking binder —
+/// so this asserts the name the predicate carries, which is the one that differs.
+///
+/// A group-by is the only producer that reaches it: the fill needs a codomain that
+/// references the binder at all, which takes a dependent collection.
+#[test]
+fn an_exact_keyed_annotation_aligns_the_filled_binder() {
+    for ann in ["FullMap(_, _)", "Map(_, _)"] {
+        let gb = if ann.starts_with("Map") {
+            "box(groupby([1,2,3], \\x -> x))"
+        } else {
+            "groupby([1,2,3], \\x -> x)"
+        };
+        let ty = infer_program(&format!("g: {ann} = {gb}\ng")).to_string();
+        assert!(
+            ty.contains("== __map_k"),
+            "`{ann}` must fill its codomain at its own binder, got {ty}"
+        );
+        assert!(
+            !ty.contains("__gb_k") && !ty.contains("__box_k"),
+            "no initializer binder may survive the fill, got {ty}"
+        );
+    }
+}
+
+/// A keyed annotation's **key type** is checked, not just the shape of the domain's
+/// refinement: an `Int`-keyed `groupby` does not satisfy `Map(String, _)`.
+///
+/// The annotation is the **bounded** form so that what this pins is the subtyping edge:
+/// a bound leaves `g` its own type and checks the edge, while an exact annotation binds
+/// `g` at the annotation and fills `𝑉` from the initializer instead
+/// ([`an_exact_keyed_annotation_aligns_the_filled_binder`] covers that path). A *written*
+/// `𝑉` is one type with no binder to name, so a group-by's dependent codomain fails it
+/// either way.
+#[test]
+fn keyed_entry_checks_the_annotated_key_type() {
+    let gb = "box(groupby([1,2,3], \\x -> x))";
+    assert!(
+        !infer_program_err(&format!("g <: Map(String, Collection(Int)) = {gb}\ng")).is_empty(),
+        "an Int-keyed group-by must not satisfy Map(String, _)"
+    );
+    // The same rejection with the value slot **elided**, which is the shape that reaches
+    // the key-parameter obligation rather than failing on the value edge first. It is
+    // what pins the key-type *equality*: the domain's membership predicate names the key
+    // morphism, and `__elem` is *applied* to it, so the shared scheme variable receives
+    // the base as a lower bound only. Without the [`Type::SharedHole`] equating the base
+    // with the morphism's codomain, `String` and `Int` would join instead of conflicting
+    // and this annotation would be accepted.
+    assert!(
+        !infer_program_err(&format!("g <: Map(String, _) = {gb}\ng")).is_empty(),
+        "an Int-keyed group-by must not satisfy Map(String, _) with the value elided"
+    );
+    // Positive control: the right key type still reaches the annotation. The value type
+    // is left elided — a group is a bare data function, and `Collection(Int)` is a sum
+    // only a term can enter, so naming one there would be a second, unrelated rejection.
+    let ty = infer_program(&format!("g <: Map(Int, _) = {gb}\ng")).to_string();
+    // The key type, not a binder spelling: a reference to the type's own function is
+    // stored as an index and rendered at whichever binder the type carries
+    // (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of two
+    // forms"), so asserting the spelling would pin a display choice.
+    assert!(
+        ty.contains("Int") && ty.contains(": σ) ⤇ "),
+        "the matching key type must still reach the annotation, got {ty}"
+    );
+}
+
+/// `Set(𝐾)` lowers to `Map(𝐾, unit)` — a map whose payload is the single
+/// `unit` a present key carries (`src/ccl/design/collections.md`, "The six collection
+/// types"). The annotation is the only surface naming one here; the `set(…)` constructor
+/// that *produces* one arrives later in the stack, so this pins the lowering arm on the
+/// parameter form, which needs no producer.
+///
+/// The key type is carried rather than elided, which is what makes the arm more than a
+/// shape: `Set(String)` and `Set(Int)` are different annotations.
+#[test]
+fn a_set_annotation_is_a_unit_valued_map() {
+    let int_keyed = infer_program("def f(s: Set(Int)):\n    s\nf").to_string();
+    assert!(
+        int_keyed.contains("SubtypesOf(Int)") && int_keyed.contains("⤇ Unit"),
+        "`Set(Int)` is a map over `Int` whose values are `unit`, got {int_keyed}"
+    );
+    let str_keyed = infer_program("def f(s: Set(String)):\n    s\nf").to_string();
+    assert!(
+        str_keyed.contains("SubtypesOf(String)"),
+        "`Set(String)` must carry its own key type, got {str_keyed}"
+    );
+    let elided = infer_program("def f(s: Set(_)):\n    s\nf").to_string();
+    assert!(
+        elided.contains("⤇ Unit"),
+        "an elided key leaves the payload stated, got {elided}"
+    );
+    // A list is `Int`-valued, so it is no set of `Int`s at either annotation strength.
+    for code in ["s: Set(Int) = [1,2,3]\ns", "s <: Set(Int) = [1,2,3]\ns"] {
+        assert!(
+            !infer_program_err(code).is_empty(),
+            "an `Int`-valued collection must not satisfy `Set(Int)`: {code}"
+        );
+    }
+}
+
+/// **[Interim]** `sum(m)` type-checks today and sums a map's values, and this pins that
+/// state rather than a rule. `Σ`-elimination (`Σ <: Fun`) is kind-blind, and it is the same
+/// arm that makes `sum(xs)` work for a `List` and `[f(g) for g in groupby(…)]` work for a
+/// group-by, so the map takes it too.
+///
+/// Direct consumption is the second route into a map's values, beside the widening
+/// [`test_a_map_widens_to_collection_interim`] pins, and the same open question covers which
+/// of the two rejects `sum(m)`
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"). This route is
+/// the [Interim] "`for`-in binds the codomain for every kind" state rather than a second
+/// subtyping hole: closing it means giving `Map` a per-kind `Iterable` instance, which needs
+/// the kind represented
+/// (`src/ccl/design/collections.md`, "The collection type is declared, not read off the shape").
+/// When the operation layer lands this assertion flips to a rejection pointing at
+/// `values(m)`.
+#[test]
+fn test_map_consumption_is_kind_blind_interim() {
+    assert_eq!(
+        infer_program("def g(m: Map(Int, Int)):\n    sum(m)\ng").to_string(),
+        "(Σ (σ : SubtypesOf(Int)). (σ ⤇ Int) ⇒ Int)"
+    );
+}
+
 #[test]
 fn test_aggregate_over_scalar_lambda_is_rejected() {
     // Summing a plain lambda: a bare `λ` is a capability, built concrete
@@ -1914,9 +2295,11 @@ fn test_copair_heterogeneous_rejected() {
 // comparison, so without a stated relation its type can only arrive backwards
 // along the operand requirement that relates a comparison's two sides — making a
 // group-by's key inference depend on an operator's internals. One
-// `Type::SharedHole` states it, carried by the key application and by the domain of
-// the group-by's own `data_fun` annotation; these cases pin that the key resolves
-// to the key function's result type and not to the collection's element type.
+// `Type::SharedHole` states it, carried by the key application and by the key binder's
+// own domain; these cases pin that the key resolves to the key function's result type
+// and not to the collection's element type. Asserted on the **base** of that domain: the
+// domain itself is `{K | __elem ▷ (𝑚 ▷ collection_contains)}`, the present-key domain this group-by
+// mints, and which keys are present is a different fact from what type they are.
 //
 // The relation is **not** visible in `test_lower_groupby`'s snapshots, because
 // `symbolic` does not render annotations. These are the tests that cover it.
@@ -1928,7 +2311,21 @@ fn test_groupby_key_type_comes_from_the_key_function(#[case] code: &str, #[case]
     let Type::Fun { domain, .. } = &ty else {
         panic!("a group-by is a function from key to partition, got {ty}");
     };
-    assert_eq!(**domain, key_ty, "wrong key type for {code}");
+    assert_eq!(
+        strip_refinements(domain),
+        key_ty,
+        "wrong key type for {code}"
+    );
+}
+
+/// The bare type under any refinement layers — the local stand-in for
+/// `ccl_utils::strip_refinements`, which is crate-private.
+fn strip_refinements(ty: &Type) -> Type {
+    let mut cur = ty;
+    while let Type::Refinement(inner, _) = cur {
+        cur = inner;
+    }
+    cur.clone()
 }
 
 /// The key type of the group-by in `code`'s result, which is expected to be a
@@ -1939,7 +2336,9 @@ fn groupby_key_types(code: &str) -> (Type, Type) {
         panic!("expected a pair of group-bys, got {ty}");
     };
     let key_of = |t: &Type| match t {
-        Type::Fun { domain, .. } => (**domain).clone(),
+        // The **base** of the present-key domain; see
+        // `test_groupby_key_type_comes_from_the_key_function`.
+        Type::Fun { domain, .. } => strip_refinements(domain),
         other => panic!("a group-by is a function from key to partition, got {other}"),
     };
     (key_of(&parts[0]), key_of(&parts[1]))
@@ -1980,116 +2379,93 @@ fn test_groupby_key_relation_is_per_occurrence(#[case] code: &str) {
     assert_eq!(groupby_key_types(code), (int(), string()), "for {code}");
 }
 
-// The tests above pin what a group-by's key type *resolves to*; this one pins
-// that the key type is still **enforced** at a lookup. Stating the relation on
-// the `data_fun` annotation makes the edge directional (`key_ty <: ⟨domain⟩` —
-// contravariance), and a directional edge is exactly the kind that can go slack
-// without any test noticing: every case above would still pass if a lookup at an
-// unrelated key type were silently accepted.
-//
-// Asserted on the rendered message rather than the error *variant*: which check
-// catches this is a property of how `==` is typed, not of the key relation, so
-// pinning the variant would make the test fail on any change to that — it says
-// only that the two types met and were refused.
+/// A lookup at the wrong key type is refused, and **membership is the reason**.
+///
+/// The key-type edge (`key_ty <: ⟨domain⟩`, contravariant) is directional, and a
+/// directional edge can go slack without a resolution test noticing. It is not what
+/// catches this today: the group-by's domain is the present-key domain, so a bare key
+/// fails to carry the membership refinement before its base type is ever compared. This
+/// pins the rejection that fires, so a change in which check catches it shows up here
+/// rather than passing silently.
+///
+/// The key-type edge gets its own failure to stand on once a lookup discharges membership
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). Until then the
+/// `String` key type is unenforced at a lookup, and no test claims otherwise.
 #[test]
-fn test_groupby_lookup_at_wrong_key_type_rejected() {
+fn a_lookup_at_the_wrong_key_type_is_refused_for_membership() {
     let errs = infer_program_err(indoc! {r#"
         groups = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
         groups(1)
     "#});
+    let msgs: Vec<String> = errs.iter().map(|e| format!("{e:?}")).collect();
     assert!(
-        errs.iter()
-            .map(|e| format!("{e:?}"))
-            .any(|msg| msg.contains("Int") && msg.contains("String")),
-        "expected the Int key to be rejected against the String key type, got {errs:?}"
+        msgs.iter().any(|m| m.contains("collection_contains")),
+        "the rejection must name the present-key domain the key fails to carry, got {errs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("String")),
+        "the key type is not yet what refuses this; if it is, the doc comment above and \
+         the membership assertion are both stale: {errs:?}"
     );
 }
 
+/// **Dependent application discharges the binder to the argument.** The headline case
+/// the Pi-type + substitution machinery unlocks: a function whose *result type mentions
+/// its parameter*, applied at a concrete value, must have that value substituted into the
+/// result — before it, the predicate kept the unbound binder.
+///
+/// The vehicle is a filtered comprehension over the parameter, which is dependent for the
+/// ordinary reason (the body's type mentions `k`) and needs **no membership proof**. A
+/// group-by key lookup would not serve: it couples this machinery to whether a bare key can
+/// be shown present in a `Map`, an unrelated question that the proven operator
+/// answers "no" by design (`src/ccl/design/collections.md`, "Lookup: membership
+/// discharge").
 #[test]
-fn test_groupby_aggregate() {
-    // groups = groupby([1, 2, 3], \x -> x)
-    // g = groups(1)
-    // sum(g)
-    // Expected: Int (sum of a group of integers)
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-g = groups(1)
-sum(g)
-"#
-        .trim(),
+fn dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    // The function is genuinely dependent: its codomain refinement mentions the binder.
+    assert!(
+        infer_program(&format!("{f}f"))
+            .to_string()
+            .starts_with("((k: Int) ⇒ "),
+        "the vehicle must be a dependent function"
     );
-    assert_eq!(ty, int(), "expected Int, got {ty}");
+    assert_predicate_discharged(&infer_program(&format!("{f}f(0)")), "k");
 }
 
-/// Dependent application: looking up one partition of a group-by applies the
-/// key function `(k) ⇒ {i | key(i) == k} ⇒ V` at a concrete key, and the
-/// surviving partition predicate must reflect that key — the binder is
-/// *discharged* to the argument (design §5 / Appendix A). This is the headline
-/// case the Pi-type + substitution machinery unlocks: before it, the predicate
-/// kept the unbound group-by key.
+/// O3 (**higher-order** dependent application): apply a dependent function through a
+/// function-typed *parameter* whose type is still an inference variable at emit time.
+/// `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply` cannot peek its Pi
+/// binder to build the identity correspondence — the discharge `[k ↦ 0]` must instead be
+/// resolved at coalesce, once `g` resolves to the dependent function.
+///
+/// `apply0(f)` must therefore land on exactly what the *direct* `f(0)` yields.
 #[test]
-fn test_groupby_dependent_application_discharges_key() {
-    // groups : (k) ⇒ ({i | i ▷ xs ▷ key_fn == k} ⇒ Int); groups(0) discharges
-    // k ↦ 0, so the partition predicate must mention the literal 0 and no
-    // longer reference the group-by key binder `__gb_k`.
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-groups(0)
-"#
-        .trim(),
+fn higher_order_dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    let direct = infer_program(&format!("{f}f(0)"));
+    let through = infer_program(&format!("{f}apply0 = \\g -> g(0)\napply0(f)"));
+    assert_predicate_discharged(&through, "k");
+    assert_eq!(
+        through, direct,
+        "applying through a function-typed parameter must give the same type as applying \
+         directly"
     );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
+}
+
+/// Shared assertion for the two discharge tests: `ty` is a data function whose domain
+/// refinement mentions the discharged argument `0` and no longer references `binder`.
+fn assert_predicate_discharged(ty: &Type, binder: &str) {
+    let Type::Fun { domain: dom, .. } = ty else {
+        panic!("expected a refined data function, got {ty}");
     };
     let [r] = dom.refinements() else {
-        panic!("expected a singly-refined partition domain, got {ty}");
+        panic!("expected a singly-refined domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged, but predicate still has it: {pred}"
-    );
-    assert!(
-        pred.contains('0'),
-        "discharged predicate should mention the argument 0: {pred}"
-    );
-}
-
-// O3 (higher-order dependent application): apply a dependent function through a
-// function-typed *parameter* whose type is still an inference variable at emit
-// time. `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply`
-// cannot peek its Pi binder to build the identity correspondence — the discharge
-// `[k ↦ 0]` must instead be resolved at coalesce, once `g` resolves to the
-// group-by partition function. The result of `apply0(groups)` must be the same
-// `{i | key(i) == 0} ⇒ Int` partition the *direct* `groups(0)` yields: predicate
-// mentions `0`, not the group-by key binder `__gb_k`.
-//
-// Was blocked on O3 until the apply discharge moved to coalesce: `coalesce_node`
-// re-derives each application's type from its already-resolved function child,
-// discharging on the function's *real* binder rather than the fresh `__arg`
-// binder `emit_apply` peeks when the function is still an inference variable.
-#[test]
-fn test_higher_order_dependent_application_discharges_key() {
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-apply0 = \g -> g(0)
-apply0(groups)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
-    };
-    let [r] = dom.refinements() else {
-        panic!("expected a singly-refined partition domain, got {ty}");
-    };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
-    assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged through the higher-order apply, but: {pred}"
+        !pred.contains(binder),
+        "binder `{binder}` should be discharged, but the predicate still has it: {pred}"
     );
     assert!(
         pred.contains('0'),
@@ -4701,8 +5077,11 @@ f(box([1, 2]) if c else box([1, 2, 3]))"
 fn a_boxed_dependent_collection_declares_its_binder_on_the_witness() {
     let gb = "box(groupby([1,2,3], \\x -> x))";
     let bare = infer_program(&format!("g = {gb}\ng")).to_string();
+    // The candidate is the argument's domain *exactly* — the group-by's present-key
+    // domain, refined — because `box`'s candidate position is invariant. What this pins is
+    // one level up: the Pi binder is declared on the witness `σ`, not on that candidate.
     assert!(
-        bare.starts_with("Σ (σ : [Int]). ((__box_k: σ) ⤇ "),
+        bare.starts_with("Σ (σ : [") && bare.contains("]). ((__box_k: σ) ⤇ "),
         "the Pi binder is declared on the witness domain, got {bare}"
     );
     assert!(
