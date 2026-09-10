@@ -9,9 +9,9 @@ use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
 use cambra::ccl::TagMap;
+use indoc::indoc;
 
 use crate::helpers::*;
-use indoc::indoc;
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -476,6 +476,39 @@ fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
         "},
         Value::Int(3),
     );
+}
+
+/// Two feeds into **one** deferred collection, in a loop body with no accumulator.
+/// The body's statements have one grammar at every position
+/// ([`lower_for_body_stmt`]), so the first feed is an effect sequenced before the
+/// second rather than a non-terminal statement to reject. The same body with an
+/// accumulator compiled already, through the other loop-body lowering.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            o << i
+            o << i * 10
+        sum(o)
+    "#},
+    Value::Int(33)
+)]
+#[case(
+    indoc! {r#"
+        acc := 0
+        o = defer()
+        for i in [1, 2]:
+            o << i
+            o << i * 10
+            acc += 1
+        sum(o)
+    "#},
+    Value::Int(33)
+)]
+fn two_feeds_into_one_defer_in_a_loop_body(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 /// `<<=` sets a channel's read view outright, so its RHS must be a collection
