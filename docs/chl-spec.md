@@ -1826,13 +1826,8 @@ type-checked as one.
 Patterns are **shallow**: an arm matches one tag and binds the whole
 payload, with no nesting, no literal patterns, and no per-arm guard.
 
-**A `for`-loop body admits a `match`.** An arm may `yield` or `<<`; the loop's
-feeds then fan out one channel per feeding arm, so an arm's fed value may read
-its payload.
-
-Where the same loop also writes an accumulator, a fed value built from the arm's
-payload is rejected (**[Planned]**). Feed the scrutinee and project it
-downstream, or write the accumulator in a second `for` over the same source.
+**A `for`-loop body admits a `match`.** An arm may `yield` or `<<`, and the fed
+value may read the arm's payload, the loop's accumulators, or both.
 
 #### The one-line form
 

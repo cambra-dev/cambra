@@ -1517,14 +1517,18 @@ pub(crate) fn fold_induction_loop(
         .iter()
         .map(|f| {
             let _g = f.site.enter(FEED_LABEL, provenance::Nature::Expansion);
-            let view = hist_field_view(
-                &h,
-                &hist_ty,
-                &domain_ty,
-                &f.field,
-                &f.value.ty,
-                &decision_ty,
-            );
+            // The decision carries the tap as `` {`fired{𝑉} | `idle} ``, so the
+            // view reads the field at that type and eliminates `` `fired ``:
+            // the channel is the fired positions with their values
+            // ([`fired_project`](crate::ccl::ccl_utils::fired_project)).
+            let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value.ty.clone());
+            let field_view =
+                hist_field_view(&h, &hist_ty, &domain_ty, &f.field, &tap_ty, &decision_ty);
+            let mut view = Expr::compose(vec![
+                field_view,
+                crate::ccl::ccl_utils::fired_project(f.value.ty.clone()),
+            ]);
+            view.ty = Type::fun_like(&hist_ty, domain_ty.clone(), f.value.ty.clone());
             (f.defer.clone(), view)
         })
         .collect();

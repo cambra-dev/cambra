@@ -2698,7 +2698,12 @@ fn record_field_ty(ty: &Type, field: &str) -> Type {
 struct HoistedFeed {
     defer: Name,
     tap: Name,
+    /// The raw tap stream's type — `` 𝐼 ⇒ {`fired{𝑉} | `idle} ``, as the decision
+    /// carries it.
     tap_ty: Type,
+    /// The fed value type `𝑉`, which the channel carries after `` `fired `` is
+    /// eliminated.
+    value_ty: Type,
 }
 
 /// Assemble the transaction `letrec` from the built writers/keys/feeds and
@@ -2870,12 +2875,18 @@ fn plan_store(
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
-            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), f.value_ty.clone());
+            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value_ty.clone());
+            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone());
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
             let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
+            // The decision carries the tap as `` {`fired{𝑉} | `idle} ``, and the
+            // binding is that stream verbatim — recognition reads the history
+            // record's tap field type off it, and the store holds what the
+            // decision put there. The `` `fired `` elimination happens at the feed
+            // hoist below, where the channel wants the fed value.
             let mut field_proj = Expr::proj_field(f.field.clone());
-            field_proj.ty = Type::fun(payload_ty.clone(), f.value_ty.clone());
+            field_proj.ty = Type::fun(payload_ty.clone(), tap_value_ty.clone());
             let mut tap_expr = Expr::compose(vec![
                 tvar(&commits[j], commits_ty.clone()),
                 dec_proj,
@@ -2888,6 +2899,7 @@ fn plan_store(
                 defer: f.defer,
                 tap: tap_name,
                 tap_ty,
+                value_ty: f.value_ty.clone(),
             });
         }
     }
@@ -3103,7 +3115,20 @@ impl StorePlan {
     fn feed_views(&self) -> Vec<(Name, Expr)> {
         self.hoisted
             .iter()
-            .map(|f| (f.defer.clone(), tvar(&f.tap, f.tap_ty.clone())))
+            .map(|f| {
+                // The channel carries the fed value at the positions the tap
+                // fired, so the hoist eliminates `` `fired `` off the raw tap.
+                let mut view = Expr::compose(vec![
+                    tvar(&f.tap, f.tap_ty.clone()),
+                    crate::ccl::ccl_utils::fired_project(f.value_ty.clone()),
+                ]);
+                view.ty = Type::fun_like(
+                    &f.tap_ty,
+                    f.tap_ty.domain().unwrap_or(Type::Hole),
+                    f.value_ty.clone(),
+                );
+                (f.defer.clone(), view)
+            })
             .collect()
     }
 }

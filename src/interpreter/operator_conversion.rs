@@ -1668,6 +1668,13 @@ fn build_transact_store(
 /// channelize folded onto the writer body; for a commit store, op-conversion commits
 /// each tap as a write-only key so the reply rides the transaction's commit and is
 /// read back as a value-stream. Empty for a writer with no reply.
+///
+/// The type is the tap's `` {`fired{𝑉} | `idle} ``
+/// ([`tap_variant_ty`](crate::ccl::ccl_utils::tap_variant_ty)) as the decision
+/// carries it. A store holds the tag alongside the value, and the IR's
+/// ``variant_project(`fired)`` on the read eliminates it — so the *stream's*
+/// restriction to fired positions is a typed step rather than a decode the type
+/// cannot see.
 fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
@@ -1684,9 +1691,8 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     };
     fields
         .into_iter()
-        // `writes` is the decision core; a `*__fire` field is a tap's *fire gate*
-        // (read by `body_decision_at`), not a tap value itself.
-        .filter(|(f, _)| f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX))
+        // `writes` is the decision core; every other field is a tap.
+        .filter(|(f, _)| f != F_WRITES)
         .collect()
 }
 

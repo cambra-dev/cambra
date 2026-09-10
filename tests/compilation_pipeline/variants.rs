@@ -1605,40 +1605,72 @@ fn test_a_tap_value_reads_the_accumulator() {
     );
 }
 
-/// The one shape the writer's decision record cannot carry: a tap value reading
-/// the arm's **payload**. `variant_project` restricts the domain rather than
-/// answering over it, so the value answers on its arm's positions while the
-/// record commits on every arm's — see `src/ccl/lower/loops.rs`,
-/// `feed_reading_payload_error`. Rejected at lowering rather than stalling the
-/// writer at run time.
+/// A tap value reading the arm's **payload** — the shape the decision record
+/// could not carry while a tap's value had to answer at every committing
+/// position. The tap holds `` {`fired{𝑉} | `idle} `` now, so the value is asked
+/// for only where the tap fires, which is exactly where an arm's
+/// `variant_project` answers.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case(indoc! {"
-    o = defer()
-    acc := 0
-    for m in [`a(2), `b(3)]:
-        match m:
-            case `a(n):
-                o << n
-            case `b(k):
-                acc += k
-    sum(o)"})]
-// Binding the payload first puts the same projection in the tap, so the
-// rejection follows the value through the `let` rather than matching the
-// spelling.
-#[case(indoc! {"
-    o = defer()
-    acc := 0
-    for m in [`a(2), `b(3)]:
-        match m:
-            case `a(n):
-                v = n * 2
-                o << v
-            case `b(k):
-                acc += k
-    sum(o)"})]
-fn test_a_tap_value_reading_its_payload_is_rejected(#[case] code: &str) {
-    check_compile_error(code, "is built from the arm's payload");
+#[case("sum(o)", Value::Int(7))]
+#[case("acc", Value::Int(3))]
+fn test_a_tap_value_reads_its_payload(#[case] tail: &str, #[case] expected: Value) {
+    let loop_program = indoc! {"
+        o = defer()
+        acc := 0
+        for m in [`a(2), `b(3), `a(5)]:
+            match m:
+                case `a(n):
+                    o << n
+                case `b(k):
+                    acc += k
+    "};
+    check_scalar(&format!("{loop_program}{tail}"), expected);
+}
+
+/// A tap value reading the payload **and** the accumulator. The payload restricts
+/// the value's domain and the accumulator is the writer's per-position snapshot,
+/// so this shape needs both the tap (for read-your-writes) and the restriction —
+/// neither the fan-out nor a total-valued tap can carry it.
+///
+/// Position 0 reads the seed (`2 + 0`) and position 2 reads the write position 1
+/// made (`5 + 3`); position 1 feeds nothing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_a_tap_value_reads_its_payload_and_the_accumulator() {
+    check_scalar(
+        indoc! {"
+            o = defer()
+            acc := 0
+            for m in [`a(2), `b(3), `a(5)]:
+                match m:
+                    case `a(n):
+                        o << n + acc
+                    case `b(k):
+                        acc += k
+            sum(o)"},
+        Value::Int(10),
+    );
+}
+
+/// Partitioning a tagged stream: one arm forwards its payload to a channel, the
+/// other counts. The shape a `match` in a loop is written for.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum(out)", Value::Int(30))]
+#[case("errors", Value::Int(1))]
+fn test_a_match_in_a_loop_partitions_a_tagged_stream(#[case] tail: &str, #[case] expected: Value) {
+    let loop_program = indoc! {"
+        out = defer()
+        errors := 0
+        for msg in [`data(10), `error(404), `data(20)]:
+            match msg:
+                case `data(v):
+                    out << v
+                case `error(code):
+                    errors += 1
+    "};
+    check_scalar(&format!("{loop_program}{tail}"), expected);
 }
 
 // A payload-binding arm and a payload-less one in the same `match`, both
