@@ -179,6 +179,25 @@ ci_doc_refs() {
   python3 .github/scripts/doc-refs/check_doc_refs.py || return 1
 }
 
+# Gate against an item inserted into another item's doc block, which leaves the
+# displaced item undocumented and the new one wearing a doc that describes
+# something else. Reads the diff of each commit on the branch rather than the
+# working tree, because the defect is a property of how the text arrived.
+# Same ordering rule as `ci_doc_refs`: checker tests first, and `|| return 1` per
+# command because `ci_all` disables errexit for this function's extent.
+ci_doc_adoption() {
+  python3 .github/scripts/test_doc_adoption.py || return 1
+  local base="main"
+  if git rev-parse --verify --quiet origin/main >/dev/null; then base="origin/main"; fi
+  # Under `jj` the git HEAD sits at the working copy's parent, so `base..HEAD`
+  # would silently check nothing. Ask jj for the tip when it owns the repo.
+  local tip="HEAD"
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    tip="$(jj log -r @ --no-graph -T 'commit_id')"
+  fi
+  python3 .github/scripts/doc-adoption.py "${base}" "${tip}" || return 1
+}
+
 # Gate the interpreter's no-back-channel invariant: operators exchange tiles
 # through `get`, never through shared mutable state (`src/interpreter/CLAUDE.md`).
 # Same ordering rule as `ci_doc_refs`: checker tests first, and `|| return 1` per
@@ -219,6 +238,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc_refs || failed="${failed} doc_refs"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_doc_adoption || failed="${failed} doc_adoption"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_shared_state || failed="${failed} shared_state"

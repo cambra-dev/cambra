@@ -278,6 +278,10 @@ fn freshen_level(ty: &Type) -> Level {
     lvl
 }
 
+/// Copy `ty` with every variable introduced above `lim` replaced by a fresh one
+/// at `target`, reusing `cache` so a variable reached twice freshens once.
+///
+/// A type wholly at or below `lim` is returned unchanged.
 pub fn freshen_above(
     lim: Level,
     ty: &Type,

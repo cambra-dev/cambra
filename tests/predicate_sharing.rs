@@ -170,6 +170,8 @@ fn a_cast_target_does_not_carry_its_value_s_refinements() {
     );
 }
 
+/// A comprehension nested in another's source keeps each distinct filter
+/// predicate as one `Rc`, at both depths.
 #[test]
 fn nested_comprehension_shares_predicate_rcs() {
     assert_no_split(

@@ -627,15 +627,6 @@ struct FeedSite {
     value_ty: Type,
 }
 
-/// Rewrite every `with begin():` writer of a `Mut(_, Txn)` mutable variable into one shared
-/// commit `Transact`. A no-op (returns the input untouched) on programs that
-/// write no transactional mutable variable.
-///
-/// `txn_mut_vars` is the set of α-unique mutable variable [`Name`]s — the `Mut(_, Txn)`
-/// bindings on the inlined, typed tree (see
-/// [`collect_txn_mut_vars`]). Keying on the exact binder identity (not the surface
-/// base name) makes the fold immune to an unrelated local variable merely
-/// *spelled* like a mutable variable.
 /// One commit store's writer sites and their in-block feeds, as [`run`] collects
 /// them before the store is planned.
 ///
@@ -646,6 +637,15 @@ struct FeedSite {
 /// the two vectors stay index-parallel.
 type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
 
+/// Rewrite every `with begin():` writer of a `Mut(_, Txn)` mutable variable into one shared
+/// commit `Transact`. A no-op (returns the input untouched) on programs that
+/// write no transactional mutable variable.
+///
+/// `txn_mut_vars` is the set of α-unique mutable variable [`Name`]s — the `Mut(_, Txn)`
+/// bindings on the inlined, typed tree (see
+/// [`collect_txn_mut_vars`]). Keying on the exact binder identity (not the surface
+/// base name) makes the fold immune to an unrelated local variable merely
+/// *spelled* like a mutable variable.
 pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // Strip whenever a `with begin():` block is present. A block need not write a
     // transactional mutable variable — a read-only block (`out << balance`) has no write
