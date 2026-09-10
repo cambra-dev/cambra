@@ -562,8 +562,9 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 // partial feed) is blocked earlier, at lowering — a bare `if` with no `else` is
 // rejected as a value-returning expression before channelize sees it. The source-less-feed path handles
 // the feed extraction once lowering admits the shape; the if/else and elif forms
-// above exercise it. A *scrutinee / pattern* feed stays rejected
-// (`PartialFeedCaseUnsupported`): a pattern match cannot be gated by a boolean.
+// above exercise it. A *scrutinee / pattern* feed has no boolean to gate on there and
+// stays rejected. Inside a loop it is admitted, by the per-arm refined-source channels
+// the fan-out builds (`two_defers_fed_from_complementary_arms` in `feeds_cases`).
 
 // ---------------------------------------------------------------------------
 // Comprehension over a conditional collection
