@@ -14,8 +14,8 @@ compile reads the lowering projection alone.
 
 | | |
 |---|---|
-| Input | a `CompiledProgram`: the pane trees, the provenance table, the lowering projection, the parsed surface AST, the source text |
-| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table and its root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
+| Input | a `CompiledProgram`: the pane trees, the operator graph, the provenance table, the lowering projection, the parsed surface AST, the source text |
+| Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table, and a tree pane's root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | `src/inspector_server`, which serves the payload, and the `cambra-inspector/web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
@@ -49,9 +49,10 @@ edges it already walks, which is why a node carries no depth.
 recent, not-yet-released data. A value is data-dependent and keyed by a tick, so it cannot ride a
 payload built at compile time.
 
-That path needs node identity in operator conversion and a tick channel; neither exists. On the
-first, see
-[provenance.md](../ccl/design/provenance.md#known-prerequisites-for-panes-past-post-planning).
+That path needs node identity in operator conversion and a tick channel. The first exists —
+conversion records, and `post-conversion` is a pane — and the tick channel does not. On the first,
+see
+[provenance.md](../ccl/design/provenance.md#operator-conversion).
 
 It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.
@@ -78,7 +79,11 @@ node is that pane's own answer.
 
 ### A node on the wire
 
-A pane ships `nodes`, every node of that pane exactly once, and `root`, the id its walk starts from.
+A tree pane ships `nodes`, every node of that pane exactly once, and `root`, the root of the
+expression the pane is. The producer hands `root` over rather than deriving it. The operator pane
+has no root and ships none; where a walk of it begins is derived from its edges, which the
+producer does not ship either.
+
 A node reached from several places — a shared refinement predicate, most often — is one entry that
 several children name. The order is first-visit pre-order, so the payload is byte-reproducible.
 
@@ -98,7 +103,8 @@ reachable from each of them. `fold` unions blame spans, which is what makes that
 second span → node table: it held one row per node per span, which is what `spans` says, and the
 node-table walk that would build it already reads the same attributions.
 `a_nodes_spans_are_its_attributions_narrowest_first` and `no_node_repeats_a_span` (`wire.rs`) pin
-the order and the uniqueness.
+the order and the uniqueness over the corpus, and `wire_spans_orders_narrowest_first_and_dedups`
+pins the function both shapes get them from.
 
 `rewritten` is `null` for a `Nature::Source` tag, which null-compresses at the one emission site via
 `Nature::is_source`. `Source` is positional rather than a judgment about faithfulness: a node is
@@ -127,6 +133,38 @@ and its binder's type, and for a lambda those are the same `Type`, so a slot-ord
 type's predicates once per slot. Since a shared predicate is one entry in the table, a second child
 naming it asserts nothing the first does, and `no_node_repeats_a_predicate_edge` (`wire.rs`) pins
 the absence. A predicate several nodes reach still carries a child edge from each of them.
+
+### An operator node on the wire
+
+The operator pane ships the dataflow graph, so its node is a different shape: no `root`, `inputs`
+rather than `children`, and no type. It carries `label`, `nodeId`, `spans` and `rewritten` on the
+same terms as a tree node, plus:
+
+| field | what it holds |
+|---|---|
+| `role` | `operator`, `source` or `sink` |
+| `tiling` | the operator's output tiling, rendered; `null` for a boundary node |
+| `inputs` | the nodes it subscribes, each `{ subscribed, role, kind, deferred }` |
+
+An input edge is a subscription, stored on the consumer: `subscribed` names the node the consumer
+reads, so the recorded relation runs against dataflow.
+
+A walk of the pane starts at the nodes no `value` edge subscribes — a sink per compiled output, a
+fan input per share point, and a source per registered data source. That set is derived from
+`inputs` rather than shipped: a node's owner is the one `value` edge naming it, so the table already
+answers it and a shipped copy could only disagree. Every node is reachable from there following
+`value` edges alone, which is the relation a consumer walks, so the forest a renderer draws covers
+the pane with no special case. Both validators pin that closure, which fails on a node reachable
+only along a `share` edge and on a cycle among the `value` edges.
+
+`spans` means what it means on a tree node, down to the ordering: narrowest first, each span once.
+Both shapes take them from `wire_spans` (`wire.rs`) for that reason. Stating the invariant twice
+and implementing it twice is what let the two disagree — the operator table shipped the fold's
+union order, so `spans[0]` was the widest span rather than the narrowest, and a consumer taking the
+first span to render one position rendered the wrong one.
+
+A node whose id the pane's projection does not cover ships empty `spans` and `null` `rewritten`,
+exactly as a tree node does.
 
 ### Pane links are dense
 
@@ -214,7 +252,7 @@ name is a field rather than a node, so the only span available is the whole node
 covering a statement would contain the narrower uses inside it, and a consumer takes the first
 containing row, so a broad row would shadow them. Those uses contribute none: `out` in
 `out << value` does not resolve to its declaration. Closing it needs a span on the name field, which
-is a `ccl` change. Over the fixture corpus this is 2 rows of 31.
+is a `ccl` change.
 
 This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
 and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a
@@ -332,8 +370,10 @@ value domains and carries a `contains` bug on half-bounded intervals (see
   pass-through nodes. `lambda_elim` is that phase today, so each pass-through node reads to a
   consumer as a rewrite of its predecessor — see
   [provenance.md](../ccl/design/provenance.md#the-edge-labels).
-- **No pane exists past `post-planning`** until operator conversion carries a node identity. A pane
-  may be issued at any point in the pipeline; that one has nothing to resolve against.
+- **The operator pane resolves against ids, not positions.** `post-conversion` is a real pane now
+  that conversion records what it builds, but an operator is not an expression: it has no type, and
+  the positional queries (`tightestNodeAt` and its kin) are defined over the tree panes only. A
+  consumer reaches an operator through the pane links, never by asking where the cursor is.
 - **No channel names a binder site.** A binder is not an expression, so nothing attributes it and no
   field says which node binds the name written at a given span. The payload therefore carries no
   binder types, and a consumer clicking a binder resolves the node whose span contains it — for

@@ -36,6 +36,9 @@ use crate::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
         },
+        operator_graph::{
+            BoundarySession, OperatorGraph, assert_graph_invariants, materialize_sources,
+        },
         sinks::{DoneNotifier, SinkConsumer},
         tile_operators::{TileOperator, TileProducer},
     },
@@ -574,9 +577,9 @@ pub struct CompiledProgram {
     /// none — it was never rewritten. Refinement-predicate interiors are rows
     /// like any other: `collect_tree_ids` enumerates them, so the fold must
     /// explain them, and `PredMemo::rebuild` records a derived predicate against
-    /// the one it was built from. What is not recorded is planning **raising** a
-    /// predicate back into the main tree; see `design/provenance.md`, "Known
-    /// prerequisites for panes past `post-planning`".
+    /// the one it was built from. Planning raising a predicate back into the main
+    /// tree keeps the predicate's own parentage; see `design/provenance.md`,
+    /// "Operator conversion".
     ///
     /// Empty when capture is switched off — no phase scope is opened then, so
     /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
@@ -584,6 +587,18 @@ pub struct CompiledProgram {
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
     /// pair.
     pub(crate) provenance_table: ProvenanceTable,
+    /// The static structure of the operator graph.
+    ///
+    /// Walked from the compiled outputs before they are subscribed, which is the
+    /// last point at which every operator still holds its inputs: `subscribe`
+    /// takes each `CycleSlot` and each store's `init_ops`. See
+    /// [`operator_graph`](crate::interpreter::operator_graph).
+    ///
+    /// Retained unconditionally, unlike
+    /// [`provenance_table`](Self::provenance_table): `CAMBRA_PROVENANCE`
+    /// switches off attribution, and the graph is the `post-conversion` pane's
+    /// content, held like the trees beside it.
+    pub operator_graph: OperatorGraph,
     /// The original program source text, retained verbatim.
     ///
     /// Inspector queries need the source string to produce snippets (`hover`'s
@@ -685,6 +700,14 @@ pub enum Phase {
     /// Join/dataflow planning: hash-join and restrict scaffolding, clause
     /// fusion, refinement-predicate compilation.
     Planning,
+    /// Operator conversion: building the dataflow operator graph from the
+    /// planned tree.
+    ///
+    /// The one phase whose products are not expression nodes. An operator
+    /// carries a [`NodeId`](crate::ccl::provenance::NodeId) like any other
+    /// artifact, and conversion mints no expression nodes, so the rows this
+    /// phase writes key on ids disjoint from every pane above it.
+    Convert,
 }
 
 /// Ids carried by two *distinct* predicate terms, or by a predicate term and the
@@ -1725,13 +1748,12 @@ pub fn compile_program(
     code: &str,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    // The frontend is [], shared with []: parse through
-    // join planning, every check between, and the three panes the inspector
-    // reads — each of which is a captured phase output.
+    // `run_frontend` runs parse through join planning, every check between, and
+    // every pane but `post-conversion` — each of which is a captured phase
+    // output. `compile_to` runs the same frontend, stopping earlier.
     //
-    // Phase-internal consistency checks (, )
-    // keep their  inside the frontend because firing them means the
-    // compiler itself is wrong, not the user's input.
+    // Phase-internal consistency checks stay inside the frontend: firing one
+    // means the compiler itself is wrong, not the user's input.
     const PANES: [Phase; 5] = [
         Phase::Uniquify,
         Phase::Infer,
@@ -1773,12 +1795,35 @@ pub fn compile_program(
     // tail of the `Let*` chain rather than a `Record`; we synthesise a single
     // `("main", op)` entry for them so the rest of the function operates
     // uniformly on `Vec<(name, op)>`.
-    let per_field_ops = if sink_bindings_registry.is_empty() {
-        let op = convert_to_operators(&join_planned, ctx.conversion_ctx()).errs()?;
-        vec![("main".to_string(), op)]
-    } else {
-        convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx()).errs()?
-    };
+    // The one phase scope `compile_program` opens itself: every earlier phase
+    // runs inside `run_frontend`, and conversion is past the frontend's last
+    // pane. `table_session` is still installed here, which is what lets these
+    // rows reach the same table.
+    //
+    // The session is unconditional while the rows it carries are gated: the
+    // graph is a pane's content, and a pane's content is retained whatever
+    // `CAMBRA_PROVENANCE` says. Gating it would ship an empty pane, which both
+    // wire validators reject.
+    let boundary_session = BoundarySession::install();
+    let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
+        let ops = if sink_bindings_registry.is_empty() {
+            convert_to_operators(&join_planned, ctx.conversion_ctx())
+                .map(|op| vec![("main".to_string(), op)])
+        } else {
+            convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())
+        };
+        // A source node names every expression that read it, so it can only be
+        // minted once the walk has found them all. Inside the phase scope,
+        // because each needs a row like any other node of the pane.
+        materialize_sources();
+        ops
+    })
+    .errs()?;
+    // Before the subscribe loop below: `subscribe` takes every `CycleSlot` and
+    // every store's `init_ops`, so an operator asked for its inputs afterwards
+    // would answer without them.
+    let operator_graph = boundary_session.into_graph(&per_field_ops);
+    assert_graph_invariants(&operator_graph);
 
     let sink_count = per_field_ops
         .iter()
@@ -1856,6 +1901,7 @@ pub fn compile_program(
         post_as_of_read_ir,
         post_lambda_elim_ir,
         provenance_table,
+        operator_graph,
         source: code.to_string(),
     };
 

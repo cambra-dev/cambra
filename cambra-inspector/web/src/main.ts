@@ -6,8 +6,8 @@
 //   - the program source in a read-only CodeMirror 6 editor, with hover types,
 //     Ctrl/Cmd-click goto-def, diagnostic squiggles, and the resolved selection
 //     highlight (see sourceView.ts);
-//   - one collapsible, cross-linked IR tree per pipeline pane (treeView.ts),
-//     ordered upstream -> downstream;
+//   - one collapsible, cross-linked IR tree per tree-shaped pipeline pane
+//     (treeView.ts), ordered upstream -> downstream;
 //   - or — on a degraded/failed snapshot — a diagnostics list in place of the
 //     trees. Squiggles still render in the editor in the degraded case.
 //
@@ -30,8 +30,10 @@ import {
 } from "./paneVisibility";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
+import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
 import { validateSnapshot } from "./wireValidate";
+import { isIrPane } from "./types";
 import type { Diagnostic, Snapshot, Span } from "./types";
 
 function el(tag: string, className?: string, text?: string): HTMLElement {
@@ -150,7 +152,8 @@ export interface PaneDescriptor {
 
 /**
  * Every pane the layout renders, in order: the source pane, then one per
- * pipeline stage — or, on a degraded snapshot, a single diagnostics pane.
+ * pipeline stage — or, on a degraded snapshot, a single diagnostics pane. A
+ * stage is drawn by `TreeView` or, for the operator graph, by `OperatorView`.
  *
  * Source is first and mounted first, and that ordering is load-bearing:
  * CodeMirror lays out against its panel's size, so the editor is built while
@@ -193,9 +196,25 @@ export function describePanes(store: Store): PaneDescriptor[] {
   }
 
   for (const pane of store.panes) {
+    // The operator pane holds a dataflow graph — a forest of subscription trees, and
+    // inputs rather than children — so it gets its own view.
+    if (!isIrPane(pane)) {
+      panes.push({
+        id: pane.id,
+        label: pane.label,
+        badge: "dataflow",
+        paneClass: "tree",
+        copyText: () => serializeOperatorGraph(pane),
+        mount: (body) => {
+          if (pane.nodes.length > 0) new OperatorView(body, store, pane);
+        },
+      });
+      continue;
+    }
     // Holes-kind panes (still hole-typed, pre-inference) carry a badge
     // mirroring the static-no-values one.
     const holes = pane.kind === "holes";
+    const root = pane.root;
     const nodesOf = () => (pane.nodes.length > 0 ? store.indicesFor(pane.id)?.nodeById : undefined);
     panes.push({
       id: pane.id,
@@ -204,10 +223,10 @@ export function describePanes(store: Store): PaneDescriptor[] {
       paneClass: "tree",
       copyText: () => {
         const nodes = nodesOf();
-        return nodes ? serializeTree(pane.root, nodes) : "";
+        return nodes ? serializeTree(root, nodes) : "";
       },
       mount: (body) => {
-        if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.root);
+        if (pane.nodes.length > 0) new TreeView(body, store, pane.id, root);
       },
     });
   }

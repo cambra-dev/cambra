@@ -31,14 +31,24 @@ impl<T: ?Sized> CycleSlot<T> {
     /// so the caller can build the rest of the cycle first. `FnOnce` because a
     /// slot is wired exactly once: a second fill would silently replace a live
     /// input.
-    pub fn setter(&self) -> impl FnOnce(Box<T>) + use<T> {
+    pub(crate) fn setter(&self) -> impl FnOnce(Box<T>) + use<T> {
         let slot = self.0.clone();
-        move |op| {
+        move |op: Box<T>| {
             debug_assert!(
                 slot.borrow().is_none(),
                 "a cycle slot is wired once; refilling it would drop a live input"
             );
             *slot.borrow_mut() = Some(op);
+        }
+    }
+
+    /// Run `f` on the wired operator, if the slot has been filled.
+    ///
+    /// How the graph walk reads a late-wired edge. It runs before `subscribe`,
+    /// which is the only other reader and which empties the slot.
+    pub(crate) fn peek(&self, f: &mut dyn FnMut(&T)) {
+        if let Some(op) = self.0.borrow().as_deref() {
+            f(op);
         }
     }
 

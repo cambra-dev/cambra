@@ -1,19 +1,23 @@
-//! The pipeline's **panes** — its retained AST snapshots — and what a fold
-//! between two adjacent ones produces.
+//! The pipeline's **panes** — its retained snapshots — and what a fold between
+//! two adjacent ones produces.
 //!
-//! A pane is one snapshot of the tree, taken at a named point in
-//! [`compile_program`](crate::ccl::context::compile_program). [`PANES`] declares
-//! the topology once: every pane, the phases that produced it from the pane
-//! before it, and whether its pair is gated.
+//! A pane is one snapshot taken at a named point in
+//! [`compile_program`](crate::ccl::context::compile_program): an expression tree
+//! through `post-planning`, and the operator graph at `post-conversion`.
+//! [`PANES`] declares the topology once: every pane, the phases that produced
+//! it from the pane before it, and whether its pair is gated.
 //!
 //! Split out of [`context`](crate::ccl::context) because it is the inspector's
 //! half of the seam. `context` owns the pipeline and the [`Phase`] axis; this
-//! module owns what a pane pair is and what folding one yields, and none of it
-//! runs in a release compile except [`gate_leaks`], which `compile_program`
-//! calls only under `CAMBRA_PROVENANCE_GATE`. The inherent `impl
+//! module owns what a pane pair is and what folding one yields. Only
+//! [`gate_leaks`] is asserted, and `compile_program` calls it under
+//! `CAMBRA_PROVENANCE_GATE` alone; the snapshots themselves are retained
+//! whatever the capture switch says. The inherent `impl
 //! CompiledProgram` below lives here rather than beside the struct for the same
 //! reason: the methods are the pane layer's, not the pipeline's. See
 //! `design/provenance.md`, "The seam".
+
+use std::collections::HashSet;
 
 use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase, collect_tree_ids};
@@ -37,8 +41,7 @@ impl CompiledProgram {
     // Cold path: the inspector's snapshot serve, which is not in this workspace.
     #[allow(dead_code)]
     pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
-        let trees = self.pane_trees();
-        let ids: Vec<_> = trees.iter().map(|t| collect_tree_ids(t)).collect();
+        let ids = self.pane_ids();
 
         // The anchor pane's projection is the lowering projection: `uniquify`
         // preserves every id in place, so lowering's keys are still its keys.
@@ -72,12 +75,12 @@ impl CompiledProgram {
     }
 
     /// The retained pane trees, in pipeline order, element for element with
-    /// [`PANES`]. The length is [`PANES`]' own, so the two cannot disagree about
-    /// how many panes there are.
+    /// [`PANES`]' leading [`PaneKind::Ir`] entries. [`IR_PANE_COUNT`] is pinned
+    /// against [`PANES`], so the two cannot disagree about how many there are.
     ///
     /// The inspector model reads this alongside [`PANES`] to build one snapshot
     /// pane per entry.
-    pub(crate) fn pane_trees(&self) -> [&Expr; PANES.len()] {
+    pub(crate) fn pane_trees(&self) -> [&Expr; IR_PANE_COUNT] {
         [
             &self.pre_inference_ir,
             &self.post_inference_ir,
@@ -87,16 +90,54 @@ impl CompiledProgram {
             &self.ast,
         ]
     }
+
+    /// Each pane's id set, in pipeline order, element for element with
+    /// [`PANES`].
+    ///
+    /// This is all the fold wants from a pane — it never reads content — which
+    /// is what lets a pane hold an operator graph rather than a tree.
+    pub(crate) fn pane_ids(&self) -> Vec<HashSet<NodeId>> {
+        let mut trees = self.pane_trees().into_iter();
+        PANES
+            .iter()
+            .map(|spec| match spec.content {
+                PaneKind::Ir => collect_tree_ids(
+                    trees
+                        .next()
+                        .unwrap_or_else(|| unreachable!("one tree per declared IR pane")),
+                ),
+                PaneKind::Operators => self.operator_graph.ids().collect(),
+            })
+            .collect()
+    }
 }
 
-/// One pane — a retained AST snapshot — and the phases that produced it from the
-/// pane before it.
+/// What a pane holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PaneKind {
+    /// An expression tree.
+    Ir,
+    /// The dataflow operator graph.
+    Operators,
+}
+
+/// One pane — one retained snapshot of the pipeline — and the phases that
+/// produced it from the pane before it.
 ///
 /// [`PANES`] declares the whole topology in one place, so adding a pane is one
-/// entry there plus its tree in [`CompiledProgram::pane_trees`].
+/// entry there, plus its tree in [`CompiledProgram::pane_trees`] when it holds
+/// one.
 pub(crate) struct PaneSpec {
     /// The pane's name, e.g. `"post-channelize"`.
     pub(crate) name: &'static str,
+    /// What this pane holds.
+    ///
+    /// The fold reads id sets rather than content, so this distinction reaches
+    /// only the consumers that render a pane. Declaration order is pipeline
+    /// order and conversion runs last, so every [`PaneKind::Ir`] pane precedes
+    /// every [`PaneKind::Operators`] one, which the assertion under
+    /// [`IR_PANE_COUNT`] pins.
+    pub(crate) content: PaneKind,
     /// The phases that ran between the previous pane and this one — the set
     /// [`CompiledProgram::materialize_panes`] restricts the whole-compile table
     /// by.
@@ -127,9 +168,14 @@ pub(crate) struct PaneSpec {
     pub(crate) gated: bool,
 }
 
+/// How many panes hold an expression tree.
+///
+/// [`CompiledProgram::pane_trees`]' arity. The assertion below pins it against
+/// [`PANES`], so the trees zip against the [`PaneKind::Ir`] entries in order.
+pub(crate) const IR_PANE_COUNT: usize = 6;
+
 /// The pipeline's panes, in pipeline order, each naming the phases that produced
-/// it from its predecessor. Order matches [`CompiledProgram::pane_trees`]
-/// element for element.
+/// it from its predecessor.
 ///
 /// The first entry is the anchor: it has no predecessor, so its `phases` is
 /// empty and its `gated` is unused — its projection is the lowering projection
@@ -139,19 +185,22 @@ pub(crate) struct PaneSpec {
 /// compiles. `pre-inference → post-inference` reaches that only because the fold's
 /// id domain was widened to the slot domain the passes rewrite and inference's
 /// per-instantiation predicate freshen took a copy recording.
-pub(crate) const PANES: [PaneSpec; 6] = [
+pub(crate) const PANES: [PaneSpec; 7] = [
     PaneSpec {
         name: "pre-inference",
+        content: PaneKind::Ir,
         phases: &[],
         gated: false,
     },
     PaneSpec {
         name: "post-inference",
+        content: PaneKind::Ir,
         phases: &[Phase::Infer],
         gated: true,
     },
     PaneSpec {
         name: "post-channelize",
+        content: PaneKind::Ir,
         phases: &[
             Phase::Inline,
             Phase::Transact,
@@ -162,20 +211,45 @@ pub(crate) const PANES: [PaneSpec; 6] = [
     },
     PaneSpec {
         name: "post-as-of-read",
+        content: PaneKind::Ir,
         phases: &[Phase::AsOfRead],
         gated: true,
     },
     PaneSpec {
         name: "post-lambda-elim",
+        content: PaneKind::Ir,
         phases: &[Phase::LambdaElim],
         gated: true,
     },
     PaneSpec {
         name: "post-planning",
+        content: PaneKind::Ir,
         phases: &[Phase::Planning],
         gated: true,
     },
+    PaneSpec {
+        name: "post-conversion",
+        content: PaneKind::Operators,
+        phases: &[Phase::Convert],
+        gated: true,
+    },
 ];
+
+/// [`PANES`]' [`PaneKind::Ir`] entries are exactly its leading [`IR_PANE_COUNT`].
+///
+/// [`CompiledProgram::pane_ids`] zips the trees against them in declaration
+/// order, so both the count and the position are load-bearing. Counting is O(1)
+/// at compile time, which is what keeps the two declarations from drifting.
+const _: () = {
+    let mut i = 0;
+    while i < PANES.len() {
+        assert!(
+            matches!(PANES[i].content, PaneKind::Ir) == (i < IR_PANE_COUNT),
+            "PANES' `Ir` entries must be exactly its leading `IR_PANE_COUNT` entries",
+        );
+        i += 1;
+    }
+};
 
 /// One adjacent pair of panes and everything the fold derives for it.
 // Consumed by the inspector model; the compiler reads only `leaks` and `gated`.
@@ -283,81 +357,8 @@ mod tests {
         provenance_capture_enabled,
     };
     use crate::ccl::provenance::Link;
+    use crate::ccl::test_corpus::pipeline_corpus as corpus;
     use crate::interpreter::Consumer;
-
-    /// The pane-measurement corpus: every demo-gallery program that compiles
-    /// today, plus four inline programs covering the phases the gallery does not
-    /// reach (a `with begin():` transaction, a group-by, a UDF chain, and a
-    /// nested comprehension).
-    ///
-    /// The gallery's remaining programs are excluded for reasons unrelated to
-    /// provenance: most are deliberate *failure* fixtures (`while`, record-term
-    /// syntax, `Feed(_)` types) that pin errors and so have no panes to fold,
-    /// and the three HTTP demos bind a real listening socket during lowering,
-    /// which collides with itself under a parallel test runner.
-    fn corpus() -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "arithmetic",
-                include_str!("../../tests/programs/arithmetic/program.cambra").to_string(),
-            ),
-            (
-                "filter_and_aggregate",
-                include_str!("../../tests/programs/filter_and_aggregate/program.cambra").to_string(),
-            ),
-            (
-                "for_accumulator",
-                include_str!("../../tests/programs/for_accumulator/program.cambra").to_string(),
-            ),
-            (
-                "generator_pipeline",
-                include_str!("../../tests/programs/generator_pipeline/program.cambra").to_string(),
-            ),
-            (
-                "inner_join",
-                include_str!("../../tests/programs/inner_join/program.cambra").to_string(),
-            ),
-            (
-                "join_then_groupby",
-                include_str!("../../tests/programs/join_then_groupby/program.cambra").to_string(),
-            ),
-            (
-                "prefix_lines",
-                include_str!("../../tests/programs/prefix_lines/program.cambra").to_string(),
-            ),
-            (
-                "streaming_echo",
-                include_str!("../../tests/programs/streaming_echo/program.cambra").to_string(),
-            ),
-            (
-                "transaction",
-                "out = defer()\n\
-                 pool: Mut(Int, Txn) := 100\n\
-                 for r in [10, 20, 30]:\n\
-                 \x20   with begin():\n\
-                 \x20       pool := pool - r\n\
-                 with begin():\n\
-                 \x20   out << pool\n\
-                 out\n"
-                    .to_string(),
-            ),
-            (
-                "group_by",
-                "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]\n"
-                    .to_string(),
-            ),
-            (
-                "udf_chain",
-                "def double(x):\n    x * 2\ndef bump(x):\n    double(x) + 1\n\
-                 xs = [1, 2, 3]\n[bump(x) for x in xs]\n"
-                    .to_string(),
-            ),
-            (
-                "feed_loop",
-                "out = defer()\nfor x in [1, 2, 3]:\n    out << x * 2\nout\n".to_string(),
-            ),
-        ]
-    }
 
     /// Compile `code` through the full pipeline, panicking on error.
     fn compile_ok(code: &str) -> CompiledProgram {
@@ -489,11 +490,7 @@ mod tests {
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let panes = program.materialize_panes();
-            let ids: Vec<_> = program
-                .pane_trees()
-                .iter()
-                .map(|t| collect_tree_ids(t))
-                .collect();
+            let ids = program.pane_ids();
 
             for (i, pane_pair) in panes.pairs.iter().enumerate() {
                 if !pane_pair.gated {
@@ -1006,6 +1003,7 @@ mod tests {
             vec![
                 Phase::AsOfRead,
                 Phase::Channelize,
+                Phase::Convert,
                 Phase::Infer,
                 Phase::LambdaElim,
                 Phase::Letrec,
@@ -1102,6 +1100,205 @@ mod tests {
         ("feed", 12),
     ];
 
+    /// Each `Transact` writer's own ids — its source and its body — paired with a
+    /// description for the failure message.
+    fn collect_writer_domains(expr: &Expr, out: &mut Vec<(HashSet<NodeId>, String)>) {
+        if let TypedExprNode::Transact { writers, .. } = &expr.node {
+            for (i, w) in writers.iter().enumerate() {
+                let mut ids = collect_tree_ids(&w.source);
+                ids.extend(collect_tree_ids(&w.body));
+                out.push((ids, format!("writer {i}")));
+            }
+        }
+        for child in expr.child_exprs() {
+            collect_writer_domains(child, out);
+        }
+    }
+
+    /// **The graph has both program boundaries**: a sink per compiled output, and
+    /// a source per registered data source that some expression reads.
+    ///
+    /// Without them the graph begins and ends in the middle of nothing, and a
+    /// reader has no way to tell an output from an operator whose consumer the
+    /// capture missed. Both are pane nodes like any other, so each carries a
+    /// provenance row and resolves to a span.
+    #[test]
+    fn the_operator_graph_carries_its_boundary_nodes() {
+        use crate::interpreter::operator_graph::GraphNode;
+
+        let mut saw_a_source = false;
+        for (name, code) in corpus() {
+            let program = compile_ok(&code);
+            let graph = &program.operator_graph;
+            let sinks: Vec<&str> = graph
+                .nodes()
+                .iter()
+                .filter_map(|n| match n {
+                    GraphNode::Sink { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !sinks.is_empty(),
+                "{name}: the graph has no sink, so it has no output boundary",
+            );
+
+            let projection = program.materialize_panes();
+            let attribution = projection
+                .projections
+                .last()
+                .expect("the operator pane's projection");
+            for node in graph.nodes() {
+                let (id, what) = match node {
+                    GraphNode::Source { id, name } => (*id, format!("source {name}")),
+                    GraphNode::Sink { id, name, .. } => (*id, format!("sink {name}")),
+                    GraphNode::Operator { .. } => continue,
+                };
+                assert!(
+                    attribution.contains_key(&id),
+                    "{name}: {what} carries no attribution, so it resolves to no span",
+                );
+            }
+
+            saw_a_source |= graph
+                .nodes()
+                .iter()
+                .any(|n| matches!(n, GraphNode::Source { .. }));
+        }
+        assert!(
+            saw_a_source,
+            "no corpus program reads a data source, so the source-node path is unexercised",
+        );
+    }
+
+    /// Whether the subscription relation is acyclic, optionally with the edges
+    /// wired through a `CycleSlot` removed. Kahn over the whole graph.
+    fn subscription_relation_is_acyclic(
+        graph: &crate::interpreter::operator_graph::OperatorGraph,
+        without_deferred: bool,
+    ) -> bool {
+        use crate::interpreter::operator_graph::EdgeKind;
+        use std::collections::HashMap;
+
+        let mut indegree: HashMap<NodeId, usize> = graph.ids().map(|id| (id, 0usize)).collect();
+        let mut forward: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (consumer, edge) in graph.edges() {
+            if without_deferred && matches!(edge.kind, EdgeKind::Value { deferred: true }) {
+                continue;
+            }
+            *indegree.entry(edge.subscribed).or_default() += 1;
+            forward.entry(consumer).or_default().push(edge.subscribed);
+        }
+        let mut ready: Vec<NodeId> = indegree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut settled = 0usize;
+        while let Some(id) = ready.pop() {
+            settled += 1;
+            for next in forward.get(&id).into_iter().flatten() {
+                let Some(d) = indegree.get_mut(next) else {
+                    continue;
+                };
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(*next);
+                }
+            }
+        }
+        settled == indegree.len()
+    }
+
+    /// **Every cycle in the operator graph runs through a deferred edge.**
+    ///
+    /// A `CycleSlot` is the only way an operator subscribes something built after
+    /// it — every other input is handed to a constructor, so it names an operator
+    /// that already exists — and a slot-held input is the only one stated
+    /// deferred. So the deferred edges are the set whose removal leaves the
+    /// relation acyclic, which is the set a layered layout withholds from ranking
+    /// and draws back as returns.
+    ///
+    /// A few programs rather than every compile: this is a property of the shapes
+    /// the corpus reaches, and `assert_graph_invariants` should not carry a graph
+    /// walk on the compile path to restate it.
+    ///
+    /// Non-vacuous because the store programs are asserted cyclic first — without
+    /// that, "acyclic once the deferred edges are gone" would hold of any acyclic
+    /// graph.
+    #[test]
+    fn every_operator_graph_cycle_runs_through_a_deferred_edge() {
+        use crate::interpreter::operator_graph::EdgeKind;
+
+        let mut cyclic_programs = 0usize;
+        for (name, code) in corpus() {
+            let program = compile_ok(&code);
+            let graph = &program.operator_graph;
+            let deferred = graph
+                .edges()
+                .filter(|(_, e)| matches!(e.kind, EdgeKind::Value { deferred: true }))
+                .count();
+
+            if !subscription_relation_is_acyclic(graph, false) {
+                cyclic_programs += 1;
+                assert!(
+                    deferred > 0,
+                    "{name}: the graph has a cycle and no deferred edge, so a construct closed a \
+                     cycle without a `CycleSlot` and the cycle set no longer names it",
+                );
+            }
+            assert!(
+                subscription_relation_is_acyclic(graph, true),
+                "{name}: a cycle survives with the {deferred} deferred edge(s) removed, so the \
+                 deferred edges are not the cycle set a layout can cut",
+            );
+        }
+        assert!(
+            cyclic_programs > 0,
+            "no corpus program builds a cyclic operator graph, so this check is vacuous",
+        );
+    }
+
+    /// **Each writer of a transaction names some operator of its own.**
+    ///
+    /// Every operator of the commit complex is minted after the writer's own
+    /// subexpressions have been converted and closed their recordings, so
+    /// without a scope per writer they all attribute to the `let __hist =
+    /// Transact{…}` binding and the pane's whole transaction region resolves to
+    /// one span. No leak class can see that: the rows are present and the
+    /// parents are live, only coarse.
+    ///
+    /// A tripwire for that collapse rather than a measure of attribution
+    /// quality — it would pass on a partial collapse where one writer swallowed
+    /// another's operators. It asserts nothing about *how many* operators a
+    /// writer compiles into, which is what keeps it stable across changes to the
+    /// complex.
+    #[test]
+    fn every_writer_site_has_an_operator_attributed_inside_it() {
+        for (name, code) in corpus() {
+            let program = compile_ok(&code);
+            let mut writers: Vec<(HashSet<NodeId>, String)> = Vec::new();
+            collect_writer_domains(&program.ast, &mut writers);
+            if writers.is_empty() {
+                continue;
+            }
+            let panes = program.materialize_panes();
+            let pair = panes
+                .pairs
+                .last()
+                .expect("the operator pane pair is the last one");
+            for (ids, what) in &writers {
+                let attributed = ids.iter().any(|id| !pair.map.downstream(id).is_empty());
+                assert!(
+                    attributed,
+                    "{name}: no operator attributes to anything inside {what}, so the whole \
+                     transaction resolves to its binding — `build_commit_store` needs its \
+                     per-writer recording",
+                );
+            }
+        }
+    }
+
     /// Rough compile-time and retained-memory sanity for pane capture. Ignored
     /// by default — it is a measurement, not an assertion.
     ///
@@ -1133,9 +1330,10 @@ mod tests {
             let mut best_fold = std::time::Duration::MAX;
             let mut rows = 0usize;
             let mut tags = 0usize;
-            // The three retained pane snapshots are unconditional — they are not
-            // part of what the capture switch turns off — so their size is the
-            // pane design's real memory floor, against which the logs are noise.
+            // The retained pane snapshots — every tree, and the operator graph —
+            // are not part of what the capture switch turns off, so their size
+            // is the pane design's real memory floor, against which the logs are
+            // noise.
             let mut panes_nodes = 0usize;
             for _ in 0..reps {
                 let t0 = std::time::Instant::now();

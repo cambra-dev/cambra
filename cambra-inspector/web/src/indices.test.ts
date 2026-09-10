@@ -132,7 +132,7 @@ describe("definitionAt", () => {
 
 describe("buildIndices: degraded (no nodes)", () => {
   it("is empty but queries are safe", () => {
-    const degraded = buildIndices(null, [], []);
+    const degraded = buildIndices(0, [], []);
     expect(degraded.nodeById.size).toBe(0);
     expect(degraded.tightestNodeAt(0)).toBeNull();
     expect(degraded.typesAt(0)).toEqual([]);

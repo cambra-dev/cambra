@@ -66,6 +66,72 @@ export interface IrNode {
   children: IrChild[];
 }
 
+// One node of an operator pane: an operator, or one of the two program
+// boundaries.
+export interface OperatorNode {
+  // What to show: the operator's type name, or `Source(name)` / `Sink(name)`
+  // for a boundary.
+  label: string;
+  // The node's `NodeId`, in the same space as an expression node's — an
+  // operator carries a `NodeId` so a pane pair spanning conversion is
+  // homogeneous like every other.
+  nodeId: number;
+  // Which of the three node kinds this is: "operator", "source", "sink". Data,
+  // not display policy.
+  role: string;
+  // The operator's output tiling, rendered, and null for a boundary node.
+  tiling: string | null;
+  // Every source span this node traces to, narrowest first. Same channel and
+  // same meaning as `IrNode.spans`.
+  spans: Span[];
+  // The node's rewrite tag, on the same terms as `IrNode.rewritten`.
+  rewritten: RewriteInfo | null;
+  // The graph inputs this node holds.
+  inputs: OperatorEdge[];
+}
+
+// What names an input at its consumer, carrying the shape that named it. A
+// field called `0` and the first element of a `Vec` render alike, so the wire
+// keeps the shape rather than flattening both to a string.
+export type OperatorEdgeRole =
+  | { kind: "named"; name: string }
+  | { kind: "positional"; index: number }
+  | { kind: "storeKey"; key: string };
+
+// How a role reads in a row label.
+export function roleLabel(role: OperatorEdgeRole): string {
+  switch (role.kind) {
+    case "named":
+      return role.name;
+    case "positional":
+      return String(role.index);
+    case "storeKey":
+      return role.key;
+  }
+}
+
+// One input edge of an operator node.
+//
+// A *construction* edge — which operator holds which, and how. Runtime dataflow
+// follows a different relation, and nothing here asserts the two coincide.
+export interface OperatorEdge {
+  // What names this input at its consumer.
+  role: OperatorEdgeRole;
+  // "value" for an exclusively owned input, "share" for one several consumers
+  // may reach.
+  //
+  // The value edges form a forest, which is what lets a renderer walk them as a
+  // child relation with no cycle guard; the share edges are the
+  // cross-references. A cycle is a "value" edge with `deferred` set.
+  kind: string;
+  // Whether the edge was wired after its consumer was constructed. An attribute
+  // of when, not of ownership.
+  deferred: boolean;
+  // The id of the node this edge subscribes — an entry of the same pane's
+  // `nodes`.
+  subscribed: number;
+}
+
 export interface Definition {
   useSpan: Span;
   defSpan: Span;
@@ -90,19 +156,78 @@ export interface Meta {
   schema: number;
 }
 
-// One ordered pipeline pane (upstream -> downstream). Each pane carries its own
-// self-contained node table; it resolves against its own
-// (Expr, SourceProjection) projection on the backend.
-export interface PaneEntry {
+// What every pane carries, whichever shape its node table holds. Each pane is
+// one position in the pipeline (upstream -> downstream) and resolves against its
+// own (Expr, SourceProjection) projection on the backend.
+interface PaneCommon {
   id: string;
   label: string;
-  // "holes" (the still-hole-typed pre-inference tree) or "typed" (a fully
-  // typed tree — every pane from post-inference on).
-  kind: string;
-  // The id of the node the pane's walk starts from — an entry of `nodes`.
+}
+
+// A pane holding an expression tree: "holes" for the still-hole-typed
+// pre-inference tree, "typed" for a fully typed one (every tree pane from
+// post-inference on).
+export interface IrPane extends PaneCommon {
+  kind: "holes" | "typed";
+  // The root node of this pane's expression, shipped by the producer. Not a
+  // derived walk start: the operator pane's starts are read off its edges, this
+  // is the tree the pane is.
   root: number;
   // Every node of this pane exactly once, in first-visit pre-order.
   nodes: IrNode[];
+}
+
+// The pane holding the dataflow operator graph.
+export interface OperatorPane extends PaneCommon {
+  kind: "operators";
+  // A graph names no walk start. The nodes no `value` edge subscribes are where
+  // a walk begins — a sink per compiled output, a fan input per share point, a
+  // source per registered data source — and the `inputs` already say which those
+  // are, so a consumer derives them. `wireValidate.ts` pins that they reach the
+  // whole table.
+  //
+  // Every node of this pane exactly once, in conversion order.
+  nodes: OperatorNode[];
+}
+
+// One ordered pipeline pane. `kind` is the discriminant for which shape `nodes`
+// holds: the two share an id and a label and nothing else — a tree pane names
+// one `root` and its nodes have a type and children, an operator pane names no
+// start and its nodes have a tiling and typed input edges, and neither field set
+// is meaningful for the other.
+export type PaneEntry = IrPane | OperatorPane;
+
+/**
+ * Narrow a pane to the tree-shaped panes. The one place the `kind` discriminant
+ * is read as a predicate, so a caller that needs `IrNode`s — a tree walk, a
+ * type query — states that need once rather than re-spelling the kind set.
+ */
+export function isIrPane(pane: PaneEntry): pane is IrPane {
+  return pane.kind !== "operators";
+}
+
+/**
+ * An edge the child relation follows, as against one a view renders as a
+ * reference.
+ */
+export function isChildEdge(edge: OperatorEdge): boolean {
+  return edge.kind === "value";
+}
+
+/**
+ * The nodes no value edge subscribes, in table order — where each tree of the
+ * operator forest starts.
+ *
+ * Derived rather than shipped: a node's owner is the one value edge naming it,
+ * so the table already answers this, and a shipped copy could only disagree.
+ * Both the renderer and the validator read it here, so the derivation the
+ * validator pins is the one the renderer walks.
+ */
+export function walkStarts(nodes: readonly OperatorNode[]): number[] {
+  const subscribed = new Set(
+    nodes.flatMap((n) => n.inputs.filter(isChildEdge).map((e) => e.subscribed)),
+  );
+  return nodes.map((n) => n.nodeId).filter((id) => !subscribed.has(id));
 }
 
 // The dense node->node links between two adjacent panes — each adjacent pane

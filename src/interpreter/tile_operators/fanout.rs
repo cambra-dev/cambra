@@ -2,6 +2,7 @@ use log::trace;
 use std::{cell::RefCell, rc::Rc};
 
 use super::*;
+use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{Consumer, Scheduler},
     pretty_graph::VizOptions,
@@ -181,7 +182,7 @@ impl FanOut {
     pub fn branch(&self) -> Box<dyn TileOperator> {
         let result = FanOutBranch {
             input: self.input.clone(),
-            tiling: self.tiling.clone(),
+            base: OperatorBase::new(self.tiling.clone()),
             shared: self.shared.clone(), // shares the Rc — always connected
             primary: !*self.used.borrow(),
         };
@@ -198,7 +199,8 @@ struct FanOutBranch {
     // shared-state-ok: the same operator handle as [`FanOut::input`] — a branch is
     // a view of one fan-out, not a second one. An operator, not a value.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
-    tiling: Tiling,
+    /// The tiling is the fan-out's, forwarded to every branch of it.
+    base: OperatorBase,
     /// All mutable shared state.  Created eagerly so that branches produced by
     /// [`FanOut::branch`] always share the same object.
     shared: Rc<RefCell<FanOutShared>>,
@@ -208,8 +210,11 @@ struct FanOutBranch {
 }
 
 impl TileOperator for FanOutBranch {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        let input = self.input.borrow();
+        visit(share(&**input));
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
@@ -234,7 +239,7 @@ impl TileOperator for FanOutBranch {
             let mut shared = self.shared.borrow_mut();
             let index = shared.consumers.len();
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
-            shared.release_guards.push(self.tiling.empty_guard());
+            shared.release_guards.push(self.tiling().empty_guard());
             index
         }; // borrow released here before we might call input.subscribe
 
@@ -295,7 +300,7 @@ impl TileOperator for FanOutBranch {
         }
 
         Box::new(FanOutProducer {
-            base: ProducerBase::new(self.shared.borrow().id, &self.tiling),
+            base: ProducerBase::new(self.shared.borrow().id, self.tiling()),
             shared: self.shared.clone(),
             index,
         })
@@ -436,23 +441,25 @@ impl TileProducer for FanOutProducer {
 /// and immediately releasing upstream according to the received Tiles.
 pub struct Memo {
     pub input: Box<dyn TileOperator>,
-    pub tiling: Tiling,
+    /// The tiling is `input`'s, forwarded unchanged.
+    base: OperatorBase,
 }
 
 impl Memo {
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
-        Self { input, tiling }
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
     }
 }
 
 impl TileOperator for Memo {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -462,7 +469,7 @@ impl TileOperator for Memo {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MemoProducer {
-            base: ProducerBase::new(MemoProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(MemoProducer::alloc_id(), self.tiling()),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             cached_tile: self.tiling().empty_tile(),
             upstream_drained: false,

@@ -106,8 +106,8 @@ impl InspectNode {
     /// only caller). The program inspector's `/api/snapshot` path
     /// ([`inspector_server`](crate::inspector_server)) uses the `Serialize` impl
     /// below instead; this method and `web_inspector` will be removed once the
-    /// program inspector gains the operator-graph and live panes the old
-    /// dashboard still provides.
+    /// program inspector gains the live per-tick pane the old dashboard still
+    /// provides.
     ///
     /// Field names mirror the Rust struct fields. `None` guard fields are
     /// omitted. Children serialize as `{"edge":"...","node":{...}}` pairs,

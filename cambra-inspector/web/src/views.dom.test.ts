@@ -19,15 +19,22 @@ import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { TreeView, serializeTree } from "./treeView";
 
-import { fixture, paneById, stubLayout, theNode } from "./__fixtures__/helpers";
+import { serializeOperatorGraph } from "./operatorView";
+
+import { fixture, irPaneById, operatorPaneById, stubLayout, theNode } from "./__fixtures__/helpers";
+import { isIrPane } from "./types";
 import type { Snapshot } from "./types";
 
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
 const listMin = fixture(listMinJson);
+// The tree-shaped panes. The layout draws every pane; these tests drive the
+// source<->tree link, and the operator pane's own rendering is covered in
+// operatorView.dom.test.ts.
+const treePanes = listMin.panes.filter(isIrPane);
 
-// Mount the full app (source + one tree pane per pane entry) into a fresh
-// container, returning the store and the per-pane tree-pane DOM roots.
+// Mount the source view and one tree pane per tree-shaped pane entry into a
+// fresh container, returning the store and the per-pane tree-pane DOM roots.
 function mountApp(snap: Snapshot): {
   store: Store;
   source: HTMLElement;
@@ -45,7 +52,10 @@ function mountApp(snap: Snapshot): {
   new SourceView(sourceBody, store);
 
   const trees = new Map<string, HTMLElement>();
-  for (const pane of store.panes) {
+  // The tree panes only. `TreeView` cannot draw a graph, and these tests assert
+  // the source<->tree direction of the link; the operator pane's half of it is
+  // asserted in operatorView.dom.test.ts.
+  for (const pane of store.panes.filter(isIrPane)) {
     const body = document.createElement("div");
     root.appendChild(body);
     trees.set(pane.id, body);
@@ -59,7 +69,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
   it("a tree-node selection highlights the source span AND the tree rows", () => {
     const { store, source, trees } = mountApp(listMin);
-    const pre = paneById(listMin, "pre-inference");
+    const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))"); // span [1,2), identity across panes
 
     store.setSelection({ kind: "node", paneId: "pre-inference", nodeId: lit.nodeId });
@@ -75,7 +85,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
   it("a source selection highlights every tree pane (reverse direction)", () => {
     const { store, trees } = mountApp(listMin);
-    const pre = paneById(listMin, "pre-inference");
+    const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))");
 
     // posAtCoords is unusable in jsdom (no layout); drive the store directly,
@@ -89,7 +99,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
   it("a source selection produces a primary source highlight (.cm-sel-node)", () => {
     const { store, source } = mountApp(listMin);
-    const pre = paneById(listMin, "pre-inference");
+    const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))");
 
     store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
@@ -110,7 +120,7 @@ describe("pre-inference resolved-type display (Bug 2)", () => {
   it("shows the resolved type as a hover tooltip on a pre-inference row", () => {
     const { store, trees } = mountApp(listMin);
     const pre = trees.get("pre-inference")!;
-    const lit = theNode(paneById(listMin, "pre-inference"), "Lit(Int(1))");
+    const lit = theNode(irPaneById(listMin, "pre-inference"), "Lit(Int(1))");
     // Sanity: this hole resolves downstream to the literal's singleton type.
     expect(store.resolvedTypesFor("pre-inference", lit.nodeId)).toEqual(["Int@1"]);
 
@@ -136,6 +146,9 @@ describe("pre-inference resolved-type display (Bug 2)", () => {
 describe("pane copy button", () => {
   let writeText: ReturnType<typeof vi.fn>;
 
+  const panelFor = (root: HTMLElement, id: string): HTMLElement =>
+    root.querySelector<HTMLElement>(`.panel[data-pane-id="${id}"]`)!;
+
   const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
   const mount = (): HTMLElement => {
@@ -159,6 +172,8 @@ describe("pane copy button", () => {
 
   it("gives every pane a copy button", () => {
     const root = mount();
+    // Source, plus one per pipeline pane — the operator pane included: the copy
+    // affordance belongs to a pane, not to a node shape.
     expect(root.querySelectorAll(".pane-copy").length).toBe(1 + listMin.panes.length);
   });
 
@@ -173,15 +188,29 @@ describe("pane copy button", () => {
 
   it("copies the serialized tree from a tree pane", () => {
     const root = mount();
-    // Panes render source-first, then one per pipeline pane in order.
-    const panels = root.querySelectorAll<HTMLElement>(".panel.tree");
-    expect(panels.length).toBe(listMin.panes.length);
-
-    const pane = listMin.panes[1];
-    panels[1].querySelector<HTMLButtonElement>(".pane-copy")!.click();
+    const pane = treePanes[1];
+    // By pane id, not by position among `.panel.tree`: the operator pane wears
+    // the same panel class, so an index would not say which pane was clicked.
+    panelFor(root, pane.id).querySelector<HTMLButtonElement>(".pane-copy")!.click();
     expect(writeText).toHaveBeenCalledWith(
       serializeTree(pane.root, new Map(pane.nodes.map((n) => [n.nodeId, n]))),
     );
+  });
+
+  it("copies the serialized graph from the operator pane", () => {
+    const root = mount();
+    const pane = operatorPaneById(listMin, "post-conversion");
+
+    panelFor(root, pane.id).querySelector<HTMLButtonElement>(".pane-copy")!.click();
+
+    const text = serializeOperatorGraph(pane);
+    expect(writeText).toHaveBeenCalledWith(text);
+    // The indented forest, not an empty string. This graph is all value edges,
+    // so its line count is exactly its node count; indentation carries the
+    // child relation. (Reference rows are pinned in operatorView.dom.test.ts.)
+    expect(text.split("\n").length).toBe(pane.nodes.length);
+    expect(text).toMatch(/\n {4}\S/);
+    expect(text).toContain("Sink(main)");
   });
 
   it("reports a successful copy on the button", async () => {

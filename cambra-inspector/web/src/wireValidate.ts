@@ -13,14 +13,25 @@
 // their kinds and the adjacent paneLinks windows (dense — self-edges legal,
 // every edge endpoint a live node id in its pane); a degraded
 // (`payloadKind: "failed"`) payload ships empty panes/paneLinks; each pane's
-// node table is closed under its own child edges and `root`; and every node's
-// `rewritten` tag stays inside the pinned vocabulary. Extend both validators
-// together.
+// node table is closed under its own edges, and reachable from where a walk of it
+// begins — a tree pane's shipped `root`, and on an operator pane the nodes no
+// `value` edge subscribes, derived; and every node's `rewritten` tag stays inside the pinned
+// vocabulary. Extend both validators together.
 //
 // One contract, no relaxations: a committed fixture is a whole payload document,
 // so a fixture and a live payload are validated on identical terms.
 
-import type { IrChild, IrNode, PaneEntry, PaneLink, Snapshot, Span } from "./types";
+import type {
+  IrChild,
+  IrNode,
+  OperatorEdge,
+  OperatorNode,
+  PaneEntry,
+  PaneLink,
+  Snapshot,
+  Span,
+} from "./types";
+import { walkStarts } from "./types";
 
 class WireError extends Error {
   constructor(path: string, expected: string, got: unknown) {
@@ -48,14 +59,27 @@ export const PANE_IDS = [
   "post-as-of-read",
   "post-lambda-elim",
   "post-planning",
+  "post-conversion",
 ] as const;
-const PANE_KINDS = ["holes", "typed", "typed", "typed", "typed", "typed"] as const;
+// The `kind` each pane id mandates, aligned with `PANE_IDS`. It is also the
+// node-shape discriminant: a "holes" or "typed" pane holds IR nodes, an
+// "operators" pane holds operator nodes.
+const PANE_KINDS = [
+  "holes",
+  "typed",
+  "typed",
+  "typed",
+  "typed",
+  "typed",
+  "operators",
+] as const;
 const PANE_WINDOWS = [
   ["pre-inference", "post-inference"],
   ["post-inference", "post-channelize"],
   ["post-channelize", "post-as-of-read"],
   ["post-as-of-read", "post-lambda-elim"],
   ["post-lambda-elim", "post-planning"],
+  ["post-planning", "post-conversion"],
 ] as const;
 
 // The observed rewrite-tag vocabulary on the wire: `rewritten.via` is a phase in
@@ -75,8 +99,14 @@ const ALLOWED_VIA = [
   "AsOfRead",
   "LambdaElim",
   "Planning",
+  "Convert",
 ];
 const ALLOWED_NATURE = ["expansion", "machinery"];
+
+// An operator node's `role`, and an operator input edge's `kind` — the two
+// closed vocabularies of the operator pane.
+const ALLOWED_ROLE = ["operator", "source", "sink"];
+const ALLOWED_EDGE_KIND = ["value", "share"];
 
 function describe(v: unknown): string {
   if (v === null) return "null";
@@ -120,6 +150,10 @@ function validateSpanOrNull(v: unknown, path: string): Span | null {
   return validateSpan(v, path);
 }
 
+// One entry of a *tree* pane's node table. `validatePane` dispatches here on the
+// pane's kind, which is what keeps the retired-field checks below off an
+// operator node — an operator carries a `tiling`, and on a tree node that field
+// is the renderer's, not the wire's.
 function validateNode(v: unknown, path: string): IrNode {
   const o = obj(v, path);
   str(o.label, `${path}.label`);
@@ -138,25 +172,7 @@ function validateNode(v: unknown, path: string): IrNode {
   }
   if (o.span !== undefined) throw new WireError(`${path}.span`, "absent", o.span);
   num(o.nodeId, `${path}.nodeId`);
-  // Every span the node's attribution records, narrowest first and each once —
-  // the table the spatial queries scan.
-  const spans = arr(o.spans, `${path}.spans`).map((sp, i) =>
-    validateSpan(sp, `${path}.spans[${i}]`),
-  );
-  let previousExtent = -1;
-  const seenSpans = new Set<string>();
-  spans.forEach((sp, i) => {
-    const key = `${sp.start}:${sp.end}`;
-    if (seenSpans.has(key)) {
-      throw new WireError(`${path}.spans[${i}]`, "a span not already on this node", sp);
-    }
-    seenSpans.add(key);
-    const extent = sp.end - sp.start;
-    if (extent < previousExtent) {
-      throw new WireError(`${path}.spans[${i}]`, "spans ordered narrowest first", sp);
-    }
-    previousExtent = extent;
-  });
+  validateSpans(o.spans, path);
   // The rewrite tag: null for a lowering root (or an uncovered node), else
   // { via, nature, label } pinned to the observed vocabulary — a new pass name
   // or nature reaching the wire must be a deliberate, reviewed event.
@@ -164,6 +180,93 @@ function validateNode(v: unknown, path: string): IrNode {
   const children = arr(o.children, `${path}.children`);
   children.forEach((c, i) => validateChild(c, `${path}.children[${i}]`));
   return v as IrNode;
+}
+
+// Every span a node's attribution records, narrowest first and each once — the
+// table the spatial queries scan. Both node shapes carry the channel and both
+// carry the same contract, so both read it here.
+function validateSpans(v: unknown, path: string): void {
+  const spans = arr(v, `${path}.spans`).map((sp, i) => validateSpan(sp, `${path}.spans[${i}]`));
+  let previousExtent = -1;
+  const seen = new Set<string>();
+  spans.forEach((sp, i) => {
+    const key = `${sp.start}:${sp.end}`;
+    if (seen.has(key)) {
+      throw new WireError(`${path}.spans[${i}]`, "a span not already on this node", sp);
+    }
+    seen.add(key);
+    const extent = sp.end - sp.start;
+    if (extent < previousExtent) {
+      throw new WireError(`${path}.spans[${i}]`, "spans ordered narrowest first", sp);
+    }
+    previousExtent = extent;
+  });
+}
+
+// One entry of the operator pane's node table: an operator, or one of the two
+// program boundaries. It shares an id, a span table and a rewrite tag with a
+// tree node and nothing else, so the two fields that carry a tree node's
+// content are asserted absent here exactly as `tiling` is asserted absent
+// there.
+function validateOperatorNode(v: unknown, path: string): OperatorNode {
+  const o = obj(v, path);
+  str(o.label, `${path}.label`);
+  num(o.nodeId, `${path}.nodeId`);
+  if (o.type !== undefined) throw new WireError(`${path}.type`, "absent", o.type);
+  if (o.children !== undefined) throw new WireError(`${path}.children`, "absent", o.children);
+  const role = str(o.role, `${path}.role`);
+  if (!ALLOWED_ROLE.includes(role)) {
+    throw new WireError(`${path}.role`, `one of {${ALLOWED_ROLE.join(", ")}}`, role);
+  }
+  // The tiling is the operator's own rendered output tiling, so a boundary has
+  // none: `Source` and `Sink` name a program edge rather than a computation.
+  if (role === "operator") {
+    str(o.tiling, `${path}.tiling`);
+  } else if (o.tiling !== undefined && o.tiling !== null) {
+    throw new WireError(`${path}.tiling`, "null or absent on a boundary node", o.tiling);
+  }
+  validateSpans(o.spans, path);
+  validateRewritten(o.rewritten, `${path}.rewritten`);
+  arr(o.inputs, `${path}.inputs`).forEach((e, i) =>
+    validateOperatorEdge(e, `${path}.inputs[${i}]`),
+  );
+  return v as OperatorNode;
+}
+
+// What names an input at its consumer. Three shapes, each carrying its own
+// payload field, so a field called `0` stays distinct from position 0.
+function validateEdgeRole(v: unknown, path: string): void {
+  const o = obj(v, path);
+  const kind = str(o.kind, `${path}.kind`);
+  switch (kind) {
+    case "named":
+      str(o.name, `${path}.name`);
+      return;
+    case "positional":
+      num(o.index, `${path}.index`);
+      return;
+    case "storeKey":
+      str(o.key, `${path}.key`);
+      return;
+    default:
+      throw new WireError(`${path}.kind`, "one of {named, positional, storeKey}", kind);
+  }
+}
+
+// One input edge of an operator node. `subscribed` names a node of the same
+// pane's table; `validatePane` checks that once the table's ids are known.
+function validateOperatorEdge(v: unknown, path: string): OperatorEdge {
+  const o = obj(v, path);
+  validateEdgeRole(o.role, `${path}.role`);
+  const kind = str(o.kind, `${path}.kind`);
+  if (!ALLOWED_EDGE_KIND.includes(kind)) {
+    throw new WireError(`${path}.kind`, `one of {${ALLOWED_EDGE_KIND.join(", ")}}`, kind);
+  }
+  if (typeof o.deferred !== "boolean") {
+    throw new WireError(`${path}.deferred`, "boolean", o.deferred);
+  }
+  num(o.subscribed, `${path}.subscribed`);
+  return v as OperatorEdge;
 }
 
 function validateChild(v: unknown, path: string): IrChild {
@@ -175,33 +278,109 @@ function validateChild(v: unknown, path: string): IrChild {
   return v as IrChild;
 }
 
-// A pane's node table: `root` and every child id name an entry of this same
-// pane's `nodes`, and no id appears twice. The closure check is what the table
-// buys over the nested tree it replaced — an edge a consumer follows always
-// lands on an entry the pane holds.
+// A pane's node table: every walk start, every child id and every operator
+// input id names an entry of this same pane's `nodes`, and no id appears twice.
+// The closure check is what the table buys over the nested tree it replaced — an
+// edge a consumer follows always lands on an entry the pane holds.
+//
+// A tree pane ships `root`, the expression the pane is. An operator graph has no
+// root; the nodes no `value` edge subscribes are where a walk of it begins, and
+// the `inputs` already say which those are, so shipping them could only add a
+// channel that disagrees. This derives them and checks they reach every node.
+// A node outside that closure is one the pane holds, that pane links land on,
+// and that no view draws; only a whole-graph walk sees it, since every
+// individual edge and id resolves.
+//
+// `kind` is the shape discriminant, so it picks both the node validator and the
+// edge relation the closure runs over. A kind outside the pinned set reads as a
+// tree here and is caught by the per-id kind pin in `validateSnapshot`.
 function validatePane(v: unknown, path: string): PaneEntry {
   const o = obj(v, path);
   str(o.id, `${path}.id`);
   str(o.label, `${path}.label`);
-  str(o.kind, `${path}.kind`);
+  const kind = str(o.kind, `${path}.kind`);
   if (o.ir !== undefined) throw new WireError(`${path}.ir`, "absent", o.ir);
   // The parallel span table shipped one row per node per span, which is what a
   // node's own `spans` says.
   if (o.spanIndex !== undefined) throw new WireError(`${path}.spanIndex`, "absent", o.spanIndex);
-  const root = num(o.root, `${path}.root`);
-  const nodes = arr(o.nodes, `${path}.nodes`).map((n, i) =>
-    validateNode(n, `${path}.nodes[${i}]`),
-  );
-  const ids = new Set<number>();
-  nodes.forEach((n, i) => {
-    if (ids.has(n.nodeId)) {
-      throw new WireError(`${path}.nodes[${i}].nodeId`, "an id not already in the table", n.nodeId);
+  const operators = kind === "operators";
+
+  // A tree pane ships the root of its expression; an operator pane has no root
+  // and derives where a walk of it begins from the edges, so `root` is pinned
+  // absent there. The two are different questions, so only this one is a field.
+  let rootId: number | null = null;
+  if (operators) {
+    if (o.root !== undefined) {
+      throw new WireError(`${path}.root`, "absent on an operator pane", o.root);
     }
-    ids.add(n.nodeId);
-  });
-  if (!ids.has(root)) {
-    throw new WireError(`${path}.root`, "an id present in this pane's nodes", root);
+  } else {
+    rootId = num(o.root, `${path}.root`);
   }
+
+  const rawNodes = arr(o.nodes, `${path}.nodes`);
+  const ids = new Set<number>();
+
+  // The table holds each node once, and a tree pane's root is an entry of it.
+  // Both hold whichever shape the nodes are, so they run off the ids alone.
+  const closeOverIds = (validated: readonly { nodeId: number }[]): void => {
+    validated.forEach((n, i) => {
+      if (ids.has(n.nodeId)) {
+        throw new WireError(
+          `${path}.nodes[${i}].nodeId`,
+          "an id not already in the table",
+          n.nodeId,
+        );
+      }
+      ids.add(n.nodeId);
+    });
+    if (rootId !== null && !ids.has(rootId)) {
+      throw new WireError(`${path}.root`, "an id present in this pane's nodes", rootId);
+    }
+  };
+
+  if (operators) {
+    const nodes = rawNodes.map((n, i) => validateOperatorNode(n, `${path}.nodes[${i}]`));
+    closeOverIds(nodes);
+    nodes.forEach((n, i) => {
+      n.inputs.forEach((e, j) => {
+        if (!ids.has(e.subscribed)) {
+          throw new WireError(
+            `${path}.nodes[${i}].inputs[${j}].subscribed`,
+            "an id present in this pane's nodes",
+            e.subscribed,
+          );
+        }
+      });
+    });
+    // The `value` edges reach every node from the ones no `value` edge
+    // subscribes. That is the relation the renderer follows — value edges are the
+    // child relation, share edges are reference leaves — so a node outside this
+    // closure is one no view draws and no selection can reach. A `value` cycle
+    // fails it too: its members are all subscribed, so no walk enters them.
+    const inputsById = new Map(nodes.map((n) => [n.nodeId, n.inputs]));
+    const reached = new Set<number>();
+    const stack = walkStarts(nodes);
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (reached.has(id)) continue;
+      reached.add(id);
+      for (const e of inputsById.get(id) ?? []) {
+        if (e.kind === "value") stack.push(e.subscribed);
+      }
+    }
+    const stranded = nodes.filter((n) => !reached.has(n.nodeId)).map((n) => n.nodeId);
+    if (stranded.length > 0) {
+      throw new WireError(
+        `${path}.nodes`,
+        "every node reachable along the value edges from the nodes nothing subscribes",
+        stranded,
+      );
+    }
+    return v as PaneEntry;
+  }
+
+  const nodes = rawNodes.map((n, i) => validateNode(n, `${path}.nodes[${i}]`));
+  closeOverIds(nodes);
   nodes.forEach((n, i) => {
     // One edge per predicate: a node's type slots overlap, so a slot-order walk
     // upstream reaches a shared predicate once per slot, and a second edge to it

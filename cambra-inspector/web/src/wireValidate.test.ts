@@ -11,6 +11,7 @@ import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 import failedJson from "./__fixtures__/failed.snapshot.json";
 import deferLiftJson from "./__fixtures__/defer_lift.snapshot.json";
+import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
 
 describe("validateSnapshot: real fixtures", () => {
   for (const [name, json] of [
@@ -19,6 +20,7 @@ describe("validateSnapshot: real fixtures", () => {
     ["list_min", listMinJson],
     ["failed", failedJson],
     ["defer_lift", deferLiftJson],
+    ["source_shared", sourceSharedJson],
   ] as const) {
     it(`${name} validates and round-trips identity`, () => {
       const snap = validateSnapshot(json);
@@ -26,6 +28,26 @@ describe("validateSnapshot: real fixtures", () => {
       expect(snap.meta.schema).toBe(SCHEMA_VERSION);
     });
   }
+
+  it("source_shared pins a source node: null tiling, shared by both readers", () => {
+    const snap = validateSnapshot(sourceSharedJson);
+    const pane = snap.panes.find((p) => p.kind === "operators");
+    expect(pane).toBeDefined();
+    const sources = pane!.nodes.filter((n) => "role" in n && n.role === "source");
+    expect(sources).toHaveLength(1);
+    const source = sources[0] as { nodeId: number; tiling: string | null; spans: unknown[] };
+    // A boundary node has no tiling, which the validator asserts and this pins
+    // as a real payload rather than a hand-built one.
+    expect(source.tiling ?? null).toBeNull();
+    expect(source.spans.length).toBeGreaterThanOrEqual(2);
+    const reads = pane!.nodes.flatMap((n) =>
+      "inputs" in n ? n.inputs.filter((e) => e.subscribed === source.nodeId) : [],
+    );
+    expect(reads.length).toBeGreaterThanOrEqual(2);
+    // A shared node has no owner: recording a read as `value` is what trips the
+    // producer's exclusive-ownership assertion.
+    expect(reads.every((e) => e.kind === "share")).toBe(true);
+  });
 
   it("the failed (degraded) fixture validates with empty panes", () => {
     const snap = validateSnapshot(failedJson);
@@ -51,8 +73,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   // A minimal valid *successful* snapshot: the exact panes and windows the
   // pinned contract requires, built from `PANE_IDS` so a pane added upstream
   // fails the validator's own pin rather than this fixture's spelling. Every
-  // pane's table is one `minimalNode` (nodeId 0) at `root`, so the (empty)
-  // paneLinks trivially satisfy endpoint liveness.
+  // pane's table is one node (nodeId 0), named by that pane's own walk-start
+  // key, so the (empty) paneLinks trivially satisfy endpoint liveness.
   const minimalNode = (): Record<string, unknown> => ({
     label: "Lit(Int(1))",
     nodeId: 0,
@@ -61,17 +83,34 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     type: "_",
     children: [],
   });
+  // The operator pane's counterpart. A `sink` rather than an `operator`, so the
+  // node needs no tiling; the operator-node cases below set `role` themselves.
+  const minimalOperatorNode = (): Record<string, unknown> => ({
+    label: "Sink(main)",
+    nodeId: 0,
+    role: "sink",
+    tiling: null,
+    spans: [],
+    rewritten: null,
+    inputs: [],
+  });
+  // The `kind` a pane id mandates. Spelled here rather than imported: the
+  // validator's own table is what these cases exist to check.
+  const kindOf = (id: string): string =>
+    id === "pre-inference" ? "holes" : id === "post-conversion" ? "operators" : "typed";
   const minimalSuccess = (): Record<string, unknown> => ({
     source: { name: "x.chl", text: "1" },
     definitions: [],
     diagnostics: [],
     meta: { payloadKind: "program", schema: SCHEMA_VERSION },
-    panes: PANE_IDS.map((id, i) => ({
+    panes: PANE_IDS.map((id) => ({
       id,
       label: `IR (${id.toUpperCase()})`,
-      kind: i === 0 ? "holes" : "typed",
-      root: 0,
-      nodes: [minimalNode()],
+      kind: kindOf(id),
+      // A tree pane's walk start is `root`, singular. An operator pane ships
+      // none — a consumer derives them from the edges.
+      ...(kindOf(id) === "operators" ? {} : { root: 0 }),
+      nodes: [kindOf(id) === "operators" ? minimalOperatorNode() : minimalNode()],
     })),
     paneLinks: PANE_IDS.slice(1).map((to, i) => ({
       from: PANE_IDS[i],
@@ -83,6 +122,10 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   // The nodes array of a `minimalSuccess()` pane, for the per-node cases below.
   const paneNodes = (bad: Record<string, unknown>, i = 0): Record<string, unknown>[] =>
     (bad.panes as { nodes: Record<string, unknown>[] }[])[i].nodes;
+  // The operator pane's index in `panes` — the last one.
+  const OPERATORS = PANE_IDS.length - 1;
+  const operatorNodes = (bad: Record<string, unknown>): Record<string, unknown>[] =>
+    paneNodes(bad, OPERATORS);
 
   it("accepts the minimal valid degraded and successful snapshots", () => {
     expect(() => validateSnapshot(minimalDegraded())).not.toThrow();
@@ -227,10 +270,87 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
   });
 
-  it("throws when `root` names an id the pane's table does not hold", () => {
+  it("throws when a walk start names an id the pane's table does not hold", () => {
     const bad = minimalSuccess();
     (bad.panes as Record<string, unknown>[])[0].root = 99;
     expect(() => validateSnapshot(bad)).toThrow(/panes\[0\]\.root.*present in this pane/);
+  });
+
+  it("throws when a tree pane names no walk start at all", () => {
+    const missing = minimalSuccess();
+    delete (missing.panes as Record<string, unknown>[])[0].root;
+    expect(() => validateSnapshot(missing)).toThrow(/panes\[0\]\.root.*number/);
+  });
+
+  it("throws on an edge role that is not one of the three shapes", () => {
+    // The shape is what tells a field named `0` from position 0, so a role that
+    // names no shape is not a role a consumer can read.
+    const unknown = minimalSuccess();
+    operatorNodes(unknown)[0].inputs = [
+      { role: { kind: "field", name: "input" }, kind: "value", deferred: false, subscribed: 0 },
+    ];
+    expect(() => validateSnapshot(unknown)).toThrow(/role\.kind/);
+
+    const missing = minimalSuccess();
+    operatorNodes(missing)[0].inputs = [
+      { role: { kind: "positional" }, kind: "value", deferred: false, subscribed: 0 },
+    ];
+    expect(() => validateSnapshot(missing)).toThrow(/role\.index/);
+  });
+
+  it("throws when an operator pane ships a walk start", () => {
+    // A tree's start is singular by type, so nothing has to assert that it is
+    // one id. What has to be pinned is that an operator pane, whose starts are
+    // derived from the edges, ships none for them to disagree with.
+    const graphWithRoot = minimalSuccess();
+    (graphWithRoot.panes as Record<string, unknown>[])[OPERATORS].root = 0;
+    expect(() => validateSnapshot(graphWithRoot)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.root.*absent on an operator pane`),
+    );
+  });
+
+  it("accepts an operator pane where several nodes are subscribed by nothing", () => {
+    const ok = minimalSuccess();
+    const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
+    pane.nodes = [minimalOperatorNode(), { ...minimalOperatorNode(), nodeId: 1 }];
+    expect(() => validateSnapshot(ok)).not.toThrow();
+  });
+
+  it("accepts a node reachable only through a share edge", () => {
+    // A source is subscribed by no value edge, so the derived walk starts at it.
+    // Under a shipped start set this was the source-shaped bug: the producer had
+    // to remember to list it, and omitting it stranded the node.
+    const ok = minimalSuccess();
+    const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
+    pane.nodes = [
+      {
+        ...minimalOperatorNode(),
+        inputs: [{ role: { kind: "named", name: "source" }, kind: "share", deferred: false, subscribed: 1 }],
+      },
+      { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
+    ];
+    expect(() => validateSnapshot(ok)).not.toThrow();
+  });
+
+  it("throws when the value edges form a cycle, which no walk can enter", () => {
+    // The gap the derived check still catches: every member of a value cycle is
+    // subscribed, so none of them is a walk start and none is ever drawn.
+    const bad = minimalSuccess();
+    const pane = (bad.panes as Record<string, unknown>[])[OPERATORS];
+    pane.nodes = [
+      {
+        ...minimalOperatorNode(),
+        inputs: [{ role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 1 }],
+      },
+      {
+        ...minimalOperatorNode(),
+        nodeId: 1,
+        inputs: [{ role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 0 }],
+      },
+    ];
+    expect(() => validateSnapshot(bad)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes.*reachable along the value edges`),
+    );
   });
 
   it("throws when a node id appears twice in one pane's table", () => {
@@ -270,6 +390,111 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     const bad = minimalSuccess();
     (bad.paneLinks as { edges: unknown[] }[])[0].edges = [[1, 2, ["descends"]]];
     expect(() => validateSnapshot(bad)).toThrow(/paneLinks\[0\]\.edges\[0\].*pair/);
+  });
+
+  it("throws on an operator node's role outside the three kinds", () => {
+    const bad = minimalSuccess();
+    operatorNodes(bad)[0].role = "fan";
+    expect(() => validateSnapshot(bad)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.role.*operator, source, sink`),
+    );
+  });
+
+  it("throws when an operator carries no tiling, or a boundary carries one", () => {
+    // The tiling is the operator's own rendered output tiling, so the two roles
+    // disagree about it on purpose.
+    const untiled = minimalSuccess();
+    operatorNodes(untiled)[0] = { ...minimalOperatorNode(), role: "operator" };
+    expect(() => validateSnapshot(untiled)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.tiling.*string`),
+    );
+
+    const tiledBoundary = minimalSuccess();
+    operatorNodes(tiledBoundary)[0].tiling = "SF({[0, 5]} → Int)";
+    expect(() => validateSnapshot(tiledBoundary)).toThrow(
+      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.tiling.*boundary`),
+    );
+  });
+
+  it("accepts a tiled operator node", () => {
+    const ok = minimalSuccess();
+    operatorNodes(ok)[0] = {
+      ...minimalOperatorNode(),
+      label: "MapResult",
+      role: "operator",
+      tiling: "SF({[0, 5]} → Int)",
+    };
+    expect(() => validateSnapshot(ok)).not.toThrow();
+  });
+
+  it("throws on the tree-node fields an operator node cannot carry", () => {
+    // The mirror of the retired-field checks on a tree node: the two shapes
+    // share an id and an attribution, and a type or children on an operator is
+    // the wrong shape in the wrong pane.
+    for (const [field, value] of [
+      ["type", "Int"],
+      ["children", []],
+    ] as const) {
+      const bad = minimalSuccess();
+      operatorNodes(bad)[0][field] = value;
+      expect(() => validateSnapshot(bad)).toThrow(
+        new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.${field}.*absent`),
+      );
+    }
+  });
+
+  it("throws when an operator input names an id the pane's table does not hold", () => {
+    const bad = minimalSuccess();
+    operatorNodes(bad)[0].inputs = [
+      { role: { kind: "positional", index: 0 }, kind: "value", deferred: false, subscribed: 99 },
+    ];
+    expect(() => validateSnapshot(bad)).toThrow(
+      new RegExp(
+        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.subscribed.*present in this pane`,
+      ),
+    );
+  });
+
+  it("throws on an operator input's kind or deferred flag", () => {
+    const wrongKind = minimalSuccess();
+    operatorNodes(wrongKind)[0].inputs = [
+      { role: { kind: "positional", index: 0 }, kind: "owned", deferred: false, subscribed: 0 },
+    ];
+    expect(() => validateSnapshot(wrongKind)).toThrow(
+      new RegExp(
+        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.kind.*value, share`,
+      ),
+    );
+
+    const noFlag = minimalSuccess();
+    operatorNodes(noFlag)[0].inputs = [{ role: { kind: "positional", index: 0 }, kind: "share", subscribed: 0 }];
+    expect(() => validateSnapshot(noFlag)).toThrow(
+      new RegExp(
+        `panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.inputs\\[0\\]\\.deferred.*boolean`,
+      ),
+    );
+  });
+
+  it("accepts an operator node's value, deferred and share inputs", () => {
+    const ok = minimalSuccess();
+    const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
+    pane.nodes = [
+      { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
+      {
+        ...minimalOperatorNode(),
+        inputs: [
+          { role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 1 },
+          { role: { kind: "named", name: "acc" }, kind: "value", deferred: true, subscribed: 1 },
+        ],
+      },
+    ];
+    expect(() => validateSnapshot(ok)).not.toThrow();
+  });
+
+  it("accepts `Convert`, the phase operator conversion records under", () => {
+    const ok = minimalSuccess();
+    operatorNodes(ok)[0].rewritten = { via: "Convert", nature: "machinery", label: "convert.sink" };
+    expect(() => validateSnapshot(ok)).not.toThrow();
   });
 
   it("throws naming source.text when missing", () => {

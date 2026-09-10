@@ -2706,6 +2706,114 @@
           "children": []
         }
       ]
+    },
+    {
+      "id": "post-conversion",
+      "label": "IR (POST-CONVERSION)",
+      "kind": "operators",
+      "nodes": [
+        {
+          "label": "IterateExtent",
+          "nodeId": 418,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → {[0, 3]})",
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "Constant",
+          "nodeId": 419,
+          "role": "operator",
+          "tiling": "({[0, 3]} -> Int)",
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": []
+        },
+        {
+          "label": "MapResult",
+          "nodeId": 420,
+          "role": "operator",
+          "tiling": "SF({[0, 3]} → Int)",
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": {
+                "kind": "named",
+                "name": "input"
+              },
+              "kind": "value",
+              "deferred": false,
+              "subscribed": 418
+            },
+            {
+              "role": {
+                "kind": "named",
+                "name": "fn"
+              },
+              "kind": "value",
+              "deferred": false,
+              "subscribed": 419
+            }
+          ]
+        },
+        {
+          "label": "Sink(main)",
+          "nodeId": 421,
+          "role": "sink",
+          "tiling": null,
+          "spans": [
+            {
+              "start": 1,
+              "end": 12
+            }
+          ],
+          "rewritten": {
+            "via": "Convert",
+            "nature": "machinery",
+            "label": "opconv.convert"
+          },
+          "inputs": [
+            {
+              "role": {
+                "kind": "named",
+                "name": "output"
+              },
+              "kind": "value",
+              "deferred": false,
+              "subscribed": 420
+            }
+          ]
+        }
+      ]
     }
   ],
   "paneLinks": [
@@ -3228,6 +3336,28 @@
         [
           46,
           46
+        ]
+      ]
+    },
+    {
+      "from": "post-planning",
+      "to": "post-conversion",
+      "edges": [
+        [
+          42,
+          419
+        ],
+        [
+          42,
+          420
+        ],
+        [
+          284,
+          418
+        ],
+        [
+          285,
+          421
         ]
       ]
     }

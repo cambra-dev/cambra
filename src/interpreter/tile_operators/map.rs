@@ -2,6 +2,7 @@ use bit_set::BitSet;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
+use crate::interpreter::operator_graph::{source, value};
 use crate::{
     interpreter::{
         BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
@@ -17,7 +18,7 @@ use crate::{
 /// of nesting.
 pub struct MapResult {
     /// Output tiling matches `input` tiling, transforming the codomain according to `function`.
-    tiling: Tiling,
+    base: OperatorBase,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
     /// The function to apply to each element.
@@ -54,10 +55,10 @@ impl MapResult {
                     "a single-key lookup's key extent must match the collection's key extent"
                 );
                 return Self {
-                    tiling: Tiling::SealedFunction {
+                    base: OperatorBase::new(Tiling::SealedFunction {
                         domain: fn_domain2.clone(),
                         codomain: Box::new(Tiling::Scalar(fn_codomain.clone())),
-                    },
+                    }),
                     input,
                     function,
                 };
@@ -100,7 +101,7 @@ impl MapResult {
                 codomain: fn_codomain.clone(),
             };
             return Self {
-                tiling,
+                base: OperatorBase::new(tiling),
                 input,
                 function,
             };
@@ -129,7 +130,7 @@ impl MapResult {
             output_tiling
         });
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             input,
             function,
         }
@@ -137,13 +138,11 @@ impl MapResult {
 }
 
 impl TileOperator for MapResult {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("fn", self.function.inspect(opts))
-            .child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+        visit(value("fn", &*self.function));
     }
 
     fn subscribe(
@@ -164,7 +163,7 @@ impl TileOperator for MapResult {
             scheduler,
         );
         Box::new(MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling()),
             input: input_producer,
             function: function_producer,
         })
@@ -515,7 +514,7 @@ impl TileProducer for MapResultProducer {
 /// `input` must be a `SealedFunction` or `CurriedFunction` tile; `constant` must be a Scalar.
 pub struct MapResultToConst {
     /// Output tiling matches `input` tiling, transforming the codomain to `constant`.
-    tiling: Tiling,
+    base: OperatorBase,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
     /// The constant to apply to each element.
@@ -554,7 +553,7 @@ impl MapResultToConst {
             }),
         };
         Self {
-            tiling,
+            base: OperatorBase::new(tiling),
             input,
             constant,
             mode,
@@ -563,13 +562,11 @@ impl MapResultToConst {
 }
 
 impl TileOperator for MapResultToConst {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
-            .child("constant", self.constant.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+        visit(value("constant", &*self.constant));
     }
 
     fn subscribe(
@@ -590,7 +587,7 @@ impl TileOperator for MapResultToConst {
             scheduler,
         );
         Box::new(MapResultToConstProducer {
-            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), self.tiling()),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -720,7 +717,7 @@ pub struct MapResultWithSource {
     /// The data source providing both domain keys and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
     /// Output tiling: `SealedFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
-    tiling: Tiling,
+    base: OperatorBase,
 }
 
 impl MapResultWithSource {
@@ -739,20 +736,20 @@ impl MapResultWithSource {
             Tiling::Scalar(output_extent)
         });
         Self {
+            base: OperatorBase::new(tiling),
             input,
             source: source.clone(),
-            tiling,
         }
     }
 }
 
 impl TileOperator for MapResultWithSource {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+        let handle = self.source.borrow();
+        visit(source(handle.get_id()));
     }
 
     fn subscribe(

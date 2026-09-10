@@ -84,6 +84,12 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "cell of `HashMap<usize, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
+    # The operator-graph recorder, twice: the `thread_local!` and the cell inside
+    # it each match the ambient-state shape. Necessary because `OperatorBase::new`
+    # runs inside operator constructors, which take no context parameter; what
+    # crosses the cell is graph structure, never a tile.
+    ("src/interpreter/operator_graph.rs", "ambient mutable state"),
+    ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),

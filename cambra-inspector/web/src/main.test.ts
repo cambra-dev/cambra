@@ -20,6 +20,7 @@ import {
   serializeDiagnostics,
 } from "./main";
 import { Store } from "./store";
+import { isIrPane } from "./types";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
 
 import failedJson from "./__fixtures__/failed.snapshot.json";
@@ -164,11 +165,32 @@ describe("describePanes", () => {
     ]);
   });
 
-  it("badges the holes pane and nothing else", () => {
+  it("puts the operator pane last on the roster and mounts its renderer", () => {
+    // The operator pane is a pane like any other now that `OperatorView` draws
+    // the graph: it holds the roster slot its pipeline position gives it, which
+    // is last — conversion is the most downstream pane.
+    const store = new Store(listMin);
+    const operatorPanes = store.panes.filter((pane) => !isIrPane(pane));
+    expect(operatorPanes.length).toBe(1);
+
+    const roster = describePanes(store);
+    expect(roster[roster.length - 1].id).toBe(operatorPanes[0].id);
+
+    // The descriptor mounts a real view, not an empty body. Which nodes that
+    // view draws is `operatorView.dom.test.ts`'.
+    const body = document.createElement("div");
+    document.body.appendChild(body);
+    roster[roster.length - 1].mount(body);
+    expect(body.querySelector(".tree-root")).not.toBeNull();
+  });
+
+  it("badges the holes pane and the operator pane", () => {
     const panes = describePanes(new Store(listMin));
     const badged = panes.filter((p) => p.badge !== undefined);
-    expect(badged.map((p) => p.id)).toEqual(["pre-inference"]);
-    expect(badged[0].badge).toBe("pre-inference (holes)");
+    expect(badged.map((p) => [p.id, p.badge])).toEqual([
+      ["pre-inference", "pre-inference (holes)"],
+      ["post-conversion", "dataflow"],
+    ]);
   });
 
   it("replaces the IR panes with a diagnostics pane on a degraded snapshot", () => {

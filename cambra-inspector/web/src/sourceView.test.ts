@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 import { Store } from "./store";
 import { hoverPayloadAt, resolveSourceClick } from "./sourceView";
 
-import { fixture, paneById, theNode } from "./__fixtures__/helpers";
+import { fixture, irPaneById, theNode } from "./__fixtures__/helpers";
 import type { Indices } from "./indices";
 
 import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
@@ -31,7 +31,7 @@ describe("hoverPayloadAt", () => {
   it("returns the tightest node's label + type set at a literal span", () => {
     const store = new Store(listMin);
     const anchor = anchorOf(store);
-    const lit = theNode(paneById(listMin, "post-inference"), "Lit(Int(1))"); // span [1,2)
+    const lit = theNode(irPaneById(listMin, "post-inference"), "Lit(Int(1))"); // span [1,2)
 
     const payload = hoverPayloadAt(anchor, store.offsets, lit.spans[0]!.start);
     expect(payload).not.toBeNull();
@@ -86,7 +86,7 @@ describe("resolveSourceClick", () => {
   it("Ctrl/Cmd-click off any use-site falls back to a plain source selection", () => {
     const store = new Store(arithmetic);
     const anchor = anchorOf(store);
-    const lit = theNode(paneById(arithmetic, "post-inference"), "Lit(Int(10))");
+    const lit = theNode(irPaneById(arithmetic, "post-inference"), "Lit(Int(10))");
     // A literal is not a use-site, so goto has nothing to resolve.
     expect(resolveSourceClick(anchor, lit.spans[0]!.start, { goto: true })).toEqual({
       kind: "source",

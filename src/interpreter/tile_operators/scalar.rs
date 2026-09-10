@@ -3,6 +3,7 @@ use bit_set::BitSet;
 use super::*;
 use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::UnionArm;
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{BaseType, ColumnValue, Consumer, Extent, FunctionDef, Scheduler, Value},
     pretty_graph::VizOptions,
@@ -16,7 +17,7 @@ pub struct Constant {
     /// The extent (type) of the produced value.
     pub extent: Extent,
     /// The tiling — always `Tiling::Scalar`.
-    pub tiling: Tiling,
+    base: OperatorBase,
 }
 
 impl Constant {
@@ -32,19 +33,19 @@ impl Constant {
         Self {
             value,
             extent,
-            tiling,
+            base: OperatorBase::new(tiling),
         }
     }
 }
 
 impl TileOperator for Constant {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    impl_operator_base!();
+
+    fn inspect_annotation(&self) -> Option<String> {
+        Some(self.value.to_string())
     }
 
-    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-        node.annotate(format!("{}", self.value))
-    }
+    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
     fn subscribe(
         &mut self,
@@ -54,7 +55,7 @@ impl TileOperator for Constant {
     ) -> Box<dyn TileProducer> {
         consumer.notify();
         Box::new(ConstantProducer {
-            base: ProducerBase::new(ConstantProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling()),
             value: self.value.clone(),
             released: false,
         })
@@ -108,7 +109,7 @@ pub struct ToScalar {
     /// The `SealedFunction`-typed input to unwrap.
     input: Box<dyn TileOperator>,
     /// Output tiling: the codomain of the input's `SealedFunction` tiling.
-    tiling: Tiling,
+    base: OperatorBase,
 }
 
 impl ToScalar {
@@ -123,17 +124,18 @@ impl ToScalar {
                 input.tiling()
             )
         });
-        Self { input, tiling }
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
     }
 }
 
 impl TileOperator for ToScalar {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
+    impl_operator_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -146,7 +148,7 @@ impl TileOperator for ToScalar {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(ToScalarProducer {
-            base: ProducerBase::new(ToScalarProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(ToScalarProducer::alloc_id(), self.tiling()),
             input: input_producer,
         })
     }
@@ -179,7 +181,7 @@ pub struct VariantWrap {
     variant_extents: TagMap<Extent>,
     /// Output tiling — `Scalar(Union)` for a scalar payload, or
     /// `SealedFunction { D ⇒ Scalar(Union) }` for a payload stream.
-    tiling: Tiling,
+    base: OperatorBase,
 }
 
 impl VariantWrap {
@@ -206,10 +208,10 @@ impl VariantWrap {
             _ => Tiling::Scalar(union_ext),
         };
         Self {
+            base: OperatorBase::new(tiling),
             input,
             tag,
             variant_extents,
-            tiling,
         }
     }
 }
@@ -238,13 +240,14 @@ fn wrap_variant_column(
 }
 
 impl TileOperator for VariantWrap {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    impl_operator_base!();
+
+    fn inspect_annotation(&self) -> Option<String> {
+        Some(format!("tag {}", self.tag))
     }
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("payload", self.input.inspect(opts))
-            .annotate(format!("tag {}", self.tag))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
     }
 
     fn subscribe(
@@ -257,7 +260,7 @@ impl TileOperator for VariantWrap {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantWrapProducer {
-            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(VariantWrapProducer::alloc_id(), self.tiling()),
             input,
             tag: self.tag.clone(),
             variant_extents: self.variant_extents.clone(),
@@ -394,7 +397,7 @@ pub struct VariantProject {
     /// shape without destructuring it back out.
     payload_extent: Extent,
     /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
-    tiling: Tiling,
+    base: OperatorBase,
 }
 
 impl VariantProject {
@@ -427,22 +430,23 @@ impl VariantProject {
             codomain: Box::new(Tiling::Scalar(payload_extent.clone())),
         };
         Self {
+            base: OperatorBase::new(tiling),
             input,
             tag,
             payload_extent,
-            tiling,
         }
     }
 }
 
 impl TileOperator for VariantProject {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    impl_operator_base!();
+
+    fn inspect_annotation(&self) -> Option<String> {
+        Some(format!("arm {}", self.tag))
     }
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("scrutinee", self.input.inspect(opts))
-            .annotate(format!("arm {}", self.tag))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("scrutinee", &*self.input));
     }
 
     fn subscribe(
@@ -455,7 +459,7 @@ impl TileOperator for VariantProject {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantProjectProducer {
-            base: ProducerBase::new(VariantProjectProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(VariantProjectProducer::alloc_id(), self.tiling()),
             input,
             tag: self.tag.clone(),
             payload_extent: self.payload_extent.clone(),
@@ -600,8 +604,8 @@ pub struct VariantIs {
     input: Box<dyn TileOperator>,
     /// The tag to test for.
     tag: FieldKey,
-    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ Bool }`.
-    tiling: Tiling,
+    /// Identity and the output tiling — `SealedFunction { <scrutinee domain> ⇒ Bool }`.
+    base: OperatorBase,
 }
 
 impl VariantIs {
@@ -625,18 +629,23 @@ impl VariantIs {
             domain: domain_extent,
             codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Bool))),
         };
-        Self { input, tag, tiling }
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+            tag,
+        }
     }
 }
 
 impl TileOperator for VariantIs {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    impl_operator_base!();
+
+    fn inspect_annotation(&self) -> Option<String> {
+        Some(format!("is arm {}", self.tag))
     }
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("scrutinee", self.input.inspect(opts))
-            .annotate(format!("is arm {}", self.tag))
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("scrutinee", &*self.input));
     }
 
     fn subscribe(
@@ -647,7 +656,7 @@ impl TileOperator for VariantIs {
     ) -> Box<dyn TileProducer> {
         let input = self.input.subscribe(intent_guard, consumer, scheduler);
         Box::new(VariantIsProducer {
-            base: ProducerBase::new(VariantIsProducer::alloc_id(), &self.tiling),
+            base: ProducerBase::new(VariantIsProducer::alloc_id(), &self.base.tiling),
             input,
             tag: self.tag.clone(),
         })
@@ -779,11 +788,10 @@ mod tests {
     }
 
     impl TileOperator for FixedOp {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
-        }
-        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-            node
         }
         fn subscribe(
             &mut self,

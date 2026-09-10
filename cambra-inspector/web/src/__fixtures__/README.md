@@ -4,34 +4,58 @@ Real `/api/snapshot` payloads emitted by the `cambra` backend, used by
 `store.test.ts` to test the frontend's derived logic (the B5 hole→type stitch,
 cross-pane resolution) **and** to guard the wire-shape contract: if the Rust
 payload drifts from the TypeScript wire types in `../types.ts`, these tests
-break. The corpus lives in `../../../scripts/fixtures.manifest`: which program each
-fixture is dumped from, and a comment per row saying what that row pins. It is
-shared by `regen-fixtures.sh`, the ci.sh drift gate, and the cargo golden tests
-(`tests/inspector_goldens.rs`), so a row and the thing it describes move
+break. The corpus lives in `../../../scripts/fixtures.manifest`: which program
+each fixture is dumped from, and a comment per row saying what that row pins. It
+is shared by `regen-fixtures.sh`, the ci.sh drift gate, and the cargo golden
+tests (`tests/inspector_goldens.rs`), so a row and the thing it describes move
 together.
 
-Every fixture is the whole live wire. A program too large or too volatile to pin
-byte-for-byte carries no fixture at all and a structural assertion over a fresh
-dump instead, in `tests/inspector_goldens.rs`.
+Every fixture is the full live wire. A program too large or too volatile to pin
+byte-for-byte gets no fixture at all and a structural assertion over a fresh dump
+instead, in `tests/inspector_goldens.rs`.
 
 A successful **live** payload carries one entry of `panes` per declared pane, in
-pipeline order — `pre-inference` (kind `holes`) then `post-inference` (kind
+pipeline order — `pre-inference` (kind `holes`), then `post-inference` (kind
 `typed`, the anchor), `post-channelize`, `post-as-of-read`, `post-lambda-elim`
-and `post-planning` (all `typed`) — and one `paneLinks` window per adjacent pair,
-so `paneLinks` is always one shorter than `panes`. The pane set is the compiler's
-`PANES` table; `wireValidate.ts` pins it rather than reading it, so an added pane
-fails the validator instead of passing silently. There is no top-level
-`ir`/`spanIndex` (the earlier aliases are retired).
+and `post-planning` (all `typed`), then `post-conversion` (kind `operators`) —
+and one `paneLinks` window per adjacent pair, so `paneLinks` is always one
+shorter than `panes`. The pane set is the compiler's `PANES` table;
+`wireValidate.ts` pins it rather than reading it, so an added pane fails the
+validator instead of passing silently. There is no top-level `ir`/`spanIndex`
+(the earlier aliases are retired).
 
-A pane ships a **node table**: `nodes`, holding each node of that pane exactly
-once in first-visit pre-order, and `root`, the id its walk starts from. A child
-is `{ edge, id, predicate }` — the id names an entry of the same table, so a node
-reached from several places is one entry that several edges name.
+## What a pane ships
 
-A refinement predicate riding a type slot is a node like any other, reached under
-a `where.N`-labelled child edge instead of a positional index. `predicate: true`
-on the edge is what distinguishes a subtree inside a type from an operand; the
-edge label is for display.
+`nodes` holds each node of that pane exactly once, and the pane's own walk-start
+key names the ids a walk of it starts from. `kind` is the discriminant for which
+shape `nodes` holds, and for which of the two keys the pane carries.
+
+A **tree pane** (`holes`, `typed`) holds expression nodes, in first-visit
+pre-order, and names its start under `root` — one id, since a tree has one by
+construction. A child is `{ edge, id, predicate }` — the
+id names an entry of the same table, so a node reached from several places is one
+entry that several edges name. A refinement predicate riding a type slot is a
+node like any other, reached under a `where.N`-labelled child edge instead of a
+positional index; `predicate: true` on the edge is what distinguishes a subtree
+inside a type from an operand, and the label is for display. Each node carries
+its type as a rendered string in `type` (`"Int"`, `"_"`).
+
+The **operator pane** (`operators`) holds the dataflow graph, in conversion
+order, and names no walk start. A walk begins at the nodes no `value` edge
+subscribes — a sink per compiled output, a fan input per share point, and a
+source per registered data source — which a consumer derives from `inputs`.
+Every node is reachable from there following `value` edges alone, which is the
+relation a consumer walks.
+
+A node carries `role` (`operator`, `source`, `sink`), a `tiling` for an operator
+and none for a boundary, and `inputs`: `{ role, kind, deferred, subscribed }`. An
+edge's `kind` is `value` for an exclusively owned input and `share` for one
+several consumers may reach; `deferred` marks a `value` edge wired through a
+`CycleSlot` after its consumer was constructed, which is when rather than how it
+is held. An edge is a
+subscription, stored on the consumer: `subscribed` names the operator it holds and
+calls `get` on, so the relation runs against dataflow. `notify` runs the other
+way.
 
 ## Regenerating
 

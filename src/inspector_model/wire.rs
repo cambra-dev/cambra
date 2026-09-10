@@ -51,9 +51,10 @@
 use crate::ccl::Expr;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 use crate::chl_parser::ast::Span;
+use crate::interpreter::operator_graph::{EdgeKind, EdgeRole, GraphNode, InputEdge, OperatorGraph};
 
 use super::definitions::Definition;
-use super::program::InspectedProgram;
+use super::program::{InspectedProgram, PaneContent};
 use super::walk::{node_label, predicate_children};
 
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
@@ -102,17 +103,136 @@ pub struct PaneEntry {
     pub id: &'static str,
     /// Human-readable label for the pane header, derived from `id`.
     pub label: String,
-    /// Discriminant for the pane kind: `"holes"` for a tree inference has not
-    /// run on yet, `"typed"` for one it has.
+    /// Discriminant for the pane kind, and for which shape
+    /// [`nodes`](Self::nodes) holds: `"holes"` for a tree inference has not run
+    /// on yet, `"typed"` for one it has, `"operators"` for the dataflow graph.
     pub kind: &'static str,
-    /// The id of the pane's root node — where a consumer starts walking
-    /// [`nodes`](Self::nodes).
-    pub root: u64,
-    /// Every node of this pane exactly once, in first-visit pre-order. A node
-    /// reached from several places — a refinement predicate shared by several
-    /// type slots, most of all — is one entry here that each of those places
+    /// The root node of a tree pane's expression, shipped because the compiler
+    /// hands it over — it is the pane's own `Expr`, not something read back off
+    /// the node table. An operator graph has no root, so this is absent there;
+    /// where that pane's walk begins is derived from its edges instead, which is
+    /// a different question with a different answer set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<u64>,
+    /// Every node of this pane exactly once, in first-visit pre-order for a
+    /// tree and conversion order for a graph. A node reached from several
+    /// places — a refinement predicate shared by several type slots, or a fan
+    /// input several branches read — is one entry that each of those places
     /// names by id.
-    pub nodes: Vec<IrNode>,
+    pub nodes: PaneNodes,
+}
+
+/// A pane's node table, in whichever shape the pane holds.
+///
+/// Untagged, so `nodes` is a plain array either way; [`PaneEntry::kind`] is the
+/// discriminant. The two shapes share nothing but an id and an attribution: an
+/// expression node has a type and children, an operator has a tiling and typed
+/// input edges, and neither field set is meaningful for the other.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum PaneNodes {
+    Ir(Vec<IrNode>),
+    Operators(Vec<OperatorNode>),
+}
+
+#[cfg(test)]
+impl PaneNodes {
+    /// Every node's id, in table order.
+    pub(crate) fn ids(&self) -> Vec<u64> {
+        match self {
+            PaneNodes::Ir(nodes) => nodes.iter().map(|n| n.node_id).collect(),
+            PaneNodes::Operators(nodes) => nodes.iter().map(|n| n.node_id).collect(),
+        }
+    }
+
+    /// The expression nodes, or `None` for an operator pane.
+    pub(crate) fn ir(&self) -> Option<&[IrNode]> {
+        match self {
+            PaneNodes::Ir(nodes) => Some(nodes),
+            PaneNodes::Operators(_) => None,
+        }
+    }
+}
+
+/// One node of an operator pane: an operator, or one of the two program
+/// boundaries.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorNode {
+    /// What to show: the operator's type name, or `Source(name)` / `Sink(name)`
+    /// for a boundary.
+    pub label: String,
+    /// The node's [`NodeId`](crate::ccl::provenance::NodeId) as a number, in the
+    /// same space as an expression node's — an operator carries a `NodeId` so a
+    /// pane pair spanning conversion is homogeneous like every other.
+    pub node_id: u64,
+    /// Which of the three node kinds this is: `"operator"`, `"source"`,
+    /// `"sink"`. Data, not display policy.
+    pub role: &'static str,
+    /// The operator's output tiling, rendered, and `None` for a boundary node.
+    pub tiling: Option<String>,
+    /// Every source span this node traces to, narrowest first. Same channel and
+    /// same meaning as [`IrNode::spans`].
+    pub spans: Vec<Span>,
+    /// The node's rewrite tag, on the same terms as [`IrNode::rewritten`].
+    pub rewritten: Option<RewriteInfo>,
+    /// The graph inputs this node holds.
+    pub inputs: Vec<OperatorEdge>,
+}
+
+/// One input edge of an operator node.
+///
+/// A subscription: the consumer holds this operator and calls `get` on it. What
+/// an operator holds and what it subscribes are the same set, stated from its
+/// fields, with one exception — a source is not an operator, so a read of one is
+/// recorded rather than subscribed.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorEdge {
+    /// What names this input at its consumer.
+    pub role: OperatorEdgeRole,
+    /// `"value"` for an exclusively owned input, `"share"` for one several
+    /// consumers may reach.
+    ///
+    /// The value edges form a forest, which is what lets a renderer walk them as
+    /// a child relation with no cycle guard; the share edges are the
+    /// cross-references. A cycle is a `"value"` edge with
+    /// [`deferred`](Self::deferred) set.
+    pub kind: &'static str,
+    /// Whether the edge was wired after its consumer was constructed, through a
+    /// `CycleSlot`. An attribute of when, not of ownership.
+    pub deferred: bool,
+    /// The id of the node this edge subscribes — an entry of the same pane's
+    /// [`nodes`](PaneEntry::nodes).
+    pub subscribed: u64,
+}
+
+/// What names an input at its consumer, carrying the shape that named it.
+///
+/// Three shapes rather than one rendered string, because two of them render
+/// alike: a field named `0` and the first element of a `Vec` both flatten to
+/// `"0"`, and a consumer that has to tell them apart cannot.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OperatorEdgeRole {
+    /// A field of the consumer, e.g. `"input"`, `"predicate"`.
+    Named { name: String },
+    /// A position in a `Vec` of inputs, as `FanIn` and `UnionOperator` have.
+    Positional { index: usize },
+    /// A store key, as both stores' `init_ops` are keyed by. Rendered from a
+    /// `Value`, so a string key arrives quoted.
+    StoreKey { key: String },
+}
+
+/// How a role reads in a row label — the Rust side of `roleLabel` in `types.ts`.
+impl std::fmt::Display for OperatorEdgeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperatorEdgeRole::Named { name } => f.write_str(name),
+            OperatorEdgeRole::Positional { index } => write!(f, "{index}"),
+            OperatorEdgeRole::StoreKey { key } => f.write_str(key),
+        }
+    }
 }
 
 /// One node of a pane's shipped node table.
@@ -367,18 +487,108 @@ pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// Build one pane's node table against its `projection`, returning the root
-/// node's id and every node reachable from `expr` exactly once, in first-visit
-/// pre-order.
+/// The operator pane's node table.
 ///
-/// The single source-linking node builder: every pane's payload nodes go
-/// through this one shape, parameterized only by its `(Expr, SourceProjection)`
-/// pair.
+/// Nodes come out in the graph's own order, which is conversion order and so
+/// deterministic. Attribution is read the same way an expression node's is: the
+/// pane's projection is a fold product like any other.
+fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) -> Vec<OperatorNode> {
+    graph
+        .nodes()
+        .iter()
+        .map(|node| {
+            let (id, label, role, tiling, inputs) = match node {
+                GraphNode::Operator {
+                    id,
+                    kind,
+                    tiling,
+                    inputs,
+                } => (
+                    *id,
+                    (*kind).to_string(),
+                    "operator",
+                    Some(tiling.to_string()),
+                    inputs.as_slice(),
+                ),
+                GraphNode::Source { id, name } => (
+                    *id,
+                    format!("Source({name})"),
+                    "source",
+                    None,
+                    [].as_slice(),
+                ),
+                GraphNode::Sink { id, name, input } => (
+                    *id,
+                    format!("Sink({name})"),
+                    "sink",
+                    None,
+                    std::slice::from_ref(input),
+                ),
+            };
+            let attribution = projection.get(&id);
+            OperatorNode {
+                label,
+                node_id: id.as_u64(),
+                role,
+                tiling,
+                spans: attribution
+                    .map(|a| wire_spans(&a.spans))
+                    .unwrap_or_default(),
+                rewritten: attribution.and_then(rewrite_info),
+                inputs: inputs.iter().map(wire_edge).collect(),
+            }
+        })
+        .collect()
+}
+
+/// An attribution's spans as they ship: **narrowest first**, deduplicated.
 ///
-/// A node reached from several places — a refinement predicate shared by
-/// several type slots — is emitted once and named by id from each place that
-/// reaches it, so nothing repeats and the walk terminates on a shared term. The
-/// pre-order is what makes the emitted array byte-reproducible.
+/// Both node shapes carry this channel on the same terms — see
+/// [`IrNode::spans`] and [`OperatorNode::spans`] — so both get it from here.
+/// `fold` unions blame spans in encounter order, which is not width order, so
+/// the ordering is this function's to establish rather than something the
+/// projection already holds.
+///
+/// The key is `(width, start, end)` rather than width alone, so two spans of
+/// equal width order by position and the payload stays byte-reproducible.
+fn wire_spans(spans: &[Span]) -> Vec<Span> {
+    let mut spans = spans.to_vec();
+    spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end));
+    spans.dedup();
+    spans
+}
+
+/// The rewrite tag as it ships, or `None` for a
+/// [`Nature::Source`](crate::ccl::provenance::Nature::Source) tag — the root of a
+/// lowered source expression. The validators guard that `"source"` never ships.
+fn rewrite_info(attr: &crate::ccl::provenance::SourceAttribution) -> Option<RewriteInfo> {
+    let tag = &attr.rewritten;
+    (!tag.nature.is_source()).then(|| RewriteInfo {
+        via: format!("{:?}", tag.via),
+        nature: tag.nature.wire_str().to_string(),
+        label: tag.label.to_string(),
+    })
+}
+
+fn wire_edge(edge: &InputEdge) -> OperatorEdge {
+    let (kind, deferred) = match edge.kind {
+        EdgeKind::Value { deferred } => ("value", deferred),
+        EdgeKind::Share => ("share", false),
+    };
+    OperatorEdge {
+        role: match &edge.role {
+            EdgeRole::Named(name) => OperatorEdgeRole::Named {
+                name: (*name).to_string(),
+            },
+            EdgeRole::Positional(i) => OperatorEdgeRole::Positional { index: *i },
+            EdgeRole::StoreKey(key) => OperatorEdgeRole::StoreKey { key: key.clone() },
+        },
+        kind,
+        deferred,
+        subscribed: edge.subscribed.as_u64(),
+    }
+}
+
 fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrNode>) {
     fn visit(
         expr: &Expr,
@@ -400,25 +610,8 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
             children: Vec::new(),
         };
         if let Some(attr) = projection.get(&id) {
-            // The rewrite channel: a `Nature::Source` tag — the root of a
-            // lowered source expression — null-compresses and carries no wire
-            // tag; every other node carries `{via, nature, label}`. The
-            // validators guard that `"source"` never ships.
-            let tag = &attr.rewritten;
-            if !tag.nature.is_source() {
-                node.rewritten = Some(RewriteInfo {
-                    via: format!("{:?}", tag.via),
-                    nature: tag.nature.wire_str().to_string(),
-                    label: tag.label.to_string(),
-                });
-            }
-            // The spans channel: every span the attribution records, narrowest
-            // first so a consumer wanting one position takes the first, and
-            // deduplicated so no span is claimed twice for one node.
-            let mut spans = attr.spans.clone();
-            spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end));
-            spans.dedup();
-            node.spans = spans;
+            node.rewritten = rewrite_info(attr);
+            node.spans = wire_spans(&attr.spans);
         }
 
         // The entry claims its pre-order slot before its children are walked, so
@@ -500,7 +693,16 @@ impl InspectedProgram<'_> {
             .panes()
             .iter()
             .map(|pane| {
-                let (root, nodes) = build_node_table(pane.ir, &pane.projection);
+                let (root, nodes) = match pane.content {
+                    PaneContent::Ir(ir) => {
+                        let (root, nodes) = build_node_table(ir, &pane.projection);
+                        (Some(root), PaneNodes::Ir(nodes))
+                    }
+                    PaneContent::Operators(graph) => (
+                        None,
+                        PaneNodes::Operators(build_operator_table(graph, &pane.projection)),
+                    ),
+                };
                 PaneEntry {
                     id: pane.id,
                     label: pane.label.clone(),
@@ -631,19 +833,56 @@ mod tests {
                   total := total + x
                 total
             "#},
+            // A join, for the multi-span node. Every other corpus program
+            // attributes each node to one span, so the span-ordering and
+            // span-uniqueness assertions below ran only over one-element
+            // vectors and could not fail. The hash-join planner attributes the
+            // operators it builds to both the comprehension and the record
+            // inside it, which is the only shape in the tree that reaches
+            // `wire_spans` with something to order.
+            indoc! {r#"
+                us = [(id=1, n="a")]
+                os = [(uid=1, amt=5)]
+                [(c=u.n, t=o.amt) for u in us for o in os if u.id == o.uid]
+            "#},
         ]
     }
 
-    /// Every `nodeId` in one pane's shipped node table.
+    /// Every `nodeId` in one pane's shipped node table, whatever shape the pane
+    /// holds.
     fn pane_ids(pane: &PaneEntry) -> HashSet<u64> {
-        pane.nodes.iter().map(|n| n.node_id).collect()
+        pane.nodes.ids().into_iter().collect()
+    }
+
+    /// Each node's id, label and spans, whatever shape the pane holds. The two
+    /// shapes carry the same span channel, so a check over spans covers an
+    /// operator pane on the same terms as a tree.
+    fn node_rows(pane: &PaneEntry) -> Vec<(u64, &str, &[Span])> {
+        match &pane.nodes {
+            PaneNodes::Ir(nodes) => nodes
+                .iter()
+                .map(|n| (n.node_id, n.label.as_str(), n.spans.as_slice()))
+                .collect(),
+            PaneNodes::Operators(nodes) => nodes
+                .iter()
+                .map(|n| (n.node_id, n.label.as_str(), n.spans.as_slice()))
+                .collect(),
+        }
+    }
+
+    /// The pane's expression nodes. Panics for an operator pane, which the
+    /// callers reach by pane id and so never hand one.
+    fn ir_nodes(pane: &PaneEntry) -> &[IrNode] {
+        pane.nodes
+            .ir()
+            .unwrap_or_else(|| panic!("the {} pane holds expression nodes", pane.id))
     }
 
     /// The pane's node carrying `id`. Panics when no node does, which is the
     /// dangling-child-id failure `every_child_id_resolves_in_its_own_table`
     /// rules out over the whole corpus.
     fn node_with_id(pane: &PaneEntry, id: u64) -> &IrNode {
-        pane.nodes
+        ir_nodes(pane)
             .iter()
             .find(|n| n.node_id == id)
             .unwrap_or_else(|| panic!("node {id} is absent from the {} table", pane.id))
@@ -651,7 +890,7 @@ mod tests {
 
     /// The pane's first node labelled `label`.
     fn node_named<'a>(pane: &'a PaneEntry, label: &str) -> &'a IrNode {
-        pane.nodes
+        ir_nodes(pane)
             .iter()
             .find(|n| n.label == label)
             .unwrap_or_else(|| panic!("no {label} node in the {} table", pane.id))
@@ -701,16 +940,24 @@ mod tests {
                 assert_eq!(link.to, pair[1].id);
             }
 
-            // The kind is read off the phases, so exactly the panes at or after
-            // inference are typed.
+            // The kind is read off the phases and the pane's content, so
+            // exactly the tree panes at or after inference are typed, and it is
+            // the discriminant for which shape `nodes` holds.
             assert_eq!(
                 payload.panes[0].kind, "holes",
                 "the anchor precedes inference"
             );
-            assert!(
-                payload.panes[1..].iter().all(|s| s.kind == "typed"),
-                "every pane at or after inference is typed"
-            );
+            for pane in &payload.panes[1..] {
+                let expected = match pane.nodes {
+                    PaneNodes::Ir(_) => "typed",
+                    PaneNodes::Operators(_) => "operators",
+                };
+                assert_eq!(
+                    pane.kind, expected,
+                    "the {} pane's kind names the shape it ships",
+                    pane.id
+                );
+            }
             assert_eq!(payload.meta.schema, SCHEMA_VERSION);
         }
     }
@@ -753,6 +1000,59 @@ mod tests {
         }
     }
 
+    /// `wire_spans` establishes the ordering both node shapes promise, over
+    /// spans handed to it in any order.
+    ///
+    /// A unit test rather than a corpus one because the corpus cannot reach the
+    /// case: an operator node with more than one span needs a join, and no
+    /// program in `corpus()` has one. That gap is why the operator table
+    /// shipped `a.spans.clone()` unsorted through every payload the suite
+    /// built — `inner_join` and `join_then_groupby` are the only programs in
+    /// the tree that expose it, and neither was in a corpus the validators ran
+    /// on. Here the shape is stated directly, so the invariant no longer
+    /// depends on some program happening to produce it.
+    #[test]
+    fn wire_spans_orders_narrowest_first_and_dedups() {
+        let span = |start: usize, end: usize| Span { start, end };
+
+        // The observed regression: `inner_join`'s operator nodes carried the
+        // 99-byte comprehension ahead of the 32-byte record it contains, so
+        // `spans[0]` — the one a consumer renders — was the widest.
+        assert_eq!(
+            wire_spans(&[span(435, 534), span(436, 468)]),
+            vec![span(436, 468), span(435, 534)],
+        );
+
+        // Already narrowest-first is left alone.
+        assert_eq!(
+            wire_spans(&[span(436, 468), span(435, 534)]),
+            vec![span(436, 468), span(435, 534)],
+        );
+
+        // Equal widths order by position, so the payload is byte-reproducible
+        // whatever order the union produced. `source_shared`'s one multi-span
+        // operator node is this case.
+        assert_eq!(
+            wire_spans(&[span(348, 355), span(305, 312)]),
+            vec![span(305, 312), span(348, 355)],
+        );
+
+        // A repeated span is claimed once. The operator table omitted this too.
+        assert_eq!(
+            wire_spans(&[span(10, 20), span(10, 20), span(1, 2)]),
+            vec![span(1, 2), span(10, 20)],
+        );
+
+        // Adjacent-after-sort is what `dedup` needs, so a duplicate separated
+        // by a narrower span still collapses.
+        assert_eq!(
+            wire_spans(&[span(10, 20), span(1, 2), span(10, 20)]),
+            vec![span(1, 2), span(10, 20)],
+        );
+
+        assert_eq!(wire_spans(&[]), vec![]);
+    }
+
     /// A node's `spans` are exactly the spans its pane's projection records for
     /// it, narrowest first and each one once. This is what the retired parallel
     /// span table used to pin as a round trip: with the spans on the node there
@@ -766,6 +1066,13 @@ mod tests {
             let payload = inspected.build_payload("test");
             for (wire_pane, pane) in payload.panes.iter().zip(inspected.panes()) {
                 assert_eq!(wire_pane.id, pane.id, "the panes line up");
+
+                // The recorded side is a tree walk, so this covers the IR
+                // panes; an operator pane has no tree to walk.
+                let (Some(shipped_nodes), Some(ir)) = (wire_pane.nodes.ir(), pane.content.ir())
+                else {
+                    continue;
+                };
 
                 // What the projection records, keyed the way the wire keys it.
                 let mut recorded: HashMap<u64, Vec<Span>> = HashMap::new();
@@ -790,14 +1097,9 @@ mod tests {
                         collect(predicate, projection, seen, out);
                     }
                 }
-                collect(
-                    pane.ir,
-                    &pane.projection,
-                    &mut HashSet::new(),
-                    &mut recorded,
-                );
+                collect(ir, &pane.projection, &mut HashSet::new(), &mut recorded);
 
-                for node in &wire_pane.nodes {
+                for node in shipped_nodes {
                     let mut shipped = node.spans.clone();
                     shipped.sort_by_key(|s| (s.start, s.end));
                     assert_eq!(
@@ -839,7 +1141,7 @@ mod tests {
             .find(|s| s.id == "post-inference")
             .expect("the payload ships the post-inference pane");
 
-        for node in &pane.nodes {
+        for node in ir_nodes(pane) {
             assert!(!node.ty.is_empty(), "{} ships a type", node.label);
 
             // The value children come first and the predicates follow, so a
@@ -886,9 +1188,9 @@ mod tests {
         );
     }
 
-    /// Every child id, and every pane's `root`, names a node of that pane's own
-    /// table. A dangling child id is the failure the node table makes possible
-    /// and a nested tree could not express.
+    /// Every child id, every operator input id, and every walk start of every
+    /// pane names a node of that pane's own table. A dangling id is the failure
+    /// the node table makes possible and a nested tree could not express.
     #[test]
     fn every_child_id_resolves_in_its_own_table() {
         for code in corpus() {
@@ -896,22 +1198,57 @@ mod tests {
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
-                assert!(
-                    ids.contains(&pane.root),
-                    "the {} root {} is absent from its own table",
-                    pane.id,
-                    pane.root
-                );
-                for node in &pane.nodes {
-                    for child in &node.children {
+                for start in pane.root.iter() {
+                    assert!(
+                        ids.contains(start),
+                        "the {} root {start} is absent from its own table",
+                        pane.id
+                    );
+                }
+                match &pane.nodes {
+                    PaneNodes::Ir(nodes) => {
                         assert!(
-                            ids.contains(&child.id),
-                            "{}'s child {} of {} is absent from the {} table",
-                            node.label,
-                            child.id,
-                            node.node_id,
+                            pane.root.is_some(),
+                            "a tree pane ships the root of its expression; {} ships none",
                             pane.id
                         );
+                        for node in nodes {
+                            for child in &node.children {
+                                assert!(
+                                    ids.contains(&child.id),
+                                    "{}'s child {} of {} is absent from the {} table",
+                                    node.label,
+                                    child.id,
+                                    node.node_id,
+                                    pane.id
+                                );
+                            }
+                        }
+                    }
+                    // An operator's inputs are its edges into the same table.
+                    PaneNodes::Operators(nodes) => {
+                        // A graph ships no start set: the nodes no `value` edge
+                        // names are derivable from the edges, so shipping them
+                        // would only add a channel that can disagree.
+                        assert!(
+                            pane.root.is_none(),
+                            "an operator pane ships no root; {} ships {:?}",
+                            pane.id,
+                            pane.root
+                        );
+                        for node in nodes {
+                            for input in &node.inputs {
+                                assert!(
+                                    ids.contains(&input.subscribed),
+                                    "{}'s {} input {} of {} is absent from the {} table",
+                                    node.label,
+                                    input.role,
+                                    input.subscribed,
+                                    node.node_id,
+                                    pane.id
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -931,21 +1268,31 @@ mod tests {
         for code in corpus() {
             let prog = compile(code);
             let payload = InspectedProgram::new(&prog).build_payload("test");
-            for (pane, tree) in payload.panes.iter().zip(prog.pane_trees()) {
+            // No id repeats, in a pane of either shape.
+            for pane in &payload.panes {
                 let mut seen = HashSet::new();
-                for node in &pane.nodes {
+                for id in pane.nodes.ids() {
                     assert!(
-                        seen.insert(node.node_id),
-                        "{} appears twice in the {} table",
-                        node.node_id,
+                        seen.insert(id),
+                        "{id} appears twice in the {} table",
                         pane.id
                     );
                 }
+            }
 
+            // The id set is the pane's tree, neither short nor beyond.
+            // `pane_trees` yields the six IR panes, so the zip runs over those.
+            for (pane, tree) in payload
+                .panes
+                .iter()
+                .filter(|pane| pane.nodes.ir().is_some())
+                .zip(prog.pane_trees())
+            {
+                let shipped: HashSet<u64> = pane_ids(pane);
                 let held: HashSet<u64> =
                     collect_tree_ids(tree).iter().map(|i| i.as_u64()).collect();
-                let dropped: Vec<u64> = held.difference(&seen).copied().collect();
-                let invented: Vec<u64> = seen.difference(&held).copied().collect();
+                let dropped: Vec<u64> = held.difference(&shipped).copied().collect();
+                let invented: Vec<u64> = shipped.difference(&held).copied().collect();
                 assert!(
                     dropped.is_empty() && invented.is_empty(),
                     "the {} table drops {dropped:?} and invents {invented:?}",
@@ -958,21 +1305,62 @@ mod tests {
     /// No node claims one span twice. A node is visited once and its spans come
     /// from that one attribution, so a repeat would mean the attribution itself
     /// carries a duplicate.
+    /// **An operator node's own fields**: `role` says which of the three node
+    /// kinds it is, `tiling` is present for an operator and absent for a
+    /// boundary, and `spans` is narrowest-first like an expression node's.
+    ///
+    /// The shape checks elsewhere range over ids and attributions, which both
+    /// node kinds share. These are the fields only an operator node has.
+    #[test]
+    fn an_operator_node_carries_its_role_tiling_and_ordered_spans() {
+        for code in corpus() {
+            let prog = compile(code);
+            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let pane = payload
+                .panes
+                .last()
+                .expect("the operator pane is the last one");
+            let PaneNodes::Operators(nodes) = &pane.nodes else {
+                panic!("the last pane holds operators");
+            };
+            assert!(!nodes.is_empty(), "the operator pane has no nodes");
+            for node in nodes {
+                match node.role {
+                    "operator" => assert!(
+                        node.tiling.is_some(),
+                        "operator {} ships no tiling",
+                        node.label
+                    ),
+                    "source" | "sink" => assert!(
+                        node.tiling.is_none(),
+                        "boundary node {} ships a tiling, which it has none of",
+                        node.label
+                    ),
+                    other => panic!("unknown operator-node role {other:?} on {}", node.label),
+                }
+                let widths: Vec<usize> = node.spans.iter().map(|s| s.end - s.start).collect();
+                assert!(
+                    widths.windows(2).all(|w| w[0] <= w[1]),
+                    "{}'s spans are not narrowest-first: {widths:?}",
+                    node.label,
+                );
+            }
+        }
+    }
+
     #[test]
     fn no_node_repeats_a_span() {
         for code in corpus() {
             let prog = compile(code);
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
-                for node in &pane.nodes {
+                for (_, label, spans) in node_rows(pane) {
                     let mut seen = HashSet::new();
-                    for span in &node.spans {
+                    for span in spans {
                         assert!(
                             seen.insert((span.start, span.end)),
-                            "{} in {} repeats span {:?}",
-                            node.label,
-                            pane.id,
-                            span
+                            "{label} in {} repeats span {span:?}",
+                            pane.id
                         );
                     }
                 }
@@ -994,7 +1382,11 @@ mod tests {
             let prog = compile(code);
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
-                for node in &pane.nodes {
+                // A predicate edge rides a type slot, which only a tree node has.
+                let Some(nodes) = pane.nodes.ir() else {
+                    continue;
+                };
+                for node in nodes {
                     let mut seen = HashSet::new();
                     for child in node.children.iter().filter(|c| c.predicate) {
                         assert!(
@@ -1046,7 +1438,7 @@ mod tests {
             .expect("the payload ships the post-inference pane");
 
         let mut edges: HashMap<u64, usize> = HashMap::new();
-        for node in &pane.nodes {
+        for node in ir_nodes(pane) {
             for child in node.children.iter().filter(|c| c.predicate) {
                 *edges.entry(child.id).or_default() += 1;
             }
@@ -1057,7 +1449,10 @@ mod tests {
             .expect("a predicate this pane reaches from more than one type slot");
         assert!(count > 1, "{shared} is named by {count} predicate edges");
         assert_eq!(
-            pane.nodes.iter().filter(|n| n.node_id == shared).count(),
+            ir_nodes(pane)
+                .iter()
+                .filter(|n| n.node_id == shared)
+                .count(),
             1,
             "the shared predicate {shared} is one entry in the table"
         );
@@ -1140,11 +1535,10 @@ mod tests {
             let payload = InspectedProgram::new(&prog).build_payload("test");
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
-                let attributed: HashSet<u64> = pane
-                    .nodes
+                let attributed: HashSet<u64> = node_rows(pane)
                     .iter()
-                    .filter(|n| !n.spans.is_empty())
-                    .map(|n| n.node_id)
+                    .filter(|(_, _, spans)| !spans.is_empty())
+                    .map(|(id, _, _)| *id)
                     .collect();
                 let missing: Vec<u64> = ids.difference(&attributed).copied().collect();
                 assert!(
@@ -1382,14 +1776,14 @@ max(totals)
             .iter()
             .find(|s| s.id == pane_id)
             .unwrap_or_else(|| panic!("the payload ships a {pane_id} pane"));
-        pane.nodes
+        node_rows(pane)
             .iter()
-            .filter(|n| {
-                n.spans
+            .filter(|(_, _, spans)| {
+                spans
                     .iter()
                     .any(|s| s.start <= span.start && span.end <= s.end)
             })
-            .map(|n| n.label.clone())
+            .map(|(_, label, _)| (*label).to_string())
             .collect()
     }
 
@@ -1546,8 +1940,7 @@ max(totals)
             .iter()
             .find(|s| s.id == "post-channelize")
             .expect("the payload ships the post-channelize pane");
-        let absent: Vec<&str> = pane
-            .nodes
+        let absent: Vec<&str> = ir_nodes(pane)
             .iter()
             .filter(|n| n.spans.is_empty() && n.rewritten.is_none())
             .map(|n| n.label.as_str())

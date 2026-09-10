@@ -371,6 +371,170 @@ fn for_accumulator_produces_dense_channelize_window() {
     assert_dense_window_sanity("for_accumulator");
 }
 
+/// The operator-pane edge shapes only a store produces, over a fresh dump.
+///
+/// A store is the one construct that wires an input late, so a `deferred` edge
+/// exists nowhere else — and neither does a store-keyed edge role. Every
+/// committed fixture carries neither, so without this nothing checks that either
+/// reaches the wire at all. That the deferred edges are the cycle set is
+/// `every_operator_graph_cycle_runs_through_a_deferred_edge`'s claim, over the
+/// graph rather than the payload.
+///
+/// Structural rather than a fixture, matching the two window checks above: a
+/// transaction program's operator pane is large, and pinning its bytes would
+/// re-bless on every change to how a store is built.
+fn assert_store_edge_shapes(example: &str) {
+    let raw = dump(example);
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let pane = v["panes"]
+        .as_array()
+        .expect("panes is an array")
+        .iter()
+        .find(|p| p["kind"] == "operators")
+        .unwrap_or_else(|| panic!("{example}: no operator pane"));
+
+    let mut kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deferred = 0usize;
+    let mut store_keyed = 0usize;
+    for node in pane["nodes"].as_array().expect("nodes is an array") {
+        for edge in node["inputs"].as_array().expect("inputs is an array") {
+            if let Some(kind) = edge["kind"].as_str() {
+                kinds.insert(kind.to_string());
+            }
+            if edge["deferred"] == Value::Bool(true) {
+                deferred += 1;
+            }
+            if edge["role"]["kind"] == "storeKey" {
+                store_keyed += 1;
+            }
+        }
+    }
+
+    for want in ["value", "share"] {
+        assert!(
+            kinds.contains(want),
+            "{example}: the operator pane carries no {want} edge; got {kinds:?}"
+        );
+    }
+    assert!(
+        deferred > 0,
+        "{example}: no edge is deferred, so the `CycleSlot` wiring reached no edge"
+    );
+    assert!(
+        store_keyed > 0,
+        "{example}: no edge carries a store-keyed role"
+    );
+}
+
+/// `txn_multi_read` (no committed fixture) exercises the store-only operator
+/// edge shapes.
+#[test]
+fn txn_multi_read_produces_store_edge_shapes() {
+    assert_store_edge_shapes("txn_multi_read");
+}
+
+/// `for_accumulator` (no committed fixture) exercises the store-only operator
+/// edge shapes.
+#[test]
+fn for_accumulator_produces_store_edge_shapes() {
+    assert_store_edge_shapes("for_accumulator");
+}
+
+/// **One source node per registered source, attributed to every read site.**
+///
+/// The shape decision the source half of the graph rests on: a source read from
+/// several expressions is one node several readers point at, never a node
+/// duplicated per reader — sharing is reified everywhere else in this graph and
+/// the boundary is no exception.
+///
+/// The span count is the assertion that matters. A source node cannot be minted
+/// at the first read site, because its row names every site that reads it and a
+/// row's parents are fixed when its recording closes; `materialize_sources`
+/// mints once the walk is done, for that reason alone. Minting at the first read
+/// site instead would look correct, would keep the node count right, and would
+/// silently attribute the source to one of its readers. Only the span count
+/// catches it.
+#[test]
+fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
+    let raw = dump("source_shared");
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let pane = v["panes"]
+        .as_array()
+        .expect("panes is an array")
+        .iter()
+        .find(|p| p["kind"] == "operators")
+        .expect("source_shared has an operator pane");
+
+    let sources: Vec<&Value> = pane["nodes"]
+        .as_array()
+        .expect("nodes is an array")
+        .iter()
+        .filter(|n| n["role"] == "source")
+        .collect();
+    assert_eq!(
+        sources.len(),
+        1,
+        "source_shared reads one source, so the graph holds one source node; got {}",
+        sources.len()
+    );
+    let source = sources[0];
+    let source_id = source["nodeId"].as_u64().expect("nodeId is a number");
+
+    // Nothing subscribes a source with a `value` edge, so a walk of the value
+    // edges starts at it rather than reaching it. Were it owned, it would be a
+    // node the pane holds that no view draws and no selection reaches.
+    let owned: Vec<u64> = pane["nodes"]
+        .as_array()
+        .expect("nodes is an array")
+        .iter()
+        .flat_map(|n| n["inputs"].as_array().expect("inputs is an array"))
+        .filter(|e| e["kind"] == "value")
+        .filter_map(|e| e["subscribed"].as_u64())
+        .collect();
+    assert!(
+        !owned.contains(&source_id),
+        "the source node {source_id} is subscribed by a value edge, so the walk of the value \
+         edges never starts at it"
+    );
+
+    let readers: Vec<&Value> = pane["nodes"]
+        .as_array()
+        .expect("nodes is an array")
+        .iter()
+        .filter(|n| {
+            n["inputs"].as_array().is_some_and(|es| {
+                es.iter()
+                    .any(|e| e["subscribed"].as_u64() == Some(source_id))
+            })
+        })
+        .collect();
+    assert!(
+        readers.len() >= 2,
+        "source_shared reads stdin twice, so at least two operators read the source node; got {}",
+        readers.len()
+    );
+
+    for reader in &readers {
+        for edge in reader["inputs"].as_array().expect("inputs is an array") {
+            if edge["subscribed"].as_u64() == Some(source_id) {
+                assert_eq!(
+                    edge["kind"], "share",
+                    "a source has no single owner, so a read of it is a share edge"
+                );
+            }
+        }
+    }
+
+    let spans = source["spans"].as_array().expect("spans is an array");
+    assert!(
+        spans.len() >= readers.len(),
+        "the source node carries {} span(s) for {} read site(s): it was minted against one \
+         read rather than after the walk, so `also_consumes` reached none of the others",
+        spans.len(),
+        readers.len()
+    );
+}
+
 /// Every `rewritten.via` a pane of `dump` carries.
 fn dump_vias(example: &str) -> std::collections::HashSet<String> {
     let raw = dump(example);
@@ -557,10 +721,12 @@ fn every_gallery_program_produces_a_valid_payload() {
 /// in place, and likewise every inference-variable number inside a rendered
 /// type.
 ///
-/// The id fields are exactly `panes[].root`, `panes[].nodes[].nodeId`,
-/// `panes[].nodes[].children[].id` and both endpoints of every
-/// `paneLinks[].edges` pair; spans and the pane's own string `id` are not ids
-/// and are left alone. Renumbering is global rather than per-pane because a
+/// The id fields are exactly `panes[].root` on a tree pane (an operator pane
+/// ships no start set), every `panes[].nodes[].nodeId`,
+/// every inbound edge id a node names — `children[].id` on a tree pane,
+/// `inputs[].subscribed` on an operator pane — and both endpoints of every
+/// `paneLinks[].edges` pair; spans and the pane's own string `id` are not ids and
+/// are left alone. Renumbering is global rather than per-pane because a
 /// surviving node keeps one id across every pane it appears in, and that
 /// identity — not the number — is what the frontend joins on.
 ///
@@ -619,12 +785,23 @@ fn canonicalize_ids(v: &mut Value) {
     };
 
     for pane in v["panes"].as_array_mut().into_iter().flatten() {
-        renumber(&mut pane["root"]);
+        // A tree pane's walk start is one id under `root`; an operator pane ships
+        // none, so the null check covers both shapes without a kind test.
+        if !pane["root"].is_null() {
+            renumber(&mut pane["root"]);
+        }
         for node in pane["nodes"].as_array_mut().into_iter().flatten() {
             renumber(&mut node["nodeId"]);
             canonical_type(&mut node["type"]);
-            for child in node["children"].as_array_mut().into_iter().flatten() {
-                renumber(&mut child["id"]);
+            // A tree pane names its inbound edges `children` and an operator
+            // pane `inputs`; a child carries `id` and an operator input
+            // `subscribed`. A node has one of the two, so walking both reaches
+            // every edge without a kind test.
+            for edge in node["children"].as_array_mut().into_iter().flatten() {
+                renumber(&mut edge["id"]);
+            }
+            for edge in node["inputs"].as_array_mut().into_iter().flatten() {
+                renumber(&mut edge["subscribed"]);
             }
         }
     }
