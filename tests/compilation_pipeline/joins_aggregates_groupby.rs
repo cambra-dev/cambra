@@ -200,6 +200,152 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
     run_pipeline(code);
 }
+
+// `set([…])` is a deduplicating re-keying constructor: the distinct
+// elements become the present keys, each mapped to `unit` (the `Set(K) =
+// Map(K, unit)` payload). Duplicate elements collapse via the `Drain` aggregate.
+// See `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
+// now, constant-folding later".
+//
+// The domain (key) order is hash-nondeterministic and the uniform `Units`
+// codomain isn't normalized by `sort_sealed_function_by_domain`, so compare the
+// sorted key column and assert the codomain is `n` units.
+fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = run_pipeline(code)
+    else {
+        panic!("`set` must build a SealedFunction");
+    };
+    let got = match domain {
+        ColumnValue::Ints(mut v) => {
+            v.sort_unstable();
+            ColumnValue::Ints(v)
+        }
+        ColumnValue::Strings(mut v) => {
+            v.sort_unstable();
+            ColumnValue::Strings(v)
+        }
+        other => panic!("unexpected key column: {other:?}"),
+    };
+    // Sorted but **not** deduplicated: deduplication is what is under test, so
+    // normalizing it away here would leave the key column unasserted and only the
+    // `Units(n)` codomain catching a `set` that kept its duplicates.
+    assert_eq!(got, sorted_keys, "deduplicated keys");
+    assert_eq!(
+        *codomain,
+        Tile::Scalar(ColumnValue::Units(n)),
+        "unit payload"
+    );
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("set([1,2,2,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
+#[case("set([3,1,2,1,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
+#[case("set(['a','b','a'])", ColumnValue::strings(&["a", "b"]), 2)]
+fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usize) {
+    check_set_keys(code, sorted_keys, n);
+}
+
+// `map([…])` is the value-carrying re-keying constructor: the distinct first
+// components become the present keys, each mapped to its entry's second component
+// via the `Sole` collapse. Same shape as `set` above at a different collapse
+// (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
+// constant-folding later").
+//
+// Key order is hash-nondeterministic, so compare entries sorted by key — sorting the
+// key column alone would break its pairing with the value column, which is the thing
+// under test.
+fn check_map_entries(code: &str, mut expected: Vec<(Value, Value)>) {
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = run_pipeline(code)
+    else {
+        panic!("`map` must build a SealedFunction");
+    };
+    let Tile::Scalar(values) = *codomain else {
+        panic!("`map`'s codomain must be a scalar column");
+    };
+    let mut got: Vec<(Value, Value)> = (0..domain.len())
+        .map(|i| (domain.index_at(i), values.index_at(i)))
+        .collect();
+    got.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("comparable keys"));
+    expected.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("comparable keys"));
+    assert_eq!(got, expected, "keyed entries");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("map([(1, 10), (2, 20)])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
+#[case("map([(3, 30), (1, 10), (2, 20)])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20)), (Value::Int(3), Value::Int(30))])]
+#[case("map([('a', 1), ('b', 2)])", vec![(Value::String("a".into()), Value::Int(1)), (Value::String("b".into()), Value::Int(2))])]
+fn test_map(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
+    check_map_entries(code, expected);
+}
+
+// A repeated key gives one group two entries, which `Sole` rejects. The spec makes a
+// duplicate key in a map literal a *compile-time* error; enforcing it here is later
+// than that, because only the key values decide it and nothing folds constants yet
+// (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
+// constant-folding later"). `set` has no such fault — `Drain` absorbs duplicates,
+// which is set semantics.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[should_panic(expected = "elements under one key")]
+fn map_rejects_a_duplicate_key() {
+    run_pipeline("map([(1, 10), (2, 20), (1, 99)])");
+}
+
+// A re-keying constructor over a literal whose elements share **one** singleton type does
+// not compile, and neither constructor causes it: a plain `groupby` over the same literal
+// fails identically ([`a_groupby_over_a_singleton_element_literal`] carries the diagnosis).
+// `set` and `map` reach it through the group-by their shared shape is built on, and both
+// spellings are listed because both do.
+//
+// The parameter's domain resolves to `Int` while every occurrence of that domain's binder
+// resolves to `Int@1`, and a data function's domain is invariant, so `post-lambda-elim`
+// rejects the tree. A fix for that — meeting both sides when a negative position is read —
+// is in flight and is not under this stack, so the pin is on the failure: it reports the day
+// a base carrying the fix arrives, which an `#[ignore]` could not.
+//
+// It blocks the single-entry seed a mutable map wants (`map([("tee", 5)])`), so it is
+// recorded here rather than left to be rediscovered.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("set([1])")]
+#[case("set([1, 1])")]
+#[case("map([(1, 10)])")]
+#[should_panic(
+    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
+)]
+fn test_rekeying_over_a_singleton_literal(#[case] code: &str) {
+    run_pipeline(code);
+}
+
+// A `set(…)` value **nested as another comprehension's source** is not driven:
+// planning inserts the iteration site at a chain head, so `set(…)` compiles as the
+// program tail (`test_set` above) and let-bound-then-consumed (`s = set(…)` …
+// `[k for k in s]`), but inlined into a comprehension source the underlying list
+// literal reaches op-conversion with no `iterate` before it. This is the acceptance test
+// for that gap.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[ignore = "a set value nested as a comprehension source is not driven by planning"]
+fn test_undriven_set_as_a_comprehension_source() {
+    // Asserting only that compilation succeeds: the point is that planning gives
+    // the source an iteration site at all.
+    run_pipeline("[1 for k in set([1,2,2,3])]");
+}
+
+// A bare `groupby(…)` **is** driven: the program tail is a chain head, which is where
+// planning puts the iteration site, so the shape the nested source lacks is present here.
+// Its companion above is the shape that fails, and the two are not one gap.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn a_bare_groupby_tail_is_driven() {
+    run_pipeline("groupby([1,2,3,4], \\y -> y // 2)");
+}
 // 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]

@@ -14,16 +14,13 @@ domains.
 
 The type-level machinery is the sum — a data function carrying its Σ binders — and the
 [`TypeKind`] classifying the types each binder ranges over, specified in
-[type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums). Each
-collection type is a Σ whose witness ranges over one **kind**, and this document says which
-kind each one picks. "Kind" throughout means that `TypeKind`, never the collection type
-itself; a witness is a binder, and the kind classifies the types it ranges over rather than
-the binder.
+[type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums). Throughout,
+**kind** means that `TypeKind` and never the collection type itself; a witness is a binder,
+and the kind classifies the types it ranges over rather than the binder.
 
-The kind tells four of the five apart: `Array(𝑛, 𝑇)` is a bare data function over
-one range, `List(𝑇)` a Σ over `UIntRanges`, `Collection(𝑇)` a Σ over `Type`. `Set(𝐾)` and
-`Map(𝐾, 𝑉)` share the `SubtypesOf(𝐾)` kind and its key parameter, differing only in a codomain
-that is `unit` for one, so the operation layer has nothing to dispatch on between them.
+`Set(𝐾)` and `Map(𝐾, 𝑉)` are the one pair the kind does not separate: they share the
+`SubtypesOf(𝐾)` kind and its key parameter, differing only in a codomain that is `unit` for
+one, so the operation layer has nothing to dispatch on between them.
 [Telling `Set` and `Map` apart](#telling-set-and-map-apart-open) is the open part.
 
 > **What is built.** Everything in this document is implemented unless it is tagged
@@ -127,12 +124,15 @@ document:
 Nothing in [`Type`] carries a collection type constructor today, so none of this is an
 implemented property.
 
-**Until this is settled** `for ... in` binds the codomain for every collection type, because
-key and entry iteration is exactly the `Set`-versus-`Map` distinction. If the operation
-layer is needed first, the interim to reach for is **uniform entry iteration**: a `Set`'s
-entry is `(𝐾, unit)` and the projection to `𝐾` is lossless, so `Map` gets correct entry
-iteration without the distinction existing. That is surface-visible — `for k in s` would
-bind a pair — so it is a spec decision, not a silent one.
+**Until this is settled** `for ... in` binds the codomain for every collection type, so
+`for g in groupby(xs, key)` binds each group rather than each key. The spec's choice is
+kind-directed ([chl-spec §4.6](../../../docs/chl-spec.md#46-for--iteration)), so what blocks
+it is the missing `Set`/`Map` distinction rather than the unbuilt operation layer: key and
+entry iteration is exactly that distinction. If the operation layer is needed first, the
+interim to reach for is **uniform entry iteration**: a `Set`'s entry is `(𝐾, unit)` and the
+projection to `𝐾` is lossless, so `Map` gets correct entry iteration without the distinction
+existing. That is surface-visible — `for k in s` would bind a pair — so it is a spec
+decision, not a silent one.
 
 ## `groupby`'s exact type
 
@@ -157,8 +157,7 @@ it has.
 A key domain is spelled as the image of a named morphism term:
 `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` is the keys `𝑚` produces.
 `present_key_domain` in `src/ccl/lower/exprs.rs` builds every one, so a domain of this shape
-came from a re-keying producer ([Keyed entry needs the key domain written down at
-lowering](#keyed-entry-needs-the-key-domain-written-down-at-lowering)).
+came from a re-keying producer.
 
 **Naming the morphism is what makes membership provable.** A domain that said only "the keys
 of this collection" would have no introduction rule: nothing could produce a value at it
@@ -188,19 +187,20 @@ Implication does not close that gap, because the obligation the two spellings ne
 definition `c = [1,1,2]` rather than an entailment between predicates over values. Relating them
 is canonicalization work, and nothing does it today.
 
-**A morphism is spelled the same way at every position.** Planning compiles a refinement's
-predicate to the point-free form the restrict pipeline consumes, and a key domain is born in
-that form: `fn_of_bare_predicate` returns `f` verbatim from a bare `__elem ▷ f`, so compilation
-is the identity on `__elem ▷ (𝑚 ▷ collection_contains)` and the morphism inside `𝑚` is never
-rewritten. That is what keeps the spellings from splitting — a morphism point-freed at one
-position and pointful at another would be two structurally unequal domains, and the membership
-fact would stop transferring between them.
-
 Two things follow from naming a term at all. A key domain embeds its whole producer, so the type
 grows with the producer and shows up wherever the key type does. And a type's identity now rests
 on a term's, which is the same identity-by-shape exposure the Σ rule's `𝜌` substitution has
 ([type-inference.md, What checks each
 premise](type-inference.md#what-checks-each-premise)).
+
+**Every re-keying producer stamps its own key binder, at lowering.** An entry term runs a
+membership predicate on the entering side, so it decides at constraint-emission time only for
+a domain that is already concrete, and otherwise becomes a
+[kinding edge](type-inference.md#an-unresolved-candidate-becomes-a-kinding-edge) on the domain
+variable. Whether a producer satisfies that is a fact about whether lowering wrote the domain
+down rather than about the collection type. Get it wrong and the failure is an
+`AnnotationMismatch` on the Σ witness rather than anything naming the cause, because the gate
+had nothing concrete to test.
 
 **`Converse` discharges the present-key domain.** Planning rebuilds the site as
 `converse ≫ map`, and the two halves are typed at different domains: the key-extraction
@@ -212,7 +212,66 @@ partition.
 The predicate rides to op-conversion on **types**, never as a term. Point-free compilation
 applies to the predicates planning reifies into a `Restrict`, and this one it never
 reaches — a membership evaluation would be a keyed lookup or an `x in s` filter, neither of
-which exists.
+which exists. Compilation is the identity on it besides: `fn_of_bare_predicate` returns `f`
+verbatim from a bare `__elem ▷ f`, which is the form a key domain is born in, so the morphism
+inside it is never rewritten. That is what keeps one collection's key domain to one spelling —
+a morphism point-freed at one position and pointful at another would be two structurally
+unequal domains, and the membership fact would stop transferring between them.
+
+### Constructor lowering: runtime `groupby` now, constant-folding later
+
+The re-keying constructors are the first surface (before the `[k -> v]` sugar and
+annotation-driven implicit insertion). Their **value construction is a runtime
+`groupby`** on the key projection ([chl-spec
+§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)): `map([𝑘𝑣…])` groups the pairs by
+`.0` and collapses each group with `Sole` to its `.1`; `set([𝑒…])` groups by the element and
+collapses with the terminal `Drain` to the one `unit` a `Set` holds; `list([𝑒…])` keeps the
+positional domain (`Array` widened to `List`). The result is the `Map`/`Set` Σ or `List`, and
+[`lower_rekeyed`] builds both re-keyings.
+
+Two consequences are **deferred to a future constant-folding pass**, recorded
+here so the shortcut is explicit:
+
+- **Compile-time construction.** A literal argument has statically-known keys, so
+  the ideal is to build the sealed keyed tile at compile time rather than run a
+  `groupby` over a constant. Cambra has no constant-folding today; when it lands,
+  folding a re-keying over a constant collection *is* the compile-time
+  construction, with no literal-detection special-case (the fold either succeeds
+  on constant inputs or falls through to the runtime operator).
+- **Duplicate-key error timing.** The spec makes a duplicate key in a map
+  *literal* a *compile-time* error
+  ([§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)). At runtime, a duplicate produces a
+  non-singleton group, which `map`'s `sole` collapse **rejects at run time** (that
+  is its whole point) — so the error is *enforced*, just later than the spec wants.
+  Moving it to compile time needs the key *values*, which only a constant fold
+  has; so the compile-time-ness (not the enforcement) rides on constant-folding.
+
+**The collapse aggregate is the whole difference between absorbing a duplicate and
+faulting on one.** `set([1,2,2,3])` and `map([(1,10),(1,20)])` are one [`lower_rekeyed`] over
+one input condition, a repeated key, and the constructors pick different aggregates to
+collapse the group. `Drain` is total, so a group of any size yields the one `unit` a `Set`
+holds; `Sole` is partial, and a group of two has no value to yield
+([`AggregateKind::is_partial`]). A set absorbing duplicates is set semantics, so both
+answers are right, and neither is a property of the key.
+
+#### A duplicate key is a process fault today
+
+`Sole`'s rejection is an `assert!` in `AggregateKind::accumulate`, and the engine has no
+channel for a fault raised by a query's **data**. Every other assertion in the tile
+operators is about a shape no pass should have produced, where stopping is right. This one
+is decided by user values, so one duplicate key fails every request the process is serving
+rather than the one that carried it.
+
+What it should become is a fault the failing query reports. That is a runtime channel and
+not a change to this check: the alternative to the assertion is silent corruption, so the
+assertion stays until the channel exists.
+
+Literals are not the boundary. A map comprehension `[k -> v for …]` reads as a `Map` exactly
+as a map literal does
+([chl-spec §3.12](../../../docs/chl-spec.md#312-comprehensions)),
+and [`lower_rekeyed`] is the one shape both re-keyings take, so a map built from request data
+inherits the fault on the same path unless the comprehension's lowering decides otherwise.
+The comprehension is decided as surface and unimplemented, so that decision is still open.
 
 ## Operations: how the trait layer dispatches [Planned]
 
@@ -305,33 +364,6 @@ so that the witness cannot escape into the consumer's result; an iterated key is
 a consumed sum's witness, and the membership has nothing to discharge against. The
 apparatus is there — `𝑘 : σ` alongside `𝑚 : σ` is the pairing a discharge needs — but which
 shape closes it is open, and it lands before the `[]` / `[]?` surface rather than with it.
-
-## Keyed entry needs the key domain written down at lowering
-
-An entry term runs a membership predicate on the entering side, so it decides at
-constraint-emission time only for a domain that is already concrete, and otherwise becomes
-a kinding constraint on the domain variable. Whether a producer satisfies that is not a
-property of the collection type but of whether lowering wrote the domain down. So the rule
-for every re-keying producer is: **stamp your own key binder with the present-key domain**
-`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`
-([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)). Get
-it wrong and the failure is an `AnnotationMismatch` on the Σ witness rather than anything
-naming the cause, because the gate had nothing concrete to test.
-
-A re-keying producer knows its key image syntactically, so it needs no deferred obligation
-of the kind a comprehension's range domain takes. One comes due for a producer whose key
-domain is unknowable until coalesce — a map comprehension, a keyed feed — and none exists
-today.
-
-## Iterating a `Set`/`Map` binds the codomain, not the keys [Interim]
-
-`for g in groupby(xs, key)` binds `g` to the **codomain** — each group, not each key. The
-semantic decision is made and kind-directed
-([chl-spec §4.6](../../../docs/chl-spec.md#46-for--iteration)); what blocks it is narrower
-than the operation layer being unbuilt. The element choice has to distinguish `Set` from
-`Map`, and those are currently the same type, so there is nothing to dispatch on
-([Telling `Set` and `Map` apart](#telling-set-and-map-apart-open)).
-
 
 ## Compiling a conditional collection
 

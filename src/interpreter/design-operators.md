@@ -291,8 +291,10 @@ iteration source itself by compiling its argument with `input=None`) or
 This dispatch is mirrored exactly by the iteration-marking pass in
 [`crate::ccl::planning::insert_iterate_markers`] — its
 `is_internalising_builtin_function` and `is_iteration_bearing` helpers both
-consult [`Builtin::iterates_arg`], the single per-builtin policy method that
-enumerates the input-internalising group.  The pass walks the AST inserting
+consult [`Builtin::iterates_arg`], the single per-builtin policy method for the
+input-internalising group. It derives that group's aggregate half from
+[`Builtin::as_aggregate`], so a newly added `AggregateKind` joins by construction rather
+than by a second list agreeing.  The pass walks the AST inserting
 `Apply(true ▷ const, Iterate)` as the source at every iteration site and
 *applying* zero or more `restrict(p)` filter steps to it (one per refinement
 layer) — `iterate ▷ (p ▷ restrict) ▷ …`, application rather than composition.
