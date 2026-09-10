@@ -1454,13 +1454,13 @@ impl TileProducer for InductionStoreProducer {
                         .collect(),
                 )
             } else {
-                // Carry: no change is appended, so a tap (fired or not) contributes
-                // nothing at this position — an *ungated* tap (one whose fire path
-                // is the commit itself, so it carries no `__fire` gate) reads
-                // `tap_fired = true` by default, but a carry position records it
-                // nowhere, which is correct: the letrec phase folds every feed-fire
-                // path into `commit`, so a position that genuinely fires a tap
-                // commits (and takes the branch above) rather than carrying here.
+                // Carry: no change is appended, so a tap contributes nothing at this
+                // position, whatever its tag. A tap whose fire path is the commit
+                // itself is `` `fired `` at every position the decision exists at,
+                // and a carry position records it nowhere — which is correct: the
+                // letrec phase folds every feed-fire path into `commit`, so a
+                // position that genuinely fires a tap commits (and takes the branch
+                // above) rather than carrying here.
                 None // the accumulator holds from tick 0 / the latest change
             };
             self.engine.step(pos + 1, write_set);

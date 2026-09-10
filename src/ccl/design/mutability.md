@@ -1228,12 +1228,15 @@ The value-`Case` positions ride the same union-of-restricts:
 
 ### General in-transaction conditionals (and conditional writes)
 
-A `with begin():` block admits `if`/`elif`/`else` and multiple sibling `if` guards, compiled by a
-uniform **path-based** walk (`transact_phase::walk_block`/`walk_case`).
+A `with begin():` block admits `if`/`elif`/`else`, multiple sibling `if` guards, and `match`
+dispatch, compiled by a uniform **path-based** walk
+(`transact_phase::walk_block`/`walk_case`). A `match` reaches the walk as a guard-`Case`: the phase
+rewrites its arms to `variant_is` tests at the strip
+(`ccl_utils::statement_tag_cases_to_guards`), so an arm is a path like any other.
 
 A **path** is one straight-line route through the block's branch structure: the statements a single
-execution runs, given a choice of arm at every `if`/`elif`/`else` it passes through. Nested and
-sibling conditionals multiply, so a block with two independent `if`s has four paths. Each path
+execution runs, given a choice of arm at every branch it passes through. Nested and sibling
+conditionals multiply, so a block with two independent `if`s has four paths. Each path
 carries a **path condition** — the conjunction of the guards it took, each `elif` guard first-match
 adjusted (`π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`). A path condition is a `Bool` expression over the
 transaction's *snapshot* alone — resolved through whatever the path has already written
@@ -1244,8 +1247,9 @@ mutually exclusive and, taken together with the implicit empty arm of a guard th
 exhaustive: exactly one path runs per transaction.
 
 Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
-one decision variant, whose `` `commit ``/`` `abort `` tag and per-tap fire fields are path conditions
-and whose per-key writes are `Case`s over the local branch guards — so every path is evaluated in
+one decision variant, whose `` `commit ``/`` `abort `` tag is a path condition, whose per-tap
+`` `fired ``/`` `idle `` tag is that tap's own path condition, and whose per-key writes are `Case`s
+over the local branch guards — so every path is evaluated in
 one straight-line writer body and one transaction is still one decision. Walking a block threads
 `(path, env)` (read-your-writes) and the block denotes
 `` snapshot ⇒ {`commit{writes, to_<defer>*} | `abort} `` — a decision **variant**

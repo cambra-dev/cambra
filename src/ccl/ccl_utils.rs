@@ -146,8 +146,8 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
     rebuilt
 }
 
-/// Assemble a writer **decision record** `{commit, writes, (to_<feed>__fire,)?
-/// to_<feed>, …}` — the single encoding of the tap protocol shared by the
+/// Assemble a writer **decision record** `{commit, writes, to_<feed>, …}` — the
+/// single encoding of the tap protocol shared by the
 /// transaction writer ([`crate::ccl::transact_phase`]) and the induction writer
 /// ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the same
 /// `body_decision_at` decoder, so the shape must be built in exactly one place.

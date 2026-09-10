@@ -994,10 +994,10 @@ struct FeedSite {
     site: StmtSite,
     /// The control-flow path under which this feed fires — `true` for a feed on
     /// the loop spine, a conjunction of enclosing guards for a feed inside an
-    /// `if`. A conditional feed (`fire != true`) rides the decision as a
-    /// `to_<feed>__fire` gate the engine reads to emit the reply only on its own
-    /// route; its path also joins the commit gate so the firing position appends a
-    /// change carrying the tap.
+    /// `if`. A conditional feed (`fire != true`) rides the decision as a tap that
+    /// is `` `fired `` on its own route and `` `idle `` elsewhere, so the engine
+    /// emits the reply only there; its path also joins the commit gate so the
+    /// firing position appends a change carrying the tap.
     fire: Expr,
 }
 
@@ -1427,8 +1427,8 @@ pub(crate) fn fold_induction_loop(
 
     // The decision codomain is exactly the record `attach_feed_fields` built (its
     // type propagates through the RYW `let`s), so `hist_ty`/the body lambda match
-    // it by construction — no separate reconstruction of the `to_<feed>`/`__fire`
-    // field set (which would have to re-derive the same gate condition).
+    // it by construction — no separate reconstruction of the `to_<feed>` field set
+    // (which would have to re-derive the same fire conditions).
     let decision_ty = chain.ty.clone();
     // The recurrence binds the loop's history, so it is a collection — and a `Type::fun`
     // here rode down into everything lambda elimination mints out of the position binder,
@@ -1948,8 +1948,8 @@ fn transform_chain(
                 let mut branch_env = env.clone();
                 // Each branch walks under `path ∧ πᵢ`, collecting its feeds into the
                 // shared `feeds` (unique field names, per-branch fire paths) — so a
-                // feed under a guard becomes a `to_<feed>__fire`-gated tap that fires
-                // only on its route. The post-`Case` remainder is spliced into every
+                // feed under a guard becomes a tap that is `` `fired `` on its own
+                // route only. The post-`Case` remainder is spliced into every
                 // branch, so a feed after the `if` is collected once per path with
                 // that path's predicate: mutually exclusive, exactly one fires per
                 // position. The write set is merged separately below (carry from the
@@ -2056,9 +2056,9 @@ fn transform_chain(
         TypedExprNode::Lit(Lit::Unit) => {
             // Terminal: the bare always-commit decision `{commit: true, writes:
             // (…)}` — the latest value of each accumulator as the positional write
-            // set (one element even for a single accumulator). Feed (`to_<feed>`)
-            // and fire (`to_<feed>__fire`) fields are attached once at the top from
-            // the fully-collected `feeds` (see `attach_feed_fields`), which also
+            // set (one element even for a single accumulator). The `to_<feed>` tap
+            // fields are attached once at the top from the fully-collected `feeds`
+            // (see `attach_feed_fields`), which also
             // folds each conditional feed's fire path into the commit gate — so a
             // spine feed on a plain loop is unchanged, and a feed reached only under
             // a guard still appends a change carrying its tap.
@@ -2242,12 +2242,13 @@ fn is_true_lit(e: &Expr) -> bool {
 }
 
 /// Attach the collected feeds to a writer decision `let* in {commit, writes}`,
-/// producing `let* in {commit', writes, to_<feed>*(, to_<feed>__fire)*}`:
+/// producing `let* in {commit', writes, to_<feed>*}`:
 ///
-/// - each feed contributes a `to_<feed>` tap value field;
-/// - a **conditional** feed (`fire ≠ true`) also contributes a `to_<feed>__fire`
-///   gate the engine reads (`body_decision_at`) to emit the reply only on its
-///   route; a spine feed (`fire == true`) fires with every committing position and
+/// - each feed contributes a `to_<feed>` tap field, holding
+///   `` {`fired{𝑉} | `idle} ``;
+/// - a **conditional** feed (`fire ≠ true`) is `` `fired `` only on its own route,
+///   which the engine reads (`body_decision_at`) to emit the reply there; a spine
+///   feed (`fire == true`) fires with every committing position and
 ///   needs no gate, keeping a plain feed loop's shape unchanged;
 /// - `commit` is widened to `commit ∨ ⋁ fire` so a position that only *feeds*
 ///   (no accumulator write) still appends a change carrying the tap.
@@ -2287,8 +2288,8 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
                 .clone();
             // Widen commit to also fire on every feed's path, so a feed-only
             // committing position appends a change carrying the tap; then hand off
-            // to the shared decision builder (the one place the `__fire` encoding
-            // lives — see `ccl_utils::writer_decision_record`).
+            // to the shared decision builder (the one place the tap encoding lives
+            // — see `ccl_utils::writer_decision_record`).
             let commit = crate::ccl::ccl_utils::disjoin(
                 std::iter::once(commit_base).chain(feeds.iter().map(|f| f.fire.clone())),
                 false,

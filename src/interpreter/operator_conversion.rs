@@ -2087,9 +2087,9 @@ fn build_induction_store_single(
     // becomes a write-only changelog key (appended after the accumulator keys), so
     // its per-position value rides the committing change and is read back densely.
     // A tap is a per-position event, not a carried mutable variable (`carry_forward:
-    // false`): it appears only at the position that fired it. Under a conditional
-    // feed the decision also carries a `to_<defer>__fire` gate, which the producer
-    // reads to omit a non-fired tap from the delta.
+    // false`): it appears only at the position that fired it. A tap holds
+    // `` {`fired{𝑉} | `idle} ``, and the producer omits an `` `idle `` one from the
+    // delta.
     let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
     let mut tap_fields: Vec<String> = Vec::new();
     for (field, tap_ty) in taps {

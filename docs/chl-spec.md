@@ -1826,8 +1826,9 @@ type-checked as one.
 Patterns are **shallow**: an arm matches one tag and binds the whole
 payload, with no nesting, no literal patterns, and no per-arm guard.
 
-**A `for`-loop body admits a `match`.** An arm may `yield` or `<<`, and the fed
-value may read the arm's payload, the loop's accumulators, or both.
+**Both statement contexts admit a `match`** — a `for`-loop body and a `with
+begin():` block. An arm may `yield` or `<<`, and the fed value may read the arm's
+payload, the loop's accumulators, or both.
 
 #### The one-line form
 

@@ -2141,11 +2141,11 @@ fn build_writer(
     writes.ty = Type::Tuple(write_tys.clone());
 
     // Decision record `{commit, writes, to_<defer>*}` — built by the shared
-    // `writer_decision_record` (the one place the tap/`__fire` encoding lives, so
-    // the induction writer and this transaction writer stay in lockstep). The
-    // in-block feeds ride as `to_<defer>` taps (read-your-writes value + a
-    // `__fire` gate when their path is narrower than the commit); `feed_sites`
-    // records the defer/field/type the phase hoists.
+    // `writer_decision_record` (the one place the tap encoding lives, so the
+    // induction writer and this transaction writer stay in lockstep). The in-block
+    // feeds ride as `to_<defer>` taps, each holding its read-your-writes value
+    // under `` `fired `` on the positions its own path admits; `feed_sites` records
+    // the defer/field/type the phase hoists.
     let feed_sites: Vec<FeedSite> = collected_feeds
         .iter()
         .map(|(defer, field, val, _)| FeedSite {
@@ -2330,8 +2330,8 @@ fn walk_block(
                 // (its path == commit). A feed under one arm of genuine cross-key
                 // *routing* (path ⊊ commit) would over-fire on a sibling route's
                 // commit — so the feed records its own `path`, and the decision
-                // assembler emits a per-tap `__fire` field (this path) the engine
-                // checks, unless the path *is* the commit (then it always fires).
+                // assembler makes that path the tap's `` `fired `` condition,
+                // unless the path *is* the commit (then it wraps unconditionally).
                 TypedExprNode::Feed { name, value } => {
                     let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     let field = format!("to_{}_{}", name.base(), *feed_counter);
