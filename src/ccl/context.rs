@@ -52,18 +52,18 @@ use crate::{
 
 /// One error a user can hit when compiling a CHL program.
 ///
-/// Variants are tagged by the pipeline stage that produced them — parsing,
+/// Variants are tagged by the pipeline phase that produced them — parsing,
 /// lowering (unsupported construct), type inference, lambda elimination,
-/// defer/feed resolution, or operator-graph conversion. Stage-internal
+/// defer/feed resolution, or operator-graph conversion. Phase-internal
 /// consistency checks (`typecheck`, `check_fully_typed` between phases,
 /// lambda-elim of a typed tree) are invariants — they panic with `.expect`
 /// because firing them indicates a compiler bug, not user error.
 ///
 /// [`compile_program`] returns `Result<_, Vec<CompileError>>`: when multiple
-/// stages produce errors (e.g. parse errors plus a lowering error in a
+/// phases produce errors (e.g. parse errors plus a lowering error in a
 /// statement unaffected by the parse hole), every error is returned in one
-/// pass instead of giving up at the first failing stage. Each entry is
-/// single-stage; the parser's multi-error output is flattened into one
+/// pass instead of giving up at the first failing phase. Each entry is
+/// single-phase; the parser's multi-error output is flattened into one
 /// [`CompileError::Parse`] per [`ParseError`].
 ///
 /// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
@@ -272,12 +272,12 @@ impl From<ConversionError> for CompileError {
     }
 }
 
-/// Lift a stage-specific error (or `Vec` of them) into the
+/// Lift a phase-specific error (or `Vec` of them) into the
 /// [`Vec<CompileError>`] channel used by [`compile_program`].
 ///
 /// The orphan rule prevents `From<X> for Vec<CompileError>` impls, so we go
-/// through a trait. Single-error stages produce a one-element list; the
-/// inference stage flattens its `Vec<InferError>` into one `CompileError`
+/// through a trait. Single-error phases produce a one-element list; the
+/// inference phase flattens its `Vec<InferError>` into one `CompileError`
 /// per inference error.
 pub trait IntoCompileErrors {
     fn into_compile_errors(self) -> Vec<CompileError>;
@@ -315,7 +315,7 @@ impl IntoCompileErrors for ConversionError {
 
 /// Extension on `Result` whose `Err` knows how to become a
 /// `Vec<CompileError>`. Lets the rest of the compile pipeline write
-/// `stage(...).errs()?` instead of an inline `.map_err(...)` per call site.
+/// `phase(...).errs()?` instead of an inline `.map_err(...)` per call site.
 pub trait CompileErrsExt<T> {
     fn errs(self) -> Result<T, Vec<CompileError>>;
 }
@@ -571,12 +571,12 @@ impl SourceSinkRegistry {
     }
 }
 
-/// Bundles the per-stage registries needed to thread externally-managed data
+/// Bundles the per-phase registries needed to thread externally-managed data
 /// sources through the full CCL pipeline (lowering → type inference → compilation).
 pub struct GlobalContext {
-    /// Lowering-stage registry: maps source names to their implementations.
+    /// Lowering-phase registry: maps source names to their implementations.
     lowering: LoweringContext,
-    /// Inference-stage registry: supplies the CCL function type for each source.
+    /// Inference-phase registry: supplies the CCL function type for each source.
     inference: TypeInferenceContext,
     /// Operator Conversion context.
     conversion: OpConversionContext,
@@ -588,7 +588,7 @@ pub struct GlobalContext {
 }
 
 impl GlobalContext {
-    /// Create a new context with stdin pre-registered in the lowering stage.
+    /// Create a new context with stdin pre-registered in the lowering phase.
     ///
     /// Inference and operator-conversion registration for stdin (and all other
     /// sources) happens in [`compile_program`] after lowering completes via
@@ -716,7 +716,7 @@ impl GlobalContext {
 
     /// Pre-register a data source so that `name()` is a valid call during lowering.
     ///
-    /// This adds the source to the lowering-stage registry only.  Inference and
+    /// This adds the source to the lowering-phase registry only.  Inference and
     /// operator-conversion registration happen later in [`compile_program`] when
     /// [`LoweringContext::take_sources`] is called and every accumulated source
     /// (pre-registered and discovered) is registered in one uniform pass.
@@ -843,7 +843,7 @@ pub struct CompiledProgram {
     /// view. The inspector anchors here instead.
     pub post_inference_ir: Expr,
     /// The post-channelize IR snapshot — the inspector's **downstream** pane, one
-    /// pipeline stage *below* [`post_inference_ir`](Self::post_inference_ir).
+    /// pipeline phase *below* [`post_inference_ir`](Self::post_inference_ir).
     ///
     /// This is `expr` captured **right after `channelize`** (which now runs
     /// after `infer`/`inline`/`transact`/`letrec`): fully typed and structurally
@@ -1473,7 +1473,7 @@ enum Check {
 }
 
 /// A phase boundary's post-conditions: ids unique, no witness reference free, output
-/// dumped, tree valid for the stage.
+/// dumped, tree valid for the phase.
 ///
 /// None of the four is type-enforced, and each fails silently in its own way. A
 /// duplicated id collapses two nodes' provenance into one entry; a tree that
@@ -1612,7 +1612,7 @@ fn run_frontend(
     capture: &[Phase],
     record: bool,
 ) -> Result<Frontend, Vec<CompileError>> {
-    // The parse and lower stages accumulate errors before bailing: when the
+    // The parse and lower phases accumulate errors before bailing: when the
     // parser recovers from a syntax error it still produces a partial AST, which
     // lowering can run on and report its own errors against, so the user sees
     // everything at once. Inference and below assume a well-typed tree with no
@@ -2532,14 +2532,14 @@ Error: lowering error
     }
 
     /// A parser-recoverable error in one statement does not stop us from
-    /// running lowering and reporting lowering errors elsewhere. Both stages'
+    /// running lowering and reporting lowering errors elsewhere. Both phases'
     /// errors come back in a single `Vec<CompileError>`.
     #[test]
     fn parse_error_does_not_suppress_later_lowering_errors() {
         // Statement 1 has a syntax error (parser recovers at the next
         // newline); statement 2 is a brace record in value position, which
         // parses but lowering rejects (braces are type syntax). We must see
-        // both stages' errors in the result.
+        // both phases' errors in the result.
         let code = "\
 x = (1 +)
 y = {a: 1}
