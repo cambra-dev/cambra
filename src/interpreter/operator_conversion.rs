@@ -651,8 +651,6 @@ impl OpConversionContext {
             .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}")))
     }
 
-    /// Mutable variable an output sink under `name`.
-    ///
     /// Enter a fresh lexical scope, returning a guard that pops it on drop.
     ///
     /// The guard dereferences to `TileCompileContext`, so it can be passed as

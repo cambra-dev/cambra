@@ -2149,11 +2149,11 @@ fn compile_version(
         ..
     } = ctx;
     sources_and_sinks.retire_routes_absent_from(&bound, scheduler);
-    // The frontend ran to , which is past every pane boundary.
+    // The frontend ran to `Phase::Planning`, which is past every pane boundary.
     let mut pane = |phase: Phase| {
         panes
             .remove(&phase)
-            .unwrap_or_else(|| unreachable!("a run to  passes {phase:?}'s output"))
+            .unwrap_or_else(|| unreachable!("a run to Planning passes {phase:?}'s output"))
     };
     let (
         pre_inference_ir,
