@@ -3,7 +3,12 @@ use log::trace;
 use crate::{
     ccl::{
         AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
-        Type, TypedExprNode, V_COMMIT, WriterSite, ccl_utils::is_trivially_true_predicate,
+        Type, TypedExprNode, V_COMMIT, WriterSite,
+        ccl_utils::strip_refinements,
+        ccl_utils::{free_names, is_trivially_true_predicate},
+        content_hash::{ContentHash, content_hash},
+        diff::Diff,
+        provenance::NodeId,
         symbolic::symbolic,
     },
     interpreter::{
@@ -24,8 +29,9 @@ use crate::{
         commit_operator::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
+            store_frontier, store_value_at,
         },
-        operator_graph::{record_sink, record_source_read},
+        operator_graph::{record_kept_operators, record_sink, record_source_read},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
@@ -37,7 +43,11 @@ use crate::{
     },
     util::ScopeStack,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 /// Converts a λ-eliminated CCL expression into an operator graph.
 ///
@@ -104,26 +114,8 @@ pub fn convert_to_operators(
 /// One compiled operator per field of a trailing record.
 pub type RecordFieldOperators = Vec<(String, Box<dyn TileOperator>)>;
 
-/// What a `Let` binding compiles to, for the `Var` uses that read it.
-///
-/// Both variants carry the input the body is converted with, because whether the
-/// enclosing input is fanned depends on which variant this is: a transaction
-/// store consumes no input and hands the body the original.
-enum LetBinding {
-    /// A transaction store, registered under the binding's name. `__hist` is
-    /// never a plain `Var` use, so it binds no scope entry.
-    Store {
-        body_input: Option<Box<dyn TileOperator>>,
-    },
-    /// A fan-out over the memoized bound operator, and how a `Var` use reads it.
-    Bound {
-        fan_out: Rc<FanOut>,
-        kind: BindingKind,
-        body_input: Option<Box<dyn TileOperator>>,
-    },
-}
-
-/// Compile a `Let`'s bound expression, shared by both conversion entry points.
+/// Compile a `Let`'s bound expression into the innermost scope, shared by both
+/// conversion entry points, and return the input its body is converted with.
 ///
 /// Extracted because both entry points need it and a duplicate of it is how the
 /// second copy goes stale — the record-fields entry point had its own copy, and
@@ -133,28 +125,30 @@ enum LetBinding {
 /// reason: `convert_impl` has a frame for the enclosing `Let` and the
 /// record-fields walk has none, so putting it in the shared path makes the
 /// invariant hold whoever calls.
+///
+/// The caller enters the scope, because the body is converted in it.
 fn compile_let_binding(
-    let_id: crate::ccl::provenance::NodeId,
+    let_id: NodeId,
     binding: &crate::ccl::TypedBinding,
     bound_expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<LetBinding, ConversionError> {
+) -> Result<Option<Box<dyn TileOperator>>, ConversionError> {
     let _scope = crate::ccl::provenance::converting(let_id);
 
     // `let __hist = Transact{…}`: build the shared store once and register it
-    // under the binding's name; the reads (`__hist.k`) project keys off it. The
-    // check precedes the fan because a store consumes no input, so fanning first
-    // would hand the body a branch where it expects the original operator.
+    // under the binding's name; the reads (`__hist.k`) project keys off it.
+    // `__hist` is never a plain `Var` use, so it binds no scope entry. The check
+    // precedes the fan because a store consumes no input, so fanning first would
+    // hand the body a branch where it expects the original operator.
     if let TypedExprNode::Transact {
         keys,
         writers,
         domain,
     } = &bound_expr.node
     {
-        let info = build_transact_store(keys, writers, domain, ctx)?;
-        ctx.register_store(binding.name.clone(), info);
-        return Ok(LetBinding::Store { body_input: input });
+        ctx.bind_store(&binding.name, bound_expr, keys, writers, domain)?;
+        return Ok(input);
     }
 
     let (bound_input, body_input) = match input {
@@ -164,32 +158,8 @@ fn compile_let_binding(
         }
         None => (None, None),
     };
-
-    // `kind` captures whether this binding was created inside an iteration
-    // scope: an iteration-aligned binding (compiled with `Some(input)`) yields
-    // an op whose tile-domain matches the surrounding stream, so `Var` lookups
-    // must pass through rather than re-apply via `MapResult`. A free binding
-    // (no input) is a standalone function; references under an iteration must
-    // wrap it in `MapResult` to look up at each position.
-    let kind = if bound_input.is_some() {
-        BindingKind::Aligned
-    } else {
-        BindingKind::Free
-    };
-    // `bound_expr` is compiled unconditionally — whether or not the body
-    // references the binding. This is why `planning` must make every
-    // function-typed bound expr iteration-bearing: an unused,
-    // non-iteration-bearing function-typed binding would otherwise reach an
-    // `input=None` arm here and error. It also means a dead iterable binding is
-    // materialised rather than dropped; #232 tracks making iteration use-driven
-    // (lazy `Let` compilation / DCE) so this eager compile is no longer forced.
-    let bound_op = convert_impl(bound_expr, bound_input, ctx)?;
-    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
-    Ok(LetBinding::Bound {
-        fan_out,
-        kind,
-        body_input,
-    })
+    ctx.bind_let(&binding.name, bound_expr, bound_input)?;
+    Ok(body_input)
 }
 
 /// Compile a `Let* Record{…}` tree into one operator per record field, sharing
@@ -213,16 +183,11 @@ pub fn convert_record_fields_to_operators(
             bound_expr,
             body,
         } => {
+            let mut scope = ctx.enter_scope();
             // No surrounding iteration here — this entry point compiles a
             // `Let* Record` chain from the top — so every binding is free.
-            match compile_let_binding(expr.node_id(), binding, bound_expr, None, ctx)? {
-                LetBinding::Store { .. } => convert_record_fields_to_operators(body, ctx),
-                LetBinding::Bound { fan_out, kind, .. } => {
-                    let mut scope = ctx.enter_scope();
-                    scope.bind(&binding.name, fan_out, kind);
-                    convert_record_fields_to_operators(body, &mut scope)
-                }
-            }
+            compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
+            convert_record_fields_to_operators(body, &mut scope)
         }
         TypedExprNode::Record(fields) => fields
             .iter()
@@ -335,35 +300,65 @@ enum StoreReadKind {
     /// changelog: a read is a [`StoreDenseRead`] folding the changelog at every
     /// position of the loop extent (`StoreReadInfo::induction_extent`) into the
     /// dense history `D ⇀ V` — the changelog counterpart of `Induction`'s
-    /// `.writes.(index)`, serving both scalar-final and co-iterated reads.
+    /// `__hist.k`, serving both scalar-final and co-iterated reads.
     InductionChangelog,
 }
 
 /// How to read one key (variable) of a transactional store. The scalar-read
 /// reduction to the current/final value (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
+#[derive(Clone)]
 struct KeyReadInfo {
+    /// What identifies this variable across versions, or `None` for a key that is
+    /// not a variable.
+    ///
+    /// `Some` exactly for a mutable variable, so this is also what
+    /// [`carry_forward`](Self::carry_forward) answers: a reply tap is a
+    /// per-commit event, and a key that carries no value between ticks has no
+    /// state to carry between versions either. One field rather than two that
+    /// would have to agree.
+    ///
+    /// Distinct from `runtime_key`, which labels the variable inside *this*
+    /// store's record and is the user's spelling alone: a spelling is unique per
+    /// record, and an identity has to be unique per program. Assigned by the walk
+    /// the guard also reads ([`mutable_variable_paths`]).
+    carried: Option<VarPath>,
     /// The runtime key the variable's value lives under in the commit store map
     /// (`commit` stores only; `Value::Unit` for induction stores).
     runtime_key: Value,
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
-    /// The key's position in the writer's `writes` tuple: `__hist.k` projects
-    /// `.writes.(index)` off the store body stream (`Induction` stores).
-    index: usize,
+}
+
+impl KeyReadInfo {
     /// Whether the key's value carries forward across commit ticks that don't
-    /// write it (`commit` stores): `true` for a mutable variable (persistent value),
-    /// `false` for a reply tap (a per-commit event). See
-    /// [`StoreValueStream::carry_forward`].
-    carry_forward: bool,
+    /// write it (`commit` stores). See [`StoreValueStream::carry_forward`].
+    fn carry_forward(&self) -> bool {
+        self.carried.is_some()
+    }
+}
+
+impl StoreReadInfo {
+    /// This store's keys that carry state, each with the identity it carries it
+    /// under.
+    fn carried_keys(&self) -> impl Iterator<Item = (&VarPath, &KeyReadInfo)> {
+        self.keys
+            .values()
+            .filter_map(|k| k.carried.as_ref().map(|path| (path, k)))
+    }
 }
 
 /// A built transactional store, registered under its `__hist` binder so each
 /// per-variable read (`__hist.k`) can branch the shared fan and project key
 /// `k`. The scalar-read reduction (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
+#[derive(Clone)]
 struct StoreReadInfo {
+    /// The [`content_hash`] of the `Transact` node this store was built from, in
+    /// the version that built it. Compared against the next version's sites to
+    /// tell an edited site from one whose state has moved — see [`site_moved`].
+    site: ContentHash,
     /// The cyclic store fan — a [`FanOut`] over the store body stream; every
     /// read is a branch of this one fan.
     fan: Rc<FanOut>,
@@ -387,15 +382,191 @@ pub struct OpConversionContext {
     /// Variable bindings in scope, innermost scope last.  Each binding
     /// carries a [`BindingKind`] so [`TypedExprNode::Var`] lookups can
     /// dispatch on it without inspecting tile-level types.
-    scopes: ScopeStack<Name, (Rc<FanOut>, BindingKind)>,
+    scopes: ScopeStack<Name, LetBinding>,
+    /// What the version this one replaces left behind, to be kept where the
+    /// computation is unchanged. Consulted at every `Let` binding
+    /// ([`bind_let`](Self::bind_let)), every store
+    /// ([`bind_store`](Self::bind_store)) and every iteration input
+    /// ([`iteration_input`](Self::iteration_input)); empty for a program's first
+    /// compilation.
+    inherited: Inheritance,
+    /// What this compilation binds, for the version that replaces it.
+    minted: Inheritance,
+    /// Where each node of the tree being converted stood in the version this one
+    /// replaces. Empty for a program's first compilation, which keeps nothing.
+    correspondence: Correspondence,
+    /// The bindings this compilation built rather than kept, by binder name.
+    ///
+    /// What makes reuse hereditary. A term is eligible for reuse only when none
+    /// of the names free in it is here, so a kept operator is never left reading
+    /// a subgraph this compilation rebuilt. The node correspondence cannot answer
+    /// this on its own: it matches a term's free variables by spelling, so an
+    /// unchanged term can read a binding that changed.
+    ///
+    /// A binding is in here whenever its operator is new, which covers more than
+    /// an edited term: a binding under an iteration is always rebuilt, and so is
+    /// one the previous version did not have.
+    rebuilt: HashSet<Name>,
+    /// How much of the previous version's graph this compilation kept.
+    reuse: ReuseTally,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    /// Every mutable variable's identity, by the `Transact` node that declares
+    /// it, from [`mutable_variable_paths`] over the tree about to be converted.
+    /// Installed by [`set_var_paths`](Self::set_var_paths) before conversion
+    /// begins; empty for a context converting no `Transact`.
+    var_paths: HashMap<NodeId, Vec<VarPath>>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
     /// `let __hist = Transact{…}` builds the shared store once and mutable variables
     /// it here; each variable read `__hist.k` projects key `k` off the shared
     /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
     /// (unscoped) map suffices.
     transactional_stores: HashMap<Name, StoreReadInfo>,
+}
+
+/// What one compilation hands the version that replaces it: the operator behind
+/// every node it recorded one for, and the value each mutable variable was
+/// holding.
+///
+/// One type for both sides of the handover — what a compilation accumulates and
+/// what it inherits are the same thing.
+///
+/// It describes the running graph rather than the terms this compilation walked.
+/// The two differ wherever a binding is kept, since keeping one does not walk the
+/// bound term and so reaches no [`bind_store`](OpConversionContext::bind_store)
+/// below it; [`keep_region`](OpConversionContext::keep_region) is what puts such
+/// a store in the handover anyway.
+///
+/// Every consumer reads it as the running graph:
+/// [`live_state`](OpConversionContext::live_state) takes a value off each store,
+/// [`state_conflicts`](OpConversionContext::state_conflicts) guards each
+/// variable, and the next compilation keeps from it.
+#[derive(Default)]
+pub struct Inheritance {
+    /// What the graph holds, by the node it was built from.
+    entries: HashMap<NodeId, Recorded>,
+    /// The value each mutable variable hands to the variable that replaces it, by
+    /// identity. Read off `stores` at handover
+    /// ([`OpConversionContext::into_inheritance`]), so the copy a compilation is
+    /// still accumulating into carries none — only the one it hands on.
+    ///
+    /// A value and nothing else. Where the recurrence had reached is a property
+    /// of the input it was reading rather than of the variable, and the update
+    /// carries that input across itself
+    /// ([`OpConversionContext::iteration_input`]), so a position travelling here
+    /// would be a second, independently-derived answer to a question the graph
+    /// already answers.
+    mutable_state: HashMap<VarPath, Value>,
+}
+
+impl Inheritance {
+    /// Every `Transact` store the graph holds. The handover is one map over all
+    /// three reuse sites, and a store is the one entry a reader projects.
+    fn stores(&self) -> impl Iterator<Item = &StoreReadInfo> {
+        self.entries.values().filter_map(|e| match e {
+            Recorded::Store(info) => Some(info),
+            Recorded::Operator(_) => None,
+        })
+    }
+}
+
+/// Where each node of the tree being converted stood in the version it replaces.
+///
+/// A node is the identity an operator is kept under. Conversion records what it
+/// built for a node under that node, and the next version looks its own nodes up
+/// through this map — so an operator is kept exactly where the two versions'
+/// trees correspond and the computation is unchanged.
+///
+/// Only [`Content::Same`](crate::ccl::diff::Content::Same) correspondences are
+/// recorded, which is what makes one direction enough. A `Same` node's whole
+/// subtree is `Same` (`src/ccl/design/diffing.md`, "The actionable form:
+/// divergences and shared roots"), so a kept region's nodes stand one-for-one
+/// against the previous version's and every node inside one can be looked up
+/// here — see [`keep_region`](OpConversionContext::keep_region).
+#[derive(Default)]
+pub struct Correspondence {
+    previous: HashMap<NodeId, NodeId>,
+}
+
+impl Correspondence {
+    /// The unchanged correspondences of `diff`, whose `dst` is the tree about to
+    /// be converted.
+    fn of(diff: &Diff<'_>) -> Self {
+        Self {
+            previous: diff
+                .shared()
+                .map(|m| (m.dst.node_id(), m.src.node_id()))
+                .collect(),
+        }
+    }
+
+    /// The node `node` replaces, when the two versions compute the same thing
+    /// there.
+    fn previous(&self, node: NodeId) -> Option<NodeId> {
+        self.previous.get(&node).copied()
+    }
+}
+
+/// What the graph holds at one node.
+///
+/// One type for all three reuse sites, and a sum because a node is one thing or
+/// the other: `bind_store` is reached exactly when the bound term is a
+/// `Transact` and `bind_let` otherwise, so a store's reads and a bare operator
+/// never both sit at a node. Two maps keyed the same way, one per site shape, is
+/// what this replaces; they meant every traversal was written twice and every
+/// field added to one had to be remembered for the other.
+///
+/// Keeping the entry keeps the whole subgraph under it. What that subgraph holds
+/// is not recorded here: the region corresponds node-for-node, so
+/// [`keep_region`](OpConversionContext::keep_region) finds it by walking the
+/// tree.
+#[derive(Clone)]
+enum Recorded {
+    /// A `Let` binding's operator, or a writer's iteration input.
+    Operator(Rc<FanOut>),
+    /// A `Transact` store, which every mutable-variable read projects.
+    Store(StoreReadInfo),
+}
+
+impl Recorded {
+    /// The fan-out every use of this node branches off. A store's is its own
+    /// cyclic fan, which is why the two arms are not a fan plus a payload.
+    fn fan(&self) -> &Rc<FanOut> {
+        match self {
+            Recorded::Operator(fan) => fan,
+            Recorded::Store(info) => &info.fan,
+        }
+    }
+}
+
+/// What a recurrence iterates: the operator, and the first position it will
+/// offer.
+///
+/// The two travel together because a position number means nothing without the
+/// input it counts in. A drive told to start below what its input still offers
+/// waits for an element that has gone; told to start above, it skips one nothing
+/// has decided.
+struct IterationInput {
+    op: Box<dyn TileOperator>,
+    first_position: usize,
+}
+
+/// How much of the previous version's graph a compilation kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReuseTally {
+    /// Bindings, stores and iteration inputs taken from the previous version
+    /// rather than built.
+    pub kept: usize,
+    /// Bindings, stores and iteration inputs bound in total.
+    pub bound: usize,
+}
+
+/// One `Let` binding in scope during conversion.
+pub(crate) struct LetBinding {
+    /// The fan-out every use of the binding branches off.
+    pub(crate) fan: Rc<FanOut>,
+    /// Whether the binding was compiled inside an iteration scope.
+    pub(crate) kind: BindingKind,
 }
 
 /// RAII scope guard for [`TileCompileContext`].
@@ -432,7 +603,26 @@ impl OpConversionContext {
         Self::default()
     }
 
-    /// Mutable variable a data-source implementation under `name`.
+    /// Install the identities the tree about to be converted declares.
+    ///
+    /// Read off the tree once, before conversion, so a store is built under the
+    /// identity the guard checked it against rather than under a second
+    /// derivation of one.
+    pub fn set_var_paths(&mut self, expr: &Expr) {
+        self.var_paths = mutable_variable_paths(expr);
+    }
+
+    /// Install where each node of the tree about to be converted stood in the
+    /// version it replaces, from the structural diff of the two trees.
+    ///
+    /// Conversion keeps an operator where the node it is converting corresponds
+    /// to one the running graph was built from — see [`Correspondence`]. Called
+    /// once, before conversion begins, and not at all for a first compilation.
+    pub fn set_correspondence(&mut self, diff: &Diff<'_>) {
+        self.correspondence = Correspondence::of(diff);
+    }
+
+    /// Register a data-source implementation under `name`.
     ///
     /// After registration, [`Type::DataSource`] resolves to
     /// [`Extent::DataSourceDomain`] in [`Self::extent_of`].
@@ -465,24 +655,464 @@ impl OpConversionContext {
         TileCompileContextGuard { ctx: self }
     }
 
-    /// Bind `name` to `binding` in the innermost scope.
-    ///
-    /// `kind` records whether the binding was compiled inside an iteration
-    /// scope ([`BindingKind::Aligned`]) or outside one ([`BindingKind::Free`]);
-    /// [`Self::lookup`] returns this alongside the [`FanOut`] so the
-    /// [`TypedExprNode::Var`] arm can dispatch without inspecting tile types.
-    pub(crate) fn bind(&mut self, name: &Name, binding: Rc<FanOut>, kind: BindingKind) {
-        self.scopes.bind(name.clone(), (binding, kind));
-    }
-
     /// Look up `name` from innermost scope outward.
-    pub(crate) fn lookup(&self, name: &Name) -> Option<&(Rc<FanOut>, BindingKind)> {
+    pub(crate) fn lookup(&self, name: &Name) -> Option<&LetBinding> {
         self.scopes.lookup(name)
     }
 
-    /// Mutable variable a built transactional store under its `__hist` binder.
-    fn register_store(&mut self, name: Name, info: StoreReadInfo) {
-        self.transactional_stores.insert(name, info);
+    /// Whether the operator behind `bound_expr` may be kept — that is, whether
+    /// every binding it reads is still the previous version's.
+    ///
+    /// The correspondence says the term is unchanged, which is not enough on its
+    /// own: a term's free variables are matched by spelling, so an unchanged term
+    /// can read a binding this compilation rebuilt, and keeping the operator
+    /// above it would leave it reading the retired version's subgraph.
+    ///
+    /// See [`rebuilt`](Self::rebuilt). Bindings are bound in dependency order, so
+    /// checking the names free in one term is transitive: a binding that reads a
+    /// rebuilt one is itself recorded as rebuilt.
+    fn reads_only_kept(&self, bound_expr: &Expr) -> bool {
+        self.rebuilt.is_empty()
+            || free_names(bound_expr)
+                .iter()
+                .all(|name| !self.rebuilt.contains(name))
+    }
+
+    /// Build the store `bound_expr` describes, or keep the one the previous
+    /// version built at the node it corresponds to, and register it under `name`.
+    ///
+    /// The store-shaped counterpart of [`bind_let`](Self::bind_let), and reuse
+    /// matters more here than anywhere else: the store *is* the program's
+    /// mutable state, so keeping one is what carries an accumulator across an
+    /// update.
+    fn bind_store(
+        &mut self,
+        name: &Name,
+        bound_expr: &Expr,
+        keys: &[TransactKey],
+        writers: &[WriterSite],
+        domain: &Type,
+    ) -> Result<(), ConversionError> {
+        let node = bound_expr.node_id();
+        self.reuse.bound += 1;
+        // The identities the guard checked this version against, for the store
+        // about to be built. Assigned by one walk of the planned tree
+        // ([`mutable_variable_paths`]) rather than derived here, so a variable is
+        // built under the identity it was checked under.
+        let paths = self
+            .var_paths
+            .get(&bound_expr.node_id())
+            .cloned()
+            .unwrap_or_default();
+        debug_assert_eq!(
+            paths.len(),
+            keys.len(),
+            "the identity walk and conversion disagree about how many variables this store declares"
+        );
+
+        let keepable = self
+            .reads_only_kept(bound_expr)
+            .then(|| self.keepable(bound_expr, false))
+            .flatten();
+        let info = match keepable {
+            Some(Recorded::Store(info)) => {
+                self.reuse.kept += 1;
+                trace!("keeping store for binding {name}");
+                // The store's own iteration inputs stay in the running graph and
+                // this compilation does not walk to them, so they are re-recorded
+                // here rather than at `iteration_input`.
+                self.keep_region(bound_expr, &info.fan);
+                info
+            }
+            Some(Recorded::Operator(_)) => unreachable!(
+                "a `Transact` node's entry is a store: `bind_store` is the only site that \
+records one and the only site a `Transact` reaches"
+            ),
+            None => {
+                trace!("building store for binding {name}");
+                self.rebuilt.insert(name.clone());
+                build_transact_store(keys, writers, domain, &paths, self)?
+            }
+        };
+        let info = StoreReadInfo {
+            // The site of the version minting this store, kept or rebuilt, so the
+            // next version compares against where its state actually sits.
+            site: content_hash(bound_expr),
+            ..info
+        };
+        self.record(node, Recorded::Store(info.clone()));
+        self.transactional_stores.insert(name.clone(), info);
+        Ok(())
+    }
+
+    /// Compile `bound_expr` into the fan-out its uses branch off, reusing the
+    /// operator a previous version built for the same computation where there is
+    /// one, and bind it to `name`.
+    ///
+    /// A `Let` is the reuse boundary because it is already the sharing boundary:
+    /// the fan-out and [`Memo`] a binding compiles to are what let several uses
+    /// draw on one operator, and a new version's use is just one more. A late
+    /// branch does not re-subscribe upstream — it pulls the same `MemoProducer`,
+    /// so a reused operator hands the new version whatever it still holds.
+    ///
+    /// What it still holds is not everything it ever produced. A `Memo` drops
+    /// what its consumers release, so what a new version inherits is bounded by
+    /// what the retired one had finished with, and the new subscriber's release
+    /// guard starts at what the fan-out has already released. A binding released
+    /// in full is not kept at all ([`keepable`](Self::keepable)).
+    ///
+    /// Reuse is declined for a binding compiled under an iteration
+    /// ([`BindingKind::Aligned`]). Such an operator is parameterized by the
+    /// iteration input threaded into it, which the node does not name; keeping it
+    /// would keep the input the previous version supplied.
+    fn bind_let(
+        &mut self,
+        name: &Name,
+        bound_expr: &Expr,
+        bound_input: Option<Box<dyn TileOperator>>,
+    ) -> Result<(), ConversionError> {
+        let kind = if bound_input.is_some() {
+            BindingKind::Aligned
+        } else {
+            BindingKind::Free
+        };
+        let node = bound_expr.node_id();
+        self.reuse.bound += 1;
+        let keepable = (kind == BindingKind::Free && self.reads_only_kept(bound_expr))
+            .then(|| self.keepable(bound_expr, false))
+            .flatten();
+        if let Some(entry) = keepable {
+            self.reuse.kept += 1;
+            trace!("keeping operator for binding {name}");
+            // What is under this binding stays in the running graph, and this
+            // compilation does not walk to it, so it is re-recorded here rather
+            // than where it was first bound.
+            self.keep_region(bound_expr, entry.fan());
+            let fan = entry.fan().clone();
+            self.record(node, entry);
+            self.scopes.bind(name.clone(), LetBinding { fan, kind });
+            return Ok(());
+        }
+
+        // `bound_expr` is compiled unconditionally — whether or not the body
+        // references the binding.  This is why `planning` must make every
+        // function-typed bound expr iteration-bearing: an unused,
+        // non-iteration-bearing function-typed binding would otherwise reach an
+        // `input=None` arm here and error.  It also means a dead iterable
+        // binding is materialised rather than dropped; #232 tracks making
+        // iteration use-driven (lazy `Let` compilation / DCE) so this eager
+        // compile is no longer forced.
+        trace!("building operator for binding {name}");
+        self.rebuilt.insert(name.clone());
+        let bound_op = convert_impl(bound_expr, bound_input, self)?;
+        let fan = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
+        // An `Aligned` operator is offered to the next version even though it
+        // will not be kept: the offer is keyed by the node, and declining is the
+        // reader's decision, made where the operator would be taken.
+        self.record(node, Recorded::Operator(fan.clone()));
+        self.scopes.bind(name.clone(), LetBinding { fan, kind });
+        Ok(())
+    }
+
+    /// The operator the previous version bound at the node `term` corresponds to,
+    /// or `None` when there is none to take.
+    ///
+    /// Declines one whose subscribers released it in full. Such an operator has
+    /// told its input that nothing will be read again and a [`Memo`] input drops
+    /// what it holds in response, so it can only answer empty and keeping it
+    /// would bind a name to nothing ([`FanOut::released_in_full`]).
+    ///
+    /// An iteration input is the exception, and passes `released_in_full_is_fine`:
+    /// released in full is what a finished collection looks like. The decline
+    /// happens where the operator would be taken rather than by withholding it
+    /// from the handover, because the handover is also the ledger
+    /// [`live_state`](Self::live_state) and
+    /// [`state_conflicts`](Self::state_conflicts) read: a store that can no
+    /// longer produce still holds the value its variables hand on.
+    fn keepable(&self, term: &Expr, released_in_full_is_fine: bool) -> Option<Recorded> {
+        self.inherited
+            .entries
+            .get(&self.correspondence.previous(term.node_id())?)
+            .filter(|e| released_in_full_is_fine || !e.fan().released_in_full())
+            .cloned()
+    }
+
+    /// The operator a recurrence iterates, and the first position it will offer:
+    /// `term` built behind a fan-out this compilation records, or a branch off
+    /// the fan-out the previous version recorded at the node `term` corresponds
+    /// to.
+    ///
+    /// `fresh_start` is where a freshly-built iteration begins, and the caller
+    /// picks it. An induction store passes [`source_start`], which is `0` for a
+    /// collection and a source's carried release for a source; a commit store
+    /// passes `0` throughout, because its drive attempts the lowest position the
+    /// source still offers rather than the one it is based at
+    /// ([`TransactDriver`](crate::interpreter::commit_operator::TransactDriver)).
+    ///
+    /// The seam a `Let` gets from being a sharing point, made available at a node
+    /// that is not one. A fan-out is what carries a producer across a version: it
+    /// owns the producer it subscribed and re-points the notification to the new
+    /// version's branch, which is why a producer cannot be moved between graphs
+    /// any other way — a producer's consumer is fixed at
+    /// [`subscribe`](TileOperator::subscribe) and a moved one would go on waking
+    /// the retired version's.
+    ///
+    /// Placed where a rebuild would lose progress that cannot be recomputed. An
+    /// iteration is that case: `IterateExtentProducer` holds the extent it has
+    /// left as an interval set that shrinks when a position is released, so how
+    /// far a drive has got through its source is in that producer and nowhere
+    /// else, and a rebuilt one offers every position again.
+    ///
+    /// Two things differ from [`bind_let`](Self::bind_let):
+    ///
+    /// - A released-in-full operator is taken rather than declined. Released in
+    ///   full is what a finished iteration looks like, and a branch off it yields
+    ///   nothing further, which is the state the drive is in. Declining it would
+    ///   restart the iteration.
+    /// - No [`Memo`] is interposed. One reader pulls this, so there is nothing to
+    ///   share, and a memo would drop what a full release told it to drop.
+    fn iteration_input(
+        &mut self,
+        term: &Expr,
+        fresh_start: usize,
+        build: impl FnOnce(&mut Self) -> Result<Box<dyn TileOperator>, ConversionError>,
+    ) -> Result<IterationInput, ConversionError> {
+        let node = term.node_id();
+        self.reuse.bound += 1;
+        // Reading a rebuilt binding makes the progress meaningless: the positions
+        // this got through are positions of something the update replaced.
+        if self.reads_only_kept(term)
+            && let Some(kept) = self.keepable(term, true)
+        {
+            self.reuse.kept += 1;
+            self.keep_region(term, kept.fan());
+            let fan = kept.fan().clone();
+            // Where the kept iteration has got to, read off the fan rather than
+            // carried alongside the values: what a recurrence may start on is a
+            // property of the input it reads, and the input is right here.
+            let first_position = fan.released_position().map_or(fresh_start, |p| p + 1);
+            trace!("keeping iteration operator: first_position={first_position}");
+            self.record(node, kept);
+            return Ok(IterationInput {
+                op: fan.branch(),
+                first_position,
+            });
+        }
+        let op = build(self)?;
+        let fan = Rc::new(FanOut::new(op));
+        self.record(node, Recorded::Operator(fan.clone()));
+        Ok(IterationInput {
+            op: fan.branch(),
+            first_position: fresh_start,
+        })
+    }
+
+    /// Record `entry` under `node` as this compilation's.
+    fn record(&mut self, node: NodeId, entry: Recorded) {
+        self.minted.entries.insert(node, entry);
+    }
+
+    /// Record everything the previous version holds inside `term` as this
+    /// compilation's own, and note the sources the region reads.
+    ///
+    /// Keeping an operator keeps the whole subgraph under it, and this
+    /// compilation does not walk into that subgraph, so nothing inside reaches
+    /// [`bind_let`](Self::bind_let), [`bind_store`](Self::bind_store) or
+    /// [`iteration_input`](Self::iteration_input) to be recorded — and the
+    /// version after this one would find nothing at those nodes.
+    ///
+    /// A source the region reads needs the same treatment for the same reason:
+    /// the `Source` arm of `convert_impl` is where a read is noted, and a kept
+    /// region never reaches it. The graph walk descends into the kept operators
+    /// regardless, so an unnoted read reaches
+    /// [`assert_graph_invariants`](crate::interpreter::operator_graph::assert_graph_invariants)
+    /// as an edge to a boundary node nothing minted.
+    ///
+    /// The region corresponds `Content::Same` throughout, so its nodes stand
+    /// one-for-one against the previous version's and what it holds is whatever
+    /// the previous version recorded at a corresponding node. Walking the tree
+    /// for that is what lets an entry carry no list of what sits under it: a list
+    /// has to be assembled at every bind site, kept in step with the map, and
+    /// re-keyed on the way across, and the omission of any one of those is
+    /// silent until the update after next.
+    ///
+    /// The kept operators are rowed here too, and for the same reason: nothing
+    /// mints them, so without a row they reach the `post-conversion` pane
+    /// unexplained — see
+    /// [`record_kept_operators`](crate::interpreter::operator_graph::record_kept_operators).
+    ///
+    /// The caller records the root. This records what is under it.
+    ///
+    /// `walk_children` visits a subset of the children the differ pairs — it
+    /// skips the predicates of a `Cast` target, which live in a `Type` — and that
+    /// is sound in both directions here: conversion discards a cast target
+    /// (`convert_impl`), so no entry is ever recorded inside one.
+    fn keep_region(&mut self, term: &Expr, kept: &Rc<FanOut>) {
+        kept.with_input(record_kept_operators);
+        fn nodes_below(e: &Expr, out: &mut Vec<NodeId>) {
+            e.walk_children(|child| {
+                out.push(child.node_id());
+                nodes_below(child, out);
+            });
+        }
+        fn source_reads<'a>(e: &'a Expr, out: &mut Vec<(&'a str, NodeId)>) {
+            if let TypedExprNode::Source(name) = &e.node {
+                out.push((name, e.node_id()));
+            }
+            e.walk_children(|child| source_reads(child, out));
+        }
+        let mut reads = Vec::new();
+        source_reads(term, &mut reads);
+        for (name, node) in reads {
+            record_source_read(name, node);
+        }
+
+        let mut below = Vec::new();
+        nodes_below(term, &mut below);
+        for node in below {
+            let Some(previous) = self.correspondence.previous(node) else {
+                debug_assert!(
+                    false,
+                    "a kept region corresponds `Content::Same` throughout, so every node \
+in it has a correspondent",
+                );
+                continue;
+            };
+            if let Some(entry) = self.inherited.entries.get(&previous).cloned() {
+                self.record(node, entry);
+            }
+        }
+    }
+
+    /// Every variable the running program holds that `planned` cannot take over.
+    ///
+    /// Checked before anything is torn down, so a version that would lose a
+    /// value or change its type is refused while the running program is whole.
+    /// A type change is refused rather than reseeded because the value would
+    /// become the seed of a store built for another shape, and the store fails
+    /// on its first pull rather than at the swap.
+    pub fn state_conflicts(&self, planned: &Expr) -> Vec<StateConflict> {
+        let declared = declared_state(planned);
+        let mut out = Vec::new();
+
+        for info in self.minted.stores() {
+            for (path, key) in info.carried_keys() {
+                let Some(decl) = declared.get(path) else {
+                    out.push(StateConflict::Dropped { path: path.clone() });
+                    continue;
+                };
+                // A declared type the conversion context cannot resolve to an
+                // extent is a compile error the real compile will raise with its
+                // own diagnostic; this check has nothing to add.
+                let Ok(extent) = self.extent_of(&decl.ty) else {
+                    continue;
+                };
+                if extent != key.value_extent {
+                    out.push(StateConflict::Retyped {
+                        path: path.clone(),
+                        held: key.value_extent.clone(),
+                        declared: extent,
+                    });
+                }
+                if let Some(now) = site_moved(path, info.site, &declared) {
+                    out.push(StateConflict::Moved {
+                        path: path.clone(),
+                        now,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The value each mutable variable currently holds, by the identity state is
+    /// carried under. Readable before the version is retired, so a replacement
+    /// can be checked against what it would inherit.
+    ///
+    /// A store [`state_conflicts`](Self::state_conflicts) treated as carryable is
+    /// skipped here only when it holds nothing, because a store with a value that
+    /// this drops is the one outcome the guard exists to prevent: the replacement
+    /// reseeds from the init, the program carries on answering, and only the
+    /// history is gone. So the absent cached tile is an assertion — a store's fan
+    /// is always cyclic ([`FanOut::new_cyclic`]) and a cyclic fan always has one —
+    /// while the two ways of holding nothing are ordinary cases: a store that has
+    /// decided no position has no frontier, and a variable no position has written
+    /// has no value at the frontier. Either way its replacement reads its init,
+    /// which is what it would have read anyway.
+    pub(crate) fn live_state(&self) -> HashMap<VarPath, Value> {
+        let mut out: HashMap<VarPath, Value> = HashMap::new();
+        for info in self.minted.stores() {
+            let Some(tile) = info.fan.cached_tile() else {
+                debug_assert!(
+                    false,
+                    "a store's fan is cyclic, so it has a cached tile: {:?}",
+                    info.keys.keys().collect::<Vec<_>>()
+                );
+                continue;
+            };
+            // No frontier means no position has been decided, so there is no
+            // accumulated value to hand over and nothing is lost by starting the
+            // replacement at its init.
+            let Some(frontier) = store_frontier(&tile) else {
+                continue;
+            };
+            for (path, key) in info.carried_keys() {
+                if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
+                    let prior = out.insert(path.clone(), value);
+                    debug_assert!(
+                        prior.is_none(),
+                        "{path} is declared by two stores, so the walk that assigns \
+identities is not distinguishing them",
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Everything the running graph holds: its bindings and stores, and the
+    /// value each mutable variable is at.
+    ///
+    /// Reopens every fan first. A fan closes when its subscribers go, and this
+    /// version's are about to; a carried-forward one has to be open for the
+    /// replacement to subscribe to it.
+    ///
+    /// Hands on every entry, including ones whose subscribers released them in
+    /// full. Those can no longer produce, and [`keepable`](Self::keepable)
+    /// declines them for that reason at every site but an iteration input, but
+    /// the value a store's variables hand on is still readable off its fan.
+    pub fn into_inheritance(mut self) -> Inheritance {
+        for entry in self.minted.entries.values() {
+            entry.fan().reopen();
+        }
+        self.minted.mutable_state = self.live_state();
+        self.minted
+    }
+
+    /// Drop what the previous version offered and this compilation did not take.
+    ///
+    /// Called once conversion is over. Until then the offer holds every operator
+    /// the retired version built, including the ones this compilation rebuilt
+    /// instead — and an operator holds the producers beneath it, so a source's
+    /// release record for a producer nobody reads any more would go on
+    /// constraining what that source may drop. The records are handed back from
+    /// the producers' own `Drop`
+    /// ([`DataSourceDomainExtentImpl::retire_producer`](crate::interpreter::DataSourceDomainExtentImpl::retire_producer)),
+    /// so this is what makes them run. What was kept is unaffected: the
+    /// compilation that kept it holds its own reference.
+    pub fn release_inheritance(&mut self) {
+        self.inherited = Inheritance::default();
+    }
+
+    /// Seed this context with what a previous version bound.
+    pub fn inherit(&mut self, inheritance: Inheritance) {
+        self.inherited = inheritance;
+    }
+
+    /// How much of the previous version's graph this compilation kept. `0` kept
+    /// for a first compilation, which inherits nothing.
+    pub fn reuse(&self) -> ReuseTally {
+        self.reuse
     }
 
     /// Look up a transactional store by its `__hist` binder.
@@ -684,18 +1314,12 @@ fn convert_impl_inner(
             binding,
             bound_expr,
             body,
-        } => match compile_let_binding(expr.node_id(), binding, bound_expr, input, ctx)? {
-            LetBinding::Store { body_input } => convert_impl(body, body_input, ctx),
-            LetBinding::Bound {
-                fan_out,
-                kind,
-                body_input,
-            } => {
-                let mut scope = ctx.enter_scope();
-                scope.bind(&binding.name, fan_out, kind);
-                convert_impl(body, body_input, &mut scope)
-            }
-        },
+        } => {
+            let mut scope = ctx.enter_scope();
+            let body_input =
+                compile_let_binding(expr.node_id(), binding, bound_expr, input, &mut scope)?;
+            convert_impl(body, body_input, &mut scope)
+        }
 
         // const(c): maps every domain element to the constant value c.
         TypedExprNode::Apply { argument, function }
@@ -1267,9 +1891,9 @@ fn convert_impl_inner(
         }
 
         TypedExprNode::Var(name) => {
-            if let Some((fan_out, kind)) = ctx.lookup(name) {
-                let kind = *kind;
-                let op = fan_out.branch();
+            if let Some(binding) = ctx.lookup(name) {
+                let kind = binding.kind;
+                let op = binding.fan.branch();
                 // Aligned bindings already vary in lockstep with the
                 // surrounding iteration — return the FanOut branch directly.
                 // Free bindings are standalone functions; under an
@@ -1722,12 +2346,13 @@ fn build_transact_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
     domain: &Type,
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     if !matches!(domain, Type::Txn) {
-        return build_induction_store(keys, writers, ctx);
+        return build_induction_store(keys, writers, domain, paths, ctx);
     }
-    build_commit_store(keys, writers, ctx)
+    build_commit_store(keys, writers, paths, ctx)
 }
 
 /// The reply taps on a writer body's `` {`commit{writes, to_<defer>*} | `abort} ``
@@ -1771,7 +2396,11 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// so it occupies the single key `` `reg(unit) ``. The tag is what keeps one
 /// mutable variable's keys disjoint from another's — without it a keyed mutable variable holding
 /// the string `"pool"` would alias the scalar mutable variable spelled `pool`.
-fn store_key(reg: &str, at: Value) -> Value {
+///
+/// The tag is also the name a decision's write set is keyed by, which `body_decision_at`
+/// reads back — so the engine's own tests build their keys here rather than restating
+/// the shape.
+pub(crate) fn store_key(reg: &str, at: Value) -> Value {
     Value::Union {
         tag: FieldKey::Name(reg.into()),
         inner: Box::new(at),
@@ -1804,6 +2433,7 @@ fn store_key_extent(arms: Vec<(String, Extent)>) -> Extent {
 fn build_commit_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     // Each variable becomes an arm of the store's key space, tagged by its
@@ -1842,23 +2472,34 @@ fn build_commit_store(
     // homogeneous store collapses the union to its single extent (the common
     // case, unchanged).
     let mut value_extents: Vec<Extent> = Vec::new();
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let runtime_key = store_key(&field, Value::Unit);
         let key_value_extent = ctx.extent_of(&k.init.ty)?;
         if !value_extents.contains(&key_value_extent) {
             value_extents.push(key_value_extent.clone());
         }
-        // Seed tick 0 from the key's (literal or computed) init op.
-        let init_op = convert_impl(&k.init, None, ctx)?;
+        // Seed tick 0 from the value the retired version left this variable
+        // holding, or from the key's (literal or computed) init op when this
+        // version introduces it. Rebuilding a commit store therefore changes how
+        // a transaction decides without discarding what it has committed — the
+        // same rule the induction path follows, and the reason state is keyed by
+        // variable rather than by store.
+        let carried = ctx.inherited.mutable_state.get(&paths[i]);
+        let init_op: Box<dyn TileOperator> = match carried {
+            Some(carried) => {
+                trace!("resuming transactional {field} from the retired version's value");
+                Box::new(Constant::new(carried.clone(), key_value_extent.clone()))
+            }
+            None => convert_impl(&k.init, None, ctx)?,
+        };
         init_ops.push((runtime_key.clone(), init_op));
         let prior = keys_map.insert(
             field,
             KeyReadInfo {
+                carried: Some(paths[i].clone()),
                 runtime_key,
                 value_extent: key_value_extent,
-                index: 0,            // unused for `commit` reads (keyed by `runtime_key`)
-                carry_forward: true, // mutable variable: value persists across commits
             },
         );
         debug_assert!(
@@ -1918,7 +2559,16 @@ fn build_commit_store(
             ))
         })?;
         let item_extent = ctx.extent_of(&item_ty)?;
-        let source_op = convert_impl(&w.source, None, ctx)?;
+        // A drive counts commits against the positions its source offers, so
+        // where it starts is whatever the source it is handed still has. A source
+        // this version keeps has already passed some of them. A freshly-built one
+        // starts at `0` whatever the source has done: this drive finds its next
+        // item by scanning up from its cursor, so an advanced source costs it a
+        // comparison, where the induction drive's window would stall.
+        let IterationInput {
+            op: source_op,
+            first_position: drive_resume,
+        } = ctx.iteration_input(&w.source, 0, |ctx| convert_impl(&w.source, None, ctx))?;
         // The body's input is the driver's tile, `(snap_{k₀}, …, item)`; the
         // snapshot columns carry each read key's per-commit value extent.
         let read_extents: Vec<Extent> = w
@@ -1934,11 +2584,14 @@ fn build_commit_store(
             })
             .collect::<Result<_, _>>()?;
         let driver = TransactDriver::new(
-            store_fan.branch(),
+            // The driver is placed inside this store by `set_writer` below, so
+            // its read of the store is a recurrence rather than a reader.
+            store_fan.recurrence_branch(),
             source_op,
             w.read_keys.iter().map(runtime_key).collect(),
             read_extents,
             item_extent,
+            drive_resume,
         );
         // Two branches of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver advances its item cursor on the release
@@ -1959,13 +2612,14 @@ fn build_commit_store(
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
-                    runtime_key: store_key(&field, Value::Unit),
-                    value_extent: tap_value_extent,
-                    index: 0, // unused for `commit` reads (keyed by `runtime_key`)
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
-                    // taps to one defer don't smear across the shared clock.
-                    carry_forward: false,
+                    // taps to one defer don't smear across the shared clock. It
+                    // carries nothing between ticks and so nothing between
+                    // versions.
+                    carried: None,
+                    runtime_key: store_key(&field, Value::Unit),
+                    value_extent: tap_value_extent,
                 },
             );
             // A tap shares this map with the mutable-variable keys, so its
@@ -1978,7 +2632,9 @@ fn build_commit_store(
             tap_fields.push(field);
         }
         let writer = CommitWriter::new(
-            store_fan.branch(),
+            // The writer *is* this store's input, so its read of the store is a
+            // recurrence. `driver_fan` is a sibling, and held as a reader.
+            store_fan.recurrence_branch(),
             body_op,
             driver_fan.branch(),
             w.read_keys.iter().map(runtime_key).collect(),
@@ -1995,6 +2651,8 @@ fn build_commit_store(
         keys: keys_map,
         kind: StoreReadKind::Commit,
         induction_extent: None,
+        // Set by `bind_store`, which is what knows the store's identity.
+        site: ContentHash(0),
     })
 }
 
@@ -2010,6 +2668,297 @@ fn induction_extent_is_positional(extent: &Extent) -> bool {
     matches!(extent, Extent::UIntRange(_) | Extent::DataSourceDomain(_))
 }
 
+/// A mutable variable's identity across versions of a program.
+///
+/// The spelling carries the meaning and the index only disambiguates, because a
+/// spelling is not unique on its own: a declaration can be shadowed, and a
+/// function holding a whole stateful loop declares one variable per call site
+/// once inlining has cloned its body. Neither of those has a name of its own to
+/// borrow, so the index is what tells them apart.
+///
+/// The address is the source's own: the bindings whose definitions enclose the
+/// declaration, then the spelling. `a = count_by(src, 1)` and
+/// `z = count_by(src, 10)` inline to two `Transact`s under the definitions of `a`
+/// and `z`, so the two variables spelled `n` are `a`.`n` and `z`.`n` — distinct
+/// without either of them having to be counted. Reordering the two bindings, or
+/// adding a third, moves neither address.
+///
+/// Only a binder the author wrote enters the chain
+/// ([`Name::source_spelling`]). A minted one is named by a uid whose value
+/// depends on how many the passes before it minted, and the bindings a pass
+/// interposes are not something the source says, so neither addresses anything
+/// two versions of a program agree on.
+///
+/// The index counts among the variables sharing *both* the chain and the
+/// spelling, which is only ever more than one where the source supplies no name
+/// to tell them apart: two anonymous call sites of one stateful function in one
+/// expression. An edit to either body leaves the index alone. Reordering them,
+/// or inserting a third ahead, moves it — and that update is refused rather than
+/// carried onto the wrong variable, which is [`site_moved`]'s job.
+///
+/// This is not derived from anything the program computes. Two instantiations of
+/// one function can differ only in their writer bodies once arguments are
+/// substituted, so any content-derived identity either fails to tell them apart
+/// or changes under exactly the edit state has to survive. Content still decides
+/// whether a *site* is the one that held a value, which is a narrower question
+/// than which variable a value belongs to — see [`site_moved`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VarPath {
+    /// The bindings whose definitions enclose the declaration, outermost first.
+    chain: Vec<String>,
+    /// The variable's own spelling — [`Name::field_key`].
+    name: String,
+    /// Its position among the variables sharing this chain and this spelling.
+    index: usize,
+}
+
+impl std::fmt::Display for VarPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Qualified the way the source reads, and the index only when it is
+        // doing work: an author recognizes ``a`.`n`` where ``n` (#0)`` says
+        // nothing, so the suffix appears only once a second variable needs it.
+        for binding in &self.chain {
+            write!(f, "`{binding}`.")?;
+        }
+        write!(f, "`{}`", self.name)?;
+        if self.index > 0 {
+            write!(f, " (#{})", self.index)?;
+        }
+        Ok(())
+    }
+}
+
+/// The first position the source `domain` names will offer a producer registering
+/// now, or `0` for a domain that is not a source.
+fn source_start(domain: &Type, ctx: &OpConversionContext) -> usize {
+    let Type::DataSource(name) = domain else {
+        return 0;
+    };
+    ctx.sources.get(name).map_or(0, |source| {
+        source.borrow().first_position_for_a_new_producer()
+    })
+}
+
+/// Every mutable variable `expr` declares, by identity, with the type it is
+/// declared at.
+///
+/// One walk, shared by the guard and by conversion, so the identity a version is
+/// checked against is the identity its stores are built under. Deriving it twice
+/// would mean two computations that have to agree, and a disagreement reads as a
+/// variable that is still declared having been dropped.
+pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
+    let mut out = HashMap::new();
+    for v in mutable_variables(expr) {
+        out.insert(
+            v.path,
+            DeclaredVariable {
+                ty: v.key.init.ty.clone(),
+                site: v.site,
+            },
+        );
+    }
+    out
+}
+
+/// The variable `site` declares in the new version, when that is not `path`.
+///
+/// A variable is named by the bindings enclosing its declaration, its spelling,
+/// and — where the source supplies no name to tell two sibling declarations
+/// apart — its position among them. The position is what two anonymous call
+/// sites of one stateful function come down to, and it moves when they are
+/// reordered or one is inserted ahead of another, taking each variable's value
+/// onto its neighbour.
+///
+/// The site's own content is what catches that. A site whose body an update
+/// edited is *gone* from the new version, so its variable stays where the
+/// position puts it and the edit carries as it should. A site still present
+/// under a different variable is the other case: the source has two
+/// interchangeable positions and has moved the state between them, which nothing
+/// here can follow, so the update is refused rather than carried wrong.
+///
+/// Two limits, both of which fall back on the position rather than misreporting:
+///
+/// - Sites that hash equal are the same computation reading the same spellings,
+///   so which of them holds which value does not matter. This returns `None` for
+///   them, and the update is accepted.
+/// - A reorder that also edits both bodies leaves neither site present, so it
+///   reads as two edits and the position decides. That is the one shape this does
+///   not address.
+fn site_moved(
+    path: &VarPath,
+    site: ContentHash,
+    declared: &HashMap<VarPath, DeclaredVariable>,
+) -> Option<VarPath> {
+    if declared.get(path).is_some_and(|d| d.site == site) {
+        return None;
+    }
+    declared
+        .iter()
+        .find(|(other, d)| *other != path && d.site == site)
+        .map(|(other, _)| other.clone())
+}
+
+/// What a version declares a mutable variable as — enough to decide whether the
+/// running program's value can be seeded into it.
+pub struct DeclaredVariable {
+    ty: Type,
+    /// The declaring site's [`content_hash`], as [`MutableVariable::site`].
+    site: ContentHash,
+}
+
+/// Every mutable variable's identity, in key order, by the `Transact` node that
+/// declares it.
+///
+/// Handed to conversion so that a store is built under the identities the guard
+/// checked, rather than under a second derivation of them.
+pub fn mutable_variable_paths(expr: &Expr) -> HashMap<NodeId, Vec<VarPath>> {
+    let mut out: HashMap<NodeId, Vec<VarPath>> = HashMap::new();
+    for v in mutable_variables(expr) {
+        out.entry(v.declared_by).or_default().push(v.path);
+    }
+    out
+}
+
+/// One mutable variable as the identity walk sees it.
+struct MutableVariable<'e> {
+    path: VarPath,
+    key: &'e TransactKey,
+    /// The `Transact` node declaring it, so conversion can ask for the identities
+    /// of the store it is building.
+    declared_by: NodeId,
+    /// That node's [`content_hash`] — free variables by spelling, so the same
+    /// site hashes the same in either version. Not an identity: a site whose body
+    /// an update edits hashes differently, which is why the chain and the index
+    /// name a variable and this only says whether two versions' sites are the
+    /// same one. See [`site_moved`].
+    site: ContentHash,
+}
+
+/// Every mutable variable in `expr`, in tree order, with its identity.
+///
+/// The one place identities are assigned. `Transact` is the only node that
+/// declares a mutable variable, so the walk is over those.
+fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
+    type Counts = HashMap<(Vec<String>, String), usize>;
+
+    fn go<'e>(
+        e: &'e Expr,
+        chain: &mut Vec<String>,
+        counts: &mut Counts,
+        out: &mut Vec<MutableVariable<'e>>,
+    ) {
+        if let TypedExprNode::Transact { keys, .. } = &e.node {
+            // One hash per `Transact`, shared by every key it declares: the site
+            // is the node, not the key.
+            let site = content_hash(e);
+            for k in keys {
+                let name = k.name.field_key();
+                let index = counts.entry((chain.clone(), name.clone())).or_insert(0);
+                out.push(MutableVariable {
+                    path: VarPath {
+                        chain: chain.clone(),
+                        name,
+                        index: *index,
+                    },
+                    key: k,
+                    declared_by: e.node_id(),
+                    site,
+                });
+                *index += 1;
+            }
+        }
+        // A binding's definition is an address the source names, so a `Transact`
+        // inside one is addressed under that name. The binding's *body* is not:
+        // what the body declares belongs to the enclosing chain. `walk_children`
+        // visits exactly these two children for both node kinds.
+        let binding_parts = match &e.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => Some((binding, bound_expr.as_ref(), body.as_ref())),
+            TypedExprNode::MutDecl {
+                binding,
+                init,
+                body,
+            } => Some((binding, init.as_ref(), body.as_ref())),
+            _ => None,
+        };
+        match binding_parts {
+            Some((binding, definition, body)) => {
+                let named = binding.name.source_spelling().map(str::to_string);
+                if let Some(spelling) = named.clone() {
+                    chain.push(spelling);
+                }
+                go(definition, chain, counts, out);
+                if named.is_some() {
+                    chain.pop();
+                }
+                go(body, chain, counts, out);
+            }
+            None => e.walk_children(|c| go(c, chain, counts, out)),
+        }
+    }
+
+    let mut chain = Vec::new();
+    let mut counts = Counts::new();
+    let mut out = Vec::new();
+    go(expr, &mut chain, &mut counts, &mut out);
+    out
+}
+
+/// A variable the running program is holding that a new version cannot take
+/// over.
+///
+/// Both shapes are about the *value* having nowhere to go. A variable whose
+/// recurrence now reads something else is not one of them: the value seeds and
+/// the position restarts, since a position only means something in the domain it
+/// was counted in.
+#[derive(Debug)]
+pub enum StateConflict {
+    /// The new version does not declare it, so its value has nowhere to be
+    /// seeded and would be discarded.
+    Dropped { path: VarPath },
+    /// The new version declares it at a different type. Its value cannot be the
+    /// seed of a store that expects another shape: the store would be built
+    /// around a constant of the wrong extent and fail on its first pull.
+    Retyped {
+        path: VarPath,
+        held: Extent,
+        declared: Extent,
+    },
+    /// The site that declared it still exists in the new version, declaring a
+    /// different variable. See [`site_moved`].
+    Moved { path: VarPath, now: VarPath },
+}
+
+impl std::fmt::Display for StateConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateConflict::Dropped { path } => write!(f, "{path} is no longer declared"),
+            StateConflict::Retyped {
+                path,
+                held,
+                declared,
+            } => write!(f, "{path} is now {declared} rather than {held}"),
+            StateConflict::Moved { path, now } => {
+                // Both directions of a swap are conflicts and describe one thing,
+                // so they render identically and the caller's sort collapses them.
+                let (first, second) = if path <= now {
+                    (path, now)
+                } else {
+                    (now, path)
+                };
+                write!(
+                    f,
+                    "{first} and {second} are told apart only by where they appear, and this \
+                     version moves a value between them",
+                )
+            }
+        }
+    }
+}
+
 /// Build an induction-domain store (a `mut` loop). Every induction store — plain,
 /// conditional, or feed-carrying, over a finite or async extent — is single-writer
 /// (recognition folds a conditional write to one carry-complete writer), so this
@@ -2017,6 +2966,8 @@ fn induction_extent_is_positional(extent: &Extent) -> bool {
 fn build_induction_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
+    domain: &Type,
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let n_accs = keys.len();
@@ -2047,7 +2998,7 @@ fn build_induction_store(
         w.write_keys.len(),
         "the induction writer writes every accumulator key"
     );
-    build_induction_store_single(keys, w, ctx)
+    build_induction_store_single(keys, w, domain, paths, ctx)
 }
 
 /// Build a single-writer induction store as a position-driven [`InductionStore`]
@@ -2063,6 +3014,8 @@ fn build_induction_store(
 fn build_induction_store_single(
     keys: &[TransactKey],
     w: &WriterSite,
+    domain: &Type,
+    paths: &[VarPath],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let taps = body_tap_fields(&w.body.ty);
@@ -2074,6 +3027,7 @@ fn build_induction_store_single(
             .collect(),
     );
     let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
+    let domain = strip_refinements(domain);
 
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
@@ -2081,28 +3035,45 @@ fn build_induction_store_single(
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     let mut value_extents: Vec<Extent> = Vec::new();
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = store_key(&field, Value::Unit);
         let value_extent = ctx.extent_of(&k.init.ty)?;
         if !value_extents.contains(&value_extent) {
             value_extents.push(value_extent.clone());
         }
-        init_ops.push((rk.clone(), convert_impl(&k.init, None, ctx)?));
-        keys_map.insert(
-            field,
+        // A variable the replaced version was carrying resumes from the value it
+        // held; one this version introduces starts from the init it declares.
+        // Rebuilding a store therefore changes what the loop does next without
+        // discarding what it had accumulated, which is what distinguishes
+        // swapping the logic from recomputing the program.
+        let carried = ctx.inherited.mutable_state.get(&paths[i]);
+        let init_op: Box<dyn TileOperator> = match carried {
+            Some(carried) => {
+                trace!("resuming {field} from the retired version's value");
+                Box::new(Constant::new(carried.clone(), value_extent.clone()))
+            }
+            None => convert_impl(&k.init, None, ctx)?,
+        };
+        init_ops.push((rk.clone(), init_op));
+        let prior = keys_map.insert(
+            field.clone(),
             KeyReadInfo {
+                // An accumulator persists across positions. A literal init is the
+                // leading-carry fold default; a *conditional* single-writer loop
+                // does have leading carries (positions before the first
+                // committing write), and those read the accumulator's seed,
+                // supplied by the tick-0 init in `CommitEngine::new(inits)` — not
+                // this default, which anchors a computed-init empty fold.
+                carried: Some(paths[i].clone()),
                 runtime_key: rk,
                 value_extent,
-                index: 0, // unused: dense reads fold by runtime_key
-                carry_forward: true, // an accumulator persists across positions
-                          // A literal init is the leading-carry fold default. A
-                          // *conditional* single-writer loop does have leading carries
-                          // (positions before the first committing write); those read the
-                          // accumulator's seed, supplied by the tick-0 init in
-                          // `CommitEngine::new(inits)` — not this default, which anchors a
-                          // computed-init empty fold.
             },
+        );
+        debug_assert!(
+            prior.is_none(),
+            "two of this store's keys are labeled `{field}`, so one variable's read \
+resolves to the other's value",
         );
     }
 
@@ -2122,7 +3093,7 @@ fn build_induction_store_single(
             w.source.ty
         ))
     })?;
-    let induction_extent = ctx.extent_of(&crate::ccl::ccl_utils::strip_refinements(&raw_domain))?;
+    let induction_extent = ctx.extent_of(&strip_refinements(&raw_domain))?;
     // The recurrence is sequenced by `UInt` position end to end: the driver pairs
     // items with `UInt` domain keys, `CommitEngine` ticks are positions, and
     // `StoreDenseRead` folds tick `p + 1` at each. A product domain (a
@@ -2140,7 +3111,21 @@ fn build_induction_store_single(
              induction recurrence cannot sequence"
         )));
     }
-    let source_op = convert_impl(&w.source, None, ctx)?;
+    // Where this store's recurrence starts, which is wherever its source still
+    // offers positions. A source this version keeps has passed some of them
+    // already; a freshly-built iteration over a data source starts at the release
+    // that source carried forward ([`source_start`]), and one over a collection at
+    // `0`.
+    //
+    // Both the store's seed tick and the drive's window base come from this: a
+    // store based below every position its input will offer waits for an element
+    // that is not coming.
+    let IterationInput {
+        op: source_op,
+        first_position: resume_at,
+    } = ctx.iteration_input(&w.source, source_start(&domain, ctx), |ctx| {
+        convert_impl(&w.source, None, ctx)
+    })?;
     let read_extents: Vec<Extent> = w
         .read_keys
         .iter()
@@ -2159,8 +3144,8 @@ fn build_induction_store_single(
     // the same shape a commit writer carries (see `build_commit_store`). Each tap
     // becomes a write-only changelog key (appended after the accumulator keys), so
     // its per-position value rides the committing change and is read back densely.
-    // A tap is a per-position event, not a carried mutable variable (`carry_forward:
-    // false`): it appears only at the position that fired it. A tap holds
+    // A tap is a per-position event, not a carried mutable variable (`carried:
+    // None`): it appears only at the position that fired it. A tap holds
     // `` {`fired{𝑉} | `idle} ``, and the producer omits an `` `idle `` one from the
     // delta.
     let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
@@ -2168,14 +3153,21 @@ fn build_induction_store_single(
     for (field, tap_ty) in taps {
         let tap_value_extent = ctx.extent_of(&tap_ty)?;
         write_keys.push(store_key(&field, Value::Unit));
-        keys_map.insert(
+        let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
+                carried: None, // a tap fires only at its own position
                 runtime_key: store_key(&field, Value::Unit),
                 value_extent: tap_value_extent,
-                index: 0,             // unused: dense reads fold by runtime_key
-                carry_forward: false, // a tap fires only at its own position
             },
+        );
+        // A tap is minted into the double-underscore namespace
+        // ([`Name::defer_tap_field`]), so it cannot be an accumulator's spelling;
+        // this catches two taps landing on one field.
+        debug_assert!(
+            prior.is_none(),
+            "two of this store's keys are labeled `{field}`, so one read resolves \
+to the other's value",
         );
         tap_fields.push(field);
     }
@@ -2190,18 +3182,28 @@ fn build_induction_store_single(
     // all minted after the writer's own subexpressions have been converted, so
     // they attribute to the writer rather than to the enclosing binding.
     let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
-    let store = InductionStore::new(init_ops, write_keys, tap_fields, key_extent, value_extent);
+    let store = InductionStore::new(
+        init_ops,
+        write_keys,
+        tap_fields,
+        key_extent,
+        value_extent,
+        resume_at,
+    );
     let set_body = store.body_input_setter();
     // Cyclic: the driver reads this store's changelog back to recover each
     // position's previous accumulator, so one fan branch feeds the cycle and the
     // rest serve the downstream `__hist.k` dense reads.
     let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
     let driver = InductionDriver::new(
-        fan.branch(),
+        // The driver is placed inside this store by `set_body` below, so its
+        // read of the store's changelog is a recurrence rather than a reader.
+        fan.recurrence_branch(),
         source_op,
         w.read_keys.iter().map(runtime_key).collect(),
         read_extents,
         item_extent,
+        resume_at,
     );
     set_body(convert_impl(&w.body, Some(Box::new(driver)), ctx)?);
     Ok(StoreReadInfo {
@@ -2209,6 +3211,8 @@ fn build_induction_store_single(
         keys: keys_map,
         kind: StoreReadKind::InductionChangelog,
         induction_extent: Some(induction_extent),
+        // Set by `bind_store`, which is what knows the store's identity.
+        site: ContentHash(0),
     })
 }
 
@@ -2355,8 +3359,7 @@ fn convert_store_read(
             (
                 k.runtime_key.clone(),
                 k.value_extent.clone(),
-                k.index,
-                k.carry_forward,
+                k.carry_forward(),
             )
         });
         (
@@ -2376,14 +3379,9 @@ fn convert_store_read(
         // does — which is what makes `await_final(x)` independent of a store-mate
         // still committing. `final_or_default(stream, init)` then reduces it with
         // `ExtractFinal`, supplying the seed when the key was never written.
-        (StoreReadKind::Commit, Some((runtime_key, value_extent, _, carry_forward))) => {
-            Ok(Box::new(StoreValueStream::new(
-                fan.branch(),
-                runtime_key,
-                value_extent,
-                carry_forward,
-            )))
-        }
+        (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => Ok(Box::new(
+            StoreValueStream::new(fan.branch(), runtime_key, value_extent, carry_forward),
+        )),
         // An `InductionChangelog` key read off the changelog, folded at every
         // position of the loop extent via [`StoreDenseRead`] (an `IterateExtent(D)`
         // trigger + the store branch). An **accumulator** (`carry_forward: true`)
@@ -2394,10 +3392,7 @@ fn convert_store_read(
         // per-position value stream: only the positions where the tap fired
         // (its value present in that position's changelog delta), keyed by loop
         // position — the same `Fun(D, V)` the sink reads.
-        (
-            StoreReadKind::InductionChangelog,
-            Some((runtime_key, value_extent, _, carry_forward)),
-        ) => {
+        (StoreReadKind::InductionChangelog, Some((runtime_key, value_extent, carry_forward))) => {
             let extent = induction_extent.ok_or_else(|| {
                 ConversionError::Unsupported(format!(
                     "induction-changelog store {store_name} has no loop extent"

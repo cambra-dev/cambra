@@ -406,6 +406,10 @@ struct Boundaries {
     sources: Vec<(String, NodeId)>,
     /// Each compiled output field's node.
     sinks: Vec<(String, NodeId)>,
+    /// Operators this compile took from the version it replaces, already rowed
+    /// by [`record_kept_operators`]. One fan-out reaches several bindings, and a
+    /// second row for one id is a defect the table asserts on.
+    rowed_kept: std::collections::HashSet<NodeId>,
 }
 
 /// RAII installer for the per-compile boundary record.
@@ -532,6 +536,41 @@ fn walk_operator(
         kind: op.kind(),
         tiling: op.tiling().clone(),
         inputs,
+    });
+}
+
+/// Row every operator in `op`'s subgraph against the expression node whose
+/// recording is open.
+///
+/// A version replacing another keeps operators the previous compile built, ids
+/// and all ([`OpConversionContext::keep_region`]), and this compile never walks
+/// into one — so nothing mints them and they reach the `post-conversion` pane
+/// with no row. Rowing them here gives a kept operator the same attribution a
+/// rebuilt one gets: the binding it now sits at, in the program the user is
+/// running.
+///
+/// The descent is [`TileOperator::visit_inputs`], the same one
+/// [`BoundarySession::into_graph`] makes, so what is rowed is exactly what the
+/// pane will hold. A kept store has already been subscribed, so its body is out
+/// of reach of both walks alike.
+///
+/// [`OpConversionContext::keep_region`]: crate::interpreter::operator_conversion::OpConversionContext
+pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
+    let Some(id) = op.operator_id() else {
+        return;
+    };
+    let fresh = BOUNDARIES.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(boundaries) => boundaries.rowed_kept.insert(id),
+        None => false,
+    });
+    if !fresh {
+        return;
+    }
+    crate::ccl::provenance::on_mint(id);
+    op.visit_inputs(&mut |spec| {
+        if let InputTarget::Operator(child) = spec.target {
+            record_kept_operators(child);
+        }
     });
 }
 

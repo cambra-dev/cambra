@@ -52,6 +52,37 @@ pub enum Predicate {
 }
 
 impl Predicate {
+    /// The largest position this predicate covers, for a prefix-style release of
+    /// a monotone `UInt` domain — a commit clock or an iteration's positions.
+    ///
+    /// `None` for a predicate with no concrete upper bound (`True`, `False`,
+    /// non-`UInt`). `True` is the terminal release, after which the consumer
+    /// pulls no more, so there is no position to advance past.
+    pub fn max_released_position(&self) -> Option<usize> {
+        match self {
+            Predicate::LessThanEq(Value::UInt(k)) => Some(*k),
+            Predicate::Intervals(iset) => iset
+                .intervals()
+                .iter()
+                .filter_map(|iv| match iv.rval() {
+                    Some(&Value::UInt(k)) => Some(k),
+                    _ => None,
+                })
+                .max(),
+            Predicate::Or(arms) => arms
+                .iter()
+                .filter_map(Predicate::max_released_position)
+                .max(),
+            // A union's arms are tag-keyed, so they are walked by value rather
+            // than sharing the `Or` arm's positional vector.
+            Predicate::Union(arms) => arms
+                .values()
+                .filter_map(Predicate::max_released_position)
+                .max(),
+            _ => None,
+        }
+    }
+
     /// Builds a `Predicate` from a list of arms, flattening any nested `Or`
     /// variants.  Returns the single element directly when `arms` has length
     /// one to avoid gratuitous wrapping.

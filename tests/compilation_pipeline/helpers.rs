@@ -91,7 +91,7 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
         after.is_empty(),
         "pull after a universal release returned {after:?}"
     );
-    (compiled.ast, result)
+    (*compiled.ast, result)
 }
 
 // ---------------------------------------------------------------------------

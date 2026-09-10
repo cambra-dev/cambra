@@ -2416,10 +2416,11 @@ fn emit_transact_writer<C: Typing>(
     }
     let body_dom = accumulator_body_domain(snaps, item);
 
-    // Body codomain: `{commit: Bool, writes: Tuple(new_j…)}`, with `new_j` a
-    // fresh var bounded above by `write_keys[j]`'s value type. `writes` is a
-    // positional tuple built directly (not via `product`, whose empty case
-    // collapses to `Record([])`): even a single-key write set is `Tuple([_])`.
+    // One fresh `new_j` per write key, bounded above by `write_keys[j]`'s value
+    // type. They become the `writes: {k_j: new_j…}` field of the decision
+    // codomain below. The write set is keyed by the variable written, so a slot
+    // carries which variable it belongs to all the way to the store — see
+    // `src/ccl/design/mutability.md`.
     let mut new_tys: Vec<Type> = Vec::with_capacity(writer.write_keys.len());
     let mut news: Vec<(Type, Type)> = Vec::with_capacity(writer.write_keys.len());
     for wk in &writer.write_keys {
@@ -2433,7 +2434,7 @@ fn emit_transact_writer<C: Typing>(
         news.push((new, bound));
     }
     // Decision codomain: the variant `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense)
-    // payload record carrying at least `writes: Tuple(new_j…)` — the body's real
+    // payload record carrying at least `writes: {k_j: new_j…}` — the body's real
     // `commit` payload width-subtypes to it (its `to_<defer>` taps are extra
     // fields). Tag order is `commit`=0, `abort`=1, matching
     // `ccl_utils::decision_variant_ty` and the runtime `body_decision_at` decode;
@@ -2442,7 +2443,14 @@ fn emit_transact_writer<C: Typing>(
     let mut payload: BTreeMap<FieldKey, Type> = BTreeMap::new();
     payload.insert(
         FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
-        Type::Tuple(new_tys),
+        Type::Record(
+            writer
+                .write_keys
+                .iter()
+                .map(|wk| wk.field_key())
+                .zip(new_tys)
+                .collect(),
+        ),
     );
     let decision_codom = Type::variant(vec![
         (FieldKey::Name(SmolStr::from(V_COMMIT)), product(payload)),
