@@ -314,6 +314,10 @@ fn lower_tx_block_scoped(
                     "nested `with begin():` transactions are not supported",
                 ));
             }
+            // `pass` contributes no statement, so the chain passes through
+            // (`docs/chl-spec.md`, "4.7 `pass`"). A block of nothing but `pass` has no
+            // footprint, which the caller's must-do-something check reports.
+            ChlStmt::Pass => chain,
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,

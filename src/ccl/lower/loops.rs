@@ -441,6 +441,9 @@ fn lower_for_body_stmts_scoped(
                      is not yet supported",
                 ));
             }
+            // `pass` contributes no statement, so it binds nothing here
+            // (`docs/chl-spec.md`, "4.7 `pass`").
+            ChlStmt::Pass => {}
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -620,6 +623,10 @@ fn lower_for_body_terminal(
             "a `with begin():` transaction inside a generator/nested for-loop body \
              is not yet supported",
         )),
+        // `pass` contributes no statement, and a loop body expects no value, so a body
+        // that ends in one ends in `unit` — the same terminal a guard with no `else`
+        // falls through to (`docs/chl-spec.md`, "4.7 `pass`").
+        ChlStmt::Pass => Ok(ctx.tag_image(Expr::lit(Lit::Unit), stmt.span)),
         _ => Err(LoweringError::unsupported(
             stmt.span,
             "for-loop body must end in a yield, `<<` feed, nested for, if-guard, or match",
@@ -1169,6 +1176,9 @@ fn lower_loop_body_chain_scoped(
                 let begin = ctx.tag_image(Expr::begin(block), stmt.span);
                 ctx.tag_machinery(Expr::expr_stmt(begin, chain), stmt.span, "lower.stmt_seq")
             }
+            // `pass` contributes no statement, so the chain passes through
+            // (`docs/chl-spec.md`, "4.7 `pass`").
+            ChlStmt::Pass => chain,
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
