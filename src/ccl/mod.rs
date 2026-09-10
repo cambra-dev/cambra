@@ -63,7 +63,7 @@ pub(crate) use ty::eq_refinement_predicate;
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_all_id_counters() {
     reset_infer_var_counter();
-    reset_kind_var_counter();
+    reset_fun_kind_var_counter();
 }
 
 /// Convenience for the [`TypedExprNode::Error`] match arm in passes that run

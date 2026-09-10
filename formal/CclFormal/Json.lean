@@ -1,6 +1,8 @@
 import Lean.Data.Json
 import CclFormal.Ty
 import CclFormal.Merge
+import CclFormal.TypeKind
+import CclFormal.TypeKindMerge
 
 /-!
 # The wire codec
@@ -221,9 +223,11 @@ partial def toJson : CompactTy → Json
          ("var", match varT with | none => Json.null | some m => mapJson m),
          ("fn", match fn with
                 | none => Json.null
-                | some (k, ds, cod) =>
+                | some (k, d, cod) =>
                     Json.mkObj [("kind", Lean.toJson k.toWire),
-                      ("doms", Json.arr (ds.map toJson).toArray),
+                      -- One domain, not a list: the slot holds one position
+                      -- (`compact.rs`, `CompactFun::domain`).
+                      ("dom", toJson d),
                       ("cod", toJson cod)]),
          ("refinements", match refinements with
                     | none => Json.null
@@ -239,9 +243,9 @@ partial def fromJson? (j : Json) : Except String CompactTy := do
     | Json.null => pure none
     | f => do
       let k ← KindMerge.fromWire (← (← f.getObjVal? "kind").getStr?)
-      let ds ← (← (← f.getObjVal? "doms").getArr?).toList.mapM fromJson?
+      let d ← fromJson? (← f.getObjVal? "dom")
       let cod ← fromJson? (← f.getObjVal? "cod")
-      pure (some (k, ds, cod))
+      pure (some (k, d, cod))
   let refinements ← match ← j.getObjVal? "refinements" with
     | Json.null => pure none
     | c => some <$> Lean.fromJson? c
@@ -267,6 +271,55 @@ end CompactTy
 
 instance : ToJson CompactTy := ⟨CompactTy.toJson⟩
 instance : FromJson CompactTy := ⟨CompactTy.fromJson?⟩
+
+namespace TypeKind
+
+/-- A Σ binder's kind over `Ty`, tagged the same four ways as its compact form. -/
+def toJson : TypeKind → Json
+  | .everyType => Json.mkObj [("k", "everyType")]
+  | .uintRanges => Json.mkObj [("k", "uintRanges")]
+  | .subtypesOf t => Json.mkObj [("k", "subtypesOf"), ("param", Ty.toJson t)]
+  | .candidates ds =>
+      Json.mkObj [("k", "candidates"), ("ds", Json.arr (ds.map Ty.toJson).toArray)]
+
+def fromJson? (j : Json) : Except String TypeKind := do
+  match ← (← j.getObjVal? "k").getStr? with
+  | "everyType" => return .everyType
+  | "uintRanges" => return .uintRanges
+  | "subtypesOf" => return .subtypesOf (← Ty.fromJson? (← j.getObjVal? "param"))
+  | "candidates" =>
+      return .candidates (← (← (← j.getObjVal? "ds").getArr?).toList.mapM Ty.fromJson?)
+  | k => throw s!"unknown TypeKind: {k}"
+
+end TypeKind
+
+instance : ToJson TypeKind := ⟨TypeKind.toJson⟩
+instance : FromJson TypeKind := ⟨TypeKind.fromJson?⟩
+
+namespace CompactTypeKind
+
+/-- A Σ binder's kind, tagged by which of the four it is. The two that name members carry
+them; the two that state a property carry nothing. -/
+def toJson : CompactTypeKind → Json
+  | .everyType => Json.mkObj [("k", "everyType")]
+  | .uintRanges => Json.mkObj [("k", "uintRanges")]
+  | .subtypesOf t => Json.mkObj [("k", "subtypesOf"), ("param", CompactTy.toJson t)]
+  | .candidates ds =>
+      Json.mkObj [("k", "candidates"), ("ds", Json.arr (ds.map CompactTy.toJson).toArray)]
+
+def fromJson? (j : Json) : Except String CompactTypeKind := do
+  match ← (← j.getObjVal? "k").getStr? with
+  | "everyType" => return .everyType
+  | "uintRanges" => return .uintRanges
+  | "subtypesOf" => return .subtypesOf (← CompactTy.fromJson? (← j.getObjVal? "param"))
+  | "candidates" =>
+      return .candidates (← (← (← j.getObjVal? "ds").getArr?).toList.mapM CompactTy.fromJson?)
+  | k => throw s!"unknown CompactTypeKind: {k}"
+
+end CompactTypeKind
+
+instance : ToJson CompactTypeKind := ⟨CompactTypeKind.toJson⟩
+instance : FromJson CompactTypeKind := ⟨CompactTypeKind.fromJson?⟩
 
 /-- Round-trip smoke checks (`BEq`-compared; `beq ↔ eq` is a later step). -/
 private def roundTrips (t : Ty) : Bool :=
@@ -296,14 +349,14 @@ private def cRoundTrips (t : CompactTy) : Bool :=
 #guard !CompactTy.equiv (.mk [] none none none none) (.mk [] none none none (some []))
 #guard cRoundTrips (.mk [.prim .int, .txn, .uintRange 3, .source "s"] none none none
   (some [.binop "eq" .elem (.litInt 1)]))
--- Every slot at once, including a `null` ("two or more") domain and a conflicted kind.
+-- Every slot at once, including a conflicted kind, whose domain rides along like any other.
 #guard cRoundTrips (.mk [.prim .bool]
   (some [(.idx 0, .mk [.prim .int] none none none (some []))])
   (some [(.name "tag", .mk [] none none none none)])
-  (some (.conflict, [], .mk [.prim .string] none none none (some []))) (some []))
+  (some (.conflict, .mk [] none none none none, .mk [.prim .string] none none none (some [])))
+  (some []))
 #guard cRoundTrips (.mk [] none none
-  (some (.unknown, [.mk [.prim .int] none none none (some []),
-      .mk [.prim .bool] none none none (some [])],
+  (some (.unknown, .mk [.prim .int, .prim .bool] none none none (some []),
     .mk [] (some []) none none none)) (some []))
 
 end CclFormal

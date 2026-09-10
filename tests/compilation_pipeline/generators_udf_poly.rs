@@ -260,15 +260,10 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 // Generator `def` chained through a poly wrapper at two element types — the
 // chained variant of `test_generator_polymorphic_over_element_type`.
 //
-// **Currently ignored** — pre-existing `channelize` bug, independent of
-// monomorphization: a yield-based generator `def` *invoked inside a lambda
-// body* desugars to `λ ys → λ __floated___floated_chain_0 → ()` — the
-// generator's body is lost and the wrapper returns unit, so inference rejects
-// `sum(wrap(...))` with "Type mismatch for Aggregate: expected (), found
-// Int". The defer/feed plumbing assumes a generator call's result is
-// consumed at the statement level, not captured under a binder. Tracked in
-// the `defer-generator-call-inside-lambda` vault issue.
-#[ignore = "channelize drops a generator def's body when the call sits inside a lambda"]
+// The generator call sits *inside a lambda body* rather than at the statement level, so
+// the defer/feed plumbing has to carry the generator's body across a binder. `channelize`
+// once dropped it there — the wrapper desugared to `λ ys → λ __floated___floated_chain_0 →
+// ()`, returning unit, and inference rejected `sum(wrap(...))`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_generator_def_through_poly_wrapper_two_element_types() {

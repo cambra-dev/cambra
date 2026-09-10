@@ -112,7 +112,7 @@ pub fn inline_capability_lambdas(expr: Expr) -> Expr {
 /// `src/ccl/design/optimization.md`, "Inlining a collection is loop fusion".
 fn should_inline(bound_ty: &Type) -> bool {
     match bound_ty {
-        Type::Fun { kind, .. } => !matches!(kind, crate::ccl::ty::FunKind::Data),
+        Type::Fun { fun_kind, .. } => !matches!(fun_kind, crate::ccl::ty::FunKind::Data(..)),
         _ => false,
     }
 }
@@ -617,7 +617,7 @@ mod tests {
     fn should_inline_scalar_to_scalar() {
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -631,11 +631,11 @@ mod tests {
         // combinator is produced.
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Fun {
                 name: None,
-                kind: FunKind::Compute,
+                fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
             }),
@@ -653,13 +653,13 @@ mod tests {
         let refinement = Refinement::born(pred);
         let inner_fun = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::refined_one(inner_fun, refinement)),
         };
@@ -673,7 +673,7 @@ mod tests {
     fn should_not_inline_a_collection() {
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Data,
+            fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -687,7 +687,7 @@ mod tests {
     fn should_inline_a_capability_over_an_enumerable_domain() {
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -699,7 +699,7 @@ mod tests {
         // (Int, Int) → Int: an uncurried multi-arg capability, so inlined.
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::Base(BaseType::Int),
                 Type::Base(BaseType::Int),
@@ -715,7 +715,7 @@ mod tests {
         // enumerable first component makes no difference.
         let ty = Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::UIntRange(3),
                 Type::Base(BaseType::Int),
@@ -940,7 +940,7 @@ mod tests {
     fn fn_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
             name: None,
-            kind: FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
@@ -1122,7 +1122,7 @@ mod tests {
         let handle = Type::History {
             value: Box::new(singleton.clone()),
             domain: Box::new(Type::Txn),
-            kind: HistoryKind::Overwrite,
+            history_kind: HistoryKind::Overwrite,
         };
         let udf_ty = fn_ty(singleton.clone(), int.clone());
 
@@ -1145,7 +1145,7 @@ mod tests {
         let handle = Type::History {
             value: Box::new(crate::ccl::infer::lit_singleton(&Lit::Int(7))),
             domain: Box::new(Type::Txn),
-            kind: HistoryKind::Overwrite,
+            history_kind: HistoryKind::Overwrite,
         };
         let udf_ty = fn_ty(demanded.clone(), int.clone());
 

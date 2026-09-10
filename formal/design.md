@@ -31,8 +31,11 @@ intent. Until a row says otherwise, a component's only coverage is ordinary Rust
 
 | Solver component | Model | Differential | Proofs |
 |---|---|---|---|
-| `constrain_subtype`, concrete pairs | `Subtyping` / `subtypeCheck` | yes | reflexivity, transitivity, decidability |
+| `constrain_subtype`, concrete pairs with no sum among them | `Subtyping` / `subtypeCheck` | yes | reflexivity, transitivity, decidability |
+| `constrain_subtype`'s Σ arm | `SigmaBelow`, the kind premise alone | no — `CompactTy` has no binder slot, so the wire refuses a slot carrying binders and drops every witness atom | the premise is the elementwise reading of what a Σ denotes, which is what fixes its direction (`sigma_below_iff_elementwise`), and the swapped premise is a different relation (`swapped_premise_is_unsound`); the binder correspondence `𝜌` has neither model nor differential |
 | `CompactType::merge` | `merge` | yes, every fold step | commutativity, idempotence, associativity, congruence, lub, uniqueness |
+| `TypeKind::refuses` | `refuses` | yes, on the concrete fragment | a refusal never lands on a member (`not_admits_of_refuses`); the pair the bound arm's equality test refused while admitting it |
+| `CompactTypeKind::merge` | `mergeTypeKind` | yes, every fold step | commutativity, idempotence, associativity at the join; the meet checked exhaustively over a bounded universe |
 | `coalesce_compact` (`CompactType` → `Type`) | `coalesce` | yes, per materialized bound | totality; well-formedness of the result (`coalesce_wellFormed`); the merge materializes to a bound of both operands (`merge_is_a_bound`) and to the least such type (`merge_is_least_type`) |
 | bound recording, sweeping, `extrude` | — | — | — |
 | `traits` (operator obligations) | — | — | — |
@@ -252,6 +255,34 @@ a domain flips the polarity and the subtyping edge together, and a `data` domain
 closing that case needs the bound carried on the other side as well. One induction proves all four
 cells, and leastness alone would not close the function case.
 
+### The fn slot holds one domain
+
+`CompactFun` holds **one** domain, merged contravariantly like any other position, plus a
+`domains_disagree` flag and the operand pair a merge had to combine. A candidate set lives one level
+up, on the witness a Σ binds. The model followed: the slot's `List CompactTy` became a `CompactTy`,
+which retired `unionDomains`, `meetDomains`, `anyEquiv`, `subtypeDomains`, `domainsEquiv`,
+`OneDistinct`, `meetAll` and their theorems — `OneDistinct` in particular, since "at most one
+distinct domain" is now the slot's type rather than a predicate proved about it.
+
+Three consequences, each measured:
+
+- **`DataAgree` states the domain edge at both polarities.** A positive merge meets the domains
+  too, so the evidence that two `data` domains disagreed is erased either way, and the hypothesis
+  is needed at both. Unguarded, that is 8 failures on one surface and 4 on the other, in both
+  orders.
+- **`merge_is_a_bound` holds on 1844 of 2048 samples.** A `compute` slot carrying two domain
+  alternatives, which would materialize by meeting them, cannot arise over one domain.
+- **`merge_assoc`, `merge_is_least_absorber` and `least_absorber_unique` need no
+  `Classical.choice`**: their proofs are `rw` plus a triple of componentwise facts.
+
+**What the model does not state.** The Rust reaches `DomainJoinConflict` two ways: the merged domain
+denoting several alternatives, which `funShapes` mirrors through `denotesSeveralDomains`; and the
+`domains_disagree` flag, which `CompactFun::merge` sets from the *operands* because the meet erases
+the evidence. There is no slot for the flag here, so a disagreement whose merged position is not
+several atoms is a verdict this model does not give. The coalesce differential reports 0 mismatches
+over 4000 bounds, so the sampler does not reach it; closing it means a fourth component on the fn
+slot and a model of `data_domains_disagree`.
+
 **A disagreement is caught loudly exactly when the domains' join is undefined, and silently whenever
 it exists.** Two distinct atoms join to a two-atom position `coalesce` rejects, so nothing
 materializes and the statement is vacuous; record keys intersect, variant tags unite, and refinement
@@ -351,14 +382,27 @@ third theorem, subordinate to the two above.
 
 ### Σ types and `FunKind` inference
 
-Model kind variables resolved at coalesce ([type-inference.md, "4.6 Data vs compute
-functions"](../src/ccl/design/type-inference.md#46-data-vs-compute-functions)), Σ formation over
-candidate domains, and the witness discipline — **one value = one witness**, arms α-converted onto
-the value's witness (adopt if unanimous, mint on disagreement, sticky), with the join deferred to
-compaction. That invariant was established only after a constraint-time-join defect was root-caused
-at some expense, which is the reason to freeze it as a theorem before the next refactor disturbs it.
+What a witness ranges over is modelled: `TypeKind`, its containment order and its lattice, the
+`refuses` test, and `CompactTypeKind`'s merge, each with a differential. `SigmaBelow` states the
+kind premise and proves it is the elementwise reading of what a Σ denotes.
 
-Σ would also supply the bound `DataAgree` currently excludes, and would let the lattice statement
+The Σ is not. `Ty` carries no witness and `CompactTy`'s function slot no binders, so a Σ is a rule
+over a candidate list rather than a type, and no sum crosses the wire. The binder correspondence
+`𝜌` is where that costs the most: it is the premise a var-to-sum edge was found missing, its
+absence raises no error because the domain premise runs either way, and an assert in
+`constrain_subtype`'s Fun/Fun arm plus the Rust tests are the whole of what stands behind it
+([type-inference.md, "What checks each
+premise"](../src/ccl/design/type-inference.md#what-checks-each-premise)). A binder slot on
+`CompactTy` is what would put the Σ rule behind the merge differential, and it is the cheaper half
+of this step.
+
+The rest is the witness discipline — **one value = one witness**, arms α-converted onto the value's
+witness (adopt if unanimous, mint on disagreement, sticky), with the join deferred to compaction —
+and kind variables resolved at coalesce ([type-inference.md, "4.6 Data vs compute
+functions"](../src/ccl/design/type-inference.md#46-data-vs-compute-functions)). The discipline was
+established only after a constraint-time-join defect was root-caused at some expense, which is the
+reason to freeze it as a theorem before the next refactor disturbs it. Modelling the kind variables
+would also supply the bound `DataAgree` currently excludes, and would let the lattice statement
 above say which join Σ represents. **If Σ comes to materialize multi-domain joins, the merge's
 "alternatives beyond one" adjudication has to be revisited.**
 

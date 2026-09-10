@@ -108,7 +108,13 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // in place.
         TypedExprNode::Builtin(b) => {
             if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
-                scheme.instantiate(ctx.level)
+                // Through [`Typing::instantiate`], which stamps the *use site's*
+                // telescope: an operator template's variables stand nowhere, and a
+                // refinement flowing into an operand variable (a filtered
+                // collection meeting `box`'s parameter) must find the names it
+                // references in that variable's scope.
+                let scheme = scheme.clone();
+                ctx.instantiate(&scheme)
             } else {
                 ctx.normalize_annotation(&expr.ty)
             }
@@ -119,6 +125,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Cast: an upcast re-viewing `value` at the supertype `target`. See
         // [`emit_cast`] (shared with `check_node`).
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        // Realization is a planning rewrite, so it is born after inference has finished:
+        // Emit only ever runs on a tree that has none. The post-inference check *does*
+        // meet them, and trusts the assertion ([`check_node_rule`]).
+        TypedExprNode::Realize(_) => {
+            unreachable!("Realize is born in planning, after inference")
+        }
 
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
@@ -310,9 +322,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // A **concrete** function kind on the annotation is a *provenance stamp*:
         // lowering marks a data collection (a comprehension / `groupby`) with a
         // `data_fun(_, _)` annotation, and here we set that kind concretely on the
-        // node's own type (see `stamp_kind_from`). `bind_annotation` below still
+        // node's own type (see `stamp_fun_kind_from`). `bind_annotation` below still
         // reconciles the domain/codomain.
-        stamp_kind_from(&mut ty, &annotation);
+        stamp_fun_kind_from(&mut ty, &annotation);
         ctx.bind_annotation(&ty, &annotation)?;
     }
 
@@ -327,7 +339,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
 /// Stamp a concrete function **kind** from a *provenance-declaring* reference
 /// type onto a `target` function type. FunKind is a provenance property decided
-/// at lowering, not a function of the domain (see `KindMerge::of`,
+/// at lowering, not a function of the domain (see `FunKind::resolved`,
 /// `src/ccl/infer/solver/compact.rs`), and a bare lambda is built `Compute` by
 /// construction (`emit_lambda`). The two sites that *declare* a lambda to be a
 /// data collection instead — a `data_fun` annotation on a comprehension /
@@ -339,13 +351,33 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 /// a coercion). A concrete `Data` kind here is always lowering-internal or a
 /// declared carrier type — user function annotations are `Compute`/unkinded — so
 /// this never silently relabels a user's kind.
-fn stamp_kind_from(target: &mut Type, reference: &Type) {
+fn stamp_fun_kind_from(target: &mut Type, reference: &Type) {
     use crate::ccl::ty::FunKind;
     if let Some(ref_kind) = reference.fun_kind()
-        && !matches!(ref_kind, FunKind::Var(_))
-        && let Type::Fun { kind, .. } = target
+        && let Type::Fun { fun_kind, .. } = target
     {
-        *kind = ref_kind.clone();
+        // The **flag**, never the binders. A sum's witnesses ride its kind, and they are
+        // the reference's own — transplanting them would wrap the target in a sum it
+        // never entered, which is the introduction edge spelled as a stamp.
+        //
+        // A kind **variable** stamps only when lowering pinned it `Data` at construction
+        // ([`FunKind::fresh_data`]) — that is the consumer stamp, and the variable itself
+        // is shared so the collection pinning the annotation pins the node's own function.
+        // An unpinned variable (an elimination's demand) declares nothing and is skipped.
+        // A target already carrying a **concrete data kind** is already what the stamp
+        // would say, and overwriting it loses what it says: a sum loses its binders, and a
+        // plain collection loses the one fact that would have reached the annotation's kind
+        // variable as an edge — leaving that variable's width unknown, and a comprehension
+        // built over it binding nothing.
+        if matches!(fun_kind, FunKind::Data(_)) {
+            return;
+        }
+        *fun_kind = match ref_kind {
+            FunKind::Data(_) => FunKind::Data(None),
+            FunKind::Var(v) if v.resolved().is_data() => ref_kind.clone(),
+            FunKind::Var(_) => return,
+            other => other.clone(),
+        };
     }
 }
 
@@ -378,10 +410,16 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             emit_annotation_predicates(inner, ctx)
         }
         Type::Fun {
+            fun_kind,
             domain: d,
             codomain: c,
             ..
         } => {
+            for w in fun_kind.witnesses_mut() {
+                for t in w.types_mut() {
+                    emit_annotation_predicates(t, ctx)?;
+                }
+            }
             emit_annotation_predicates(d, ctx)?;
             emit_annotation_predicates(c, ctx)
         }
@@ -411,6 +449,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
@@ -597,7 +636,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             Type::History {
                 value: av,
                 domain: ad,
-                kind,
+                history_kind,
             },
             Type::History {
                 value: iv,
@@ -607,7 +646,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
         ) => Type::History {
             value: Box::new(complete_annotation(av, iv)),
             domain: Box::new(complete_annotation(ad, id)),
-            kind: *kind,
+            history_kind: *history_kind,
         },
         _ => ann.clone(),
     }
@@ -683,16 +722,16 @@ pub(super) fn emit_lambda<C: Typing>(
     // annotation from lowering, a declared `Data` recurrence carrier, an
     // aggregate's `Data` demand, a `Compute` parameter position. Each pins the
     // variable at the edge where the claim is actually made
-    // (`constrain_kind`), and an unconstrained kind resolves to the capability
-    // default at coalesce (`KindMerge::of`).
+    // (`constrain_fun_kind`), and an unconstrained kind resolves to the capability
+    // default at coalesce (`FunKind::resolved`).
     //
     // In Check mode `recorded` is the node's resolved type, so reading the kind
     // back reproduces what inference settled instead of minting a second
     // variable that nothing would constrain.
     Ok(Type::Fun {
         name: Some(param.name.clone()),
-        kind: match recorded {
-            Type::Fun { kind, .. } => kind.clone(),
+        fun_kind: match recorded {
+            Type::Fun { fun_kind, .. } => fun_kind.clone(),
             _ => FunKind::Compute,
         },
         domain: Box::new(param_simple),
@@ -740,10 +779,28 @@ pub(super) fn emit_cast<C: Typing>(
     // bound to the (unrefined) domain `d`, enforcing `Bool` (§6.2). Rebuilding
     // it on the `target` slot is what carries the typed predicate onto the
     // syntactic node; the result domain below then clones the typed refinement.
-    if let Type::Fun { domain, .. } = target
+    //
+    // **A sum target's predicate is not re-typed here.** A filter over a conditional
+    // source carries its own copy of the conditional inside the predicate, and that copy
+    // names its own witness — the site's and the copy's are reconciled by candidates
+    // in planning (`read_the_arm_instead`), not by identity during inference. Re-running
+    // the predicate's rules against the site's recorded types compares the two binders
+    // and rejects a tree the pipeline compiles correctly.
+    if let Type::Fun {
+        fun_kind, domain, ..
+    } = target
+        && fun_kind.witnesses().is_empty()
         && let Type::Refinement(_, refinements) = domain.as_mut()
     {
-        refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, &d, ctx))?;
+        // Each predicate is typed at the element type it sees in the restrict
+        // pipeline — the value's domain narrowed by the refinements applied
+        // before it (`application_order`, the single place that order is
+        // chosen) — because that is the context planning compiled its interior
+        // at. A lowering-born target carries one refinement, whose element
+        // type is `d` itself, so Emit is unchanged; a multi-refinement target
+        // is planning's (a gate over a filter), seen here only by Check.
+        let elem_tys = crate::ccl::application_elem_types(refinements.as_slice(), &d);
+        refinements.try_rewrite_each(|i, r| emit_bare_predicate(r, &elem_tys[i], ctx))?;
     }
     let domain = match cast_target_refinement(target) {
         Some(refinements) => Type::refined(d, refinements),
@@ -759,7 +816,7 @@ pub(super) fn emit_cast<C: Typing>(
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
     // still carries its kind, which a match on the raw target would drop
     // to the `Compute` default.
-    let kind = target.fun_kind().cloned().unwrap_or(FunKind::Compute);
+    let fun_kind = target.fun_kind().cloned().unwrap_or(FunKind::Compute);
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
@@ -779,7 +836,7 @@ pub(super) fn emit_cast<C: Typing>(
     };
     Ok(Type::Fun {
         name,
-        kind,
+        fun_kind,
         domain: Box::new(domain),
         codomain: Box::new(v),
     })
@@ -844,7 +901,14 @@ pub(super) fn emit_apply<C: Typing>(
     // A morphism's contravariant domain, left under-determined by the one-way
     // edges, is recovered structurally at coalesce
     // (`specialize_projection_domain` / `specialize_lambda_domain`).
-    ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
+    let declared = function
+        .user_annotation
+        .as_ref()
+        .and_then(Type::fun_kind)
+        .cloned();
+    ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
+        "Apply".to_string()
+    })
 }
 
 /// Record an operator's single obligation and give back its result type.
@@ -1034,7 +1098,7 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
     Type::History {
         value: Box::new(ctx.fresh()),
         domain: Box::new(ctx.fresh()),
-        kind: crate::ccl::HistoryKind::Append,
+        history_kind: crate::ccl::HistoryKind::Append,
     }
 }
 
@@ -1172,7 +1236,7 @@ fn constrain_into_feed<C: Typing>(
             let required = Type::History {
                 value: Box::new(rho_value.clone()),
                 domain: Box::new(rho_domain.clone()),
-                kind: crate::ccl::HistoryKind::Append,
+                history_kind: crate::ccl::HistoryKind::Append,
             };
             ctx.require_sub(target_ty, &required, &|| {
                 format!("feed target of {label} must be a feed handle")
@@ -1223,7 +1287,11 @@ pub(super) fn emit_copair<C: Typing>(
         // Each operand is a collection (function); its codomain joins into the
         // shared `cod_var`, its domain becomes the variant tag for operand `i`.
         let (dom, cod) = ctx.as_function(&ty, &|| "Copair element".to_string())?;
-        ctx.require_sub(&cod, &cod_var, &|| "Copair codomain".to_string())?;
+        // The codomain left this element's Σ behind, so the edge carries it.
+        let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+        ctx.require_sub_under(&cod, &binders, &cod_var, &[], &|| {
+            "Copair codomain".to_string()
+        })?;
         tags.insert(FieldKey::Index(i), dom);
     }
     let dom_variant = variant_type(tags);
@@ -1258,8 +1326,14 @@ pub(super) fn emit_disjoint_join<C: Typing>(
         // One shared domain: each operand's domain flows into the same variable, so
         // operands over genuinely different index sets are a type error here rather
         // than being silently tagged apart.
-        ctx.require_sub(&dom, &dom_var, &|| "DisjointJoin domain".to_string())?;
-        ctx.require_sub(&cod, &cod_var, &|| "DisjointJoin codomain".to_string())?;
+        // Both parts left this element's Σ behind, so both edges carry it.
+        let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+        ctx.require_sub_under(&dom, &binders, &dom_var, &[], &|| {
+            "DisjointJoin domain".to_string()
+        })?;
+        ctx.require_sub_under(&cod, &binders, &cod_var, &[], &|| {
+            "DisjointJoin codomain".to_string()
+        })?;
     }
     // The kind rides the node's own function type, as at every other rebuilt shape
     // (`emit_compose`). Only `lambda_elim` mints a `DisjointJoin` — it is the
@@ -1267,10 +1341,10 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // eliminated lambda's, and reconstructing a kind here instead would let this
     // rule disagree with the pass that built the node. A join with no function type to
     // read is a collection: the node *is* the merged map.
-    let kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data);
+    let fun_kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     Ok(Type::Fun {
         name: None,
-        kind,
+        fun_kind,
         domain: Box::new(dom_var),
         codomain: Box::new(cod_var),
     })
@@ -1343,7 +1417,7 @@ pub(super) fn emit_let<C: Typing>(
         && let Type::History {
             value,
             domain,
-            kind: crate::ccl::HistoryKind::Append,
+            history_kind: crate::ccl::HistoryKind::Append,
         } = &bound_ty
         && let Type::Infer(dv) = domain.as_ref()
     {
@@ -1353,7 +1427,7 @@ pub(super) fn emit_let<C: Typing>(
                 binding.name.clone(),
                 crate::ccl::ChanLevel(dv.level),
             )),
-            kind: crate::ccl::HistoryKind::Append,
+            history_kind: crate::ccl::HistoryKind::Append,
         };
         bound_expr.ty = handle.clone();
         handle
@@ -1485,8 +1559,8 @@ pub(super) fn emit_letrec<C: Typing>(
             // domain), it declares the value lambda's kind by provenance — stamp
             // it, so a `Compute`-by-construction accumulator body reconciles rather
             // than tripping the kind-mismatch reject in `require_sub`.
-            stamp_kind_from(&mut def_ty, &declared[i].1);
-            stamp_kind_from(&mut def.ty, &declared[i].1);
+            stamp_fun_kind_from(&mut def_ty, &declared[i].1);
+            stamp_fun_kind_from(&mut def.ty, &declared[i].1);
             let label = b.name.clone();
             ctx.require_sub(&def_ty, &declared[i].1, &|| {
                 format!("LetRec binding `{label}`")
@@ -1575,7 +1649,9 @@ pub(super) fn emit_for<C: Typing>(
     let target_simple = ctx.normalize(&target.ty);
     target.ty = target_simple.clone();
     let target_label = target.name.clone();
-    ctx.require_sub(&item_ty, &target_simple, &|| {
+    // The element type left the source's Σ behind, so the edge carries it.
+    let source_binders = iter_ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+    ctx.require_sub_under(&item_ty, &source_binders, &target_simple, &[], &|| {
         format!("for-loop target `{target_label}`")
     })?;
     if let Some(ann) = target.user_annotation.clone() {
@@ -1657,10 +1733,10 @@ pub(super) fn emit_list<C: Typing>(
     // typed as the morphism it replaced, denoting the same function. Reading the
     // kind back reproduces what that position settled on instead of re-asserting
     // `Data` over it.
-    let kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data);
+    let fun_kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     let fun_ty = |domain, codomain| Type::Fun {
         name: None,
-        kind: kind.clone(),
+        fun_kind: fun_kind.clone(),
         domain: Box::new(domain),
         codomain: Box::new(codomain),
     };
@@ -1687,7 +1763,7 @@ pub(super) fn emit_list<C: Typing>(
     // element (codomain) type takes the dereferenced element type so no `Mut`
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
-    // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
+    // it — see `src/ccl/design/type-inference.md`, "The domain join needs `box`".
     Ok(fun_ty(Type::UIntRange(n), read_through(&first_ty)))
 }
 
@@ -1778,10 +1854,10 @@ pub(super) fn emit_case<C: Typing>(
     // domain rides the contravariant `Fun` domain — it demands `D <: {D | p}`,
     // rejecting two arms that are the same expression.
     //
-    // Data-collection arms with distinct domains are rejected at coalesce rather
-    // than met (`CoalesceError::DomainJoinConflict`). (Heterogeneous *scalar* arms
-    // remain a hard `IncompatibleBounds` error — the sound union relaxation for
-    // them is deferred; see `coalesce`.)
+    // Data-collection arms with distinct domains coalesce to a
+    // conditional-collection Sigma. (Heterogeneous *scalar* arms remain a hard
+    // `IncompatibleBounds` error — the sound union relaxation for them is
+    // deferred; see `coalesce`.)
     //
     // A `Mut` arm needs no special case: it derefs into the join like any other
     // read, so a `Case` over two mutable variables types as their *value*. The
@@ -1882,14 +1958,20 @@ struct ChainEnds {
 fn compose_chain<C: Typing>(
     elts: &mut [Expr],
     i: usize,
-    prev_cod: Option<Type>,
+    // The previous morphism's codomain **and the binders it was taken from**: an adjacency
+    // edge relates two parts cut out of two different functions, so each side carries the Σ
+    // it left behind ([`Typing::require_sub_under`]).
+    prev_cod: Option<(Type, Vec<crate::ccl::ty::Witness>)>,
     ctx: &mut C,
 ) -> Result<ChainEnds, LocatedInferError> {
     let (head, rest) = elts.split_at_mut(1);
     let ty = ctx.subexpr(&mut head[0])?;
     let (dom, cod) = ctx.as_function(&ty, &|| format!("Compose[{i}]"))?;
-    if let Some(prev) = prev_cod {
-        ctx.require_sub(&prev, &dom, &|| format!("Compose[{i}]"))?;
+    let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+    if let Some((prev, prev_binders)) = prev_cod {
+        ctx.require_sub_under(&prev, &prev_binders, &dom, &binders, &|| {
+            format!("Compose[{i}]")
+        })?;
     }
     let cod = crate::ccl::subst::open_codomain(&ty, &cod);
     if rest.is_empty() {
@@ -1899,7 +1981,8 @@ fn compose_chain<C: Typing>(
             last_ty: ty,
         });
     }
-    let mut tail = |ctx: &mut C| compose_chain(rest, i + 1, Some(cod.clone()), ctx);
+    let mut tail =
+        |ctx: &mut C| compose_chain(rest, i + 1, Some((cod.clone(), binders.clone())), ctx);
     let ends = match ty.peel_refinements() {
         Type::Fun {
             name: Some(b),
@@ -1955,18 +2038,18 @@ pub(super) fn emit_compose<C: Typing>(
     // annotation lowering stamps on the node, which `emit_node` applies to this
     // result. The value here is only the placeholder that stamp overwrites — it is
     // not the answer, and `emit_node` asserts that an answer exists.
-    let kind = match recorded.peel_refinements() {
-        Type::Fun { kind, .. } => kind.clone(),
+    let fun_kind = match recorded.peel_refinements() {
+        Type::Fun { fun_kind, .. } => fun_kind.clone(),
         _ => FunKind::Compute,
     };
     // Construction closes: the chain's codomain was opened at the binder for the
     // adjacency above, so assembling the Pi puts the reference back in the index
     // form every stored type is in.
     Ok(match last_name {
-        Some(b) => Type::pi_kinded(b, first_dom, prev_cod, kind),
+        Some(b) => Type::pi_kinded(b, first_dom, prev_cod, fun_kind),
         None => Type::Fun {
             name: None,
-            kind,
+            fun_kind,
             domain: Box::new(first_dom),
             codomain: Box::new(prev_cod),
         },
@@ -2116,7 +2199,7 @@ pub(super) fn emit_transact<C: Typing>(
         // the mutable variable's sequencing domain; `final_or_default` reads it back to the
         // latest `α`.
         let value_ty = ctx.fresh();
-        let read_ty = fun(domain.clone(), value_ty.clone());
+        let read_ty = crate::ccl::ccl_utils::history_ty(domain, &value_ty);
         let init_ty = ctx.subexpr(&mut k.init)?;
         // The seed is one contribution to the mutable variable's value type, same as on the
         // `MutWrite` path, and flows in verbatim. A transactional mutable variable's writes
@@ -2137,7 +2220,10 @@ pub(super) fn emit_transact<C: Typing>(
         // mutable variable's sequencing domain.
         let site_dom = w.source.ty.domain().unwrap_or_else(|| domain.clone());
         for (field, value_ty) in writer_tap_fields(&w.body.ty) {
-            fields.push((field, fun(site_dom.clone(), value_ty)));
+            fields.push((
+                field,
+                crate::ccl::ccl_utils::history_ty(&site_dom, &value_ty),
+            ));
         }
     }
     Ok(Type::Record(fields))

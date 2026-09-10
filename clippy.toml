@@ -1,1 +1,6 @@
 large-error-threshold = 144
+
+# `WitnessId` hashes and orders on `(spelling, uid, position)` — plain integers. A
+# `Pending` reaches a `FunKindVar`'s `RefCell` through an `Rc`, and nothing that keys a
+# set or map ever reads it, so the interior mutability cannot move an entry.
+ignore-interior-mutability = ["cambra::ccl::ty::WitnessId"]

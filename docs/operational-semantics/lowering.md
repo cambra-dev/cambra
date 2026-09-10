@@ -208,7 +208,7 @@ In relational terms: an equijoin on the index domain.
 subdomain where the predicate holds:
 
 ```
-restrict : (p: I ⇒ Bool) ⇒ {i: I | p(i)} ⇒ {i: I | p(i)} 
+restrict : (p: I ⤇ Bool) ⇒ {i: I | p(i)} ⇒ {i: I | p(i)} 
 restrict(pred)  =  λ i | pred(i) == true → i
 ```
 
