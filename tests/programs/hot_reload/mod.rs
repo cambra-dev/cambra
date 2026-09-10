@@ -3336,3 +3336,64 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
     .expect("interchangeable declarations need no telling apart");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|xx");
 }
+
+/// A store this reload builds does not seed an accumulator from a binding the
+/// retired version released in full.
+///
+/// `OpConversionContext::keepable` declines a correspondent whose subscribers
+/// released it in full, and this is the case that decline is for. `base` is read
+/// by the accumulator's init and by the trailing read's default, so a completed
+/// fold leaves both done with it and the `Memo` under it drops what it held.
+/// `p` is new in the replacement, so its init is compiled rather than seeded from
+/// a carried value, and compiling it reaches `base`. Keeping `base` there hands
+/// the store a branch that answers empty, and `InductionStore::subscribe` drains
+/// an init op to a scalar — so the reload panics with `init op for accumulator
+/// \`p(()) produced an empty scalar` instead of installing.
+///
+/// The iteration input at the same node is kept in the same reload, released in
+/// full and correctly so: it is reused for the position it reached, not for what
+/// it can still supply. That is the whole of the asymmetry between
+/// `keepable` and `correspondent`.
+#[test]
+fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
+    let fold = |extra_decl: &str, extra_write: &str, result: &str| {
+        format!(
+            indoc! {r#"
+                base = ""
+                n := base
+                {extra_decl}for x in ["a", "b", "c"]:
+                    n := n + x
+                {extra_write}{result}
+            "#},
+            extra_decl = extra_decl,
+            extra_write = extra_write,
+            result = result,
+        )
+    };
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &fold("", "", "n"), &no_main).expect("v1 compiles");
+    assert_eq!(
+        drive_main_to_terminal(&mut ctx, &mut live),
+        "abc",
+        "the fold runs to the end, so every reader of `base` is done with it"
+    );
+
+    live.reload(
+        &mut ctx,
+        &fold(
+            "p := base
+",
+            "    p := p + x
+",
+            "n + p",
+        ),
+        &no_main,
+    )
+    .expect("adding an accumulator is accepted, and its init must still resolve");
+
+    assert_eq!(
+        drive_main_to_terminal(&mut ctx, &mut live),
+        "abc",
+        "`p` seeds from its own init and folds nothing, the source being spent"
+    );
+}

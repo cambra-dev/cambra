@@ -71,13 +71,19 @@ do](#what-a-reload-does-not-do) says why they are not everywhere.
 Keeping an operator keeps the whole subgraph under it, including its stores and their accumulated
 values. Two conditions bound that: every binding the term reads must have been kept too ([Reuse is
 hereditary](#reuse-is-hereditary)), and the operator must not have been released in full by its
-subscribers, since it can then only answer empty (`OpConversionContext::keepable`). An iteration
-input is the exception to the second, and it is kept for its position rather than for its data.
-`FanOut::released_position` is where a drive reads how far the fold got, so keeping a
-released-in-full iteration is what says the fold is finished and leaves the replacement asking for
-nothing. Building a fresh one instead offers every position of the collection again and folds the
-whole list onto the carried value
-(`a_fold_over_a_fixed_collection_resumes_where_it_stopped`).
+subscribers, since it can then only answer empty (`OpConversionContext::keepable`).
+
+The second condition bounds the two sites that reuse an operator for what it supplies. A binding is
+what a name reads and a store seeds its accumulators from, so a spent one hands on nothing
+(`a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding`). An iteration input is
+reused for something else — the position it reached, which `FanOut::released_position` reports as
+well from a spent operator as from a live one — so it looks the correspondence up through
+`OpConversionContext::correspondent` and takes a released-in-full operator. Keeping it is what says
+the fold is finished and leaves the replacement asking for nothing; building a fresh one offers
+every position of the collection again and folds the whole list onto the carried value
+(`a_fold_over_a_fixed_collection_resumes_where_it_stopped`). One released-in-full collection can be
+reached from both sites in one reload, which is why the condition belongs to the lookup each site
+does rather than to the operator.
 
 ### 3. Build the rest and wire it to its input
 

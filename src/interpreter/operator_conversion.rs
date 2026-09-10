@@ -711,7 +711,7 @@ impl OpConversionContext {
 
         let keepable = self
             .reads_only_kept(bound_expr)
-            .then(|| self.keepable(bound_expr, false))
+            .then(|| self.keepable(bound_expr))
             .flatten();
         let info = match keepable {
             Some(Recorded::Store(info)) => {
@@ -778,7 +778,7 @@ records one and the only site a `Transact` reaches"
         let node = bound_expr.node_id();
         self.reuse.bound += 1;
         let keepable = (kind == BindingKind::Free && self.reads_only_kept(bound_expr))
-            .then(|| self.keepable(bound_expr, false))
+            .then(|| self.keepable(bound_expr))
             .flatten();
         if let Some(entry) = keepable {
             self.reuse.kept += 1;
@@ -813,27 +813,42 @@ records one and the only site a `Transact` reaches"
         Ok(())
     }
 
-    /// The operator the previous version bound at the node `term` corresponds to,
-    /// or `None` when there is none to take.
+    /// What the previous version holds at the node `term` corresponds to, or
+    /// `None` when the two versions do not correspond there.
     ///
-    /// Declines one whose subscribers released it in full. Such an operator has
-    /// told its input that nothing will be read again and a [`Memo`] input drops
-    /// what it holds in response, so it can only answer empty and keeping it
-    /// would bind a name to nothing ([`FanOut::released_in_full`]).
-    ///
-    /// An iteration input is the exception, and passes `released_in_full_is_fine`:
-    /// released in full is what a finished collection looks like. The decline
-    /// happens where the operator would be taken rather than by withholding it
-    /// from the handover, because the handover is also the ledger
-    /// [`live_state`](Self::live_state) and
-    /// [`state_conflicts`](Self::state_conflicts) read: a store that can no
-    /// longer produce still holds the value its variables hand on.
-    fn keepable(&self, term: &Expr, released_in_full_is_fine: bool) -> Option<Recorded> {
+    /// The lookup and nothing else. A caller that needs the entry to still
+    /// *supply* something wants [`keepable`](Self::keepable) instead; this one
+    /// answers for a caller that reuses a fan-out for the progress it recorded,
+    /// which a spent operator reports as well as a live one.
+    fn correspondent(&self, term: &Expr) -> Option<Recorded> {
         self.inherited
             .entries
             .get(&self.correspondence.previous(term.node_id())?)
-            .filter(|e| released_in_full_is_fine || !e.fan().released_in_full())
             .cloned()
+    }
+
+    /// The operator the previous version bound at the node `term` corresponds to
+    /// and that can still produce, or `None`.
+    ///
+    /// [`correspondent`](Self::correspondent) plus the one condition that
+    /// separates reuse-for-what-it-supplies from reuse-for-where-it-got-to: an
+    /// operator whose subscribers released it in full has told its input that
+    /// nothing will be read again, a [`Memo`] input drops what it holds in
+    /// response, and it can then only answer empty
+    /// ([`FanOut::released_in_full`]). Binding a name to it, or seeding a store
+    /// from it, hands on nothing —
+    /// `a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding`
+    /// is the case, and it panics inside `InductionStore::subscribe` without
+    /// this.
+    ///
+    /// The decline happens where the operator would be taken rather than by
+    /// withholding it from the handover, because the handover is also the ledger
+    /// [`live_state`](Self::live_state) and
+    /// [`state_conflicts`](Self::state_conflicts) read: a store that can no
+    /// longer produce still holds the value its variables hand on.
+    fn keepable(&self, term: &Expr) -> Option<Recorded> {
+        self.correspondent(term)
+            .filter(|e| !e.fan().released_in_full())
     }
 
     /// The operator a recurrence iterates, and the first position it will offer:
@@ -864,10 +879,11 @@ records one and the only site a `Transact` reaches"
     ///
     /// Two things differ from [`bind_let`](Self::bind_let):
     ///
-    /// - A released-in-full operator is taken rather than declined. Released in
-    ///   full is what a finished iteration looks like, and a branch off it yields
-    ///   nothing further, which is the state the drive is in. Declining it would
-    ///   restart the iteration.
+    /// - The lookup is [`correspondent`](Self::correspondent) rather than
+    ///   [`keepable`](Self::keepable), so a released-in-full operator is taken.
+    ///   Released in full is what a finished iteration looks like, and a branch
+    ///   off it yields nothing further, which is the state the drive is in.
+    ///   Declining it would restart the iteration.
     /// - No [`Memo`] is interposed. One reader pulls this, so there is nothing to
     ///   share, and a memo would drop what a full release told it to drop.
     fn iteration_input(
@@ -881,7 +897,7 @@ records one and the only site a `Transact` reaches"
         // Reading a rebuilt binding makes the progress meaningless: the positions
         // this got through are positions of something the reload replaced.
         if self.reads_only_kept(term)
-            && let Some(kept) = self.keepable(term, true)
+            && let Some(kept) = self.correspondent(term)
         {
             self.reuse.kept += 1;
             self.keep_region(term, kept.fan());
