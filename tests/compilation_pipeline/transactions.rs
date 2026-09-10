@@ -3101,6 +3101,59 @@ fn a_keyed_write_reaches_an_induction_store() {
     );
 }
 
+/// A mutable `Map` seeded with a **one-entry** literal, which does not compile.
+///
+/// The seed's key type is that key's own singleton, so its present-key domain is
+/// `{String | __elem == "a", __elem ▷ (… ▷ collection_contains)}`. Meeting both sides at a
+/// negative position settles the re-keying shape — both binders of `lower_rekeyed` read the
+/// singleton — and `box`'s instantiated domain still reads the bare
+/// `{String | __elem ▷ (… ▷ collection_contains)}`, which a data domain's invariance rejects.
+///
+/// **The key variable resolves two ways at one polarity, decided by how the walk reached
+/// it.** Entered as a position it reads the meet (the singleton); reached through another
+/// variable's bound chain — which is how `box`'s type reaches it — it reads the demand side
+/// alone. `fallback_allowed` gates both the shape collapse and the meet, and only the
+/// collapse needs it: a collapse is a choice, which must not propagate along subtyping
+/// edges, while the meet is a narrowing, which may.
+///
+/// Ungating the meet closes all three shapes below and is not the fix as it stands. It costs
+/// `def by_key(c, f): groupby(c, f)` applied at two types 1.4s → 10s. And where a discharge
+/// is suspended on the chain it meets two data domains whose refinement sets differ only in
+/// the discharged binder's spelling — `{[0, 2] | x == 0}` against `{[0, 2] | x == __arg}`.
+/// `data_domains_disagree` compares those sets structurally, so one domain reached twice
+/// reads as two that disagree, which
+/// `higher_order_dependent_application_discharges_the_binder` reports as conflicting
+/// domains.
+///
+/// Pinned on the failure rather than deferred: it reports the day a base closes the gap,
+/// which an `#[ignore]` could not. The sibling below seeds **two** entries for this reason.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+// Read alone, with no write at all: the seed's own type is enough.
+#[case(indoc! {r#"
+    m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+    sum(m)
+"#})]
+// A keyed write per loop position, over an induction domain.
+#[case(indoc! {r#"
+    m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+    for k in ["b", "c"]:
+        m[k] := 9
+    m
+"#})]
+// The same write inside a transaction.
+#[case(indoc! {r#"
+    m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+    for r in [1, 2]:
+        with begin():
+            m["c"] := 3
+    await_final(m)
+"#})]
+#[should_panic(expected = "produced an invalid tree: [Type mismatch for collection domain")]
+fn a_one_entry_seed_does_not_reach_a_mutable_map(#[case] code: &str) {
+    run_pipeline(code);
+}
+
 /// A keyed write through a `Mut` **parameter**: `fw(m, x)` writes one key of the caller's
 /// mutable variable, the pass-by-reference shape `def fw(c: Mut(Int))` already supports for a
 /// scalar accumulator.

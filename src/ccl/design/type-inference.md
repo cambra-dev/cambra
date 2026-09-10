@@ -347,6 +347,26 @@ equation](#a-shared-hole-naming-a-domain-states-an-equation)); without it the sp
 the other only through the argument edge keeps the wider reading. Pinned by
 `a_negative_position_meets_both_sides` and `a_groupby_over_a_singleton_element_literal`.
 
+**The merge is gated as if it were the collapse, and one variable therefore has two readings
+at one polarity.** `fallback_allowed` answers both, so a variable entered as a position reads
+the merge while the same variable reached through another variable's bound chain reads the
+demand side alone. Only the collapse needs that gate: a choice does not propagate along
+subtyping edges, and a narrowing does. What the difference leaves open is a mutable `Map`
+seeded with a one-entry literal — `box`'s instantiated domain reaches the key variable
+through a chain and keeps the bare reading, which invariance then rejects against the
+singleton the seed establishes (`a_one_entry_seed_does_not_reach_a_mutable_map`).
+
+Ungating the merge closes that shape and costs two things it does not pay for. Reading the
+opposite side at every negative variable compacts it in full there, so the walk doubles per
+level of type nesting — `def by_key(c, f): groupby(c, f)` applied at two types goes from 1.4s
+to 10s. And where a discharge is suspended on the chain, two data domains meet whose
+refinement sets differ only in the spelling of the discharged binder: `{[0, 2] | 𝑥 == 0}`
+against `{[0, 2] | 𝑥 == __arg}`. [`data_domains_disagree`] compares those sets structurally,
+so it reads one domain reached twice as two domains that disagree, and the position has no
+common answer — which `higher_order_dependent_application_discharges_the_binder` reports.
+Forcing the discharge on both contributions before they meet is the prerequisite for letting
+the merge follow a chain.
+
 **Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
 
 **Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no*
