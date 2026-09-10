@@ -355,16 +355,34 @@ pub enum AnnotationMode {
 /// The left-hand side of an assignment, augmented assignment, defer-define,
 /// for-loop, or comprehension `for` clause — i.e. anywhere CHL binds names.
 ///
-/// Restricted to bare names and (possibly-nested) tuple patterns. Subscript
-/// (`xs[0] = ...`) and attribute (`obj.f = ...`) targets are not part of
-/// CHL today; if added later they would extend this enum rather than
-/// reopening the `target: Expr` escape hatch the previous AST allowed.
+/// Restricted to bare names, (possibly-nested) tuple patterns, and a subscript.
+/// Attribute targets (`obj.f = ...`) are not part of CHL today; if added later
+/// they would extend this enum rather than reopening the `target: Expr` escape
+/// hatch the previous AST allowed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignTarget {
     /// A bare identifier: `x = ...`.
     Name(SmolStr),
     /// A tuple destructuring pattern: `(a, b), c = ...`. May nest.
     Tuple(Vec<Spanned<AssignTarget>>),
+    /// One key of a `Map`: `m[k] := v`.
+    ///
+    /// Not a binding position, unlike the other two: the collection is not being
+    /// bound, one of its keys is being written. Only `:=` accepts it, a keyed write
+    /// being a write to a mutable collection (`src/ccl/design/mutability.md`,
+    /// "Surface-marker nodes: `For`, `MutWrite`, `Begin`, `Feed`"); every other
+    /// statement form rejects it at lowering, where the message can name the binder
+    /// the form wanted. The checked spelling `m[k]? := v` is refused earlier, in
+    /// [`expr_to_assign_target`](crate::chl_parser::parser), because it is not a
+    /// target this enum can hold rather than a target used in the wrong statement.
+    ///
+    /// The target is an arbitrary expression rather than a name so that a write
+    /// through a path (`a.b[k] := v`) has somewhere to land; lowering accepts only
+    /// the shapes it can resolve a mutable variable from.
+    Subscript {
+        target: Box<Spanned<Expr>>,
+        index: Box<Spanned<Expr>>,
+    },
 }
 
 // ---------------------------------------------------------------------------

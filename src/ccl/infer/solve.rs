@@ -1490,11 +1490,21 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // A `Defer` leaf's `Feed(ρ)` resolves through the standard
         // end-of-function `resolve_var_type` like any other node type.
         TypedExprNode::Defer => {}
-        // Feed/Define/MutWrite: recurse into the contributed/written value;
-        // the node's own `Unit` type needs no resolution.
-        TypedExprNode::Feed { value, .. }
-        | TypedExprNode::Define { value, .. }
-        | TypedExprNode::MutWrite { value, .. } => {
+        // Feed/Define: recurse into the contributed value; the node's own `Unit` type
+        // needs no resolution.
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            coalesce_node(value, level, ctx);
+        }
+        // A write: the written value, and a keyed write's **key**. The key is a value
+        // position like the value, and its type reaches no other slot — a write is
+        // `Unit`, so nothing downstream carries it. A variable left raw here therefore
+        // survives inference silently: the pre-desugar wall tolerates residual `Infer`
+        // (`collect_type_errors`, [`Strictness`]), so it surfaces only once a later phase
+        // reads the slot and puts the type somewhere reachable.
+        TypedExprNode::MutWrite { key, value, .. } => {
+            if let Some(key) = key {
+                coalesce_node(key, level, ctx);
+            }
             coalesce_node(value, level, ctx);
         }
         // A `Begin` block: recurse into its body chain; the block's own `Unit`

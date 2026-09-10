@@ -375,9 +375,9 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
         // logical write* at a new spine position, so carry the input node's id
         // (a preserve, not a mint) — freshening would sever the write's source
         // span and duplicate the id if the original ever also survived.
-        TypedExprNode::MutWrite { name, value } => {
+        TypedExprNode::MutWrite { name, key, value } => {
             let write = Expr {
-                node: TypedExprNode::MutWrite { name, value },
+                node: TypedExprNode::MutWrite { name, key, value },
                 ty: writer_body.ty,
                 user_annotation: writer_body.user_annotation,
                 // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
@@ -735,7 +735,12 @@ fn rewrite(mut expr: Expr) -> Expr {
         // top-level `cnt += 1`, or an inlined pass-by-reference writer
         // (`bump(cnt)`) spliced between statements. There is no recurrence to
         // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
-        if let TypedExprNode::MutWrite { name, value } = effect.node {
+        if let TypedExprNode::MutWrite {
+            name,
+            key: None,
+            value,
+        } = effect.node
+        {
             // The shadowing `let` this mints is captured against the statement
             // node it replaces, with the `MutWrite` blamed. Neither is claimed
             // dead: both are absent from the output tree, so the boundary
@@ -800,6 +805,146 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
     rename_uses(&mut cont, &name, &fresh);
     let cont = rewrite(cont);
     Expr::let_in(binding(fresh, vty), value, cont)
+}
+
+/// View each mutable variable's seed at the value type its binder declares.
+///
+/// A concrete collection is a value of an abstract collection type only through an
+/// introduction: entering a sum is a term and not a subtyping edge
+/// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). A mutable variable annotated
+/// `Mut(Map(𝐾, 𝑉), _)` holds the abstract map, whose key domain grows with every write,
+/// while its seed names one key domain — so the seed reaches the mutable variable's type through
+/// [`Builtin::Box`].
+///
+/// Stating the mutable variable's value type on that introduction is also what keeps it. `unbox`
+/// erases a box whose **stated** sum lists one candidate, reading the kind off `box`'s own
+/// function type, and a described kind lists none
+/// (`src/ccl/planning/conditionals.rs`). So a seed built by a conditional still realizes —
+/// the fan-out acts on the inner, multi-candidate sum — while the introduction that states
+/// the mutable variable's type survives realization and carries the value into it.
+///
+/// Runs after inference, so it stamps the types it builds and the CHECK-mode `typecheck`
+/// behind it validates them: the reconcile there is `derived <: recorded`, and the derived
+/// `Σ (σ : [𝑋]). σ ⤇ 𝑉` sits below the stated `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` by kind
+/// containment.
+pub fn view_seeds_at_value_type(expr: &mut Expr) {
+    if let TypedExprNode::MutDecl { binding, init, .. } = &mut expr.node {
+        let value_ty = value_type_of(&binding.ty);
+        if value_ty.peel_refinements().sum().is_some() && init.ty != value_ty {
+            // The `box` this mints stands in for the seed it restates, so the recording
+            // names the seed. Opened around `view_at` alone: the recursion below must
+            // attach its own products to their own nodes.
+            let _g = provenance::enter(
+                init.node_id(),
+                "transact.view_seed_at_value_type",
+                provenance::Nature::Machinery,
+            );
+            view_at(init, value_ty);
+        }
+    }
+    expr.walk_children_mut(&mut view_seeds_at_value_type);
+}
+
+/// Restate `e`'s introduction at `target`, minting one where `e` has none.
+fn view_at(e: &mut Expr, target: Type) {
+    if let TypedExprNode::Apply { function, argument } = &mut e.node
+        && matches!(function.node, TypedExprNode::Builtin(Builtin::Box))
+    {
+        function.ty = Type::fun(argument.ty.clone(), target.clone());
+        e.ty = target;
+        return;
+    }
+    let inner = std::mem::replace(e, Expr::lit(Lit::Unit));
+    let mut boxed = Expr::builtin(Builtin::Box);
+    boxed.ty = Type::fun(inner.ty.clone(), target.clone());
+    *e = Expr::apply(inner, boxed);
+    e.ty = target;
+}
+
+/// Rewrite every **keyed write** `m[k] := v` to the whole-value write it denotes:
+/// `m := insert(m, k, v)` ([`Builtin::Insert`]).
+///
+/// A keyed mutable variable's history is `Txn ⇒ Map(𝐾, 𝑉)` under the overwrite law, like any
+/// other mutable variable, so a write replaces the whole collection. Every phase below
+/// therefore sees one kind of `MutWrite` and needs no notion of a key.
+///
+/// **The whole collection is what commits.** The mutable variable's collection goes to one store
+/// key, and the rewritten value reads `m`, so the mutable variable is in its writer's read
+/// footprint as well as its write set even where the source only wrote one key. Two
+/// transactions touching one map therefore conflict whatever keys they touch. Narrowing
+/// either footprint to the key is unbuilt and is scoped in
+/// `src/ccl/design/mutability.md`, "Future work".
+///
+/// Runs after inference, so it stamps the types it builds and the CHECK-mode `typecheck`
+/// behind it validates them.
+pub fn desugar_keyed_writes(expr: &mut Expr) {
+    let mut value_tys: HashMap<Name, Type> = HashMap::new();
+    collect_mut_value_types(expr, &mut value_tys);
+    rewrite_keyed_writes(expr, &value_tys);
+}
+
+/// Record each mutable variable's value type, read off the binder that introduces it.
+///
+/// Two binders introduce one, and both are read here: [`TypedExprNode::MutDecl`], and a
+/// `Lambda` param that takes a mutable variable *by reference* — the case that genuinely
+/// crosses a function boundary (see [`TypedExprNode::MutDecl`]'s own docs). Reading only
+/// the declaration leaves a keyed write through a `Mut` parameter with no value type,
+/// which `def bump(m: Mut(Map(Int, Int)), k: Int): m[k] := 1` reaches whenever the writer
+/// is not inlined — a returned one is not.
+fn collect_mut_value_types(expr: &Expr, out: &mut HashMap<Name, Type>) {
+    match &expr.node {
+        TypedExprNode::MutDecl { binding, .. } => {
+            out.insert(binding.name.clone(), value_type_of(&binding.ty));
+        }
+        TypedExprNode::Lambda { param, .. } if param.ty.mut_value_type().is_some() => {
+            out.insert(param.name.clone(), value_type_of(&param.ty));
+        }
+        _ => {}
+    }
+    expr.walk_children(&mut |c| collect_mut_value_types(c, out));
+}
+
+/// The value a `Mut(𝑉, 𝐷)` binder holds, peeling refinements on either side.
+fn value_type_of(ty: &Type) -> Type {
+    match ty {
+        Type::History { value, .. } => value_type_of(value),
+        Type::Refinement(inner, _) => value_type_of(inner),
+        other => other.clone(),
+    }
+}
+
+fn rewrite_keyed_writes(expr: &mut Expr, value_tys: &HashMap<Name, Type>) {
+    expr.walk_children_mut(&mut |c| rewrite_keyed_writes(c, value_tys));
+    let write_id = expr.node_id();
+    let TypedExprNode::MutWrite { name, key, value } = &mut expr.node else {
+        return;
+    };
+    let Some(key) = key.take() else {
+        return;
+    };
+    // `m := insert(m, k, v)` is what `m[k] := v` denotes, so the nodes below are that
+    // write's faithful expansion and the recording names the write. Opened after the
+    // recursion and after the two returns that abandon it.
+    let _g = provenance::enter(
+        write_id,
+        "transact.keyed_write",
+        provenance::Nature::Expansion,
+    );
+    let map_ty = value_tys.get(name).cloned().unwrap_or_else(|| {
+        panic!(
+            "desugar_keyed_writes: keyed write to `{name}`, which neither a `MutDecl` nor a \
+             `Mut` parameter binds — the two binders of a mutable variable, and an unbound \
+             target is rejected before this phase"
+        )
+    });
+    let arg_ty = Type::Tuple(vec![map_ty.clone(), key.ty.clone(), value.ty.clone()]);
+    let mut arg = Expr::tuple(vec![tvar(name, map_ty.clone()), *key, (**value).clone()]);
+    arg.ty = arg_ty.clone();
+    let mut insert = Expr::builtin(Builtin::Insert);
+    insert.ty = Type::fun(arg_ty, map_ty.clone());
+    let mut app = Expr::apply(arg, insert);
+    app.ty = map_ty;
+    **value = app;
 }
 
 /// A `Var` reference stamped with its concrete type.
@@ -1575,7 +1720,7 @@ fn collect_writes_in(
     value_tys: &HashMap<Name, Type>,
     out: &mut Vec<AccumulatorVariable>,
 ) {
-    if let TypedExprNode::MutWrite { name, value } = &expr.node {
+    if let TypedExprNode::MutWrite { name, value, .. } = &expr.node {
         let write = expr.node_id();
         let site = StmtSite::new(stmt.unwrap_or(write), write);
         match out.iter_mut().find(|a| a.name == *name) {
@@ -1825,7 +1970,7 @@ fn transform_chain(
                 // `let` wrapping the decision (which would break the value-`Case`
                 // C-form compilation of the write set), and a feed reached after a
                 // write can be hoisted without stranding a branch-local binder.
-                TypedExprNode::MutWrite { name, value } => {
+                TypedExprNode::MutWrite { name, value, .. } => {
                     // Advance the read-your-writes environment by *inlining* the
                     // written value (point-free over `__p`), not binding a `let` —
                     // the same substitution model `transact_phase::walk_block` uses.

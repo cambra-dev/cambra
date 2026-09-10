@@ -518,9 +518,17 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         // Mutable-variable write: `x := e` — distinct from let-binding `=`
         // (the name references its introduction; it is not a fresh binder).
-        TypedExprNode::MutWrite { name, value } => (
+        TypedExprNode::MutWrite { name, key, value } => (
             Precedence::Lowest,
-            format!("{} := {}", name, fmt(value, Precedence::Lowest, opts)),
+            match key {
+                Some(k) => format!(
+                    "{}[{}] := {}",
+                    name,
+                    fmt(k, Precedence::Lowest, opts),
+                    fmt(value, Precedence::Lowest, opts)
+                ),
+                None => format!("{} := {}", name, fmt(value, Precedence::Lowest, opts)),
+            },
         ),
 
         TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),

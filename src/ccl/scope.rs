@@ -251,8 +251,18 @@ where
 
         // The write target is a *use* of the binder that introduced the defer
         // handle / mutable variable, so it resolves like any variable.
-        N::Feed { name, value } | N::Define { name, value } | N::MutWrite { name, value } => {
+        N::Feed { name, value } | N::Define { name, value } => {
             f(ScopedItem::VarRef(name));
+            open(f, value);
+        }
+
+        // As above, plus the key: a keyed write's key is an ordinary expression
+        // evaluated in the enclosing scope, so its free variables are uses too.
+        N::MutWrite { name, key, value } => {
+            f(ScopedItem::VarRef(name));
+            if let Some(k) = key {
+                open(f, k);
+            }
             open(f, value);
         }
 
@@ -588,6 +598,7 @@ mod tests {
             }),
             node(N::MutWrite {
                 name: Name::raw("m"),
+                key: None,
                 value: Box::new(var("mv")),
             }),
             node(N::Proj(ProjKey::Index(0))),

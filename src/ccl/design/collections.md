@@ -435,13 +435,19 @@ substituting the binder's occurrence does not reach — so a discharge re-run af
 builds a term emission never produced (`Typing::keyed_value_at`).
 
 The operator's domain is a pair, so it never produces a function value. Its point-free form
-is a morphism from a zip, `⟨𝑐, 𝑘⟩ ≫ lookup?`, and a collection reaches that zip one way: one
-collection for the whole iteration, its leg closed in the loop binder. `simplify`'s
-partial-lookup rule rewrites `⟨const(𝑐), 𝑔⟩ ≫ lookup?` to `𝑔 ≫ (𝑐 ▷ curry(lookup?))`, and
-op-conversion compiles that partial application to a collection read once with every key
-answered against it. The rewrite is not an optimization: a streamed collection cannot be
-replicated into every row, because broadcasting copies a single present value and a
-collection is a tile.
+is a morphism from a zip, `⟨𝑐, 𝑘⟩ ≫ lookup?`, and a collection reaches that zip two ways:
+
+- **One collection for the whole iteration**, its leg closed in the loop binder.
+  `simplify`'s partial-lookup rule rewrites `⟨const(𝑐), 𝑔⟩ ≫ lookup?` to
+  `𝑔 ≫ (𝑐 ▷ curry(lookup?))`, and op-conversion compiles that partial application to a
+  collection read once with every key answered against it. The rewrite is not an
+  optimization: a streamed collection cannot be replicated into every row, because
+  broadcasting copies a single present value and a collection is a tile.
+- **One collection per position**, where the leg is a projection of the row. A mutable
+  collection's mutable variable read inside a transaction is the only producer: `transact_phase`
+  applies the writer body to a snapshot tuple, so the mutable variable arrives as `.n` of that tuple
+  and no eta-reduction makes it closed again. Each row's cell is one materialized map value,
+  and the lookup searches that value's bindings.
 
 **A collection-valued answer does not materialize.** A group-by's rows are themselves
 collections, so the answer would carry a collection as its `` `some `` payload, and a

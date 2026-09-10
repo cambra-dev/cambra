@@ -650,9 +650,16 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // maintain (it trusts recorded types), and the contribution/write
         // edge was already recorded during inference. Check the value
         // subtree; the node itself is `Unit`.
-        TypedExprNode::Feed { value, .. }
-        | TypedExprNode::Define { value, .. }
-        | TypedExprNode::MutWrite { value, .. } => {
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            ctx.subexpr(value)?;
+            prim(BaseType::Unit)
+        }
+        // A write checks its value subtree and, for a keyed write, its key: both are
+        // ordinary value positions, and the key's type reaches no other slot.
+        TypedExprNode::MutWrite { key, value, .. } => {
+            if let Some(key) = key {
+                ctx.subexpr(key)?;
+            }
             ctx.subexpr(value)?;
             prim(BaseType::Unit)
         }

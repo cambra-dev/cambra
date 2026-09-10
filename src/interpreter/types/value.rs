@@ -22,6 +22,10 @@ pub enum FunctionDef {
     /// Unary arithmetic or boolean operation applied element-wise to a single column.
     UnaryOp(UnaryOpKind),
     RecordField(String),
+    /// `insert(m, k, v)` — the collection with one key's value replaced, inserting the key
+    /// where it was absent. Applied to a `Records` column of the tupled argument
+    /// ([`crate::ccl::Builtin::Insert`]), pointwise: one map in, one map out.
+    Insert,
 }
 
 impl FunctionDef {
@@ -36,9 +40,41 @@ impl FunctionDef {
             (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
                 .remove(f)
                 .unwrap_or_else(|| panic!("Missing field {f}")),
+            (FunctionDef::Insert, ColumnValue::Records(mut fields)) => {
+                let maps = fields
+                    .remove(&tuple_field(0))
+                    .expect("insert: no collection");
+                let keys = fields.remove(&tuple_field(1)).expect("insert: no key");
+                let values = fields.remove(&tuple_field(2)).expect("insert: no value");
+                ColumnValue::Variants(
+                    (0..maps.len())
+                        .map(|i| {
+                            insert_binding(maps.index_at(i), keys.index_at(i), values.index_at(i))
+                        })
+                        .collect(),
+                )
+            }
             _ => panic!("Invalid function application"),
         }
     }
+}
+
+/// `m` with `key` bound to `value` — replacing an existing binding, appending a new one.
+///
+/// A map value is a [`Value::Function`] binding list, so a key is present at most once and
+/// replacement is positional. A non-function `m` is a shape error the type system rules out.
+fn insert_binding(m: Value, key: Value, value: Value) -> Value {
+    let Value::Function(mut bindings) = m else {
+        panic!("insert: the collection operand is not a function value, got {m:?}");
+    };
+    match bindings.iter_mut().find(|b| b.input == key) {
+        Some(b) => b.output = value,
+        None => bindings.push(FuncBinding {
+            input: key,
+            output: value,
+        }),
+    }
+    Value::Function(bindings)
 }
 
 impl std::fmt::Display for FunctionDef {
@@ -47,6 +83,7 @@ impl std::fmt::Display for FunctionDef {
             FunctionDef::UnaryOp(op) => write!(f, "UnaryOp({op:?})"),
             FunctionDef::BinOp(op) => write!(f, "BinOp({})", fmt_binop(op)),
             FunctionDef::RecordField(field) => write!(f, ".{field}"),
+            FunctionDef::Insert => write!(f, "insert"),
         }
     }
 }
