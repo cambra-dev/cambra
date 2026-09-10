@@ -1713,16 +1713,32 @@ begin():` block, and `while` loops.
 
 ### 4.7 `pass`
 
-No-op statement that holds a place where a block is required:
+A statement that contributes nothing, for a block that takes statements and
+expects no value:
 
 ```python
-def todo(x):
-    pass    # placeholder body
+for m in entries:
+    match m:
+        case `debit(d):
+            total += d
+        case `credit(c):
+            pass
 ```
 
-A `pass` body is only valid where a block of statements is required and
-no value is expected. A function body of `pass` is rejected because the
-function body must yield a value.
+A `match` arm is where one is needed. An `if` arm can be left out — a guard
+with no `else` does nothing at the positions it rejects — while a `match`'s
+arms partition the scrutinee's tags, so an arm that does nothing is still
+written.
+
+The blocks that expect no value are a `for`-loop body, a `with begin():`
+block, and the `if` / `match` arms inside one. Everywhere else a block's value
+is its last statement, so `pass` stands before that statement and not as it:
+`def todo(x): pass` is rejected, because the function body must yield a value.
+
+A loop body of nothing but `pass` is a loop that does nothing, and compiles as
+one. A `with begin():` block of nothing but `pass` is rejected, by the rule
+that a transaction must write or feed
+([8.2 Transactions: `with begin():`](#82-transactions-with-begin)).
 
 ### 4.8 `return`
 
