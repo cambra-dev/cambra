@@ -235,7 +235,7 @@ impl fmt::Display for Tiling {
                 domain2,
                 codomain,
             } => {
-                write!(f, "CF({domain1:?} → {domain2:?} → {codomain:?}])")
+                write!(f, "CF({domain1:?} → {domain2:?} → {codomain:?})")
             }
             Tiling::Aggregation { kind, accumulator } => {
                 write!(f, "agg({kind:?}, {accumulator:?})")
@@ -543,12 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn display_lookup_function() {
+    fn display_curried_function() {
+        // The whole rendering, not a substring: a `[` test passes on the range
+        // domain whichever way the brackets fall, which is how an unbalanced
+        // one survived here.
         let s = curried(range(4), int(), bool_ext()).to_string();
-        assert!(
-            s.contains("→") && s.contains('['),
-            "expected '→ [' in '{s}'"
-        );
+        assert_eq!(s, "CF({[0, 3]} → Int → Bool)");
     }
 
     #[test]
