@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 
+use crate::ccl::Name;
+
 use super::*;
 use crate::{
     ccl::{Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
@@ -33,6 +35,7 @@ fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
                 || else_body.as_deref().is_some_and(for_body_has_yield)
         }
         ChlStmt::For { body, .. } => for_body_has_yield(body),
+        ChlStmt::Match { arms, .. } => arms.iter().any(|a| for_body_has_yield(&a.body)),
         _ => false,
     }
 }
@@ -60,6 +63,7 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
                 || else_body.as_deref().is_some_and(for_body_has_feed)
         }
         ChlStmt::For { body, .. } => for_body_has_feed(body),
+        ChlStmt::Match { arms, .. } => arms.iter().any(|a| for_body_has_feed(&a.body)),
         _ => false,
     }
 }
@@ -289,18 +293,90 @@ fn in_loop_mut_var_error(span: Span, name: &str) -> LoweringError {
     )
 }
 
-/// Rejection for a `yield` or `<<` inside a `match` arm in a for-loop body.
+/// Rejection for a `yield` or `<<` whose value is built from the arm's payload,
+/// in a `match` arm of a for-loop body that also writes an accumulator.
 ///
-/// A conditional feed rides its path's predicate as a `to_<defer>__fire` gate,
-/// and a `match` arm has no predicate to ride: it is selected by its tag, which
-/// the writer decision reads as a `Case` over the scrutinee rather than as a
-/// boolean.
-fn feed_in_match_arm_error(span: Span) -> LoweringError {
+/// The decision record's density is the bound, not the `match`. An accumulator
+/// makes the loop a single writer, and a feed inside it becomes a `to_<defer>`
+/// field of that writer's decision record, where every field answers at every
+/// committing position — the interpreter's `body_decision_at` reads each tap
+/// field before consulting its `__fire` gate, so a committing position that
+/// supplies none has no decision at all. An arm's payload is a
+/// [`variant_project`](crate::ccl::Builtin::VariantProject), which restricts the
+/// domain rather than answering over it, so a value built from it answers on its
+/// own arm's positions while the record commits on every arm's, and the writer
+/// waits for a decision that never assembles.
+///
+/// Lifting the restriction means encoding in the tap what its `__fire` gate
+/// already implies — a tap has a value exactly where it fires — so the value may
+/// be restricted to the positions the gate names.
+///
+/// The shapes around it compile. Without an accumulator the loop's feeds fan out
+/// one channel per arm ([`crate::ccl::channelize`]) and reach no decision record,
+/// so a fed value may read its payload there. With one, a fed value reading the
+/// accumulator or the whole scrutinee answers everywhere and rides the tap.
+fn feed_reading_payload_error(span: Span, binder: &str) -> LoweringError {
     LoweringError::unsupported(
         span,
-        "a `yield` or `<<` feed inside a `match` arm in a for-loop body is not \
-         supported; move it after the `match`, where it fires once per iteration",
+        format!(
+            "a `yield` or `<<` feed whose value is built from the arm's payload \
+             (`{binder}`) is not supported in a `match` arm of a for-loop body \
+             that also writes an accumulator: feed the scrutinee itself and \
+             project it downstream, or move the accumulator into a second \
+             for-loop over the same source, where the feeds fan out per arm"
+        ),
     )
+}
+
+/// The payload binder whose value reaches a feed in the same `match` arm, if
+/// any.
+///
+/// Walks the lowered arms rather than the CHL statements so the question is asked
+/// of the binder [`super::stmts::lower_match_over`] actually introduced — an arm
+/// that names no payload gets a reserved spelling, which nothing in the arm can
+/// read, and so can never answer here.
+fn arm_feed_reads_payload(case: &Expr) -> Option<Name> {
+    let TypedExprNode::Case { branches, .. } = &case.node else {
+        return None;
+    };
+    branches.iter().find_map(|br| {
+        let binder = &br.pattern.as_ref()?.binding.name;
+        let mut derived = vec![binder.clone()];
+        arm_feeds_payload_derived(&br.body, &mut derived).then(|| binder.clone())
+    })
+}
+
+/// Whether a `Feed` in `expr` has a value built from any name in `derived`,
+/// which the walk grows with each `let` that reads one.
+///
+/// The rejection covers the value, not the spelling: `v = w` then `o << v` puts
+/// the same restricted projection in the tap as `o << w` does, so asking only
+/// about the binder would accept it.
+///
+/// A `MutWrite` does not extend `derived`. Writing the payload into an
+/// accumulator commits it under the arm's own guard and the decision totals that
+/// write against the carry, so the accumulator slot a later feed reads answers at
+/// every position.
+fn arm_feeds_payload_derived(expr: &Expr, derived: &mut Vec<Name>) -> bool {
+    match &expr.node {
+        TypedExprNode::Feed { value, .. } => {
+            return derived
+                .iter()
+                .any(|n| crate::ccl::ccl_utils::is_free(n, value));
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if derived
+            .iter()
+            .any(|n| crate::ccl::ccl_utils::is_free(n, bound_expr)) =>
+        {
+            derived.push(binding.name.clone());
+        }
+        _ => {}
+    }
+    expr.any_child(|c| arm_feeds_payload_derived(c, derived))
 }
 
 /// Rejection for `x op= e` inside a for-loop body where `x` is not a mutable
@@ -505,7 +581,7 @@ fn lower_for_body_terminal(
             _ => Err(LoweringError::unsupported(
                 value.span,
                 "for-loop body must end in a yield, `<<` feed, nested for, \
-                 or if-guard",
+                 if-guard, or match",
             )),
         },
         ChlStmt::If {
@@ -591,6 +667,23 @@ fn lower_for_body_terminal(
                 ctx,
             ))
         }
+        // ``match m: case `tag(w): …`` — tag dispatch, the `match` counterpart of
+        // the `if` above. The arms share one first-match rule over one `Case`, so
+        // a feeding arm fans out as an `if` arm does. The arm also binds a
+        // payload, which `lower_match_over` puts in the scope its statements are
+        // lowered under; that scope is the arm's mutation scope, because a payload
+        // binder is bound outside the arm's statements and writing it is rejected
+        // for the reason writing the iteration variable is.
+        ChlStmt::Match { scrutinee, arms } => lower_match_over(
+            stmt.span,
+            scrutinee,
+            arms,
+            mutation_scope,
+            ctx,
+            |body, scope, ctx| {
+                lower_for_body_stmts(body, defer_name, scope, frame_introduced.clone(), ctx)
+            },
+        ),
         // A `with begin():` transaction as a *generator* loop-body terminal is a
         // later increment; top-level and simple `for … with begin():` loops are
         // lowered in `stmts.rs`/`transactions.rs`.
@@ -601,7 +694,7 @@ fn lower_for_body_terminal(
         )),
         _ => Err(LoweringError::unsupported(
             stmt.span,
-            "for-loop body must end in a yield, `<<` feed, nested for, or if-guard",
+            "for-loop body must end in a yield, `<<` feed, nested for, if-guard, or match",
         )),
     }
 }
@@ -1049,14 +1142,6 @@ fn lower_loop_body_chain(
             // is a write path; there is no complement, because the arms
             // partition the scrutinee's tags.
             ChlStmt::Match { scrutinee, arms } => {
-                if let Some(bad) = arms
-                    .iter()
-                    .find(|a| for_body_has_yield(&a.body) || for_body_has_feed(&a.body))
-                {
-                    return Err(feed_in_match_arm_error(
-                        bad.body.first().map_or(stmt.span, |s| s.span),
-                    ));
-                }
                 let case = lower_match_over(
                     stmt.span,
                     scrutinee,
@@ -1075,6 +1160,15 @@ fn lower_loop_body_chain(
                         )
                     },
                 )?;
+                // An accumulator puts this loop's feeds on the writer's decision
+                // record, which a payload-reading value cannot answer over
+                // ([`feed_reading_payload_error`]). Without one the feeds fan out
+                // per arm, where a restricted value is the expected shape.
+                if !acc_names.is_empty()
+                    && let Some(binder) = arm_feed_reads_payload(&case)
+                {
+                    return Err(feed_reading_payload_error(stmt.span, binder.base()));
+                }
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `if p: … [else: …]` — a conditional write path. Lowered to a
@@ -1133,8 +1227,9 @@ fn lower_loop_body_chain(
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     "only assignments (`x = …`, `x op= …`), `<<` feeds, \
-                     `yield`, `if` guards, `with begin():` transactions, and bare \
-                     side-effect calls are supported inside a for-loop body",
+                     `yield`, `if` guards, `match` dispatch, `with begin():` \
+                     transactions, and bare side-effect calls are supported \
+                     inside a for-loop body",
                 ));
             }
         };

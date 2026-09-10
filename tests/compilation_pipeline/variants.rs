@@ -1512,24 +1512,133 @@ fn test_match_arm_reading_its_payload_in_a_loop(#[case] code: &str, #[case] expe
     check_scalar(code, expected);
 }
 
-/// A `yield` or `<<` inside a `match` arm in a for-loop body is rejected: a
-/// conditional feed rides its path's predicate as a fire gate, and a `match`
-/// arm is selected by its tag rather than by a predicate.
+// A `<<` feed inside a `match` arm in a for-loop body. With no accumulator the
+// loop's feeds fan out one refined-source channel per arm, so an arm's value may
+// read its payload — the arm's channel is the source restricted to that arm's
+// positions, and the projection answers over exactly those.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn test_feed_inside_a_match_arm_in_a_loop_is_rejected() {
-    check_compile_error(
+#[case(indoc! {"
+    o = defer()
+    for m in [`a(2), `b(3), `a(5)]:
+        match m:
+            case `a(n):
+                o << n
+            case `b(k):
+                o << k * 100
+    sum(o)"}, Value::Int(307))]
+// The `case _:` fallback feeds too, so the fan-out spans a tagged arm and the
+// default one.
+#[case(indoc! {"
+    o = defer()
+    for m in [`a(2), `b(3), `a(5)]:
+        match m:
+            case `a(n):
+                o << n
+            case _:
+                o << 100
+    sum(o)"}, Value::Int(107))]
+fn test_feed_inside_a_match_arm_fans_out_per_arm(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A feed and an accumulator in the same `match`. The accumulator makes the loop a
+// single writer and the feed becomes a `to_<defer>` tap on its decision record,
+// gated by the arm's own `variant_is` test — so the tap fires on its arm's
+// positions only, while the record commits on every arm's.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum(o)", Value::Int(2))]
+#[case("acc", Value::Int(3))]
+fn test_feed_and_accumulator_in_one_match(#[case] tail: &str, #[case] expected: Value) {
+    let loop_program = indoc! {"
+        o = defer()
+        acc := 0
+        for m in [`a(2), `b(3), `a(5)]:
+            match m:
+                case `a(n):
+                    o << 1
+                case `b(k):
+                    acc += k
+    "};
+    check_scalar(&format!("{loop_program}{tail}"), expected);
+}
+
+// Every arm feeding, beside an accumulator: one tap per feed site, each with its
+// own gate.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_every_arm_feeds_beside_an_accumulator() {
+    check_scalar(
         indoc! {"
+            o = defer()
             acc := 0
-            for m in [`a(2), `b(3)]:
+            for m in [`a(2), `b(3), `a(5)]:
                 match m:
                     case `a(n):
-                        yield n
+                        o << 1
+                    case `b(k):
+                        o << 100
+                        acc += k
+            sum(o)"},
+        Value::Int(102),
+    );
+}
+
+// A tap value may read the accumulator: the writer's snapshot of it answers at
+// every position, so reading it keeps the tap total.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_a_tap_value_reads_the_accumulator() {
+    check_scalar(
+        indoc! {"
+            o = defer()
+            acc := 0
+            for m in [`a(2), `b(3), `a(5)]:
+                match m:
+                    case `a(n):
+                        o << acc
                     case `b(k):
                         acc += k
-            acc"},
-        "inside a `match` arm in a for-loop body is not",
+            sum(o)"},
+        Value::Int(3),
     );
+}
+
+/// The one shape the writer's decision record cannot carry: a tap value reading
+/// the arm's **payload**. `variant_project` restricts the domain rather than
+/// answering over it, so the value answers on its arm's positions while the
+/// record commits on every arm's — see `src/ccl/lower/loops.rs`,
+/// `feed_reading_payload_error`. Rejected at lowering rather than stalling the
+/// writer at run time.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    o = defer()
+    acc := 0
+    for m in [`a(2), `b(3)]:
+        match m:
+            case `a(n):
+                o << n
+            case `b(k):
+                acc += k
+    sum(o)"})]
+// Binding the payload first puts the same projection in the tap, so the
+// rejection follows the value through the `let` rather than matching the
+// spelling.
+#[case(indoc! {"
+    o = defer()
+    acc := 0
+    for m in [`a(2), `b(3)]:
+        match m:
+            case `a(n):
+                v = n * 2
+                o << v
+            case `b(k):
+                acc += k
+    sum(o)"})]
+fn test_a_tap_value_reading_its_payload_is_rejected(#[case] code: &str) {
+    check_compile_error(code, "is built from the arm's payload");
 }
 
 // A payload-binding arm and a payload-less one in the same `match`, both

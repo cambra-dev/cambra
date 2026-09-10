@@ -46,9 +46,11 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BaseType, Branch, Builtin, Expr, F_WRITES, FieldKey, HistoryKind, Lit, Name, Type,
-    TypedBinding, TypedExprNode,
-    ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
+    BaseType, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type, TypedBinding,
+    TypedExprNode,
+    ccl_utils::{
+        COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose, unit_expr,
+    },
     letrec::check_letrec_causal,
     provenance::{self, NodeId, RecordingGuard, RewriteLabel},
     subst::Subst,
@@ -236,13 +238,6 @@ fn erase_mut_in_type(ty: &mut Type) {
 fn erase_mut(expr: &mut Expr) {
     expr.walk_type_slots_mut(erase_mut_in_type);
     expr.walk_children_mut(erase_mut);
-}
-
-/// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write.
-fn unit_expr() -> Expr {
-    let mut u = Expr::new(TypedExprNode::Lit(Lit::Unit));
-    u.ty = Type::Base(BaseType::Unit);
-    u
 }
 
 /// Whether `e` is a bare mutable write.
@@ -1210,7 +1205,7 @@ fn transform_loop(
                 // paths that split per feed. One lambda carries the whole body
                 // here, however many arms feed, so there is no product to hand to
                 // any one feed statement.
-                let body = strip_trailing_unit(loop_body.clone());
+                let body = guard_cases_only(strip_trailing_unit(loop_body.clone()));
                 let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), body);
                 lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
                 let map = typed_compose(vec![iter, lambda]);
@@ -1801,15 +1796,33 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
 /// feed/write. Distinguishes a conditional feed loop (fanned out by `channelize`)
 /// from a straight-line feed loop (hoisted by `transform_feed_only_loop`). Ignores
 /// *value*-position `Case`s (a ternary in a feed value is straight-line).
+/// Rewrite every tag-dispatching `Case` in a generator body into the guard-`Case`
+/// [`channelize::try_extract_fanout_feed`](crate::ccl::channelize) fans out.
+///
+/// The feed-only path hands its body to `channelize` rather than to
+/// [`transform_chain`], so the rewrite that walker performs at its own
+/// consumption point has to happen here too: the fan-out matches a boolean guard
+/// against a bare `Feed`, and a `match` arm carries a `Pattern` and a tag until
+/// [`tag_case_to_guard_case`] turns them into a `variant_is` test and a
+/// substituted `variant_project`.
+fn guard_cases_only(expr: Expr) -> Expr {
+    let mut expr = expr;
+    expr.map_children(guard_cases_only);
+    if matches!(
+        &expr.node,
+        TypedExprNode::Case {
+            scrutinee: Some(_),
+            ..
+        }
+    ) {
+        return crate::ccl::ccl_utils::tag_case_to_guard_case(expr);
+    }
+    expr
+}
+
 fn body_has_statement_case(expr: &Expr) -> bool {
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
-        && matches!(
-            &effect.node,
-            TypedExprNode::Case {
-                scrutinee: None,
-                ..
-            }
-        )
+        && matches!(&effect.node, TypedExprNode::Case { .. })
     {
         return true;
     }
@@ -1887,8 +1900,9 @@ fn transform_chain(
         // A statement-position tag-`Case` (``match m: case `t(w): acc += e``,
         // lowered by `lower_loop_body_chain`). Rewrite it into the guard-`Case`
         // the arm below already merges into a writer decision, and re-enter. The
-        // payload stays a projection, bound at the head of its arm where
-        // `decision_writes` inlines it.
+        // payload is substituted into the arm rather than bound, so it carries no
+        // binder into a value this walker lifts out of the arm
+        // ([`tag_case_to_guard_case`](crate::ccl::ccl_utils::tag_case_to_guard_case)).
         TypedExprNode::ExprStmt { expr: effect, body }
             if matches!(
                 &effect.node,
@@ -1898,7 +1912,10 @@ fn transform_chain(
                 }
             ) =>
         {
-            let rewritten = Expr::expr_stmt(tag_case_to_guard_case(*effect), *body);
+            let rewritten = Expr::expr_stmt(
+                crate::ccl::ccl_utils::tag_case_to_guard_case(*effect),
+                *body,
+            );
             transform_chain(rewritten, env, accs, writes_ty, entering, path, feeds)
         }
         // A statement-position guard-`Case` (`if p: acc += e`, lowered by
@@ -2201,85 +2218,6 @@ fn conditional_decision(
         })
         .collect();
     decision_record(commit, write_elts, writes_ty)
-}
-
-/// Rewrite a tag-dispatching `Case` into the boolean-guard `Case` a writer
-/// decision is built from ([`Builtin::VariantIs`](crate::ccl::Builtin::VariantIs)
-/// for why the guard is a total test rather than a projection).
-///
-/// Each arm's `Pattern` becomes a `variant_is(tag)` guard over the scrutinee and
-/// a `let` binding its payload to the same arm's `variant_project(tag)`, so the
-/// arm reads as `if` does. A `match` without a `case _:` arm gains the trailing
-/// `true → unit` carry every lowered guard-`Case` ends in — the position where
-/// the accumulators keep their previous value. The arms partition the tags, so
-/// the decision commits at every position where a guard-`Case` leaves the
-/// changelog sparse.
-///
-/// The scrutinee is duplicated once per arm rather than bound: a `let` around
-/// the `Case` would put its name in the write set, where it escapes the writer
-/// lambda. A loop's `match` scrutinee is the iteration variable or a projection
-/// of it, so the copies are reads.
-fn tag_case_to_guard_case(case: Expr) -> Expr {
-    let case_ty = case.ty.clone();
-    let TypedExprNode::Case {
-        scrutinee,
-        branches,
-    } = case.node
-    else {
-        unreachable!("caller guarantees a Case")
-    };
-    let scrut = *scrutinee.expect("caller guarantees a tag-dispatching Case");
-    let scrut_ty = scrut.ty.clone();
-    let bool_ty = Type::Base(BaseType::Bool);
-    let mut has_default = false;
-    let mut out: Vec<Branch> = Vec::with_capacity(branches.len() + 1);
-    for br in branches {
-        let Some(pat) = br.pattern else {
-            // A `case _:` arm is already the fallback the trailing `true` guard
-            // names, and lowering has placed it last.
-            has_default = true;
-            out.push(Branch {
-                pattern: None,
-                guard: br.guard,
-                body: br.body,
-            });
-            continue;
-        };
-        let tag = FieldKey::Name(pat.tag.clone().into());
-        let payload_ty = pat.binding.ty.clone();
-        let mut guard = Expr::apply(
-            scrut.clone(),
-            Expr::builtin(Builtin::VariantIs(tag.clone()))
-                .with_ty(Type::fun(scrut_ty.clone(), bool_ty.clone())),
-        );
-        guard.ty = bool_ty.clone();
-        let mut payload = Expr::apply(
-            scrut.clone(),
-            Expr::builtin(Builtin::VariantProject(tag))
-                .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone())),
-        );
-        payload.ty = payload_ty;
-        out.push(Branch {
-            pattern: None,
-            guard,
-            body: Expr::let_in(pat.binding, payload, br.body),
-        });
-    }
-    if !has_default {
-        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
-        t.ty = bool_ty;
-        out.push(Branch {
-            pattern: None,
-            guard: t,
-            body: unit_expr(),
-        });
-    }
-    let mut rebuilt = Expr::new(TypedExprNode::Case {
-        scrutinee: None,
-        branches: out,
-    });
-    rebuilt.ty = case_ty;
-    rebuilt
 }
 
 /// Assemble a writer decision record `{commit, writes: (write_elts…)}`.

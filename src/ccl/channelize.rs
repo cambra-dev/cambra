@@ -227,15 +227,27 @@ impl fmt::Display for DeferError {
 /// Returns each arm's `(guard, feed_value?)` in source order — `feed_value` is
 /// `None` for a non-feeding arm, whose guard still participates in later arms'
 /// predicate synthesis ([`synthesize_arm_predicate`]). Returns `None` (not
-/// fannable) if there is a scrutinee, the trailing guard is not `true`, an arm
-/// binds a pattern, or an arm body is neither this defer's feed nor `Unit` — so a
-/// `Case` mixing this defer's feeds with other effects falls through to the
-/// generic handling rather than being silently collapsed.
+/// fannable) if the trailing guard is not `true` or an arm body is neither this
+/// defer's feed nor `Unit` — so a `Case` mixing this defer's feeds with other
+/// effects falls through to the generic handling rather than being silently
+/// collapsed.
 fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Option<Expr>)>> {
+    // A `match` arm dispatches on a tag, so it reaches the fan-out as a
+    // `Pattern` against a scrutinee. Convert it to the guard form first — the
+    // same rewrite the induction writer applies at its own consumption point —
+    // and match on the result, so the arms below are guards either way.
+    let converted = matches!(
+        &body.node,
+        TypedExprNode::Case {
+            scrutinee: Some(_),
+            ..
+        }
+    )
+    .then(|| crate::ccl::ccl_utils::tag_case_to_guard_case(body.clone()));
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
-    } = &body.node
+    } = &converted.as_ref().unwrap_or(body).node
     else {
         return None;
     };

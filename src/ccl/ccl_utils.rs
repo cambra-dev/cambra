@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
+use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, Branch, Builtin, Expr, F_FIRE_SUFFIX, F_WRITES, FieldKey, Lit, LogicKind,
     Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind,
@@ -45,6 +46,104 @@ pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Typ
         });
     }
     acc.unwrap_or_else(|| lit(empty))
+}
+
+/// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write, and
+/// of the `true` arm a `match` without a `case _:` gains.
+pub(crate) fn unit_expr() -> Expr {
+    let mut u = Expr::new(TypedExprNode::Lit(Lit::Unit));
+    u.ty = Type::Base(BaseType::Unit);
+    u
+}
+
+/// Rewrite a tag-dispatching `Case` into the boolean-guard `Case` its two
+/// consumers are built from ([`Builtin::VariantIs`](crate::ccl::Builtin::VariantIs)
+/// for why the guard is a total test rather than a projection).
+///
+/// Each arm's `Pattern` becomes a `variant_is(tag)` guard over the scrutinee, and
+/// the arm's `variant_project(tag)` is substituted for its payload binder, so the
+/// arm reads as `if` does. A `match` without a `case _:` arm gains the trailing
+/// `true → unit` carry every lowered guard-`Case` ends in — the position where
+/// the accumulators keep their previous value. The arms partition the tags, so
+/// the decision commits at every position where a guard-`Case` leaves the
+/// changelog sparse.
+///
+/// Both consumers dispatch on a guard and neither reads a `Pattern`: the
+/// induction writer merges the arms into one decision ([`crate::ccl::mut_elim`]'s
+/// `transform_chain`), and the feed fan-out refines the loop source once per
+/// feeding arm ([`crate::ccl::channelize`]'s `try_extract_fanout_feed`). The
+/// rewrite runs in a phase rather than at lowering because both builtins are
+/// minted after inference.
+///
+/// The scrutinee is substituted too, not bound. Each consumer lifts a
+/// sub-expression out of the arm — the fan-out composes the arm's feed value onto
+/// a refined source, the writer hoists it into a `to_<feed>` decision field — so a
+/// `let` inside the arm strands its binder there, and a `let` around the `Case`
+/// puts its name in the write set, where it escapes the writer lambda. A loop's
+/// `match` scrutinee is the iteration variable or a projection of it, so the
+/// copies are reads.
+pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
+    let case_ty = case.ty.clone();
+    let TypedExprNode::Case {
+        scrutinee,
+        branches,
+    } = case.node
+    else {
+        unreachable!("caller guarantees a Case")
+    };
+    let scrut = *scrutinee.expect("caller guarantees a tag-dispatching Case");
+    let scrut_ty = scrut.ty.clone();
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut has_default = false;
+    let mut out: Vec<Branch> = Vec::with_capacity(branches.len() + 1);
+    for br in branches {
+        let Some(pat) = br.pattern else {
+            // A `case _:` arm is already the fallback the trailing `true` guard
+            // names, and lowering has placed it last.
+            has_default = true;
+            out.push(Branch {
+                pattern: None,
+                guard: br.guard,
+                body: br.body,
+            });
+            continue;
+        };
+        let tag = FieldKey::Name(pat.tag.clone().into());
+        let payload_ty = pat.binding.ty.clone();
+        let mut guard = Expr::apply(
+            scrut.clone(),
+            Expr::builtin(Builtin::VariantIs(tag.clone()))
+                .with_ty(Type::fun(scrut_ty.clone(), bool_ty.clone())),
+        );
+        guard.ty = bool_ty.clone();
+        let mut payload = Expr::apply(
+            scrut.clone(),
+            Expr::builtin(Builtin::VariantProject(tag))
+                .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone())),
+        );
+        payload.ty = payload_ty;
+        let payload_subst = Subst::discharge(pat.binding.name.clone(), payload);
+        out.push(Branch {
+            pattern: None,
+            guard,
+            body: payload_subst.apply_expr(&br.body),
+        });
+    }
+    if !has_default {
+        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+        t.ty = bool_ty;
+        out.push(Branch {
+            pattern: None,
+            guard: t,
+            body: unit_expr(),
+        });
+    }
+    let mut rebuilt = Expr::new(TypedExprNode::Case {
+        scrutinee: None,
+        branches: out,
+    });
+    rebuilt.ty = case_ty;
+    rebuilt
 }
 
 /// Assemble a writer **decision record** `{commit, writes, (to_<feed>__fire,)?
