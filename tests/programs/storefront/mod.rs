@@ -43,8 +43,12 @@
 //!    price once it is spent — and that both invariants held across the
 //!    upgrade.
 //!
-//! Steps 4–5 need the versioning surface (`Versioned` dispatch, the
-//! branch point `t_new`, branch/merge), which is still open design.
+//! Steps 4–5 upgrade at a branch point, which is one of two things. Replacing
+//! V0 with V1 outright is implemented — the running program's state carries
+//! across the swap (`src/ccl/design/hot-reload.md`, "How a reload works"), which
+//! is what step 4 asks for and what `hot_reload` demonstrates. Serving both
+//! sides of `t_new` at once still needs the versioning surface (`Versioned`
+//! dispatch, branch/merge), which is open design.
 //!
 //! ### Current limitations (what this test depends on)
 //!
@@ -84,8 +88,9 @@
 //!   rollup `groupby_rollup` covers.
 //! - Record terms `(f=v)` — `reachability`.
 //! - `Feed(...)` annotations — `fanout`.
-//! - Version dispatch across a branch point — no isolating program yet
-//!   (deferred with the still-open versioning surface).
+//! - Replacing one version with another — `hot_reload`.
+//! - Serving two versions at once across a branch point — no isolating program
+//!   yet (deferred with the still-open versioning surface).
 //!
 //! The variant tags and the refinement braces parse now (`docs/chl-spec.md`,
 //! "3.15 Variant constructors" and "6.4 Refinement syntax"), so what each file

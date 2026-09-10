@@ -5,9 +5,7 @@
 //! blocking on its response) while the main thread drives the scheduler;
 //! that's the same pattern as `tests/http_server.rs`.
 
-use std::{sync::mpsc, thread, time::Duration};
-
-use super::common::{compile_sink, drive_until, http_get, http_post, reserve_test_port};
+use super::serving::{compile_sink, exchange, http_get, http_post, reserve_test_port};
 
 #[test]
 fn http_greeter() {
@@ -15,17 +13,13 @@ fn http_greeter() {
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
     let mut ctx = compile_sink(&source);
 
-    let (tx, rx) = mpsc::channel::<Vec<String>>();
-    thread::spawn(move || {
-        let responses = vec![
+    let actual = exchange(&mut ctx, move || {
+        vec![
             http_get(port, "/greet"),
             http_post(port, "/echo", "world"),
             http_post(port, "/shout", "loud"),
-        ];
-        tx.send(responses).unwrap();
+        ]
     });
-
-    let actual = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(
         actual,
         vec![

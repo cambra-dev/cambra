@@ -12,6 +12,8 @@
 //! For the human-facing gallery, see `docs/demo-programs.md`.
 
 mod common;
+#[path = "../support/serving.rs"]
+mod serving;
 
 mod arithmetic;
 mod defer_generators;

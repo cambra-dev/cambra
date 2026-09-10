@@ -6,9 +6,7 @@
 //! statement position. Plain-`String` requests and responses (`http_serve`
 //! yields the request body as a `String`; the reply is the accumulated text).
 
-use std::{sync::mpsc, thread, time::Duration};
-
-use super::common::{compile_sink, drive_until, http_post, reserve_test_port};
+use super::serving::{compile_sink, exchange, http_post, reserve_test_port};
 
 #[test]
 fn http_accumulator() {
@@ -16,18 +14,14 @@ fn http_accumulator() {
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
     let mut ctx = compile_sink(&source);
 
-    let (tx, rx) = mpsc::channel::<Vec<String>>();
-    thread::spawn(move || {
-        // Each POST adds an entry; the response is the full guestbook so far.
-        let responses = vec![
+    // Each POST adds an entry; the response is the full guestbook so far.
+    let actual = exchange(&mut ctx, move || {
+        vec![
             http_post(port, "/sign", "alice: hi"),
             http_post(port, "/sign", "bob: hello"),
             http_post(port, "/sign", "carol: hey"),
-        ];
-        tx.send(responses).unwrap();
+        ]
     });
-
-    let actual = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(
         actual,
         vec![
