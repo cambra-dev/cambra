@@ -269,7 +269,30 @@ pub(super) fn lower_list_comp(
         let source = match source.user_annotation.as_ref().and_then(Type::fun_kind) {
             Some(annotated) => {
                 result_kv.contributes_first(annotated.clone());
-                source
+                // An annotation states a kind, a domain, or both, and only the domain
+                // answers the question above. A `groupby` source states its keys through
+                // its key binder and annotates the kind alone, so `named_data_domain`
+                // found no id to adopt and the shared one minted above still has to reach
+                // it — without that the two domains are ordered by the argument edge and
+                // nothing says they are one, which is what lets the two readings of one
+                // invariant position diverge.
+                match (&iter_dom, source.user_annotation.clone()) {
+                    (
+                        Some(shared),
+                        Some(Type::Fun {
+                            name,
+                            fun_kind,
+                            domain,
+                            codomain,
+                        }),
+                    ) if matches!(*domain, Type::Hole) => source.with_user_annotation(Type::Fun {
+                        name,
+                        fun_kind,
+                        domain: Box::new(shared.clone()),
+                        codomain,
+                    }),
+                    _ => source,
+                }
             }
             None => {
                 assert!(

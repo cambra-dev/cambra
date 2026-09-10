@@ -169,37 +169,41 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
-// A group-by over a literal whose elements share **one singleton type** does not compile.
-// `[1]` and `[1, 1]` both have element type `Int@1`, so the key morphism's codomain — and
-// with it the key domain — is `Int@1`, where `[1, 2]`'s is `Int`.
-//
-// The two spellings meet at the consuming lambda. Inference leaves
-// `λ __iter_record : Int → __iter_record:<Int@1> ▷ ⟨the group-by⟩`: the binder is declared
-// at the *widened* `Int` while its own occurrence keeps `Int@1`. A parameter may drop a
-// refinement — a refined argument flows into an unrefined parameter — but a **data**
-// function's domain is invariant (`src/ccl/design/type-inference.md`, "Data domains are
-// invariant"), so the two do not reconcile and `post-lambda-elim` reports
-// `expected Int, found Int@1`.
-//
-// The consuming lambda is the program's result, so nothing applies it and
-// `specialize_lambda_domain` — which recovers an under-determined contravariant domain from
-// the argument flowing in — never runs on it. Reproduces on `main`; `set` and `map` inherit
-// it through the shared re-keying shape rather than causing it.
+// A group-by whose element type is a singleton refinement (`[1]`, `[1, 1]`) keys the same
+// as one whose elements only share a base type (`[1, 2]`). The singleton rides the group
+// key's lower bounds, which a domain's reading meets
+// (`src/ccl/design/type-inference.md`, "The collapse happens at the position").
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[case("[sum(x) for x in groupby([1], \\x -> x)]")]
-#[case("[sum(x) for x in groupby([1, 1], \\x -> x)]")]
-// Pinned on the failure: it reports the day a base carrying the fix arrives, which an
-// `#[ignore]` could not. The parameter's domain resolves to `Int` while its occurrences
-// resolve to `Int@1`, and a data domain is invariant.
-//
-// The **pass** that catches it is not part of the claim, and it moves: `post-lambda-elim`
-// rejects the collection domain here, while the keyed-collection branches above reach
-// `post-planning` and an `Apply` mismatch on the same program. So the pin is on the
-// post-pass tree check rather than on either message.
-#[should_panic(expected = "produced an invalid tree: [Type mismatch")]
-fn a_groupby_over_a_singleton_element_literal(#[case] code: &str) {
-    run_pipeline(code);
+#[case(
+    "[sum(x) for x in groupby([1], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[sum(x) for x in groupby([1, 1], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[sum(x) for x in groupby([1, 2], \\x -> x)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+fn a_groupby_over_a_singleton_element_literal(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // `set([…])` is a deduplicating re-keying constructor: the distinct
@@ -245,6 +249,10 @@ fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
 #[case("set([1,2,2,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
 #[case("set([3,1,2,1,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
 #[case("set(['a','b','a'])", ColumnValue::strings(&["a", "b"]), 2)]
+// A literal whose elements share one singleton type keys like any other
+// ([`a_groupby_over_a_singleton_element_literal`] carries the group-by it is built on).
+#[case("set([1])", ColumnValue::Ints(vec![1]), 1)]
+#[case("set([1, 1])", ColumnValue::Ints(vec![1]), 1)]
 fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usize) {
     check_set_keys(code, sorted_keys, n);
 }
@@ -281,6 +289,7 @@ fn check_map_entries(code: &str, mut expected: Vec<(Value, Value)>) {
 #[case("map([(1, 10), (2, 20)])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
 #[case("map([(3, 30), (1, 10), (2, 20)])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20)), (Value::Int(3), Value::Int(30))])]
 #[case("map([('a', 1), ('b', 2)])", vec![(Value::String("a".into()), Value::Int(1)), (Value::String("b".into()), Value::Int(2))])]
+#[case("map([(1, 10)])", vec![(Value::Int(1), Value::Int(10))])]
 fn test_map(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
     check_map_entries(code, expected);
 }
@@ -296,32 +305,6 @@ fn test_map(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
 #[should_panic(expected = "elements under one key")]
 fn map_rejects_a_duplicate_key() {
     run_pipeline("map([(1, 10), (2, 20), (1, 99)])");
-}
-
-// A re-keying constructor over a literal whose elements share **one** singleton type does
-// not compile, and neither constructor causes it: a plain `groupby` over the same literal
-// fails identically ([`a_groupby_over_a_singleton_element_literal`] carries the diagnosis).
-// `set` and `map` reach it through the group-by their shared shape is built on, and both
-// spellings are listed because both do.
-//
-// The parameter's domain resolves to `Int` while every occurrence of that domain's binder
-// resolves to `Int@1`, and a data function's domain is invariant, so `post-lambda-elim`
-// rejects the tree. A fix for that — meeting both sides when a negative position is read —
-// is in flight and is not under this stack, so the pin is on the failure: it reports the day
-// a base carrying the fix arrives, which an `#[ignore]` could not.
-//
-// It blocks the single-entry seed a mutable map wants (`map([("tee", 5)])`), so it is
-// recorded here rather than left to be rediscovered.
-#[rstest]
-#[timeout(Duration::from_secs(30))]
-#[case("set([1])")]
-#[case("set([1, 1])")]
-#[case("map([(1, 10)])")]
-#[should_panic(
-    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
-)]
-fn test_rekeying_over_a_singleton_literal(#[case] code: &str) {
-    run_pipeline(code);
 }
 
 // A `set(…)` value **nested as another comprehension's source** is not driven:

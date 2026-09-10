@@ -1581,12 +1581,17 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
 }
 
 /// A **boxed exact `Map`** annotation on a group-by types and cannot be consumed: the `box`
-/// references the comprehension's `__iter_record` from outside its scope.
+/// names the comprehension's `__iter_record` where the group-by's own key binder belongs, so
+/// the two spellings of the one key domain do not reconcile.
 ///
 /// A compiler bug rather than a rule, pinned so its fix is visible. Its exact `FullMap`
 /// counterpart compiles and runs
 /// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation form is the whole
 /// difference.
+///
+/// The claim is that the two spellings collide, not which check reports it. Pinned on the
+/// two domains the diagnostic names, because that is what says *which* binder each side
+/// carries; the wording around them belongs to whichever check gets there first.
 #[test]
 fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     let errs = infer_program_err(indoc! {r#"
@@ -1596,8 +1601,8 @@ fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     assert!(
         errs.iter()
             .map(|e| format!("{e:?}"))
-            .any(|m| m.contains("out-of-scope binder") && m.contains("__iter_record")),
-        "expected the box to escape the comprehension's binder, got {errs:?}"
+            .any(|m| m.contains("__iter_record") && m.contains("__box_k")),
+        "expected the two spellings of the key domain to collide, got {errs:?}"
     );
 }
 

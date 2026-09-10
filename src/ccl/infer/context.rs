@@ -611,6 +611,41 @@ impl Typing for InferCtx {
                 inferred: inferred_ty,
             })
         })?;
+        // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
+        // above is contravariant in the domain, so it leaves the shared variable *below*
+        // every domain annotated with it: a common lower bound, which orders each domain
+        // under it and says nothing between them. Lowering writes the id to claim that two
+        // positions are one domain, and a data domain is invariant, so the claim is an
+        // equation and this draws its other half.
+        //
+        // Only where the id names the domain. A domain variable reached any other way may
+        // receive several domains deliberately — a conditional collection's arms, a
+        // domain-generic consumer's parameter — and equating those is what `constrain_go`'s
+        // invariant-domain arm declines to do for a variable-sided edge.
+        //
+        // Never against a **bound witness**. A sum's domain is its binder's reference, and
+        // entering a sum is a term (`src/ccl/design/type-inference.md`, "Only a term builds
+        // a sum"), so an equation between that reference and a free variable is not a claim
+        // about two positions but an escape of the binder — the coercion the one-way rule
+        // above exists to leave to the Σ rule.
+        if let Type::Fun {
+            domain: claimed, ..
+        } = ann_to_normalize.peel_refinements()
+            && matches!(**claimed, Type::SharedHole(_))
+            && let Type::Fun { domain: shared, .. } = ann_simple.peel_refinements()
+            && let Type::Fun {
+                domain: inferred_dom,
+                ..
+            } = inferred.peel_refinements()
+            && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
+        {
+            constrain_subtype(inferred_dom, shared, &mut self.cache).map_err(|_| {
+                self.raise(InferError::AnnotationMismatch {
+                    annotation: ann.clone(),
+                    inferred: coalesce_for_error(inferred),
+                })
+            })?;
+        }
         Ok(ann_simple)
     }
 
