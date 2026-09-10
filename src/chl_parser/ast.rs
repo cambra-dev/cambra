@@ -520,11 +520,19 @@ pub enum Expr {
         codomain: Box<Spanned<Expr>>,
     },
 
-    /// Subscript: `target[index]` — **collection lookup only**. Projecting a product
-    /// is a different operation and has its own spelling, [`Expr::Attribute`].
+    /// Subscript: `target[index]`, or the **checked** form `target[index]?` —
+    /// **collection lookup only**. Projecting a product is a different operation and
+    /// has its own spelling, [`Expr::Attribute`].
+    ///
+    /// The two subscript forms are one syntactic form because they are one operation —
+    /// evaluate a finite function at a point — differing only in what happens when the
+    /// point may be absent. `checked` yields `Option(V)` and always type-checks; the
+    /// plain form yields `V` and requires the index's presence to be *provable*
+    /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
     Subscript {
         target: Box<Spanned<Expr>>,
         index: Box<Spanned<Expr>>,
+        checked: bool,
     },
 
     /// Attribute access: `target.attr` — a record field by **name** (`r.age`) or a

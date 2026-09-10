@@ -25,28 +25,31 @@ one, so the operation layer has nothing to dispatch on between them.
 
 > **What is built.** Everything in this document is implemented unless it is tagged
 > `[Planned]` (e.g. the operation layer). Where a `[Planned]` feature has an interim
-> behavior in today's code, that is tagged `[Interim]`.
+> behavior in today's code, that is tagged `[Interim]`; a section whose operators are partly
+> built is tagged `[Partly implemented]`.
 
 ## The six collection types
 
-With `𝐷` a witness domain and `𝑛` a length:
+With `𝐷` a witness domain and `𝑛` a length. Each entry gives the type's semantics rather
+than its status: which lookups type-check today is in
+[Lookup: membership discharge](#lookup-membership-discharge), and `in` is [Planned] with the
+rest of the [operation layer](#operations-how-the-trait-layer-dispatches-planned).
 
-- **`Array(𝑛, 𝑇)`** = `[0, 𝑛) ⤇ 𝑇` — domain `UIntRange(n)`, length *static*.
-  Ordered. Lookup `arr[𝑖] : 𝑇` — total, because the bound `{𝑖 | 𝑖 < 𝑛}` is
-  statically dischargeable. This is the shape the compiler builds for a list
-  literal today.
-- **`List(𝑇)`** = `Σ (𝐷 : UIntRanges). 𝐷 ⤇ 𝑇` — *some* index range, which one not
-  necessarily known statically. Ordered. Lookup `lst[𝑖] : Option(𝑇)` — the bound is not
-  statically dischargeable, so lookup is partial. The length is the witness domain's size,
-  so `len` is its first projection rather than a stored field.
+- **`Array(𝑛, 𝑇)`** = `[0, 𝑛) ⤇ 𝑇` — domain `UIntRange(n)`, length static.
+  Ordered. Lookup `arr[𝑖] : 𝑇` is total, the index bound being static. This is the shape the
+  compiler builds for a list literal today.
+- **`List(𝑇)`** = `Σ (𝐷 : UIntRanges). 𝐷 ⤇ 𝑇` — some index range, which one not
+  necessarily known statically. Ordered. The range is not static, so nothing proves an index
+  present and the lookup is the checked `lst[𝑖]? : Option(𝑇)`. The length is the witness
+  domain's size, so `len` is its first projection rather than a stored field.
 - **`Set(𝐾)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ unit` — a key domain with trivial codomain;
   the domain is the payload. Unordered. Membership `𝑒 in 𝑠` discharges `𝑒`'s
   presence in the domain.
 - **`Map(𝐾, 𝑉)`** = `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` — a key domain; a concrete one's keys are
   typed `{𝑘: 𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`
   ([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)).
-  Unordered. Lookup `𝑚[𝑘] : Option(𝑉)` in general, `: 𝑉` when presence discharges (see
-  [Lookup](#lookup-membership-discharge)). Membership `𝑘 in 𝑚`.
+  Unordered. Lookup `𝑚[𝑘] : 𝑉` where the key's type proves it present, `𝑚[𝑘]? : Option(𝑉)`
+  where nothing does. Membership `𝑘 in 𝑚`.
 - **`FullMap(𝐾, 𝑉)`** = `(𝑘: 𝐾) ⤇ 𝑉` — a value for **every** key of `𝐾`, so the key set is
   readable from the type and `𝑚[𝑘] : 𝑉` needs no proof. Unordered. `𝑉` may depend on `𝑘`,
   which is why `groupby` returns one and no `Map` describes it
@@ -150,7 +153,9 @@ on `𝑘`**.
 That dependency decides what the type is: a [`FullMap`](#the-six-collection-types), not a
 `Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
 annotation or consumer converts one into the other, so a group-by is consumed at the type
-it has.
+it has. A checked lookup answers at the key, the binder discharging to the key term
+([The checked lookup `𝑐[𝑘]?`](#the-checked-lookup-𝑐𝑘)); what it cannot do is
+materialize, a group being a collection.
 
 ### The key domain is the key morphism's image
 
@@ -305,9 +310,9 @@ become the per-type standard-library instances with no semantic change. Everythi
   **[Interim]:** today the loop binds the codomain unconditionally (a map iterates
   values, as `groupby` results do); the per-type element choice is the [Planned]
   work and only *adds* cases — it does not change the tuple-binder form.
-- **Lookup.** The two operators `[]` (proven) / `[]?` (optional) are the surface;
-  their single shared mechanic is one domain-membership refinement that either
-  discharges (`: 𝑇`) or does not (`: Option(𝑇)`).
+- **Lookup.** The two operators `[]` (proven, `: 𝑇`) and `[]?` (optional, `: Option(𝑇)`)
+  share one mechanic, the domain-membership refinement: `[]` requires it to discharge and is
+  a type error otherwise, `[]?` decides it at runtime instead.
 - **Membership (`in`).** `Map`/`Set`'s instance tests the domain, `List`/`Collection`'s
   the codomain (Python semantics). A key-membership guard refines the key (`if k in
   m` ⟹ `k` carries the domain-membership proof), which is what a proven `[]` needs.
@@ -336,18 +341,114 @@ become the per-type standard-library instances with no semantic change. Everythi
 
 ## Lookup: membership discharge
 
-> **[Planned]** — `c[k]` lowers as the lookup `c(k)`, but no rule discharges the index's
-> membership, so it is a type error at the `Apply` for every index. The surface operators are
-> specified in [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access);
-> this is the mechanic that decides which one type-checks.
+> **[Partly implemented]** — the two surface operators, proven `c[k] : 𝑇` and checked
+> `c[k]? : Option(𝑇)`, are specified in
+> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
+> `c[k]?` types today for a `Map` or `Set` whose type is known at the lookup
+> ([`Builtin::LookupChecked`]). The proven `c[k]` answers on a `FullMap`, whose key set is
+> the key type itself, and is a type error naming `c[k]?` on every other collection — which
+> is the design rather than a missing rule, since no expression yields a key carrying its
+> collection's key domain while iteration binds the codomain.
 
-Lookup is uniform across ranges and keys: `𝑐[𝑥]` is well-typed when `𝑥`'s type proves
-`𝑥 ∈ dom(𝑐)`, and its totality is *whether that proof discharges*. Membership rides on the
-**element's** type, not the collection's, so iterating a collection's own domain hands the
-proof over and `m[k]` is total there, while a key from outside carries no proof and takes
-the checked `m[k]?`. The range case is the same rule at a different domain: `arr[𝑖] : 𝑇`
-where `{𝑖 | 𝑖 < 𝑛}` discharges, `lst[𝑖]? : Option(𝑇)` where it cannot. One mechanic covers
-all four collection types rather than one per type.
+`𝑐[𝑘]` is application. It lowers to `𝑐(𝑘)` and carries an application's one obligation, that
+the argument's type is a subtype of the function's domain — subscript and call are the same
+operation ([chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)).
+
+### The checked lookup `𝑐[𝑘]?`
+
+`𝑐[𝑘]?` is its own total operation, answering `Option(𝑉)` for any key. A collection is a
+total function on its own domain and says nothing about keys outside it, so neither half of
+the operation is a reading: the typing rule cannot be an application, and the operator has
+to search.
+
+**The rule**, four steps in `emit_lookup_checked`:
+
+1. **Take the key domain, the key binder and the codomain off the collection**
+   (`keyed_access_types`). An abstract `Map(𝐾, 𝑉)` is a Σ over `SubtypesOf(𝐾)`, so the sum
+   is instantiated at `𝐾` by the ordinary Σ rule; a concrete `Map` is already the function.
+2. **Substitute the key term for the key binder** in the codomain (`keyed_value_at`), so a
+   group-by's `𝑔[𝑘]` answers the group refined at `𝑘`
+   (`a_key_dependent_lookup_discharges_the_key_binder`).
+3. **Require the key's type below the key domain's base**, the membership refinement peeled
+   off (`keyed_access_value`).
+4. **Answer `Option`** of step 2's value, and stamp the builtin with the pair it is applied
+   to and that result, so later passes read one type off the node.
+
+Step 3 is the whole of the key's obligation, and it is what an application cannot express.
+An application requires its argument to lie in the function's domain, and a checked lookup
+is reached exactly where that is unknown, so typing it as one would first have to relax
+`𝑐`'s domain — and a collection type with its domain relaxed is a type no value has.
+Peeling the refinement instead leaves the key owing `𝐾` and nothing more, which is right
+because the refinement is what says which keys are present, and deciding presence is the
+operator's job at runtime.
+
+**Not an application, typed where applications are.** The category is a claim about the
+rule and not about the term: lowering emits `(𝑐, 𝑘) ▷ lookup?`, an ordinary application of
+a builtin, so `emit_apply` is where the node arrives and the rule is reached by intercepting
+it there. Giving the rule its own emission path would mean giving `𝑐[𝑘]?` its own
+`TypedExprNode`, which buys nothing the interception does not: the four steps above run
+whole, and no application rule runs on the way past. A scheme is what cannot express it —
+a scheme would have to name the key type, only a `SubtypesOf(𝐾)` kind states one, and every
+concrete collection would then need an entry term first, which only a typed pass can decide
+to insert.
+
+Step 3 is an edge in one direction, and that is load-bearing. Relating the key and the
+collection's keys to a common supertype — the literal reading of `SubtypesOf` — is satisfied
+by any join, so a `String` key against an `Int`-keyed map would widen the key type rather
+than fail (`a_checked_lookup_is_not_an_application`).
+
+Step 2 is sound because step 3 asks nothing of the key beyond `𝐾`. `𝑘` is only maybe
+present, and the substituted type stands for any key of the key type, denoting the empty
+group where the key is absent — `` `none `` against `` `some `` of an empty group is what
+distinguishes the two cases. The binder's declared domain is where the binder was
+introduced, not something the key has to satisfy.
+
+[`Builtin::CollectionContains`] is the same rule one payload lighter — `∀ι κ. (ι ⤇ κ) ⇒
+(κ ⇒ Bool)`, a runtime-decided question behind a total function. It names the key set
+`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` at the type level and is never executed; `𝑐[𝑘]?`
+answers the same question with the value instead of a tag.
+
+**The operator.** Lowering emits `(𝑐, 𝑘) ▷ lookup?`, which op-conversion compiles to a
+[`CheckedLookup`] taking the collection and the key as separate sources: it searches the
+collection's domain for the key and emits `` `some(𝑐(𝑘)) `` or `` `none ``.
+
+**Absence is decided, not read off an empty tile.** An empty tile means "no rows known
+here", which covers both a key genuinely absent and a producer that has not converged.
+Answering `` `none `` from emptiness would make the tag a function of how far the source had
+run rather than of the collection's value, so the same lookup on a live source would answer
+`` `none `` and later `` `some `` — and a live source is the ordinary case here. Terminality
+is therefore the **readiness** condition: `CheckedLookup` withholds until the domain is
+decided, and only then answers `` `none ``.
+
+**A lookup on an unpinned live domain never decides absence.** Terminality stands in for
+"the domain has a definite value", and a live feed has one only where something pins it —
+a filter against `txn.current_time()`, or a store read inside `with begin():`. Neither
+terminates, so the present condition withholds `` `none `` from both, and a lookup over a
+bare live feed withholds it forever. The condition a pin would state, and why unboundedness
+is the wrong predicate for it, is
+[chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
+
+Emission computes step 2's discharge; a check reads it back off the operator's stamped type
+rather than re-running it. Planning compiles a refinement's predicate to point-free form,
+and compilation records the binder's type on the `const` minted to carry it — a place
+substituting the binder's occurrence does not reach — so a discharge re-run after planning
+builds a term emission never produced (`Typing::keyed_value_at`).
+
+The operator's domain is a pair, so it never produces a function value. Its point-free form
+is a morphism from a zip, `⟨𝑐, 𝑘⟩ ≫ lookup?`, and a collection reaches that zip one way: one
+collection for the whole iteration, its leg closed in the loop binder. `simplify`'s
+partial-lookup rule rewrites `⟨const(𝑐), 𝑔⟩ ≫ lookup?` to `𝑔 ≫ (𝑐 ▷ curry(lookup?))`, and
+op-conversion compiles that partial application to a collection read once with every key
+answered against it. The rewrite is not an optimization: a streamed collection cannot be
+replicated into every row, because broadcasting copies a single present value and a
+collection is a tile.
+
+**A collection-valued answer does not materialize.** A group-by's rows are themselves
+collections, so the answer would carry a collection as its `` `some `` payload, and a
+variant payload that is a collection has no materialization. Op-conversion rejects that
+shape by name (`a_group_valued_lookup_is_rejected_by_name`). It is also the case where
+presence and emptiness genuinely differ: a `Map(𝐾, Collection(𝑉))` can store an empty
+collection at a present key.
 
 ### Prerequisite: the proof has to survive being consumed
 

@@ -1,10 +1,12 @@
 use bit_set::BitSet;
-use std::{cell::RefCell, rc::Rc};
 
 use super::*;
 use crate::{
     ccl::TagMap,
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value},
+    interpreter::{
+        ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value, forwarding_consumer,
+        shared_consumer,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -262,19 +264,17 @@ impl TileOperator for UnionOperator {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter_mut()
             .map(|op| {
                 op.subscribe(
                     op.tiling().universal_guard(),
-                    Box::new(consumer_wrapper.clone()),
+                    forwarding_consumer(&shared),
                     scheduler,
                 )
             })
@@ -460,6 +460,7 @@ mod tests {
     use crate::ccl::FieldKey;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     // ── UnionProducer::release_impl ───────────────────────────────────────────
 

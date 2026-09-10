@@ -801,7 +801,11 @@ fn lower_expr_inner(
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::tuple(items?))
         }
-        ChlExpr::Subscript { target, index } => lower_subscript(target, index, ctx),
+        ChlExpr::Subscript {
+            target,
+            index,
+            checked,
+        } => lower_subscript(target, index, *checked, expr.span, ctx),
         // Record value `(name=expr, ...)`. Lowered to a `Record` constructor:
         // `(x=1, y="foo")` becomes `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
         ChlExpr::Record(fields) => {

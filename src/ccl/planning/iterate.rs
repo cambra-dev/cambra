@@ -209,6 +209,17 @@ pub(super) fn insert_iterate_recurse(
                 wrap_with_iterate(operand, discharged, "copair-operand");
             }
         }
+        // The **checked lookup**'s collection is compiled with `input=None` (`𝑐 ▷ lookup?`
+        // reads the collection once and takes the keys as its input), so it is an
+        // iteration site.
+        TypedExprNode::Apply { argument, function }
+            if matches!(
+                &function.node,
+                TypedExprNode::Builtin(Builtin::LookupChecked)
+            ) =>
+        {
+            wrap_with_iterate(argument, discharged, "checked-lookup-collection");
+        }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.
         TypedExprNode::Apply { argument, function }

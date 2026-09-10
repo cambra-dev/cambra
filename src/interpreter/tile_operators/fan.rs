@@ -1,10 +1,12 @@
 use bit_set::BitSet;
 use log::trace;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::collections::HashMap;
 
 use super::*;
 use crate::{
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, tuple_field},
+    interpreter::{
+        ColumnValue, Consumer, Extent, Scheduler, forwarding_consumer, shared_consumer, tuple_field,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -202,12 +204,10 @@ impl TileOperator for FanIn {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         Box::new(FanInProducer {
             base: ProducerBase::new(FanInProducer::alloc_id(), &self.tiling),
             names: self.names.clone(),
@@ -217,7 +217,7 @@ impl TileOperator for FanIn {
                 .map(|i| {
                     i.subscribe(
                         i.tiling().universal_guard(),
-                        Box::new(consumer_wrapper.clone()),
+                        forwarding_consumer(&shared),
                         scheduler,
                     )
                 })
@@ -517,12 +517,10 @@ impl TileOperator for ScalarFanIn {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
+        let shared = shared_consumer(consumer);
         Box::new(ScalarFanInProducer {
             base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &self.tiling),
             names: self.names.clone(),
@@ -532,7 +530,7 @@ impl TileOperator for ScalarFanIn {
                 .map(|i| {
                     i.subscribe(
                         i.tiling().universal_guard(),
-                        Box::new(consumer_wrapper.clone()),
+                        forwarding_consumer(&shared),
                         scheduler,
                     )
                 })

@@ -923,13 +923,39 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 >
 > So `arr[i]: T` and `lst[i]?: Option(T)` are one operator pair on two proof
 > outcomes, as are `m[k]: V` for a key known present and `m[k]?: Option(V)`
-> otherwise. A `Set` has no subscript — its keys are its content, so test it with
-> `k in s` (below). A `FullMap` (§6.3) discharges every key by construction, so
-> `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
-> *Partiality*, §3). **Partly implemented** — `c[k]` lowers as the lookup `c(k)`, so a
-> `FullMap` subscript answers `V` today, its key set being the key type itself. For every
-> other collection nothing discharges the index's membership, so the subscript is a type
-> error whatever the index.
+> otherwise. A `Set` is `Map(K, unit)`, so `s[k]?: Option(unit)` states membership as a
+> value — `` `some `` for a present key, `` `none `` for an absent one — where `k in s`
+> (below) states it as a `Bool`. A `FullMap` (§6.3) discharges every key by construction,
+> so `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
+> *Partiality*, §3). **Partly implemented** — `c[k]?` answers on a `map` and a `set`; on a
+> `groupby` it types (the group's type names the key it was looked up at) and is rejected
+> when compiled, because nothing materializes a collection as an `` `some `` payload; and
+> on a list it is rejected, because a range domain carries no membership to decide.
+> `c[k]` lowers as the lookup `c(k)`, so a `FullMap` subscript answers `V` today, its key
+> set being the key type itself; for every other collection nothing discharges the index's
+> membership, so the proven subscript is a type error whatever the index.
+
+> **Direction [Open] — `c[k]?` decides absence at a cut.** Answering `` `none ``
+> requires knowing the collection's domain has a definite value, and today's condition
+> for that is **termination**: the operator withholds `` `none `` until the domain is
+> terminal. A live source never terminates, so a lookup over one answers `` `some `` or
+> never answers.
+>
+> Termination is standing in for the property actually needed, which is that the domain is
+> **pinned at a cut**. `orders.filter(\o -> o.time < txn.current_time())` is a pinned view
+> of a feed that never ends, and it is decided; a `Mut(…, Txn)` store read inside `with
+> begin():` is pinned by the transaction the same way. The condition should be the pin, so
+> that both of those answer and only a bare unpinned feed does not.
+>
+> Unboundedness is the wrong predicate: it would reject the north-star `txn_kv`, which does
+> an `Option` lookup on a live transactional store. Two alternatives are declined. A
+> provisional `` `none `` corrected later is a cut with better ergonomics rather than a
+> separate design, and arrives with incremental view maintenance. A timeout or watermark
+> makes the answer a function of wall-clock, which is the nondeterminism this operator
+> already refuses when it declines to read absence off an empty tile.
+>
+> Until a pin is expressible, a lookup on an unpinned live domain never decides absence
+> ([collections.md, The checked lookup](../src/ccl/design/collections.md#the-checked-lookup-𝑐𝑘)).
 
 ### 3.10 Lambda
 
@@ -2234,8 +2260,8 @@ and how the checker carries the distinction, is
   (§3.9).
 - `List(T)` — values in order, count known only at runtime. `lst[i]?:
   Option(T)`, since nothing bounds `i`.
-- `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4); there
-  is no subscript, because the keys are the content. The checker does not yet
+- `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4) as a
+  `Bool`, or `s[k]?: Option(unit)` (§3.9) as a value. The checker does not yet
   tell a `Set(K)` from a `Map(K, unit)`; both lower to one type
   ([collections.md, "Telling `Set` and `Map` apart [Open]"](../src/ccl/design/collections.md#telling-set-and-map-apart-open)).
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
