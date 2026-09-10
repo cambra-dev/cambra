@@ -23,7 +23,7 @@ fn source(text: &str, port: u16) -> String {
 /// one `Transact` store bound to `__hist`, and a read of one is a projection off
 /// that binding. While the store was registered outside the conversion scope,
 /// `__hist` was free in every such term and hashed by its bare spelling, so
-/// `sign_resps` (`__hist.to_sign_resps_0`) hashed identically however the
+/// `sign_resps` (`__hist.__to_sign_resps_0`) hashed identically however the
 /// recurrence was edited, and its operator was reused against a store that no
 /// longer computed what it had. The edit was accepted, reported as a divergence,
 /// and silently did nothing.

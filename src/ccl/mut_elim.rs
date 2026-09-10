@@ -2107,7 +2107,7 @@ fn transform_chain(
     }
 }
 
-/// The `writes` tuple elements of a `{commit, writes(, to_*)}` decision record
+/// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
 /// (as [`transform_chain`] builds it) — one *self-contained* expression per
 /// accumulator, in accumulator order. A branch's write introduces RYW `let`s
 /// (`let total = __p.0 + __p.1 in {…, writes: (total)}`) that the merged

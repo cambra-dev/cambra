@@ -166,7 +166,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 // value each iteration, producing a running-total stream.  This routes
 // through the causal `LetRec` the unified phase emits (recognized onto the
 // `Transact` carrier, then the induction store), with the yield-defer hoisted out as a
-// `to_*` feed field on the history record.
+// `__to_*` feed field on the history record.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(

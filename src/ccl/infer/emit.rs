@@ -2511,7 +2511,7 @@ pub(super) fn emit_transact<C: Typing>(
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, ctx)?;
         // A `__to_<defer>` field on the writer's decision record becomes a
-        // virtual mutable variable key the consumer reads as `__hist.to_…`. Its stream
+        // virtual mutable variable key the consumer reads as `__hist.__to_…`. Its stream
         // is **site-domained** — one tap value per iteration of *this
         // writer's* source (the channel unions channelize assembled reference
         // it at that type) — unlike the key histories, which live over the

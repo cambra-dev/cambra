@@ -678,7 +678,7 @@ variable's history:
 let __hist : {pool#6: (Txn ⇒ Int), to_out_0: ([0, 2] ⇒ Int), to_out_1: ([0, 0] ⇒ Int)} =
   transact (pool = 100) { [pool]⇒[pool] over iterate ≫ [10, 20, 30] do <decision>;
                           [pool]⇒[pool] over iterate ≫ [unit]         do <decision> }
-in let out : ([0, 2] | [0, 0] ⇒ Int) = __hist.to_out_0 ⊎ __hist.to_out_1
+in let out : ([0, 2] | [0, 0] ⇒ Int) = __hist.__to_out_0 ⊎ __hist.__to_out_1
 in __hist.pool#6 ▷ final_read
 ```
 
