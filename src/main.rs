@@ -10,7 +10,7 @@ use cambra::{
         Consumer,
         tile_operators::{FunctionGuard, Tile, TileGuard},
     },
-    live_program::LiveProgram,
+    live_program::{LiveProgram, render_unreadable},
     pretty_graph::pretty_tile_operator,
     web_inspector::WebInspector,
 };
@@ -49,7 +49,11 @@ fn poll_control(
     let Some(message) = port.poll() else { return };
     let reply = match message.request() {
         ControlRequest::Diff { code, phase } => match live.diff_against(ctx, code, *phase) {
-            Ok(rendered) => ControlReply::ok(rendered),
+            Ok(report) => ControlReply::ok(format!(
+                "{}{}",
+                report.diff,
+                render_unreadable(&report.unreadable)
+            )),
             Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
         },
         ControlRequest::Reload { code } => match live.reload(ctx, code, main_consumer) {
@@ -58,11 +62,10 @@ fn poll_control(
                 // the driver for one pass.
                 *new_data.borrow_mut() = true;
                 let ReuseTally { kept, bound } = report.reuse;
-                let unreadable: String =
-                    report.unreadable.iter().map(|u| format!("\n{u}")).collect();
                 ControlReply::ok(format!(
-                    "reloaded: {kept}/{bound} operators kept{unreadable}\n\n{}",
-                    report.diff
+                    "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+                    report.diff,
+                    render_unreadable(&report.unreadable),
                 ))
             }
             Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),

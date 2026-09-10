@@ -327,10 +327,12 @@ is offered what the retired one already committed —
 
 1. Render the difference between the running source and the new one, which compiles both to
    `Phase::AsOfRead`.
-2. Compile the new version to `Phase::Planning` against the endpoint registry, opening the endpoints
-   it adds and keeping them, and run the state guard on the planned tree. Neither step builds an
-   operator, so a version that fails either leaves the running program serving; a refusal here hands
-   the ports back (`release_unrouted_ports`).
+2. Compile the new version to `Phase::Planning` against the endpoint registry, binding a port it
+   adds and keeping the listener, and run the state guard on the planned tree. Neither step builds
+   an operator, so a version that fails either leaves the running program serving; a refusal here
+   hands the ports back (`release_unrouted_ports`). The report of every variable that begins above
+   its loop's input comes off this same tree, which is why a reload derives it once and carries it
+   in `ReloadReport` rather than rendering it into the difference.
 3. Tear down the running graph: detach its sinks, drop its outputs.
 4. `GlobalContext::retire_version` moves the retiring conversion context's operators and stores into
    the next compilation's inheritance.
@@ -367,9 +369,11 @@ Steps 3 and 4 come after step 2 so that a rejection is never destructive, and be
 what the new version inherits is held by the inheritance and not also by a graph still running.
 
 An accepted reload therefore compiles four times: twice for the diff, once to `Planning` for the
-guard, and once for real. `run_frontend` goes from source to a stop phase and there is no way to
-continue a stopped tree into operator conversion, so the guard's tree cannot be the one that gets
-built — which is why `LiveProgram::reload` documents a panic for the two compiles disagreeing.
+guard and the report, and once for real. `run_frontend` goes from source to a stop phase and there
+is no way to continue a stopped tree into operator conversion, so the guard's tree cannot be the one
+that gets built — which is why `LiveProgram::reload` documents a panic for the two compiles
+disagreeing. `/diff` compiles three times: the same two, and a `Planning` tree of its own, because
+it answers the report without a version to install.
 
 Reuse is keyed on step 5's own tree, not on step 1's or step 2's. Step 1 renders a difference for a
 reader and step 2's tree is thrown away, while a node's identity is its address, so a correspondence

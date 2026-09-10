@@ -119,6 +119,14 @@ fn a_loop_that_cannot_read_its_collection_from_the_start_is_reported() {
         rendered[0].contains("`m`") && rendered[0].contains("element 3"),
         "the report names the variable and where it begins: {rendered:?}",
     );
+    // The report is a field, not part of the difference: a reply that rendered
+    // both would say it twice, and deriving it for the difference as well would
+    // compile the planned tree a second time.
+    assert!(
+        !report.diff.contains("`m`"),
+        "the difference carries the difference and nothing else: {}",
+        report.diff,
+    );
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "4")]);
     assert_eq!(
@@ -1138,7 +1146,8 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 
     let identical = live
         .diff_against(&ctx, &source("guestbook", port), Phase::AsOfRead)
-        .expect("the running source compiles against its own endpoints");
+        .expect("the running source compiles against its own endpoints")
+        .diff;
     assert!(
         identical.contains("no difference"),
         "a program should not differ from itself: {identical}",
@@ -1150,7 +1159,8 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
             &source("guestbook-stateless-edit", port),
             Phase::AsOfRead,
         )
-        .expect("the new version compiles against the running endpoints");
+        .expect("the new version compiles against the running endpoints")
+        .diff;
     assert!(
         changed.contains("divergence"),
         "an edited program should report a divergence: {changed}",
@@ -1367,7 +1377,8 @@ fn diffing_against_a_version_that_drops_a_route_does_not_retire_it() {
             &source("guestbook-drops-route", port),
             Phase::AsOfRead,
         )
-        .expect("the new version compiles against the running endpoints");
+        .expect("the new version compiles against the running endpoints")
+        .diff;
     assert!(
         changed.contains("divergence"),
         "dropping a route is a difference: {changed}",
@@ -1446,7 +1457,8 @@ fn every_offered_phase_is_a_diff_point() {
     for (spelling, phase) in cambra::control_port::OFFERED_PHASES {
         let rendered = live
             .diff_against(&ctx, &source("guestbook-stateless-edit", port), *phase)
-            .unwrap_or_else(|e| panic!("diff at {spelling} failed: {e:?}"));
+            .unwrap_or_else(|e| panic!("diff at {spelling} failed: {e:?}"))
+            .diff;
         assert!(
             rendered.contains("divergence"),
             "the edit should be visible at {spelling}: {rendered}",

@@ -65,7 +65,8 @@ pub struct LiveProgram {
 
 /// What one accepted [`LiveProgram::reload`] did.
 pub struct ReloadReport {
-    /// The rendered difference between the two versions.
+    /// The rendered difference between the two versions, and nothing else: the
+    /// report below is a second answer about the same pair, not part of it.
     pub diff: String,
     /// How much of the replaced version's graph the new one kept.
     pub reuse: ReuseTally,
@@ -74,6 +75,35 @@ pub struct ReloadReport {
     /// is every reload of a program whose collections are built rather than
     /// read.
     pub unreadable: Vec<UnreadablePrefix>,
+}
+
+/// What one [`LiveProgram::diff_against`] question answered.
+///
+/// The two answers a [`ReloadReport`] carries, minus what only a reload can say,
+/// so `/diff` and `/reload` render alike and an author reads the report before
+/// the swap in the shape it will have after it.
+pub struct DiffReport {
+    /// The rendered difference between the two versions.
+    pub diff: String,
+    /// The loops the new version adds that would begin above the beginning of
+    /// what they read.
+    pub unreadable: Vec<UnreadablePrefix>,
+}
+
+/// What a difference reads as where there is none.
+fn no_difference(phase: Phase) -> String {
+    format!("no difference at phase {phase:?}\n")
+}
+
+/// The loops that begin above the beginning of their input, one per line, and
+/// the empty string for none.
+///
+/// One renderer for both replies, so the note reads the same whether `/diff`
+/// raised it before a swap or `/reload` reported it after. It ends a reply
+/// rather than opening one: what changed is the answer, and this is the caveat
+/// on it.
+pub fn render_unreadable(unreadable: &[UnreadablePrefix]) -> String {
+    unreadable.iter().map(|u| format!("\n{u}")).collect()
 }
 
 impl LiveProgram {
@@ -126,7 +156,8 @@ impl LiveProgram {
         &self.program.source
     }
 
-    /// Render how `code` differs from this version, comparing at `phase`.
+    /// Answer what `/diff` asks: how `code` differs from this version at
+    /// `phase`, and what reloading it would report.
     ///
     /// Compiles both sides against the running sources and sinks, which opens
     /// nothing and leaves the running program untouched: a route the registry does
@@ -139,41 +170,50 @@ impl LiveProgram {
         ctx: &GlobalContext,
         code: &str,
         phase: Phase,
-    ) -> Result<String, Vec<CompileError>> {
+    ) -> Result<DiffReport, Vec<CompileError>> {
+        // A version identical to the running one declares the same variables, so
+        // none of them is new and the report is empty without being asked.
+        let Some(diff) = self.difference(ctx, code, phase)? else {
+            return Ok(DiffReport {
+                diff: no_difference(phase),
+                unreadable: Vec::new(),
+            });
+        };
+        // A reload reports off the planned tree it is about to build. A question
+        // has no such tree, so it compiles one — at `Phase::Planning` whatever
+        // phase the difference was asked at, and without opening ports, which is
+        // what separates asking from doing.
+        let planned = ctx.sources_and_sinks().compile_to(code, Phase::Planning)?;
+        Ok(DiffReport {
+            diff,
+            unreadable: ctx.unreadable_inputs(&self.program.ast, &planned),
+        })
+    }
+
+    /// How `code` differs from this version at `phase`, or `None` where the two
+    /// are identical.
+    ///
+    /// The difference alone. What a reload additionally reports rides its
+    /// [`ReloadReport`] rather than this string, so that a reply carrying both
+    /// neither says the report twice nor compiles the planned tree twice to
+    /// derive it.
+    fn difference(
+        &self,
+        ctx: &GlobalContext,
+        code: &str,
+        phase: Phase,
+    ) -> Result<Option<String>, Vec<CompileError>> {
         let old = ctx.sources_and_sinks().compile_to(self.source(), phase)?;
         let new = ctx.sources_and_sinks().compile_to(code, phase)?;
         let d = diff(&old, &new);
         if d.is_identical() {
-            return Ok(format!("no difference at phase {phase:?}\n"));
+            return Ok(None);
         }
-        Ok(format!(
-            "phase {phase:?}: {} divergence(s), {} shared root(s)\n{}\n{d}",
+        Ok(Some(format!(
+            "phase {phase:?}: {} divergence(s), {} shared root(s)\n\n{d}",
             d.divergences().len(),
             d.shared_roots().len(),
-            self.unreadable_report(ctx, code)?,
-        ))
-    }
-
-    /// The loops `code` adds that would begin above the beginning of what they
-    /// read, rendered for a diff, or the empty string when there are none.
-    ///
-    /// Answered by `/diff` as well as `/reload` so an author sees it before the
-    /// swap rather than in the report of one that already happened. It needs the
-    /// planned tree whatever phase the diff was asked at, so it compiles to
-    /// `Phase::Planning` itself — without opening ports, which is what separates
-    /// asking from doing.
-    fn unreadable_report(
-        &self,
-        ctx: &GlobalContext,
-        code: &str,
-    ) -> Result<String, Vec<CompileError>> {
-        let planned = ctx.sources_and_sinks().compile_to(code, Phase::Planning)?;
-        let unreadable = ctx.unreadable_inputs(&self.program.ast, &planned);
-        if unreadable.is_empty() {
-            return Ok(String::new());
-        }
-        let lines: Vec<String> = unreadable.iter().map(ToString::to_string).collect();
-        Ok(format!("\n{}\n", lines.join("\n")))
+        )))
     }
 
     /// Replace this program with the version `code` describes.
@@ -221,12 +261,14 @@ impl LiveProgram {
         code: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<ReloadReport, Vec<CompileError>> {
-        let diff = self.diff_against(ctx, code, Phase::AsOfRead)?;
-        // This compile opens the endpoints the new version adds and keeps them,
-        // because binding is the one step it and the compile that installs the
-        // version would otherwise not share: a port already in use would fail
-        // only after the running graph was torn down. Refusing below hands the
-        // ports back.
+        let diff = self
+            .difference(ctx, code, Phase::AsOfRead)?
+            .unwrap_or_else(|| no_difference(Phase::AsOfRead));
+        // This compile binds the ports the new version adds and keeps the
+        // listeners, because binding is the one step it and the compile that
+        // installs the version would otherwise not share: a port already in use
+        // would fail only after the running graph was torn down. Refusing below
+        // hands the ports back.
         let planned = ctx
             .sources_and_sinks_mut()
             .compile_to_opening(code, Phase::Planning)
