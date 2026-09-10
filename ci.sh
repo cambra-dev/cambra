@@ -190,9 +190,17 @@ ci_doc_adoption() {
   local base="main"
   if git rev-parse --verify --quiet origin/main >/dev/null; then base="origin/main"; fi
   # Under `jj` the git HEAD sits at the working copy's parent, so `base..HEAD`
-  # would silently check nothing. Ask jj for the tip when it owns the repo.
+  # would silently check nothing. Ask jj for the tip only in the checkout jj is
+  # rooted at: `@` names that one workspace's working copy, and a linked git
+  # worktree is not a workspace of its own, so from a worktree under the jj root
+  # `@` is the root checkout's commit and the gate reads a branch this run never
+  # touched. `-ef` compares the directories, because either path can be spelled
+  # through a symlink.
   local tip="HEAD"
-  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+  local jj_root git_root
+  git_root="$(git rev-parse --show-toplevel)"
+  if command -v jj >/dev/null 2>&1 && jj_root="$(jj root 2>/dev/null)" &&
+    [[ "${jj_root}" -ef "${git_root}" ]]; then
     tip="$(jj log -r @ --no-graph -T 'commit_id')"
   fi
   python3 .github/scripts/doc-adoption.py "${base}" "${tip}" || return 1
