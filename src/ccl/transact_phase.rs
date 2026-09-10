@@ -1152,6 +1152,26 @@ fn strip(
         let TypedExprNode::Begin { body: block } = effect.node else {
             unreachable!("guarded above")
         };
+        // ``match m: case `tag(w): <writes>`` in the block reaches here as a
+        // statement-position tag-`Case`. Convert the whole block once rather than
+        // at each consumer: `collect_footprint` separates a guard's spine reads
+        // from an arm's conditional ones, and `walk_block` scopes each arm's
+        // writes to its path — neither reads a `Pattern`, and after the rewrite an
+        // arm's scrutinee test sits in the guard where the footprint scan wants it
+        // ([`statement_tag_cases_to_guards`](crate::ccl::ccl_utils::statement_tag_cases_to_guards)).
+        let block = {
+            // The rewrite duplicates the scrutinee once per arm, so it needs a
+            // recording of its own: it runs before either block path opens one,
+            // and it applies to both (a writing block and a read-only one may each
+            // dispatch on a tag).
+            let g = provenance::enter(
+                stmt_id,
+                "transact.tag_guards",
+                provenance::Nature::Expansion,
+            );
+            g.blame(&[begin_id]);
+            Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
+        };
         if block_writes_txn(&block, txn_mut_vars) {
             // A writing block → a commit-record site keyed on the *enclosing*
             // loop. Partition it by mutable variable domain: the transactional remainder is
@@ -1505,10 +1525,10 @@ pub fn check_no_guarded_induction_write_in_block(
         && let Some(name) = guarded_non_txn_write(body, txn_mut_vars, false)
     {
         return Err(format!(
-            "`{name}` is written under an `if` inside a `with begin():` block. A guarded \
-             induction write in a transaction block is not supported — move the write outside \
-             the block, or (if it should be shared across the transaction) declare it \
-             `Mut(…, Txn)` and write it directly, not under a branch"
+            "`{name}` is written under an `if` or a `match` arm inside a `with begin():` \
+             block. A branch-guarded induction write in a transaction block is not supported \
+             — move the write outside the block, or (if it should be shared across the \
+             transaction) declare it `Mut(…, Txn)` and write it directly, not under a branch"
         ));
     }
     let mut result = Ok(());
@@ -1826,9 +1846,9 @@ fn contains_await_final(e: &Expr) -> bool {
 }
 
 /// The first non-txn `MutWrite` target that appears **inside a statement-`Case`**
-/// (an `if` arm) within `block` — a guarded induction write. `in_case` marks
-/// whether the walk is currently under such an arm; a guard is spine-evaluated,
-/// so only arm *bodies* set it.
+/// (an `if` or `match` arm) within `block` — a guarded induction write. `in_case`
+/// marks whether the walk is currently under such an arm; a guard is
+/// spine-evaluated, so only arm *bodies* set it.
 fn guarded_non_txn_write(
     block: &Expr,
     txn_mut_vars: &HashSet<Name>,
@@ -1838,10 +1858,10 @@ fn guarded_non_txn_write(
         TypedExprNode::MutWrite { name, .. } if in_case && !txn_mut_vars.contains(name) => {
             return Some(name.clone());
         }
-        TypedExprNode::Case {
-            scrutinee: None,
-            branches,
-        } => {
+        // Both `Case` forms: an `if` arm and a `match` arm are equally
+        // conditional, and this walk runs before the tag-to-guard rewrite, so it
+        // has to recognize the tag form as it stands.
+        TypedExprNode::Case { branches, .. } => {
             for b in branches {
                 if let Some(n) = guarded_non_txn_write(&b.body, txn_mut_vars, true) {
                     return Some(n);
@@ -2121,11 +2141,11 @@ fn build_writer(
     writes.ty = Type::Tuple(write_tys.clone());
 
     // Decision record `{commit, writes, to_<defer>*}` — built by the shared
-    // `writer_decision_record` (the one place the tap/`__fire` encoding lives, so
-    // the induction writer and this transaction writer stay in lockstep). The
-    // in-block feeds ride as `to_<defer>` taps (read-your-writes value + a
-    // `__fire` gate when their path is narrower than the commit); `feed_sites`
-    // records the defer/field/type the phase hoists.
+    // `writer_decision_record` (the one place the tap encoding lives, so the
+    // induction writer and this transaction writer stay in lockstep). The in-block
+    // feeds ride as `to_<defer>` taps, each holding its read-your-writes value
+    // under `` `fired `` on the positions its own path admits; `feed_sites` records
+    // the defer/field/type the phase hoists.
     let feed_sites: Vec<FeedSite> = collected_feeds
         .iter()
         .map(|(defer, field, val, _)| FeedSite {
@@ -2310,8 +2330,8 @@ fn walk_block(
                 // (its path == commit). A feed under one arm of genuine cross-key
                 // *routing* (path ⊊ commit) would over-fire on a sibling route's
                 // commit — so the feed records its own `path`, and the decision
-                // assembler emits a per-tap `__fire` field (this path) the engine
-                // checks, unless the path *is* the commit (then it always fires).
+                // assembler makes that path the tap's `` `fired `` condition,
+                // unless the path *is* the commit (then it wraps unconditionally).
                 TypedExprNode::Feed { name, value } => {
                     let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     let field = format!("to_{}_{}", name.base(), *feed_counter);
@@ -2698,7 +2718,12 @@ fn record_field_ty(ty: &Type, field: &str) -> Type {
 struct HoistedFeed {
     defer: Name,
     tap: Name,
+    /// The raw tap stream's type — `` 𝐼 ⇒ {`fired{𝑉} | `idle} ``, as the decision
+    /// carries it.
     tap_ty: Type,
+    /// The fed value type `𝑉`, which the channel carries after `` `fired `` is
+    /// eliminated.
+    value_ty: Type,
 }
 
 /// Assemble the transaction `letrec` from the built writers/keys/feeds and
@@ -2870,12 +2895,18 @@ fn plan_store(
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
-            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), f.value_ty.clone());
+            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value_ty.clone());
+            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone());
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
             let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
+            // The decision carries the tap as `` {`fired{𝑉} | `idle} ``, and the
+            // binding is that stream verbatim — recognition reads the history
+            // record's tap field type off it, and the store holds what the
+            // decision put there. The `` `fired `` elimination happens at the feed
+            // hoist below, where the channel wants the fed value.
             let mut field_proj = Expr::proj_field(f.field.clone());
-            field_proj.ty = Type::fun(payload_ty.clone(), f.value_ty.clone());
+            field_proj.ty = Type::fun(payload_ty.clone(), tap_value_ty.clone());
             let mut tap_expr = Expr::compose(vec![
                 tvar(&commits[j], commits_ty.clone()),
                 dec_proj,
@@ -2888,6 +2919,7 @@ fn plan_store(
                 defer: f.defer,
                 tap: tap_name,
                 tap_ty,
+                value_ty: f.value_ty.clone(),
             });
         }
     }
@@ -3103,7 +3135,20 @@ impl StorePlan {
     fn feed_views(&self) -> Vec<(Name, Expr)> {
         self.hoisted
             .iter()
-            .map(|f| (f.defer.clone(), tvar(&f.tap, f.tap_ty.clone())))
+            .map(|f| {
+                // The channel carries the fed value at the positions the tap
+                // fired, so the hoist eliminates `` `fired `` off the raw tap.
+                let mut view = Expr::compose(vec![
+                    tvar(&f.tap, f.tap_ty.clone()),
+                    crate::ccl::ccl_utils::fired_project(f.value_ty.clone()),
+                ]);
+                view.ty = Type::fun_like(
+                    &f.tap_ty,
+                    f.tap_ty.domain().unwrap_or(Type::Hole),
+                    f.value_ty.clone(),
+                );
+                (f.defer.clone(), view)
+            })
             .collect()
     }
 }

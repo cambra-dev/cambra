@@ -1454,13 +1454,13 @@ impl TileProducer for InductionStoreProducer {
                         .collect(),
                 )
             } else {
-                // Carry: no change is appended, so a tap (fired or not) contributes
-                // nothing at this position — an *ungated* tap (one whose fire path
-                // is the commit itself, so it carries no `__fire` gate) reads
-                // `tap_fired = true` by default, but a carry position records it
-                // nowhere, which is correct: the letrec phase folds every feed-fire
-                // path into `commit`, so a position that genuinely fires a tap
-                // commits (and takes the branch above) rather than carrying here.
+                // Carry: no change is appended, so a tap contributes nothing at this
+                // position, whatever its tag. A tap whose fire path is the commit
+                // itself is `` `fired `` at every position the decision exists at,
+                // and a carry position records it nowhere — which is correct: the
+                // letrec phase folds every feed-fire path into `commit`, so a
+                // position that genuinely fires a tap commits (and takes the branch
+                // above) rather than carrying here.
                 None // the accumulator holds from tick 0 / the latest change
             };
             self.engine.step(pos + 1, write_set);
@@ -3384,6 +3384,12 @@ fn is_commit_tag(tag: &crate::ccl::FieldKey) -> bool {
     matches!(tag, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_COMMIT)
 }
 
+/// The `` `fired `` tag of a tap variant `` {`fired{𝑉} | `idle} ``. Matched by name
+/// for the reason [`is_commit_tag`] is.
+fn is_fired_tag(tag: &crate::ccl::FieldKey) -> bool {
+    matches!(tag, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_FIRED)
+}
+
 /// The newest position present in a body-input tile — the attempt a writer is
 /// currently deciding, superseding any older live one (see the caller). `None`
 /// when the driver has emitted nothing live.
@@ -3424,12 +3430,12 @@ fn next_decided_position(tile: &Tile, pos: usize) -> Option<usize> {
 /// `Scalar(Union)` column, one `Value::Union { tag, inner }` per position.
 /// `abort` (any tag but `commit` — see [`is_commit_tag`]) is a whole-transaction deny — no writes, no
 /// taps (carry / no proposal). `commit` carries the dense payload record `𝑃 =
-/// {writes: (new₀, …), to_<defer>*(, to_<defer>__fire)*}`.
+/// {writes: (new₀, …), to_<defer>*}`, each tap holding `` {`fired{𝑉} | `idle} ``.
 ///
 /// Returns `(commit, writes, tap_fired)`: `commit` gates grant vs deny; `writes[j]`
 /// is the new value for `write_keys[j]` (carry writes then tap values, in that
 /// order); and `tap_fired[t]` says whether tap `tap_fields[t]` fires at this
-/// position (its `__fire` gate inside the payload, or `true` for an ungated tap).
+/// position (its `` `fired ``/`` `idle `` tag).
 /// A committing decision applies a carry write and a *fired* tap, but not a
 /// non-fired tap.
 fn body_decision_at(
@@ -3478,19 +3484,25 @@ fn body_decision_at(
         Value::Unit => {}
         _ => return None,
     }
-    // Per tap, its value and whether it *fires* at this position. A tap with a
-    // companion `<tap>__fire` field in the payload (a feed under cross-key routing)
-    // fires only where that gate holds; a tap without one (a single-guard/spine
-    // feed) always fires with its committing transaction.
+    // Per tap, its value and whether it *fires* at this position. A tap holds
+    // `` {`fired{𝑉} | `idle} ``, so the tag answers both at once: `` `fired ``
+    // carries the fed value, and `` `idle `` is a position the tap's own route did
+    // not admit — a sibling route's commit, which must not over-fire this reply.
+    // An `` `idle `` position still occupies its slot in `writes`, because the
+    // caller indexes that vector by `write_keys` and drops the non-fired entries
+    // by `tap_fired`; `Unit` is the value nothing reads.
     let mut tap_fired = Vec::with_capacity(tap_fields.len());
     for tap in tap_fields {
-        writes.push(payload.get(tap)?.clone());
-        let fire_field = format!("{tap}{}", crate::ccl::F_FIRE_SUFFIX);
-        let fired = match payload.get(&fire_field) {
-            Some(Value::Bool(b)) => *b,
-            _ => true,
+        let value = payload.get(tap)?.clone();
+        let Value::Union { tag, .. } = &value else {
+            return None;
         };
-        tap_fired.push(fired);
+        // The tag is the gate. The *value* goes to the store as it stands, tag and
+        // all: the IR reads a tap through ``variant_project(`fired)``, so the
+        // stream's restriction to fired positions happens there, on a value whose
+        // type says what it is.
+        tap_fired.push(is_fired_tag(tag));
+        writes.push(value);
     }
     Some((true, writes, tap_fired))
 }

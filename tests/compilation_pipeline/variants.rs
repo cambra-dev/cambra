@@ -1441,3 +1441,252 @@ p"#;
 fn test_const_lifted_arm_is_point_free(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
+
+// A `match` in a for-loop body dispatches on `variant_is` guards, so its arms
+// are the boolean-guard `Case` an `if` chain builds and the writer decision
+// merges them the same way.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case `b:
+                acc += 10
+    acc"}, Value::Int(12))]
+// `case _:` is already the fallback the trailing `true` guard names.
+#[case(indoc! {"
+    acc := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case _:
+                acc += 10
+    acc"}, Value::Int(12))]
+// An arm that does not write an accumulator is that accumulator's carry
+// position, as an `if` without an `else` is. Each arm here writes one of the
+// two, so each is a non-writing arm for the other.
+#[case(indoc! {"
+    acc := 0
+    other := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case `b:
+                other += 100
+    acc"}, Value::Int(2))]
+#[case(indoc! {"
+    acc := 0
+    other := 0
+    for m in [`a, `b, `a]:
+        match m:
+            case `a:
+                acc += 1
+            case `b:
+                other += 100
+    other"}, Value::Int(100))]
+fn test_match_in_a_for_loop_body(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// An arm reading its payload projects it out of the scrutinee, inside a writer
+// body whose driver reclaims the prefix it has consumed. The projection narrows
+// the domain but preserves keys, so it forwards that release to the scrutinee
+// rather than refusing it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    acc := 0
+    for m in [`a(2), `b(3), `a(5)]:
+        match m:
+            case `a(n):
+                acc += n
+            case `b(k):
+                acc += k
+    acc"}, Value::Int(10))]
+fn test_match_arm_reading_its_payload_in_a_loop(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A `<<` feed inside a `match` arm in a for-loop body. With no accumulator the
+// loop's feeds fan out one refined-source channel per arm, so an arm's value may
+// read its payload — the arm's channel is the source restricted to that arm's
+// positions, and the projection answers over exactly those.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    o = defer()
+    for m in [`a(2), `b(3), `a(5)]:
+        match m:
+            case `a(n):
+                o << n
+            case `b(k):
+                o << k * 100
+    sum(o)"}, Value::Int(307))]
+// The `case _:` fallback feeds too, so the fan-out spans a tagged arm and the
+// default one.
+#[case(indoc! {"
+    o = defer()
+    for m in [`a(2), `b(3), `a(5)]:
+        match m:
+            case `a(n):
+                o << n
+            case _:
+                o << 100
+    sum(o)"}, Value::Int(107))]
+fn test_feed_inside_a_match_arm_fans_out_per_arm(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A feed and an accumulator in the same `match`. The accumulator makes the loop a
+// single writer and the feed becomes a `to_<defer>` tap on its decision record,
+// gated by the arm's own `variant_is` test — so the tap fires on its arm's
+// positions only, while the record commits on every arm's.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum(o)", Value::Int(2))]
+#[case("acc", Value::Int(3))]
+fn test_feed_and_accumulator_in_one_match(#[case] tail: &str, #[case] expected: Value) {
+    let loop_program = indoc! {"
+        o = defer()
+        acc := 0
+        for m in [`a(2), `b(3), `a(5)]:
+            match m:
+                case `a(n):
+                    o << 1
+                case `b(k):
+                    acc += k
+    "};
+    check_scalar(&format!("{loop_program}{tail}"), expected);
+}
+
+// Every arm feeding, beside an accumulator: one tap per feed site, each with its
+// own gate.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_every_arm_feeds_beside_an_accumulator() {
+    check_scalar(
+        indoc! {"
+            o = defer()
+            acc := 0
+            for m in [`a(2), `b(3), `a(5)]:
+                match m:
+                    case `a(n):
+                        o << 1
+                    case `b(k):
+                        o << 100
+                        acc += k
+            sum(o)"},
+        Value::Int(102),
+    );
+}
+
+// A tap value may read the accumulator: the writer's snapshot of it answers at
+// every position, so reading it keeps the tap total.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_a_tap_value_reads_the_accumulator() {
+    check_scalar(
+        indoc! {"
+            o = defer()
+            acc := 0
+            for m in [`a(2), `b(3), `a(5)]:
+                match m:
+                    case `a(n):
+                        o << acc
+                    case `b(k):
+                        acc += k
+            sum(o)"},
+        Value::Int(3),
+    );
+}
+
+/// A tap value reading the arm's **payload** — the shape the decision record
+/// could not carry while a tap's value had to answer at every committing
+/// position. The tap holds `` {`fired{𝑉} | `idle} `` now, so the value is asked
+/// for only where the tap fires, which is exactly where an arm's
+/// `variant_project` answers.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum(o)", Value::Int(7))]
+#[case("acc", Value::Int(3))]
+fn test_a_tap_value_reads_its_payload(#[case] tail: &str, #[case] expected: Value) {
+    let loop_program = indoc! {"
+        o = defer()
+        acc := 0
+        for m in [`a(2), `b(3), `a(5)]:
+            match m:
+                case `a(n):
+                    o << n
+                case `b(k):
+                    acc += k
+    "};
+    check_scalar(&format!("{loop_program}{tail}"), expected);
+}
+
+/// A tap value reading the payload **and** the accumulator. The payload restricts
+/// the value's domain and the accumulator is the writer's per-position snapshot,
+/// so this shape needs both the tap (for read-your-writes) and the restriction —
+/// neither the fan-out nor a total-valued tap can carry it.
+///
+/// Position 0 reads the seed (`2 + 0`) and position 2 reads the write position 1
+/// made (`5 + 3`); position 1 feeds nothing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_a_tap_value_reads_its_payload_and_the_accumulator() {
+    check_scalar(
+        indoc! {"
+            o = defer()
+            acc := 0
+            for m in [`a(2), `b(3), `a(5)]:
+                match m:
+                    case `a(n):
+                        o << n + acc
+                    case `b(k):
+                        acc += k
+            sum(o)"},
+        Value::Int(10),
+    );
+}
+
+/// Partitioning a tagged stream: one arm forwards its payload to a channel, the
+/// other counts. The shape a `match` in a loop is written for.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum(out)", Value::Int(30))]
+#[case("errors", Value::Int(1))]
+fn test_a_match_in_a_loop_partitions_a_tagged_stream(#[case] tail: &str, #[case] expected: Value) {
+    let loop_program = indoc! {"
+        out = defer()
+        errors := 0
+        for msg in [`data(10), `error(404), `data(20)]:
+            match msg:
+                case `data(v):
+                    out << v
+                case `error(code):
+                    errors += 1
+    "};
+    check_scalar(&format!("{loop_program}{tail}"), expected);
+}
+
+// A payload-binding arm and a payload-less one in the same `match`, both
+// writing — the mixed shape the two tests above take one side of each.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {"
+    msgs = [`ping(3), `close, `ping(4)]
+    acc := 0
+    for m in msgs:
+        match m:
+            case `ping(seq):
+                acc += seq
+            case `close:
+                acc += 1
+    acc"}, Value::Int(8))]
+fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}

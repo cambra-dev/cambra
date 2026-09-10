@@ -588,6 +588,10 @@ pub enum Builtin {
     /// reading the arm *is* the restriction; there is no separate boolean
     /// `Restrict` step and no tag-discriminating `Predicate`.
     ///
+    /// The projection narrows the domain but preserves keys, so a domain release
+    /// forwards to the scrutinee verbatim and it can sit inside an induction
+    /// writer body.
+    ///
     /// **A tag the scrutinee does not carry is not an error** — it projects empty.
     /// That is what makes a width-subtype scrutinee well-formed here.
     ///
@@ -682,6 +686,28 @@ pub enum Builtin {
     /// stamped on the node at emission and the post-phase CHECK-mode `typecheck`
     /// validates it directly, as [`Self::BeginTxn`]'s is.
     Insert,
+    /// ``variant_is(c) : Union({cᵢ: Pᵢ}) ⇒ Bool`` — whether a union value carries
+    /// the arm named `c`. **Total** where [`Self::VariantProject`] restricts:
+    /// every position of the scrutinee's domain gets an answer, `true` on the
+    /// rows the arm holds and `false` on the rest.
+    ///
+    /// Reading an arm *is* the tag restriction, so a `match` compiled as a
+    /// fan-out of projections needs no predicate — but an induction writer
+    /// decision selects on a predicate over its whole driver domain: its commit
+    /// selector is a disjunction of the arms' guards, and each guard is
+    /// complemented against the ones before it into a first-match predicate. A
+    /// projection restricts that domain rather than answering over it, so it
+    /// cannot stand there. A total boolean test answers every position, so a
+    /// `match` in a for-loop body dispatches on `variant_is` guards and rides
+    /// the same first-match `Case` machinery an `if` chain does.
+    ///
+    /// **A tag the scrutinee does not carry is not an error** — it answers `false`
+    /// everywhere, matching [`Self::VariantProject`]'s empty projection.
+    ///
+    /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
+    /// scheme: its type `Union ⇒ Bool` is stamped on the node and the post-phase
+    /// CHECK-mode `typecheck` trusts it (like [`Self::VariantProject`]).
+    VariantIs(FieldKey),
 }
 
 impl Builtin {
@@ -730,6 +756,7 @@ impl Builtin {
             Self::CollectionContains => "collection_contains",
             Self::LookupChecked => "lookup?",
             Self::Insert => "insert",
+            Self::VariantIs(_) => "variant_is",
         }
     }
 

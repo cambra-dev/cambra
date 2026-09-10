@@ -177,8 +177,9 @@ fn contains_feed(e: &Expr) -> bool {
 
 /// Build the block's statement chain right-to-left. Assignments to
 /// transactional mutable variables become `MutWrite` markers (reads stay bare `Var`
-/// snapshots); `if cond:` guards become `Case` (the no-else deny branch); other
-/// assignments are per-iteration `Let`s.
+/// snapshots); `if cond:` guards and `match` dispatch become `Case` (an `if`
+/// without an `else` carries the deny branch); other assignments are
+/// per-iteration `Let`s.
 ///
 /// `fallback_span` anchors the manufactured chain terminal when the statement
 /// list is empty (the block's own statement spans win when present).
@@ -188,11 +189,12 @@ fn lower_tx_block_inner(
     fallback_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // Multiple `if` guards, `elif` chains, and `else` branches are all supported:
-    // `transact_phase`'s path walk scopes each write to its own control-flow path,
-    // rejoins each key with a carry-forward `Case`, and commits on the disjunction
-    // of the write paths (see `src/ccl/design/mutability.md`). A guard is no longer
-    // transaction-scoped — a spine write beside an `if` commits unconditionally.
+    // Multiple `if` guards, `elif` chains, `else` branches and `match` arms are all
+    // supported: `transact_phase`'s path walk scopes each write to its own
+    // control-flow path, rejoins each key with a carry-forward `Case`, and commits
+    // on the disjunction of the write paths (see `src/ccl/design/mutability.md`).
+    // A guard is not transaction-scoped — a spine write beside a branch commits
+    // unconditionally.
     //
     // The chain terminal is manufactured sequencing (spanned to the block's
     // statements — the `with` construct when the block is empty).
@@ -271,6 +273,26 @@ fn lower_tx_block_inner(
                 let feed = lower_expr(value, ctx)?;
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
             }
+            // ``match m: case `tag(w): <writes>`` — tag dispatch, the `match`
+            // counterpart of the `if` above. The arms share one first-match rule
+            // over one `Case`, and `transact_phase` scopes each arm's writes to
+            // its own path exactly as it does an `if` arm's. Arms partition the
+            // tags, so there is no deny complement of the kind a bare `if cond:`
+            // leaves — the trailing `true → unit` a `match` without a `case _:`
+            // gains is minted by
+            // [`tag_case_to_guard_case`](crate::ccl::ccl_utils::tag_case_to_guard_case),
+            // not here.
+            ChlStmt::Match { scrutinee, arms } => {
+                let case = lower_match_over(
+                    stmt.span,
+                    scrutinee,
+                    arms,
+                    outer_bindings,
+                    ctx,
+                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, ctx),
+                )?;
+                ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
+            }
             ChlStmt::With { .. } => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -281,7 +303,8 @@ fn lower_tx_block_inner(
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     "a `with begin():` block supports mutable writes (`x := …`, `x += …`), \
-                     local bindings (`x = …`), `if cond:` guards, and feeds (`out << e`)",
+                     local bindings (`x = …`), `if cond:` guards, `match` dispatch, \
+                     and feeds (`out << e`)",
                 ));
             }
         };

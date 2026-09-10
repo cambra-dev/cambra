@@ -1135,8 +1135,8 @@ today rather than silently mishandled.
 > below and `../../interpreter/design-operators.md`). That desugar also resolves the former residual —
 > a value-selecting `Case` inside a lambda with no visible iteration source (a UDF body, or a
 > comprehension `if`-filter beside the element `Case`). A conditional *feed* on an induction path
-> (`if 𝑝: out << e`) is **implemented** — it rides the same decision as a `to_<defer>__fire`-gated tap
-> (below).
+> (`if 𝑝: out << e`) is **implemented** — it rides the same decision as a tap whose value is
+> `` `fired `` on its own path (below).
 
 The *filter* `Case` (`[𝑔 → action; true → unit]` → `Restrict`), the value-selecting `Case`, and the
 conditional induction write all compile. The value-`Case` compilation is a **literal union of
@@ -1176,8 +1176,8 @@ model treats a finite domain as a stream that terminates (§Liveness) — and ev
 uses one realization: the changelog `InductionStore`. Plain, conditional, and feed-carrying loops
 over finite or async extents all route through it. The
 driver reads its source by absolute domain position (async domains arrive unordered), reclaims the
-consumed prefix as it advances, and carries reply feeds as `__fire`-gated taps — see *Induction
-stores as a changelog* in `../../interpreter/design-operators.md`.
+consumed prefix as it advances, and carries reply feeds as taps tagged `` `fired ``/`` `idle `` — see
+*Induction stores as a changelog* in `../../interpreter/design-operators.md`.
 
 The value-`Case` positions ride the same union-of-restricts:
 
@@ -1228,12 +1228,15 @@ The value-`Case` positions ride the same union-of-restricts:
 
 ### General in-transaction conditionals (and conditional writes)
 
-A `with begin():` block admits `if`/`elif`/`else` and multiple sibling `if` guards, compiled by a
-uniform **path-based** walk (`transact_phase::walk_block`/`walk_case`).
+A `with begin():` block admits `if`/`elif`/`else`, multiple sibling `if` guards, and `match`
+dispatch, compiled by a uniform **path-based** walk
+(`transact_phase::walk_block`/`walk_case`). A `match` reaches the walk as a guard-`Case`: the phase
+rewrites its arms to `variant_is` tests at the strip
+(`ccl_utils::statement_tag_cases_to_guards`), so an arm is a path like any other.
 
 A **path** is one straight-line route through the block's branch structure: the statements a single
-execution runs, given a choice of arm at every `if`/`elif`/`else` it passes through. Nested and
-sibling conditionals multiply, so a block with two independent `if`s has four paths. Each path
+execution runs, given a choice of arm at every branch it passes through. Nested and sibling
+conditionals multiply, so a block with two independent `if`s has four paths. Each path
 carries a **path condition** — the conjunction of the guards it took, each `elif` guard first-match
 adjusted (`π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`). A path condition is a `Bool` expression over the
 transaction's *snapshot* alone — resolved through whatever the path has already written
@@ -1244,8 +1247,9 @@ mutually exclusive and, taken together with the implicit empty arm of a guard th
 exhaustive: exactly one path runs per transaction.
 
 Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
-one decision variant, whose `` `commit ``/`` `abort `` tag and per-tap fire fields are path conditions
-and whose per-key writes are `Case`s over the local branch guards — so every path is evaluated in
+one decision variant, whose `` `commit ``/`` `abort `` tag is a path condition, whose per-tap
+`` `fired ``/`` `idle `` tag is that tap's own path condition, and whose per-key writes are `Case`s
+over the local branch guards — so every path is evaluated in
 one straight-line writer body and one transaction is still one decision. Walking a block threads
 `(path, env)` (read-your-writes) and the block denotes
 `` snapshot ⇒ {`commit{writes, to_<defer>*} | `abort} `` — a decision **variant**
@@ -1273,11 +1277,18 @@ serialization point; multi-key read-your-writes needs one snapshot and one write
 
 A conditional feed under genuine cross-key *routing* fires only on its own route. A feed under one
 arm would otherwise ride the transaction's (broader) commit and over-fire on a sibling route's
-commit, so each such tap carries a **per-tap fire field** — `to_<defer>_k__fire : Bool`, its own
-control-flow path (`F_FIRE_SUFFIX`) — that the commit engine (`body_decision_at`) checks: a committed
-transaction appends the tap only where its fire gate holds. A single-guard feed (`if 𝑝: w; out << 𝑒`,
-path == commit) and a spine feed omit the field and fire with their transaction — so unconditional
-programs keep their fire-field-free shape.
+commit, so a tap's value is `` {`fired{𝑉} | `idle} `` (`V_FIRED`): the fed value on the positions its
+own control-flow path admits, `` `idle `` on the rest. The commit engine (`body_decision_at`) reads
+the tag and appends the tap only where it is `` `fired ``. A single-guard feed (`if 𝑝: w; out << 𝑒`,
+path == commit) and a spine feed wrap unconditionally, since every position the decision exists at is
+one they fire at.
+
+The tag rather than a companion `Bool` is what lets a tap value be **domain-restricted**. A gate
+beside a same-position value obliges the value to answer wherever the record commits; a `match` arm's
+payload is a `variant_project`, which restricts the domain rather than answering over it, so a fed
+value reading the payload answers on its own arm's positions only. Under the tag those are the
+`` `fired `` positions and the value is asked for nowhere else, so `` out << v `` inside
+`` case `data(v): `` compiles beside an accumulator the other arms write.
 
 A write key written conditionally and never read (an absolute `k := 𝑒` inside a `Case` arm) is
 finalized into the *read* set by `collect_footprint`, so it has a snapshot to **carry** on the paths
@@ -1292,19 +1303,16 @@ reduces the whole history whatever order the commits land in
 
 **Not yet implemented**: `with t = begin():` (the handle) is still rejected.
 
-**Future work (deferred optimizations).** The `` `commit `` payload is currently **dense**:
-an unwritten key on a committing path carries its snapshot value (a no-op re-write), and a routed
-reply tap carries a `to_<defer>_k__fire : Bool` gate (`F_FIRE_SUFFIX`) the engine checks. Two deferred
-refinements, scoped by the review as "worth doing later, not now":
+**Future work (deferred optimization).** The `` `commit `` payload is **dense**: an unwritten key on
+a committing path carries its snapshot value, a no-op re-write.
 
-1. ***Partial* writes** — materialize only the keys a committing path actually changed, encoding an
-   absent key as carry directly (e.g. a `Some | None` per write key), rather than re-writing the
-   snapshot. This needs a dense presence encoding: a naive sparse per-key column is silently dropped
-   by the record `zip`'s inner-join (it deletes the committing positions where any conditionally-
-   written key is absent), so it cannot be a bare non-exhaustive `Case`.
-2. **Folding `__fire` into payload presence** — a routed reply would be *present in the `` `commit ``
-   payload iff its route fired*, retiring the separate `to_<defer>_k__fire` gate. Same dense-presence
-   requirement as (1).
+***Partial* writes** would materialize only the keys a committing path actually changed, encoding an
+absent key as carry directly rather than re-writing the snapshot. A naive sparse per-key column is
+silently dropped by the record `zip`'s inner-join — it deletes the committing positions where any
+conditionally-written key is absent — so the encoding has to keep a value at every committing
+position while saying which of them changed. The tap variant above is that encoding for a reply, and
+a per-write-key `` {`wrote{𝑉} | `carried} `` is the same shape: dense in the record, restricted at the
+read.
 
 **An off-path partial op cannot fault.** Both induction and transaction value-`Case`s compile through
 the lazy `filter_values` union-of-restricts, so a guard-protected `//`/`%` is never evaluated on the

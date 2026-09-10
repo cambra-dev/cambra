@@ -3285,3 +3285,71 @@ fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
         vec![(1, 10), (2, 20), (3, 2), (4, 3)]
     );
 }
+
+/// ``match m: case `tag(w): <writes>`` inside a `with begin():` block. The arms
+/// route their writes per path exactly as an `if` arm's do — lowering shares
+/// `match`'s tag rules through `lower_match_over`, and the phase converts the
+/// tag-`Case` to guards before the footprint scan and the decision walk see it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn match_dispatch_inside_a_transaction_block() {
+    check_scalar(
+        indoc! {"
+            bal: Mut(Int, Txn) := 0
+            for m in [`dep(10), `wd(3)]:
+                with begin():
+                    match m:
+                        case `dep(n):
+                            bal := bal + n
+                        case `wd(k):
+                            bal := bal - k
+            await_final(bal)"},
+        Value::Int(7),
+    );
+}
+
+/// A reply tap fed from one `match` arm inside the block. The tap fires on that
+/// arm's commits only, which is what its `` `fired ``/`` `idle `` tag records.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn match_arm_reply_inside_a_transaction_block() {
+    check_scalar(
+        indoc! {"
+            resp = defer()
+            bal: Mut(Int, Txn) := 0
+            for m in [`dep(10), `wd(3)]:
+                with begin():
+                    match m:
+                        case `dep(n):
+                            bal := bal + n
+                            resp << n
+                        case `wd(k):
+                            bal := bal - k
+            sum(resp)"},
+        Value::Int(10),
+    );
+}
+
+/// A guarded *induction* write inside a block is rejected through a `match` arm as
+/// through an `if` arm. Without the arm the write escapes the pre-strip check and
+/// reaches `transact_phase`'s unrecorded-write-key panic, so the rejection is what
+/// keeps a real diagnostic in front of the author.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn guarded_induction_write_in_a_match_arm_is_rejected() {
+    check_compile_error(
+        indoc! {"
+            bal: Mut(Int, Txn) := 0
+            cnt := 0
+            for m in [`dep(10), `wd(3)]:
+                with begin():
+                    bal := bal + 1
+                    match m:
+                        case `dep(n):
+                            cnt += 1
+                        case `wd(k):
+                            bal := bal - k
+            await_final(bal)"},
+        "is written under an `if` or a `match` arm inside",
+    );
+}

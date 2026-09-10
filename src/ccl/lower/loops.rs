@@ -33,6 +33,7 @@ fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
                 || else_body.as_deref().is_some_and(for_body_has_yield)
         }
         ChlStmt::For { body, .. } => for_body_has_yield(body),
+        ChlStmt::Match { arms, .. } => arms.iter().any(|a| for_body_has_yield(&a.body)),
         _ => false,
     }
 }
@@ -60,6 +61,7 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
                 || else_body.as_deref().is_some_and(for_body_has_feed)
         }
         ChlStmt::For { body, .. } => for_body_has_feed(body),
+        ChlStmt::Match { arms, .. } => arms.iter().any(|a| for_body_has_feed(&a.body)),
         _ => false,
     }
 }
@@ -491,7 +493,7 @@ fn lower_for_body_terminal(
             _ => Err(LoweringError::unsupported(
                 value.span,
                 "for-loop body must end in a yield, `<<` feed, nested for, \
-                 or if-guard",
+                 if-guard, or match",
             )),
         },
         ChlStmt::If {
@@ -577,6 +579,23 @@ fn lower_for_body_terminal(
                 ctx,
             ))
         }
+        // ``match m: case `tag(w): …`` — tag dispatch, the `match` counterpart of
+        // the `if` above. The arms share one first-match rule over one `Case`, so
+        // a feeding arm fans out as an `if` arm does. The arm also binds a
+        // payload, which `lower_match_over` puts in the scope its statements are
+        // lowered under; that scope is the arm's mutation scope, because a payload
+        // binder is bound outside the arm's statements and writing it is rejected
+        // for the reason writing the iteration variable is.
+        ChlStmt::Match { scrutinee, arms } => lower_match_over(
+            stmt.span,
+            scrutinee,
+            arms,
+            mutation_scope,
+            ctx,
+            |body, scope, ctx| {
+                lower_for_body_stmts(body, defer_name, scope, frame_introduced.clone(), ctx)
+            },
+        ),
         // A `with begin():` transaction as a *generator* loop-body terminal is a
         // later increment; top-level and simple `for … with begin():` loops are
         // lowered in `stmts.rs`/`transactions.rs`.
@@ -587,7 +606,7 @@ fn lower_for_body_terminal(
         )),
         _ => Err(LoweringError::unsupported(
             stmt.span,
-            "for-loop body must end in a yield, `<<` feed, nested for, or if-guard",
+            "for-loop body must end in a yield, `<<` feed, nested for, if-guard, or match",
         )),
     }
 }
@@ -698,6 +717,11 @@ fn collect_mutation_loop_vars(
                 collect_mutation_loop_vars(else_body, scope, vars, seen);
             }
         }
+        if let ChlStmt::Match { arms, .. } = &stmt.node {
+            for arm in arms {
+                collect_mutation_loop_vars(&arm.body, scope, vars, seen);
+            }
+        }
         if let Some(inner) = block_value_stmt(stmt) {
             collect_mutation_loop_vars(std::slice::from_ref(inner), scope, vars, seen);
         }
@@ -758,6 +782,13 @@ pub(super) fn find_nested_mutation_var(
                     && let Some(n) = find_nested_mutation_var(else_body, mutation_scope)
                 {
                     return Some(n);
+                }
+            }
+            ChlStmt::Match { arms, .. } => {
+                for arm in arms {
+                    if let Some(n) = find_nested_mutation_var(&arm.body, mutation_scope) {
+                        return Some(n);
+                    }
                 }
             }
             ChlStmt::For { body, .. } => {
@@ -1018,6 +1049,31 @@ fn lower_loop_body_chain(
                 let feed = ctx.tag_image(Expr::feed(defer_name.to_string(), lowered), value.span);
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
             }
+            // ``match m: case `tag(w): …`` — tag dispatch over a conditional
+            // write path, the `match` counterpart of the `if` below. Every arm
+            // is a write path; there is no complement, because the arms
+            // partition the scrutinee's tags.
+            ChlStmt::Match { scrutinee, arms } => {
+                let case = lower_match_over(
+                    stmt.span,
+                    scrutinee,
+                    arms,
+                    outer_bindings,
+                    ctx,
+                    |body, scope, ctx| {
+                        lower_loop_body_chain(
+                            body,
+                            acc_names,
+                            yield_defer,
+                            true,
+                            scope,
+                            stmt.span,
+                            ctx,
+                        )
+                    },
+                )?;
+                ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
+            }
             // `if p: … [else: …]` — a conditional write path. Lowered to a
             // statement-position filter-`Case` (`[gᵢ → branchᵢ; true → else|unit]`)
             // that `letrec_phase` forks into one recurrence leg per path (the
@@ -1074,8 +1130,9 @@ fn lower_loop_body_chain(
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     "only assignments (`x = …`, `x op= …`), `<<` feeds, \
-                     `yield`, `if` guards, `with begin():` transactions, and bare \
-                     side-effect calls are supported inside a for-loop body",
+                     `yield`, `if` guards, `match` dispatch, `with begin():` \
+                     transactions, and bare side-effect calls are supported \
+                     inside a for-loop body",
                 ));
             }
         };

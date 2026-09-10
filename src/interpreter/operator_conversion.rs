@@ -30,7 +30,7 @@ use crate::{
             Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling,
-            Uncurry, UnionOperator, VariantProject, VariantWrap, fan_in, fan_in_named,
+            Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -1335,6 +1335,25 @@ fn convert_impl_inner(
                         payload_extent,
                     )))
                 }
+                // `variant_is(c)` — the total tag test. Same scrutinee shapes as
+                // `variant_project(c)`, but every key of the domain is answered,
+                // which is what a writer decision's guard position takes.
+                Builtin::VariantIs(tag) => {
+                    let ok = match input.tiling() {
+                        Tiling::Scalar(Extent::Union(_)) => true,
+                        Tiling::SealedFunction { codomain, .. } => {
+                            matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(ConversionError::TypeError(format!(
+                            "variant_is({tag}) expects a (Sealed)Union scrutinee, got {}",
+                            input.tiling()
+                        )));
+                    }
+                    Ok(Box::new(VariantIs::new(input, tag.clone())))
+                }
                 // `variant_wrap(c)` — the point-free constructor. Consumes the fed
                 // payload stream and injects it at tag `c`. The union extents come
                 // from the node's codomain (`P_c ⇒ Union`); the
@@ -1649,6 +1668,13 @@ fn build_transact_store(
 /// channelize folded onto the writer body; for a commit store, op-conversion commits
 /// each tap as a write-only key so the reply rides the transaction's commit and is
 /// read back as a value-stream. Empty for a writer with no reply.
+///
+/// The type is the tap's `` {`fired{𝑉} | `idle} ``
+/// ([`tap_variant_ty`](crate::ccl::ccl_utils::tap_variant_ty)) as the decision
+/// carries it. A store holds the tag alongside the value, and the IR's
+/// ``variant_project(`fired)`` on the read eliminates it — so the *stream's*
+/// restriction to fired positions is a typed step rather than a decode the type
+/// cannot see.
 fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
@@ -1665,9 +1691,8 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     };
     fields
         .into_iter()
-        // `writes` is the decision core; a `*__fire` field is a tap's *fire gate*
-        // (read by `body_decision_at`), not a tap value itself.
-        .filter(|(f, _)| f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX))
+        // `writes` is the decision core; every other field is a tap.
+        .filter(|(f, _)| f != F_WRITES)
         .collect()
 }
 
@@ -2062,9 +2087,9 @@ fn build_induction_store_single(
     // becomes a write-only changelog key (appended after the accumulator keys), so
     // its per-position value rides the committing change and is read back densely.
     // A tap is a per-position event, not a carried mutable variable (`carry_forward:
-    // false`): it appears only at the position that fired it. Under a conditional
-    // feed the decision also carries a `to_<defer>__fire` gate, which the producer
-    // reads to omit a non-fired tap from the delta.
+    // false`): it appears only at the position that fired it. A tap holds
+    // `` {`fired{𝑉} | `idle} ``, and the producer omits an `` `idle `` one from the
+    // delta.
     let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
     let mut tap_fields: Vec<String> = Vec::new();
     for (field, tap_ty) in taps {

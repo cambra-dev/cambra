@@ -5,10 +5,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
+use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Builtin, Expr, F_FIRE_SUFFIX, F_WRITES, FieldKey, Lit, LogicKind,
-    Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind,
-    V_ABORT, V_COMMIT,
+    BaseType, BinOpKind, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit, LogicKind, Name,
+    PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind, V_ABORT,
+    V_COMMIT, V_FIRED, V_IDLE,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -47,18 +48,123 @@ pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Typ
     acc.unwrap_or_else(|| lit(empty))
 }
 
-/// Assemble a writer **decision record** `{commit, writes, (to_<feed>__fire,)?
-/// to_<feed>, …}` — the single encoding of the tap/`__fire` protocol shared by the
+/// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write, and
+/// of the `true` arm a `match` without a `case _:` gains.
+pub(crate) fn unit_expr() -> Expr {
+    let mut u = Expr::new(TypedExprNode::Lit(Lit::Unit));
+    u.ty = Type::Base(BaseType::Unit);
+    u
+}
+
+/// Rewrite a tag-dispatching `Case` into the boolean-guard `Case` its two
+/// consumers are built from ([`Builtin::VariantIs`](crate::ccl::Builtin::VariantIs)
+/// for why the guard is a total test rather than a projection).
+///
+/// Each arm's `Pattern` becomes a `variant_is(tag)` guard over the scrutinee, and
+/// the arm's `variant_project(tag)` is substituted for its payload binder, so the
+/// arm reads as `if` does. A `match` without a `case _:` arm gains the trailing
+/// `true → unit` carry every lowered guard-`Case` ends in — the position where
+/// the accumulators keep their previous value. The arms partition the tags, so
+/// the decision commits at every position where a guard-`Case` leaves the
+/// changelog sparse.
+///
+/// Both consumers dispatch on a guard and neither reads a `Pattern`: the
+/// induction writer merges the arms into one decision ([`crate::ccl::mut_elim`]'s
+/// `transform_chain`), and the feed fan-out refines the loop source once per
+/// feeding arm ([`crate::ccl::channelize`]'s `try_extract_fanout_feed`). The
+/// rewrite runs in a phase rather than at lowering because both builtins are
+/// minted after inference.
+///
+/// The scrutinee is substituted too, not bound. Each consumer lifts a
+/// sub-expression out of the arm — the fan-out composes the arm's feed value onto
+/// a refined source, the writer hoists it into a `to_<feed>` decision field — so a
+/// `let` inside the arm strands its binder there, and a `let` around the `Case`
+/// puts its name in the write set, where it escapes the writer lambda. A loop's
+/// `match` scrutinee is the iteration variable or a projection of it, so the
+/// copies are reads.
+pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
+    let case_ty = case.ty.clone();
+    let TypedExprNode::Case {
+        scrutinee,
+        branches,
+    } = case.node
+    else {
+        unreachable!("caller guarantees a Case")
+    };
+    let scrut = *scrutinee.expect("caller guarantees a tag-dispatching Case");
+    let scrut_ty = scrut.ty.clone();
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut has_default = false;
+    let mut out: Vec<Branch> = Vec::with_capacity(branches.len() + 1);
+    for br in branches {
+        let Some(pat) = br.pattern else {
+            // A `case _:` arm is already the fallback the trailing `true` guard
+            // names, and lowering has placed it last.
+            has_default = true;
+            out.push(Branch {
+                pattern: None,
+                guard: br.guard,
+                body: br.body,
+            });
+            continue;
+        };
+        let tag = FieldKey::Name(pat.tag.clone().into());
+        let payload_ty = pat.binding.ty.clone();
+        let mut guard = Expr::apply(
+            scrut.clone(),
+            Expr::builtin(Builtin::VariantIs(tag.clone()))
+                .with_ty(Type::fun(scrut_ty.clone(), bool_ty.clone())),
+        );
+        guard.ty = bool_ty.clone();
+        let mut payload = Expr::apply(
+            scrut.clone(),
+            Expr::builtin(Builtin::VariantProject(tag))
+                .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone())),
+        );
+        payload.ty = payload_ty;
+        let payload_subst = Subst::discharge(pat.binding.name.clone(), payload);
+        out.push(Branch {
+            pattern: None,
+            guard,
+            body: payload_subst.apply_expr(&br.body),
+        });
+    }
+    if !has_default {
+        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+        t.ty = bool_ty;
+        out.push(Branch {
+            pattern: None,
+            guard: t,
+            body: unit_expr(),
+        });
+    }
+    let mut rebuilt = Expr::new(TypedExprNode::Case {
+        scrutinee: None,
+        branches: out,
+    });
+    rebuilt.ty = case_ty;
+    rebuilt
+}
+
+/// Assemble a writer **decision record** `{commit, writes, to_<feed>, …}` — the
+/// single encoding of the tap protocol shared by the
 /// transaction writer ([`crate::ccl::transact_phase`]) and the induction writer
 /// ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the same
 /// `body_decision_at` decoder, so the shape must be built in exactly one place.
 ///
-/// `feeds` are `(field, value, fire)` in tap order. A tap whose `fire` path is
-/// structurally the writer's `commit` — a spine or sole-committer feed that fires
-/// with *every* committing position — carries **no** gate (the engine treats an
-/// ungated tap as firing with the commit). A **narrower** `fire` carries a
-/// `to_<feed>__fire` gate the engine reads to fire the reply only on its own route,
-/// so a sibling route's commit does not over-fire it.
+/// `feeds` are `(field, value, fire)` in tap order. Each tap's field holds
+/// `` {`fired{𝑉} | `idle} `` ([`V_FIRED`](crate::ccl::V_FIRED)): the value at the
+/// positions its `fire` path admits, and `` `idle `` elsewhere. A tap whose `fire`
+/// is structurally the writer's `commit` — a spine or sole-committer feed that
+/// fires with every committing position — wraps unconditionally; a **narrower**
+/// `fire` becomes the guard of a two-arm value-`Case`, so a sibling route's commit
+/// leaves this tap `` `idle ``.
+///
+/// The tag rather than a companion `Bool` is what lets a tap value be
+/// domain-restricted. A gate beside a same-position value obliges the value to
+/// answer wherever the record commits, and an arm's `variant_project` answers only
+/// on its own arm's positions; under the tag, the non-firing positions are
+/// `` `idle `` and the value is asked for nowhere else.
 ///
 /// `commit` must already be the writer's *final* commit gate — including every
 /// feed's fire path, so a feed-only committing position appends a change carrying
@@ -69,15 +175,16 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr
     fields.push((COMMIT_SELECTOR.to_string(), commit.clone()));
     fields.push((F_WRITES.to_string(), writes));
     for (field, value, fire) in feeds {
-        // Gate iff the fire path is *narrower* than the commit — a structural test
-        // (no Boolean simplification); the engine handles both an ungated tap
-        // (fires with commit) and a gated one (fires on its route) correctly, so
-        // the two shapes are observationally equal, this only decides which is
-        // emitted.
-        if *fire != commit {
-            fields.push((format!("{field}{F_FIRE_SUFFIX}"), fire.clone()));
-        }
-        fields.push((field.clone(), value.clone()));
+        // Wrap unconditionally iff the fire path *is* the commit — a structural
+        // test (no Boolean simplification). Such a tap fires at every position the
+        // record exists at, so the `` `idle `` arm would be unreachable; a narrower
+        // fire keeps it as the arm the non-firing positions take.
+        let tap = if *fire == commit {
+            tap_fired(value.clone())
+        } else {
+            tap_gated(fire.clone(), value.clone())
+        };
+        fields.push((field.clone(), tap));
     }
     let ty = Type::Record(
         fields
@@ -86,6 +193,71 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr
             .collect(),
     );
     Expr::new(TypedExprNode::Record(fields)).with_ty(ty)
+}
+
+/// The tap variant type `` {`fired{𝑉} | `idle} `` over a fed value type `𝑉`.
+///
+/// Tag order is `fired`=0, `idle`=1 — the positions [`tap_fired`]/[`tap_idle`]
+/// inject and `body_decision_at` decodes.
+pub fn tap_variant_ty(value_ty: Type) -> Type {
+    Type::variant(vec![
+        (FieldKey::Name(V_FIRED.into()), value_ty),
+        (FieldKey::Name(V_IDLE.into()), Type::Base(BaseType::Unit)),
+    ])
+}
+
+/// `` `fired(value) `` — a tap carrying its fed value.
+pub fn tap_fired(value: Expr) -> Expr {
+    let ty = tap_variant_ty(value.ty.clone());
+    let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_FIRED.into())))
+        .with_ty(Type::fun(value.ty.clone(), ty.clone()));
+    Expr::apply(value, wrap).with_ty(ty)
+}
+
+/// `` `idle `` — a tap that did not fire, at the fed value type `𝑉` the firing
+/// positions carry.
+pub fn tap_idle(value_ty: Type) -> Expr {
+    let ty = tap_variant_ty(value_ty);
+    let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_IDLE.into())))
+        .with_ty(Type::fun(Type::Base(BaseType::Unit), ty.clone()));
+    Expr::apply(unit_expr(), wrap).with_ty(ty)
+}
+
+/// A tap under a `fire` path narrower than the record's commit:
+/// `` { fire → `fired(value); true → `idle } ``.
+///
+/// A two-arm value-`Case`, the shape a conditional write already takes, so
+/// `lambda_elim`'s C-form compiles it with no new machinery — and the `` `idle ``
+/// arm is what re-totals the tap over the positions `value` does not answer at.
+fn tap_gated(fire: Expr, value: Expr) -> Expr {
+    let fired = tap_fired(value);
+    let ty = fired.ty.clone();
+    let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+    t.ty = Type::Base(BaseType::Bool);
+    let mut case = Expr::new(TypedExprNode::Case {
+        scrutinee: None,
+        branches: vec![
+            Branch {
+                pattern: None,
+                guard: fire,
+                body: fired,
+            },
+            Branch {
+                pattern: None,
+                guard: t,
+                body: tap_idle(match &ty {
+                    Type::Variant(tags, _) => tags
+                        .iter()
+                        .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_FIRED))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Type::Hole),
+                    _ => Type::Hole,
+                }),
+            },
+        ],
+    });
+    case.ty = ty;
+    case
 }
 
 /// The decision **variant** type `` {`commit{𝑃} | `abort} `` over a (dense) payload
@@ -147,6 +319,52 @@ pub fn commit_project(decision_ty: &Type) -> Expr {
         decision_ty.clone(),
         commit_payload_ty(decision_ty),
     ))
+}
+
+/// Rewrite every tag-dispatching `Case` in `expr` into the guard-`Case` its
+/// consumers read ([`tag_case_to_guard_case`]).
+///
+/// Applied to a whole body when that body has more than one consumer, rather than
+/// at each consumption point: the induction writer converts as it walks
+/// ([`crate::ccl::mut_elim`]'s `transform_chain`), but a feed-only loop body goes
+/// to `channelize`'s fan-out and a transaction block goes to both a footprint scan
+/// and a decision walk, and a consumer left un-taught reads a `Pattern` it has no
+/// arm for.
+///
+/// **Statement position only**, which the `Unit` type identifies: an arm in
+/// statement position is a chain of effects ending in `unit`, and a `match`
+/// without a `case _:` gains a `true → unit` arm in the rewrite, which types only
+/// against arms that are themselves `unit`. A value-position `match` keeps the
+/// projection fan-out `lambda_elim` compiles it to.
+pub(crate) fn statement_tag_cases_to_guards(expr: Expr) -> Expr {
+    let mut expr = expr;
+    expr.map_children(statement_tag_cases_to_guards);
+    if matches!(
+        &expr.node,
+        TypedExprNode::Case {
+            scrutinee: Some(_),
+            ..
+        }
+    ) && matches!(expr.ty, Type::Base(BaseType::Unit))
+    {
+        return tag_case_to_guard_case(expr);
+    }
+    expr
+}
+
+/// The point-free one-arm eliminator ``variant_project(`fired) : {`fired{𝑉} |
+/// `idle} ⇒ 𝑉`` reading a tap stream's fed value — appended after a `.to_<defer>`
+/// read so the channel carries the positions the tap fired at.
+///
+/// The restriction is the point: a channel assembled from a tap holds what the
+/// program fed and nothing at the positions it fed nothing, which is the same
+/// domain a fanned-out conditional feed produces
+/// ([`crate::ccl::channelize`]). `` `idle `` positions drop out of the eliminated
+/// stream, so the `` `fired `` payload need answer nowhere else.
+pub fn fired_project(value_ty: Type) -> Expr {
+    let tap_ty = tap_variant_ty(value_ty.clone());
+    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_FIRED.into())))
+        .with_ty(Type::fun(tap_ty, value_ty))
 }
 
 /// Wrap a writer **decision record** `{commit, writes, to_<defer>*}` (the
