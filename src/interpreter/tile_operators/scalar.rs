@@ -5,7 +5,9 @@ use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
 use crate::{
-    interpreter::{BaseType, ColumnValue, Consumer, Extent, FunctionDef, Scheduler, Value},
+    interpreter::{
+        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Scheduler, Value,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -283,33 +285,29 @@ impl TileProducer for VariantWrapProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        match self.input.get(self.input.tiling().universal_guard()) {
-            // Scalar payload column → `Scalar(Union)` (the scalar `VariantCtor`).
-            tile @ Tile::Scalar(_) | tile @ Tile::Record(_) => {
-                let payload = scalar_tile_to_column_value(tile);
-                Tile::Scalar(wrap_variant_column(
-                    payload,
-                    &self.tag,
-                    &self.variant_extents,
-                ))
-            }
-            // Payload *stream* → wrap the codomain element-wise, preserving the
-            // domain `D`, so the constructor composes as `payload ≫ variant_wrap`.
-            mut tile @ Tile::Function { .. } => {
-                let slot = tile.deepest_values_mut();
-                let payload = scalar_tile_to_column_value(std::mem::replace(
-                    slot,
-                    Tile::Record(HashMap::new()),
-                ));
-                *slot = Tile::Scalar(wrap_variant_column(
-                    payload,
-                    &self.tag,
-                    &self.variant_extents,
-                ));
-                tile
-            }
-            other => panic!("VariantWrap: unexpected payload tile {other:?}"),
-        }
+        let mut tile = self.input.get(self.input.tiling().universal_guard());
+        // Which of the two cases this is was decided at construction, from the input's
+        // tiling, and is read back from the output's: a payload **stream** keeps its domain
+        // and wraps element-wise (so the constructor composes as `payload ≫ variant_wrap`),
+        // while a payload **value** becomes one union column. The tile cannot say — a stream
+        // of payloads and a payload that is itself a collection are both `Tile::Function`,
+        // and only the tiling separates them.
+        //
+        // Either way the payload becomes a value: an arm rides its row as one, so a payload
+        // carrying a collection materializes here rather than staying a level.
+        let slot = if self.tiling().is_function() {
+            tile.values_at_mut(1)
+        } else {
+            &mut tile
+        };
+        let payload =
+            materialize_collections(std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0))));
+        *slot = Tile::Scalar(wrap_variant_column(
+            payload,
+            &self.tag,
+            &self.variant_extents,
+        ));
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -355,7 +353,7 @@ impl TileProducer for VariantWrapProducer {
 ///   domain `D` is explicit (a variant field of a record stream, `x.f`). The
 ///   projected keys are the **actual `D` keys** at the tagged positions,
 ///   *not* synthetic positions — so the projected payload co-iterates by key
-///   with the outer element `x` under a `zip`/`FanIn` (the outer-binder arm
+///   with the outer element `x` under a `zip`/`Zip` (the outer-binder arm
 ///   `λ (x, wᵢ) → eᵢ`), which inner-joins on shared keys.
 ///
 /// **Restrict and project are one operation here.** A [`ColumnValue::Union`] arm
@@ -978,8 +976,8 @@ mod tests {
     /// **Outer-binder alignment.** Over a variant *stream* keyed by an explicit
     /// (non-`0..N`) domain, `VariantProject` keeps the real domain keys, so the
     /// projected payload co-iterates by key with the outer element under a
-    /// `FanIn` (the `⟨id, x.f ≫ variant_project(cᵢ)⟩ ▷ zip` shape). This is the
-    /// mechanism the outer-binder arm `λ (x, wᵢ) → eᵢ` relies on; the `FanIn`
+    /// `Zip` (the `⟨id, x.f ≫ variant_project(cᵢ)⟩ ▷ zip` shape). This is the
+    /// mechanism the outer-binder arm `λ (x, wᵢ) → eᵢ` relies on; the `Zip`
     /// inner-joins on the shared keys, so the outer arm need not be pre-restricted.
     #[test]
     fn variant_project_stream_preserves_keys_and_zips() {
@@ -1032,7 +1030,7 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
 
-        // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the FanIn joins
+        // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the Zip joins
         // the full outer stream with the tag-restricted payload on shared keys.
         let ops: Vec<Box<dyn TileOperator>> = vec![
             Box::new(FixedOp {
@@ -1041,7 +1039,7 @@ mod tests {
             }),
             Box::new(vp),
         ];
-        let mut fan = FanIn::new_at(
+        let mut fan = Zip::new_at(
             (0..2).map(crate::interpreter::tuple_field).collect(),
             ops,
             1,

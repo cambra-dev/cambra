@@ -4833,10 +4833,10 @@
           ]
         },
         {
-          "label": "FanIn",
+          "label": "MakeRecord",
           "nodeId": 656,
           "role": "operator",
-          "tiling": "Fn(Source(stdin) → {String, String})",
+          "tiling": "{Fn(Source(stdin) → String), Fn(Source(stdin) → String)}",
           "spans": [
             {
               "start": 87,

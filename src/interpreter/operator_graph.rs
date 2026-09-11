@@ -73,7 +73,7 @@ pub enum EdgeRole {
     /// The field the consumer stores the input under, e.g. `"input"`,
     /// `"predicate"`, `"default"`.
     Named(&'static str),
-    /// A position in a `Vec` of inputs, as `FanIn` and `UnionOperator` have.
+    /// A position in a `Vec` of inputs, as `Zip` and `UnionOperator` have.
     Positional(usize),
     /// A store key, as both stores' `init_ops` are keyed by.
     StoreKey(String),
