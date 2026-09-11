@@ -33,8 +33,8 @@ use crate::{
         },
         operator_graph::{record_kept_operators, record_sink, record_source_read},
         tile_operators::{
-            Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
+            Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
+            FlattenTupleDomain, IterateExtent, Lookup, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling,
             Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in, fan_in_named,
@@ -2060,60 +2060,71 @@ fn convert_impl_inner(
             convert_permute_domain(function, argument, ctx)
         }
 
-        // A **partially applied** checked lookup: `𝑐 ▷ curry(lookup?)` is the morphism "look a
-        // key up in `𝑐`", so this node arrives with the keys as its input. `simplify`'s
+        // A **partially applied** lookup: `𝑐 ▷ curry(lookup)` is the morphism "look a key up
+        // in `𝑐`", so this node arrives with the keys as its input. `simplify`'s
         // `try_partial_lookup` mints it wherever the collection does not vary, which is what
         // lets the collection be compiled once and read per key — a streamed collection
         // cannot be replicated into every row, since broadcasting copies a single value.
         TypedExprNode::Apply { argument, function }
-            if as_curried_builtin(function) == Some(Builtin::LookupChecked) =>
+            if as_curried_builtin(function).is_some_and(|b| b.is_lookup()) =>
         {
-            let keys = expect_input(input, "partial checked lookup")?;
-            let option_ty = expr.ty.codomain().ok_or_else(|| {
+            let form = as_curried_builtin(function)
+                .and_then(|b| b.lookup_form())
+                .expect("guarded above");
+            let keys = expect_input(input, "partial lookup")?;
+            let answer_ty = expr.ty.codomain().ok_or_else(|| {
                 ConversionError::TypeError(format!(
-                    "`c ▷ curry(lookup?)` must have function type, got {}",
+                    "`c ▷ curry(lookup)` must have function type, got {}",
                     expr.ty
                 ))
             })?;
-            let option_extent = ctx.extent_of(&option_ty)?;
+            let answer_extent = ctx.extent_of(&answer_ty)?;
             let collection = convert_impl(argument, None, ctx)?;
             reject_unanswerable_lookup_collection(collection.tiling())?;
-            Ok(Box::new(CheckedLookup::split(
+            Ok(Box::new(Lookup::split(
                 collection,
                 keys,
-                option_extent,
+                answer_extent,
+                form,
             )))
         }
 
-        // The **checked lookup** with both operands syntactic: `(𝑐, 𝑘) ▷ lookup?` where the
-        // pair is still a term, so each leg compiles as its own source and the collection is
-        // read once rather than lifted into every row. This is the shape a lookup at a point
+        // A **lookup** with both operands syntactic: `(𝑐, 𝑘) ▷ lookup` where the pair is
+        // still a term, so each leg compiles as its own source and the collection is read
+        // once rather than lifted into every row. This is the shape a lookup at a point
         // takes. Where the pair has already been assembled into a stream of `(collection,
-        // key)` rows, the bare-`lookup?` arm below takes over.
+        // key)` rows, the bare-builtin arm below takes over.
         TypedExprNode::Apply { argument, function }
-            if matches!(
-                &function.node,
-                TypedExprNode::Builtin(Builtin::LookupChecked)
-            ) && matches!(&argument.node, TypedExprNode::Tuple(_)) =>
+            if as_builtin(function).is_some_and(|b| b.is_lookup())
+                && matches!(&argument.node, TypedExprNode::Tuple(_)) =>
         {
-            expect_no_input(input, "checked lookup")?;
+            let form = as_builtin(function)
+                .and_then(|b| b.lookup_form())
+                .expect("guarded above");
             let TypedExprNode::Tuple(pair) = &argument.node else {
                 unreachable!("guarded above")
             };
             let [coll_expr, key_expr] = pair.as_slice() else {
                 return Err(ConversionError::Unsupported(format!(
-                    "`lookup?` takes exactly a collection and a key, got {} operands",
+                    "a lookup takes exactly a collection and a key, got {} operands",
                     pair.len()
                 )));
             };
-            let option_extent = ctx.extent_of(&expr.ty)?;
             let collection = convert_impl(coll_expr, None, ctx)?;
+            // Before the input check, because a collection-valued answer is what puts an
+            // input here: the proven form answers the collection itself, which planning
+            // marks an iteration site, so the node arrives composed with its consumer. The
+            // collection is the reason either way, and naming it is what makes the two forms
+            // fail alike (`a_group_valued_lookup_is_rejected_by_name`).
             reject_unanswerable_lookup_collection(collection.tiling())?;
+            expect_no_input(input, "lookup")?;
+            let answer_extent = ctx.extent_of(&expr.ty)?;
             let keys = convert_impl(key_expr, None, ctx)?;
-            Ok(Box::new(CheckedLookup::split(
+            Ok(Box::new(Lookup::split(
                 collection,
                 keys,
-                option_extent,
+                answer_extent,
+                form,
             )))
         }
 
@@ -2213,23 +2224,26 @@ fn convert_impl_inner(
                         )),
                     )))
                 }
-                // `lookup?` over an assembled stream of `(collection, key)` rows — what the
+                // A lookup over an assembled stream of `(collection, key)` rows — what the
                 // point-free form of a lookup inside an iteration composes to. The two
-                // collection representations arrive as two shapes of field 0 and
-                // `CheckedLookup` reads whichever it is given: a nested function tile is one
-                // collection shared by every row, a scalar column is one materialized map
-                // value per row.
-                Builtin::LookupChecked => {
-                    let option_ty = expr.ty.codomain().ok_or_else(|| {
+                // collection representations arrive as two shapes of field 0 and [`Lookup`]
+                // reads whichever it is given: a nested function tile is one collection
+                // shared by every row, a scalar column is one materialized map value per row.
+                b if b.is_lookup() => {
+                    let answer_ty = expr.ty.codomain().ok_or_else(|| {
                         ConversionError::TypeError(format!(
-                            "`lookup?` must have function type, got {}",
+                            "`{b}` must have function type, got {}",
                             expr.ty
                         ))
                     })?;
-                    let option_extent = ctx.extent_of(&option_ty)?;
+                    let answer_extent = ctx.extent_of(&answer_ty)?;
                     Ok(Box::new(
-                        CheckedLookup::paired(input, option_extent)
-                            .map_err(ConversionError::Unsupported)?,
+                        Lookup::paired(
+                            input,
+                            answer_extent,
+                            b.lookup_form().expect("guarded above"),
+                        )
+                        .map_err(ConversionError::Unsupported)?,
                     ))
                 }
                 Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
@@ -4104,13 +4118,13 @@ fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
 
 /// Reject a lookup whose collection has no answer shape.
 ///
-/// Two shapes answer, and `CheckedLookup` asserts rather than re-checks them. A
+/// Two shapes answer, and [`Lookup`] asserts rather than re-checks them. A
 /// **streamed** collection tiles as a sealed function over a **scalar** codomain: the
 /// operator searches the domain column to decide presence and carries one codomain value as
-/// the `` `some `` payload, so a codomain of any other shape — a `CurriedFunction`'s
-/// collection-valued rows, a `Record`'s several columns — has nothing to put there. A
-/// **materialized** collection is one map value, as a mutable collection's mutable variable holds
-/// it; it carries its own bindings, and any value can be the payload.
+/// the answer, so a codomain of any other shape — a `CurriedFunction`'s collection-valued
+/// rows, a `Record`'s several columns — has nothing to put there. A **materialized**
+/// collection is one map value, as a mutable collection's mutable variable holds it; it
+/// carries its own bindings, and any value can be the answer.
 ///
 /// Typing rejects the one producer of a key-dependent codomain today, so this is the
 /// boundary check for a shape that reaches op-conversion by some other route. Naming it
@@ -4127,10 +4141,10 @@ fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), Conversi
         return Ok(());
     }
     Err(ConversionError::Unsupported(format!(
-        "`c[k]?` needs a collection that tiles either as a sealed function over a scalar \
-         codomain, so that its domain can be searched and its values carried as the `some` \
-         payload, or as one materialized map value; this one tiles as {tiling}. A \
-         collection-valued codomain is the usual reason"
+        "a lookup needs a collection that tiles either as a sealed function over a scalar \
+         codomain, so that its domain can be searched and its values carried as the answer, \
+         or as one materialized map value; this one tiles as {tiling}. A collection-valued \
+         codomain is the usual reason"
     )))
 }
 

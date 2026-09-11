@@ -47,7 +47,9 @@
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 
-use crate::ccl::ccl_utils::{PredMemo, apply_primitive, is_builtin, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{
+    PredMemo, apply_primitive, is_builtin, is_lookup_builtin, walk_refined_predicates_mut,
+};
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{id, zip_pair};
 use crate::ccl::ty::FunKind;
@@ -934,24 +936,24 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
     )
 }
 
-/// Partial lookup: `⟨const(𝑐), 𝑔⟩ ≫ lookup?  ⟹  𝑔 ≫ (𝑐 ▷ curry(lookup?))`
+/// Partial lookup: `⟨const(𝑐), 𝑔⟩ ≫ lookup  ⟹  𝑔 ≫ (𝑐 ▷ curry(lookup))`, on either form.
 ///
-/// `lookup?` takes a `(collection, key)` pair, so a lookup whose collection does not vary
+/// A lookup takes a `(collection, key)` pair, so one whose collection does not vary
 /// has no term for "look a key up in `𝑐`" until the pair is broken apart again. `curry` is
 /// that term, and supplying `𝑐` to it is the partial application op-conversion compiles to a
 /// collection read once with every key answered against it. Without this the collection would
 /// have to be replicated into every row, which a streamed collection cannot be: broadcasting
 /// copies one present value, and a collection is a tile.
 ///
-/// Stated on `lookup?` rather than on any tupled morphism. The rewrite is only an improvement
-/// where the partial application has a compiled meaning, and `curry` of an arbitrary morphism
-/// does not — `⟨const(2), 𝑔⟩ ≫ add` would become a function value nothing consumes.
+/// Stated on the lookups rather than on any tupled morphism. The rewrite is only an
+/// improvement where the partial application has a compiled meaning, and `curry` of an
+/// arbitrary morphism does not — `⟨const(2), 𝑔⟩ ≫ add` would become a function value nothing
+/// consumes.
 fn try_partial_lookup(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| {
-            is_builtin(right, Builtin::LookupChecked)
-                && as_zip(left).is_some_and(|(l, _)| as_const(l).is_some())
+            is_lookup_builtin(right) && as_zip(left).is_some_and(|(l, _)| as_const(l).is_some())
         },
         |left, lookup, mint_kind| {
             let TypedExpr {

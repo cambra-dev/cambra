@@ -853,8 +853,44 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
     check_scalar(code, expected);
 }
 
-/// A group-by's groups are themselves collections, so a checked lookup on one would carry
-/// a collection as its `` `some `` payload — which nothing materializes.
+/// The **proven** lookup `c[k]` end to end: the value itself, and a process fault where the
+/// key is absent.
+///
+/// The fault is the interim half. Membership is not discharged at compile time, so the
+/// operator decides presence exactly as the checked form does and has nothing to answer with
+/// — a `` `none `` would be a value of a type this form does not have
+/// (`src/ccl/design/collections.md`, "The proven lookup `𝑐[𝑘]`").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map("m = map([(1, 10), (2, 20)])\nm[2]", Value::Int(20))]
+// A `Set(K)` is `Map(K, unit)`, so a present key answers with the unit its values are.
+#[case::set("s = set([1, 2, 3])\ns[2]", Value::Unit)]
+// Over a key stream, which is the partial application `simplify` mints: the collection is
+// read once and every key answered against it.
+#[case::key_stream(
+    "m = map([(1, 10), (2, 20)])\nsum([m[k] for k in [1, 2]])",
+    Value::Int(30)
+)]
+fn proven_lookup_answers_the_value(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// An absent key faults the process rather than compiling to an answer.
+#[test]
+fn a_proven_lookup_on_an_absent_key_faults() {
+    let panic = std::panic::catch_unwind(|| run_pipeline("m = map([(1, 10), (2, 20)])\nm[9]"))
+        .expect_err("an absent key must fault");
+    let message = panic
+        .downcast_ref::<String>()
+        .map_or("<non-string panic payload>", String::as_str);
+    assert!(
+        message.contains("is not a key of the collection"),
+        "the fault must name the absent key, got {message}"
+    );
+}
+
+/// A group-by's groups are themselves collections, so a lookup on one would carry a
+/// collection as its answer — which nothing materializes.
 ///
 /// Rejected at **op-conversion**, not by the typing rule: the answer's *type* is fine, the
 /// key binder having discharged to the key

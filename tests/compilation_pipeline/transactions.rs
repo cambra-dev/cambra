@@ -3377,6 +3377,52 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
     );
 }
 
+/// The **proven** lookup on a mutable collection, at both of the shapes a mutable variable
+/// reaches one: the awaited final value, and the per-row snapshot inside a block.
+///
+/// One operator serves both forms, so what this adds over the checked cases beside it is
+/// that the value arrives unwrapped — a mutable collection is readable without `Option`
+/// handling at every site (`src/ccl/design/collections.md`, "The proven lookup `𝑐[𝑘]`").
+/// The read-modify-write case is the one that needs both: `m[r]` is the write's key and its
+/// value's source in one statement.
+#[test]
+fn a_proven_lookup_reads_a_mutable_collection() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m["c"] := 3
+            final: Map(String, Int) = await_final(m)
+            final["c"]
+        "#},
+        Value::Int(3),
+    );
+    let snapshot = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                n := n + m[r]
+        await_final(n)
+    "#});
+    assert_eq!(snapshot, Value::Int(30));
+}
+
+/// A read-modify-write through the proven lookup: `m[r] := m[r] + 1` over the keys the
+/// mutable collection already holds.
+#[test]
+fn a_proven_lookup_carries_a_read_modify_write() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        for r in [1, 2]:
+            with begin():
+                m[r] := m[r] + 1
+        await_final(m)
+    "#});
+    assert_eq!(map_entries_int(&value), vec![(1, 11), (2, 21)]);
+}
+
 /// A key the mutable variable never held answers `` `none `` — the seed's keys and the written one
 /// are what it has, and nothing else.
 #[test]
