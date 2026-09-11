@@ -1,5 +1,6 @@
 //! BinOp operator: binary arithmetic operations on dataflow values.
 
+use std::collections::HashMap;
 use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 
 use bit_vec::BitVec;
@@ -192,8 +193,56 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
         (BinOpKind::Compare(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
             ColumnValue::Bools(zip_bool_compare(op, l, r))
         }
+        // A product compares **componentwise**, which is the whole of what makes one
+        // equatable (`src/ccl/design/type-inference.md`, "What the tables hold"). Both
+        // columns hold the same fields, the type having required the two operands to be one
+        // product, so a field one side lacks is a shape error rather than an inequality.
+        (
+            BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),
+            ColumnValue::Records(l),
+            ColumnValue::Records(r),
+        ) => ColumnValue::Bools(compare_records(op, l, r)),
         (op, left, right) => panic!("Unsupported binop: {:?} on {:?}, {:?}", op, left, right),
     }
+}
+
+/// Compare two record columns field by field, `Equals` conjoining the results and
+/// `NotEquals` disjoining them.
+///
+/// A record with no fields compares equal to itself at every position, which is the empty
+/// conjunction; the length comes from the columns rather than from a field, which is why it
+/// is passed rather than read off one.
+fn compare_records(
+    op: CompareKind,
+    left: HashMap<String, ColumnValue>,
+    right: &HashMap<String, ColumnValue>,
+) -> BitVec {
+    let rows = left
+        .values()
+        .map(ColumnValue::len)
+        .chain(right.values().map(ColumnValue::len))
+        .min()
+        .unwrap_or(0);
+    let mut acc = BitVec::from_elem(rows, op == CompareKind::Equals);
+    for (field, l) in left {
+        let r = right.get(&field).unwrap_or_else(|| {
+            panic!(
+                "comparing records with different fields: the right column has no `{field}`. \
+                 An equality's two operands are one product type"
+            )
+        });
+        let mut field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
+            ColumnValue::Bools(b) => b,
+            other => unreachable!("a comparison yields a Bool column, got {other:?}"),
+        };
+        field_eq.truncate(rows);
+        match op {
+            CompareKind::Equals => acc.and(&field_eq),
+            CompareKind::NotEquals => acc.or(&field_eq),
+            _ => unreachable!("guarded by the caller's match"),
+        };
+    }
+    acc
 }
 
 #[cfg(test)]

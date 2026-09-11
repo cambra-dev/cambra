@@ -22,8 +22,7 @@ use smol_str::SmolStr;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
-    BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet,
-    Type,
+    Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet, Type,
 };
 
 use super::smt::{NoScope, ScopeEnv, SmtError};
@@ -151,8 +150,9 @@ pub enum ConstrainError {
         /// shape that is not a base at all.
         found: Type,
         /// What that position could still have accepted, given everything already
-        /// known about the other operand.
-        accepted: Vec<BaseType>,
+        /// known about the other operand: the surviving rows' bases, or the product this
+        /// trait has already been answered at ([`Trait::is_structural`]).
+        accepted: Vec<Type>,
     },
     /// An attempt to compare two refinement bodies using an SMT
     /// solver failed, and the bodies could not be semantically
