@@ -232,7 +232,10 @@ impl LiveProgram {
     /// answers 404 rather than hanging. What is refused is a value that cannot
     /// be seeded, or cannot be seeded into a decided place, because that is the
     /// one outcome an author cannot see having happened: the program carries on
-    /// answering and only the accumulated history is wrong.
+    /// answering and only the accumulated history is wrong. A version that
+    /// retires a variable says where its value goes by reading it with
+    /// `@LoadFrom`, and the other direction is refused too: a `@LoadFrom` naming
+    /// a variable no running program holds.
     ///
     /// On `Err` the running program is untouched and still serving: both the
     /// compile to [`Phase::Planning`] and this check run before anything is torn
@@ -280,29 +283,77 @@ impl LiveProgram {
         let conflicts = ctx.state_conflicts(&planned);
         if !conflicts.is_empty() {
             ctx.sources_and_sinks_mut().release_unrouted_ports();
-            let mut lines: Vec<String> = conflicts.iter().map(StateConflict::to_string).collect();
-            lines.sort();
+            // Two failures, and they are opposite ways round: state the running
+            // program holds that this version cannot take over, and state this
+            // version asks for that no running program holds. They read as
+            // separate paragraphs because the remedy for one says nothing about
+            // the other.
+            let (absent, unseatable): (Vec<&StateConflict>, Vec<&StateConflict>) =
+                conflicts.iter().partition(|c| {
+                    matches!(
+                        c,
+                        StateConflict::NoPredecessor { .. } | StateConflict::Undecided { .. }
+                    )
+                });
             // A swap reports both of its directions, and they render the same.
-            lines.dedup();
-            // Naming the declarations is the fix for a positional clash, and it is
-            // not one an author would guess from the other two refusals.
-            let remedy = if conflicts
-                .iter()
-                .any(|c| matches!(c, StateConflict::Moved { .. }))
-            {
-                "\nBind each of those declarations to its own name — `a = f(…)` rather than a \
-                 bare `f(…)` — and a reload can follow them wherever they move."
-            } else {
-                ""
+            let render = |group: &[&StateConflict]| {
+                let mut lines: Vec<String> = group.iter().map(|c| c.to_string()).collect();
+                lines.sort();
+                lines.dedup();
+                lines.join(", ")
             };
-            return Err(vec![CompileError::Unsupported(format!(
-                "this version cannot take over state the running program is holding: {}. \
-A value carries forward only into the same variable, at the same type, and only where the source \
-says which variable that is.\n\
+            let mut paragraphs: Vec<String> = Vec::new();
+            if !unseatable.is_empty() {
+                // Naming the declarations is the fix for a positional clash, and
+                // it is not one an author would guess from the other refusals.
+                let remedy = if unseatable
+                    .iter()
+                    .any(|c| matches!(c, StateConflict::Moved { .. }))
+                {
+                    "\nBind each of those declarations to its own name — `a = f(…)` rather than a \
+                     bare `f(…)` — and a reload can follow them wherever they move."
+                } else if unseatable
+                    .iter()
+                    .any(|c| matches!(c, StateConflict::CarriedAt { .. }))
+                {
+                    // The declaration's annotation is what the value is read
+                    // at, so it has to state the whole of what the running
+                    // program holds rather than the part this version uses.
+                    "\nThe annotation on a `@LoadFrom` declaration is the shape the value is read at, so \
+                     it has to state the whole of what the running program holds."
+                } else {
+                    ""
+                };
+                paragraphs.push(format!(
+                    "this version cannot take over state the running program is holding: {}. \
+A value carries forward into the same variable at the same type, or into what a `@LoadFrom` reads \
+it into, and only where the source says which variable it belongs to.\n\
 Nothing else is refused: logic may change freely, endpoints may come and go, and a variable \
 may move between loops.{remedy}",
-                lines.join(", "),
-            ))]);
+                    render(&unseatable),
+                ));
+            }
+            if !absent.is_empty() {
+                // The two have different remedies: a name nothing declares is a
+                // source to fix, while a name declared but undecided is a value
+                // the running program has not produced, which no edit to this
+                // version reaches.
+                let remedy = if absent
+                    .iter()
+                    .any(|c| matches!(c, StateConflict::Undecided { .. }))
+                {
+                    "\nA store nothing reads is never driven, so it decides no value to hand on. \
+                     Reading the variable somewhere in the running program is what gives it one."
+                } else {
+                    "\nA source containing `@LoadFrom` is an upgrade of a specific predecessor; \
+                     with the migration taken out it starts from nothing like any other."
+                };
+                paragraphs.push(format!(
+                    "this version reads state the running program does not hold: {}.{remedy}",
+                    render(&absent),
+                ));
+            }
+            return Err(vec![CompileError::Unsupported(paragraphs.join("\n\n"))]);
         }
 
         // Read before teardown, off the same planned tree the guard used, so this

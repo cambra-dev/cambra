@@ -338,6 +338,90 @@ pub(crate) mod fixtures {
                 get_resps << latest
     "#};
 
+    /// [`LATEST_WRITE`] with `latest` retired and a new variable seeded from the
+    /// value it held. The one program shape the `carried` cases vary.
+    pub const LATEST_WRITE_MIGRATED: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        @LoadFrom(latest)
+        held: String
+
+        marked: Mut(String, Txn) := held + "!"
+
+        for msg in set_reqs:
+            with begin():
+                marked := msg + "!"
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << marked
+    "#};
+
+    /// [`LATEST_WRITE_MIGRATED`] keeping `latest` as well — the declared-and-carried
+    /// case, where a version seeds a new variable from one it goes on holding.
+    pub const LATEST_WRITE_MIGRATED_BESIDE: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        latest: Mut(String, Txn) := "(none)"
+        @LoadFrom(latest)
+        held: String
+
+        marked: Mut(String, Txn) := held + "!"
+
+        for msg in set_reqs:
+            with begin():
+                latest := msg
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << latest + "/" + marked
+    "#};
+
+    /// [`LATEST_WRITE_MIGRATED`] carrying a name no version ever declared.
+    pub const LATEST_WRITE_CARRIES_A_STRANGER: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        @LoadFrom(nonesuch)
+        held: String
+
+        marked: Mut(String, Txn) := held + "!"
+
+        for msg in set_reqs:
+            with begin():
+                marked := msg + "!"
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << marked
+    "#};
+
+    /// [`LATEST_WRITE_MIGRATED`] reading the carried value as an `Int`, which is
+    /// not what `latest` holds.
+    pub const LATEST_WRITE_MIGRATED_RETYPED: &str = indoc! {r#"
+        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+        @LoadFrom(latest)
+        held: Int
+
+        marked: Mut(Int, Txn) := held + 1
+
+        for msg in set_reqs:
+            with begin():
+                marked := marked + 1
+            set_resps << "ok\n"
+
+        for req in get_reqs:
+            with begin():
+                get_resps << "ok\n"
+    "#};
+
     pub const LATEST_WRITE_WRITER_EDIT: &str = indoc! {r#"
         set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
         get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
@@ -706,6 +790,10 @@ pub(crate) fn source(name: &str, port: u16) -> String {
         "guestbook-stateless-edit" => fixtures::GUESTBOOK_STATELESS_EDIT,
         "latest-write" => fixtures::LATEST_WRITE,
         "latest-write-writer-edit" => fixtures::LATEST_WRITE_WRITER_EDIT,
+        "latest-write-migrated" => fixtures::LATEST_WRITE_MIGRATED,
+        "latest-write-migrated-beside" => fixtures::LATEST_WRITE_MIGRATED_BESIDE,
+        "latest-write-migrated-retyped" => fixtures::LATEST_WRITE_MIGRATED_RETYPED,
+        "latest-write-carries-a-stranger" => fixtures::LATEST_WRITE_CARRIES_A_STRANGER,
         "one-stateful-loop" => fixtures::ONE_STATEFUL_LOOP,
         "one-stateful-loop-both" => fixtures::ONE_STATEFUL_LOOP_BOTH,
         "one-stateful-loop-moved" => fixtures::ONE_STATEFUL_LOOP_MOVED,
