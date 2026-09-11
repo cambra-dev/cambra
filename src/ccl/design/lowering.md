@@ -248,13 +248,23 @@ than declaration-on-reach: an annotation below an alias is lowered before the al
 Source order within the pass holds an alias's right-hand side to the aliases above it, so `A = A`
 and a chain naming an alias declared below are unresolved names.
 
-`pre_declare_type_aliases` returns every rejected alias rather than the first, because
-`lower_stmts_recovering` collects per-statement errors; a nested block takes only the first. A
-rejected declaration costs the block its own name, and the aliases after it are still declared.
+**A block-entry pass that lowers a type annotation runs after the alias declaration.**
+`pre_register_txn_decls` is one: it reads each `Mut(V, Txn)` annotation through
+`mut_annotation_parts`, which lowers the value type. Run first, it reads `Mut(Cents, Txn)` as an
+unresolved name and declines to register the variable, and the failure surfaces phases later as
+"`balance` is not a transactional mutable variable" with no mention of the alias. The order is
+held by calling such a pass inside `with_block_type_aliases`'s closure — `lower_stmts_inner` does,
+and `lower_stmts_recovering`, which has no wrapper, runs the two in that order directly. Nothing
+type-enforces it.
 
-`BUILTIN_TYPE_NAMES` is the set an alias may not rebind: the base types `BaseType::from_keyword`
-resolves, the constructors `lower_type_application` dispatches on, the two heads resolved ahead of
-it (`Mut` in `mut_annotation_parts`, `Feed` on a `def` parameter), and `Mut`'s sequencing domain
-`Txn`. Refusing them at the declaration keeps a name from resolving one way as a bare annotation
-and another as an application: an alias `List = Int` would be read by `x: List` and ignored by
+`pre_declare_type_aliases` returns every rejected alias rather than the first, so the aliases
+after a rejected one are still declared. Only `lower_stmts_recovering` reads past the first, because
+it collects per-statement errors; through `with_block_type_aliases` the first error aborts the block.
+
+`is_builtin_type_name` is the refusal an alias target faces. Base types come from
+`BaseType::from_keyword`, their single source; `RESERVED_TYPE_NAMES` carries the constructors
+`lower_type_application` dispatches on, the two heads resolved ahead of it (`Mut` in
+`mut_annotation_parts`, `Feed` on a `def` parameter), and `Mut`'s sequencing domain `Txn`.
+Refusing them at the declaration keeps a name from resolving one way as a bare annotation and
+another as an application: an alias `List = Int` would be read by `x: List` and ignored by
 `x: List(Int)`.

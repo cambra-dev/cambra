@@ -102,6 +102,10 @@ mod loops;
 mod stmts;
 mod transactions;
 
+/// The names a type alias may not rebind, re-exported so the test that pins the
+/// refusal iterates the same source [`is_builtin_type_name`] reads.
+pub use stmts::{RESERVED_TYPE_NAMES, is_builtin_type_name};
+
 // Pull every submodule's `pub(super)` helpers into the `lower` namespace so
 // that sibling submodules can reach them via `use super::*`. The external
 // `crate::ccl::lower::…` surface (`LoweringContext`, `LoweringError`,

@@ -45,10 +45,12 @@ pub(super) fn lower_stmts_recovering(
     // variable-writing loop is lowered before the `:=` / `def` that precedes it
     // textually. (No transactional-registry snapshot here — the top level is the
     // outermost scope, so nothing to restore to.)
-    pre_register_txn_decls(stmts, ctx);
     // Type aliases are declared in the same forward pass, and for the same
-    // reason: an annotation below an alias is lowered before it.
+    // reason: an annotation below an alias is lowered before it. They go first
+    // because `pre_register_txn_decls` lowers the `Mut(V, Txn)` annotations it
+    // scans — see [`with_block_type_aliases`] for the constraint.
     errors.extend(pre_declare_type_aliases(stmts, ctx));
+    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // Final statement: recover by substituting Expr::error() on failure.
@@ -224,7 +226,6 @@ pub(super) fn lower_stmts_inner(
     // Restored on both the success and error paths below.
     let snapshot = ctx.snapshot_transactional();
     let saved_mut_param_fns = ctx.mut_param_fns.clone();
-    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // The final statement must be a bare expression, an if/else block, or
@@ -233,6 +234,7 @@ pub(super) fn lower_stmts_inner(
     // innermost-first. (Mutability is carried by `Type::History` and checked
     // post-inference; introduction-vs-write is decided by lexical scope.)
     let result = with_block_type_aliases(stmts, ctx, |ctx| {
+        pre_register_txn_decls(stmts, ctx);
         lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
             rest.iter()
                 .enumerate()
@@ -1538,33 +1540,37 @@ fn collect_variant_arms(
     }
 }
 
-/// Every capitalized name the type language already spells: the base types
-/// [`BaseType::from_keyword`] resolves, the constructors [`lower_type_application`]
-/// dispatches on, the two heads resolved ahead of it (`Mut` in
-/// [`mut_annotation_parts`], `Feed` on a `def` parameter), and `Mut`'s sequencing
-/// domain `Txn`. A type alias may not rebind one, so an alias name and a built-in
-/// name never both resolve.
+/// The capitalized names the type language spells that are not base types: the
+/// constructors [`lower_type_application`] dispatches on, the two heads resolved
+/// ahead of it (`Mut` in [`mut_annotation_parts`], `Feed` on a `def` parameter),
+/// and `Mut`'s sequencing domain `Txn`.
 ///
 /// A new type constructor is added here in the same change that teaches
-/// [`lower_type_application`] its head; `builtin_type_names_are_refused` pins the
-/// names already listed, and nothing catches an omission.
-const BUILTIN_TYPE_NAMES: &[&str] = &[
+/// [`lower_type_application`] its head. `builtin_type_names_are_refused` iterates
+/// this slice, so the test cannot drift from it; nothing catches a constructor
+/// added to [`lower_type_application`] and omitted here.
+pub const RESERVED_TYPE_NAMES: &[&str] = &[
     "Array",
-    "Bool",
     "Collection",
     "Feed",
     "FullMap",
-    "Int",
     "List",
     "Map",
     "Mut",
     "Option",
     "Set",
-    "String",
     "Txn",
-    "UInt",
-    "Unit",
 ];
+
+/// Whether `name` is a capitalized name the type language already spells, and so
+/// is refused as a type-alias target.
+///
+/// The base types come from [`BaseType::from_keyword`], which is their single
+/// source; [`RESERVED_TYPE_NAMES`] carries the rest. An alias name and a built-in
+/// name therefore never both resolve.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    BaseType::from_keyword(name).is_some() || RESERVED_TYPE_NAMES.contains(&name)
+}
 
 /// Whether `name` is written in the type world rather than the term world.
 ///
@@ -1607,8 +1613,10 @@ pub(super) fn type_alias_decl<'a>(
 /// type.
 ///
 /// Returns every alias the block got wrong rather than stopping at the first, so
-/// a rejected declaration costs the block only its own name: the aliases after it
-/// are still declared, and their uses below still resolve.
+/// the aliases after a rejected one are still declared. Only [`lower_stmts_recovering`]
+/// reads past the first: it collects per-statement errors, so at the top level a
+/// rejected declaration costs the block its own name and nothing else. Through
+/// [`with_block_type_aliases`] the first error aborts the block.
 pub(super) fn pre_declare_type_aliases(
     stmts: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
@@ -1622,7 +1630,7 @@ pub(super) fn pre_declare_type_aliases(
         let Some((name, rhs)) = type_alias_decl(target, value) else {
             continue;
         };
-        if BUILTIN_TYPE_NAMES.contains(&name) {
+        if is_builtin_type_name(name) {
             errors.push(LoweringError::unsupported(
                 stmt.span,
                 format!("`{name}` is a built-in type and cannot be given another meaning"),
@@ -1660,9 +1668,18 @@ pub(super) fn pre_declare_type_aliases(
 /// goes through it. The block's first rejected alias short-circuits `lower`, and
 /// the restore runs on both paths.
 ///
+/// **Every block-entry pass that lowers a type annotation belongs inside `lower`.**
+/// [`pre_register_txn_decls`] is one: it reads each `Mut(V, Txn)` annotation through
+/// [`mut_annotation_parts`], which lowers the value type. Run before the aliases are
+/// declared, it sees `Mut(Cents, Txn)` as an unresolved name, declines to register
+/// the variable as transactional, and the failure surfaces phases later as
+/// "`balance` is not a transactional mutable variable" with no mention of the alias.
+/// Nothing type-enforces the order; it is held by keeping such a pass in `lower`.
+///
 /// The top-level block is the exception: it is the outermost scope, with nothing
 /// to restore to and an error sink that takes every rejected alias rather than the
-/// first ([`lower_stmts_recovering`]).
+/// first ([`lower_stmts_recovering`], which runs the two passes in this order
+/// directly).
 pub(super) fn with_block_type_aliases<T>(
     stmts: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,

@@ -9,6 +9,8 @@ use indoc::indoc;
 
 use crate::helpers::{check_compile_error, check_scalar};
 
+use cambra::ccl::BaseType;
+use cambra::ccl::lower::{RESERVED_TYPE_NAMES, is_builtin_type_name};
 use cambra::interpreter::Value;
 
 #[test]
@@ -308,26 +310,28 @@ fn rebinding_a_built_in_type_name_is_rejected() {
     );
 }
 
+/// Every name the refusal reads, refused. The base types come from
+/// `BaseType::keyword` and the rest from `RESERVED_TYPE_NAMES`, which is the same
+/// pair `is_builtin_type_name` consults, so this cannot drift from what it pins.
 #[test]
 fn builtin_type_names_are_refused() {
-    // Every name `BUILTIN_TYPE_NAMES` holds, each refused as an alias target.
-    for name in [
-        "Array",
-        "Bool",
-        "Collection",
-        "Feed",
-        "FullMap",
-        "Int",
-        "List",
-        "Map",
-        "Mut",
-        "Option",
-        "Set",
-        "String",
-        "Txn",
-        "UInt",
-        "Unit",
-    ] {
+    let base = [
+        BaseType::Int,
+        BaseType::UInt,
+        BaseType::String,
+        BaseType::Bool,
+        BaseType::Unit,
+    ]
+    .map(|b| b.keyword());
+    for name in base
+        .iter()
+        .copied()
+        .chain(RESERVED_TYPE_NAMES.iter().copied())
+    {
+        assert!(
+            is_builtin_type_name(name),
+            "`{name}` is listed here but not refused by `is_builtin_type_name`"
+        );
         check_compile_error(
             &format!("{name} = Int\n\nx: Int = 1\nx\n"),
             &format!("`{name}` is a built-in type and cannot be given another meaning"),
@@ -406,7 +410,7 @@ fn an_alias_name_is_not_a_value() {
 
             MyInt
         "#},
-        "MyInt",
+        "Unbound variable: 'MyInt'",
     );
 }
 
@@ -442,6 +446,46 @@ fn alias_declared_in_a_loop_body_does_not_escape() {
             leftover
         "#},
         "unknown type annotation: Step",
+    );
+}
+
+/// A transactional mutable variable's value type is an ordinary type position,
+/// so an alias stands where the type it names does. `Mut(V, Txn)` is read by
+/// `pre_register_txn_decls`, which runs at block entry, so this is what pins the
+/// alias declaration ahead of it.
+#[test]
+fn alias_is_the_value_type_of_a_transactional_variable() {
+    check_scalar(
+        indoc! {r#"
+            Cents = Int
+
+            balance: Mut(Cents, Txn) := 0
+
+            for i in [1, 2, 3]:
+                with begin():
+                    balance := balance + i
+
+            await_final(balance)
+        "#},
+        Value::Int(6),
+    );
+}
+
+#[test]
+fn alias_is_the_value_type_of_a_transactional_variable_in_a_nested_block() {
+    check_scalar(
+        indoc! {r#"
+            def run(xs) => Int:
+                Cents = Int
+                balance: Mut(Cents, Txn) := 0
+                for i in xs:
+                    with begin():
+                        balance := balance + i
+                await_final(balance)
+
+            run([1, 2, 3])
+        "#},
+        Value::Int(6),
     );
 }
 

@@ -2518,10 +2518,12 @@ The rules, and what each one is doing:
   capitalized binder and names this one. A `def` name and a parameter name are
   not yet checked; a capitalized one there binds a value the type language
   cannot see.
-- **A built-in type name keeps its meaning.** `Int`, `UInt`, `String`, `Bool`,
-  `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
+- **The type language's own names are reserved.** `Int`, `UInt`, `String`,
+  `Bool`, `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
   `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
-  targets, so a name resolves as a built-in or as an alias and never as both.
+  targets. The four writable primitives keep their meaning; `Unit` and `Txn` are
+  reserved without being writable as annotations at all — the unit type is
+  written `{}` (§6.6) and `Txn` is read only in a `Mut(V, Txn)` second slot.
 - **An alias is block-scoped** (§5), and each block declares a given name once.
   An alias in an inner block shadows a same-named outer one for that block, and
   the outer one is back at the end of it.
