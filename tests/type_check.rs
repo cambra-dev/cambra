@@ -1505,27 +1505,30 @@ fn full_map_annotations_are_satisfiable() {
     );
 }
 
-/// A key drawn from the source does **not** yet carry its collection's key domain, so a
-/// lookup into a `groupby` is rejected.
+/// A key drawn from the source does **not** yet carry its collection's key domain, so
+/// applying a `groupby` to one is rejected.
 ///
 /// This is a missing rule and not a refused one. The argument edge already relates
 /// refinements in the *dropping* direction — `Int@1` reaches a domain of `Int`
-/// ([`full_map_lookup_needs_no_presence_proof`]) — and what a proven lookup needs is the
-/// other direction: a key produced by the key morphism from an element of the source
-/// *acquires* `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, because that predicate says
-/// exactly which keys the morphism produces. Nothing in the type system stands against it
-/// (`src/ccl/design/collections.md`, "Prerequisite: the proof has to survive being
+/// ([`full_map_lookup_needs_no_presence_proof`]) — and what the specified proven lookup
+/// needs is the other direction: a key produced by the key morphism from an element of the
+/// source *acquires* `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, because that predicate
+/// says exactly which keys the morphism produces. Nothing in the type system stands against
+/// it (`src/ccl/design/collections.md`, "Prerequisite: the proof has to survive being
 /// consumed"), so this pins today's rejection to make its arrival visible rather than
 /// asserting the rejection is right.
 ///
-/// All three spellings fail identically, which is the point: the source element, the
-/// morphism applied to it, and a projected field are one situation.
+/// Stated in the **call** spelling, which is where the obligation still lands: `g[k]` does
+/// not state it while the proven lookup is interim
+/// (`src/ccl/design/collections.md`, "The proven lookup `𝑐[𝑘]`"). All three spellings fail
+/// identically, which is the point: the source element, the morphism applied to it, and a
+/// projected field are one situation.
 #[test]
 fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     for program in [
-        "c = [1,1,2]\ng = groupby(c, \\v -> v)\nsum([sum(g[x]) for x in c])",
-        "k = \\v -> v\nc = [1,1,2]\ng = groupby(c, k)\nsum([sum(g[k(x)]) for x in c])",
-        "c = [(a=1,b=2),(a=2,b=3)]\ng = groupby(c, \\r -> r.a)\nsum([sum([y.b for y in g[r.a]]) for r in c])",
+        "c = [1,1,2]\ng = groupby(c, \\v -> v)\nsum([sum(g(x)) for x in c])",
+        "k = \\v -> v\nc = [1,1,2]\ng = groupby(c, k)\nsum([sum(g(k(x))) for x in c])",
+        "c = [(a=1,b=2),(a=2,b=3)]\ng = groupby(c, \\r -> r.a)\nsum([sum([y.b for y in g(r.a)]) for r in c])",
     ] {
         let errs = infer_program_err(program);
         assert!(
@@ -5441,30 +5444,29 @@ fn integer_literal_subscript_is_still_tuple_projection() {
 /// rather than its type, so an un-applied `f` still has an open index variable and
 /// nothing to reject yet — same as any un-applied function over an inferred parameter.
 /// Applying it is what closes the variable and fires the obligation.
+///
+/// A **range** domain is what is left to reject, the key domain's obligation having moved to
+/// the call spelling while the proven lookup is interim
+/// ([`a_proven_lookup_on_a_map_does_not_discharge_membership`]).
 #[test]
 fn total_subscript_demands_a_provable_index() {
-    for program in [
-        // A bare `Int` is not provably a member of `[0, 3)`.
-        "def f(a: Array(3, Int), i: Int):\n    a[i]\nf([1,2,3], 5)",
-        // Nor is a bare key provably present in a map's key domain.
-        "def f(m: Map(Int, Int), k: Int):\n    m[k]\nf(groupby([1,2,3], \\x -> x), 5)",
-    ] {
-        assert!(
-            !infer_program_err(program).is_empty(),
-            "an unprovable index must be rejected, not silently allowed: {program}"
-        );
-    }
+    // A bare `Int` is not provably a member of `[0, 3)`.
+    let program = "def f(a: Array(3, Int), i: Int):\n    a[i]\nf([1,2,3], 5)";
+    assert!(
+        !infer_program_err(program).is_empty(),
+        "an unprovable index must be rejected, not silently allowed: {program}"
+    );
 }
 
 /// `[…]` means **collection lookup only**, and `.0` / `.name` mean projection — disjoint
 /// spellings, so lowering never has to guess which operation a subscript was.
 ///
-/// The **proven** form does not type-check for a range domain: an `Array(3, 𝑇)`'s domain is
-/// the range `[0, 3)`, which relates only by equality, so no integer carries the membership
-/// proof a total lookup needs and there is no refinement for the checked form to relax
-/// either (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What this pins
-/// is that the *rejection* is uniform — `xs[0]`, `xs[i]` and `xs(0)` are one operation and
-/// fail alike — so none of them is quietly reinterpreted as projection.
+/// Neither form type-checks for a range domain: an `Array(3, 𝑇)`'s domain is the range
+/// `[0, 3)`, which relates only by equality, so no integer relates to it at all and there is
+/// no membership refinement for a lookup to set aside
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What this pins is that
+/// the *rejection* is uniform — `xs[0]`, `xs[i]` and `xs(0)` all fail on the key — so none of
+/// them is quietly reinterpreted as projection.
 #[test]
 fn subscript_is_lookup_and_dot_is_projection() {
     // Projection: both keys, on the shapes that have them.
@@ -5482,8 +5484,8 @@ fn subscript_is_lookup_and_dot_is_projection() {
         "a tuple has no domain to look up in"
     );
 
-    // Lookup on a collection is one operation however it is spelled, and all three
-    // spellings fail the same undischarged-membership edge.
+    // Lookup on a collection rejects the index however it is spelled: the subscripts
+    // through the lookup rule, the call through application.
     for program in [
         "xs = [10, 20, 30]\nxs[0]",
         "xs = [10, 20, 30]\ni = 0\nxs[i]",
@@ -5515,11 +5517,12 @@ fn a_checked_lookup_is_not_an_application() {
         infer_program(&format!("{m}m[9]?")).to_string(),
         "{`none | `some{Int}}"
     );
-    // The proven form is the pair to it, and it still demands the membership its domain
-    // states — the two are different rules, not one rule with a flag.
+    // The **call** spelling is what still demands the membership the domain states, the
+    // proven lookup having set it aside while it is interim
+    // ([`a_proven_lookup_on_a_map_does_not_discharge_membership`]).
     assert!(
         !infer_program_err(&format!("{m}m(9)")).is_empty(),
-        "the proven form must still demand a membership proof"
+        "an application must still demand a membership proof"
     );
     // Only membership is waived. The key's base type is the collection's, and a `String`
     // does not become one by being looked up carefully.
@@ -5608,6 +5611,42 @@ fn checked_lookup_on_a_set_is_membership_as_a_value() {
     assert!(
         !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]?").is_empty(),
         "a String key must not reach an Int-keyed set"
+    );
+}
+
+/// The **proven** lookup `m[k]` answers the value type, and does not discharge the key's
+/// membership.
+///
+/// Interim, and the whole of what is interim: the key owes the collection's key base and
+/// nothing more, which is the checked lookup's obligation, so a key that cannot be shown
+/// present type-checks and faults the process where it is absent
+/// (`src/ccl/design/collections.md`, "The proven lookup `𝑐[𝑘]`"). The specified operator
+/// rejects such a key at compile time instead, and the program that earns that rejection
+/// back is the one that gives a key its collection's key domain
+/// ([`a_key_from_the_source_does_not_yet_carry_its_key_domain`]).
+///
+/// The **call** spelling keeps the obligation, so the two spellings have parted company
+/// for as long as this lasts: `m[k]` is the lookup rule, `m(k)` is an application
+/// ([`a_checked_lookup_is_not_an_application`]).
+#[test]
+fn a_proven_lookup_on_a_map_does_not_discharge_membership() {
+    let m = "m = map([(1, 10), (2, 20)])\n";
+    assert_eq!(infer_program(&format!("{m}m[1]")), int());
+    assert_eq!(
+        infer_program(&format!("{m}m[9]")),
+        int(),
+        "a key that is certainly absent still types: presence is not asked here"
+    );
+    // The key's base type is the collection's, which is the one obligation it does owe.
+    assert!(
+        !infer_program_err(&format!("{m}m[\"nope\"]")).is_empty(),
+        "a String key must not reach an Int-keyed map"
+    );
+    // A `Set(K)` is `Map(K, unit)`, so its proven lookup answers `unit` where the checked
+    // one answers `Option(unit)` ([`checked_lookup_on_a_set_is_membership_as_a_value`]).
+    assert_eq!(
+        infer_program("s = set([1, 2, 3])\ns[1]").to_string(),
+        "Unit"
     );
 }
 

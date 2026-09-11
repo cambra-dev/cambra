@@ -476,25 +476,30 @@ impl Typing for CheckCtx {
         Ok(result)
     }
 
-    /// Read the payload emission recorded rather than discharging again.
+    /// Read the value emission recorded rather than discharging again.
     ///
-    /// `emit_lookup_checked` stamps the operator with `(collection, key) ⇒ Option(payload)`,
-    /// so every check after inference has the answer in hand. Asserted rather than falling
-    /// back to the discharge: a missing stamp means emission did not run this rule, and
-    /// re-deriving would paper over that while building a term against a predicate
-    /// planning may already have compiled.
+    /// `emit_lookup` stamps the operator with `(collection, key) ⇒ answer`, so every check
+    /// after inference has the answer in hand and `form` says how to read the value back out
+    /// of it. Asserted rather than falling back to the discharge: a missing stamp means
+    /// emission did not run this rule, and re-deriving would paper over that while building a
+    /// term against a predicate planning may already have compiled.
     fn keyed_value_at(
         &mut self,
+        form: crate::ccl::LookupForm,
         _codomain: &Type,
         _key_binder: Option<&Name>,
         _key: &Expr,
         stamped: &Type,
     ) -> Type {
-        let payload = stamped
-            .codomain()
-            .and_then(|answer| answer.option_payload().cloned());
-        payload.unwrap_or_else(|| {
-            panic!("emit_lookup_checked stamps `lookup?` with `(pair) ⇒ Option(payload)`, got {stamped}")
+        let value = stamped.codomain().and_then(|answer| match form {
+            crate::ccl::LookupForm::Proven => Some(answer.clone()),
+            crate::ccl::LookupForm::Checked => answer.option_payload().cloned(),
+        });
+        value.unwrap_or_else(|| {
+            panic!(
+                "`emit_lookup` stamps the {} with `(pair) ⇒ answer`, got {stamped}",
+                form.what()
+            )
         })
     }
 }

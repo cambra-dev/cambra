@@ -343,16 +343,15 @@ become the per-type standard-library instances with no semantic change. Everythi
 
 > **[Partly implemented]** — the two surface operators, proven `c[k] : 𝑇` and checked
 > `c[k]? : Option(𝑇)`, are specified in
-> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
-> `c[k]?` types today for a `Map` or `Set` whose type is known at the lookup
-> ([`Builtin::LookupChecked`]). The proven `c[k]` answers on a `FullMap`, whose key set is
-> the key type itself, and is a type error naming `c[k]?` on every other collection — which
-> is the design rather than a missing rule, since no expression yields a key carrying its
-> collection's key domain while iteration binds the codomain.
+> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access). Both types
+> today for a `Map` or `Set` whose type is known at the lookup, and `c[k]` does not yet
+> discharge the key's membership — see [The proven lookup `𝑐[𝑘]`](#the-proven-lookup-𝑐𝑘).
 
-`𝑐[𝑘]` is application. It lowers to `𝑐(𝑘)` and carries an application's one obligation, that
-the argument's type is a subtype of the function's domain — subscript and call are the same
-operation ([chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)).
+The two forms are one rule. Both take the collection's key type off the collection, relate
+the key to it, and read the codomain at the key; what separates them is how the answer is
+presented, and a `LookupForm` is the whole of that difference. Lowering emits one shape for
+both — `(𝑐, 𝑘) ▷ lookup`, tupled — `emit_lookup` types both, `simplify`'s partial-lookup
+rule rewrites both, and one tile operator answers both.
 
 ### The checked lookup `𝑐[𝑘]?`
 
@@ -361,7 +360,7 @@ total function on its own domain and says nothing about keys outside it, so neit
 the operation is a reading: the typing rule cannot be an application, and the operator has
 to search.
 
-**The rule**, four steps in `emit_lookup_checked`:
+**The rule**, four steps in `emit_lookup`:
 
 1. **Take the key domain, the key binder and the codomain off the collection**
    (`keyed_access_types`). An abstract `Map(𝐾, 𝑉)` is a Σ over `SubtypesOf(𝐾)`, so the sum
@@ -371,8 +370,9 @@ to search.
    (`a_key_dependent_lookup_discharges_the_key_binder`).
 3. **Require the key's type below the key domain's base**, the membership refinement peeled
    off (`keyed_access_value`).
-4. **Answer `Option`** of step 2's value, and stamp the builtin with the pair it is applied
-   to and that result, so later passes read one type off the node.
+4. **Answer** step 2's value as the form says — `Option` of it here — and stamp the builtin
+   with the pair it is applied to and that result, so later passes read one type off the
+   node.
 
 Step 3 is the whole of the key's obligation, and it is what an application cannot express.
 An application requires its argument to lie in the function's domain, and a checked lookup
@@ -409,7 +409,7 @@ introduced, not something the key has to satisfy.
 answers the same question with the value instead of a tag.
 
 **The operator.** Lowering emits `(𝑐, 𝑘) ▷ lookup?`, which op-conversion compiles to a
-[`CheckedLookup`] taking the collection and the key as separate sources: it searches the
+[`Lookup`] taking the collection and the key as separate sources: it searches the
 collection's domain for the key and emits `` `some(𝑐(𝑘)) `` or `` `none ``.
 
 **Absence is decided, not read off an empty tile.** An empty tile means "no rows known
@@ -417,8 +417,8 @@ here", which covers both a key genuinely absent and a producer that has not conv
 Answering `` `none `` from emptiness would make the tag a function of how far the source had
 run rather than of the collection's value, so the same lookup on a live source would answer
 `` `none `` and later `` `some `` — and a live source is the ordinary case here. Terminality
-is therefore the **readiness** condition: `CheckedLookup` withholds until the domain is
-decided, and only then answers `` `none ``.
+is therefore the **readiness** condition: [`Lookup`] withholds until the domain is decided,
+and only then answers `` `none ``.
 
 **A lookup on an unpinned live domain never decides absence.** Terminality stands in for
 "the domain has a definite value", and a live feed has one only where something pins it —
@@ -450,11 +450,31 @@ is a morphism from a zip, `⟨𝑐, 𝑘⟩ ≫ lookup?`, and a collection reach
   and the lookup searches that value's bindings.
 
 **A collection-valued answer does not materialize.** A group-by's rows are themselves
-collections, so the answer would carry a collection as its `` `some `` payload, and a
-variant payload that is a collection has no materialization. Op-conversion rejects that
-shape by name (`a_group_valued_lookup_is_rejected_by_name`). It is also the case where
-presence and emptiness genuinely differ: a `Map(𝐾, Collection(𝑉))` can store an empty
+collections, so the answer would carry a collection, and nothing materializes one there.
+Op-conversion rejects that shape by name, on the collection rather than on the answer, so
+both forms fail alike (`a_group_valued_lookup_is_rejected_by_name`). It is also the case
+where presence and emptiness genuinely differ: a `Map(𝐾, Collection(𝑉))` can store an empty
 collection at a present key.
+
+### The proven lookup `𝑐[𝑘]`
+
+`𝑐[𝑘]` answers `𝑉` at any key, and faults the process where the key is absent.
+
+**The key's obligation is the checked lookup's [Interim].** Step 3 of the rule above is the
+whole of it — the key owes the collection's key base, membership peeled off — so a key that
+cannot be shown present type-checks, and the operator reaches a decided absence with nothing
+to answer. A `` `none `` is a value of a type this form does not have, so the process faults
+(`a_proven_lookup_on_an_absent_key_faults`). Every other step is shared, including the key
+binder's discharge, so `𝑚[𝑘]` names the same value type read, written, or checked.
+
+The specified rule makes an unprovable key a compile-time error instead
+([chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)), and what it
+waits on is a key that carries its collection's key domain — the gap
+[Prerequisite: the proof has to survive being consumed](#prerequisite-the-proof-has-to-survive-being-consumed)
+states. Until then the obligation is not gone, only moved: the **call** spelling `𝑐(𝑘)` is
+still an application and still demands the index lie in the domain
+(`a_key_from_the_source_does_not_yet_carry_its_key_domain`), so the two spellings the spec
+calls one operation have parted company for as long as this lasts.
 
 ### Prerequisite: the proof has to survive being consumed
 
@@ -466,11 +486,12 @@ This is what makes `for o in orders: g[key(o)]` provable, and it is what naming 
 morphism bought — an opaque domain admits no such rule.
 
 **Iterating the collection** does not, and the gap is in consumption rather than in the
-surface. Consuming a sum deliberately presents the sum `σ` rather than the refined domain,
-so that the witness cannot escape into the consumer's result; an iterated key is therefore
-a consumed sum's witness, and the membership has nothing to discharge against. The
-apparatus is there — `𝑘 : σ` alongside `𝑚 : σ` is the pairing a discharge needs — but which
-shape closes it is open, and it lands before the `[]` / `[]?` surface rather than with it.
+surface. Consuming a sum presents the sum `σ` rather than the refined domain, so that the
+witness cannot escape into the consumer's result; an iterated key is therefore a consumed
+sum's witness, and the membership has nothing to discharge against. The apparatus is there —
+`𝑘 : σ` alongside `𝑚 : σ` is the pairing a discharge needs — but which shape closes it is
+open. Closing it is what retires the interim rule in
+[The proven lookup `𝑐[𝑘]`](#the-proven-lookup-𝑐𝑘).
 
 ## Compiling a conditional collection
 

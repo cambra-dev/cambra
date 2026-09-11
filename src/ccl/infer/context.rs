@@ -867,10 +867,11 @@ impl Typing for InferCtx {
         Ok(applied)
     }
 
-    /// Emission computes the discharge; the operator's type is not stamped yet, so
-    /// `stamped` says nothing here.
+    /// Emission computes the discharge, so neither the stamp nor the lookup's form says
+    /// anything here: the operator is not stamped yet, and both forms read the same value.
     fn keyed_value_at(
         &mut self,
+        _form: crate::ccl::LookupForm,
         codomain: &Type,
         key_binder: Option<&Name>,
         key: &Expr,

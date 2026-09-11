@@ -666,6 +666,18 @@ pub enum Builtin {
     /// binder's type (`Typing::keyed_value_at`).
     LookupChecked,
 
+    /// `lookup : ((𝑘: 𝐷) ⤇ 𝑉, 𝐾) → 𝑉[𝑘 ↦ key]` — the **proven** lookup `c[k]`, evaluating a
+    /// finite function at a point (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
+    ///
+    /// [`Self::LookupChecked`]'s rule with the answer presented as the value rather than as a
+    /// tag, and it shares every shape with it: the tupled argument, the partial application
+    /// [`Self::Curry`] mints, and the operator both compile to.
+    ///
+    /// **The membership is not discharged.** The key owes the collection's key base and
+    /// nothing more, so an absent key faults the process where the specified operator makes
+    /// it a compile-time error (`src/ccl/design/collections.md`, "The proven lookup `𝑐[𝑘]`").
+    LookupProven,
+
     /// `insert : (Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉, 𝐾, 𝑉) ⇒ (Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉)` — the
     /// collection with one key's value replaced, inserting the key where it was
     /// absent. Applied as a tupled argument, the convention [`Self::GetPrevTxn`]
@@ -710,7 +722,46 @@ pub enum Builtin {
     VariantIs(FieldKey),
 }
 
+/// Which of the two lookups a keyed access is, and so how it presents its answer.
+///
+/// The form is all that separates `c[k]` from `c[k]?`. The membership decision is one
+/// decision either way, so every pass between lowering and the tile operator treats the two
+/// alike — one typing rule, one partial-application rewrite, one iteration site, one
+/// operator — and reads the form only where the answer is built
+/// (`src/ccl/design/collections.md`, "Lookup: membership discharge").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LookupForm {
+    /// `c[k]` — the value at the key, the process faulting where the key is absent.
+    Proven,
+    /// `c[k]?` — `` `some `` of it, or `` `none `` for a decided absence.
+    Checked,
+}
+
+impl LookupForm {
+    /// How a diagnostic names this form.
+    pub fn what(self) -> &'static str {
+        match self {
+            Self::Proven => "proven lookup `c[k]`",
+            Self::Checked => "checked lookup `c[k]?`",
+        }
+    }
+}
+
 impl Builtin {
+    /// The lookup this is, or `None` for every other builtin.
+    pub fn lookup_form(&self) -> Option<LookupForm> {
+        match self {
+            Self::LookupProven => Some(LookupForm::Proven),
+            Self::LookupChecked => Some(LookupForm::Checked),
+            _ => None,
+        }
+    }
+
+    /// Whether this is one of the two lookups, `c[k]` or `c[k]?`.
+    pub fn is_lookup(&self) -> bool {
+        self.lookup_form().is_some()
+    }
+
     /// Stable, source-style display name for this built-in, used by
     /// [`crate::ccl::symbolic`] and the pretty-printer when rendering
     /// applied primitives.
@@ -755,6 +806,7 @@ impl Builtin {
             Self::VariantWrap(_) => "variant_wrap",
             Self::CollectionContains => "collection_contains",
             Self::LookupChecked => "lookup?",
+            Self::LookupProven => "lookup",
             Self::Insert => "insert",
             Self::VariantIs(_) => "variant_is",
         }

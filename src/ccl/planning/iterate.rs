@@ -8,7 +8,7 @@
 use std::mem::take;
 
 use super::join::try_hash_join_rewrite;
-use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::ccl_utils::{PredMemo, is_lookup_builtin};
 use crate::ccl::provenance;
 
 use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
@@ -209,16 +209,10 @@ pub(super) fn insert_iterate_recurse(
                 wrap_with_iterate(operand, discharged, "copair-operand");
             }
         }
-        // The **checked lookup**'s collection is compiled with `input=None` (`𝑐 ▷ lookup?`
-        // reads the collection once and takes the keys as its input), so it is an
-        // iteration site.
-        TypedExprNode::Apply { argument, function }
-            if matches!(
-                &function.node,
-                TypedExprNode::Builtin(Builtin::LookupChecked)
-            ) =>
-        {
-            wrap_with_iterate(argument, discharged, "checked-lookup-collection");
+        // A **lookup**'s collection is compiled with `input=None` (`𝑐 ▷ lookup` reads the
+        // collection once and takes the keys as its input), so it is an iteration site.
+        TypedExprNode::Apply { argument, function } if is_lookup_builtin(function) => {
+            wrap_with_iterate(argument, discharged, "lookup-collection");
         }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.

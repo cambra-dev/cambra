@@ -910,7 +910,8 @@ target.0         -- attribute: tuple field by position
 Lists and maps denote *finite functions* from their index domains
 (`UInt`, `K`) to their element / value type, so a subscript is
 "evaluate the finite function at a point" — the same operation as a
-call, `c[k]` and `c(k)` alike.
+call, `c[k]` and `c(k)` alike. (Interim: today the two differ in what
+they ask of the index — see the direction below.)
 
 **`[…]` is lookup and `.` is projection — they are not
 interchangeable.** A product is heterogeneous, so it is not a finite
@@ -939,13 +940,19 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > value — `` `some `` for a present key, `` `none `` for an absent one — where `k in s`
 > (below) states it as a `Bool`. A `FullMap` (§6.3) discharges every key by construction,
 > so `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
-> *Partiality*, §3). **Partly implemented** — `c[k]?` answers on a `map` and a `set`; on a
-> `groupby` it types (the group's type names the key it was looked up at) and is rejected
-> when compiled, because nothing materializes a collection as an `` `some `` payload; and
-> on a list it is rejected, because a range domain carries no membership to decide.
-> `c[k]` lowers as the lookup `c(k)`, so a `FullMap` subscript answers `V` today, its key
-> set being the key type itself; for every other collection nothing discharges the index's
-> membership, so the proven subscript is a type error whatever the index.
+> *Partiality*, §3). **Partly implemented** — both forms answer on a `map` and a `set`; on a
+> `groupby` they type (the group's type names the key it was looked up at) and are rejected
+> when compiled, because nothing materializes a collection as an answer; and on a list they
+> are rejected, because a range domain carries no membership to decide.
+>
+> **`c[k]` does not yet prove the index [Interim].** It asks of the index exactly what
+> `c[k]?` asks — the collection's key type, membership set aside — so a key that cannot be
+> shown present type-checks, and an absent key faults the process at runtime rather than
+> being the compile-time error above. The specified rule is what arrives when a key can
+> carry its collection's key domain; until then `c[k]?` is the form with no runtime
+> failure. The **call** spelling `c(k)` is unaffected and stays an application, so it keeps
+> demanding the index lie in the collection's domain — for as long as this lasts, `c[k]`
+> and `c(k)` are different operations rather than one spelled two ways.
 
 > **Direction [Open] — `c[k]?` decides absence at a cut.** Answering `` `none ``
 > requires knowing the collection's domain has a definite value, and today's condition

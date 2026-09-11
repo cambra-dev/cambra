@@ -332,6 +332,7 @@ pub(super) trait Typing {
     /// [`crate::ccl::expr::TypedExprNode::Proj`]'s rule does, for the same reason.
     fn keyed_value_at(
         &mut self,
+        form: crate::ccl::LookupForm,
         codomain: &Type,
         key_binder: Option<&Name>,
         key: &Expr,

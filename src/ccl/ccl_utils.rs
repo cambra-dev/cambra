@@ -455,6 +455,11 @@ pub(crate) fn is_builtin(expr: &Expr, b: Builtin) -> bool {
     matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
 }
 
+/// Whether `expr` is one of the two lookup builtins ([`Builtin::is_lookup`]).
+pub(crate) fn is_lookup_builtin(expr: &Expr) -> bool {
+    matches!(&expr.node, TypedExprNode::Builtin(b) if b.is_lookup())
+}
+
 /// Whether `e` is a chain-head **iteration-source marker** `iterate(pred)` —
 /// `Apply(pred, Builtin::Iterate)`. Planning inserts these into the *term tree*
 /// ([`crate::ccl::planning::insert_iterate_markers`]) to mark an extent as an
