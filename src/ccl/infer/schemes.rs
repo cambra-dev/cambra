@@ -379,6 +379,7 @@ impl OperatorSchemes {
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::Subtractable),
             BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::Multipliable),
             BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => arithmetic(Trait::Divisible),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow) => arithmetic(Trait::Exponentiable),
             BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
                 comparison(Trait::Equatable)
             }
