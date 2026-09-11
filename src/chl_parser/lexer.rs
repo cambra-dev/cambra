@@ -196,6 +196,11 @@ pub enum Token {
     #[token("\\")]
     Backslash,
 
+    /// Decorator introducer `@`, as in `@LoadFrom(x)` on the line above a
+    /// declaration.
+    #[token("@")]
+    At,
+
     // -- Literals ---------------------------------------------------------
     /// Decimal integer literal. `_` digit separators are not supported.
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
@@ -290,6 +295,7 @@ impl fmt::Display for Token {
             Token::Dot => ".",
             Token::Backtick => "`",
             Token::Semi => ";",
+            Token::At => "@",
             Token::Backslash => "\\",
             // Value-carrying tokens — chumsky's `select!` matches the
             // variant, not a specific value, so these typically appear

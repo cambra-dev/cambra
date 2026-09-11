@@ -670,6 +670,32 @@ pub(super) fn lower_middle_stmt(
                 stmt.span,
             ))
         }
+        // `@LoadFrom(x)` / `y: T` — `y` is the value the version this source
+        // replaces held for `x`, as a plain binding. The decorator supplies the
+        // value, so this is the one declaration that carries an annotation and
+        // no initialiser; it lowers exactly as `y: T = <that value>` would.
+        //
+        // `y` is an ordinary `let`. Nothing requires it to be mutable, and a
+        // version that only wants to read what its predecessor held declares
+        // nothing mutable at all.
+        ChlStmt::LoadFrom {
+            target,
+            annotation,
+            source,
+        } => {
+            let name = extract_name_target(target, "`@LoadFrom` declaration")?;
+            let annotation_ty = lower_type_annotation(annotation, ctx)?;
+            // The source names a variable of the *previous* version, so it is
+            // resolved against what that version held rather than against this
+            // scope — see `src/ccl/design/hot-reload.md`, "Seeding a variable
+            // from the value the predecessor held". It is a spelling here, not a
+            // reference, which is why it never goes through `lower_expr`.
+            let val = ctx.tag_image(Expr::carried(source.node.as_str()), source.span);
+            Ok(ctx.tag_image(
+                Expr::let_bind_annotated(name, val, body, annotation_ty),
+                stmt.span,
+            ))
+        }
         // `x := e` — a mutable **introduction** or **write**, split by scope:
         //  - a bare `x := e` where `x` is already in scope is a *write* — a
         //    `MutWrite` marker (which the check requires to target a mutable variable, and
@@ -951,6 +977,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::AugAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
+            | ChlStmt::LoadFrom { target, .. }
             | ChlStmt::Define { target, .. } => {
                 if let AssignTarget::Name(id) = &target.node {
                     names.insert(id.as_str().to_string());

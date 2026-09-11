@@ -1284,6 +1284,118 @@ fn await_final_of_an_induction_accumulator_rejected() {
     );
 }
 
+/// `@LoadFrom` names a mutable variable of the previous version. The variable it
+/// names belongs to the version this source replaces, so there is nothing for an
+/// expression in that position to evaluate against.
+#[test]
+fn load_from_an_expression_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            @LoadFrom(1 + 1)
+            n: Int
+            n
+        "#},
+        "parse error",
+    );
+}
+
+/// One name, and no `@LoadFrom(x, default)`: a default would turn the
+/// missing-predecessor error back into a silent wrong answer.
+#[test]
+fn load_from_with_a_default_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            @LoadFrom(m, 0)
+            n: Int
+            n
+        "#},
+        "parse error",
+    );
+}
+
+/// `LoadFrom` is the only decorator, and an unknown one is reported by name
+/// rather than as a failure to find `@`.
+#[test]
+fn an_unknown_decorator_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            @LoadsFrom(m)
+            n: Int
+            n
+        "#},
+        "unknown decorator `LoadsFrom`",
+    );
+}
+
+/// A declaration carries an annotation and no value only under `@LoadFrom`,
+/// which is what supplies the value. A bare one stays a parse error.
+#[test]
+fn a_bare_annotation_without_a_value_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            n: Int
+            n
+        "#},
+        "parse error",
+    );
+}
+
+/// A load is a declaration, and a loop body takes statements rather than
+/// declarations. The value is a snapshot, so a per-iteration one would be the
+/// same constant every time.
+#[test]
+fn load_in_a_loop_body_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            m: Mut(Int, Txn) := 0
+            for k in [1]:
+                @LoadFrom(n)
+                held: Int
+                with begin():
+                    m := m + held
+            await_final(m)
+        "#},
+        "only assignments",
+    );
+}
+
+/// The same inside a `with begin():` block, which takes the writes and reads of
+/// one transaction.
+#[test]
+fn load_in_a_transaction_block_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            m: Mut(Int, Txn) := 0
+            for k in [1]:
+                with begin():
+                    @LoadFrom(n)
+                    held: Int
+                    m := m + held
+            await_final(m)
+        "#},
+        "a `with begin():` block supports",
+    );
+}
+
+/// A source containing `@LoadFrom` is an upgrade of a specific predecessor and
+/// cannot be compiled from nothing — the cold-start rule, as an ordinary compile
+/// error.
+#[test]
+fn load_from_without_a_predecessor_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            @LoadFrom(m)
+            seed: Int
+            n: Mut(Int, Txn) := seed + 1
+            for r in [1]:
+                with begin():
+                    n := n + r
+            await_final(n)
+        "#},
+        "has no previous version to read from",
+    );
+}
+
 /// **Phase separation** — drain one transaction, seed the next from its final value.
 /// The shape a single program-wide store made impossible: `b`'s seed names `a`'s
 /// completion, so with one store `b`'s tick-0 value would await the store `b` itself

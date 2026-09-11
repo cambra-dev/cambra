@@ -1247,6 +1247,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Source(_)
+        | TypedExprNode::Carried(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {
             // Function before argument — deliberately, not just source order.

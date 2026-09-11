@@ -1004,6 +1004,955 @@ fn a_reload_may_not_change_the_type_of_held_state() {
     assert_eq!(still_serving, vec!["alice\nbob\n"], "state intact");
 }
 
+// ── `@LoadFrom(x)`: seeding a variable from the value the predecessor held ───
+
+/// A version that retires a variable and seeds a new one from the value it held
+/// is accepted, and the new variable starts at that value.
+///
+/// The migration is the declaration. Nothing else in the version says a value
+/// moved, and the variable the value came from is gone by the time the swap
+/// completes.
+#[test]
+fn a_retired_variable_seeds_its_replacement() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("latest-write", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![http_post(port, "/set", "bob"), http_get(port, "/get")]
+    });
+    assert_eq!(before, vec!["ok\n", "bob"]);
+
+    live.reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
+        .expect("retiring `latest` is accepted where `carried` reads it");
+
+    let after = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
+    assert_eq!(
+        after,
+        vec!["bob!"],
+        "the new variable starts at the retired one's value, migrated",
+    );
+}
+
+/// Declaring a variable and carrying it are independent: a version may do both,
+/// keeping the old variable live while seeding a new one from it.
+///
+/// The two share a commit store — one `with begin():` block reads both, so they
+/// fall in one causal group — which is the shape where a `carried` reads a key
+/// of the very store its own key is seeded into.
+#[test]
+fn a_loaded_variable_may_stay_declared() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("latest-write", port));
+
+    let before = exchange(&mut ctx, move || {
+        vec![http_post(port, "/set", "bob"), http_get(port, "/get")]
+    });
+    assert_eq!(before, vec!["ok\n", "bob"]);
+
+    live.reload(
+        &mut ctx,
+        &source("latest-write-migrated-beside", port),
+        &no_main,
+    )
+    .expect("keeping a variable and seeding another from it is one version");
+
+    let after = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
+    assert_eq!(
+        after,
+        vec!["bob/bob!"],
+        "`latest` resumes where it was and `marked` starts from the same value",
+    );
+}
+
+/// A migrating version is not a version that can be reloaded onto itself.
+///
+/// `@LoadFrom` is transitional: it reads a variable the predecessor holds, and
+/// the version that performs the migration retires that variable, so the version
+/// after it holds nothing of that name. Recompiling the same source is
+/// consequently refused — the migration comes out in the next version, which is
+/// the cleanup the author owes anyway.
+///
+/// The running program keeps serving, as at every other refusal.
+#[test]
+fn a_migrating_version_does_not_reload_onto_itself() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("latest-write", port));
+
+    exchange(&mut ctx, move || vec![http_post(port, "/set", "bob")]);
+    live.reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
+        .expect("the migration");
+
+    let errors = live
+        .reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
+        .err()
+        .expect("`latest` is gone, so there is nothing left for `@LoadFrom` to read");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom(latest)`"),
+        "the rejection should name the variable the source loads from: {rendered}",
+    );
+
+    let after = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
+    assert_eq!(
+        after,
+        vec!["bob!"],
+        "the refusal leaves the migrated version serving, with the value it seeded",
+    );
+}
+
+/// `@LoadFrom(x)` for a variable no running program holds is refused, and the
+/// running program keeps serving.
+#[test]
+fn a_reload_may_not_load_a_variable_nothing_holds() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("latest-write", port));
+
+    exchange(&mut ctx, move || vec![http_post(port, "/set", "bob")]);
+
+    let errors = live
+        .reload(
+            &mut ctx,
+            &source("latest-write-carries-a-stranger", port),
+            &no_main,
+        )
+        .err()
+        .expect("`nonesuch` is a variable no version ever declared");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom(nonesuch)`") && rendered.contains("does not hold"),
+        "the rejection should name the variable: {rendered}",
+    );
+
+    let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
+    assert_eq!(still_serving, vec!["bob"], "state intact");
+}
+
+/// Reading a carried value at a type the running program does not hold it at is
+/// refused, by the comparison a declaration gets.
+#[test]
+fn a_reload_may_not_load_a_variable_at_another_type() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("latest-write", port));
+
+    exchange(&mut ctx, move || vec![http_post(port, "/set", "bob")]);
+
+    let errors = live
+        .reload(
+            &mut ctx,
+            &source("latest-write-migrated-retyped", port),
+            &no_main,
+        )
+        .err()
+        .expect("`latest` holds a String; the new version reads it as an Int");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom` reads `latest`")
+            && rendered.contains("Int")
+            && rendered.contains("String"),
+        "the rejection should name the site and both types: {rendered}",
+    );
+
+    let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
+    assert_eq!(still_serving, vec!["bob"], "state intact");
+}
+
+/// A record carries whole, and the shape the site is read at is what has to
+/// match — not the shape the variable was declared at.
+///
+/// A record used one field at a time infers a record of that one field, so the
+/// expression around a `carried` decides what shape is demanded of the
+/// predecessor. Stating the shape is what makes a partial use compile.
+#[test]
+fn a_loaded_record_is_read_at_the_shape_annotated() {
+    let base = |port: u16| {
+        format!(
+            indoc! {r#"
+                reqs, resps = http_serve("{port}", "POST", "/bump")
+                n := (tag="x", count=0)
+                for r in reqs:
+                    n := (tag=n.tag + "!", count=n.count + 1)
+                    resps << n.tag + "\n"
+            "#},
+            port = port,
+        )
+    };
+    // Both fields used, so the site infers the whole record.
+    let whole = |port: u16| {
+        format!(
+            indoc! {r#"
+                reqs, resps = http_serve("{port}", "POST", "/bump")
+                @LoadFrom(n)
+                held <: {{tag: String, count: Int}}
+                m := held
+                for r in reqs:
+                    m := (tag=m.tag + "?", count=m.count + 1)
+                    resps << m.tag + "\n"
+            "#},
+            port = port,
+        )
+    };
+    // One field used, and the annotation is what states the rest.
+    let one_field = |port: u16| {
+        format!(
+            indoc! {r#"
+                reqs, resps = http_serve("{port}", "POST", "/bump")
+                @LoadFrom(n)
+                s: {{tag: String, count: Int}}
+                m := s.tag + "?"
+                for r in reqs:
+                    m := m + "!"
+                    resps << m + "\n"
+            "#},
+            port = port,
+        )
+    };
+
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&base(port));
+    assert_eq!(
+        exchange(&mut ctx, move || vec![http_post(port, "/bump", "a")]),
+        vec![
+            "x!
+"
+        ],
+    );
+    live.reload(&mut ctx, &whole(port), &no_main)
+        .expect("a record carries whole");
+    assert_eq!(
+        exchange(&mut ctx, move || vec![http_post(port, "/bump", "b")]),
+        vec![
+            "x!?
+"
+        ],
+    );
+
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&base(port));
+    assert_eq!(
+        exchange(&mut ctx, move || vec![http_post(port, "/bump", "a")]),
+        vec![
+            "x!
+"
+        ],
+    );
+    live.reload(&mut ctx, &one_field(port), &no_main)
+        .expect("the annotation states the shape the predecessor holds");
+    assert_eq!(
+        exchange(&mut ctx, move || vec![http_post(port, "/bump", "b")]),
+        vec![
+            "x!?!
+"
+        ],
+    );
+}
+
+/// The same program without the annotation is refused, naming both shapes.
+#[test]
+fn a_loaded_record_annotated_at_one_field_is_refused() {
+    let base = |port: u16| {
+        format!(
+            indoc! {r#"
+                reqs, resps = http_serve("{port}", "POST", "/bump")
+                n := (tag="x", count=0)
+                for r in reqs:
+                    n := (tag=n.tag + "!", count=n.count + 1)
+                    resps << n.tag + "\n"
+            "#},
+            port = port,
+        )
+    };
+    let one_field = |port: u16| {
+        format!(
+            indoc! {r#"
+                reqs, resps = http_serve("{port}", "POST", "/bump")
+                @LoadFrom(n)
+                held <: {{tag: String}}
+                m := held.tag + "?"
+                for r in reqs:
+                    m := m + "!"
+                    resps << m + "\n"
+            "#},
+            port = port,
+        )
+    };
+
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&base(port));
+    exchange(&mut ctx, move || vec![http_post(port, "/bump", "a")]);
+
+    let errors = live
+        .reload(&mut ctx, &one_field(port), &no_main)
+        .err()
+        .expect("the site infers a one-field record; the program holds two");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom` reads `n`")
+            && rendered.contains("state the whole of what the running program holds"),
+        "the rejection should name the site and the remedy: {rendered}",
+    );
+
+    let still_serving = exchange(&mut ctx, move || vec![http_post(port, "/bump", "b")]);
+    assert_eq!(
+        still_serving,
+        vec![
+            "x!!
+"
+        ],
+        "state intact"
+    );
+}
+
+/// A source containing `@LoadFrom(x)` cannot be started from nothing: it is an
+/// upgrade of a specific predecessor, and a first compilation has none.
+#[test]
+fn a_version_loading_state_is_not_a_cold_start() {
+    let port = reserve_test_port();
+    let mut ctx = GlobalContext::default();
+
+    let errors = LiveProgram::start(&mut ctx, &source("latest-write-migrated", port), &no_main)
+        .err()
+        .expect("there is no previous version to read `latest` from");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom(latest)`")
+            && rendered.contains("cannot be started from nothing"),
+        "the rejection should say what is missing: {rendered}",
+    );
+}
+
+/// An induction accumulator carries the same way a transactional variable does,
+/// and the value reaches the arithmetic that migrates it.
+///
+/// Built here rather than named because it has no `{PORT}` to substitute: the
+/// program's value is its accumulator, pulled to terminal.
+///
+/// The regression this pins: before `carried`, a new variable's initialiser
+/// naming the old one bound the plain `let` the declaration lowers to rather
+/// than the value the store held, so the migration silently read the declared
+/// init — `2` here rather than `8`.
+#[test]
+fn an_induction_accumulator_carries_into_its_replacement() {
+    let v1 = indoc! {r#"
+        n := 2
+        for x in [1, 2, 3]:
+            n := n + x
+        n
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(n)
+        held: Int
+        m := held * 10000
+        for x in [1, 2, 3]:
+            m := m + x
+        m
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 8);
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("retiring `n` is accepted where `carried` reads it");
+
+    // `80000`, and nothing more: the seed summarizes every position of `[1, 2, 3]`,
+    // so `m`'s drive resumes above them rather than folding them a second time.
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 80000);
+}
+
+/// A `Map`-valued variable carries whole, and the version that takes it over
+/// writes on top of what it held.
+///
+/// The value a store hands on is a `Value`, and the extent comes from what
+/// inference concluded for the site, so a collection is not a case of its own —
+/// this pins that rather than leaving it to the scalar and record cases to
+/// imply. It is also the shape a unit change on persisted state has: one keyed
+/// collection, retired into another.
+#[test]
+fn a_map_valued_variable_carries_whole() {
+    let v1 = indoc! {r#"
+        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        for r in [1]:
+            with begin():
+                qty["sol"] := 5
+        await_final(qty)
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(qty)
+        held: Map(String, Int)
+        qty_units: Mut(Map(String, Int), Txn) := held
+        for r in [1]:
+            with begin():
+                qty_units["sol"] := 9
+        await_final(qty_units)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 2),
+            ("eth".to_string(), 1),
+            ("sol".to_string(), 5),
+        ],
+    );
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("retiring a keyed collection is accepted where `carried` reads it");
+
+    // The collection carries whole, `sol` included. The writer does not fire
+    // again: its one position of `[1]` is committed into the value that was
+    // loaded, and replaying it is what a store resuming above its input avoids.
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 2),
+            ("eth".to_string(), 1),
+            ("sol".to_string(), 5),
+        ],
+    );
+}
+
+/// A carried collection is transformed on its way into the variable that
+/// replaces it — the whole of a unit change on persisted state, as a
+/// declaration.
+///
+/// A comprehension over a map binds each value and keeps the domain, so scaling
+/// every quantity is a value-only transformation over the carried collection.
+/// Both the seed's keys and the one the retired version wrote survive it.
+#[test]
+fn a_loaded_collection_is_transformed_into_its_replacement() {
+    // Whole units.
+    let v1 = indoc! {r#"
+        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        for c in [1]:
+            with begin():
+                qty["sol"] := 3
+        await_final(qty)
+    "#};
+    // Units x 10^4, and the arithmetic that reads them moves in the same version.
+    let v2 = indoc! {r#"
+        @LoadFrom(qty)
+        held <: Map(String, Int)
+        qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+        for c in [1]:
+            with begin():
+                qty_units["xrp"] := 70000
+        await_final(qty_units)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 2),
+            ("eth".to_string(), 1),
+            ("sol".to_string(), 3),
+        ],
+    );
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("the migration is a declaration, and the compiler takes it");
+
+    // `xrp` is absent: the writer's one position is committed into the value that
+    // was loaded, so it does not fire again. Its key is one the retired version
+    // never wrote, which is what makes a replay visible here rather than masked
+    // by an overwrite landing on the same value.
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 20000),
+            ("eth".to_string(), 10000),
+            ("sol".to_string(), 30000),
+        ],
+        "every quantity the retired version held is scaled, and nothing is replayed",
+    );
+}
+
+/// A carried collection whose values are records is transformed on its way into
+/// the variable that replaces it.
+///
+/// A map's seed reaches the store as a column of values, and a column of records
+/// has two representations. A value carried whole arrives boxed; a comprehension
+/// over that value builds each field separately and arrives struct-of-arrays.
+/// Only the combination reaches the second: a scalar-valued transform has no
+/// fields to build separately, and a record-valued carry is not rebuilt.
+///
+/// The regression this pins: the seed's drain accepted only the boxed form and
+/// read the struct-of-arrays one as a seed that had not settled yet, so the
+/// reload exhausted its pull bound and panicked.
+#[test]
+fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
+    // A quantity and the lot it was booked under.
+    let v1 = indoc! {r#"
+        qty: Mut(Map(String, {units: Int, lot: Int}), Txn) := box(map([("btc", (units=2, lot=7)), ("eth", (units=1, lot=8))]))
+        for c in [1]:
+            with begin():
+                qty["sol"] := (units=3, lot=9)
+        await_final(qty)
+    "#};
+    // Units x 10^4, the lot each was booked under left alone.
+    let v2 = indoc! {r#"
+        @LoadFrom(qty)
+        held <: Map(String, {units: Int, lot: Int})
+        qty_units: Mut(Map(String, {units: Int, lot: Int}), Txn) := [(units=q.units * 10000, lot=q.lot) for q in held]
+        for c in [1]:
+            with begin():
+                qty_units["xrp"] := (units=70000, lot=1)
+        await_final(qty_units)
+    "#};
+    // One entry of what `drive_main_record_map` answers, whose fields are in name
+    // order.
+    let entry = |key: &str, lot: i64, units: i64| {
+        (
+            key.to_string(),
+            vec![("lot".to_string(), lot), ("units".to_string(), units)],
+        )
+    };
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(
+        drive_main_record_map(&mut ctx, &mut live),
+        vec![entry("btc", 7, 2), entry("eth", 8, 1), entry("sol", 9, 3)],
+    );
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("the migration is a declaration, and the compiler takes it");
+
+    // Every field of every entry the retired version held survives the transform,
+    // and `xrp` is absent for the same reason it is in the scalar-valued case: the
+    // writer's one position is committed into the value that was loaded.
+    assert_eq!(
+        drive_main_record_map(&mut ctx, &mut live),
+        vec![
+            entry("btc", 7, 20000),
+            entry("eth", 8, 10000),
+            entry("sol", 9, 30000),
+        ],
+    );
+}
+
+/// A load resolves to the top-level variable however many bindings enclose the
+/// value on its way to a mutable one.
+///
+/// A declaration's address is the chain enclosing it and a `@LoadFrom` lowers
+/// into the binding it seeds, so the site's own chain already names a binding
+/// the source's `n` does not sit under. This puts a further binding between the
+/// two, which must not move the address either.
+#[test]
+fn a_load_resolves_outward_through_the_bindings_around_it() {
+    let v1 = indoc! {r#"
+        n := 2
+        for x in [1, 2, 3]:
+            n := n + x
+        n
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(n)
+        held: Int
+        seed = held * 10000
+        m := seed
+        for x in [1, 2, 3]:
+            m := m + x
+        m
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 8);
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("neither `held` nor `seed` is a chain segment the address has");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 80000);
+}
+
+/// Each version loads from the one before it, three deep.
+///
+/// A load is transitional per version, not once per program: the version that
+/// migrates retires what it loaded and declares something new, which the version
+/// after it may load in turn.
+#[test]
+fn a_load_chains_across_successive_versions() {
+    let fold = |decl: &str, name: &str| {
+        format!(
+            indoc! {r#"
+                {decl}
+                for k in [1]:
+                    with begin():
+                        {name} := {name} + 1
+                await_final({name})
+            "#},
+            decl = decl,
+            name = name,
+        )
+    };
+    let v1 = fold("a: Mut(Int, Txn) := 6", "a");
+    let v2 = fold(
+        "@LoadFrom(a)\nheld: Int\nb: Mut(Int, Txn) := held * 10",
+        "b",
+    );
+    let v3 = fold(
+        "@LoadFrom(b)\nheld: Int\nc: Mut(Int, Txn) := held * 100",
+        "c",
+    );
+
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 7);
+
+    live.reload(&mut ctx, &v2, &no_main).expect("v2 loads `a`");
+    // `a` had folded the one position of `[1]`, and the value `b` loads says so,
+    // so `b` resumes above it rather than counting it again.
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 70);
+
+    live.reload(&mut ctx, &v3, &no_main)
+        .expect("v3 loads `b`, which v2 declared and this version retires");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 7000);
+}
+
+/// One version may load two variables, and one loaded value may feed a
+/// declaration that reads both.
+#[test]
+fn a_version_may_load_more_than_one_variable() {
+    let v1 = indoc! {r#"
+        p: Mut(Int, Txn) := 0
+        q: Mut(Int, Txn) := 0
+        for c in [1]:
+            with begin():
+                p := p + 3
+                q := q + 5
+        await_final(p)
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(p)
+        hp: Int
+        @LoadFrom(q)
+        hq: Int
+        r: Mut(Int, Txn) := hp * 100 + hq
+        for c in [1]:
+            with begin():
+                r := r + 1
+        await_final(r)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 3);
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("both `p` and `q` are taken over by a load");
+    // `3 * 100 + 5`. The one position of `[1]` is in both loaded values, so `r`
+    // resumes above it and the writer does not fire again.
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 305);
+}
+
+/// A version can fail both ways at once, and each direction is reported in its
+/// own paragraph.
+#[test]
+fn both_directions_of_refusal_are_reported_together() {
+    let v1 = indoc! {r#"
+        a: Mut(Int, Txn) := 0
+        for c in [1]:
+            with begin():
+                a := a + 7
+        await_final(a)
+    "#};
+    // Drops `a` (nothing loads it) and loads a name no version declared.
+    let v2 = indoc! {r#"
+        @LoadFrom(nonesuch)
+        held: Int
+        b: Mut(Int, Txn) := held
+        for c in [1]:
+            with begin():
+                b := b + 1
+        await_final(b)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    drive_main_int(&mut ctx, &mut live);
+
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("`a` is dropped and `nonesuch` is not there to load");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`a` is no longer declared")
+            && rendered.contains("`@LoadFrom(nonesuch)`"),
+        "both directions should be named: {rendered}",
+    );
+}
+
+/// A variable the running program declares but has decided no value for is not a
+/// variable a load can take, and saying so is not the same as saying it is gone.
+///
+/// A store nothing reads is never driven, so it hands on nothing. The version is
+/// right about where the value goes, which is why this is neither a drop nor a
+/// missing predecessor — and the contrast is the same program with the variable
+/// read, where the load is accepted.
+#[test]
+fn an_undriven_store_has_no_value_to_load() {
+    // `x` and `y` are written by the same loop; which one the program's value
+    // reads is what decides whether `x`'s store is ever driven.
+    let v1 = |read: &str| {
+        format!(
+            indoc! {r#"
+                x: Mut(Int, Txn) := 41
+                y: Mut(Int, Txn) := 0
+                for c in [1]:
+                    with begin():
+                        x := x + 1
+                    with begin():
+                        y := y + 2
+                await_final({read})
+            "#},
+            read = read,
+        )
+    };
+    // `y` stays declared, so `x` is the only variable in question.
+    let v2 = indoc! {r#"
+        @LoadFrom(x)
+        held: Int
+        y: Mut(Int, Txn) := 0
+        for c in [1]:
+            with begin():
+                y := y + held
+        await_final(y)
+    "#};
+
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &v1("y"), &no_main).expect("v1 compiles");
+    drive_main_int(&mut ctx, &mut live);
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("nothing read `x`, so its store decided no value");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`x` is declared but has decided no value")
+            && !rendered.contains("`x` is no longer declared"),
+        "the refusal should say the value is missing, not the variable: {rendered}",
+    );
+
+    // The same program, with `x` read: its store is driven, and the load takes it.
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &v1("x"), &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 42);
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("a driven store hands its value on");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 42);
+}
+
+/// A load inside a stateful function reaches the variable that function's own
+/// instantiation declares.
+///
+/// This is the address the chain exists for. `count_by`'s body is inlined into
+/// `a`'s definition, so the variable it declares is ``a`.`total`` and the load
+/// sits under ``a`.`held``. The search runs outward from the site's own chain,
+/// so it passes the binding the load seeds and stops at the instantiation's.
+#[test]
+fn a_load_inside_an_instantiation_reaches_its_own_variable() {
+    let v1 = indoc! {r#"
+        def count_by(items, step) => Int:
+            total := 0
+            for x in items:
+                total := total + step
+            total
+
+        a = count_by([1, 2], 3)
+        a
+    "#};
+    let v2 = indoc! {r#"
+        def count_by(items, step) => Int:
+            @LoadFrom(total)
+            held: Int
+            scaled := held * 10
+            for x in items:
+                scaled := scaled + step
+            scaled
+
+        a = count_by([1, 2], 3)
+        a
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 6);
+
+    live.reload(&mut ctx, v2, &no_main)
+        .expect("the load resolves outward to the variable of its own instantiation");
+    // The carried 6 scaled by ten. `[1, 2]` is not folded again: the value
+    // loaded already summarizes both its positions.
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 60);
+}
+
+/// The same variable is not reachable from the top level, because no source can
+/// name it there.
+///
+/// A variable inside an instantiation is addressed under the binding the call
+/// was assigned to. The outward search starts at the site's own chain and widens,
+/// so a top-level load never descends into one — and the version is refused for
+/// dropping the variable, which is what it does.
+#[test]
+fn a_top_level_load_does_not_reach_inside_an_instantiation() {
+    let v1 = indoc! {r#"
+        def count_by(items, step) => Int:
+            total := 0
+            for x in items:
+                total := total + step
+            total
+
+        a = count_by([1, 2], 3)
+        a
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(total)
+        held: Int
+        held
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 6);
+
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("`total` at the top level names nothing the program holds");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`a`.`total` is no longer declared"),
+        "the refusal should name the address the variable actually has: {rendered}",
+    );
+}
+
+/// The binding a load seeds is not an address, so a variable of the loaded
+/// spelling inside an instantiation stays unreachable even when the two are
+/// spelled alike.
+///
+/// A `@LoadFrom` lowers into the binding it seeds, which puts that binding's name
+/// on the site's own chain. Searching outward from the whole chain would make the
+/// innermost candidate ``held`.`qty`` — the variable inside `held`'s
+/// instantiation, which is exactly the address
+/// [`a_top_level_load_does_not_reach_inside_an_instantiation`] says no source can
+/// name. Nothing is ever declared under a load's binding, its definition being
+/// the leaf and nothing else, so the chain does not carry it.
+#[test]
+fn a_load_is_not_addressed_under_the_binding_it_seeds() {
+    let v1 = indoc! {r#"
+        def count_by(items, step) => Int:
+            qty := 0
+            for x in items:
+                qty := qty + step
+            qty
+
+        held = count_by([1, 2], 3)
+        held
+    "#};
+    // `qty` at the top level names nothing, and the target's spelling matching
+    // the binding the instantiation's `qty` lives under must not change that.
+    let v2 = indoc! {r#"
+        @LoadFrom(qty)
+        held: Int
+        held
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 6);
+
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("`qty` at the top level names nothing the program holds");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom(qty)` has no variable to read")
+            && rendered.contains("`held`.`qty` is no longer declared"),
+        "the load should reach nothing, and the variable it did not take should be \
+         reported dropped: {rendered}",
+    );
+}
+
+/// A load does not make its loop re-read what the loaded value already counted,
+/// at any cut the fold admits.
+///
+/// The value a load carries summarizes the positions the retired version folded
+/// into the variable it came from, so the store built around it continues a
+/// recurrence rather than beginning one — whatever the identity of the variable
+/// it seeds. Sweeping the cut pins that at every prefix rather than at one.
+///
+/// The regression this pins: `continues` asked whether the *variable* carries a
+/// value, which a load's target never does, so the drive was rebuilt from zero
+/// and every position the seed summarized was folded a second time. The total was
+/// wrong and nothing said so.
+///
+/// The second sweep is the contrast that keeps the first honest: over a
+/// *different* collection there is no correspondent to resume, so the new
+/// collection is folded whole on top of the loaded value, which is what the
+/// sequence its positions were counted in being gone means.
+#[test]
+fn a_load_does_not_refold_the_positions_its_value_summarizes() {
+    const V0: &str = indoc! {r#"
+        n := 0
+        for x in [1, 2, 3, 4]:
+            n := n + x
+        n
+    "#};
+    let same = indoc! {r#"
+        @LoadFrom(n)
+        held: Int
+        m := held
+        for x in [1, 2, 3, 4]:
+            m := m + x
+        m
+    "#};
+    let other = indoc! {r#"
+        @LoadFrom(n)
+        held: Int
+        m := held
+        for x in [10, 20]:
+            m := m + x
+        m
+    "#};
+
+    // One pull decides no position, which leaves the store undecided and the
+    // load refused; the cuts from there sweep the prefixes.
+    for pulls in 2..6usize {
+        let decided = (pulls - 1).min(4);
+        let prefix: i64 = (1..=decided as i64).sum();
+
+        let mut ctx = GlobalContext::default();
+        let mut live = LiveProgram::start(&mut ctx, V0, &no_main).expect("v0 compiles");
+        for _ in 0..pulls {
+            let producer = live
+                .main_producer_mut()
+                .expect("the program's value is `n`");
+            let guard = producer.tiling().universal_guard();
+            let _ = producer.get(guard);
+            ctx.scheduler().check_for_notifications();
+        }
+        live.reload(&mut ctx, same, &no_main)
+            .expect("`n` is loaded");
+        assert_eq!(
+            drive_main_int(&mut ctx, &mut live),
+            10,
+            "every element folded once, whatever the cut ({decided} decided before the swap)",
+        );
+
+        let mut ctx = GlobalContext::default();
+        let mut live = LiveProgram::start(&mut ctx, V0, &no_main).expect("v0 compiles");
+        for _ in 0..pulls {
+            let producer = live
+                .main_producer_mut()
+                .expect("the program's value is `n`");
+            let guard = producer.tiling().universal_guard();
+            let _ = producer.get(guard);
+            ctx.scheduler().check_for_notifications();
+        }
+        live.reload(&mut ctx, other, &no_main)
+            .expect("`n` is loaded");
+        assert_eq!(
+            drive_main_int(&mut ctx, &mut live),
+            prefix + 30,
+            "a different collection is folded whole on top of the loaded value",
+        );
+    }
+}
+
 /// A version that stops declaring a variable the running program is holding a
 /// value for is rejected, and the running program keeps serving.
 ///
@@ -1935,6 +2884,70 @@ fn a_fold_over_a_fixed_collection_resumes_where_it_stopped() {
 /// A fold's value is final once the tile is terminal, which for an induction
 /// store means every position of its extent is decided.
 fn drive_main_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
+    let Value::String(s) = drive_main_to_scalar(ctx, live) else {
+        panic!("a string fold's value is a string");
+    };
+    s.to_string()
+}
+
+/// [`drive_main_to_terminal`] for a fold whose value is an `Int`.
+fn drive_main_int(ctx: &mut GlobalContext, live: &mut LiveProgram) -> i64 {
+    let Value::Int(n) = drive_main_to_scalar(ctx, live) else {
+        panic!("an integer fold's value is an integer");
+    };
+    n
+}
+
+/// [`drive_main_to_terminal`] for a program whose value is a `Map`, as its
+/// entries in key order.
+fn drive_main_map(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Vec<(String, i64)> {
+    let Value::Function(bindings) = drive_main_to_scalar(ctx, live) else {
+        panic!("a map's value is a function from keys to values");
+    };
+    let mut out: Vec<(String, i64)> = bindings
+        .iter()
+        .map(|b| match (&b.input, &b.output) {
+            (Value::String(k), Value::Int(n)) => (k.to_string(), *n),
+            other => panic!("expected String to Int, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// [`drive_main_map`] for a map whose values are records, as each entry's key
+/// and the record's fields in field order.
+fn drive_main_record_map(
+    ctx: &mut GlobalContext,
+    live: &mut LiveProgram,
+) -> Vec<(String, Vec<(String, i64)>)> {
+    let Value::Function(bindings) = drive_main_to_scalar(ctx, live) else {
+        panic!("a map's value is a function from keys to values");
+    };
+    let mut out: Vec<(String, Vec<(String, i64)>)> = bindings
+        .iter()
+        .map(|b| match (&b.input, &b.output) {
+            (Value::String(k), Value::Record(fields)) => {
+                let mut fields: Vec<(String, i64)> = fields
+                    .iter()
+                    .map(|(name, value)| match value {
+                        Value::Int(n) => (name.clone(), *n),
+                        other => panic!("expected an Int field, got {other:?}"),
+                    })
+                    .collect();
+                fields.sort();
+                (k.to_string(), fields)
+            }
+            other => panic!("expected String to a record of Ints, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Pull the program's value until it is terminal, and take the scalar it settles
+/// at.
+fn drive_main_to_scalar(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Value {
     for _ in 0..500 {
         ctx.scheduler().check_for_notifications();
         let producer = live
@@ -1944,12 +2957,9 @@ fn drive_main_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> St
         let tile = producer.get(guard);
         if tile.is_terminal() {
             let Tile::Scalar(column) = tile else {
-                panic!("a string fold's value is a scalar, got {tile:?}");
+                panic!("a fold's value is a scalar, got {tile:?}");
             };
-            let Value::String(s) = column.index_at(0) else {
-                panic!("a string fold's value is a string");
-            };
-            return s.to_string();
+            return column.index_at(0);
         }
     }
     panic!("the fold never settled");

@@ -18,8 +18,9 @@
 //! `nested_fold`, `boundary_pair`, `two_instantiations`, `anonymous_sites`); it
 //! needs a second port, which `source` does not substitute
 //! (`a_port_whose_last_route_goes_is_released`,
-//! `a_version_naming_an_unbindable_port_is_refused`); or it is `stdin`-sourced
-//! and has no `{PORT}` to substitute at all. The bases:
+//! `a_version_naming_an_unbindable_port_is_refused`); or it has no `{PORT}` to
+//! substitute at all, being `stdin`-sourced or a program whose value is pulled
+//! (`an_induction_accumulator_carries_into_its_replacement`). The bases:
 //!
 //! | Base | Shape |
 //! | --- | --- |
@@ -30,7 +31,7 @@
 //! | `two-loops` | `POST /a` and `POST /b` each accumulate into their own variable. Independent, so a store each — one is kept while the other is rebuilt. |
 //! | `two-accumulators` | One loop carrying two variables (`left` and `right`), for the cases about telling them apart. |
 //! | `one-stateful-loop` | `POST /p` accumulates, `POST /q` does not — the pair a variable can move between. |
-//! | `latest-write` | A transactional variable (`Mut(String, Txn)`) that `POST /set` overwrites and `GET /get` reads. |
+//! | `latest-write` | A transactional variable (`Mut(String, Txn)`) that `POST /set` overwrites and `GET /get` reads. Also the base the `@LoadFrom` variants migrate from. |
 //! | `running-log` | A transactional variable that `POST /set` appends to, so every commit leaves a mark a replay would show. |
 //! | `one-transactional-loop` | `POST /a` commits into a transactional variable, `POST /b` holds nothing — the pair a transactional writer can be added to. |
 //! | `two-transactions` | Two transactional variables written and read from disjoint endpoint pairs, so they fall in different causal groups and each gets its own commit store. |
@@ -74,6 +75,16 @@
 //! | An endpoint is removed with a request already in flight to it | Accepted; that request is answered 404 too, rather than waiting for a reply no version will compute |
 //! | Repeats and reverts | Accepted; each takes effect |
 //! | A reload after one that kept a stateful binding whole | Accepted; the variable under the kept binding is still carried and still guarded |
+//! | A variable is retired and a new one is seeded from it with `@LoadFrom(x)` | Accepted; the new variable starts at the value the retired one held |
+//! | The same, where the variable is a `Map` | Accepted; the collection carries whole and the new version writes on top of it |
+//! | The same, transformed on its way into the new variable | Accepted; the transform applies to every entry the retired version held, and the writer does not fire again |
+//! | The same, where the collection's values are records | Accepted; every field of every entry survives the transform |
+//! | The same, over three versions, each loading from the one before | Accepted; a load is transitional per version, not once per program |
+//! | A version loads two variables | Accepted; each is taken over by its own load |
+//! | A load inside a stateful function names that function's own variable | Accepted; the search runs outward from the site, so it stops at the instantiation's binding |
+//! | A load whose value seeds a loop over the collection it was folded from | Accepted; the store resumes above the positions the value summarizes, so nothing is folded twice |
+//! | The same, over a different collection | Accepted; the new collection is folded whole on top of the loaded value |
+//! | The same, with the retired variable also kept | Accepted; it resumes where it was, and the new one starts from the same value |
 //!
 //! # What it may not
 //!
@@ -82,6 +93,12 @@
 //! | A variable is no longer declared | Refused, naming it |
 //! | A variable's type changes | Refused, naming both types |
 //! | Two anonymous call sites of one stateful function are reordered, or a third inserted ahead | Refused, naming both declarations and saying to bind each call site to a name |
+//! | `@LoadFrom(x)` names a variable nothing holds | Refused, naming it |
+//! | A migrating version is reloaded onto itself | Refused; it retired the variable it loads, so nothing of that name is left |
+//! | `@LoadFrom(x)` names a variable the program declares but has decided no value for | Refused, saying the value is missing rather than the variable |
+//! | A top-level `@LoadFrom(x)` names a variable that lives inside an instantiation | Refused; the search never descends, and that variable is dropped — including where the load's own target is spelled like the binding that variable sits under |
+//! | `@LoadFrom(x)` reads a variable at another type | Refused, naming both types |
+//! | A source containing `@LoadFrom(x)` is started from nothing | Refused; such a version is an upgrade of a specific predecessor |
 //! | The source does not compile | Refused |
 //!
 //! In every refusal the running program keeps serving. Diffing is covered
