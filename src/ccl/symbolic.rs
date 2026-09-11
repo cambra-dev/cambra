@@ -228,6 +228,8 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, spelling)
         }
 
+        TypedExprNode::Carried(name) => (Precedence::Atom, format!("carried({name})")),
+
         TypedExprNode::Builtin(Builtin::VariantProject(tag)) => {
             (Precedence::Atom, format!("variant_project(`{tag})"))
         }

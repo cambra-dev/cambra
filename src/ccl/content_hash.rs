@@ -534,6 +534,10 @@ fn hash_payload<'a>(
         N::Lit(Lit::Unit) => {}
         N::Builtin(b) => b.hash(h),
         N::Source(s) => s.hash(h),
+        // The spelling is the whole content: which variable it addresses is decided
+        // by where the node sits, and the enclosing structure a reader hashes
+        // carries that.
+        N::Carried(s) => s.hash(h),
         N::Proj(ProjKey::Index(i)) => i.hash(h),
         N::Proj(ProjKey::Field(f)) => f.hash(h),
 
