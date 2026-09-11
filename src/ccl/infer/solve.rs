@@ -1498,7 +1498,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 };
             }
         }
-        TypedExprNode::Record(fs) => {
+        TypedExprNode::Record(fs) | TypedExprNode::Outputs(fs) => {
             for (_, e) in fs.iter_mut() {
                 coalesce_node(e, level, ctx);
             }
