@@ -117,6 +117,7 @@ pub fn fmt_binop(op: &BinOpKind) -> &'static str {
         BinOpKind::Arithmetic(ArithmeticKind::Sub) => "-",
         BinOpKind::Arithmetic(ArithmeticKind::Mul) => "*",
         BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => "//",
+        BinOpKind::Arithmetic(ArithmeticKind::Pow) => "**",
         BinOpKind::BoolLogic(LogicKind::And) => "and",
         BinOpKind::BoolLogic(LogicKind::Nand) => "nand",
         BinOpKind::BoolLogic(LogicKind::Or) => "or",
