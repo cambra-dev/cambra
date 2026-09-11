@@ -3365,6 +3365,58 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
     );
 }
 
+/// A **product** keys a mutable collection: written at a key the loop computes, and read
+/// back at one.
+///
+/// What the transactional path adds over the immutable cases
+/// (`tests/compilation_pipeline/joins_aggregates_groupby.rs`'s `a_product_keys_a_collection`)
+/// is that the key is a per-row product built from the loop binder rather than a literal.
+#[test]
+fn a_product_keys_a_mutable_collection() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map({Int, Int}, Int), Txn) := box(map([((1, 1), 1)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m[(r, r)] := r
+            final: Map({Int, Int}, Int) = await_final(m)
+            match final[(3, 3)]?:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        "#},
+        Value::Int(3),
+    );
+}
+
+/// A mutable collection whose keys all share a component, seeded with one entry.
+///
+/// A shared component's type is that component's own singleton rather than the join two
+/// distinct values would give, and the seed reaches `box`'s instantiated domain through a
+/// bound chain rather than as a position (`src/ccl/design/type-inference.md`, "An invariant
+/// position reads both sides however the walk reached it"). Keyed data is usually this
+/// shape — every holding for one account, every order for one SKU — so the sibling above
+/// varying both components states less than it appears to.
+#[test]
+fn a_shared_key_component_keys_a_mutable_collection() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map({Int, String}, Int), Txn) := box(map([((1, "BTC"), 5)]))
+            for r in [1, 2]:
+                with begin():
+                    m[(1, "BTC")] := r
+            final: Map({Int, String}, Int) = await_final(m)
+            match final[(1, "BTC")]?:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        "#},
+        Value::Int(2),
+    );
+}
+
 /// A key the mutable variable never held answers `` `none `` — the seed's keys and the written one
 /// are what it has, and nothing else.
 #[test]
