@@ -1215,11 +1215,12 @@ whatever term sits in the parens. A tag mismatch is therefore reported where the
 constructor meets a counterpart that lacks the tag — an annotation, a `match` arm's
 expected type, a join — rather than at the constructor.
 
-> **Direction [Tentative].** The structural type alias of §6.7 —
+> **Direction [Tentative].** A **parameterised** type alias (§6.7 [Open]) —
 > `` Option(T) = {`some{T} | `none} ``, `` Result(T) = {`ok{T} | `err{String}} `` —
 > gives the arms a name to write, and would replace the built-in `Option(T)` above
 > with a prelude definition. An alias names a shape, so two aliases with the same
-> arms are the same type.
+> arms are the same type. The unparameterised alias §6.7 specifies already names
+> the arms at a fixed payload type.
 
 ---
 
@@ -2071,10 +2072,11 @@ is **not** generic-argument syntax (it belongs to collections, §2.4).
 element `{T,}`), record type `{f: T}`, variant type
 ``{ `some{T} | `none }`` (§6.5), refinement `{T where p(_)}` (§6.4).
 
-> **Direction [Tentative].** Named types come in two strengths. A
-> plain `=` binding to a capitalized name is a structural **alias** —
-> `Item = {price: Int, cost: Int}` — interchangeable with the type it
-> names, and worked through in §6.7. A `type` declaration is **nominal** —
+Named types come in two strengths. A plain `=` binding to a capitalized
+name is a structural **alias** — `Item = {price: Int, cost: Int}` —
+interchangeable with the type it names, and specified in §6.7.
+
+> **Direction [Tentative].** A `type` declaration is **nominal** —
 > `type Price = {amount: Int}` — distinct from every other type of the
 > same shape. Nominal types are the agreed home for domain invariants
 > (a `Price` carrying `assert amount >= 0` in its declaration, per the
@@ -2446,7 +2448,7 @@ what a partial lookup returns under the collections direction (§3.9,
 distinguished kind of type: nothing in the language privileges the spellings
 `some` and `none`, and writing the arms out gives the same type. `Result` is the
 same shape with `` `ok ``/`` `err `` and has no built-in spelling — write its
-arms out, or wait for the type alias (§3.15).
+arms out, or name them with a type alias (§6.7) at a fixed payload type.
 
 Variants are matched with `match`/`case` (§4.10). Destructuring one directly
 against a single-tag variant type, where the match cannot fail, is **[Decided]**
@@ -2479,12 +2481,6 @@ says so.
 
 ### 6.7 Type-alias statements
 
-**[Tentative]** — not implemented. Nothing special-cases a capitalized
-left-hand side: `src/ccl/lower/mod.rs` lowers the right of an `=` as a *term*,
-so a `{…}` there is rejected as type syntax in value position and a bare type
-name is an unresolved name. The alias-versus-nominal split this rests on is
-the Direction note in §6.1, tentative there too.
-
 A **type alias** binds a capitalized name to a type expression with plain `=`,
 as an ordinary statement of the block it sits in:
 
@@ -2500,35 +2496,51 @@ annotation (`def f(n: Count) => Item:`), a type argument (`List(Priced)`,
 
 The rules, and what each one is doing:
 
-- **`=`, and no keyword.** An alias is a *timeless equation* between a name and
-  a type, which is what `=` already means (§4.3 Direction) — so it is
-  `assign_stmt` (§2.2), not a new statement form. What separates it from a
-  value binding is the **case of the name**: `Caps` means type, without
-  exception (§6.1). A `type` keyword is deliberately not involved; that
-  spelling belongs to the *nominal* declaration §6.1 sketches, which an alias
-  is not.
-- **An alias names an existing type; it does not make a new one.** The alias
-  and its right-hand side are the same type, interchangeable in every position,
-  with no nominal distinction, no conversion, and no invariant of the alias's
-  own. Type equality is structural and so is unaffected by spelling: `Count`
-  and `{Int where _ >= 0}` are one type, and a refined alias is an ordinary
-  type reference wherever it is written — `n: Count` carries the refinement
-  into the signature exactly as the brace form would (§6.4).
+- **`=`, and no keyword.** An alias is a timeless equation between a name and a
+  type, which is what `=` already means (§4.3 Direction), so it is `assign_stmt`
+  (§2.2) and not a new statement form. What separates it from a value binding is
+  the **case of the name**: `Caps` means type, without exception (§6.1). A
+  `type` keyword is not involved; that spelling belongs to the nominal
+  declaration §6.1 sketches, which an alias is not.
+- **An alias names an existing type; it does not make a new one.** The alias and
+  its right-hand side are the same type, interchangeable in every position, with
+  no nominal distinction, no conversion, and no invariant of the alias's own.
+  Type equality is structural and so is unaffected by spelling: `Count` and
+  `{Int where _ >= 0}` are one type, and `n: Count` carries the refinement into
+  the signature exactly as the brace form would (§6.4). An alias is accepted and
+  rejected in exactly the positions the type it names is.
 - **The right-hand side is any type expression**, including one that names other
   aliases (`Priced` above) and one carrying a refinement whose predicate names
-  *values* in scope (§6.4). An alias opens no scope of its own: the predicate
-  sees what the statement sees, and nothing more.
-- **No forward reference** (§3.2). The names on the right must already be in
-  scope, so an alias follows both the aliases and the values it reads. A
-  *self*-referential alias needs no `rec` marker, since §4.3 exempts recursive
-  types, but what one would denote is unworked.
+  values in scope (§6.4). An alias opens no scope of its own: the predicate sees
+  what the statement sees, and nothing more.
+- **A capitalized name is bound only by an alias.** Every other binding form —
+  `:=`, `op=`, `<<=`, a `for` target, a comprehension generator — rejects a
+  capitalized binder and names this one. A `def` name and a parameter name are
+  not yet checked; a capitalized one there binds a value the type language
+  cannot see.
+- **A built-in type name keeps its meaning.** `Int`, `UInt`, `String`, `Bool`,
+  `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
+  `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
+  targets, so a name resolves as a built-in or as an alias and never as both.
+- **An alias is block-scoped** (§5), and each block declares a given name once.
+  An alias in an inner block shadows a same-named outer one for that block, and
+  the outer one is back at the end of it.
+- **The name is in scope throughout its block.** An annotation above the alias
+  statement reads it, unlike a value binding (§3.2): a type is not evaluated, so
+  there is no order for it to respect.
+- **A right-hand side names only the aliases above it.** `Loop = Loop` and a
+  chain naming an alias declared below it are unresolved names. A recursive
+  alias is therefore unwritable; §4.3 exempts recursive types from the `rec`
+  marker, but what one would denote is unworked.
+
+An alias is erased at lowering, where each use is replaced by the type the name
+was declared with. A program written with an alias and the same program with the
+alias expanded lower to the same CCL, so no later phase knows the name.
 
 **[Open]** — whether an alias may be **parameterised** (`Pair(T) = {T, T}`),
-which is the difference between naming a type and naming a type constructor;
-whether aliases are block-scoped like every other binding (§5) or top-level
-only; and whether the case rule alone carries the weight, since `Count = Int`
-and `count = n` are one statement form telling a reader which world it is in by
-one letter.
+which is the difference between naming a type and naming a type constructor. A
+parameterised left-hand side is currently an "invalid assignment target" parse
+error.
 
 The north-star `storefront` exercises four aliases, two of them refined.
 

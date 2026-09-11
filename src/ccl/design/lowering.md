@@ -220,3 +220,41 @@ Inside the predicate, `_` denotes the value being refined, which is the reserved
 A function-type annotation `T => U` ([chl-spec.md](../../../docs/chl-spec.md), "6. Types (informal sketch)") lowers, in `lower_type_expr` (`ccl/lower/stmts.rs`), to `Type::fun(lower(T), lower(U))`. That helper builds the non-dependent compute function `Type::Fun { name: None, fun_kind: FunKind::Compute, .. }`. The kind is `Compute` because a `def` and a lambda both infer a compute function, so an annotated binding `f: (Int => Int) = \x -> …` checks against the lambda it binds; a data collection carries `FunKind::Data` and is written with its own constructor (`List(T)`, `Map(K, V)`), never with `=>`. The surface has no binder for the function, so the lowered type is never a Pi type, and a refinement in the codomain cannot reference the domain by name.
 
 `T` and `U` lower recursively like any other annotation, so a refinement nested in either rides through `Type::Fun` to the post-inference wall — `emit_annotation_predicates` (`ccl/infer/emit.rs`) recurses into a function type's domain and codomain to type those predicates. In value position `T => U` is rejected (`lower_expr_inner`, `ccl/lower/mod.rs`): it names a type, not a value.
+
+## Type-alias statements — `Name = T` erased at lowering
+
+A type alias ([chl-spec.md](../../../docs/chl-spec.md), "6.7 Type-alias statements") leaves
+nothing behind. `pre_declare_type_aliases` (`ccl/lower/stmts.rs`) lowers each alias's right-hand
+side through `lower_type_expr` and records the resulting `Type` on
+`LoweringContext::type_aliases`. `lower_type_expr`'s `Name` arm substitutes that type at every
+use, and the alias statement contributes no `Let`. A program written with an alias and the same
+program with the alias expanded lower to the same CCL, so no phase after lowering knows the name.
+
+`type_alias_decl` decides which assignments are aliases, on the case of the target name alone
+(`is_type_name`). Its complement is `extract_name_target`, which rejects a capitalized binder for
+every other statement form, so a capitalized name reaches one lowering path.
+
+The declaration pass runs forward over a block's statements before the block is lowered. Four of
+the five walkers that lower a block reach it through `with_block_type_aliases`, which snapshots
+`type_aliases`, declares the block's, and restores on both the success and error paths — that
+wrapper is what makes an alias block-scoped, and going through it is what makes "this is a block"
+the only thing a walker states. The four are `lower_stmts_inner` (`ccl/lower/stmts.rs`),
+`lower_for_body_stmts` and `lower_loop_body_chain` (`ccl/lower/loops.rs`), and
+`lower_tx_block_inner` (`ccl/lower/transactions.rs`). `lower_stmts_recovering` declares the
+top-level block's aliases directly: it is the outermost scope, with nothing to restore to.
+
+All but `lower_for_body_stmts` fold right-to-left, which is what makes the pass forward rather
+than declaration-on-reach: an annotation below an alias is lowered before the alias statement.
+Source order within the pass holds an alias's right-hand side to the aliases above it, so `A = A`
+and a chain naming an alias declared below are unresolved names.
+
+`pre_declare_type_aliases` returns every rejected alias rather than the first, because
+`lower_stmts_recovering` collects per-statement errors; a nested block takes only the first. A
+rejected declaration costs the block its own name, and the aliases after it are still declared.
+
+`BUILTIN_TYPE_NAMES` is the set an alias may not rebind: the base types `BaseType::from_keyword`
+resolves, the constructors `lower_type_application` dispatches on, the two heads resolved ahead of
+it (`Mut` in `mut_annotation_parts`, `Feed` on a `def` parameter), and `Mut`'s sequencing domain
+`Txn`. Refusing them at the declaration keeps a name from resolving one way as a bare annotation
+and another as an application: an alias `List = Int` would be read by `x: List` and ignored by
+`x: List(Int)`.
