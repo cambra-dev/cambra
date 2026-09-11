@@ -304,7 +304,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             trait_: trait_.to_string(),
             position,
             found: Box::new(found),
-            accepted: accepted.into_iter().map(Type::Base).collect(),
+            accepted,
             at: ctx_label.to_string(),
         },
         // Reported with the same `ctx` a coalesce-time kinding failure uses: the two

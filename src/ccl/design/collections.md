@@ -180,6 +180,14 @@ it wins on every count that decides between the two: it is smaller, it is indepe
 producer is spelled, and it keeps a producer out of a type. So the transparent form is what the
 absence of an entailment step forces, and the opaque form is its successor.
 
+**A product keys a collection like any other type.** A key domain is the morphism's image
+whatever the morphism produces, and the group predicate compares two keys — so what a key
+type owes is equality, which a tuple or record satisfies componentwise
+([type-inference.md, A product is answered off the table](type-inference.md#a-product-is-answered-off-the-table)).
+The runtime holds a product key as one `Records` column and a computed one as a column per
+field, and the lookup pivots the second into the first, so both sides of a search are one
+value.
+
 **Naming a term is also what fixes domain identity.** Refinements compare by structural
 predicate equality, so two key domains are the same domain exactly when they name the same
 morphism term. That is a fact about terms rather than about collections — a domain naming a

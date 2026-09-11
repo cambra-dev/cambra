@@ -16,7 +16,7 @@ use cambra::interpreter::{
     BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value,
     sort_sealed_function_by_domain,
 };
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -851,6 +851,108 @@ fn test_grouping_built_once(#[case] code: &str) {
 )]
 fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// A **product** keys a collection end to end: built, grouped, and looked up by a tuple or
+/// a record.
+///
+/// One key value either way. A product key is spread over a column per field where it is
+/// computed and held as one `Records` column where it is a collection's domain, so the
+/// lookup pivots the first into the second and searches with a single value.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map_over_tuples(
+    "m = map([((1, 2), 10), ((3, 4), 20)])\nsum([v for v in m])",
+    Value::Int(30)
+)]
+#[case::map_over_records(
+    "m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])\nsum([v for v in m])",
+    Value::Int(30)
+)]
+#[case::group_by_a_tuple(
+    "g = groupby([(1, 2), (1, 2), (3, 4)], \\x -> x)\nsum([sum([y.1 for y in grp]) for grp in g])",
+    Value::Int(8)
+)]
+#[case::group_by_a_record(
+    "g = groupby([(a=1, b=2), (a=1, b=2), (a=3, b=4)], \\x -> x)\nsum([sum([y.b for y in grp]) for grp in g])",
+    Value::Int(8)
+)]
+// A component every key shares, which is the ordinary shape of keyed data — every row
+// for one account, every order for one SKU. That component's type is its own singleton
+// rather than the join two distinct values would give, so these are the cases that read
+// a refinement at the invariant position (`src/ccl/design/type-inference.md`, "An
+// invariant position reads both sides however the walk reached it").
+#[case::map_over_tuples_sharing_a_component(
+    "m = map([((1, 2), 10), ((1, 4), 20)])\nsum([v for v in m])",
+    Value::Int(30)
+)]
+#[case::map_over_records_sharing_a_field(
+    "m = map([((a=1, b=2), 10), ((a=1, b=4), 20)])\nsum([v for v in m])",
+    Value::Int(30)
+)]
+#[case::one_entry_map_over_tuples("m = map([((1, 2), 10)])\nsum([v for v in m])", Value::Int(10))]
+fn a_product_keys_a_collection(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A tuple-keyed checked lookup, present and absent.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::present("(1, 2)", Value::Int(10))]
+#[case::absent("(9, 9)", Value::Int(0))]
+// A component every key shares: its type is that component's own singleton rather than the
+// join two distinct values would give, so this is the case that reads a refinement at the
+// invariant position.
+#[case::sharing_a_component("(1, 2)", Value::Int(10))]
+fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
+    let code = indoc! {r#"
+        m = map([((1, 2), 10), ((3, 4), 20)])
+        match m[KEY]?:
+            case `some(v):
+                v
+            case `none:
+                0
+    "#}
+    .replace("KEY", key);
+    check_scalar(&code, expected);
+}
+
+/// A **wider** record compares on the fields the position's type names, whichever operand
+/// carries the extra one.
+///
+/// Records are width-subtyped, so a value reaching a narrower position keeps its extra
+/// columns at run time. They are not part of the value at that type, and the two operand
+/// orders have to agree about that: reading a one-sided field as a fault aborted the process
+/// in one order while the other answered `equal` without it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::wider_on_the_left("t == (a=1, b=2)")]
+#[case::wider_on_the_right("(a=1, b=2) == t")]
+fn a_wider_record_compares_on_the_shared_fields(#[case] comparison: &str) {
+    let code = formatdoc! {r#"
+        def f(t: {{a: Int, b: Int}}):
+            {comparison}
+
+        if f((a=1, b=2, c=9)):
+            1
+        else:
+            0
+    "#};
+    check_scalar(&code, Value::Int(1));
+}
+
+/// Equality on a product, which is what a keyed collection's group predicate compares and
+/// what a program can now write directly.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::tuple_equal("(1, 2) == (1, 2)", Value::Int(1))]
+#[case::tuple_unequal("(1, 2) == (1, 9)", Value::Int(0))]
+#[case::record_equal("(a=1, b=\"x\") == (a=1, b=\"x\")", Value::Int(1))]
+#[case::record_unequal("(a=1, b=\"x\") == (a=1, b=\"y\")", Value::Int(0))]
+#[case::nested("(1, (2, \"a\")) == (1, (2, \"a\"))", Value::Int(1))]
+#[case::not_equals("(1, 2) != (1, 9)", Value::Int(1))]
+fn products_compare_componentwise(#[case] comparison: &str, #[case] expected: Value) {
+    check_scalar(&format!("x = {comparison}\n1 if x else 0"), expected);
 }
 
 /// A group-by's groups are themselves collections, so a checked lookup on one would carry
