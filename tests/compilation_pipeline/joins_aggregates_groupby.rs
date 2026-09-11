@@ -294,6 +294,18 @@ fn test_map(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
     check_map_entries(code, expected);
 }
 
+// The entry pair `k -> v` is the two-tuple `(k, v)` (`docs/chl-spec.md`, "2.4
+// Atoms"), so a map literal and a map comprehension reach `map` as the list of
+// pairs the parenthesised spelling builds — nothing below the parser reads the
+// two spellings differently.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::literal("map([1 -> 10, 2 -> 20])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
+#[case::comprehension("map([k -> k * 10 for k in [1, 2]])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
+fn test_map_entry_pairs(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
+    check_map_entries(code, expected);
+}
+
 // A repeated key gives one group two entries, which `Sole` rejects. The spec makes a
 // duplicate key in a map literal a *compile-time* error; enforcing it here is later
 // than that, because only the key values decide it and nothing folds constants yet
