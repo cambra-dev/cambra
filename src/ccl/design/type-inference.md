@@ -1125,6 +1125,13 @@ It is never drawn against a bound witness. A sum's domain is its binder's refere
 sum is a term ([Only a term builds a sum](#only-a-term-builds-a-sum)), so equating that reference
 with a free variable escapes the binder instead of relating two positions.
 
+The merge at a negative position takes no matching exclusion, because it states nothing. A
+reference meeting a concrete type is settled where the edge is drawn: `constrain_go` distributes
+the demand over the witness's candidates, one invariant edge each, and reports a mismatch where
+the kind names no candidate. Compaction reads back only what those edges admitted, and a
+reference and a concrete atom arriving at one position are two shapes, which `coalesce_compact`
+reports as `IncompatibleBounds`.
+
 ### Flowing Out: coalescing
 
 Once constraints are resolved (Pass 2), `coalesce_compact` resolves each node's `Type::Infer` variables in place:
