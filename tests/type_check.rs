@@ -300,26 +300,77 @@ fn negation_rejects_an_operand_with_no_instance() {
     );
 }
 
-/// Composites are **not** comparable, and not addable either.
+/// A composite satisfies only a **structural** trait, and only where its components do.
 ///
 /// The tables have no row for a tuple, record or collection — but an absent row is
 /// not by itself a rejection, and for a while it was not one: a composite offers no
 /// base to narrow with, and a comparison has no associated type to leave unresolved,
 /// so `(1, 2) == (3, 4)` type-checked as `Bool` and failed in the interpreter. What
-/// rejects it is the distinction between *not determined yet* and *determined, and
-/// not a base* (`Offered` in `src/ccl/infer/solver/traits.rs`).
+/// decides it is the distinction between *not determined yet* and *determined, and
+/// not a base* (`Offered` in `src/ccl/infer/solver/traits.rs`): the second is answered
+/// componentwise for `Equatable` ([`products_are_equatable_componentwise`]) and rejected
+/// for every other trait, and a collection has no components to answer with.
 #[rstest]
-#[case::tuple_equality("(1, 2) == (3, 4)", "Equatable")]
 #[case::tuple_ordering("(1, 2) < (3, 4)", "Orderable")]
 #[case::tuple_arithmetic("(1, 2) + (3, 4)", "Addable")]
-#[case::record_equality("(a=1) == (a=2)", "Equatable")]
 #[case::collection_equality("[1, 2] == [3, 4]", "Equatable")]
+#[case::tuple_with_a_collection_component("(1, [1, 2]) == (1, [3, 4])", "Equatable")]
 fn a_composite_satisfies_no_trait(#[case] code: &str, #[case] expected: &str) {
     let errs = infer_program_err(code);
     assert!(
         errs.iter()
             .any(|e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == expected)),
         "expected NoTraitInstance for {expected}, got {errs:?}"
+    );
+}
+
+/// `Equatable` reads a **product** componentwise: two tuples or records are equatable when
+/// they are the same shape and each component is.
+///
+/// Equality is the one trait with that reading — ordering would need an order on the
+/// components and a record's fields carry none ([`a_composite_satisfies_no_trait`]) — so it
+/// is answered off the table rather than by a row, and the obligation is discharged by one
+/// obligation per component. A component still unknown when the product arrives therefore
+/// resolves by the ordinary delivery path, which is what a group-by's key needs
+/// (`src/ccl/design/collections.md`, "The key domain is the key morphism's image").
+///
+/// The two operands are **one** product, the rows being homogeneous, so a mismatch in shape
+/// is a rejection rather than a comparison over the fields they share — and a wider record
+/// is a subtype, so nothing but the shape check states that.
+#[test]
+fn products_are_equatable_componentwise() {
+    assert_eq!(infer_program("(1, 2) == (3, 4)").to_string(), "Bool");
+    assert_eq!(infer_program("(a=1) == (a=2)").to_string(), "Bool");
+    assert_eq!(
+        infer_program("(1, (2, \"a\")) == (3, (4, \"b\"))").to_string(),
+        "Bool",
+        "a component that is itself a product decomposes again"
+    );
+    for (program, why) in [
+        (
+            "(1, 2) == 3",
+            "a base is not the product this obligation settled at",
+        ),
+        ("(1, 2) == (1, 2, 3)", "a wider tuple is a different shape"),
+        (
+            "(a=1, b=2) == (a=1, c=2)",
+            "different field names are different shapes",
+        ),
+    ] {
+        let errs = infer_program_err(program);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InferError::NoTraitInstance { trait_, .. } if trait_ == "Equatable"
+            )),
+            "expected an Equatable rejection ({why}), got {errs:?} for {program}"
+        );
+    }
+    // A component that fails its own obligation fails the whole comparison, at the
+    // component's own mismatch rather than at the product's.
+    assert!(
+        !infer_program_err("(1, (2, 3)) == (1, (2, \"a\"))").is_empty(),
+        "a component pair that cannot be compared must be rejected"
     );
 }
 
@@ -5611,6 +5662,45 @@ fn checked_lookup_on_a_set_is_membership_as_a_value() {
     assert!(
         !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]?").is_empty(),
         "a String key must not reach an Int-keyed set"
+    );
+}
+
+/// A **product** keys a collection: a `Map` or `Set` over a tuple or a record types, and the
+/// key domain is that product.
+///
+/// The key domain is the key morphism's image, so what a key type has to be is whatever the
+/// morphism produces — and a group-by's key predicate compares the two, which is the
+/// `Equatable` obligation a product now answers componentwise
+/// ([`products_are_equatable_componentwise`]). Nothing else about a keyed collection reads
+/// the key's shape.
+#[test]
+fn a_product_keys_a_collection() {
+    assert_eq!(
+        infer_program("m = map([((1, 2), 10), ((3, 4), 20)])\nm[(1, 2)]"),
+        int()
+    );
+    assert_eq!(
+        infer_program("m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])\nm[(a=1, b=2)]"),
+        int()
+    );
+    assert_eq!(
+        infer_program("s = set([(1, 2), (3, 4)])\ns[(1, 2)]").to_string(),
+        "Unit"
+    );
+    // The key still owes the collection's key type.
+    assert!(
+        !infer_program_err("m = map([((1, 2), 10), ((3, 4), 20)])\nm[1]").is_empty(),
+        "a bare Int key must not reach a pair-keyed map"
+    );
+    // A **wider** key is below that type, records being width-subtyped, so it types and
+    // can never be present: a key is found by value identity, and a three-field value
+    // equals no two-field one. Pinned rather than asserted as right — what would reject it
+    // is the shape agreement the trait states, delivered incrementally at a keyed access
+    // the way `Equatable` states it between two operands.
+    assert_eq!(
+        infer_program("m = map([((1, 2), 10), ((3, 4), 20)])\nm[(1, 2, 3)]"),
+        int(),
+        "a wider key types; it is the absent case at runtime"
     );
 }
 

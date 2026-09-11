@@ -136,14 +136,14 @@ impl Lookup {
                 ));
             }
         }
-        // Field 1 is the key, and a key is one value — so the runtime reads a key column
-        // rather than deciding what to do with a structured one.
+        // Field 1 is the key. A key is one value, spread over a column per field where it is
+        // a product, so the runtime pivots it to one column and searches with that.
         match fields.get(&tuple_field(1)) {
-            Some(Tiling::Scalar(_)) => {}
+            Some(t) if is_key_tiling(t) => {}
             other => {
                 return Err(format!(
-                    "a lookup's input rows carry one key each, so field 1 tiles as a scalar; \
-                     got {}",
+                    "a lookup's input rows carry one key each, so field 1 tiles as a scalar or \
+                     as a record of them; got {}",
                     other.map_or_else(|| "no field".to_string(), Tiling::to_string)
                 ));
             }
@@ -161,15 +161,37 @@ impl Lookup {
 }
 
 /// The answer's tiling for a given key tiling: one answer per key, in the keys' own shape.
+///
+/// A key is one value however many columns carry it, so a **product** key — a tuple or
+/// record, which tiles as a record of columns — takes the scalar shape
+/// ([`is_key_tiling`]).
 fn answer_tiling(keys: &Tiling, answer_extent: Extent) -> Tiling {
     match keys {
-        Tiling::Scalar(_) => Tiling::Scalar(answer_extent),
+        Tiling::Scalar(_) | Tiling::Record(_) => Tiling::Scalar(answer_extent),
         Tiling::SealedFunction { domain, .. } => Tiling::SealedFunction {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(answer_extent)),
         },
         other => panic!("Lookup keys must be a scalar or a stream, got {other}"),
     }
+}
+
+/// Whether `tiling` carries **one key**: a scalar column, or a record of them.
+///
+/// A product key is spread over a column per field and a collection's domain holds it as one
+/// `Records` column, so the two are the same value in two presentations
+/// ([`key_column`] converts).
+fn is_key_tiling(tiling: &Tiling) -> bool {
+    matches!(tiling, Tiling::Scalar(_) | Tiling::Record(_))
+}
+
+/// One key per position, as a column.
+///
+/// A product key arrives as a record of columns and is pivoted here, so everything below
+/// searches with a single `Value` — which is also the form a collection's domain holds, so
+/// the comparison is between two spellings of one value.
+fn key_column(tile: Tile) -> ColumnValue {
+    scalar_tile_to_column_value(tile)
 }
 
 impl TileOperator for Lookup {
@@ -361,14 +383,19 @@ impl TileProducer for LookupProducer {
                 let mut coll = collection.get(collection.tiling().universal_guard());
                 coll.compact();
                 match key_tile {
-                    // No key has arrived yet, so there is nothing to answer.
-                    Tile::Scalar(ref keys) if keys.is_empty() => empty_scalar,
-                    // One key: the scalar form `m[k]`.
-                    Tile::Scalar(ref keys) => match answer_for(self.form, &keys.index_at(0), &coll)
-                    {
-                        Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
-                        None => empty_scalar,
-                    },
+                    // One key: the scalar form `m[k]`, the key pivoted to one column where it
+                    // is a product. An empty column is a key that has not arrived, so there
+                    // is nothing to answer.
+                    Tile::Scalar(_) | Tile::Record(_) => {
+                        let keys = key_column(key_tile);
+                        if keys.is_empty() {
+                            return empty_scalar;
+                        }
+                        match answer_for(self.form, &keys.index_at(0), &coll) {
+                            Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
+                            None => empty_scalar,
+                        }
+                    }
                     // A stream of keys, each answered against the same collection — read
                     // once, not lifted into every row.
                     Tile::SealedFunction {
@@ -377,16 +404,11 @@ impl TileProducer for LookupProducer {
                         ref domain_predicate,
                         ..
                     } => {
-                        let Tile::Scalar(key_col) = codomain.as_ref() else {
-                            panic!(
-                                "Lookup: a key is one value, so the key stream's codomain \
-                                 tiles as a scalar; got {codomain:?}"
-                            )
-                        };
+                        let key_col = key_column((**codomain).clone());
                         let (kept, answers) = Self::answer_rows(
                             self.form,
                             domain,
-                            key_col,
+                            &key_col,
                             &RowCollection::Shared(&coll),
                         );
                         self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
@@ -415,13 +437,14 @@ impl TileProducer for LookupProducer {
                 let Tile::Record(fields) = codomain.as_ref() else {
                     panic!("Lookup: input rows are `(collection, key)` pairs; got {codomain:?}")
                 };
-                let (Some(coll_tile), Some(Tile::Scalar(key_col))) =
+                let (Some(coll_tile), Some(key_tile)) =
                     (fields.get(&tuple_field(0)), fields.get(&tuple_field(1)))
                 else {
                     panic!(
                         "Lookup: input rows carry a collection at .0 and one key at .1; got {codomain:?}"
                     )
                 };
+                let key_col = &key_column(key_tile.clone());
                 let collection = match coll_tile {
                     Tile::Scalar(col) => RowCollection::PerRow(col),
                     shared => RowCollection::Shared(shared),
