@@ -82,21 +82,23 @@ The grammar is precedence-climbed for binary operators. From lowest to
 highest precedence:
 
 1. `\x -> …` (lambda) / `yield`
-2. `<<` (feed)
-3. ternary `a if b else c`
-4. `or`
-5. `and`
-6. `not`
-7. chained comparison (`==` `!=` `<` `<=` `>` `>=`)
-8. `|`
-9. `^`
-10. `&`
-11. `++`
-12. `+`, `-`
-13. `*`, `//`
-14. unary `-`
-15. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name` / `x.0`
-16. atom: literal, name, parenthesised, list, record, brace type, comprehension
+2. `=>` (function type)
+3. `<<` (feed)
+4. `->` (pair)
+5. ternary `a if b else c`
+6. `or`
+7. `and`
+8. `not`
+9. chained comparison (`==` `!=` `<` `<=` `>` `>=`)
+10. `|`
+11. `^`
+12. `&`
+13. `++`
+14. `+`, `-`
+15. `*`, `//`
+16. unary `-`
+17. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name` / `x.0`
+18. atom: literal, name, parenthesised, list, record, brace type, comprehension
 
 Every position a bracket encloses — a list or tuple element, a call argument, a
 subscript index, a record field, a brace item, a refinement predicate, a
@@ -155,6 +157,15 @@ Key shape choices:
   return type may itself be a function type. Lowering reads `Expr::FunctionType`
   as a `Type::Fun` in annotation position and rejects it as a value
   ([docs/chl-spec.md](../../docs/chl-spec.md), "6. Types (informal sketch)").
+- **The pair arrow `k -> v` has no node of its own.** `a -> b` builds the
+  `Expr::Tuple` the parenthesised spelling builds
+  ([docs/chl-spec.md](../../docs/chl-spec.md), "2.4 Atoms"), so a map literal is an
+  ordinary list of pairs, a map comprehension an ordinary comprehension of them,
+  and `for k -> v in m` an ordinary tuple target that `expr_to_assign_target`
+  already reads. It sits between `<<` and the ternary: `m << k -> v` feeds the
+  entry `(k, v)`, and `k -> v if c else w` pairs `k` with the whole conditional.
+  It does not chain, since nothing associates a third component, so
+  `a -> b -> c` is a parse error.
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.
