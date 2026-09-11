@@ -579,6 +579,31 @@ pub enum TypedExprNode {
     /// the appropriate reader operator.
     Source(String),
 
+    /// The value the retired version of this program held for the mutable
+    /// variable `x`, written `@LoadFrom(x)` on a declaration in the source.
+    ///
+    /// A leaf, like [`Self::Source`], and resolved the same way: the name
+    /// addresses something the compilation is handed rather than something the
+    /// tree computes, and
+    /// [`crate::interpreter::operator_conversion`] supplies the value. Here that
+    /// is the retired program's state
+    /// ([`Inheritance::mutable_state`](crate::interpreter::operator_conversion::Inheritance)),
+    /// which is why a version containing one is an upgrade of a specific
+    /// predecessor and cannot be started from nothing.
+    ///
+    /// A **snapshot**, not a read: it is what the predecessor held at the swap,
+    /// evaluated once, so it is a constant for the whole life of this version and
+    /// carries no dependency on `x` going forward. That is what keeps it out of
+    /// the transactional read discipline — a loaded value is not a read of a
+    /// transactional variable, so it needs no `with begin():` block
+    /// (`src/ccl/design/hot-reload.md`, "Seeding a variable from the value the
+    /// predecessor held").
+    ///
+    /// The name is the source's own spelling. Which variable it addresses is
+    /// decided by where the node sits, exactly as a declaration's address is —
+    /// see [`CarriedSite`](crate::interpreter::operator_conversion::CarriedSite).
+    Carried(String),
+
     /// N-ary point-free function composition: `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁`.
     ///
     /// Introduced by [`crate::ccl::lambda_elim`]; always contains at least
@@ -731,6 +756,7 @@ impl TypedExprNode {
             TypedExprNode::Proj(_) => "Proj",
             TypedExprNode::Record(_) => "Record",
             TypedExprNode::Source(_) => "Source",
+            TypedExprNode::Carried(_) => "Carried",
             TypedExprNode::Compose(_) => "Compose",
             TypedExprNode::Copair(_) => "Copair",
             TypedExprNode::DisjointJoin(_) => "DisjointJoin",
@@ -1083,6 +1109,11 @@ impl TypedExpr {
     /// emission worked.
     pub fn builtin(b: Builtin) -> Self {
         Self::new(TypedExprNode::Builtin(b))
+    }
+
+    /// Construct a [`TypedExprNode::Carried`] reference to `name`.
+    pub fn carried(name: impl Into<String>) -> Self {
+        Self::new(TypedExprNode::Carried(name.into()))
     }
 
     /// Construct a list literal expression.
@@ -1490,6 +1521,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
+            | TypedExprNode::Carried(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
@@ -1678,6 +1710,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
+            | TypedExprNode::Carried(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
@@ -1806,6 +1839,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
+            | TypedExprNode::Carried(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
@@ -1855,6 +1889,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
+            | TypedExprNode::Carried(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
