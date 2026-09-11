@@ -21,7 +21,35 @@
      glyph and the word, so the flag carries on three channels rather than on
      colour alone. */
   --deleted: #8a8a8a;
+  /* Syntax. Three hues and a grey, chosen to sit in the gaps the pane's other
+     colours leave: blue is --edge and --sel-here, amber is --sel-elsewhere and
+     --node-id, red is --err. Purple, green and magenta are unclaimed, so syntax
+     can be properly coloured without a keyword ever being mistaken for a
+     resolved span or a diagnostic.
+     Keywords are purple, every literal is green, and --syn-channel is the loud
+     one: it marks `<<` and `:=`, the two places a program hands data across a
+     boundary rather than computing it, which is what a reader watching the
+     values pane is trying to find. */
+  --syn-comment: #8a8a8a;
+  --syn-keyword: #7b2d8e;
+  --syn-literal: #1a7f4f;
+  --syn-channel: #c2185b;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  /* One type scale for the whole inspector. The sizes were spread across two
+     dozen rules as literals, which made "everything one step smaller" a
+     find-and-replace rather than an edit.
+     `--fs-lg` is the body size, which the CodeMirror source pane inherits.
+
+     These are the sizes the pane is designed at. An embedder that wants more on
+     screen should scale the whole view rather than reach in here: the pane's
+     boxes, gutters and padding are px and not font-relative, so type that moves
+     on its own leaves the geometry behind. The deck does that in
+     `ProgramInspector.vue`, and its note explains why. */
+  --fs-lg: 13px;
+  --fs-md: 12px;
+  --fs-sm: 11px;
+  --fs-xs: 10px;
+  --fs-2xs: 9.5px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -41,6 +69,10 @@
     --err: #ff6b5b;
     --warn: #e0b34a;
     --deleted: #7d7d7d;
+    --syn-comment: #7d7d7d;
+    --syn-keyword: #c792ea;
+    --syn-literal: #7fd6a2;
+    --syn-channel: #ff79c6;
   }
 }
 
@@ -58,7 +90,7 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: var(--fs-lg);
   line-height: 1.45;
 }
 
@@ -85,7 +117,7 @@ body {
   color: var(--fg);
 }
 .header .badge {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   padding: 0.1rem 0.45rem;
   border-radius: 4px;
   border: 1px solid var(--border);
@@ -107,7 +139,7 @@ body {
 }
 .pane-menu-button {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   padding: 0.1rem 0.45rem;
   border-radius: 4px;
   border: 1px solid var(--border);
@@ -143,7 +175,7 @@ body {
   gap: 0.4rem;
   padding: 0.15rem 0.35rem;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--fg);
   cursor: pointer;
 }
@@ -187,7 +219,7 @@ body {
   align-items: baseline;
   gap: 0.5rem;
   padding: 0.35rem 0.9rem;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--fg-muted);
@@ -198,7 +230,7 @@ body {
 .pane-badge {
   text-transform: none;
   letter-spacing: 0;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   padding: 0.05rem 0.4rem;
   border-radius: 4px;
   border: 1px solid var(--border);
@@ -209,7 +241,7 @@ body {
 .pane-copy {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   text-transform: none;
   letter-spacing: 0;
   padding: 0.05rem 0.4rem;
@@ -276,7 +308,7 @@ body {
 }
 .edge-label {
   color: var(--edge);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 .node-label {
   font-weight: 500;
@@ -292,7 +324,7 @@ body {
   z-index: 10;
   pointer-events: none;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: 0.3rem 0.5rem;
   max-width: 32rem;
   color: var(--type);
@@ -303,12 +335,28 @@ body {
 }
 .node-id {
   color: var(--node-id);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   opacity: 0.85;
 }
 /* The operator pane draws a graph rather than rows, so its nodes are absolutely
    positioned over one SVG sheet of edges. Positions come from the layout; the
    colours are the same tokens every other pane uses. */
+/* A rebuild that never answered. Sits over the panes rather than replacing
+   them: the program they describe is still the one running. */
+.rebuild-fault {
+  position: absolute;
+  left: 50%;
+  bottom: 1.2rem;
+  transform: translateX(-50%);
+  padding: 0.35rem 0.8rem;
+  border-radius: 4px;
+  border: 1px solid var(--err);
+  background: var(--bg-panel);
+  color: var(--err);
+  font-size: var(--fs-sm);
+  z-index: 5;
+}
+
 .graph-canvas {
   position: relative;
 }
@@ -357,7 +405,7 @@ body {
   border-radius: 4px;
   white-space: nowrap;
   overflow: hidden;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   cursor: default;
 }
 /* A boundary node is where the program starts or ends, which is the one
@@ -379,7 +427,7 @@ body {
    which is the only thing its own node carried. It keeps its id, because a
    pane link may name it. */
 .graph-chip {
-  font-size: 9.5px;
+  font-size: var(--fs-2xs);
   color: var(--type);
   border: 1px solid var(--border);
   border-radius: 3px;
@@ -452,7 +500,7 @@ body {
   border-left-color: var(--warn);
 }
 .diag .diag-head {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-transform: uppercase;
   letter-spacing: 0.03em;
   margin-bottom: 0.25rem;
@@ -465,7 +513,7 @@ body {
 }
 .diag .diag-span {
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .fatal {
@@ -493,7 +541,7 @@ body {
 }
 .cm-tooltip-lint .cm-diagnostic {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: 0.3rem 0.5rem;
 }
 .cm-tooltip-lint .cm-diagnostic-error {
@@ -506,7 +554,7 @@ body {
 /* F2: hover tooltip (tightest node label / type set / provenance) */
 .cm-hover {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: 0.3rem 0.5rem;
   max-width: 32rem;
 }
@@ -518,7 +566,7 @@ body {
 }
 .cm-hover-prov {
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 .cm-hover-gotodef {
   display: block;
@@ -527,7 +575,7 @@ body {
   border: none;
   background: none;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--edge);
   cursor: pointer;
   text-align: left;
@@ -541,7 +589,7 @@ body {
   border: none;
   background: none;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--edge);
   cursor: pointer;
   text-align: left;
@@ -594,7 +642,7 @@ body {
 /* Shown in a pane holding no part of the selection itself — every row in it is
    a node the links reached. Amber, because that is what the rows are. */
 .no-anchor-notice {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--fg-muted);
   padding: 2px 6px;
   margin-bottom: 2px;

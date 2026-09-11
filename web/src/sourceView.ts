@@ -22,11 +22,15 @@ import {
   EditorView,
   drawSelection,
   hoverTooltip,
+  keymap,
   lineNumbers,
   type Tooltip,
 } from "@codemirror/view";
 import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lint";
 
+import { forceParsing } from "@codemirror/language";
+
+import { cambraLanguage } from "./cambraLang";
 import type { Indices } from "./indices";
 import type { OffsetMap } from "./offsets";
 import { SOURCE_PANE, type Resolved, type Selection, type Store } from "./store";
@@ -187,6 +191,9 @@ export class SourceView {
     // being inspected, which is what withholds the affordance under
     // `--inspect-only`.
     onInspect?: (nodeId: number, operators: readonly number[]) => void,
+    // Recompile the edited text. Absent leaves the pane read-only: an editable
+    // editor with nothing behind the chord is a control that does nothing.
+    onRebuild?: (source: string, options: { keepState: boolean }) => void,
   ) {
     this.store = store;
     const { offsets, snapshot } = store;
@@ -345,12 +352,44 @@ export class SourceView {
       doc: snapshot.source.text,
       extensions: [
         lineNumbers(),
+        // Syntax colour. Ahead of `highlightField` so that a provenance mark,
+        // which is a background, layers over syntax ink rather than under it.
+        cambraLanguage,
         // CodeMirror draws no caret in non-editable content, so nothing showed
         // where the reader clicked; `drawSelection` draws both the caret and
         // the selection itself, and puts their colours under this app's CSS.
         drawSelection(),
-        EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
+        // Editable exactly when there is something to recompile with.
+        EditorState.readOnly.of(onRebuild === undefined),
+        EditorView.editable.of(onRebuild !== undefined),
+        ...(onRebuild
+          ? [
+              // Two chords, because the difference between them is the whole
+              // point: state is either carried across the edit or it is not.
+              // `Mod-Enter` is the one a demo repeats — keep the cart, change
+              // the program — so it gets the chord without the modifier.
+              // Both stop here: CodeMirror's default `Enter` must not also
+              // insert a newline into the text being compiled.
+              keymap.of([
+                {
+                  key: "Mod-Enter",
+                  preventDefault: true,
+                  run: (view) => {
+                    onRebuild(view.state.doc.toString(), { keepState: true });
+                    return true;
+                  },
+                },
+                {
+                  key: "Mod-Shift-Enter",
+                  preventDefault: true,
+                  run: (view) => {
+                    onRebuild(view.state.doc.toString(), { keepState: false });
+                    return true;
+                  },
+                },
+              ]),
+            ]
+          : []),
         EditorView.lineWrapping,
         highlightField,
         hover,
@@ -359,12 +398,33 @@ export class SourceView {
       ],
     });
     this.view = new EditorView({ state, parent });
+
+    // Highlight the whole document on the first paint instead of letting the
+    // background worker walk it: the pane is opened to be read immediately, and
+    // a visible sweep of colour arriving after the fact reads as a glitch on a
+    // slide. This is a first-paint call only — the worker stays installed and
+    // keeps the highlighting current if the document is ever edited.
+    forceParsing(this.view, this.view.state.doc.length, Infinity);
+
     // `setDiagnostics` installs the lint state field alongside the diagnostics,
     // so this one synchronous dispatch is the whole squiggle mechanism.
     this.view.dispatch(setDiagnostics(this.view.state, diagnostics));
 
     // Re-highlight the resolved source spans whenever the selection changes.
     store.subscribe((resolved) => this.renderSelection(resolved));
+  }
+
+  /**
+   * Release the editor.
+   *
+   * CodeMirror's parse worker reschedules itself for as long as the view is
+   * alive, so a view nobody destroys keeps a timer alive with it. That is
+   * harmless in the app, where the pane lives as long as the page, and is not
+   * harmless under jsdom: the timer wakes after the test environment is torn
+   * down and reaches for a `document` that is gone.
+   */
+  destroy(): void {
+    this.view.destroy();
   }
 
   /** Reflect the resolved selection as source-span highlights. */
