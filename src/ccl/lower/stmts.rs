@@ -1459,10 +1459,58 @@ pub(super) fn lower_type_expr(
             annotation.span,
             "a tuple type is written with braces: `{T, U}`",
         )),
-        _ => Err(LoweringError::unsupported(
+        // A comparison in type position is a refinement's predicate written
+        // without its braces. `Int | _ >= 0` parses this way rather than as a
+        // `|`-chain, because comparison binds looser than `|`, so the arm above
+        // never sees it.
+        ChlExpr::Compare { .. } => Err(LoweringError::unsupported(
             annotation.span,
-            format!("unsupported type annotation form: {:?}", annotation.node),
+            "a comparison is a refinement's predicate, and a refinement is written in \
+             braces with `where`: `{Int where _ >= 0}`",
         )),
+        other => Err(LoweringError::unsupported(
+            annotation.span,
+            format!("{} is not a type", describe_type_form(other)),
+        )),
+    }
+}
+
+/// Name a CHL expression form in the surface's own words.
+///
+/// The alternative is `{:?}` on the parser AST, which puts a multi-line
+/// `Spanned`/`Span` dump in a diagnostic a reader has to look past. Every
+/// capitalized `=` routes through [`lower_type_expr`], so a plain typo
+/// (`Five = 5`) reaches this and the dump would be the whole message.
+fn describe_type_form(e: &ChlExpr) -> &'static str {
+    match e {
+        ChlExpr::Lit(ChlLit::Int(_)) => "an integer literal",
+        ChlExpr::Lit(ChlLit::String(_)) => "a string literal",
+        ChlExpr::Lit(ChlLit::Bool(_)) => "a boolean literal",
+        ChlExpr::BinOp { .. } | ChlExpr::UnaryOp { .. } => "an arithmetic expression",
+        ChlExpr::BoolOp { .. } => "a boolean expression",
+        ChlExpr::Compare { .. } => "a comparison",
+        ChlExpr::Call { .. } => "a call",
+        ChlExpr::List(_) => "a list",
+        ChlExpr::Record(_) => "a record value",
+        ChlExpr::Subscript { .. } => "a subscript",
+        ChlExpr::Attribute { .. } => "a field access",
+        ChlExpr::Lambda { .. } => "a lambda",
+        ChlExpr::IfExp { .. } => "a conditional expression",
+        ChlExpr::ListComp(_) | ChlExpr::GenExp(_) => "a comprehension",
+        ChlExpr::Yield(_) => "a `yield`",
+        ChlExpr::Feed { .. } => "a feed",
+        ChlExpr::Block(_) => "a block",
+        // `Error` is a parser recovery placeholder, which the caller surfaces
+        // through `ParseResult::errors` before this message is ever read.
+        ChlExpr::Error => "a malformed expression",
+        // The forms with their own arms in `lower_type_expr` never reach here.
+        ChlExpr::Name(_)
+        | ChlExpr::BraceRecord(_)
+        | ChlExpr::BraceGroup(_)
+        | ChlExpr::BraceRefinement { .. }
+        | ChlExpr::FunctionType { .. }
+        | ChlExpr::VariantCtor { .. }
+        | ChlExpr::Tuple(_) => "this expression",
     }
 }
 
@@ -1649,6 +1697,8 @@ pub(super) fn pre_declare_type_aliases(
         }
         match lower_type_expr(rhs, ctx) {
             Ok(ty) => ctx.declare_type_alias(name, ty),
+            // The inner error names the form in surface words
+            // ([`describe_type_form`]), so it composes into one sentence.
             Err(inner) => errors.push(LoweringError::unsupported(
                 stmt.span,
                 format!(

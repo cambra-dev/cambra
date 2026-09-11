@@ -355,6 +355,9 @@ fn declaring_one_alias_twice_in_a_block_is_rejected() {
 
 /// The case of the name is the whole discriminator, so a capitalized target is
 /// read as a type whatever sits on the right.
+///
+/// The needle runs to the end of the message: the tail is what `lower_type_expr`
+/// says about the form, and it names the form rather than dumping the parser AST.
 #[test]
 fn a_term_on_the_right_of_a_capitalized_name_is_rejected() {
     check_compile_error(
@@ -364,7 +367,38 @@ fn a_term_on_the_right_of_a_capitalized_name_is_rejected() {
             x: Int = 1
             x
         "#},
-        "declares a type alias and its right-hand side must be a type",
+        "`Five` is capitalized, so `Five = …` declares a type alias and its \
+         right-hand side must be a type: an integer literal is not a type",
+    );
+}
+
+/// `|` separates variant arms, not a refinement's base from its predicate.
+/// Comparison binds looser than `|`, so `Int | _ >= 0` reaches `lower_type_expr`
+/// as a comparison rather than as a `|`-chain, and the message names the
+/// refinement spelling `where` wants.
+#[test]
+fn a_refinement_written_with_a_bar_names_the_where_spelling() {
+    check_compile_error(
+        indoc! {r#"
+            Cents = Int | _ >= 0
+
+            x: Int = 1
+            x
+        "#},
+        "a refinement is written in braces with `where`: `{Int where _ >= 0}`",
+    );
+}
+
+/// A bare term in an ordinary annotation reaches the same message, with no alias
+/// involved — `lower_type_expr`'s catch-all is shared.
+#[test]
+fn a_term_in_an_annotation_names_its_form() {
+    check_compile_error(
+        indoc! {r#"
+            x: 5 = 5
+            x
+        "#},
+        "an integer literal is not a type",
     );
 }
 
