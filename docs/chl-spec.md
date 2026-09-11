@@ -179,7 +179,7 @@ surface level.
 ### 1.8 Operators and punctuation
 
 ```
-+  -  *  //  ++  ->  =>
++  -  *  **  //  ++  ->  =>
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
@@ -193,10 +193,14 @@ a mutable variable. It is *not* Python's walrus operator: it is an
 Algol-tradition assignment **statement**, and there is still no
 assignment-as-expression.
 
-**Notably absent vs. Python** at the lexical level: `/`, `%`, `**`, `>>`,
-`~`, `@` (no matmul, no decorators), walrus assignment-*expressions*, and
-`...`. The parser refuses these at the syntactic level rather than
-parsing-then-erroring.
+**Notably absent vs. Python** at the lexical level: `/`, `%`, `>>`, `~`,
+walrus assignment-*expressions*, and `...`. The parser refuses these at
+the syntactic level rather than parsing-then-erroring. `@` is lexed, but
+only as the decorator introducer (§1.9); there is no matrix-multiplication
+operator.
+
+`**` is exponentiation (§3.3). `**=` is not a token, so the augmented
+assignments are the four above.
 
 `++` is not a Python token at all: it is CHL's collection-union operator
 (§3.3). There is no increment operator — `++` is always binary.
@@ -383,19 +387,25 @@ noted:
 | 14 | `+` `-` | additive |
 | 15 | `*` `//` | multiplicative |
 | 16 | unary `-` | prefix |
-| 17 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold |
-| 18 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
+| 17 | `**` | exponentiation; *right*-associative |
+| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold |
+| 19 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
 
 The pair binds tighter than the feed and looser than the ternary, so
 `m << k -> v` feeds the entry `(k, v)` and `k -> v if c else w` pairs `k` with
 the whole conditional. Neither of its operands reaches the lambda, so a lambda
 on either side is parenthesised.
 
+`**` binds tighter than the unary `-` on its left and looser than the one
+on its right: `-2 ** 2` is `-(2 ** 2)`, and `2 ** -1` needs no
+parentheses. `**` groups to the right, so `2 ** 3 ** 2` is
+`2 ** (3 ** 2)`.
+
 ```ebnf
 expression ::= lambda_expr | yield_expr | fun_type | feed_expr | pair
              | ternary | bool_or | bool_and | bool_not
              | comparison | log_or | log_xor | log_and | collection_union
-             | sum_expr | product | unary | postfix | atom
+             | sum_expr | product | unary | power | postfix | atom
 
 -- Every position a bracket encloses: a list or tuple element, a call argument,
 -- a subscript index, a record field, a brace item, a refinement predicate, a
@@ -727,13 +737,20 @@ point of use. Mutual recursion between top-level functions is
 |---|---|
 | `a + b`, `a - b`, `a * b` | Integer arithmetic. Overflow is not defined (see *Partiality*, §3). |
 | `a // b` | Integer floor division. Division by zero is not defined (see *Partiality*, §3). |
+| `a ** b` | Integer exponentiation, *right*-associative (§2.3). Overflow is not defined (see *Partiality*, §3). |
 | `-a` | Integer negation. |
 | `a & b`, `a \| b`, `a ^ b` | **Logical** and / or / xor. Both sides must be `Bool`. (CHL re-uses Python's bitwise tokens for logical operators; there is no separate bitwise operator family.) |
 | `not a` | Boolean negation. |
 | `a and b`, `a or b` | Boolean conjunction / disjunction with short-circuit semantics — the right operand need not be defined when the left settles the result. See §3.5. |
 | `a ++ b` | Collection union (multiset sum) of two collections of the same element type. Since collections are unordered (§3), this is not "concatenation"; it is the bag union. |
 
-Operators absent on purpose: `/` (no fractional type), `%`, `**`, `>>`,
+`a ** 0` is 1 for every `a`. A negative exponent takes the reciprocal
+through the same division `//` performs: `a ** -n` denotes
+`1 // (a ** n)`, so `2 ** -1` is 0 and `a ** -n` is undefined at
+`a == 0` exactly where division by zero is. CHL has no fractional type
+for a negative exponent to produce instead (the `Real` note below).
+
+Operators absent on purpose: `/` (no fractional type), `%`, `>>`,
 `~`, `@`. Attempting to use these in source is a parse error.
 
 > **Direction [Tentative] — `Real` and `/`.** The target language has a

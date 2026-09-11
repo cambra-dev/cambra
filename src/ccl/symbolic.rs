@@ -51,6 +51,9 @@ enum Precedence {
     /// `*`, `//` — multiplicative operators share this level; they bind tighter
     /// than additive operators, matching standard arithmetic convention.
     Mul,
+    /// `**` — exponentiation, tighter than the multiplicative operators and the
+    /// only level whose operator groups to the right (see [`Associativity`]).
+    Pow,
     /// `▷` chains — tighter than all binary operators so `x + y ▷ f` requires
     /// explicit parens: `(x + y) ▷ f`.
     Apply,
@@ -77,7 +80,8 @@ impl Precedence {
             Self::Cmp => Self::Compose,
             Self::Compose => Self::Add,
             Self::Add => Self::Mul,
-            Self::Mul => Self::Apply,
+            Self::Mul => Self::Pow,
+            Self::Pow => Self::Apply,
             Self::Apply => Self::Unary,
             Self::Unary => Self::Subscript,
             Self::Subscript => Self::Atom,
@@ -247,10 +251,15 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::BinOp { left, op, right } => {
             let op_prec = binop_prec(op);
             let sym = op.sym();
-            // Left at same prec is fine (left-associative).
-            let l = fmt(left, op_prec, opts);
-            // Right needs one level tighter to avoid right-association.
-            let r = fmt(right, op_prec.next_highest(), opts);
+            // The side the operator groups towards keeps a child of equal
+            // precedence unparenthesised; the other side parenthesises one, so
+            // the rendering re-parses with the grouping it was built from.
+            let (l_prec, r_prec) = match binop_assoc(op) {
+                Associativity::Left => (op_prec, op_prec.next_highest()),
+                Associativity::Right => (op_prec.next_highest(), op_prec),
+            };
+            let l = fmt(left, l_prec, opts);
+            let r = fmt(right, r_prec, opts);
             (op_prec, format!("{l} {sym} {r}"))
         }
 
@@ -696,6 +705,37 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
         )
         | BinOpKind::Concat => Precedence::Add,
         BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
+        BinOpKind::Arithmetic(ArithmeticKind::Pow) => Precedence::Pow,
+    }
+}
+
+/// Which side of a binary operator holds a child of its own precedence without
+/// parentheses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Associativity {
+    Left,
+    Right,
+}
+
+/// Return the associativity of a binary operator.
+///
+/// `**` is the only one that groups to the right, matching CHL
+/// (`docs/chl-spec.md`, "2.3 Expression precedence"). Rendering it as if it
+/// grouped to the left would print `(a ** b) ** c` as `a ** b ** c`, which
+/// reads back as the other tree.
+fn binop_assoc(op: &BinOpKind) -> Associativity {
+    match op {
+        BinOpKind::Arithmetic(ArithmeticKind::Pow) => Associativity::Right,
+        BinOpKind::Arithmetic(
+            ArithmeticKind::Add
+            | ArithmeticKind::AddRefined
+            | ArithmeticKind::Sub
+            | ArithmeticKind::Mul
+            | ArithmeticKind::FloorDiv,
+        )
+        | BinOpKind::Concat
+        | BinOpKind::Compare(_)
+        | BinOpKind::BoolLogic(_) => Associativity::Left,
     }
 }
 
@@ -787,6 +827,49 @@ mod tests {
             ),
         ),
         "a + b * c"
+    )]
+    // BinOp: `**` groups to the right, so the nested exponent renders bare
+    #[case(
+        Expr::binop(
+            Expr::var("a"),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow),
+            Expr::binop(
+                Expr::var("b"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("c")
+            ),
+        ),
+        "a ** b ** c"
+    )]
+    // BinOp: and its nested *base* is the tree the bare form does not mean
+    #[case(
+        Expr::binop(
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("b")
+            ),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow),
+            Expr::var("c"),
+        ),
+        "(a ** b) ** c"
+    )]
+    // BinOp: `**` binds tighter than `*` on either side
+    #[case(
+        Expr::binop(
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("b")
+            ),
+            BinOpKind::Arithmetic(ArithmeticKind::Mul),
+            Expr::binop(
+                Expr::var("c"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("d")
+            ),
+        ),
+        "a ** b * c ** d"
     )]
     // UnaryOp(Neg) inside Mul: Unary > Mul, so -a needs no parens as left child
     #[case(

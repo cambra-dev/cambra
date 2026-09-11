@@ -139,7 +139,7 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ### Currently omitted
 
-`while` loops, floats, `%`/`**`/bit-shifts, classes, exceptions, imports (CHL is single-file today), identity (`is`), and membership operators are omitted while we focus on the areas of highest technical risk. The spec's [reserved-for-future-work section](chl-spec.md) is the authoritative list. CHL resembles Python; it does not promise Python.
+`while` loops, floats, `%`/bit-shifts, classes, exceptions, imports (CHL is single-file today), identity (`is`), and membership operators are omitted while we focus on the areas of highest technical risk. The spec's [reserved-for-future-work section](chl-spec.md) is the authoritative list. CHL resembles Python; it does not promise Python.
 
 ## Program Execution Pipeline
 

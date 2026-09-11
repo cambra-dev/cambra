@@ -130,6 +130,11 @@ pub enum Token {
     /// maximal munch takes it over `=` then `>`.
     #[token("=>")]
     DoubleArrow,
+    /// Exponentiation `**` (`docs/chl-spec.md`, "3.3 Arithmetic and logical
+    /// operators"). Two chars, so maximal munch takes it over `Star` then
+    /// `Star`; CHL has no unary `*`, so `a * *b` is not a competing parse.
+    #[token("**")]
+    StarStar,
     #[token("*=")]
     StarEq,
     #[token("//=")]
@@ -269,6 +274,7 @@ impl fmt::Display for Token {
             Token::MinusEq => "-=",
             Token::Arrow => "->",
             Token::DoubleArrow => "=>",
+            Token::StarStar => "**",
             Token::StarEq => "*=",
             Token::DoubleSlashEq => "//=",
             Token::DoubleSlash => "//",
@@ -658,7 +664,7 @@ mod tests {
     #[test]
     fn multi_char_operators() {
         assert_eq!(
-            tokens("<< <<= == != <= >= // //= += -= *= ^+"),
+            tokens("<< <<= == != <= >= // //= += -= *= ** ^+"),
             vec![
                 Token::LShift,
                 Token::LShiftEq,
@@ -671,6 +677,7 @@ mod tests {
                 Token::PlusEq,
                 Token::MinusEq,
                 Token::StarEq,
+                Token::StarStar,
                 Token::CaretPlus,
                 Token::Newline,
             ]
@@ -691,6 +698,23 @@ mod tests {
                 Token::Ident("c".into()),
                 Token::Plus,
                 Token::Ident("d".into()),
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// `**` is one token and `*` is another; the two operators share a first
+    /// character, and maximal munch is what separates them.
+    #[test]
+    fn star_star_wins_over_star_then_star() {
+        assert_eq!(
+            tokens("a ** b * c"),
+            vec![
+                Token::Ident("a".into()),
+                Token::StarStar,
+                Token::Ident("b".into()),
+                Token::Star,
+                Token::Ident("c".into()),
                 Token::Newline,
             ]
         );
