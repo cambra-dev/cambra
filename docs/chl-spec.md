@@ -1077,6 +1077,15 @@ form; the literal parses, and `map([…])` is what reads it as a `Map` (§6.3).
 distinct from it, so it is equally what an "empty record" would denote. Its type
 is the unit type, written `{}` (§6.6). `[]` is the empty list.
 
+**`[]` names no element type**, so the element type comes from whatever demands
+one: an annotation on the binding it seeds (`xs: List(Int) = box([])`), an
+operator that reads an element, or a collection it joins with. Where nothing
+demands one the element type is `unit` — the empty list has no position to read a
+value from, so no program can observe the choice.
+
+The re-keying constructors need a key type and have no elements to take one from,
+so `map([])` and `set([])` are rejected. An empty map has no spelling (§2.4).
+
 > **Direction [Decided].** The literal forms migrate with the
 > delimiter split (§2.4) and the collections model (§6.3), form by
 > form:

@@ -2237,6 +2237,13 @@ mod tests {
         );
     }
 
+    /// An empty list literal with nothing to fix its element type takes `unit`.
+    ///
+    /// The choice is `pin_empty_list_element`'s, made after the constraints are in,
+    /// so a use site or an annotation that names an element type gets it instead
+    /// (`empty_list_takes_its_element_type_from_the_use_site`). Emission leaves the
+    /// element a variable and this is what it resolves to when nothing demands
+    /// anything of it.
     #[test]
     fn test_infer_list_empty() {
         let mut ctx = TypeInferenceContext::new();

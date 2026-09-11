@@ -78,6 +78,42 @@ witness, and each is the unboxed form of the sum below it in the list. Crossing 
 to its sum is `box`, and that `box` is where the domain stops being available to reason
 with.
 
+## The empty literal names no element type
+
+`[]` is typed `[0, 0) ⤇ 𝛼`, with `𝛼` left for whatever demands an element type: an annotation on
+the binding it seeds (`xs: List(Int) = box([])`), an operator that reads an element, or a join
+with a collection that names one.
+
+With nothing demanding one, `𝛼` is pinned to `unit`. The empty literal denotes the function with
+no positions, so no program reads a value out of it, and `unit` is what this type language has for
+a value carrying no information — there is no uninhabited type
+([chl-spec, 6.6 The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit)).
+`pin_empty_list_element` makes the choice after the constraints are in, on the rule an unreachable
+`Case` arm's payload takes
+([type-inference.md, An unobservable arm payload is pinned to what its uses require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)).
+
+Emptiness is the premise the pin rests on, not a stand-in for "no value reached the element type".
+A non-empty literal whose elements are themselves undetermined — `\x -> [x, x]`, never called —
+has a value-free element type too, and there the variable is a type parameter the program left
+ambiguous; pinning it would accept a program that has no type.
+
+### A re-keying constructor rejects the empty literal
+
+`map([])` and `set([])` have no key type. A re-keying's key domain is the key morphism's image
+([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)), and
+with no elements there is no image, so nothing names the key.
+
+The pin does not supply one. The re-keyed literal is copied into the key domain's refinement
+predicate, `Clone` leaves the copy its own inference variables, and a pin inside a predicate would
+answer for the copy while the original stays free — so the pin declines there (`CoalesceCtx`'s
+`in_predicate`). Both constructors reject an empty literal as an unresolved inference variable.
+
+Closing this needs a term whose domain is **the empty subset of a key type not yet known**. The
+empty index range `[0, 0)` is not that term: it is a `UIntRanges` domain, so `box([])` against
+`Map(String, 𝑉)` collides on the domain rather than entering the sum. An empty `Map` therefore has
+no spelling
+([chl-spec, 3.11 List, tuple, record literals](../../../docs/chl-spec.md#311-list-tuple-record-literals)).
+
 ## The collection type is declared, not read off the shape
 
 Which side of `𝐷 ⤇ 𝑉` holds the payload is not fixed by the shape. `Set(𝐾)` iterates its
