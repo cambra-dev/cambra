@@ -166,17 +166,6 @@ pub(super) struct CoalesceCtx {
     /// the mark and read as surviving, though they die with the clone. Asking each
     /// frame what it is, at the moment it is created, is immune to that.
     discarding: bool,
-    /// Whether a **refinement predicate's** expression tree is being walked, rather
-    /// than the main tree.
-    ///
-    /// A predicate holds copies of terms that also stand on the main tree — the
-    /// present-key domain names the collection its group-by iterates
-    /// (`src/ccl/design/collections.md`, "The key domain is the key morphism's
-    /// image") — and `Clone` leaves each copy its own variables. So a rule that
-    /// *chooses* a type rather than reading one has to decline here:
-    /// [`pin_empty_list_element`] would answer for the copy alone, and the original
-    /// is under no obligation to agree.
-    in_predicate: bool,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -857,6 +846,13 @@ fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
 /// constraints arrive is a bound the literal never had: `Unit` written at emission
 /// meets every annotation naming another element type as a mismatch.
 fn pin_empty_list_element(list_ty: &Type) {
+    // `emit_list` builds a bare `Fun`, so this is an invariant and not a case: a list node
+    // whose type grew a wrapper would stop being pinned, and every unannotated `[]` would
+    // reach the wall as an unresolved variable with nothing pointing here.
+    debug_assert!(
+        matches!(list_ty, Type::Fun { .. }),
+        "an empty list literal's type is the bare function `emit_list` built, got {list_ty}"
+    );
     let Type::Fun { codomain, .. } = list_ty else {
         return;
     };
@@ -872,6 +868,19 @@ fn pin_empty_list_element(list_ty: &Type) {
         "pinning an empty list's element variable cannot fail: its only bounds are what \
          its uses required, and `{chosen}` is a type they all still accept",
     );
+}
+
+/// [`pin_empty_list_element`] over every empty list literal in `expr`, in one pass before
+/// coalescing reads anything.
+///
+/// Term nodes only: a refinement predicate rides a *type* slot, which this walk does not
+/// enter, so a predicate's copy keeps its own variables and is answered by whatever the
+/// original resolves to.
+fn pin_empty_list_elements(expr: &Expr) {
+    if matches!(&expr.node, TypedExprNode::List(elts) if elts.is_empty()) {
+        pin_empty_list_element(&expr.ty);
+    }
+    expr.walk_children(pin_empty_list_elements);
 }
 
 /// The type to pin an unobservable position to: the concrete type it is required
@@ -948,10 +957,23 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
         discarding: false,
-        in_predicate: false,
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
+    // **Every empty literal's element is chosen before the walk starts.** The choice is
+    // recorded on the element *variable*, and that variable also stands in the binder slots
+    // the literal feeds — a comprehension's lambda parameter, a `for` target — so a read
+    // that precedes the pin resolves one occurrence against the unpinned graph and leaves
+    // it unresolved at the wall. The walk cannot reach the literal first in general: the
+    // `Apply` arm descends into `function` before `argument` on purpose, so a comprehension
+    // over an inline `[]` reads the lambda's parameter before it ever sees the list.
+    //
+    // Here rather than at emission because a type asserted before the constraints arrive is
+    // a bound the literal never had; here rather than in the walk because by the walk it is
+    // already too late. Emission has finished, so every constraint is in, and no coalesce
+    // read has happened yet. Predicates are reached through type slots rather than this
+    // walk, so a predicate's copy is left alone for the reason the walk left it alone.
+    pin_empty_list_elements(expr);
     coalesce_node(expr, 0, &mut ctx);
     debug_assert!(
         ctx.scope.is_empty(),
@@ -1290,14 +1312,6 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         return;
     }
 
-    // An empty list literal's element type is chosen here, before this node's type is
-    // read and before the walk borrows the node. The ordering is
-    // [`pin_unobservable_arm_payload`]'s: the pin records its choice on the element
-    // *variable*, so a read that precedes it resolves one occurrence against the
-    // unpinned graph.
-    if !ctx.in_predicate && matches!(&expr.node, TypedExprNode::List(elts) if elts.is_empty()) {
-        pin_empty_list_element(&expr.ty);
-    }
     // Recurse into sub-expressions first so child types are settled
     // before we coalesce this node's (which may reference them).
     //
@@ -1893,7 +1907,6 @@ fn coalesce_type_predicates_go(
             // `coalesce_type_predicates`.
             let memo = ctx.pred_memo.clone();
             let base = inner.clone();
-            let outer_in_predicate = std::mem::replace(&mut ctx.in_predicate, true);
             refinements.rewrite_each(|_, r| {
                 memo.rebuild(r, &(), |pred| {
                     coalesce_node(pred, level, ctx);
@@ -1902,7 +1915,6 @@ fn coalesce_type_predicates_go(
                 });
                 *r = scope.close(r);
             });
-            ctx.in_predicate = outer_in_predicate;
         }
         Type::Fun {
             fun_kind,
