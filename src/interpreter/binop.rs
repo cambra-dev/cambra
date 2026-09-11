@@ -26,6 +26,63 @@ pub enum ArithmeticKind {
     Sub,
     Mul,
     FloorDiv,
+    Pow,
+}
+
+/// Integer exponentiation, the scalar behind [`ArithmeticKind::Pow`].
+///
+/// A separate trait because `**` has no `*Assign` operator to bound
+/// [`zip_arithmetic`]'s element type by, and because the two element types
+/// differ on negative exponents: `usize` has none, and `i64`'s take the
+/// reciprocal.
+trait IntPow: Copy + MulAssign {
+    /// The multiplicative identity, which seeds [`Self::raised`] and is what
+    /// `a ** 0` yields for every `a`.
+    const ONE: Self;
+
+    /// `self` raised to a non-negative `exponent`, by squaring, so the cost is
+    /// logarithmic in `exponent` and overflow arrives through the same `*` that
+    /// [`ArithmeticKind::Mul`] uses.
+    fn raised(mut self, mut exponent: u64) -> Self {
+        let mut acc = Self::ONE;
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                acc *= self;
+            }
+            exponent >>= 1;
+            if exponent > 0 {
+                self *= self;
+            }
+        }
+        acc
+    }
+
+    fn int_pow(self, exponent: Self) -> Self;
+}
+
+impl IntPow for i64 {
+    const ONE: Self = 1;
+
+    fn int_pow(self, exponent: Self) -> Self {
+        let magnitude = self.raised(exponent.unsigned_abs());
+        if exponent < 0 {
+            // `a ** -n` is `1 // (a ** n)`, the reciprocal taken through the
+            // same division `//` performs, so it is undefined at `a == 0`
+            // exactly where division by zero is (`docs/chl-spec.md`,
+            // "3.3 Arithmetic and logical operators").
+            1 / magnitude
+        } else {
+            magnitude
+        }
+    }
+}
+
+impl IntPow for usize {
+    const ONE: Self = 1;
+
+    fn int_pow(self, exponent: Self) -> Self {
+        self.raised(exponent as u64)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,7 +107,7 @@ pub enum LogicKind {
 
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
 // slows it down by ~15%
-fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssign<T>>(
+fn zip_arithmetic<T: IntPow + AddAssign<T> + SubAssign<T> + DivAssign<T>>(
     op: ArithmeticKind,
     mut l: Vec<T>,
     r: &[T],
@@ -70,6 +127,10 @@ fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssi
         ArithmeticKind::Sub => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a -= *b),
         ArithmeticKind::Mul => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a *= *b),
         ArithmeticKind::FloorDiv => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a /= *b),
+        ArithmeticKind::Pow => l
+            .iter_mut()
+            .zip(r.iter())
+            .for_each(|(a, b)| *a = a.int_pow(*b)),
     };
     l
 }

@@ -107,6 +107,14 @@ pub enum Trait {
     Multipliable,
     /// `//` over `(𝐴, 𝐵)`, associating `Output`.
     Divisible,
+    /// `**` over `(𝐴, 𝐵)`, associating `Output`, where `𝐵` is the exponent.
+    ///
+    /// The rows are the homogeneous numeric ones, so a negative `Int` exponent is
+    /// admitted here and given a value by [`ArithmeticKind::Pow`] rather than ruled
+    /// out by the type.
+    ///
+    /// [`ArithmeticKind::Pow`]: crate::ccl::ArithmeticKind::Pow
+    Exponentiable,
     /// `==` and `!=` over `(𝐴, 𝐵)`, associating **nothing** — the `Bool` is the
     /// operator's, identical for every pair the trait accepts.
     Equatable,
@@ -285,7 +293,9 @@ impl Trait {
         match self {
             Trait::Addable => NUMERIC_OR_STRING,
             Trait::AddableRefined => ADDITION_REFINED,
-            Trait::Subtractable | Trait::Multipliable | Trait::Divisible => NUMERIC,
+            Trait::Subtractable | Trait::Multipliable | Trait::Divisible | Trait::Exponentiable => {
+                NUMERIC
+            }
             Trait::Equatable | Trait::Orderable => COMPARABLE,
             Trait::Negatable => NEGATABLE,
             Trait::Comparable => ORDERED,
@@ -337,6 +347,7 @@ impl Trait {
             Trait::Subtractable => "Subtractable",
             Trait::Multipliable => "Multipliable",
             Trait::Divisible => "Divisible",
+            Trait::Exponentiable => "Exponentiable",
             Trait::Equatable => "Equatable",
             Trait::Orderable => "Orderable",
             Trait::Negatable => "Negatable",
@@ -1849,6 +1860,7 @@ mod tests {
             Trait::Subtractable,
             Trait::Multipliable,
             Trait::Divisible,
+            Trait::Exponentiable,
             Trait::Equatable,
             Trait::Orderable,
             Trait::Negatable,

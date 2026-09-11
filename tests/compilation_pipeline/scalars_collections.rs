@@ -129,8 +129,43 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // maps both to the one runtime addition.
 #[case("2 ^+ 3", Value::Int(5))]
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
+// `**` scales a constant without spelling out the zeroes.
+#[case("10 ** 8", Value::Int(100_000_000))]
+// Right-associative: `2 ** (3 ** 2)` is 512, where a left fold would be 64.
+#[case("2 ** 3 ** 2", Value::Int(512))]
+#[case("(2 ** 3) ** 2", Value::Int(64))]
+// Tighter than `*` on either side.
+#[case("2 * 3 ** 2", Value::Int(18))]
+#[case("3 ** 2 * 2", Value::Int(18))]
+// Tighter than the unary minus on its left: `-(2 ** 2)`.
+#[case("-2 ** 2", Value::Int(-4))]
+#[case("2 ** 0", Value::Int(1))]
+// A negative exponent is `1 // (a ** n)` — see `negative_exponent_divides_one_by_the_power`.
+#[case("2 ** -1", Value::Int(0))]
+#[case("1 ** -3", Value::Int(1))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// A negative exponent is the reciprocal taken through the same division `//`
+/// performs (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators"), so
+/// `a ** -n` and `1 // (a ** n)` run to the same value.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(2, 1, 0)]
+#[case(2, 3, 0)]
+#[case(7, 2, 0)]
+#[case(1, 3, 1)]
+fn negative_exponent_divides_one_by_the_power(
+    #[case] base: i64,
+    #[case] exponent: i64,
+    #[case] expected: i64,
+) {
+    check_scalar(&format!("{base} ** -{exponent}"), Value::Int(expected));
+    check_scalar(
+        &format!("1 // ({base} ** {exponent})"),
+        Value::Int(expected),
+    );
 }
 
 // ---------------------------------------------------------------------------

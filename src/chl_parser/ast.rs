@@ -10,7 +10,7 @@
 //!   diagnostics can point at any sub-expression without bolt-on span tables.
 //! - **Operators are enums, not strings.** [`BinOp`], [`CmpOp`], [`BoolOp`],
 //!   [`UnaryOp`], [`AugOp`] each enumerate exactly the operators CHL accepts;
-//!   variants Python supports but CHL does not (`/`, `%`, `**`, `>>`, `~`,
+//!   variants Python supports but CHL does not (`/`, `%`, `>>`, `~`,
 //!   unary `+`, `is`, `in`) are simply absent. This makes lowering exhaustive
 //!   without an `unimplemented!()` branch per operator.
 //! - **`if`/`elif` flattens.** A chain of `if`/`elif`/`else` produces a single
@@ -742,9 +742,9 @@ pub enum CompClause {
 
 /// Binary operators accepted by CHL.
 ///
-/// Notably absent vs. Python: `/` (true division), `%` (modulo), `**` (power),
-/// `>>` (right shift). CHL's lowering does not implement these and the parser
-/// rejects them at the syntactic level.
+/// Notably absent vs. Python: `/` (true division), `%` (modulo), `>>` (right
+/// shift). CHL's lowering does not implement these and the parser rejects them
+/// at the syntactic level.
 ///
 /// CHL reuses several Python tokens with different semantics: `&`, `|`, `^`
 /// denote logical (not bitwise) and/or/xor. `++` denotes collection union
@@ -760,6 +760,10 @@ pub enum BinOp {
     Sub,
     Mul,
     FloorDiv,
+    /// `**` — exponentiation. Right-associative, and tighter than the unary minus
+    /// on its left, so `-2 ** 2` is `-(2 ** 2)` (`docs/chl-spec.md`,
+    /// "2.3 Expression precedence").
+    Pow,
     /// `&` — logical and (CHL reuses Python's bitwise-and token).
     LogicalAnd,
     /// `|` — logical or (CHL reuses Python's bitwise-or token).
