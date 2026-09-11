@@ -489,6 +489,49 @@ fn alias_is_the_value_type_of_a_transactional_variable_in_a_nested_block() {
     );
 }
 
+/// A `Mut` parameter's value type is lowered by `mut_param_history_type` rather
+/// than through `lower_type_annotation`, and `pre_register_txn_decls` reads the
+/// same annotation to decide the curried call shape. Both sit at block entry, so
+/// this pins the second annotation-lowering pass the alias declaration precedes.
+#[test]
+fn alias_is_the_value_type_of_a_mut_parameter() {
+    check_scalar(
+        indoc! {r#"
+            Cents = Int
+
+            def bump(m: Mut(Cents), d: Int):
+                m := m + d
+
+            acc: Mut(Int) := 0
+            for i in [1, 2, 3]:
+                bump(acc, i)
+
+            acc
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// Sibling blocks do not see each other's aliases: the `if` branch's declaration
+/// is restored away before the `else` branch is lowered.
+#[test]
+fn an_if_branch_alias_does_not_escape_to_its_sibling() {
+    check_compile_error(
+        indoc! {r#"
+            x = 1
+
+            if x > 0:
+                B = Int
+                y: B = 1
+                y
+            else:
+                z: B = 2
+                z
+        "#},
+        "unknown type annotation: B",
+    );
+}
+
 /// A `with begin():` body is a block too, so an alias statement is one of its
 /// statements and leaves the transaction unchanged. The block admits no annotated
 /// local binding, so nothing inside it yet reads the name.
