@@ -14,8 +14,8 @@ use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    AggregateKind, BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type,
-    TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
+    AggregateKind, BaseType, Branch, Expr, LookupForm, Name, ProjKey, Refinement, TransactKey,
+    Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -903,26 +903,24 @@ pub(super) fn emit_apply<C: Typing>(
     argument: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // The **checked** lookup `c[k]?`, intercepted rather than given a scheme. A scheme
+    // A **keyed access** `c[k]` or `c[k]?`, intercepted rather than given a scheme. A scheme
     // would have to name the key type, and only a `SubtypesOf(𝐾)` kind states one — so it
     // would read `(Σ (σ : SubtypesOf(𝑘)). σ ⤇ 𝑣, 𝑘) ⇒ Option(𝑣)` and every concrete
     // collection would need an entry term first, which is a term only a typed pass can
     // decide to insert. The rule states the same relation directly instead.
-    if matches!(
-        &function.node,
-        TypedExprNode::Builtin(crate::ccl::Builtin::LookupChecked)
-    ) {
+    if let Some(form) = lookup_form(function) {
+        let op = form.what();
         // The argument is the `(collection, key)` pair lowering built, so emitting it
         // types both halves.
         let pair_ty = ctx.subexpr(argument)?;
         let Type::Tuple(elts) = &pair_ty else {
             return Err(ctx.raise(InferError::Unsupported(format!(
-                "`lookup?` is applied to a `(collection, key)` pair, got `{pair_ty}`"
+                "the {op} is applied to a `(collection, key)` pair, got `{pair_ty}`"
             ))));
         };
         let [collection, key_ty] = elts.as_slice() else {
             return Err(ctx.raise(InferError::Unsupported(format!(
-                "`lookup?` takes exactly a collection and a key, got `{pair_ty}`"
+                "the {op} takes exactly a collection and a key, got `{pair_ty}`"
             ))));
         };
         let (collection, key_ty) = (read_through(collection), key_ty.clone());
@@ -933,16 +931,16 @@ pub(super) fn emit_apply<C: Typing>(
         // diagnosable shape failure like the two above rather than an impossibility.
         let TypedExprNode::Tuple(pair) = &argument.node else {
             return Err(ctx.raise(InferError::Unsupported(format!(
-                "`lookup?` needs its `(collection, key)` pair as a term, so that the key can \
+                "the {op} needs its `(collection, key)` pair as a term, so that the key can \
                  discharge a dependent codomain's binder; got `{}`",
                 symbolic(argument)
             ))));
         };
         let [_, key] = pair.as_slice() else {
-            unreachable!("`lookup?`'s argument typed as a two-element Tuple");
+            unreachable!("the {op}'s argument typed as a two-element Tuple");
         };
         let key = key.clone_preserving_ids();
-        return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
+        return emit_lookup(form, function, &collection, &key, &key_ty, ctx);
     }
     let raw_arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
@@ -1010,7 +1008,7 @@ pub(super) fn emit_apply<C: Typing>(
 
 /// The value type `𝑚[𝑘]` reads, with the key related to the collection's keys.
 ///
-/// One shape at both uses. A read ([`emit_lookup_checked`]) wraps it in `Option`; a write
+/// One shape at both uses. A read ([`emit_lookup`]) presents it as its form says; a write
 /// ([`emit_keyed_write`]) requires the written value against it. That is what makes
 /// `m[k] := v` and `m[k]?` agree about what `m[k]` is, rather than two rules kept in step
 /// by hand.
@@ -1044,12 +1042,26 @@ fn keyed_access_value<C: Typing>(
     Ok(value)
 }
 
-/// Type the **checked** lookup `(𝑐, 𝑘) ▷ lookup?`: the codomain `𝑐[𝑘]` names, wrapped in
-/// `Option`.
-///
-/// The key is related to the collection's keys and nothing is applied at it
-/// ([`keyed_access_value`]); presence is what the operator decides at runtime.
-fn emit_lookup_checked<C: Typing>(
+/// The lookup `function` is, or `None` where it is any other function.
+fn lookup_form(function: &Expr) -> Option<LookupForm> {
+    match &function.node {
+        TypedExprNode::Builtin(b) => b.lookup_form(),
+        _ => None,
+    }
+}
+
+/// The answer `form` presents for a key whose value is `at_key`.
+fn lookup_answer(form: LookupForm, at_key: Type) -> Type {
+    match form {
+        LookupForm::Proven => at_key,
+        LookupForm::Checked => Type::option_of(at_key),
+    }
+}
+
+/// Type a keyed access `(𝑐, 𝑘) ▷ lookup` or `(𝑐, 𝑘) ▷ lookup?`: the codomain `𝑐[𝑘]` names,
+/// presented as `form` says.
+fn emit_lookup<C: Typing>(
+    form: LookupForm,
     function: &mut Expr,
     collection: &Type,
     key: &Expr,
@@ -1057,17 +1069,17 @@ fn emit_lookup_checked<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (keys, binder, codomain) = keyed_access_types(collection)
-        .ok_or_else(|| not_a_keyed_access(collection, "checked lookup `c[k]?`"))
+        .ok_or_else(|| not_a_keyed_access(collection, form.what()))
         .map_err(|e| ctx.raise(e))?;
-    let value = ctx.keyed_value_at(&codomain, binder.as_ref(), key, &function.ty);
+    let value = ctx.keyed_value_at(form, &codomain, binder.as_ref(), key, &function.ty);
     let at_key = keyed_access_value(
         &keys,
         value,
         key_ty,
-        &|| "checked lookup key".to_string(),
+        &|| format!("{} key", form.what()),
         ctx,
     )?;
-    let result = Type::option_of(at_key);
+    let result = lookup_answer(form, at_key);
     // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
     // passes read a consistent type off the node. The domain is the pair the operator is
     // applied to, which is what op-conversion reads to size its output.
