@@ -1495,11 +1495,14 @@ pub(super) fn lower_type_expr(
             lower_type_expr(domain, ctx)?,
             lower_type_expr(codomain, ctx)?,
         )),
-        // A parenthesised comma list `(T, U)` is a *term* product; the tuple
-        // *type* is written with braces `{T, U}` (`docs/chl-spec.md`).
+        // A parenthesised comma list `(T, U)` is a *term* product; the tuple *type* is
+        // written with braces `{T, U}` (`docs/chl-spec.md`). `->` builds the same node, so
+        // a function type written with the wrong arrow arrives here too and the message
+        // names both — nothing below the parser tells `1 -> 2` from `(1, 2)`.
         ChlExpr::Tuple(_) => Err(LoweringError::unsupported(
             annotation.span,
-            "a tuple type is written with braces: `{T, U}`",
+            "a tuple type is written with braces: `{T, U}`, and a function type with \
+             `=>`: `T => U`. `->` pairs two *terms*, so it builds a tuple here",
         )),
         // A comparison in type position is a refinement's predicate written
         // without its braces. `Int | _ >= 0` parses this way rather than as a

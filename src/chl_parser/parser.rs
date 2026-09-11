@@ -145,23 +145,10 @@ type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 
 /// The full CHL expression grammar.
 ///
-/// Precedence (lowest → highest):
-/// 1. `lambda`, `yield`
-/// 2. `x << y` (feed)
-/// 3. `then if cond else else_` (ternary)
-/// 4. `or`
-/// 5. `and`
-/// 6. `not`
-/// 7. comparison chain (`==`, `!=`, `<`, `<=`, `>`, `>=`)
-/// 8. `|`
-/// 9. `^`
-/// 10. `&`
-/// 11. `++`
-/// 12. `+`, `-`
-/// 13. `*`, `//`
-/// 14. unary `-`
-/// 15. postfix: call `f(...)`, subscript `x[...]`, attribute `x.name` / `x.0`
-/// 16. atom: literal, name, parenthesised, list, record, brace type, comprehension
+/// The precedence ladder is `docs/chl-spec.md`, "2.3 Expression precedence", and the
+/// combinators below are that table read bottom-up — each level built from the one tighter
+/// than it. Stated there and not restated here: a third copy of one ladder is a third thing
+/// to renumber, and the one nearest the code is the one a reader trusts.
 fn expression<'src, I>() -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
@@ -907,32 +894,61 @@ where
             .boxed();
 
         // ---- Ternary `then if cond else else_` ----------------------
-        let ternary = bool_or
+        // The else-branch is a **ternary**, not the whole expression: that is what chains
+        // (`a if c else b if d else e`, right-associative) while leaving anything looser to
+        // the levels above. Recursing into `expr` here instead put `pair` inside the else,
+        // so `k if hot else base -> price` read as a conditional between a scalar and a
+        // pair rather than as the entry whose key is the conditional — the grouping
+        // `docs/chl-spec.md`, "2.3 Expression precedence" states.
+        let ternary = recursive(|ternary| {
+            bool_or
+                .clone()
+                .then(
+                    just(Token::If)
+                        .ignore_then(bool_or.clone())
+                        .then_ignore(just(Token::Else))
+                        .then(ternary)
+                        .or_not(),
+                )
+                .map_with(|(then_expr, tail), e| match tail {
+                    None => then_expr,
+                    Some((cond, else_expr)) => Spanned::new(
+                        e.span(),
+                        Expr::IfExp {
+                            cond: Box::new(cond),
+                            then_expr: Box::new(then_expr),
+                            else_expr: Box::new(else_expr),
+                        },
+                    ),
+                })
+        })
+        .boxed();
+
+        // ---- Pair `k -> v` (single, not chainable) ------------------
+        //
+        // `a -> b` is the two-tuple `(a, b)` (`docs/chl-spec.md`, "2.4 Atoms"), so
+        // it builds the same `Expr::Tuple` the parenthesised spelling does and
+        // nothing below the parser tells the two apart: a map literal is an
+        // ordinary list of pairs, and `for k -> v in m` an ordinary tuple target.
+        //
+        // It binds tighter than `<<`, so `m << k -> v` feeds the entry `(k, v)`,
+        // and looser than the ternary, so `k -> v if c else w` pairs `k` with the
+        // whole conditional. Neither operand reaches the lambda level, so a lambda
+        // on either side takes parentheses. Not chainable, like `feed`: nothing
+        // associates a third component, so `a -> b -> c` is a parse error.
+        let pair = ternary
             .clone()
-            .then(
-                just(Token::If)
-                    .ignore_then(bool_or.clone())
-                    .then_ignore(just(Token::Else))
-                    .then(expr.clone())
-                    .or_not(),
-            )
-            .map_with(|(then_expr, tail), e| match tail {
-                None => then_expr,
-                Some((cond, else_expr)) => Spanned::new(
-                    e.span(),
-                    Expr::IfExp {
-                        cond: Box::new(cond),
-                        then_expr: Box::new(then_expr),
-                        else_expr: Box::new(else_expr),
-                    },
-                ),
+            .then(just(Token::Arrow).ignore_then(ternary.clone()).or_not())
+            .map_with(|(key, value), e| match value {
+                None => key,
+                Some(value) => Spanned::new(e.span(), Expr::Tuple(vec![key, value])),
             })
             .boxed();
 
         // ---- Feed `x << y` (single, not chainable) -----------------
-        let feed = ternary
+        let feed = pair
             .clone()
-            .then(just(Token::LShift).ignore_then(ternary.clone()).or_not())
+            .then(just(Token::LShift).ignore_then(pair.clone()).or_not())
             .map_with(|(lhs, rhs), e| match rhs {
                 None => lhs,
                 Some(value) => Spanned::new(
@@ -1662,6 +1678,46 @@ mod tests {
             .unwrap_or_else(|errs| panic!("parse errors: {errs:#?}"))
     }
 
+    /// A ternary on the **key** side of a pair is the key.
+    ///
+    /// `->` is looser than the ternary at both operands, so the conditional completes and
+    /// the arrow pairs it. An else-branch reaching the whole expression put the arrow inside
+    /// the conditional instead, reading `k if hot else base -> price` as a branch between a
+    /// scalar and a pair — two shapes no conditional relates.
+    #[test]
+    fn a_ternary_on_the_key_side_is_the_key() {
+        let Expr::List(items) = parse_e("[k if hot else base -> price]").node else {
+            panic!("expected a list")
+        };
+        let Expr::Tuple(parts) = &items[0].node else {
+            panic!("the element is the entry pair, got {:?}", items[0].node)
+        };
+        assert!(
+            matches!(parts[0].node, Expr::IfExp { .. }),
+            "the key is the whole conditional, got {:?}",
+            parts[0].node
+        );
+        assert!(
+            matches!(&parts[1].node, Expr::Name(n) if n.as_str() == "price"),
+            "and the value is what follows the arrow, got {:?}",
+            parts[1].node
+        );
+    }
+
+    /// The ternary still chains to the right, which is what the else-branch recursing into
+    /// itself buys: `a if c else b if d else e` is `a if c else (b if d else e)`.
+    #[test]
+    fn a_ternary_chains_to_the_right() {
+        let Expr::IfExp { else_expr, .. } = parse_e("a if c else b if d else e").node else {
+            panic!("expected a conditional")
+        };
+        assert!(
+            matches!(else_expr.node, Expr::IfExp { .. }),
+            "the else-branch is the nested conditional, got {:?}",
+            else_expr.node
+        );
+    }
+
     fn parse_m(src: &str) -> Module {
         parse_module(src)
             .into_result()
@@ -1964,6 +2020,125 @@ mod tests {
     fn feed_expression() {
         let e = parse_e("x << 1").node;
         assert!(matches!(e, Expr::Feed { .. }));
+    }
+
+    /// `a -> b` is the two-tuple `(a, b)`, so it parses to the node the
+    /// parenthesised spelling builds.
+    #[test]
+    fn pair_arrow_is_a_two_tuple() {
+        let Expr::Tuple(elts) = parse_e("1 -> 2").node else {
+            panic!("expected a Tuple");
+        };
+        let [key, value] = elts.as_slice() else {
+            panic!("expected two components");
+        };
+        assert_eq!(key.node, Expr::Lit(Lit::Int(1)));
+        assert_eq!(value.node, Expr::Lit(Lit::Int(2)));
+    }
+
+    /// Both operands take a whole operator expression, so neither half of a
+    /// pair needs parentheses.
+    #[test]
+    fn pair_arrow_binds_looser_than_the_operators() {
+        let Expr::Tuple(elts) = parse_e("1 + 1 -> 2 * 3").node else {
+            panic!("expected a Tuple");
+        };
+        let [key, value] = elts.as_slice() else {
+            panic!("expected two components");
+        };
+        assert!(matches!(key.node, Expr::BinOp { op: BinOp::Add, .. }));
+        assert!(matches!(value.node, Expr::BinOp { op: BinOp::Mul, .. }));
+    }
+
+    /// The pair is a value and `<<` an effect on one, so `m << k -> v` feeds
+    /// the entry rather than pairing the feed with `v`.
+    #[test]
+    fn a_feed_takes_a_whole_pair_as_its_value() {
+        let Expr::Feed { target, value } = parse_e("m << k -> v").node else {
+            panic!("expected a Feed");
+        };
+        assert_eq!(target.node, Expr::Name("m".into()));
+        assert!(matches!(value.node, Expr::Tuple(ref kv) if kv.len() == 2));
+    }
+
+    /// The ternary binds tighter, so a conditional value is the pair's second
+    /// component rather than the pair being the conditional's first branch.
+    #[test]
+    fn a_pair_value_may_be_a_ternary() {
+        let Expr::Tuple(elts) = parse_e("k -> v if c else w").node else {
+            panic!("expected a Tuple");
+        };
+        assert!(matches!(elts[1].node, Expr::IfExp { .. }));
+    }
+
+    /// The pair carries two components and nothing associates a third, so
+    /// `a -> b -> c` is rejected rather than nested.
+    #[test]
+    fn pair_arrow_does_not_chain() {
+        assert!(parse_expression("1 -> 2 -> 3").into_result().is_err());
+    }
+
+    /// The first `->` closes the binder list and the rest is the body
+    /// (`docs/chl-spec.md`, "3.10 Lambda").
+    #[test]
+    fn a_lambda_body_can_be_a_pair() {
+        let Expr::Lambda { params, body } = parse_e("\\x -> x -> 1").node else {
+            panic!("expected a Lambda");
+        };
+        assert_eq!(params.len(), 1);
+        assert!(matches!(body.node, Expr::Tuple(ref elts) if elts.len() == 2));
+    }
+
+    /// A map literal is an ordinary list whose elements are pairs
+    /// (`docs/chl-spec.md`, "3.11 List, tuple, record literals").
+    #[test]
+    fn a_map_literal_is_a_list_of_pairs() {
+        let Expr::List(elts) = parse_e("[1 -> 10, 2 -> 20]").node else {
+            panic!("expected a List");
+        };
+        assert_eq!(elts.len(), 2);
+        for elt in &elts {
+            assert!(matches!(elt.node, Expr::Tuple(ref kv) if kv.len() == 2));
+        }
+    }
+
+    /// A map comprehension is an ordinary comprehension whose element is a
+    /// pair (`docs/chl-spec.md`, "3.12 Comprehensions").
+    #[test]
+    fn a_map_comprehension_is_a_comprehension_of_pairs() {
+        let Expr::ListComp(comp) = parse_e("[k -> k * 10 for k in ks]").node else {
+            panic!("expected a ListComp");
+        };
+        assert!(matches!(comp.element.node, Expr::Tuple(ref kv) if kv.len() == 2));
+        assert_eq!(comp.clauses.len(), 1);
+    }
+
+    /// A `for` binder reads the pair as the tuple target it is, so entry
+    /// iteration needs no target form of its own.
+    #[test]
+    fn a_pair_arrow_binds_a_for_target() {
+        let m = parse_m(indoc! {r#"
+            for k -> v in m:
+                k
+        "#});
+        let Stmt::For { target, .. } = &m.body[0].node else {
+            panic!("expected a For");
+        };
+        let AssignTarget::Tuple(parts) = &target.node else {
+            panic!("expected a tuple target, got {:?}", target.node);
+        };
+        let bound: Vec<&str> = parts
+            .iter()
+            .map(|p| match &p.node {
+                AssignTarget::Name(n) => n.as_str(),
+                other => panic!("expected a name target, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            bound,
+            ["k", "v"],
+            "the key binds first and the value second, which only the order pins"
+        );
     }
 
     #[test]
