@@ -26,6 +26,60 @@ pub enum ArithmeticKind {
     Sub,
     Mul,
     FloorDiv,
+    Pow,
+}
+
+/// Integer exponentiation, the scalar behind [`ArithmeticKind::Pow`].
+///
+/// A separate trait because `**` has no `*Assign` operator to bound
+/// [`zip_arithmetic`]'s element type by, and because the two element types
+/// differ on negative exponents: `usize` has none, and `i64`'s take the
+/// reciprocal.
+trait IntPow: Copy + MulAssign {
+    /// The multiplicative identity, which seeds [`Self::raised`] and is what
+    /// `a ** 0` yields for every `a`.
+    const ONE: Self;
+
+    /// `self` raised to a non-negative `exponent`, by squaring, so the cost is
+    /// logarithmic in `exponent` and overflow arrives through the same `*` that
+    /// [`ArithmeticKind::Mul`] uses.
+    fn raised(mut self, mut exponent: u64) -> Self {
+        let mut acc = Self::ONE;
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                acc *= self;
+            }
+            exponent >>= 1;
+            if exponent > 0 {
+                self *= self;
+            }
+        }
+        acc
+    }
+
+    fn int_pow(self, exponent: Self) -> Self;
+}
+
+impl IntPow for i64 {
+    const ONE: Self = 1;
+
+    fn int_pow(self, exponent: Self) -> Self {
+        // The exponent is non-negative: `**` states `{Int | __elem >= 0}` of it
+        // (`src/ccl/lower/exprs.rs`'s `pow_with_checked_exponent`), so a negative one is a
+        // type error and never arrives. That is what leaves this total — the reciprocal it
+        // used to compute divided by a magnitude that is zero for `0 ** -n`, and for a
+        // large `n` after `i64` overflow.
+        debug_assert!(exponent >= 0, "`**` states a non-negative exponent");
+        self.raised(exponent.unsigned_abs())
+    }
+}
+
+impl IntPow for usize {
+    const ONE: Self = 1;
+
+    fn int_pow(self, exponent: Self) -> Self {
+        self.raised(exponent as u64)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,7 +104,7 @@ pub enum LogicKind {
 
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
 // slows it down by ~15%
-fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssign<T>>(
+fn zip_arithmetic<T: IntPow + AddAssign<T> + SubAssign<T> + DivAssign<T>>(
     op: ArithmeticKind,
     mut l: Vec<T>,
     r: &[T],
@@ -70,6 +124,10 @@ fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssi
         ArithmeticKind::Sub => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a -= *b),
         ArithmeticKind::Mul => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a *= *b),
         ArithmeticKind::FloorDiv => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a /= *b),
+        ArithmeticKind::Pow => l
+            .iter_mut()
+            .zip(r.iter())
+            .for_each(|(a, b)| *a = a.int_pow(*b)),
     };
     l
 }
