@@ -379,6 +379,21 @@ common answer — which `higher_order_dependent_application_discharges_the_binde
 Forcing the discharge on both contributions before they meet is the prerequisite for letting
 the merge follow a chain.
 
+**The gated merge pays a doubling of its own.** The gate confines the merge to the entered
+position, and a structural child *is* an entered position — `compact_go` resets `parents` to
+`None` at every one — so the merge re-opens one nesting level down and the walk doubles per
+contravariant flip. Measured in debug, median of three runs at equal test counts: the whole
+of `tests/type_check.rs` goes from 0.83s to 1.29s, and `test_groupby_key_relation_is_per_occurrence`
+— `def by_key(c, f): groupby(c, f)` at two types, the same program as above — from 0.56s to
+0.94s. `tests/compilation_pipeline` is flat, its time being execution rather than inference.
+
+What is absent is a **result memo**. `CompactState` carries `in_process`, which prunes cycles
+and caches nothing — it is removed again as each variable's walk returns — so a position
+reached twice is compacted twice. A `(uid, pol)` key would not be a correct memo: a position's
+reading also depends on `subst_acc` and on the refinement scope `st.scope` holds, so two
+entries at one variable and polarity are not interchangeable. Hash consing the rendered
+contribution keys on what was produced instead, and sidesteps that.
+
 **Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
 
 **Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no*
