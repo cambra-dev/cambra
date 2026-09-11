@@ -191,6 +191,21 @@ impl ValueRecorder {
         slot.push_back(recording);
     }
 
+    /// Forget everything one producer recorded.
+    ///
+    /// Called by [`ProducerBase`](crate::interpreter::tile_operators::ProducerBase)'s
+    /// `Drop`, which is what makes a replaced version's recordings go at the
+    /// moment its producers do. `LiveProgram::reload` tears down exactly the
+    /// producers it could not keep, so a kept operator's producer is never
+    /// dropped and its series stays continuous across the swap.
+    ///
+    /// Nothing else may retire an entry: a producer that is still running and
+    /// whose recordings were dropped would read on the wire as a node that has
+    /// produced nothing, which is what an idle node looks like.
+    pub fn retire(&mut self, node_id: Option<NodeId>, producer_id: usize) {
+        self.by_producer.remove(&(node_id, producer_id));
+    }
+
     /// Every recording for one producer, oldest first.
     ///
     /// An iterator rather than a slice: the backing `VecDeque` wraps once it has
@@ -258,6 +273,14 @@ pub struct SourceWindow {
     pub rows: Vec<RecordedRow>,
     /// Keys the window held, of which `rows` is the last `rows.len()`.
     pub total: usize,
+    /// Retained keys below the first position a new producer would be offered.
+    ///
+    /// Zero for a source nothing has abandoned. After a reload it is the leading
+    /// run the retired version's producers left behind: still in the buffer,
+    /// and offered to nobody. Shipped beside `total` rather than trimmed out of
+    /// it, because both are true and they answer different questions — what the
+    /// source is holding, and what the running program will still be given.
+    pub abandoned: usize,
 }
 
 impl SourceWindow {
@@ -277,12 +300,20 @@ pub fn render_source_window(
     name: &str,
     keys: &ColumnValue,
     values: &ColumnValue,
+    offerable_from: usize,
     limit: usize,
 ) -> SourceWindow {
     let total = keys.len();
+    // The keys of a source tiled by arrival order *are* its positions, so the
+    // abandoned prefix is those below the first one still on offer.
+    let abandoned = match keys {
+        ColumnValue::UInts(ks) => ks.iter().filter(|k| **k < offerable_from).count(),
+        _ => 0,
+    };
     SourceWindow {
         node_id,
         name: name.to_string(),
+        abandoned,
         rows: tail(total, limit)
             .map(|i| RecordedRow {
                 key: Some(cell(keys, i)),
@@ -742,7 +773,7 @@ mod tests {
     fn a_source_window_renders_the_last_keys_and_counts_the_rest() {
         let keys = uints(&[2, 3, 4]);
         let values = strings(&["c", "d", "e"]);
-        let window = render_source_window(None, "stdin", &keys, &values, 2);
+        let window = render_source_window(None, "stdin", &keys, &values, 0, 2);
 
         assert_eq!(window.name, "stdin");
         assert_eq!(window.total, 3);
@@ -772,6 +803,7 @@ mod tests {
             "stdin",
             &ColumnValue::from_uints(Vec::new()),
             &strings(&[]),
+            0,
             8,
         );
         assert_eq!(window.total, 0);

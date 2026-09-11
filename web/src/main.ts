@@ -510,6 +510,15 @@ export function renderApp(
 export interface InjectedHost {
   /** The `/api/snapshot` payload, unvalidated. */
   snapshot?: unknown;
+  /**
+   * The payload for the version now running, asked for after a reload.
+   *
+   * A reload is a second compile, so `snapshot` above describes the version the
+   * page opened on and not the one that replaced it. An embedder that can reload
+   * — a WebAssembly host calling `Host::reload` — supplies this; one that cannot
+   * omits it and is never asked.
+   */
+  currentSnapshot?: () => unknown | Promise<unknown>;
   /** Where frames come from, in place of the websocket. */
   openLive?: () => FrameSource;
   /** Pane ids to open hidden, in place of whatever the reader last chose. */
@@ -524,9 +533,17 @@ declare global {
   }
 }
 
-/** The snapshot an embedder supplied, or the one the server has. */
-async function loadSnapshot(injected: InjectedHost | undefined): Promise<unknown> {
-  if (injected?.snapshot !== undefined) return injected.snapshot;
+/**
+ * The snapshot an embedder supplied, or the one the server has.
+ *
+ * `again` asks for the version now running rather than the one the page opened
+ * on, which is what a reload makes different. An embedder that supplied a
+ * constant `snapshot` and no `currentSnapshot` has no second answer to give, so
+ * the fetch below is the fallback for it too.
+ */
+async function loadSnapshot(injected: InjectedHost | undefined, again = false): Promise<unknown> {
+  if (again && injected?.currentSnapshot) return injected.currentSnapshot();
+  if (!again && injected?.snapshot !== undefined) return injected.snapshot;
   const resp = await fetch("/api/snapshot");
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
@@ -548,9 +565,34 @@ async function main(): Promise<void> {
     const live = new LiveStore();
     if (injected?.openLive) connectLive(live, injected.openLive);
     else connectLive(live);
-    renderApp(root, new Store(snap), live, {
+    const config = {
       hiddenPanes: injected?.hiddenPanes,
       pins: injected?.pins,
+    };
+    renderApp(root, new Store(snap), live, config);
+
+    // Follow a reload. A frame from a later generation describes a version this
+    // payload does not — a rebuilt operator answers to a new `NodeId` — so the
+    // panes are redrawn against the program now running rather than left
+    // describing one that is gone.
+    //
+    // The pins survive because they are source positions rather than ids:
+    // `applyPins` re-resolves them against the new program, and one naming a
+    // construct this version dropped is simply not pinned.
+    let drawn = snap.meta.generation;
+    live.subscribe((state) => {
+      if (state.generation <= drawn) return;
+      drawn = state.generation;
+      void (async () => {
+        try {
+          renderApp(root, new Store(validateSnapshot(await loadSnapshot(injected, true))), live, config);
+        } catch (e) {
+          // The frames keep arriving and the panes keep describing the previous
+          // version, which is wrong but legible; replacing the whole view with a
+          // fatal would throw away a working session over one failed fetch.
+          console.error("live: could not follow the reload", e);
+        }
+      })();
     });
   } catch (e) {
     root.replaceChildren(el("div", "fatal", `Failed to load the snapshot: ${String(e)}`));

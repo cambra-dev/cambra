@@ -574,6 +574,22 @@ pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
     });
 }
 
+/// Every registered source's node, by the name it was registered under.
+///
+/// Re-derived per version rather than cached across one: [`materialize_sources`]
+/// mints these with `NodeId::fresh()` on every compile, so a map built from the
+/// first version names nodes a reloaded one does not have.
+pub fn source_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, NodeId> {
+    graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            GraphNode::Source { id, name } => Some((name.clone(), *id)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Note that the expression `expr` reads the source registered under `name`.
 ///
 /// The node itself is minted later, by [`materialize_sources`]: its row names

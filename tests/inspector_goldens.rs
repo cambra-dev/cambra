@@ -898,7 +898,7 @@ fn ids_are_the_only_difference_between_two_compiles() {
             let compiled =
                 compile_program(&mut ctx, &source, consumer).expect("a corpus program compiles");
             let mut v: Value =
-                serde_json::from_str(&cambra::inspector_server::snapshot_json(&compiled, name))
+                serde_json::from_str(&cambra::inspector_server::snapshot_json(&compiled, name, 0))
                     .expect("the payload is valid JSON");
             canonicalize_ids(&mut v);
             v

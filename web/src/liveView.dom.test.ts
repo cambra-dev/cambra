@@ -21,6 +21,7 @@ function nextFrame(): Promise<void> {
 function frame(overrides: Partial<LiveFrame> = {}): LiveFrame {
   return {
     tick: 3,
+    generation: 0,
     published: 3,
     final: false,
     nodes: [

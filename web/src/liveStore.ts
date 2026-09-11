@@ -65,7 +65,15 @@ export interface LiveTag {
 /** The cache and the tags, as one value a view can render from. */
 export interface LiveState {
   status: LiveStatus;
-  /** Latest rows per operator node. Bounded by the operator count, and does not grow over time. */
+  /**
+   * Latest rows per operator node. Bounded by the operator count.
+   *
+   * Does not grow over time *within a version*: the backend retires a producer's
+   * recordings when the producer is dropped, so a replaced version's operators
+   * stop appearing in frames. They would still linger here, because a node
+   * absent from a frame keeps its entry — so a generation change clears the map
+   * rather than merging two versions' operators into one.
+   */
   nodes: Map<number, LiveEntry>;
   /** Latest retained window per source, by its graph node id. */
   sources: Map<number, LiveSource>;
@@ -73,6 +81,8 @@ export interface LiveState {
   tags: readonly LiveTag[];
   /** The newest tick seen, against which an entry's own tick reads as staleness. */
   tick: number;
+  /** Which version the cached entries came from, so a swap can be noticed. */
+  generation: number;
 }
 
 /** The operators the shown tags between them ask for. */
@@ -103,11 +113,16 @@ type Listener = (state: LiveState) => void;
  * from.
  */
 export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
-  const nodes = new Map(state.nodes);
+  // A reload re-mints the ids of every operator it could not keep, so entries
+  // from the version before it name nodes the new payload does not have. They
+  // are dropped rather than aged out: a stale entry under a *reused* id would
+  // read as this version's value, which is worse than an absent one.
+  const swapped = frame.generation !== state.generation;
+  const nodes = swapped ? new Map<number, LiveEntry>() : new Map(state.nodes);
   for (const node of frame.nodes) {
     nodes.set(node.nodeId, { tick: frame.tick, producers: node.producers });
   }
-  const sources = new Map(state.sources);
+  const sources = swapped ? new Map<number, LiveSource>() : new Map(state.sources);
   for (const source of frame.sources) {
     if (source.nodeId !== null) sources.set(source.nodeId, source);
   }
@@ -115,6 +130,7 @@ export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
     ...state,
     nodes,
     sources,
+    generation: frame.generation,
     tick: frame.tick,
     status: frame.final
       ? { kind: "finished", tick: frame.tick }
@@ -136,6 +152,7 @@ export class LiveStore {
     sources: new Map(),
     tags: [],
     tick: 0,
+    generation: 0,
   };
   private readonly listeners = new Set<Listener>();
 

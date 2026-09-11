@@ -35,6 +35,7 @@
 //! type-checks — the frontend never has to branch its initial fetch on compile
 //! success.
 
+use std::sync::{Arc, RwLock};
 use std::{io, thread};
 
 use crate::ccl::channels::ChannelDecl;
@@ -80,7 +81,7 @@ fn build_bodies(code: &str, name: &str, channels: &[ChannelDecl]) -> Bodies {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
         Ok(compiled) => Bodies {
-            snapshot: snapshot_json(&compiled, name),
+            snapshot: snapshot_json(&compiled, name, 0),
             diagnostics: diagnostics_body(&[]),
         },
         Err(errors) => {
@@ -132,7 +133,7 @@ pub fn snapshot_body_pretty(code: &str, name: &str, channels: &[ChannelDecl]) ->
     }
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
-        Ok(compiled) => snapshot_json_pretty(&compiled, name),
+        Ok(compiled) => snapshot_json_pretty(&compiled, name, 0),
         Err(errors) => serde_json::to_string_pretty(&InspectorPayload::degraded(
             name,
             code,
@@ -174,7 +175,10 @@ pub fn serve(code: &str, name: &str, port: u16, channels: &[ChannelDecl]) -> io:
     // Started even without a program running: the route completes its handshake
     // and sends nothing, because nothing publishes until a run does.
     let live = LiveServer::start();
-    serve_bodies(build_bodies(code, name, channels), name, port, &live)
+    // Nothing reloads a program that is not running, so this payload is never
+    // replaced — it is wrapped only because the server answers through one type.
+    let bodies = ServedPayload(Arc::new(RwLock::new(build_bodies(code, name, channels))));
+    serve_bodies(&bodies, name, port, &live)
 }
 
 /// Serve an already-compiled program on a background thread, and return the
@@ -192,27 +196,55 @@ pub fn serve_compiled(
     compiled: &CompiledProgram,
     name: &str,
     port: u16,
-) -> io::Result<LiveChannel> {
+) -> io::Result<(LiveChannel, ServedPayload)> {
     let live = LiveServer::start();
     let channel = live.channel();
-    let bodies = Bodies {
-        snapshot: snapshot_json(compiled, name),
+    let payload = ServedPayload(Arc::new(RwLock::new(Bodies {
+        snapshot: snapshot_json(compiled, name, 0),
         diagnostics: diagnostics_body(&[]),
-    };
+    })));
+    let served = payload.clone();
     let owned_name = name.to_string();
     thread::Builder::new()
         .name("cambra-inspector".to_string())
         .spawn(move || {
-            if let Err(e) = serve_bodies(bodies, &owned_name, port, &live) {
+            if let Err(e) = serve_bodies(&served, &owned_name, port, &live) {
                 eprintln!("cambra: the inspector server stopped: {e}");
             }
         })
         .map_err(io::Error::other)?;
-    Ok(channel)
+    Ok((channel, payload))
 }
 
-/// Answer requests against pre-rendered bodies until the process is killed.
-fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io::Result<()> {
+/// The bodies the inspector is serving, which a reload replaces.
+///
+/// Shared with the server thread rather than moved into it: a reload is a second
+/// compile, and the payload rendered from the first names nodes the running
+/// graph no longer has. The driver installs the running version's through
+/// [`replace`](Self::replace); until it does, a reader is holding a description
+/// of a program that is no longer there.
+#[derive(Clone)]
+pub struct ServedPayload(Arc<RwLock<Bodies>>);
+
+impl ServedPayload {
+    /// Serve `snapshot` from now on.
+    ///
+    /// Called after an accepted reload, with the payload rendered from the
+    /// version that reload installed. A request in flight holds a read guard, so
+    /// it finishes against the payload it started on rather than seeing half of
+    /// each.
+    pub fn replace(&self, snapshot: String) {
+        self.0.write().expect("inspector bodies lock").snapshot = snapshot;
+    }
+}
+
+/// Answer requests against the rendered bodies until the process is killed.
+fn serve_bodies(
+    bodies: &ServedPayload,
+    name: &str,
+    port: u16,
+    live: &LiveServer,
+) -> io::Result<()> {
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Names the scheme and says where to look: `https://` to a plain-HTTP port
@@ -228,12 +260,15 @@ fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io:
             }
             continue;
         }
-        // `bodies` and `INDEX_HTML` both outlive the loop, so a response
-        // borrows: the snapshot is megabytes on a large program and the bundle
-        // is a quarter of one, and every request would otherwise copy it.
+        // The guard is held for the whole response rather than copied out of:
+        // the snapshot is megabytes on a large program and the bundle a quarter
+        // of one, and every request would otherwise copy it. A reload takes the
+        // write side, which is one acquisition per swap against a read per
+        // request.
+        let served = bodies.0.read().expect("inspector bodies lock");
         let (body, status, header) = match request.url() {
-            "/api/snapshot" => (bodies.snapshot.as_bytes(), 200, json_header()),
-            "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
+            "/api/snapshot" => (served.snapshot.as_bytes(), 200, json_header()),
+            "/api/diagnostics" => (served.diagnostics.as_bytes(), 200, json_header()),
             "/" | "/index.html" => (INDEX_HTML.as_bytes(), 200, html_header()),
             _ => (NOT_FOUND, 404, text_header()),
         };

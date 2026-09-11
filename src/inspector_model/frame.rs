@@ -24,6 +24,7 @@ pub fn render_frame(
     recorder: &SharedRecorder,
     sources: &[SourceWindow],
     tick: u64,
+    generation: u64,
     published: u64,
     final_frame: bool,
 ) -> String {
@@ -71,12 +72,17 @@ pub fn render_frame(
                 "name": window.name,
                 "total": window.total,
                 "dropped": window.dropped(),
+                "abandoned": window.abandoned,
                 "rows": window.rows.iter().map(row_json).collect::<Vec<_>>(),
             })
         })
         .collect();
     serde_json::json!({
         "tick": tick,
+        // Which version produced this. A client holding an older payload reads
+        // node ids that a rebuilt operator no longer answers to, so it refetches
+        // rather than drawing them against the wrong pane.
+        "generation": generation,
         "published": published,
         "final": final_frame,
         "nodes": nodes,

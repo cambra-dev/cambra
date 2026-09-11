@@ -28,7 +28,7 @@ mod serve;
 pub mod wire_check;
 
 pub use crate::inspector_model::{snapshot_json, snapshot_json_pretty};
-pub use serve::{serve, serve_compiled, snapshot_body_pretty};
+pub use serve::{ServedPayload, serve, serve_compiled, snapshot_body_pretty};
 
 #[cfg(test)]
 mod tests {
@@ -52,7 +52,7 @@ mod tests {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
-        serde_json::from_str(&snapshot_json(&compiled, name)).expect("payload is valid JSON")
+        serde_json::from_str(&snapshot_json(&compiled, name, 0)).expect("payload is valid JSON")
     }
 
     /// The structural wire-shape contract — the Rust twin of the
@@ -211,7 +211,7 @@ mod tests {
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
 
-        let json = snapshot_json(&compiled, "poly.chl");
+        let json = snapshot_json(&compiled, "poly.chl", 0);
         let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
 
         let pane_links = v["paneLinks"].as_array().expect("paneLinks is an array");
@@ -252,7 +252,7 @@ mod tests {
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
 
-        let json = snapshot_json(&compiled, "udf.chl");
+        let json = snapshot_json(&compiled, "udf.chl", 0);
         let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
 
         // The live node ids of a pane are its shipped node table, read directly.

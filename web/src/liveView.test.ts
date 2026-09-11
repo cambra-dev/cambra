@@ -28,6 +28,7 @@ function state(overrides: Partial<LiveState> = {}): LiveState {
     sources: new Map(),
     tags: [],
     tick: 5,
+    generation: 0,
     ...overrides,
   };
 }
@@ -37,6 +38,7 @@ const source: LiveSource = {
   name: "stdin",
   total: 2,
   dropped: 0,
+  abandoned: 0,
   rows: [
     { key: "u0", value: '"a"', deleted: false },
     { key: "u1", value: '"b"', deleted: false },

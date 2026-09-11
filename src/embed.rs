@@ -34,25 +34,12 @@ use crate::ccl::channels::{ChannelDecl, ChannelError, Channels};
 use crate::ccl::context::{CompileError, GlobalContext};
 use crate::ccl::provenance::NodeId;
 use crate::inspector_model::{render_frame, snapshot_json};
-use crate::interpreter::operator_graph::GraphNode;
+use crate::interpreter::operator_graph::source_nodes;
 use crate::interpreter::value_recorder::{
     DEFAULT_ROWS_PER_RECORDING, SourceWindow, ValueRecorder, render_source_window,
 };
 use crate::interpreter::{Consumer, Value};
 use crate::live_program::LiveProgram;
-
-/// Every registered source's graph node, by name, for the running version.
-fn source_nodes_of(live: &LiveProgram) -> HashMap<String, NodeId> {
-    live.program()
-        .operator_graph
-        .nodes()
-        .iter()
-        .filter_map(|node| match node {
-            GraphNode::Source { id, name } => Some((name.clone(), *id)),
-            _ => None,
-        })
-        .collect()
-}
 
 /// Why a program could not be embedded.
 #[derive(Debug)]
@@ -95,6 +82,10 @@ pub struct Host {
     ctx: GlobalContext,
     live: LiveProgram,
     channels: Channels,
+
+    /// Which version is running, counting from `0`. Shipped on the payload and
+    /// on every frame so a reader can tell the two apart across a reload.
+    generation: Cell<u64>,
 
     /// The `/api/snapshot` payload for the running version.
     ///
@@ -152,11 +143,12 @@ impl Host {
             LiveProgram::start(&mut ctx, code, &main_consumer)
                 .map_err(|errors| Box::new(EmbedError::Compile(errors)))?
         };
-        let snapshot = snapshot_json(live.program(), name);
-        let source_nodes = source_nodes_of(&live);
+        let snapshot = snapshot_json(live.program(), name, 0);
+        let source_nodes = source_nodes(&live.program().operator_graph);
         Ok(Self {
             ctx,
             live,
+            generation: Cell::new(0),
             channels,
             snapshot,
             recorder,
@@ -187,8 +179,9 @@ impl Host {
                 .reload(&mut self.ctx, code, &main_consumer)
                 .map_err(|errors| Box::new(EmbedError::Compile(errors)))?;
         }
-        self.snapshot = snapshot_json(self.live.program(), name);
-        self.source_nodes = source_nodes_of(&self.live);
+        self.generation.set(self.generation.get() + 1);
+        self.snapshot = snapshot_json(self.live.program(), name, self.generation.get());
+        self.source_nodes = source_nodes(&self.live.program().operator_graph);
         Ok(())
     }
 
@@ -278,6 +271,7 @@ impl Host {
             &self.recorder,
             &self.last_windows.borrow(),
             self.tick.get(),
+            self.generation.get(),
             self.published.get(),
             final_frame,
         )
@@ -302,6 +296,7 @@ impl Host {
                     name,
                     &keys,
                     &values,
+                    source.first_position_for_a_new_producer(),
                     DEFAULT_ROWS_PER_RECORDING,
                 ))
             })

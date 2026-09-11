@@ -460,6 +460,18 @@ pub struct Meta {
     /// a consumer rendering this as a header badge would show the reader a pane
     /// name where the kind belongs.
     pub payload_kind: String,
+    /// Which version of the running program this payload describes, counting
+    /// from `0` and incremented by each accepted reload.
+    ///
+    /// A client holds one payload and a stream of frames. Both carry this, which
+    /// is the only way it can tell a frame naming nodes it does not know from a
+    /// frame about the version it is holding: `NodeId`s come from a
+    /// process-global counter, so a reload's rebuilt operators are named
+    /// differently and its kept ones are named the same.
+    ///
+    /// `0` for a program that is compiled and not run — `--inspect-only` and
+    /// `--dump-snapshot` — which is every committed fixture.
+    pub generation: u64,
     /// The wire-format version. A client reads this to detect an incompatible
     /// payload before parsing the rest.
     ///
@@ -681,7 +693,7 @@ impl InspectedProgram<'_> {
     /// * `definitions` — [`InspectedProgram::definitions`](super::program::InspectedProgram).
     /// * `diagnostics` — empty.
     /// * `meta` — `payloadKind: "program"`, `schema:` [`SCHEMA_VERSION`].
-    pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
+    pub fn build_payload(&self, name: impl Into<String>, generation: u64) -> InspectorPayload {
         let source = SourceInfo {
             name: name.into(),
             text: self.source_text().to_string(),
@@ -755,6 +767,7 @@ impl InspectedProgram<'_> {
             diagnostics: Vec::new(),
             meta: Meta {
                 payload_kind: "program".to_string(),
+                generation,
                 schema: SCHEMA_VERSION,
             },
             panes,
@@ -795,6 +808,7 @@ impl InspectorPayload {
             diagnostics,
             meta: Meta {
                 payload_kind: "failed".to_string(),
+                generation: 0,
                 schema: SCHEMA_VERSION,
             },
             panes: Vec::new(),
@@ -940,7 +954,7 @@ mod tests {
     fn the_payload_ships_one_pane_entry_per_declared_pane_and_one_link_per_pair() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
 
             let ids: Vec<&str> = payload.panes.iter().map(|s| s.id).collect();
             let declared: Vec<&str> = PANES.iter().map(|p| p.name).collect();
@@ -989,7 +1003,7 @@ mod tests {
     fn every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             let ids: HashMap<&str, HashSet<u64>> =
                 payload.panes.iter().map(|s| (s.id, pane_ids(s))).collect();
 
@@ -1079,7 +1093,7 @@ mod tests {
         for code in corpus() {
             let prog = compile(code);
             let inspected = InspectedProgram::new(&prog);
-            let payload = inspected.build_payload("test");
+            let payload = inspected.build_payload("test", 0);
             for (wire_pane, pane) in payload.panes.iter().zip(inspected.panes()) {
                 assert_eq!(wire_pane.id, pane.id, "the panes line up");
 
@@ -1150,7 +1164,7 @@ mod tests {
             max(ys)
         "#};
         let prog = compile(code);
-        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test", 0);
         let pane = payload
             .panes
             .iter()
@@ -1211,7 +1225,7 @@ mod tests {
     fn every_child_id_resolves_in_its_own_table() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
                 for start in pane.root.iter() {
@@ -1283,7 +1297,7 @@ mod tests {
     fn a_pane_table_holds_each_node_exactly_once() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             // No id repeats, in a pane of either shape.
             for pane in &payload.panes {
                 let mut seen = HashSet::new();
@@ -1331,7 +1345,7 @@ mod tests {
     fn an_operator_node_carries_its_role_tiling_and_ordered_spans() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             let pane = payload
                 .panes
                 .last()
@@ -1368,7 +1382,7 @@ mod tests {
     fn no_node_repeats_a_span() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             for pane in &payload.panes {
                 for (_, label, spans) in node_rows(pane) {
                     let mut seen = HashSet::new();
@@ -1396,7 +1410,7 @@ mod tests {
     fn no_node_repeats_a_predicate_edge() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             for pane in &payload.panes {
                 // A predicate edge rides a type slot, which only a tree node has.
                 let Some(nodes) = pane.nodes.ir() else {
@@ -1425,7 +1439,7 @@ mod tests {
     #[test]
     fn a_payload_kind_is_never_a_pane_id() {
         let prog = compile(corpus()[0]);
-        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test", 0);
         assert_eq!(payload.meta.payload_kind, "program");
         let degraded = InspectorPayload::degraded("test", "x = 1", Vec::new());
         assert_eq!(degraded.meta.payload_kind, "failed");
@@ -1446,7 +1460,7 @@ mod tests {
         // from each node whose type slot holds it.
         let code = corpus()[0];
         let prog = compile(code);
-        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test", 0);
         let pane = payload
             .panes
             .iter()
@@ -1548,7 +1562,7 @@ mod tests {
     fn every_node_of_every_pane_carries_an_attribution() {
         for code in corpus() {
             let prog = compile(code);
-            let payload = InspectedProgram::new(&prog).build_payload("test");
+            let payload = InspectedProgram::new(&prog).build_payload("test", 0);
             for pane in &payload.panes {
                 let ids = pane_ids(pane);
                 let attributed: HashSet<u64> = node_rows(pane)
@@ -1809,7 +1823,7 @@ max(totals)
     #[test]
     fn generator_mapped_spans_resolve_to_expected_nodes() {
         let prog = compile(GENERATOR_SRC);
-        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test", 0);
         let at = |span| labels_at(&payload, "post-inference", span);
 
         // The `x * x` body → the arithmetic-mul BinOp (a mono clone of the
@@ -1857,7 +1871,7 @@ max(totals)
     #[test]
     fn defer_mapped_spans_resolve_to_expected_nodes() {
         let prog = compile(DEFER_SRC);
-        let payload = InspectedProgram::new(&prog).build_payload("test");
+        let payload = InspectedProgram::new(&prog).build_payload("test", 0);
         let at = |span| labels_at(&payload, "post-inference", span);
 
         let sum = at(nth_span(DEFER_SRC, "sum", 0));
@@ -1910,7 +1924,7 @@ max(totals)
             &prog.post_channelize_ir,
             panes.projection("post-channelize").clone(),
         )
-        .build_payload("test");
+        .build_payload("test", 0);
         let at = |span| labels_at(&payload, "post-channelize", span);
 
         // Copairing, not a disjoint join: the arms land on their coproduct, and

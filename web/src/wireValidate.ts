@@ -539,6 +539,7 @@ export function validateSnapshot(json: unknown): Snapshot {
   if (payloadKind !== "program" && payloadKind !== "failed") {
     throw new WireError("meta.payloadKind", "`program` or `failed`", payloadKind);
   }
+  num(meta.generation, "meta.generation");
   if (num(meta.schema, "meta.schema") !== SCHEMA_VERSION) {
     throw new WireError("meta.schema", `exactly ${SCHEMA_VERSION}`, meta.schema);
   }

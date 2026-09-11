@@ -75,9 +75,9 @@ pub use frame::render_frame;
 /// maps with non-string keys, no custom errors), so a failure is a bug; we
 /// surface it via `expect` rather than leaking a `serde_json::Error` into the
 /// signature the server wants.
-pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
+pub fn snapshot_json(compiled: &CompiledProgram, name: &str, generation: u64) -> String {
     let inspected = InspectedProgram::new(compiled);
-    let payload = inspected.build_payload(name);
+    let payload = inspected.build_payload(name, generation);
     serde_json::to_string(&payload).expect("snapshot payload serializes")
 }
 
@@ -89,9 +89,9 @@ pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
 /// Cargo.lock, not an external tool. Piping through `python3 -m json.tool` made
 /// the corpus a function of the local Python version, and of `FORCE_COLOR` —
 /// either silently rewrites every fixture and the gate reads it as drift.
-pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str) -> String {
+pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str, generation: u64) -> String {
     let inspected = InspectedProgram::new(compiled);
-    let payload = inspected.build_payload(name);
+    let payload = inspected.build_payload(name, generation);
     serde_json::to_string_pretty(&payload).expect("snapshot payload serializes")
 }
 

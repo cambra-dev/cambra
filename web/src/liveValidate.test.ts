@@ -26,10 +26,11 @@ function producer(overrides: Record<string, unknown> = {}) {
 function frame(overrides: Record<string, unknown> = {}) {
   return {
     tick: 1,
+    generation: 0,
     published: 1,
     final: false,
     nodes: [{ nodeId: 202, producers: [producer()] }],
-    sources: [{ nodeId: 208, name: "stdin", total: 1, dropped: 0, rows: [row("u0", '"a"')] }],
+    sources: [{ nodeId: 208, name: "stdin", total: 1, dropped: 0, abandoned: 0, rows: [row("u0", '"a"')] }],
     ...overrides,
   };
 }

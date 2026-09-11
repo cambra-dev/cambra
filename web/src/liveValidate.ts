@@ -139,6 +139,7 @@ function validateSource(v: unknown, path: string): LiveSource {
     name: str(o["name"], `${path}.name`),
     total,
     dropped,
+    abandoned: num(o["abandoned"], `${path}.abandoned`),
     rows: validateRows(o["rows"], `${path}.rows`, total, dropped),
   };
 }
@@ -164,6 +165,7 @@ export function validateLiveFrame(value: unknown): LiveFrame {
   }
   return {
     tick: num(o["tick"], "tick"),
+    generation: num(o["generation"], "generation"),
     published: num(o["published"], "published"),
     final: bool(o["final"], "final"),
     nodes,

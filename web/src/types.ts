@@ -162,6 +162,10 @@ export interface Meta {
   // Which payload this is: "program" for a successful compile, "failed" for the
   // degraded one. Never a pane id.
   payloadKind: string;
+  // Which version of the running program this payload describes, counting from
+  // `0`. A frame carrying a higher one describes a version this payload does not,
+  // which is the client's cue to refetch.
+  generation: number;
   schema: number;
 }
 
@@ -335,6 +339,11 @@ export interface LiveSource {
   name: string;
   total: number;
   dropped: number;
+  // Retained keys below the first position a new producer would be offered —
+  // after a reload, the run the replaced version's producers left behind. Held
+  // by the source and offered to nobody, so a reader can tell it from pending
+  // work rather than reading it as a backlog.
+  abandoned: number;
   rows: LiveRow[];
 }
 
@@ -342,6 +351,11 @@ export interface LiveFrame {
   // The driver tick this frame reports. Advances only over a tick that recorded
   // something, so it counts data rather than loop iterations.
   tick: number;
+  // Which version of the program produced this frame, counting from `0` and
+  // incremented by each accepted reload. A frame from a later generation than
+  // the snapshot in hand names nodes that snapshot does not have, because a
+  // reload re-mints the ids of every operator it could not keep.
+  generation: number;
   // Frames published so far, so a client can tell it is behind.
   published: number;
   // Whether the run is over and this frame is the last. A reader that never

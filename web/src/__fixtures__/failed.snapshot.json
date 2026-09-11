@@ -17,6 +17,7 @@
   ],
   "meta": {
     "payloadKind": "failed",
+    "generation": 0,
     "schema": 1
   },
   "panes": [],

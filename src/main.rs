@@ -1,4 +1,11 @@
-use std::{cell::RefCell, path::Path, rc::Rc, thread, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    path::Path,
+    rc::Rc,
+    thread,
+    time::Duration,
+};
 
 use cambra::{
     ccl::{
@@ -8,10 +15,11 @@ use cambra::{
     },
     control_port::{ControlPort, ControlReply, ControlRequest},
     host_driver::{self, StdinLines},
-    inspector_server::serve_compiled,
+    inspector_model::snapshot_json,
+    inspector_server::{ServedPayload, serve_compiled},
     interpreter::{
         Consumer, Scheduler,
-        operator_graph::GraphNode,
+        operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard},
         value_recorder::{
             self, DEFAULT_ROWS_PER_RECORDING, SharedRecorder, SourceWindow, ValueRecorder,
@@ -34,6 +42,7 @@ fn poll_control(
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
     new_data: &Rc<RefCell<bool>>,
     recorder: Option<&SharedRecorder>,
+    view: &InspectorView<'_>,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
@@ -61,6 +70,8 @@ fn poll_control(
                     // The new graph has subscribed but nothing has pulled it, so arm
                     // the driver for one pass.
                     *new_data.borrow_mut() = true;
+                    // The panes and the frames now describe this version.
+                    view.follow(live);
                     let ReuseTally { kept, bound } = report.reuse;
                     ControlReply::ok(format!(
                         "reloaded: {kept}/{bound} operators kept\n\n{}{}",
@@ -73,6 +84,42 @@ fn poll_control(
         }
     };
     message.answer(reply);
+}
+
+/// What the inspector says about the version now running.
+///
+/// Everything here is named by `NodeId`, and `NodeId`s come from a
+/// process-global counter — so a reload names its rebuilt operators differently
+/// and its kept ones the same. Each field is re-derived together by
+/// [`follow`](InspectorView::follow), because a payload describing one version
+/// beside frames describing another is the one state a reader cannot untangle.
+struct InspectorView<'a> {
+    /// The bodies being served, or `None` without `--inspect`.
+    payload: Option<&'a ServedPayload>,
+    /// Which version is running, counting from `0`.
+    generation: Cell<u64>,
+    /// Each registered source's graph node, re-minted by every compile.
+    source_node_ids: RefCell<HashMap<String, NodeId>>,
+    /// The program's name, for the payload it renders.
+    name: &'a str,
+}
+
+impl InspectorView<'_> {
+    /// Re-derive everything from the version `live` is now running.
+    ///
+    /// Called on an accepted reload and nowhere else: a rejected one leaves the
+    /// running program alone, so what the inspector says about it is still true.
+    fn follow(&self, live: &LiveProgram) {
+        self.generation.set(self.generation.get() + 1);
+        *self.source_node_ids.borrow_mut() = source_nodes(&live.program().operator_graph);
+        if let Some(payload) = self.payload {
+            payload.replace(snapshot_json(
+                live.program(),
+                self.name,
+                self.generation.get(),
+            ));
+        }
+    }
 }
 
 /// Runs a Cambra program from a source string.
@@ -130,15 +177,26 @@ fn run_program(
     // click in a pane names a node the running graph actually built.
     //
     // Named `frames` rather than `live`: `live` is the running program here.
-    let frames = match inspect_port {
+    let served = match inspect_port {
         Some(port) => match serve_compiled(live.program(), src_name, port) {
-            Ok(channel) => Some(channel),
+            Ok(pair) => Some(pair),
             Err(e) => {
                 eprintln!("error: serving the inspector: {e}");
                 return Err(());
             }
         },
         None => None,
+    };
+    let frames = served.as_ref().map(|(channel, _)| channel.clone());
+
+    // What the inspector says about the running version. Every part of it is
+    // named by `NodeId`, and a reload re-mints the ids of everything it could
+    // not keep, so all of it is re-derived when one is accepted.
+    let view = InspectorView {
+        payload: served.as_ref().map(|(_, payload)| payload),
+        generation: Cell::new(0),
+        source_node_ids: RefCell::new(source_nodes(&live.program().operator_graph)),
+        name: src_name,
     };
 
     let control = match control_port.map(ControlPort::new).transpose() {
@@ -167,7 +225,7 @@ fn run_program(
             return false;
         }
         published_through.set(recorded);
-        frames.publish(recorder, sources, tick);
+        frames.publish(recorder, sources, tick, view.generation.get());
         true
     };
 
@@ -175,7 +233,7 @@ fn run_program(
     // an idle one. The process parks afterwards, so the socket stays open.
     let finish = |tick: u64, sources: &[SourceWindow]| {
         if let (Some(frames), Some(recorder)) = (frames.as_ref(), recorder.as_ref()) {
-            frames.finish(recorder, sources, tick);
+            frames.finish(recorder, sources, tick, view.generation.get());
         }
     };
 
@@ -189,16 +247,6 @@ fn run_program(
     // context registers `stdin` whether or not the program mentions it, so
     // iterating the context's sources instead would report a window for a
     // source that is not part of the program.
-    let source_node_ids: std::collections::HashMap<String, NodeId> = live
-        .program()
-        .operator_graph
-        .nodes()
-        .iter()
-        .filter_map(|node| match node {
-            GraphNode::Source { id, name } => Some((name.clone(), *id)),
-            _ => None,
-        })
-        .collect();
     let sample_sources = |scheduler: &Scheduler| -> Vec<SourceWindow> {
         if frames.is_none() {
             return Vec::new();
@@ -210,10 +258,11 @@ fn run_program(
                 let keys = source.retained_keys()?;
                 let values = source.get(keys.clone());
                 Some(render_source_window(
-                    source_node_ids.get(name).copied(),
+                    view.source_node_ids.borrow().get(name).copied(),
                     name,
                     &keys,
                     &values,
+                    source.first_position_for_a_new_producer(),
                     DEFAULT_ROWS_PER_RECORDING,
                 ))
             })
@@ -236,6 +285,7 @@ fn run_program(
                 &main_consumer,
                 &new_data,
                 recorder.as_ref(),
+                &view,
             );
             if *new_data.borrow() {
                 break;
@@ -324,6 +374,7 @@ fn run_program(
                 &main_consumer,
                 &new_data,
                 recorder.as_ref(),
+                &view,
             );
             let produced_this_tick = match host_driver::write_sink_rows(&host_channels, &mut out) {
                 Ok(produced) => produced,

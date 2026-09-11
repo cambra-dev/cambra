@@ -343,6 +343,34 @@ impl ProducerBase {
     }
 }
 
+/// Retire this producer's recordings when it goes.
+///
+/// A replaced version's producers are dropped by `LiveProgram::reload`'s
+/// teardown, so this is what makes its recordings go with them — precisely, and
+/// without asking the recorder to guess which entries are still live. An
+/// operator the reload kept is not rebuilt, so its producer is not dropped and
+/// its recorded series continues across the swap.
+impl Drop for ProducerBase {
+    fn drop(&mut self) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        // Nothing drops a producer while the recorder is borrowed: `record`
+        // holds a mutable borrow only for the call, and `render_frame` holds a
+        // shared one while it iterates, building no producers and dropping none.
+        // A failure here is that invariant breaking rather than a case to
+        // handle, and a panicking `Drop` would abort the process.
+        match recorder.try_borrow_mut() {
+            Ok(mut recorder) => recorder.retire(self.node_id, self.id),
+            Err(_) => debug_assert!(
+                false,
+                "a producer was dropped while the recorder was borrowed, so its \
+                 recordings outlive it",
+            ),
+        }
+    }
+}
+
 /// Implement [`TileProducer::base`] and [`TileProducer::base_mut`] for a concrete
 /// producer struct that stores its shared state in a field named `base: ProducerBase`.
 ///

@@ -64,8 +64,14 @@ impl LiveChannel {
     /// Called from the driver's per-tick hook, which sits between the pull and
     /// the release, so a source's retained window is sampled before anything is
     /// dropped from it.
-    pub fn publish(&self, recorder: &SharedRecorder, sources: &[SourceWindow], tick: u64) {
-        self.send(recorder, sources, tick, false);
+    pub fn publish(
+        &self,
+        recorder: &SharedRecorder,
+        sources: &[SourceWindow],
+        tick: u64,
+        generation: u64,
+    ) {
+        self.send(recorder, sources, tick, generation, false);
     }
 
     /// Publish a last frame, marked `final`, and stop.
@@ -74,8 +80,14 @@ impl LiveChannel {
     /// idle: the process parks after the run so the socket stays open and
     /// simply goes quiet. A reader cannot infer "nothing more will ever arrive"
     /// from silence, so the run says so.
-    pub fn finish(&self, recorder: &SharedRecorder, sources: &[SourceWindow], tick: u64) {
-        self.send(recorder, sources, tick, true);
+    pub fn finish(
+        &self,
+        recorder: &SharedRecorder,
+        sources: &[SourceWindow],
+        tick: u64,
+        generation: u64,
+    ) {
+        self.send(recorder, sources, tick, generation, true);
     }
 
     fn send(
@@ -83,10 +95,11 @@ impl LiveChannel {
         recorder: &SharedRecorder,
         sources: &[SourceWindow],
         tick: u64,
+        generation: u64,
         final_frame: bool,
     ) {
         let published = self.latest.published.fetch_add(1, Ordering::Release) + 1;
-        let frame = render_frame(recorder, sources, tick, published, final_frame);
+        let frame = render_frame(recorder, sources, tick, generation, published, final_frame);
         *self.latest.frame.lock().expect("live frame lock") = Some(frame);
         // A full channel or a dead broadcaster must not stall the driver, so a
         // failed wake is dropped: the next publish wakes the same reader with
@@ -338,7 +351,7 @@ mod tests {
         let channel = live.channel();
         thread::spawn(move || {
             let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[], 3);
+            channel.publish(&recorder, &[], 3, 0);
         })
         .join()
         .expect("the publishing thread");
@@ -363,7 +376,7 @@ mod tests {
         let channel = live.channel();
         thread::spawn(move || {
             let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[], 3);
+            channel.publish(&recorder, &[], 3, 0);
         })
         .join()
         .expect("the publishing thread");
@@ -396,7 +409,7 @@ mod tests {
                     &Tile::Scalar(ColumnValue::Strings(vec!["v".into()])),
                 );
             }
-            channel.publish(&recorder, &[], 1);
+            channel.publish(&recorder, &[], 1, 0);
         })
         .join()
         .expect("the publishing thread");
@@ -433,7 +446,7 @@ mod tests {
         let publishing = channel.clone();
         thread::spawn(move || {
             let recorder = recorder_with_one_row();
-            publishing.publish(&recorder, &[], 3);
+            publishing.publish(&recorder, &[], 3, 0);
         })
         .join()
         .expect("the publishing thread");
@@ -442,7 +455,7 @@ mod tests {
 
         thread::spawn(move || {
             let recorder = recorder_with_one_row();
-            channel.finish(&recorder, &[], 4);
+            channel.finish(&recorder, &[], 4, 0);
         })
         .join()
         .expect("the finishing thread");
@@ -459,7 +472,7 @@ mod tests {
         let channel = live.channel();
         thread::spawn(move || {
             let recorder = recorder_with_one_row();
-            channel.finish(&recorder, &[], 9);
+            channel.finish(&recorder, &[], 9, 0);
         })
         .join()
         .expect("the publishing thread");
@@ -485,12 +498,13 @@ mod tests {
             "stdin",
             &ColumnValue::from_uints(vec![0, 1]),
             &ColumnValue::Strings(vec!["a".into(), "b".into()]),
+            0,
             8,
         );
         let channel = live.channel();
         thread::spawn(move || {
             let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[window], 5);
+            channel.publish(&recorder, &[window], 5, 0);
         })
         .join()
         .expect("the publishing thread");

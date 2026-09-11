@@ -30,6 +30,7 @@ function producer(tick: number, value: string): LiveProducer {
 function frame(tick: number, nodes: [number, string][], final = false): LiveFrame {
   return {
     tick,
+    generation: 0,
     published: tick,
     final,
     nodes: nodes.map(([nodeId, value]) => ({ nodeId, producers: [producer(tick, value)] })),
@@ -43,9 +44,35 @@ const empty: LiveState = {
   sources: new Map(),
   tags: [],
   tick: 0,
+  generation: 0,
 };
 
 describe("applyFrame", () => {
+  // The counterpart of the rule below: a node the newest frame did not mention
+  // keeps its rows *within a version*, but a reload re-mints the ids of every
+  // operator it could not keep, so carrying them across one would show a
+  // retired operator's value under an id this version gave to something else.
+  it("drops the cached nodes when the generation changes", () => {
+    const before = applyFrame(empty, frame(1, [[10, '"a"'], [11, '"b"']]));
+    expect(before.nodes.size).toBe(2);
+
+    const after = applyFrame(before, {
+      ...frame(2, [[12, '"c"']]),
+      generation: 1,
+    });
+
+    expect(Array.from(after.nodes.keys())).toEqual([12]);
+    expect(after.generation).toBe(1);
+  });
+
+  // A frame from the version already drawn is not a swap, so the cache stands.
+  it("keeps the cached nodes when the generation is unchanged", () => {
+    const before = applyFrame(empty, frame(1, [[10, '"a"']]));
+    const after = applyFrame(before, frame(2, [[11, '"b"']]));
+
+    expect(Array.from(after.nodes.keys()).sort()).toEqual([10, 11]);
+  });
+
   // The property the cache exists for: a node the newest frame did not mention
   // keeps its rows, so pinning it answers from the last frame it did appear in
   // rather than waiting for a next frame that a converged program never sends.
@@ -80,7 +107,7 @@ describe("applyFrame", () => {
   it("indexes a source by its graph node", () => {
     const withSource = applyFrame(empty, {
       ...frame(1, []),
-      sources: [{ nodeId: 208, name: "stdin", total: 1, dropped: 0, rows: [] }],
+      sources: [{ nodeId: 208, name: "stdin", total: 1, dropped: 0, abandoned: 0, rows: [] }],
     });
     expect(withSource.sources.get(208)?.name).toBe("stdin");
   });
@@ -88,7 +115,7 @@ describe("applyFrame", () => {
   it("drops a source carrying no graph node, which nothing could select", () => {
     const withSource = applyFrame(empty, {
       ...frame(1, []),
-      sources: [{ nodeId: null, name: "stdin", total: 0, dropped: 0, rows: [] }],
+      sources: [{ nodeId: null, name: "stdin", total: 0, dropped: 0, abandoned: 0, rows: [] }],
     });
     expect(withSource.sources.size).toBe(0);
   });

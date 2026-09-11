@@ -393,7 +393,7 @@ describe("the header's values badge", () => {
     const root = document.createElement("div");
     const live = new LiveStore();
     renderApp(root, new Store(fixture(arithmeticJson)), live);
-    live.apply({ tick: 7, published: 3, final: false, nodes: [], sources: [] });
+    live.apply({ tick: 7, generation: 0, published: 3, final: false, nodes: [], sources: [] });
     const badges = Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
     expect(badges).toContain("live · tick 7");
   });
