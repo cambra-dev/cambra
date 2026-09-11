@@ -183,10 +183,13 @@ def identity(x):
 **Not yet implemented:**
 
 * **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. Does not block today's coverage; a natural next step.
-* **SMT-backed refinements outside linear integer arithmetic.**
+* **SMT-backed refinements outside linear integer arithmetic, and after `lambda_elim`.**
   [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) discharges an
   `Int`/`Bool` predicate in linear integer arithmetic to Z3 when structural matching leaves a
-  deficit. A deficit outside that fragment is reported as unsupported, rather than a mismatch.
+  deficit. A deficit the encoder cannot read is decided structurally, as it was before the
+  fallback existed. The encoded fragment is over surface-syntax predicate shapes, and
+  `lambda_elim` rewrites every predicate point-free, so no check at or after that pass reaches
+  the fallback at all — the reach is inference and `inline`.
 
 *(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
@@ -956,7 +959,13 @@ reads, `+`/`-`, `*` with a literal factor, the comparisons, and the boolean
 connectives. `smt_sub` returns `false` for one reason: the solver produced a model of
 `⋀S₁ ∧ ¬⋀S₂`, a value satisfying `S₁` and violating `S₂`. Every other outcome is an
 `SmtError` naming what happened, because a query that was not asked or not answered has no
-result to report as a mismatch.
+result of its own to report.
+
+The deficit rule decides an unreadable predicate anyway, as a mismatch: that is the answer
+structural matching had already reached, so falling back to it is incomplete and never unsound.
+The remaining errors — a solver that will not start, one that breaks mid-query, an `unknown` —
+reach `map_constrain_err`, which aborts on each. `TODO(smt-undecided)` there records the policy
+those want instead.
 
 ##### A product is reached through its fields
 
@@ -1002,25 +1011,29 @@ change the answer — a contradictory binder proves the entailment outright — 
 declaration per binder on a query that names two. A product's fields are not enumerated either,
 for the same reason.
 
-Three environments implement it:
+Two environments implement the lookup, and a third suppresses the query:
 
 - **Emission** passes its lexical scope (`InferCtx`'s `ScopeStack`), through
-  `constrain_subtype_in`. A binder's slot mid-emission is an inference variable, so the scheme
-  body is resolved before it can be read as a fact — `value_type`, the compact → simplify →
-  coalesce pipeline with the opposite-polarity fallback suppressed. The positive reading is
-  what makes the assumption sound: the slot also carries what the binder's *uses* demanded of
-  it, and assuming a demand would let an entailment prove itself from what it was asked to
-  establish. `x = 2` needs no resolution (the literal's singleton is on the node), `x = 2 ^+ 1`
-  does — the sum's singleton is on the variable's bounds, and unresolved the binder has no sort
-  at all. A generalized binder's quantified variables stay uninstantiated; a polytype has no
-  sort, so it is dropped rather than assumed wrong.
-- **`inline`** passes `TreeScope`, the binders of the tree the pass was handed, collected once.
-  Lowering gives binders per-scope-unique names, so a predicate at a call site mentions only
-  names bound above it and an entry from a sibling subtree is never consulted; where two
-  binders share a name and disagree about the type, the name is dropped.
-- **`NoScope`** is the empty environment, what plain `constrain_subtype` supplies. The
-  post-inference check derives with it (`infer::check` resolves no names, so it holds no binder
-  types), which can only reject what emission admitted, never the reverse.
+  `constrain_subtype_in`. It is the only one that answers a lookup. A binder's slot
+  mid-emission is an inference variable, so the scheme body is resolved before it can be read
+  as a fact — `value_type`, the compact → simplify → coalesce pipeline with the
+  opposite-polarity fallback suppressed. The positive reading is what makes the assumption
+  sound: the slot also carries what the binder's *uses* demanded of it, and assuming a demand
+  would let an entailment prove itself from what it was asked to establish. `x = 2` needs no
+  resolution (the literal's singleton is on the node), `x = 2 ^+ 1` does — the sum's singleton
+  is on the variable's bounds, and unresolved the binder has no sort at all. A generalized
+  binder's quantified variables stay uninstantiated; a polytype has no sort, so it is dropped
+  rather than assumed wrong.
+- **`NoScope`** is the empty environment, what every caller outside emission supplies:
+  `constrain_subtype_under` (the post-inference check resolves no names, so it holds no binder
+  types) and `inline`'s discharge check, which runs over a tree whose binders it does not hold.
+  An empty scope only weakens what the fallback can prove, so it can reject what emission
+  admitted and never the reverse.
+- **`SkipSmtScope`** decides a deficit structurally, raising no query at all.
+  `constrain_subtype` supplies it, so the post-pass tree check reaches the fallback through
+  `constrain_subtype_under` and not through `Typing::constrain`. That split is caller policy
+  riding the scope trait rather than a third environment; the `ScopeEnv::is_skip_smt` doc names
+  the shape it wants instead.
 
 Dropping is the discipline throughout: a path with no sort, a predicate body outside the
 fragment, a name two binders disagree about. An assumption left out weakens the antecedent and
@@ -1717,6 +1730,19 @@ compact domain lattice and two distinct domains are a conflict. Both spellings a
 order-independent: whether a side is a variable is a property of the edge, not of
 when it fires, accumulation commutes, and the lattice decides with every bound in
 hand.
+
+Both directions is also all it takes. `[`Type::UIntRange`]` relating only by equality
+already rejects both base directions, and refinement **drop** (`{𝐷 | 𝑝} ⤇ 𝑉 <:
+𝐷 ⤇ 𝑉`) is already rejected one step less obviously, since behind a contravariant
+domain it demands `𝐷 <: {𝐷 | 𝑝}`. What the reverse edge adds is the case that
+inversion left admitted — refinement **acquisition**, `𝐷 ⤇ 𝑉 <: {𝐷 | 𝑝} ⤇ 𝑉`, an
+unfiltered collection standing where a filtered domain is declared. A failure in
+either direction is reported as `ConstrainError::DataDomainMismatch`, naming the two
+domains; `a_data_domain_relates_only_to_itself` pins all four directions plus the
+reflexive case, and the compute counterpart that still relates contravariantly. The
+exception is a domain comparison that raised a query and got no answer back: an
+`SmtError` decided nothing, so it is reported as itself rather than relabelled into a
+conflict.
 
 **Emitting both directions does not preempt a join.** Two domains meeting at one
 variable is a join like any other, and it has the same answer as anywhere else: none,

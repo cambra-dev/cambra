@@ -329,8 +329,13 @@ impl ConstrainCache {
 /// (see Parreaux 2020 §3.4).
 pub type ExtrudeCache = HashMap<(InferVarId, bool), Rc<InferVar>>;
 
-/// Special empty scope that signals a post-planning check, during
-/// which SMT fallback should not be used.
+/// The empty scope that also suppresses the deficit rule's semantic fallback, so a
+/// refinement deficit under it is decided structurally.
+///
+/// Caller policy rather than a lexical environment — see
+/// [`ScopeEnv::is_skip_smt`](super::smt::ScopeEnv::is_skip_smt), which names the
+/// argument this wants to be instead. [`NoScope`] is the other empty scope and
+/// differs only in letting the query run.
 pub struct SkipSmtScope;
 
 impl ScopeEnv for SkipSmtScope {
@@ -348,9 +353,10 @@ impl ScopeEnv for SkipSmtScope {
 /// the top of each constraint emission and reuse it for the recursive
 /// subtyping the rule fires.
 ///
-/// This has no environment with which to resolve variables in
-/// refinements, and so `SkipSmtScope` is passed to disable the SMT
-/// fallback for refinement comparison.
+/// Supplies [`SkipSmtScope`]: no scope to resolve a refinement's free names
+/// against, and no query raised either. A caller holding the lexical scope uses
+/// [`constrain_subtype_in`]; a caller holding none that still wants the fallback
+/// passes [`NoScope`], as [`constrain_subtype_under`] does.
 pub fn constrain_subtype(
     lhs: &Type,
     rhs: &Type,
@@ -1731,10 +1737,17 @@ fn constrain_go_impl(
                     .collect::<Vec<_>>(),
                 scope,
             )
-            .map_err(|error| ConstrainError::SmtError {
-                lhs: lhs.clone(),
-                rhs: rhs.clone(),
-                error: Box::new(error),
+            .or_else(|error| match error {
+                // A predicate the encoder cannot read leaves the deficit undecided,
+                // and undecided is the answer structural matching already gave:
+                // a mismatch. Reporting the encoder's limit instead would turn an
+                // ill-typed program's diagnostic into a note about this module.
+                SmtError::Encoding { .. } => Ok(false),
+                error => Err(ConstrainError::SmtError {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    error: Box::new(error),
+                }),
             })? {
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
@@ -2356,13 +2369,12 @@ mod tests {
             .is_err()
         );
 
-        // Behind a data function, neither refinement direction relates. The
-        // acquisition edge rejects without naming `DataDomainMismatch`: the
-        // deficit reaches the semantic fallback, and a `UIntRange` has no SMT
-        // sort, so what comes back is an undecided comparison rather than a
-        // decided conflict (see [`super::smt`]).
+        // Behind a data function, neither refinement direction relates.
         assert!(
-            constrain_subtype(&bare, &refined, &mut ConstrainCache::new()).is_err(),
+            matches!(
+                constrain_subtype(&bare, &refined, &mut ConstrainCache::new()),
+                Err(ConstrainError::DataDomainMismatch { .. })
+            ),
             "a collection may not acquire a domain filter by subsumption"
         );
         assert!(

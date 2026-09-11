@@ -1546,6 +1546,14 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     // one place elimination is meant to change a node's type, because the type
     // quotes a term the pass rewrote. Read only by the invariant assert below,
     // so it exists only where that assert does.
+    //
+    // It **disables** the invariant for that arm rather than restating it. The
+    // strong form is to compare `original_ty` against the recorded discharge
+    // re-applied — `[v ↦ elim(def)]` on the type the node arrived with, which is
+    // what the arm computes — and it is not asserted because `original_ty` quotes
+    // the uneliminated `def` at an unknown depth inside a predicate, so recovering
+    // the pre-image needs the same walk the arm performs and the assert would
+    // compare the arm against itself.
     #[cfg(debug_assertions)]
     let mut reclosed_let_ty = false;
     let result = match node {
@@ -1797,6 +1805,15 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 {
                     reclosed_let_ty = true;
                 }
+                // `clone_preserving_ids` splices the *eliminated* definition into
+                // the node's type, so this type quotes a term that a
+                // structurally-equal predicate elsewhere on the tree — one riding
+                // a node the pass reached by another route — need not quote. That
+                // is the sharing split `tests/predicate_sharing.rs` guards
+                // against, and the discharge has to quote the eliminated term:
+                // the post-pass check reconstructs this node from the tree it is
+                // handed, which holds only that one. Whether the two ever diverge
+                // in practice is open.
                 crate::ccl::subst::Subst::discharge(
                     binding.name.clone(),
                     def.clone_preserving_ids(),

@@ -37,6 +37,7 @@ mod nonneg_inventory;
 mod polymorphic;
 mod prefix_lines;
 mod reachability;
+mod refinement;
 mod source_shared;
 mod storefront;
 mod streaming_echo;

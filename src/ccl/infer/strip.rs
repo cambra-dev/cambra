@@ -12,6 +12,20 @@
 //! [`ScopeViolation`](crate::ccl::infer::InferError::ScopeViolation). Dropping the
 //! interior refinements removes the second copy rather than keeping two in step.
 //!
+//! Erasure is the decision, and it is a stopgap. The defect is that substitution
+//! does not descend into a predicate's interior type slots; the fix is to make it,
+//! which retires this phase rather than shrinking it. Erasing instead is sound
+//! because the interior copy carries no claim the predicate does not, and it is
+//! bounded because it is the only thing that reads those slots — but it deletes
+//! the evidence of the miss, so a substitution-descent gap in a *later* pass
+//! arrives with nothing to report it.
+//!
+//! Nothing here memoizes across compiles. [`compiled_refinements`] is a `Vec`
+//! searched by `contains` on every insert and every query, over
+//! [`Refinement`]'s structural equality across whole predicate terms, and the
+//! solver path behind it re-asks z3 per deficit with no memo on
+//! `(base, lhs, rhs)`. Unmeasured.
+//!
 //! Two kinds of interior type survive.
 //!
 //! A refinement on a **data function's data** is exempt, body and all: planning

@@ -110,7 +110,7 @@ pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
 /// The solver works directly on [`Type`]: each node's inferred type is written
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
-pub struct InferCtx {
+pub(super) struct InferCtx {
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -195,10 +195,6 @@ impl InferCtx {
         }
     }
 
-    pub fn empty() -> Self {
-        Self::new(HashMap::new(), NodeId::fresh())
-    }
-
     /// Enter `node`'s rule, returning the previous node for the caller to
     /// restore. Only [`emit_node`](super::emit::emit_node) calls this.
     pub(super) fn enter_node(&mut self, node: NodeId) -> NodeId {
@@ -277,6 +273,12 @@ impl InferCtx {
                 // The result is discarded because a fresh variable cannot conflict
                 // with its first upper bound; a genuine mismatch surfaces later,
                 // when a value flows in and fails against this bound.
+                //
+                // A `ConstrainError::SmtError` swallowed here is not local: a broken
+                // exchange poisons the thread's solver slot permanently
+                // (`smt::Slot::Poisoned`), so every later query returns the same
+                // failure and the first one that reaches `map_constrain_err` aborts
+                // naming a comparison that had nothing to do with it.
                 let _ = constrain_subtype_in(&v, &bound, &mut ConstrainCache::new(), &NoScope);
                 v
             }

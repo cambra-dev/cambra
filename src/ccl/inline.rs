@@ -72,7 +72,7 @@ use crate::ccl::{
     provenance,
 };
 
-use log::debug;
+use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -573,13 +573,17 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// argument — so substituting the argument for the binder **discharges** the
 /// precondition rather than dropping it.
 ///
-/// Compared with the type-blind predicate relation
+/// Structural entailment first, by the type-blind predicate relation
 /// ([`eq_refinement_predicate`](crate::ccl::eq_refinement_predicate), via `Refinement`'s
-/// `PartialEq`), because the two copies legitimately differ in inference metadata.
-/// This is deliberately a *syntactic* entailment, not a solver call: post-inference
-/// there is no constraint graph left, and the case that must succeed — an argument
-/// whose type carries the very refinement the parameter acquired *from* it — is an
-/// equality. Anything subtler is exactly what should trip the assert and get a real
+/// `PartialEq`), because the case that must succeed — an argument whose type carries
+/// the very refinement the parameter acquired *from* it — is an equality and the two
+/// copies legitimately differ in inference metadata. A demand the argument entails
+/// without matching it — `Int@6` against `{Int | __elem == 1 ^+ 5}` — goes to the
+/// same semantic fallback the deficit rule uses during inference ([`smt_sub`]). The
+/// query runs under [`NoScope`], because this pass holds no binder types for the
+/// tree it was handed; an assumption left out only weakens the antecedent.
+///
+/// Anything subtler than both is exactly what should trip the assert and get a real
 /// `restrict` lift.
 fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     let demanded = param_ty.refinements();
@@ -599,27 +603,22 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
         supplied.extend(value.refinements());
     }
 
-    // We can't semantically compare refinements in this phase, so we
-    // perform a weak comparison. Only fail here if the supplied
-    // refinements are *empty*.
     if demanded.iter().all(|d| supplied.contains(&d)) {
-        true
-    } else if !supplied.is_empty() {
-        // As long as the supplied set has *some* refinements, we'll
-        // assume they cover the demands semantically and debug-report
-        // the structurally distinct demands in case troubleshooting
-        // is needed.
-        for d in demanded.iter() {
-            if !supplied.contains(&d) {
-                debug!(
-                    "Inline ignored demand {:?} which was not in supplied set {:?}",
-                    d, supplied
-                );
-            }
-        }
-        true
-    } else {
-        false
+        return true;
+    }
+    // The base the query runs over is the argument's value, so the `Mut` stamp comes
+    // off here for the reason it does above.
+    let base = arg_ty.mut_value_type().unwrap_or(arg_ty).peel_refinements();
+    let supplied: Vec<Refinement> = supplied.into_iter().cloned().collect();
+    match smt_sub(base, &supplied, demanded, &NoScope) {
+        Ok(entailed) => entailed,
+        // A predicate the encoder cannot read leaves the entailment undecided, which
+        // is the structural answer: the demand is not discharged, and the caller's
+        // assert reports it.
+        Err(SmtError::Encoding { .. }) => false,
+        // A solver that is absent or broken decided nothing about this program, so
+        // reporting an undischarged refinement would name the wrong cause.
+        Err(error) => panic!("{error}"),
     }
 }
 
@@ -1163,7 +1162,6 @@ mod tests {
     /// carries a different refinement than the parameter demands still asserts.
     #[test]
     #[should_panic(expected = "does not entail")]
-    #[cfg(feature = "strong-post-inference-tests")]
     fn mut_var_argument_with_other_refinement_still_asserts() {
         let int = Type::Base(BaseType::Int);
         let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
@@ -1195,7 +1193,6 @@ mod tests {
     /// "Keying a specialization").
     #[test]
     #[should_panic(expected = "does not entail")]
-    #[cfg(feature = "strong-post-inference-tests")]
     fn refined_outer_param_not_entailed_by_argument_asserts() {
         let int = Type::Base(BaseType::Int);
         let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));

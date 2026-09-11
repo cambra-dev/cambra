@@ -11,8 +11,9 @@ cargo fmt        # Run formatter
 cargo build      # Build the project
 cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inner-loop check, NOT the full gate
 cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
-./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests, all `-p cambra`. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, and the fixtures gate. ~1/3 the time of the full gate — use this while iterating.
+./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + the `z3` check + tests, all `-p cambra`. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, and the fixtures gate. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh formal   # The Lean model (formal/): `lake build` — which elaborates every theorem and evaluates every #guard — then the differential oracles. Skips loudly with no `lake` on PATH; fails instead under CI.
+./ci.sh solver   # Checks for `z3` on PATH. Refinement subtyping runs queries against it, so without it the suite is red; this reports it once instead of as dozens of unrelated failures. Runs inside `fast` and the full gate.
 ./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + fixtures, auto-formatting first. Must pass before pushing a PR.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name

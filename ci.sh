@@ -70,6 +70,22 @@ ci_formal() {
   # everything: the test line reports neither.
   cargo test -q --test differential_oracle -- --nocapture
 }
+# Refinement subtyping decides a structural deficit by asking `z3`
+# (`src/ccl/infer/solver/smt.rs`), spawned as a subprocess. Without the binary
+# every query fails and the thread's solver slot poisons, which shows up as
+# dozens of unrelated test failures reporting an OS error that never names z3 —
+# so this gate says it once, up front, instead. The `lake` precedent skips;
+# this one cannot, because a missing solver does not make a gate a no-op, it
+# makes the suite red.
+ci_solver() {
+  if ! command -v z3 >/dev/null 2>&1; then
+    echo "ci_solver: no \`z3\` on PATH — refinement subtyping runs queries against it," >&2
+    echo "  so the test suite fails with Process { message: \"No such file or directory\" }." >&2
+    echo "  Install it from https://github.com/Z3Prover/z3/releases and put it on PATH;" >&2
+    echo "  .github/workflows/ci.yml pins the release CI installs." >&2
+    return 1
+  fi
+}
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc -p cambra --no-deps
@@ -232,6 +248,10 @@ ci_fast() {
   # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
   # shellcheck disable=SC2310
   { cargo clippy -p cambra -- -D warnings; } || failed=1
+  # Before `ci_test`, so a missing solver reads as one line rather than as the
+  # suite's failures.
+  # shellcheck disable=SC2310
+  ci_solver || failed=1
   # shellcheck disable=SC2310
   ci_test || failed=1
   exit "${failed}"
@@ -270,6 +290,10 @@ ci_all() {
   # Before `ci_test`, so the oracle binary exists by the time the suite runs:
   # the differential tests skip themselves without it, and a skip in the middle
   # of the gate is the failure mode this step exists to remove.
+  # Before `ci_test`, for the reason `ci_solver`'s own comment gives.
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_solver || failed="${failed} solver"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_formal || failed="${failed} formal"

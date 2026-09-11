@@ -85,28 +85,19 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     40
 )]
-// // Refined transaction bodies
-// #[case::counter_refined_1(
-//     indoc! {r#"
-//         pool: Mut({Int where _ >= 0}, Txn) := 100
-//         for r in [10, 20, 30]:
-//             with begin():
-//                 pool := pool ^+ 1
-//         await_final(pool)
-//     "#},
-//     40
-// )]
-// #[case::counter_refined_2(
-//     indoc! {r#"
-//         pool: Mut({Int where _ >= 0}, Txn) := 100
-//         for r in [10, 20, 30]:
-//             with begin():
-//                 if pool - r >= 0:
-//                     pool := pool - r
-//         await_final(pool)
-//     "#},
-//     40
-// )]
+// TODO(refined-txn-body): a transaction body writing a *refined* mutable variable
+// (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, blocked twice over.
+//
+// A `^+` write records its sum, so `pool := pool ^+ 1` types the written value
+// `{Int | __elem == pool ^+ 1}` — a predicate naming the mutable binder.
+// `close_let_type` holds a `:=` definiens back from the closing discharge (a
+// history denotes no value to substitute), so nothing eliminates the name and
+// `check_scope_valid` reports a `ScopeViolation` on a well-typed program.
+//
+// A plain `-` write is the second: `pool := pool - r` under `if pool - r >= 0`
+// types the written value `Int`, which does not entail `__elem >= 0`. Reading the
+// guard as a refinement on its branch is path sensitivity, which the type system
+// does not do.
 
 // Two writers over one mutable variable: the operator serializes + retries, conserving the
 // total: 100 − 30 − 40 = 30.

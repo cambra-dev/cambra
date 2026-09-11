@@ -2448,7 +2448,6 @@ impl Type {
     pub fn refinements(&self) -> &[Refinement] {
         match self {
             Type::Refinement(_, refinements) => refinements.as_slice(),
-            Type::History { value, .. } => value.refinements(),
             _ => &[],
         }
     }

@@ -11,6 +11,14 @@
 //! instead: a predicate reads one by projection, and the [`Path`] that read
 //! addresses is what an SMT constant is minted for.
 //!
+//! The fragment is over **surface-syntax** predicate shapes: a variable, a field
+//! read, a literal, a unary or a binary operator ([`Encode::expr`]). `lambda_elim`
+//! rewrites every predicate point-free — `__elem == 1` becomes
+//! `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)` — so no predicate at or after that pass
+//! is encodable, and every check from there on decides its deficits structurally.
+//! The reach of the fallback is therefore inference and [`crate::ccl::inline`], not
+//! the whole pipeline.
+//!
 //! `smt_sub` answers `false` for one reason: the solver found a model of
 //! `⋀lhs ∧ ¬⋀rhs`, a value of the base satisfying every lhs predicate and
 //! violating an rhs one. Every other outcome is an [`SmtError`] naming what
@@ -30,6 +38,10 @@ use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, LogicKind, Name, ProjKey, Refinement,
     Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
+
+/// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
+/// [`SmtError`] report, so a machine without it on PATH is told what is missing.
+pub const SOLVER_BINARY: &str = "z3";
 
 #[derive(Debug, Clone)]
 pub enum SmtError {
@@ -60,6 +72,33 @@ pub enum SmtError {
     },
 }
 
+/// The report a caller prints for a query that went unasked or unanswered. The
+/// [`SmtError::Process`] wording carries the install step, because a machine
+/// without a solver sees that variant and no other.
+impl std::fmt::Display for SmtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SmtError::Encoding { body, message } => write!(
+                f,
+                "the refinement predicate {} is outside the supported SMT encoding ({message})",
+                symbolic(&body.predicate)
+            ),
+            SmtError::Process { message } => write!(
+                f,
+                "refinement subtyping runs queries against `{SOLVER_BINARY}`, which could not be \
+                 started: {message}. Install it and put it on PATH — `./ci.sh solver` checks for \
+                 it, and `.github/workflows/ci.yml` pins the release CI installs."
+            ),
+            SmtError::SolverReportedUnknown => {
+                write!(f, "`{SOLVER_BINARY}` answered `unknown`")
+            }
+            SmtError::SolverError { message } => {
+                write!(f, "`{SOLVER_BINARY}` reported an error: {message}")
+            }
+        }
+    }
+}
+
 /// SMT representations of Cambra types. If a refinement base type is
 /// encountered that cannot be represented by `Sort`, the check fails
 /// fast.
@@ -71,8 +110,11 @@ pub enum Sort {
     UInt,
     /// Represented as `Int` where `_ >= 0 && _ < n`.
     UIntRange(usize),
-    /// A completely uninterpreted sort.
-    UI(String),
+    /// A sort reached by the solver's own spelling for it, carrying no constraint
+    /// of its own. `String` is the case: z3's built-in string sort, used here as a
+    /// sort name. This reaches a built-in sort and not an uninterpreted one,
+    /// which would need a `declare-sort` command that nothing here emits.
+    Named(String),
 }
 
 impl Sort {
@@ -95,7 +137,7 @@ impl Sort {
                 let c = ctx.and(non_neg(sym_atom), lt(sym_atom, n));
                 (ctx.int_sort(), Some(c))
             }
-            Self::UI(s) => (ctx.atom(s), None),
+            Self::Named(s) => (ctx.atom(s), None),
         };
         ctx.declare_const(sym, sort_atom)
             .map_err(exchange_failure)?;
@@ -114,11 +156,11 @@ impl Sort {
 /// scope, and a binder nothing mentions can still change the answer — a
 /// contradictory one would prove the entailment outright.
 ///
-/// The implementors are the two places a query is raised from: inference's
-/// lexical scope (`InferCtx`'s `ScopeStack`, `src/ccl/infer/context.rs`) and the
-/// tree's binders (`TreeScope`, `src/ccl/inline.rs`). [`NoScope`] is the empty
-/// environment. See `src/ccl/design/type-inference.md`, "The scope a query runs
-/// in".
+/// The one implementor that answers is inference's lexical scope (`InferCtx`'s
+/// `ScopeStack`, `src/ccl/infer/context.rs`). [`NoScope`] is the empty
+/// environment, which every other caller passes: a query raised after inference
+/// runs over a tree whose binder types the caller does not hold. See
+/// `src/ccl/design/type-inference.md`, "The scope a query runs in".
 pub trait ScopeEnv {
     /// The type a value has given `name` here, or `None` when this scope does not
     /// bind it or nothing has settled it.
@@ -127,8 +169,17 @@ pub trait ScopeEnv {
     /// variable and answering means resolving it — there is no settled `Type` in
     /// the scope to hand out a borrow of.
     fn binder_type(&self, name: &Name) -> Option<Type>;
-    /// Flag indicating whether a subtype comparison using this
-    /// environment should skip the SMT fallback.
+    /// Whether a subtyping comparison carrying this environment decides a
+    /// refinement deficit structurally, without raising a query at all.
+    ///
+    /// Caller policy rather than part of the encoding: nothing in this module
+    /// reads it, and every implementor outside
+    /// [`constrain`](super::constrain) answers `false`. It rides the scope
+    /// because the scope is what already reaches the deficit rule. The shape it
+    /// wants is a parameter of its own on
+    /// [`constrain_subtype_in`](super::constrain::constrain_subtype_in) — an
+    /// `Option<&dyn ScopeEnv>`, where `None` is "do not ask" — which collapses
+    /// the two empty scopes this flag forces apart.
     fn is_skip_smt(&self) -> bool;
 }
 
@@ -298,10 +349,10 @@ fn run(
     formula: SExpr,
 ) -> Result<Response, SmtError> {
     for (sym, sort) in decls {
-        // println!("Declaring {} as {:?}...", &sym, &sort);
+        log::debug!("declare {sym} at {sort:?}");
         sort.declare(sym, ctx)?;
     }
-    // println!("Checking {}...", ctx.display(formula));
+    log::debug!("check {}", ctx.display(formula));
     ctx.assert(formula).map_err(exchange_failure)?;
     ctx.check().map_err(exchange_failure)
 }
@@ -489,7 +540,7 @@ impl<'a> Encode<'a> {
             Type::Base(BaseType::UInt) => Some(Sort::UInt),
             Type::UIntRange(n) => Some(Sort::UIntRange(*n)),
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
-            Type::Base(BaseType::String) => Some(Sort::UI("String".to_string())),
+            Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
             Type::History { value, .. } => self.sort(value),
             _ => None,
         }
@@ -650,6 +701,15 @@ impl<'a> Encode<'a> {
         } else {
             self.scope.binder_type(&path.root)?
         };
+        // A mutable variable mention in a predicate is a *read*, so what the path
+        // denotes is the value the history holds and the facts it carries are that
+        // value's. Peeled here rather than in
+        // [`Type::refinements`](crate::ccl::Type::refinements), whose contract is one
+        // layer at this position — `refined(peel(t), refinements(t)) == t`, which
+        // `channelize::join_refinements` rebuilds a type by.
+        if let Some(value) = ty.mut_value_type() {
+            ty = value.clone();
+        }
         for key in &path.keys {
             ty = field_type(&ty, key)?;
         }
@@ -851,13 +911,18 @@ mod tests {
         );
     }
 
+    /// The encoder does not typecheck what it sends, so a `String` base under an
+    /// integer comparison reaches the solver and comes back as a reply the
+    /// exchange cannot use. The claim is the variant — a misencoding on this side
+    /// rather than a verdict — and not the solver's wording, which is z3's to
+    /// change.
     #[test]
     fn the_solver_will_error_on_type_errors() {
         let refs = [elem_cmp(CompareKind::Equals, lit(5))];
         let err = smt_sub(&Type::Base(BaseType::String), &refs, &refs, &NoScope).unwrap_err();
         assert!(
-            matches!(&err, SmtError::SolverError { message, .. } if message.contains("Sorts String and Int are incompatible")),
-            "expected SolverError about String vs Int, got: {err:?}"
+            matches!(&err, SmtError::SolverError { .. }),
+            "expected a SolverError, got: {err:?}"
         );
     }
 

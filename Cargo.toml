@@ -37,12 +37,6 @@ test-helpers = []
 # Enable when bisecting a miscompile: `cargo test --features deep-typecheck`.
 deep-typecheck = []
 
-# Run tests that expect refinement disequalities after the type
-# inference phase. The checks for those disequalities are currently
-# disabled, because the addition of non-trivial refinements makes the
-# equality check much more brittle than before.
-strong-post-inference-tests = []
-
 [dev-dependencies]
 # Self dev-dependency so the integration tests (separate crates) can see the
 # `test-helpers`-gated helpers. Cargo unifies this with the library under test.

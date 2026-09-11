@@ -64,7 +64,11 @@ Ordered for a newcomer; each layer is precise about what is implemented versus d
 
 ## Building from source
 
-Requires a recent Rust toolchain (pinned in [rust-toolchain.toml](rust-toolchain.toml)).
+Requires a recent Rust toolchain (pinned in [rust-toolchain.toml](rust-toolchain.toml)) and
+[z3](https://github.com/Z3Prover/z3/releases) on `PATH`. The type checker decides a refinement
+subtyping question structural matching leaves open by running a query against z3 as a subprocess,
+so without it the test suite fails. `./ci.sh solver` reports whether it is there; CI installs the
+release pinned in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ```bash
 cargo build          # build

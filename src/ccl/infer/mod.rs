@@ -101,7 +101,7 @@ use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
 use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedExpr};
 
-pub use context::InferCtx;
+use context::InferCtx;
 use emit::emit_node;
 use solve::{coalesce_pass, resolve_var_type};
 use solver::smt::SmtError;
@@ -335,29 +335,27 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             domains: domains.iter().map(coalesce_for_error).collect(),
             origin: ctx_label.to_string(),
         },
+        // TODO(smt-undecided): every arm below aborts the compiler, which is a
+        // prototype tripwire rather than the policy. The policy this wants is the
+        // one `constrain`'s deficit rule already applies to a predicate the
+        // encoder cannot read — an undecided query is a structural mismatch —
+        // extended to `unknown`, which z3 answers for reasons outside this
+        // encoder's control, and to `SolverError`, which the variant's own doc
+        // calls a misencoding on this side and which
+        // `smt::tests::the_solver_will_error_on_type_errors` reaches from a
+        // well-formed query. A solver that will not start stays a hard failure
+        // under any policy: it is a fact about the machine, not about the program.
         ConstrainError::SmtError { lhs, rhs, error } => match error.as_ref() {
-            // Only the Encoding error is passed upward as an
-            // api-level error. All other errors panic here.
-            SmtError::Encoding { body, message } => InferError::Unsupported(format!(
-                "could not compare {} <: {}: the refinement predicate {} is outside the \
-                 supported SMT encoding ({message})",
-                coalesce_for_error(&lhs),
-                coalesce_for_error(&rhs),
-                crate::ccl::symbolic::symbolic(&body.predicate),
-            )),
-            SmtError::Process { message } => {
-                // This should be independent of the types that are
-                // being compared, so don't report them.
-                panic!("Failed to spawn or communicate with solver process: {message}")
+            // `constrain` decides an unreadable predicate as a mismatch, so the
+            // variant reaches no caller.
+            SmtError::Encoding { .. } => {
+                unreachable!("an Encoding failure is decided at the deficit rule: {error}")
             }
-            SmtError::SolverReportedUnknown => {
-                // For now, treat UNKNOWN as a bug. We may later need
-                // to accept UNKNOWN as simply a type mismatch,
-                // depending on the logic fragment we target.
-                panic!("Solver returned UNKNOWN for {lhs} <: {rhs}")
-            }
-            SmtError::SolverError { message } => {
-                panic!("Could not compare {lhs} <: {rhs}. Solver process reported error: {message}")
+            // Names no types: which comparison raised the query says nothing about
+            // a solver that is not there.
+            SmtError::Process { .. } => panic!("{error}"),
+            SmtError::SolverReportedUnknown | SmtError::SolverError { .. } => {
+                panic!("could not compare {lhs} <: {rhs}: {error}")
             }
         },
     }

@@ -4370,21 +4370,42 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
     );
 }
 
+/// A `let` whose binder reaches the enclosing function's result refinement is
+/// eliminated as that refinement leaves the binder's scope, by substituting the
+/// `let`'s definition into the predicate. `m` defined as `n ^+ 1` makes the
+/// refinement `{Int | __elem == n ^+ 1 ^+ 1}`, whose only free name is the
+/// parameter, which the function type binds.
+///
+/// Asserted as the whole type rather than as a probe over the rendering: the
+/// design doc states what the type is (`src/ccl/design/type-inference.md`,
+/// "`let` binders and scope exit"), and a `Display` change then reads as a diff
+/// rather than as a check that silently stopped constraining anything.
+///
+/// TODO(refinement-let-scope): two concerns the elimination raises are open.
+/// Nested `let`s compose, so the predicate grows multiplicatively and wants a
+/// size bound. And a binder that cannot be eliminated should widen the type to
+/// the unrefined base rather than leave the name dangling — a `:=` definiens is
+/// the live case, held back from the discharge by `InferCtx::close_let_type` and
+/// reported by `check_scope_valid` (`tests/compilation_pipeline/transactions.rs`,
+/// `TODO(refined-txn-body)`).
+///
+/// This also blocks binding a multi-argument function's parameters rather than
+/// substituting them away — see `src/ccl/design/ir.md`, "A substituted
+/// parameter's site rides its projection". The two are one fix.
 #[test]
 fn let_binder_does_not_escape_into_result_refinement() {
     let ty = infer_program(indoc! {r#"
-        def g(n_arg: Int):
-            m_let = n_arg ^+ 1
-            m_let ^+ 1
+        def g(n: Int):
+            m = n ^+ 1
+            m ^+ 1
 
         g
     "#});
-    let rendered = ty.to_string();
-    assert!(rendered.contains("n_arg") && !rendered.contains("m_let"));
+    assert_eq!(ty.to_string(), "((n: Int) ⇒ {Int | __elem == n ^+ 1 ^+ 1})");
 }
 
-/// The contrast that isolates the defect above: the same refinement over the
-/// **parameter** is well-formed, because the function type binds it.
+/// The contrast: a result refinement over the **parameter** needs no
+/// elimination, because the function type binds the name it closes over.
 #[test]
 fn a_result_refinement_over_the_parameter_is_well_scoped() {
     let ty = infer_program(indoc! {r#"
