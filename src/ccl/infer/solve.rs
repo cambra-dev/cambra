@@ -166,6 +166,17 @@ pub(super) struct CoalesceCtx {
     /// the mark and read as surviving, though they die with the clone. Asking each
     /// frame what it is, at the moment it is created, is immune to that.
     discarding: bool,
+    /// Whether a **refinement predicate's** expression tree is being walked, rather
+    /// than the main tree.
+    ///
+    /// A predicate holds copies of terms that also stand on the main tree — the
+    /// present-key domain names the collection its group-by iterates
+    /// (`src/ccl/design/collections.md`, "The key domain is the key morphism's
+    /// image") — and `Clone` leaves each copy its own variables. So a rule that
+    /// *chooses* a type rather than reading one has to decline here:
+    /// [`pin_empty_list_element`] would answer for the copy alone, and the original
+    /// is under no obligation to agree.
+    in_predicate: bool,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -820,8 +831,51 @@ fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     true
 }
 
-/// The type to pin an unreachable arm's payload to: the concrete type it is
-/// required to flow into, else one its operator reads accept, else `Unit`. See
+/// Pin an **empty** list literal's element type, so it resolves to *some* type
+/// rather than staying an inference variable.
+///
+/// The empty literal denotes the function with no positions, so nothing can read
+/// its codomain, and the type language has no uninhabited type to name that with
+/// (`docs/chl-spec.md`, "6.6 The empty product is unit"). A type is chosen here on
+/// the rule an unreachable arm's payload takes: whatever the position's uses
+/// require, and `Unit` when they require nothing
+/// (`src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to
+/// what its uses require").
+///
+/// **Emptiness is the premise, not a shortcut for it.** A non-empty literal whose
+/// elements are themselves undetermined — `\x -> [x, x]`, never called — has a
+/// value-free element type too, and there the variable is a type *parameter* the
+/// program left ambiguous. Pinning it would accept a program that has no type
+/// (`test_unexercised_generic_definition_is_an_error_not_a_panic`). What makes the
+/// choice free is that the domain is empty, which only this literal knows.
+///
+/// Recorded **on the variable**, like that pin and for the same reason: the element
+/// type also occurs in the binder slots the literal feeds — a `for` target, a `let`
+/// binding — and those resolve from the variable rather than from this node.
+///
+/// Chosen here rather than in `emit_list` because a type asserted before the
+/// constraints arrive is a bound the literal never had: `Unit` written at emission
+/// meets every annotation naming another element type as a mismatch.
+fn pin_empty_list_element(list_ty: &Type) {
+    let Type::Fun { codomain, .. } = list_ty else {
+        return;
+    };
+    if value_reaches(codomain) {
+        return;
+    }
+    let chosen = payload_pin(codomain);
+    let mut cache = ConstrainCache::new();
+    let pinned = constrain_subtype(&chosen, codomain, &mut cache)
+        .and_then(|()| constrain_subtype(codomain, &chosen, &mut cache));
+    assert!(
+        pinned.is_ok(),
+        "pinning an empty list's element variable cannot fail: its only bounds are what \
+         its uses required, and `{chosen}` is a type they all still accept",
+    );
+}
+
+/// The type to pin an unobservable position to: the concrete type it is required
+/// to flow into, else one its operator reads accept, else `Unit`. See
 /// [`pin_unobservable_arm_payload`], which is the whole rationale.
 fn payload_pin(payload: &Type) -> Type {
     let Type::Infer(v) = payload else {
@@ -894,6 +948,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
         discarding: false,
+        in_predicate: false,
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
@@ -1235,6 +1290,14 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         return;
     }
 
+    // An empty list literal's element type is chosen here, before this node's type is
+    // read and before the walk borrows the node. The ordering is
+    // [`pin_unobservable_arm_payload`]'s: the pin records its choice on the element
+    // *variable*, so a read that precedes it resolves one occurrence against the
+    // unpinned graph.
+    if !ctx.in_predicate && matches!(&expr.node, TypedExprNode::List(elts) if elts.is_empty()) {
+        pin_empty_list_element(&expr.ty);
+    }
     // Recurse into sub-expressions first so child types are settled
     // before we coalesce this node's (which may reference them).
     //
@@ -1830,6 +1893,7 @@ fn coalesce_type_predicates_go(
             // `coalesce_type_predicates`.
             let memo = ctx.pred_memo.clone();
             let base = inner.clone();
+            let outer_in_predicate = std::mem::replace(&mut ctx.in_predicate, true);
             refinements.rewrite_each(|_, r| {
                 memo.rebuild(r, &(), |pred| {
                     coalesce_node(pred, level, ctx);
@@ -1838,6 +1902,7 @@ fn coalesce_type_predicates_go(
                 });
                 *r = scope.close(r);
             });
+            ctx.in_predicate = outer_in_predicate;
         }
         Type::Fun {
             fun_kind,

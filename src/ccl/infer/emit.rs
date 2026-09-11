@@ -2056,9 +2056,6 @@ pub(super) fn emit_list<C: Typing>(
         domain: Box::new(domain),
         codomain: Box::new(codomain),
     };
-    if elts.is_empty() {
-        return Ok(fun_ty(Type::UIntRange(0), prim(BaseType::Unit)));
-    }
     // Element type: the **join** of the elements, not a type the first one fixes and
     // the rest must equal. Every element flows one-way into a shared variable, so
     // the element type is what they have in common.
@@ -2068,19 +2065,26 @@ pub(super) fn emit_list<C: Typing>(
     // intersect at a join and so simply drop out of what is common. Heterogeneous
     // elements are still rejected: two distinct atoms at one position collide as
     // `IncompatibleBounds` at coalesce, reported there rather than here.
+    //
+    // Zero elements is that rule at zero, not a case of its own: the join is the
+    // variable unconstrained, so `[]` names no element type and the use site fixes it
+    // (`empty_list_takes_its_element_type_from_the_use_site`). Naming one here — the
+    // element type of a literal that has no element — is a bound the literal never
+    // had, and meets every annotation naming another element type as a mismatch.
+    // `pin_empty_list_element` chooses for the literal nothing demands anything of,
+    // once the constraints are in.
     let elem_ty = ctx.fresh();
     for elt in elts.iter_mut() {
         let t = emit_value_read(elt, ctx)?;
         ctx.require_sub(&t, &elem_ty, &|| "List element".to_string())?;
     }
-    let first_ty = elem_ty;
     let n = elts.len();
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
     // element (codomain) type takes the dereferenced element type so no `Mut`
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
     // it — see `src/ccl/design/type-inference.md`, "The domain join needs `box`".
-    Ok(fun_ty(Type::UIntRange(n), read_through(&first_ty)))
+    Ok(fun_ty(Type::UIntRange(n), read_through(&elem_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
