@@ -11,7 +11,7 @@ cargo fmt        # Run formatter
 cargo build      # Build the project
 cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inner-loop check, NOT the full gate
 cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
-./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests, all `-p cambra`. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, and the fixtures gate. ~1/3 the time of the full gate — use this while iterating.
+./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests (`-p cambra`), plus the frontend's typecheck and vitest. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, the fixtures gate, and the vendored-bundle freshness check. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh formal   # The Lean model (formal/): `lake build` — which elaborates every theorem and evaluates every #guard — then the differential oracles. Skips loudly with no `lake` on PATH; fails instead under CI.
 ./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + fixtures, auto-formatting first. Must pass before pushing a PR.
 cargo test -q --no-fail-fast      # Run all tests
@@ -241,7 +241,7 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 
 ### Workflow
 
-After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + tests) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers and that `fast` skips: the other three clippy configurations (release, `serde`, lib-only), the doc build, and the `formal` gate (the Lean model plus its differential oracles). A green debug `cargo clippy` (or `./ci.sh fast`) is not enough (see Build Commands above).
+After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + the frontend's typecheck and tests + the Rust suite) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers and that `fast` skips: the other three clippy configurations (release, `serde`, lib-only), the doc build, the vendored-bundle freshness check in `ci_web`, and the `formal` gate (the Lean model plus its differential oracles). A green debug `cargo clippy` (or `./ci.sh fast`) is not enough (see Build Commands above).
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
