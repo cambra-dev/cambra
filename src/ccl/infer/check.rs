@@ -5,6 +5,7 @@
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
 use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+    traits::{product_components, product_fields},
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
@@ -12,8 +13,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Expr, Level, Name, Refinement, RefinementSet, Type, TypedBinding, TypedExpr,
-    TypedExprNode,
+    BaseType, Expr, FieldKey, Level, Name, Refinement, RefinementSet, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
 };
 
 use super::emit::{
@@ -187,6 +188,52 @@ impl Typing for CheckCtx {
         // across the suite: it never fires.
         let bases: Option<Vec<&BaseType>> = operand_types.iter().map(|t| offered_base(t)).collect();
         let Some(bases) = bases else {
+            // **A product is determined, so it is not residue.** A structural trait is
+            // answered componentwise, so the operands' components pair and each pair has to
+            // answer the trait in turn. Checked here rather than excused: this rule is what
+            // catches a later pass rewriting the tree into something ill-typed, and a
+            // product is the shape inference answers structurally rather than through the
+            // candidate set (`traits::narrow_product`), so nothing else downstream would.
+            if trait_.is_structural()
+                && operand_types
+                    .iter()
+                    .all(|t| matches!(strip_refinements(t), Type::Tuple(_) | Type::Record(_)))
+            {
+                let shapes: Vec<Vec<FieldKey>> = operand_types
+                    .iter()
+                    .map(|t| product_fields(&strip_refinements(t)))
+                    .collect();
+                let components: Vec<Vec<Type>> = operand_types
+                    .iter()
+                    .map(|t| product_components(&strip_refinements(t)))
+                    .collect();
+                // Paired on the fields every operand carries. Records are width-subtyped, so
+                // an operand may arrive wider than the position's type, and its extra
+                // columns are not part of the value there — the rule the runtime comparison
+                // follows too (`crate::interpreter::binop`'s `compare_records`).
+                let shared = shapes[0]
+                    .iter()
+                    .filter(|f| shapes.iter().all(|s| s.contains(f)));
+                for field in shared {
+                    let at_field: Vec<&Type> = shapes
+                        .iter()
+                        .zip(&components)
+                        .map(|(s, c)| {
+                            let at = s.iter().position(|g| g == field).expect("shared field");
+                            &c[at]
+                        })
+                        .collect();
+                    self.require_trait(
+                        trait_,
+                        operator_node_id,
+                        &at_field,
+                        operand_exprs,
+                        None,
+                        at,
+                    )?;
+                }
+                return Ok(assoc.map(|_| self.fresh()));
+            }
             // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
             // still-`Infer` position under `Strictness::PreChannelize`) is not something
             // this rule can judge — the strictness wall decides whether a residual
