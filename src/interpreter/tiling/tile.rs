@@ -913,6 +913,51 @@ mod tests {
         assert_eq!(*domain_predicate, p1.union(&p2));
     }
 
+    /// `⊕` rejects a position the tile already holds, whatever value arrives
+    /// with it.
+    ///
+    /// `docs/operational-semantics/semantics.md`, "Integrity properties" makes
+    /// compatibility a requirement rather than a consequence: `⊕` is partial, and
+    /// a second claim on one position is a combination it does not define. Same
+    /// value or not makes no difference — the domain column carries the duplicate
+    /// either way, so [`validate_tile`] rejects it and `merge`'s closing
+    /// `debug_assert!` fires. Pinned because the alternative reading, that an
+    /// identical re-merge is a harmless no-op, holds for no tile shape here: a
+    /// `Sum` accumulator would double, and a `Scalar` would grow a second entry.
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the tile check `merge` closes with is a `debug_assert!`"
+    )]
+    #[should_panic(expected = "Invalid tile")]
+    fn merge_rejects_a_repeated_position_carrying_the_same_value() {
+        let mut tile = sf_int(vec![1], vec![10], Predicate::False);
+        tile.merge(sf_int(vec![1], vec![10], Predicate::False));
+    }
+
+    /// A store's changelog rejects a tick it already holds, for the same reason.
+    ///
+    /// The ticks are strictly ascending, so a repeat is not merely redundant: the
+    /// fold that reads the changelog resolves a tick to the latest change at or
+    /// below it, and two changes at one tick leave that undefined.
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the tile check `merge` closes with is a `debug_assert!`"
+    )]
+    #[should_panic(expected = "Invalid tile")]
+    fn merge_rejects_a_repeated_commit_tick() {
+        let store = || Tile::Store {
+            changes: ColumnValue::from_uints(vec![0]),
+            deltas: ColumnValue::Variants(vec![Value::UInt(1)]),
+            frontier: Predicate::False,
+            terminal: false,
+            closed_keys: Vec::new(),
+        };
+        let mut tile = store();
+        tile.merge(store());
+    }
+
     #[test]
     fn merge_curried_function_appends_with_correct_offsets() {
         // Group 0 (d1=0): d2=[10, 11], cod=[100, 110]

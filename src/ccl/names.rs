@@ -324,30 +324,66 @@ impl Name {
         }
     }
 
+    /// The decision-record field a `defer`'s reply rides, for the `index`-th feed
+    /// to it in one writer body.
+    ///
+    /// Double-underscored because the field shares a record with the mutable
+    /// variables, which are labeled by the author's own spelling
+    /// ([`field_key`](Self::field_key)). A tap named `to_<defer>_<n>` collided
+    /// with a variable of that spelling, and the record's last writer won: the
+    /// variable's read resolved to the tap. User code cannot bind a
+    /// double-underscore name ([`source_spelling`](Self::source_spelling)), so
+    /// minting into that namespace rules the collision out rather than checking
+    /// for it.
+    pub fn defer_tap_field(&self, index: usize) -> String {
+        format!("__to_{}_{}", self.base(), index)
+    }
+
+    /// The spelling this binder has in the source, or `None` for one the
+    /// compiler minted.
+    ///
+    /// The spelling is the test because user code cannot bind a
+    /// double-underscore name, which `lower::TUPLE_ARG_PREFIX` and the other
+    /// minted prefixes already rely on. A minted binder's identity is its uid,
+    /// and which uid it gets depends on how many the passes before it minted, so
+    /// nothing outside one compilation can address it.
+    ///
+    /// Two callers need exactly this distinction: a binder a reader can go to
+    /// ([`crate::inspector_model`]'s binder sites) and a binding whose name can
+    /// address state across a version swap
+    /// ([`VarPath`](crate::interpreter::operator_conversion::VarPath)).
+    pub fn source_spelling(&self) -> Option<&str> {
+        match self {
+            Name::Unique { base, .. } if !base.starts_with("__") => Some(base),
+            _ => None,
+        }
+    }
+
     /// This name as a **mutable variable record field label** for a
     /// [`crate::ccl::TypedExprNode::Transact`] key. A variable read of a
     /// mutable variable key projects this field of the history record
     /// (`__hist.field_key`).
     ///
-    /// It is the plain [`base`](Self::base) spelling, and deliberately carries
-    /// no `uid`. The label has to be distinct only among the keys of *one*
-    /// history record — every consumer resolves it against a `keys_map`
-    /// built per [`Transact`](crate::ccl::TypedExprNode::Transact) node, so
-    /// accumulators in sibling loops live in different records and cannot
-    /// collide. Folding the `uid` in would buy global distinctness nothing
-    /// needs, at the cost of rendering a run-varying identity into a `String`:
-    /// once a name is a record label, uid-robust comparison is impossible, and
-    /// two compilations of one source disagree. That made program diffing at
-    /// and below loop planning unusable — see `src/ccl/design/diffing.md`.
+    /// It is the plain [`base`](Self::base) spelling, and carries no `uid`. The
+    /// label has to be distinct only among the keys of one history record — every
+    /// consumer resolves it against a `keys_map` built per
+    /// [`Transact`](crate::ccl::TypedExprNode::Transact) node, so accumulators in
+    /// sibling loops live in different records and cannot collide. Folding the
+    /// `uid` in would buy global distinctness nothing needs, at the cost of
+    /// rendering a run-varying identity into a `String`: once a name is a record
+    /// label, uid-robust comparison is impossible, and two compilations of one
+    /// source disagree. That made program diffing at and below loop planning
+    /// unusable — see `src/ccl/design/diffing.md`.
     ///
-    /// The per-record uniqueness this relies on is a property of spellings, not
-    /// of construction: a key spelling is either the user's own variable name,
-    /// distinct within its block, or a label planning mints indexed by position
-    /// (`acc0`, `acc1`), and a writer's `to_<base>_<n>` taps share the record
-    /// with both. Nothing in the type system rules a collision out, so each site
-    /// that builds a record from these labels asserts distinctness in debug:
-    /// `hist_record` in `planning/loops.rs`, and the two `keys_map` inserts
-    /// in `interpreter/operator_conversion.rs`.
+    /// The per-record uniqueness this relies on is a property of spellings. A key
+    /// spelling is the user's own variable name, distinct within the block or loop
+    /// that declares it; the reply taps sharing the record are minted into the
+    /// double-underscore namespace user code cannot bind
+    /// ([`defer_tap_field`](Self::defer_tap_field)), so they cannot collide with
+    /// one. Nothing in the type system says that, so each site that builds a
+    /// record from these labels asserts distinctness in debug: `hist_record` in
+    /// `planning/loops.rs`, and the four `keys_map` inserts in
+    /// `interpreter/operator_conversion.rs`.
     pub fn field_key(&self) -> String {
         match self {
             // Not a binder, so no mutable variable is ever declared at one and

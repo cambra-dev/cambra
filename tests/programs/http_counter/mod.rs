@@ -11,9 +11,7 @@
 //! plain position-based HTTP dispatch on `String` values suffices — no
 //! `{id, payload}` records.
 
-use std::{sync::mpsc, thread, time::Duration};
-
-use super::common::{compile_sink, drive_until, http_get, http_post, reserve_test_port};
+use super::serving::{compile_sink, exchange, http_get, http_post, reserve_test_port};
 
 #[test]
 fn http_counter() {
@@ -21,18 +19,15 @@ fn http_counter() {
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
     let mut ctx = compile_sink(&source);
 
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
+    let got = exchange(&mut ctx, move || {
         // Two overwrites, then read: the live mutable variable must reflect the *latest*
         // committed value (`bob`) — not the init `(none)`, nor the first write
         // `alice`. Writes precede the read, so it isn't racing cross-endpoint
         // commit visibility.
         http_post(port, "/set", "alice");
         http_post(port, "/set", "bob");
-        tx.send(http_get(port, "/get")).unwrap();
+        http_get(port, "/get")
     });
-
-    let got = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(got, "bob");
 }
 
@@ -55,15 +50,12 @@ fn http_computed_live_read() {
     );
     let mut ctx = compile_sink(&source);
 
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
+    let got = exchange(&mut ctx, move || {
         // Overwrite to `bob`, then read the computed reply `bob!`.
         http_post(port, "/set", "alice");
         http_post(port, "/set", "bob");
-        tx.send(http_get(port, "/get")).unwrap();
+        http_get(port, "/get")
     });
-
-    let got = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(got.trim(), "bob!");
 }
 
@@ -86,12 +78,9 @@ fn http_multi_mut_var_live_read() {
     );
     let mut ctx = compile_sink(&source);
 
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
+    let got = exchange(&mut ctx, move || {
         http_post(port, "/set", "x");
-        tx.send(http_get(port, "/get")).unwrap();
+        http_get(port, "/get")
     });
-
-    let got = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(got.trim(), "xx");
 }

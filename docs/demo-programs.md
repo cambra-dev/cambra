@@ -63,8 +63,10 @@ When you add a program under [`tests/programs/`](../tests/programs/), add a
 row here.  See [tests/programs/main.rs](../tests/programs/main.rs) for the
 list of registered programs and [tests/programs/common/mod.rs](../tests/programs/common/mod.rs)
 for the helpers each `mod.rs` uses (`expect_scalar`,
-`expect_compile_error`, `expect_scalar_currently_buggy`, plus the
-HTTP-sink and subprocess utilities).
+`expect_compile_error`, `expect_scalar_currently_buggy`, and the subprocess
+utilities).  An entry that runs a program and talks to it takes
+[tests/support/serving.rs](../tests/support/serving.rs) instead, which the
+hot-reload suite shares.
 
 ## The inspector reads this gallery
 
@@ -123,6 +125,7 @@ plan and the full dependency map.
 | [discount_contract](../tests/programs/discount_contract/) | Function contract via boundary asserts | `assert` preconditions + postcondition, lift to CCL refinements, call-site discharge | 🚧 blocked | The CHL contract surface (see [the function-contracts Direction note](chl-spec.md#6-types-informal-sketch)). Parse-blocked on `assert`; behind it, the lift itself. Expected `75` once working. |
 | [nonneg_inventory](../tests/programs/nonneg_inventory/) | Stock reservation against a refined store | `Mut(Map(String, {Int where _ >= 0}), Txn)` value refinement, map literal `[k -> v]`, guarded decrement discharging it, `match`/`Option` | 🚧 blocked | The storefront's oversell invariant in isolation — deleting the guard must be a type error. Lex-blocked on the `` ` `` variant tag; behind it, the `->` map entry in the store literal. |
 | [ledger_balance](../tests/programs/ledger_balance/) | Deposit ledger + time-pinned `/balance` view | feed written inside transactions, transaction time on feed elements, `restrict(\e -> e.time < txn.current_time())`, `sum` | 🚧 blocked | Lifts `txn_kv`'s `/stats` idiom from request streams to feeds — `e.time` comes from the feed's transaction-time domain, not the feeder. Lex-blocked on the `\` lambda. |
+| [hot_reload](../tests/programs/hot_reload/) | Replace a running guestbook with an edited version of itself | `http_serve`, `:=` mutation across a reload, the control port's `/reload` | ✅ working | Two sources (`program.cambra`, `reloaded.cambra` — the diff edits the accumulating loop). The store is rebuilt and resumes from the value it held, so the entries already signed stand and the new rule governs from here. The feature's own suite is [tests/hot_reload.rs](../tests/hot_reload.rs). |
 | [storefront](../tests/programs/storefront/) | **North-star app**: transactional orders + inventory + contract-checked pricing + time-indexed revenue views, in V0 and V1 | everything the four rows above pin, plus type aliases (`Dollars`/`Qty`/`ItemPricing`/`SKU`), record refinements, a value-dependent key type, `FullMap` total lookups, `static assert`, HTTP-lib validation derived from handler types, `groupby` rollup iterated as `key -> g` entry pairs, map comprehension `[k -> v for …]`, status-code response constructors (`http.ok`/`http.not_found`/`http.conflict`, via `import http`), map-valued `/stats` response, version upgrade | 🚧 blocked | Two sources (`v0.cambra`, `v1.cambra` — the diff is the budgeted-flash-sale upgrade) under one orchestrating test; its `mod.rs` documents the full dependency list. See [the corpus policy above](#north-star-programs-and-corpus-policy). Lex-blocked on the `` ` `` variant tag. |
 
 ## Known issues surfaced by these programs
@@ -152,9 +155,11 @@ when you go to add more.
   large literal lists (replacement for the deleted `examples/slow.cambra`).
   Measures how cross-product compilation scales; ideally paired with a
   benchmark harness.
-- **Version upgrade** — the first instance now exists: `storefront` carries
-  `v0.cambra`/`v1.cambra` as two files whose diff is the upgrade, exercising
-  version dispatch over persistent transactional state at the `t_new` branch
-  point.  Still open: the `Versioned` node shape and dispatch semantics (no
-  isolating feature program yet), and long-term a v2 of *every* program (a
+- **Version upgrade** — `storefront` carries `v0.cambra`/`v1.cambra` as two
+  files whose diff is the upgrade, exercising version dispatch over persistent
+  transactional state at the `t_new` branch point, and `hot_reload` carries the
+  pair a running program is swapped between.  Replacing one version with another
+  is implemented ([hot-reload.md](../src/ccl/design/hot-reload.md)); what is
+  still open is running two at once, which is what the `Versioned` node shape
+  and its dispatch semantics are for, and long-term a v2 of *every* program (a
   diffing dimension across the corpus); branch/merge is out of scope for now.

@@ -766,22 +766,36 @@ pub(crate) fn fold(
     let mut roots: HashMap<NodeId, HashMap<NodeId, EdgeLabels>> = HashMap::new();
     let mut attr: SourceProjection = upstream_attr.clone();
 
+    // An id no row among these phases produced is reachable from itself and
+    // nothing else, whatever its place in the order. Seeding those before the
+    // sweep rather than at their place in it is what lets a row name one as an
+    // upstream regardless of age: operator conversion rows an operator it took
+    // from the version it replaces against the node that version's replacement
+    // binds it at, and that node is younger than the operator by a whole
+    // compile. Nothing else about the order relaxes — an id this fold produces
+    // is still resolved before anything may name it.
+    for &x in &vertices {
+        if table.tag_in(x, phases).is_none() {
+            roots.insert(x, HashMap::from([(x, EdgeLabels::ANCESTRY)]));
+        }
+    }
+
     for &x in &vertices {
         let Some(tag) = table.tag_in(x, phases) else {
-            // No row among these phases: an input-pane id, reachable from itself and
-            // nothing else. A node descends from itself, so the self-edge is an
-            // ancestry edge. Its upstream attribution passes through unchanged.
-            roots.insert(x, HashMap::from([(x, EdgeLabels::ANCESTRY)]));
+            // Seeded above; a node descends from itself, so the self-edge is an
+            // ancestry edge, and its upstream attribution passes through
+            // unchanged.
             continue;
         };
 
         let mut r: HashMap<NodeId, EdgeLabels> = HashMap::new();
         for (p, hop) in row_hops(table, x) {
             debug_assert!(
-                p < x,
-                "row {x:?} names the younger id {p:?} as an upstream — both columns hold \
-                 ids the rewrite read before it minted, so ascending NodeId order must be \
-                 a topological order of the definition graph",
+                p < x || table.tag_in(p, phases).is_none(),
+                "row {x:?} names the younger id {p:?} as an upstream, and this fold \
+                 produces {p:?} too — ascending NodeId order must be a topological order \
+                 of what the fold produces, so a rewrite must read an id before it mints \
+                 one",
             );
             // An upstream older than `x` is already resolved if the fold knows
             // it at all. No entry means it is neither an input-pane id nor
@@ -869,9 +883,10 @@ pub(crate) fn fold(
 /// the sweep's premise holds. Measurement-only.
 ///
 /// [`backward_edges`](Self::backward_edges) is the falsifier: ascending `NodeId`
-/// order is only a topological order if every edge runs from a smaller id to a
-/// larger one, so a non-zero count is exactly the number of vertices the sweep
-/// would have to revisit — the fixed point it claims not to need.
+/// order is only a topological order of what the fold produces if every edge
+/// between two produced ids runs from a smaller id to a larger one, so a
+/// non-zero count is exactly the number of vertices the sweep would have to
+/// revisit — the fixed point it claims not to need.
 #[cfg(test)]
 pub(crate) struct SweepMetrics {
     /// Vertices the sweep visits — and, since `roots` only ever grows, its peak
@@ -879,8 +894,10 @@ pub(crate) struct SweepMetrics {
     pub vertices: usize,
     /// Provenance edges (`upstream → node`, either label) the fold reads.
     pub edges: usize,
-    /// Edges running from a larger `NodeId` to a smaller one — the revisit
-    /// count. Must be zero.
+    /// Edges running from a larger `NodeId` to a smaller one, counting only
+    /// those whose upstream this fold produces — the revisit count. Must be
+    /// zero. An edge to an input-pane id runs backwards without costing a
+    /// revisit, because [`fold`] resolves those before the sweep.
     pub backward_edges: usize,
 }
 
@@ -898,7 +915,7 @@ pub(crate) fn sweep_metrics(
     for x in table.rows_in(phases) {
         for (p, _) in row_hops(table, x) {
             edges += 1;
-            if p >= x {
+            if p >= x && table.tag_in(p, phases).is_some() {
                 backward_edges += 1;
             }
         }

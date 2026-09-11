@@ -1642,7 +1642,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
             node_id,
         },
         // A letrec's continuation is the scope its trailing reads live in, and
-        // a channel assembled from the group's taps (`__hist ≫ .to_<feed>`)
+        // a channel assembled from the group's taps (`__hist ≫ .__to_<feed>`)
         // *captures a group binder* — so the cluster must bind BELOW the
         // group, inside its body, or the capture dangles. (Emitting above is
         // required only in the inverse case — a group binding referencing a
@@ -2645,11 +2645,11 @@ fn extract_for_defer_impl(
         } => {
             // Case branches: each branch is an inner scope.  When *some*
             // arm contains a feed for `defer_name`, we wrap each arm's
-            // terminal in `Record({result, to_<d>})` with an Empty channel
+            // terminal in `Record({result, __to_<d>})` with an Empty channel
             // for arms that don't feed (so all arms share the same Record
             // shape), and the Case's outer value becomes that Record.  The
             // surrounding scope's channel contribution is `case ▷
-            // Proj("to_<d>")` and the surrounding `result` is `case ▷
+            // Proj("__to_<d>")` and the surrounding `result` is `case ▷
             // Proj("result")`.
             //
             // For arms with feeds where the feed value references arm-local

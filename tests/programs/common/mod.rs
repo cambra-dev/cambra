@@ -64,13 +64,10 @@
 use std::{
     any::Any,
     cell::RefCell,
-    io::{Read, Write},
-    net::TcpStream,
+    io::Write,
     panic::{self, AssertUnwindSafe},
     process::{Command, Stdio},
     rc::Rc,
-    sync::mpsc,
-    time::{Duration, Instant},
 };
 
 use cambra::{
@@ -223,99 +220,6 @@ pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_subs
             stdout.contains(expected),
             "expected stdout to contain {expected:?}\nfull stdout:\n{stdout}\nstderr:\n{stderr}",
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sink programs (HTTP, etc.)
-// ---------------------------------------------------------------------------
-
-/// Compile `source` for a sink program and return the surrounding
-/// [`GlobalContext`].  Sink programs (e.g. `http_serve`) have no `main`
-/// output; their sinks bind their resources during `compile_program` and
-/// then await scheduler ticks to dispatch values.
-///
-/// The caller must keep the returned context alive (and drive its scheduler
-/// via [`drive_until`]) for the duration of the test — sinks are only
-/// serviced while the scheduler is running.
-pub fn compile_sink(source: &str) -> GlobalContext {
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let _ = compile_program(&mut ctx, source, consumer).unwrap_or_render("<test>", source);
-    ctx
-}
-
-/// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the
-/// library, behind `test-helpers`, so this crate and `tests/http_server.rs`
-/// share one implementation — see [`reserve_test_port`] for why the naive
-/// "bind `:0` and close" allocator is not safe here.
-pub use cambra::interpreter::http_server::reserve_test_port;
-
-/// Send a raw HTTP/1.1 GET request and return the response body.  Uses a
-/// plain `TcpStream` so we don't need an HTTP-client crate as a dev
-/// dependency.
-pub fn http_get(port: u16, path: &str) -> String {
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    raw_http(port, &request)
-}
-
-/// Send a raw HTTP/1.1 POST with `body` and return the response body.
-pub fn http_post(port: u16, path: &str, body: &str) -> String {
-    let request = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        len = body.len(),
-    );
-    raw_http(port, &request)
-}
-
-fn raw_http(port: u16, request: &str) -> String {
-    let mut stream =
-        TcpStream::connect(format!("127.0.0.1:{port}")).expect("failed to connect to test server");
-    stream
-        .write_all(request.as_bytes())
-        .expect("failed to write HTTP request");
-    stream.flush().unwrap();
-    let mut raw = String::new();
-    stream
-        .read_to_string(&mut raw)
-        .expect("failed to read HTTP response");
-    raw.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default()
-}
-
-/// Drive `ctx`'s scheduler on the current thread until `rx` delivers a
-/// value or `timeout` elapses.
-///
-/// HTTP sink dispatch is handled automatically by `SinkConsumer` when the
-/// scheduler notifies it; this function only needs to keep the scheduler
-/// ticking while the request-sending thread runs.
-///
-/// `check_for_notifications` has no blocking form, so the scheduler has to be
-/// pumped on a timer; `recv_timeout` supplies that cadence while still returning
-/// the instant the response lands, rather than up to a tick later.
-pub fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Duration) -> T {
-    const PUMP_INTERVAL: Duration = Duration::from_millis(10);
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        ctx.scheduler().check_for_notifications();
-        match rx.recv_timeout(PUMP_INTERVAL) {
-            Ok(value) => return value,
-            Err(mpsc::RecvTimeoutError::Timeout) => assert!(
-                Instant::now() < deadline,
-                "timed out after {timeout:?} waiting for sink response",
-            ),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("request thread dropped the channel without sending a response")
-            }
-        }
     }
 }
 

@@ -12,6 +12,8 @@
 //! For the human-facing gallery, see `docs/demo-programs.md`.
 
 mod common;
+#[path = "../support/serving.rs"]
+mod serving;
 
 mod arithmetic;
 mod defer_generators;
@@ -23,6 +25,7 @@ mod for_accumulator;
 mod generator_pipeline;
 mod groupby_filtered_rollup;
 mod groupby_rollup;
+mod hot_reload;
 mod http_accumulator;
 mod http_counter;
 mod http_greeter;

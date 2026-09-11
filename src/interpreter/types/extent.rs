@@ -284,6 +284,91 @@ pub trait DataSourceDomainExtentImpl {
     /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
     fn release(&mut self, producer: &str, obsolete: Predicate);
+    /// Record what every current producer has released, so a producer
+    /// registering with this source from now on starts there rather than at the
+    /// oldest value it still holds.
+    ///
+    /// Called when a running program is replaced
+    /// ([`LiveProgram::reload`](crate::live_program::LiveProgram::reload)). The
+    /// operators the replacement rebuilds register as new producers, and a source
+    /// hands a newly-registered one everything it has retained, so without this
+    /// the replacement recomputes the program's history instead of continuing it
+    /// and re-emits an output for every input the replaced version answered.
+    ///
+    /// What is carried is the *agreed* release — the part every producer is
+    /// finished with — so an element that arrived but went unhandled is still
+    /// delivered to whoever takes over.
+    ///
+    /// There is no default: a source that silently did not carry would replay its
+    /// history into the replacement, which reads as the program answering every
+    /// request it had already answered.
+    fn carry_release_to_new_producers(&mut self);
+
+    /// The first position a producer registering with this source from now on
+    /// will be offered.
+    ///
+    /// An induction store built over this source starts here rather than at `0`.
+    /// Its drive bases a window at the position it is handed, so a base below
+    /// what the source will offer waits for an element that is not coming. `0`
+    /// for a source that has released nothing, which is every source of a
+    /// program's first version, so this is `0` wherever there is no predecessor
+    /// to have advanced it.
+    ///
+    /// A store resuming a predecessor over this same source starts at that
+    /// store's frontier instead, which is behind this: a drive reads one position
+    /// back through its input, so the source still owes the replacement an
+    /// element the recurrence has already decided.
+    ///
+    /// A commit store asks nothing of this and starts at `0` whatever the source
+    /// has done. Its drive attempts the lowest position the source still offers
+    /// at or above its cursor, so a cursor below the frontier costs a comparison
+    /// rather than a stall
+    /// ([`TransactDriver`](crate::interpreter::commit_operator::TransactDriver)).
+    ///
+    /// There is no default, for the same reason
+    /// [`carry_release_to_new_producers`](Self::carry_release_to_new_producers)
+    /// has none: a source that answered `0` when it had advanced would base an
+    /// induction drive below every position it will offer, and the drive would
+    /// wait for an element that is not coming.
+    fn first_position_for_a_new_producer(&self) -> usize;
+
+    /// Answer whatever this source left in flight, because it will never be read
+    /// again.
+    ///
+    /// Called when the endpoint behind the source is retired
+    /// ([`SourceSinkRegistry::retire_routes_absent_from`](crate::ccl::context::SourceSinkRegistry))
+    /// — see `src/ccl/design/hot-reload.md`, "A route a version stops serving is retired".
+    /// A request that arrived before the retirement has no version left to
+    /// compute its reply, and the source holding it is kept alive past the route
+    /// by the handover a retired version's operators sit in, so nothing else ends
+    /// the client's wait.
+    ///
+    /// The default does nothing, unlike the release methods above: a source with
+    /// no client waiting on it has nothing in flight to answer.
+    fn answer_in_flight(&mut self) {}
+
+    /// Forget `producer`'s release record, because that producer is gone.
+    ///
+    /// A source outlives the version of the program reading it, and a producer
+    /// does not: replacing a program drops the operators it rebuilt. What a
+    /// producer has released constrains what the source may drop and where a
+    /// newly-registered one starts, both by intersection over every record, so a
+    /// record left behind pins that intersection at wherever a dead producer
+    /// stopped. The source then retains everything above it for the life of the
+    /// process, and hands each replacement a starting point below what its
+    /// predecessor had already handled — which reads as the program answering
+    /// requests it answered two versions ago.
+    ///
+    /// Called from the producer's own `Drop`, so the record lasts exactly as long
+    /// as the producer does. An operator carried across a reload keeps its
+    /// producer and so keeps its record, which is what stops the source dropping
+    /// data that operator has not finished with.
+    ///
+    /// There is no default, for the same reason
+    /// [`carry_release_to_new_producers`](Self::carry_release_to_new_producers)
+    /// has none: a source that silently kept the record would replay its history
+    /// into the version after next.
+    fn retire_producer(&mut self, producer: &str);
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {

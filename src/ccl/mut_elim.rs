@@ -1002,8 +1002,7 @@ struct FeedSite {
 }
 
 /// `p ▷ .i : elt_ty` — projection of a tuple-typed variable (a writer-body
-/// snapshot slot or the packed previous-values tuple). Mirrors
-/// `transact_phase`'s `proj_tuple`.
+/// snapshot slot). Mirrors `transact_phase`'s `proj_tuple`.
 fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     let mut proj = Expr::proj_index(i);
     proj.ty = Type::fun(tuple_ty.clone(), elt_ty.clone());
@@ -1012,24 +1011,25 @@ fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     app
 }
 
-/// `__hist ≫ variant_project(`commit) ≫ .writes ≫ .i : domain ⇒ vty` — the
-/// accumulator-`i` slice of the history's committing-write stream, built as one
+/// `__hist ≫ variant_project(`commit) ≫ .writes ≫ .acc : domain ⇒ vty` — one
+/// accumulator's slice of the history's committing-write stream, built as one
 /// flat compose so recognition (and the causal-slot grammar) match it
-/// structurally. The ``variant_project(`commit)`` step eliminates the ``{`commit{𝑃} | `abort}`` decision to its dense payload before the `.writes` read.
-fn writes_index_view(
+/// structurally. The write set is keyed by accumulator name, so the slice is
+/// named too. The ``variant_project(`commit)`` step eliminates the ``{`commit{𝑃} | `abort}`` decision to its dense payload before the `.writes` read.
+fn writes_key_view(
     h: &Name,
     hist_ty: &Type,
     domain_ty: &Type,
     writes_ty: &Type,
     decision_ty: &Type,
-    i: usize,
+    acc: &str,
     vty: &Type,
 ) -> Expr {
     let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
     let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
     let mut wproj = Expr::proj_field(F_WRITES);
     wproj.ty = Type::fun(payload_ty, writes_ty.clone());
-    let mut iproj = Expr::proj_index(i);
+    let mut iproj = Expr::proj_field(acc);
     iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
     let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, wproj, iproj]);
     comp.ty = Type::fun_like(hist_ty, domain_ty.clone(), vty.clone());
@@ -1046,7 +1046,7 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
 }
 
 /// `__hist ▷ variant_project(`commit) ▷ .field : domain ⇒ field_ty` — a projected
-/// view of the history's committing-decision payload (`{writes, to_<feed>*}`).
+/// view of the history's committing-decision payload (`{writes, __to_<feed>*}`).
 /// The ``variant_project(`commit)`` step eliminates the `` {`commit{𝑃} | `abort} ``
 /// decision to its dense payload before the field read.
 fn hist_field_view(
@@ -1113,7 +1113,7 @@ pub(crate) fn close_recurrence_group(
 /// Wrap `body` in one `Feed(defer, view)` per collected in-body feed, so
 /// `channelize` routes each per-position value stream to its channel. Each
 /// `view` is the feed's value stream over its contributing domain — for an
-/// induction loop, `__hist ▷ .to_<feed>` (see [`hist_field_view`]); for a `with
+/// induction loop, `__hist ▷ .__to_<feed>` (see [`hist_field_view`]); for a `with
 /// begin():` block, a commit-record tap binding. Both the mutation-loop phase
 /// and the transaction phase collect their feeds differently but hoist them
 /// through this one routine.
@@ -1145,21 +1145,21 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
 /// `transact_phase` emits for a commit decision:
 ///
 /// ```text
-/// __hist : D ⇒ {`commit{writes: (V₀, …), to_<feed>*} | `abort} =
-///   λ r → let __prev = get_prev_seq((__hist ≫ variant_project(`commit) ≫ .writes, r, (init₀, …)))
-///         in (__prev.0, …, r ▷ iter) ▷ (λ __p → ⟨RYW chain over __p⟩
-///                                       ending in `commit(⟨writes, to_*⟩) | `abort)
+/// __hist : D ⇒ {`commit{writes: {acc₀: V₀, …}, __to_<feed>*} | `abort} =
+///   λ r → let __prev = get_prev_seq((__hist ≫ variant_project(`commit) ≫ .writes, r, (acc₀: init₀, …)))
+///         in (__prev.acc₀, …, r ▷ iter) ▷ (λ __p → ⟨RYW chain over __p⟩
+///                                       ending in `commit(⟨writes, __to_*⟩) | `abort)
 /// ```
 ///
 /// Factoring here — where the pointful information exists — is what lets
 /// induction and transaction bindings share ONE post-`lambda_elim` normal
 /// form (`(guard, source) ▷ zip ≫ body`), so recognition splits snapshot
 /// from body structurally and never rebuilds either. `writes` is always a
-/// positional tuple (one element even for a single accumulator), matching
-/// the transaction decision convention; the guard reads the *writes
+/// record keyed by the variable written, matching the transaction decision
+/// convention; the guard reads the *writes
 /// projection* of the history (causal — see `check_letrec_causal`); each
-/// feed rides the decision as a `to_<feed>` field, hoisted to
-/// `Feed(defer, __hist ≫ .to_<feed>)` for `channelize` to route.
+/// feed rides the decision as a `__to_<feed>` field, hoisted to
+/// `Feed(defer, __hist ≫ .__to_<feed>)` for `channelize` to route.
 fn transform_loop(
     loop_site: StmtSite,
     target: TypedBinding,
@@ -1247,11 +1247,11 @@ fn transform_loop(
 /// One accumulating mutable variable of an induction loop: the variable, the value
 /// type its recurrence slot carries, and every write to it in the loop body.
 ///
-/// One entry per variable, not per write. The entry's position in
-/// [`InductionFold::accs`] is the variable's slot index in the decision write set
-/// (`writes.i`), so a variable the body writes five times holds one slot and one
-/// entry, and [`collect_writes`]'s traversal order fixes both the index and the
-/// order of `writes`.
+/// One entry per variable, not per write. The variable's own `field_key` labels
+/// its slot in the decision write set (`writes.acc`), so a variable the body
+/// writes five times holds one slot and one entry, and [`collect_writes`]'s
+/// traversal order fixes only the layout of `writes`, not which slot is which
+/// variable.
 pub(crate) struct AccumulatorVariable {
     pub name: Name,
     pub ty: Type,
@@ -1299,7 +1299,7 @@ impl AccumulatorVariable {
 /// read). The caller applies `renames` to its continuation, recurses, prepends
 /// `reads`, and hoists `feed_views`. The `hist`/type/`accs` fields let the
 /// transaction phase synthesize a per-position accumulator read
-/// (`__hist ≫ .writes ≫ .i` applied at a position).
+/// (`__hist ≫ .writes ≫ .acc` applied at a position).
 pub(crate) struct InductionFold {
     /// `(__hist, λ r → …)` — the guarded induction history binding.
     pub binding: (TypedBinding, Expr),
@@ -1316,12 +1316,15 @@ pub(crate) struct InductionFold {
     pub domain_ty: Type,
     pub writes_ty: Type,
     pub decision_ty: Type,
-    /// Accumulating variables in first-write order (index `i` ↦ `writes.i`).
+    /// Accumulating variables in first-write order. The order is the layout; a
+    /// variable's slot in the write set is named by its `field_key`
+    /// (`writes.acc`), not by its position here.
     pub accs: Vec<AccumulatorVariable>,
 }
 
 impl InductionFold {
-    /// `__hist ≫ .writes ≫ .i : domain ⇒ vty` — accumulator `i`'s value stream.
+    /// `__hist ≫ .writes ≫ .acc : domain ⇒ vty` — accumulator `i`'s value stream,
+    /// read by the name it declares rather than by `i`.
     /// A per-position cross-domain read of that accumulator (`acc(pos)`) is this
     /// applied at `pos`; the transaction phase uses it to resolve a `commits(r)`
     /// decision that reads an induction accumulator at its request position.
@@ -1335,13 +1338,13 @@ impl InductionFold {
     pub(crate) fn acc_view(&self, i: usize) -> Expr {
         let acc = &self.accs[i];
         let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
-        writes_index_view(
+        writes_key_view(
             &self.hist,
             &self.hist_ty,
             &self.domain_ty,
             &self.writes_ty,
             &self.decision_ty,
-            i,
+            &acc.name.field_key(),
             &acc.ty,
         )
     }
@@ -1368,9 +1371,19 @@ pub(crate) fn fold_induction_loop(
 
     let (domain_ty, item_ty) = fun_parts(&iter.ty);
     let acc_tys: Vec<Type> = accs.iter().map(|a| a.ty.clone()).collect();
-    // The proposed write set — always a positional tuple, one element even
-    // for a single accumulator (the transaction decision convention).
-    let writes_ty = Type::Tuple(acc_tys.clone());
+    // The proposed write set, labelled by the accumulators' own names. A
+    // positional tuple reads the same everywhere downstream and costs nothing
+    // here, but the labels are the only record of which variable a slot belongs
+    // to: `planning::plan_loops` is handed this and nothing else, so an
+    // unlabelled write set leaves it inventing `acc0`/`acc1` from position, and
+    // a slot identified only by position cannot be matched back to its variable
+    // by anything downstream — including a second compilation of the same
+    // program, which is what makes the labels worth carrying.
+    let writes_ty = Type::Record(
+        accs.iter()
+            .map(|a| (a.name.field_key(), a.ty.clone()))
+            .collect(),
+    );
 
     let h = Name::fresh("__hist");
     let r = Name::fresh("__pos");
@@ -1418,7 +1431,7 @@ pub(crate) fn fold_induction_loop(
         loop_body, &mut env, &accs, &writes_ty, &entering, &spine, &mut feeds,
     );
     let chain = attach_feed_fields(chain, &feeds);
-    // Wrap the assembled `{commit, writes, to_<feed>*}` record into the decision
+    // Wrap the assembled `{commit, writes, __to_<feed>*}` record into the decision
     // **variant** `` Case[commit → `commit(⟨writes, taps⟩); true → `abort] ``: a
     // committing position appends the (dense) `commit` payload, a full-carry
     // (non-writing) position `` `abort ``s — the changelog stays sparse at the
@@ -1427,7 +1440,7 @@ pub(crate) fn fold_induction_loop(
 
     // The decision codomain is exactly the record `attach_feed_fields` built (its
     // type propagates through the RYW `let`s), so `hist_ty`/the body lambda match
-    // it by construction — no separate reconstruction of the `to_<feed>` field set
+    // it by construction — no separate reconstruction of the `__to_<feed>` field set
     // (which would have to re-derive the same fire conditions).
     let decision_ty = chain.ty.clone();
     // The recurrence binds the loop's history, so it is a collection — and a `Type::fun`
@@ -1440,18 +1453,19 @@ pub(crate) fn fold_induction_loop(
     body_lam.ty = Type::fun(p_ty.clone(), decision_ty.clone());
 
     // The recurrence guard reads the *writes projection* of the history:
-    // `get_prev_seq((__hist ≫ .writes, r, (init₀, …)))` — a projection of the
-    // history is a causal reference (see `check_letrec_causal`); the
-    // defaults are the accumulators' pre-loop bindings, tupled.
+    // `get_prev_seq((__hist ≫ .writes, r, (acc₀: init₀, …)))` — a projection of
+    // the history is a causal reference (see `check_letrec_causal`); the defaults
+    // are the accumulators' pre-loop bindings, under the same labels as the write
+    // set they default.
     let writes_view = hist_field_view(&h, &hist_ty, &domain_ty, F_WRITES, &writes_ty, &decision_ty);
-    let seeds: Vec<Expr> = accs
+    let seeds: Vec<(String, Expr)> = accs
         .iter()
         .map(|a| {
             let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
-            tvar(&a.name, a.ty.clone())
+            (a.name.field_key(), tvar(&a.name, a.ty.clone()))
         })
         .collect();
-    let mut defaults = Expr::tuple(seeds);
+    let mut defaults = Expr::new(TypedExprNode::Record(seeds));
     defaults.ty = writes_ty.clone();
     let guard = {
         let mut arg = Expr::tuple(vec![writes_view, tvar(&r, domain_ty.clone()), defaults]);
@@ -1467,13 +1481,19 @@ pub(crate) fn fold_induction_loop(
         app
     };
 
-    // λ r → let __prev = ⟨guard⟩ in (__prev.0, …, r ▷ iter) ▷ __body
+    // λ r → let __prev = ⟨guard⟩ in (__prev.acc₀, …, r ▷ iter) ▷ __body.
+    // The previous values are the write set, so they are read by accumulator
+    // name; the body's parameter stays a positional tuple, which is what
+    // `transact_phase::build_writer` and the drive both build.
     let mut snap_elts: Vec<Expr> = accs
         .iter()
-        .enumerate()
-        .map(|(i, a)| {
+        .map(|a| {
             let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
-            proj_of(&prev, &writes_ty, i, &acc_tys[i])
+            let mut proj = Expr::proj_field(a.name.field_key());
+            proj.ty = Type::fun(writes_ty.clone(), a.ty.clone());
+            let mut app = Expr::apply(tvar(&prev, writes_ty.clone()), proj);
+            app.ty = a.ty.clone();
+            app
         })
         .collect();
     let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
@@ -1488,16 +1508,24 @@ pub(crate) fn fold_induction_loop(
     lambda.ty = hist_ty.clone();
 
     // Trailing reads: one extracted final value per accumulator —
-    // `(__hist ≫ .writes ≫ .i, x0) ▷ final_or_default` — paired with the
+    // `(__hist ≫ .writes ≫ .acc, x0) ▷ final_or_default` — paired with the
     // `(acc → fresh-final)` rename the caller applies to its continuation (so a
     // later loop over the same variable accumulates from the extracted value).
     // The read's default is the accumulator's pre-loop binding.
     let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
     let mut renames: Vec<(Name, Name)> = Vec::new();
-    for (i, acc) in accs.iter().enumerate() {
+    for acc in accs.iter() {
         let _g = acc.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
         let vty = &acc.ty;
-        let view = writes_index_view(&h, &hist_ty, &domain_ty, &writes_ty, &decision_ty, i, vty);
+        let view = writes_key_view(
+            &h,
+            &hist_ty,
+            &domain_ty,
+            &writes_ty,
+            &decision_ty,
+            &acc.name.field_key(),
+            vty,
+        );
         let view_ty = view.ty.clone();
         let mut arg = Expr::tuple(vec![view, tvar(&acc.name, vty.clone())]);
         arg.ty = Type::Tuple(vec![view_ty, vty.clone()]);
@@ -1511,7 +1539,7 @@ pub(crate) fn fold_induction_loop(
         reads.push((binding(x_final, vty.clone()), read));
     }
 
-    // Each in-loop feed as a hoistable `(defer, __hist ▷ .to_<feed>)` view, in
+    // Each in-loop feed as a hoistable `(defer, __hist ▷ .__to_<feed>)` view, in
     // source order (`hoist_feeds` preserves it).
     let feed_views = feeds
         .iter()
@@ -1862,7 +1890,7 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
 /// becomes a fresh shadowing `Let` that advances the environment, each
 /// `Feed` records its (env-resolved) value into `feeds` and drops out of the
 /// chain, and the terminal `Unit` becomes the writer decision record
-/// `{commit: true, writes: (…), to_<feed>*}`.
+/// `{commit: true, writes: {acc: …}, __to_<feed>*}`.
 fn transform_chain(
     expr: Expr,
     env: &mut HashMap<Name, Expr>,
@@ -2008,14 +2036,14 @@ fn transform_chain(
                     transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
                 }
                 // A feed is captured (value resolved in the current env) and
-                // dropped from the chain; it becomes a `to_<feed>` field on
+                // dropped from the chain; it becomes a `__to_<feed>` field on
                 // the decision record, hoisted out of the loop by the caller. Its
                 // `fire` is the current control-flow path — `true` on the spine, a
                 // guard conjunction inside an `if`.
                 TypedExprNode::Feed { name, value } => {
                     let site = StmtSite::new(stmt_id, effect_id);
                     let val = Subst::discharge_env_in_place(*value, env);
-                    let field = format!("to_{}_{}", name.base(), feeds.len());
+                    let field = name.defer_tap_field(feeds.len());
                     feeds.push(FeedSite {
                         defer: name,
                         field,
@@ -2055,8 +2083,8 @@ fn transform_chain(
         }
         TypedExprNode::Lit(Lit::Unit) => {
             // Terminal: the bare always-commit decision `{commit: true, writes:
-            // (…)}` — the latest value of each accumulator as the positional write
-            // set (one element even for a single accumulator). The `to_<feed>` tap
+            // {acc: …}}` — the latest value of each accumulator, which
+            // `decision_record` labels from `writes_ty`. The `__to_<feed>` tap
             // fields are attached once at the top from the fully-collected `feeds`
             // (see `attach_feed_fields`), which also
             // folds each conditional feed's fire path into the commit gate — so a
@@ -2067,20 +2095,10 @@ fn transform_chain(
                     .expect("letrec phase: accumulator missing from RYW environment")
                     .clone()
             };
-            let mut writes = Expr::tuple(accs.iter().map(|a| current(&a.name)).collect());
-            writes.ty = writes_ty.clone();
+            let write_elts: Vec<Expr> = accs.iter().map(|a| current(&a.name)).collect();
             let mut commit = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
             commit.ty = Type::Base(BaseType::Bool);
-            decision_record(
-                commit,
-                {
-                    let TypedExprNode::Tuple(elts) = writes.node else {
-                        unreachable!("writes is a tuple")
-                    };
-                    elts
-                },
-                writes_ty,
-            )
+            decision_record(commit, write_elts, writes_ty)
         }
         other => panic!(
             "letrec phase: unexpected node in loop-body chain: {}",
@@ -2089,7 +2107,7 @@ fn transform_chain(
     }
 }
 
-/// The `writes` tuple elements of a `{commit, writes(, to_*)}` decision record
+/// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
 /// (as [`transform_chain`] builds it) — one *self-contained* expression per
 /// accumulator, in accumulator order. A branch's write introduces RYW `let`s
 /// (`let total = __p.0 + __p.1 in {…, writes: (total)}`) that the merged
@@ -2114,12 +2132,12 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
                     .find(|(f, _)| f == F_WRITES)
                     .expect("letrec phase: a writer decision has a `writes` field")
                     .1;
-                let TypedExprNode::Tuple(elts) = &writes.node else {
-                    panic!("letrec phase: a decision `writes` is a positional tuple");
+                let TypedExprNode::Record(elts) = &writes.node else {
+                    panic!("letrec phase: a decision `writes` is keyed by accumulator");
                 };
                 return elts
                     .iter()
-                    .map(|e| Subst::discharge_env_in_place(e.clone(), &env))
+                    .map(|(_, e)| Subst::discharge_env_in_place(e.clone(), &env))
                     .collect();
             }
             _ => panic!(
@@ -2206,9 +2224,26 @@ fn conditional_decision(
     decision_record(commit, write_elts, writes_ty)
 }
 
-/// Assemble a writer decision record `{commit, writes: (write_elts…)}`.
+/// Assemble a writer decision record `{commit, writes: {acc: e, …}}`.
+///
+/// The write set's labels come from `writes_ty`, which is where the
+/// accumulators' names live once [`fold_induction_loop`] has built it.
 fn decision_record(commit: Expr, write_elts: Vec<Expr>, writes_ty: &Type) -> Expr {
-    let mut writes = Expr::tuple(write_elts);
+    let Type::Record(fields) = writes_ty else {
+        panic!("decision write set is a record keyed by accumulator name, got {writes_ty}");
+    };
+    assert_eq!(
+        fields.len(),
+        write_elts.len(),
+        "one written value per accumulator"
+    );
+    let mut writes = Expr::new(TypedExprNode::Record(
+        fields
+            .iter()
+            .map(|(label, _)| label.clone())
+            .zip(write_elts)
+            .collect(),
+    ));
     writes.ty = writes_ty.clone();
     let mut rec = Expr::new(TypedExprNode::Record(vec![
         (COMMIT_SELECTOR.to_string(), commit),
@@ -2242,9 +2277,9 @@ fn is_true_lit(e: &Expr) -> bool {
 }
 
 /// Attach the collected feeds to a writer decision `let* in {commit, writes}`,
-/// producing `let* in {commit', writes, to_<feed>*}`:
+/// producing `let* in {commit', writes, __to_<feed>*}`:
 ///
-/// - each feed contributes a `to_<feed>` tap field, holding
+/// - each feed contributes a `__to_<feed>` tap field, holding
 ///   `` {`fired{𝑉} | `idle} ``;
 /// - a **conditional** feed (`fire ≠ true`) is `` `fired `` only on its own route,
 ///   which the engine reads (`body_decision_at`) to emit the reply there; a spine

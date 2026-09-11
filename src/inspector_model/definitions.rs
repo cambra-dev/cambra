@@ -100,14 +100,12 @@ const UNCURRY_PROJ: &str = "lower.uncurry_proj";
 fn collect_binder_sites(expr: &Expr, projection: &SourceProjection, out: &mut HashMap<Uid, Span>) {
     if let Some(span) = node_span(expr, projection) {
         expr.walk_binders(|b| {
-            // Lowering's own binders are not names a reader can go to. User code
-            // cannot bind a double-underscore name (`lower::TUPLE_ARG_PREFIX` and
-            // the other minted prefixes rely on that), so the spelling is the
-            // test. Without it the tupled binder's own occurrences would emit a
-            // second row at a parameter's use span, competing with the
-            // projection's.
-            if let Name::Unique { uid, base } = &b.name
-                && !base.starts_with("__")
+            // Lowering's own binders are not names a reader can go to
+            // ([`Name::source_spelling`]). Without the test the tupled binder's
+            // own occurrences would emit a second row at a parameter's use span,
+            // competing with the projection's.
+            if let Name::Unique { uid, .. } = &b.name
+                && b.name.source_spelling().is_some()
             {
                 // A uid may sit at several binding sites: lowering copies
                 // pre-minted subtrees, and each copy keeps the uid. Those copies

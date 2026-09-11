@@ -28,7 +28,10 @@ Concretely:
   docs for the contract — but the data on the wire is still a [`Tile`].
   A cyclic pull is served the fan's cached snapshot rather than
   re-entering the inner producer, which is why such a cycle advances one
-  step per outer pull.
+  step per outer pull.  The branch that closes the cycle is a
+  `FanOut::recurrence_branch`, which does not own the fan: an owning
+  handle taken from inside the fan's own input chain retains that whole
+  subgraph for the life of the process — see [`FanHold`].
 - Constructor-time wiring (a [`CycleSlot`], filled through its
   `setter` once the rest of the cycle exists) passes `TileOperator`
   handles, not raw values.  The operator graph is static; values flow
@@ -56,10 +59,14 @@ Concretely:
   emit a different value at `d` later.  Recomputing because "the
   upstream changed" is not a thing — upstream tiles only grow.
 - `Tile::merge` is `⊕` from the semantics: it combines disjoint
-  information.  Merging the same position twice with different values
-  is a bug.  Merging the same position with the *same* value is
-  allowed if you can't easily avoid it (idempotent), but prefer
-  releasing before re-emitting if you find yourself doing this.
+  information.  Merging a position the tile already holds is a bug
+  whether or not the value matches, and `merge` closes with a
+  `debug_assert!` on `validate_tile` that rejects it for every shape
+  that can see it — a duplicate domain entry in a function tile, a
+  repeated commit tick in a store's changelog.  Release before
+  re-emitting.  A tile's join-shaped components combine idempotently
+  and that is `∨`, not `⊕`: a store's frontier, its terminality and
+  its closed keys, and a `Max` or `Drain` accumulator.
 - `release` is the *only* operation that shrinks a tile.  It removes
   data from the producer's view (and the consumer's), but the
   consumer has already extracted whatever value it needed before

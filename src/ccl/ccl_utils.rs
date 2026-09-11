@@ -13,7 +13,7 @@ use crate::ccl::{
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
-/// writer phases build (`{commit, writes, to_<defer>*}`) *before*
+/// writer phases build (`{commit, writes, __to_<defer>*}`) *before*
 /// [`wrap_decision_variant`] folds it into the `` {`commit{𝑃} | `abort} `` variant.
 /// The whole-transaction grant/deny is no longer a decision-codomain field — it
 /// is the variant *tag* — so this constant is phase-internal plumbing, not part
@@ -77,7 +77,7 @@ pub(crate) fn unit_expr() -> Expr {
 ///
 /// The scrutinee is substituted too, not bound. Each consumer lifts a
 /// sub-expression out of the arm — the fan-out composes the arm's feed value onto
-/// a refined source, the writer hoists it into a `to_<feed>` decision field — so a
+/// a refined source, the writer hoists it into a `__to_<feed>` decision field — so a
 /// `let` inside the arm strands its binder there, and a `let` around the `Case`
 /// puts its name in the write set, where it escapes the writer lambda. A loop's
 /// `match` scrutinee is the iteration variable or a projection of it, so the
@@ -146,7 +146,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
     rebuilt
 }
 
-/// Assemble a writer **decision record** `{commit, writes, to_<feed>, …}` — the
+/// Assemble a writer **decision record** `{commit, writes, __to_<feed>, …}` — the
 /// single encoding of the tap protocol shared by the
 /// transaction writer ([`crate::ccl::transact_phase`]) and the induction writer
 /// ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the same
@@ -261,7 +261,7 @@ fn tap_gated(fire: Expr, value: Expr) -> Expr {
 }
 
 /// The decision **variant** type `` {`commit{𝑃} | `abort} `` over a (dense) payload
-/// record type `𝑃` (`{writes, to_<defer>*}`). Tag order is `commit`=0, `abort`=1
+/// record type `𝑃` (`{writes, __to_<defer>*}`). Tag order is `commit`=0, `abort`=1
 /// — the positions [`wrap_decision_variant`] injects and `body_decision_at`
 /// decodes.
 pub fn decision_variant_ty(payload_ty: Type) -> Type {
@@ -307,7 +307,7 @@ pub fn commit_payload_ty(decision_ty: &Type) -> Type {
 }
 
 /// The point-free one-arm eliminator ``variant_project(`commit) : 𝑑 ⇒ 𝑃`` reading a
-/// decision stream's `commit` payload — inserted before a `.writes`/`.to_<defer>`
+/// decision stream's `commit` payload — inserted before a `.writes`/`.__to_<defer>`
 /// read so a `` Fun(D, {`commit{𝑃} | `abort}) `` history projects its committing
 /// payload. (`abort` positions carry no payload and drop out of the eliminated
 /// stream; a read is only meaningful at committing positions.)
@@ -353,7 +353,7 @@ pub(crate) fn statement_tag_cases_to_guards(expr: Expr) -> Expr {
 }
 
 /// The point-free one-arm eliminator ``variant_project(`fired) : {`fired{𝑉} |
-/// `idle} ⇒ 𝑉`` reading a tap stream's fed value — appended after a `.to_<defer>`
+/// `idle} ⇒ 𝑉`` reading a tap stream's fed value — appended after a `.__to_<defer>`
 /// read so the channel carries the positions the tap fired at.
 ///
 /// The restriction is the point: a channel assembled from a tap holds what the
@@ -367,9 +367,9 @@ pub fn fired_project(value_ty: Type) -> Expr {
         .with_ty(Type::fun(tap_ty, value_ty))
 }
 
-/// Wrap a writer **decision record** `{commit, writes, to_<defer>*}` (the
+/// Wrap a writer **decision record** `{commit, writes, __to_<defer>*}` (the
 /// intermediate the two phases build via [`writer_decision_record`]) into the
-/// **decision variant** `Case[ commit → .commit(⟨writes, to_<defer>*⟩) ; true →
+/// **decision variant** `Case[ commit → .commit(⟨writes, __to_<defer>*⟩) ; true →
 /// `abort(unit) ]``. The `commit` field becomes the value-`Case` **selector** (its
 /// disjunction of path conditions) rather than a stored field; the remaining
 /// fields are the (dense) `commit` payload. This is the single site both the
@@ -400,7 +400,7 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             let bool_ty = Type::Base(BaseType::Bool);
             let unit_ty = Type::Base(BaseType::Unit);
             // Split the `commit` selector out from the payload fields (everything
-            // else — `writes` and the `to_<defer>*` taps, in order).
+            // else — `writes` and the `__to_<defer>*` taps, in order).
             let mut commit: Option<Expr> = None;
             let mut payload_fields: Vec<(String, Expr)> = Vec::with_capacity(fields.len());
             for (k, v) in fields {
@@ -1593,6 +1593,55 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
     }
     let mut out = HashSet::new();
     go(expr, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Every name free in `expr`, in its term structure **and** inside the
+/// refinement predicates riding its type slots — the set counterpart of
+/// [`is_free`], as [`free_names_in_value`] is of [`is_free_in_value`].
+///
+/// Answers "which bindings does this term read?" for a caller that must decide
+/// something for all of them at once and would otherwise walk the term once per
+/// candidate name. Predicates count because a term can depend on a binding
+/// through one: a refinement is a term in a type position, and a domain
+/// restriction built from it reaches the operator graph.
+///
+/// Self-referential predicates terminate on the same `visited` discipline as
+/// [`count_free`], and the refinement element binder is excluded in type
+/// position for the reason given on [`count_free_in_type_with_visited`].
+pub fn free_names(expr: &Expr) -> HashSet<Name> {
+    fn go(
+        e: &Expr,
+        bound: &mut Vec<Name>,
+        visited: &mut HashSet<PredicateId>,
+        out: &mut HashSet<Name>,
+    ) {
+        e.walk_type_slots(|ty| {
+            walk_refined_predicates(ty, visited, &mut |pred, vis| {
+                // A binder's declared type sits in the enclosing scope, so the
+                // predicate is walked under the binders in force *here*.
+                let mut inner = HashSet::new();
+                go(pred, bound, vis, &mut inner);
+                out.extend(inner.into_iter().filter(|n| !n.is_elem()));
+            });
+        });
+        for_each_scoped_item(e, &mut |item| match item {
+            ScopedItem::VarRef(n) => {
+                if !bound.contains(n) {
+                    out.insert(n.clone());
+                }
+            }
+            ScopedItem::KeyRef(_) => {}
+            ScopedItem::Child { expr, binders } => {
+                let depth = bound.len();
+                bound.extend(binders.iter().map(|b| b.name.clone()));
+                go(expr, bound, visited, out);
+                bound.truncate(depth);
+            }
+        });
+    }
+    let mut out = HashSet::new();
+    go(expr, &mut Vec::new(), &mut HashSet::new(), &mut out);
     out
 }
 

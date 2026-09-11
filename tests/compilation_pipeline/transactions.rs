@@ -588,7 +588,7 @@ fn string_valued_store() {
 
 /// One writer feeds *two* distinct reply streams inside the same block; the
 /// program returns both as a tuple. Each rides the writer decision as its own
-/// `to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
+/// `__to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
 /// of squares) = 1,5,14 over commit ticks 1,2,3.
 #[test]
 fn two_reply_feeds_one_transaction() {
@@ -1676,10 +1676,7 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
                 b := b + y
         (await_final(a), await_final(b))
     "#};
-    assert_eq!(
-        commit_stores(code),
-        vec!["[0, 1][acc0]", "Txn[a]", "Txn[b]"]
-    );
+    assert_eq!(commit_stores(code), vec!["[0, 1][cnt]", "Txn[a]", "Txn[b]"]);
     check_tile(
         code,
         Tile::Record(std::collections::HashMap::from([
@@ -1739,10 +1736,7 @@ fn a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store() {
                 b := b + acc
         await_final(b)
     "#};
-    assert_eq!(
-        commit_stores(code),
-        vec!["Txn[a]", "[0, 1][acc0]", "Txn[b]"]
-    );
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "[0, 1][acc]", "Txn[b]"]);
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![92])));
 }
 

@@ -16,6 +16,29 @@ use crate::helpers::*;
 #[timeout(Duration::from_secs(10))]
 #[case::feed_list("x = defer(); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
 #[case::feed_scalar_to_defer("x = defer(); x << 1; x", Tile::SealedFunction { domain: ColumnValue::Units(1), codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
+// An accumulator spelled like the tap its own loop's feed rides. The regression
+// these pin: a tap was named `to_<defer>_<n>`, which is a spelling user code can
+// write, and the tap and the accumulator share one decision record — so the
+// record's last writer won and the accumulator's read resolved to the reply's
+// value (`300` here, in release; an internal panic in debug). Taps are now minted
+// into the double-underscore namespace user code cannot bind
+// (`Name::defer_tap_field`).
+#[case::accumulator_spelled_like_its_tap(
+r#"to_o_0 := 0
+o = defer()
+for l in [1, 2, 3]:
+    to_o_0 := to_o_0 + l
+    o << l * 100
+to_o_0"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
+// The same for a tap's `__fire` companion, which shares the record too.
+#[case::accumulator_spelled_like_its_taps_fire_gate(
+r#"to_o_0__fire := 0
+o = defer()
+for l in [1, 2, 3]:
+    to_o_0__fire := to_o_0__fire + l
+    if l > 1:
+        o << l * 100
+to_o_0__fire"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
 #[case::feed_in_comprehension("x = defer(); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
 #[case::feed_in_for_loop(
 r#"x = defer()
@@ -412,7 +435,7 @@ fn scalar_define_into_defer_is_rejected() {
 
 /// Type errors in defer programs are reported against the *user's* program
 /// shape: inference now runs before `channelize`, so the rendered
-/// message must not leak channelize artifacts (floated parameters, `to_<defer>`
+/// message must not leak channelize artifacts (floated parameters, `__to_<defer>`
 /// record fields, channel unions, scope-out bindings).
 #[rstest]
 #[timeout(Duration::from_secs(1))]

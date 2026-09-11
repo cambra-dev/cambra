@@ -279,7 +279,7 @@ enum TxnBinding {
     History,
     /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩ ▷ zip`.
     Commit,
-    /// `to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field`.
+    /// `__to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field`.
     Tap,
 }
 
@@ -514,7 +514,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         }
     }
 
-    // Variable record `{key.field_key(): Fun(Txn, V), …, to_<defer>: Fun(Txn, V)}`
+    // Variable record `{key.field_key(): Fun(Txn, V), …, __to_<defer>: Fun(Txn, V)}`
     // — mutable variable keys (key order) then tap virtual keys (feed order), the exact
     // field order op-conversion\'s `emit_transact`/`build_commit_store` produce.
     let mut hist_field_tys: Vec<(String, Type)> = key_ty
@@ -643,9 +643,10 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
 /// ```
 ///
 /// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
-/// defaults tuple; the source off the snapshot\'s trailing slot. Reads of
-/// `__hist` in the letrec body (`__hist ≫ .writes ≫ .i` extracts and
-/// `__hist ≫ .to_<feed>` taps) become history-record projections.
+/// defaults record, under the accumulators\' own labels; the source off the
+/// snapshot\'s trailing slot. Reads of `__hist` in the letrec body
+/// (`__hist ≫ .writes ≫ .acc` extracts and `__hist ≫ .__to_<feed>` taps) become
+/// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
     // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
@@ -676,8 +677,8 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         matches!(which, Builtin::GetPrevSeq),
         "letrec recognition: induction history causal by get_prev_txn"
     );
-    let TypedExprNode::Tuple(inits) = defaults.node else {
-        panic!("letrec recognition: guard defaults are not the tupled inits");
+    let TypedExprNode::Record(inits) = defaults.node else {
+        panic!("letrec recognition: guard defaults are not the accumulators' inits record");
     };
 
     let (prev_slots, source, writer_body) = split_decision_compose(*applied, &decision_ty);
@@ -694,18 +695,16 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         })
         .collect();
 
-    // One mutable variable key per accumulator. Every read is positional
-    // (`__hist ≫ .writes ≫ .i`), so these names carry no meaning beyond
-    // labelling the mutable variable record — but the label still has to be
-    // distinct *within* that record, and `field_key` is the plain spelling. So
-    // index by position: a shared `"acc"` base would collapse two accumulators
-    // onto one field, and position is the one distinguisher that is also stable
-    // across compilations, which uid-free labels require.
+    // One store key per accumulator, under the name the program gave it.
+    // `mut_elim` labels the write set by `field_key`, so the accumulators arrive
+    // named and stay named: a read is `__hist ≫ .writes ≫ .acc`, the history
+    // record is keyed the same way, and two compilations of one program agree on
+    // which slot is which variable — which is what lets a replacement version
+    // resume an accumulator rather than guess by position.
     let keys: Vec<TransactKey> = inits
         .into_iter()
-        .enumerate()
-        .map(|(i, init)| TransactKey {
-            name: Name::fresh(format!("acc{i}")),
+        .map(|(label, init)| TransactKey {
+            name: Name::fresh(label),
             init,
         })
         .collect();
@@ -779,8 +778,8 @@ fn hist_field_read(hist: &Name, hist_ty: &Type, field: String, field_ty: Type) -
 
 /// Rewrite every `__hist` view in the letrec body to a history-record
 /// projection `__hist.field`. The phase builds accumulator reads as the flat
-/// compose `__hist ≫ .writes ≫ .i` and feed reads as `__hist ≫ .to_<feed>`;
-/// downstream normalization may extend those composes (`__hist ≫ .to ≫ f`),
+/// compose `__hist ≫ .writes ≫ .acc` and feed reads as `__hist ≫ .__to_<feed>`;
+/// downstream normalization may extend those composes (`__hist ≫ .__to ≫ f`),
 /// so the match is on the *prefix*, keeping any tail elements.
 fn rewrite_hist_reads(
     e: &mut Expr,
@@ -794,7 +793,7 @@ fn rewrite_hist_reads(
     if let TypedExprNode::Compose(elts) = &e.node
         && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
         // The phase now interposes a ``variant_project(`commit)`` step between the
-        // history var and the `.writes`/`.to_<feed>` reads, eliminating the
+        // history var and the `.writes`/`.__to_<feed>` reads, eliminating the
         // `` {`commit{𝑃} | `abort} `` decision to its dense payload. Skip it, then
         // match the payload-field prefix as before (`elts[2]`/`elts[3]`).
         && matches!(
@@ -815,16 +814,25 @@ fn rewrite_hist_reads(
         // elements the prefix covered (the `variant_project` step included).
         let replacement: Option<(Expr, usize)> =
             match (elts.get(2).map(|x| &x.node), elts.get(3).map(|x| &x.node)) {
+                // An accumulator read `` __hist ≫ variant_project(`commit) ≫
+                // .writes ≫ .acc ``. Both projections are named now that the
+                // write set is keyed by accumulator, so `.writes` on the outer
+                // one is what tells this from a tap read.
                 (
                     Some(TypedExprNode::Proj(ProjKey::Field(f))),
-                    Some(TypedExprNode::Proj(ProjKey::Index(i))),
+                    Some(TypedExprNode::Proj(ProjKey::Field(acc))),
                 ) if f == F_WRITES => {
-                    let field = keys[*i].field_key();
-                    let field_ty = crate::ccl::ccl_utils::history_ty(domain_ty, &acc_tys[*i]);
-                    Some((hist_field_read(hist, hist_ty, field, field_ty), 4))
+                    let i = keys
+                        .iter()
+                        .position(|k| k.field_key() == *acc)
+                        .unwrap_or_else(|| {
+                            panic!("letrec recognition: `.writes ≫ .{acc}` names no accumulator")
+                        });
+                    let field_ty = crate::ccl::ccl_utils::history_ty(domain_ty, &acc_tys[i]);
+                    Some((hist_field_read(hist, hist_ty, acc.clone(), field_ty), 4))
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-                    // A tap read ``__hist ≫ variant_project(`commit) ≫ .to_<feed>``:
+                    // A tap read ``__hist ≫ variant_project(`commit) ≫ .__to_<feed>``:
                     // its stream type is the history record\'s field type.
                     let field = f.clone();
                     let field_ty = hist_ty_field(hist_ty, &field);

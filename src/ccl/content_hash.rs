@@ -63,12 +63,12 @@
 //! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Three
 //! hashes, three questions".
 //!
-//! # Stage-agnostic by construction
+//! # Phase-agnostic by construction
 //!
 //! The hash is a pure function of a [`TypedExpr`] plus the binder-scoping rules
 //! of [`crate::ccl::scope`], which cover **every** [`TypedExprNode`] variant —
 //! including the ones (`LetRec`, `Transact`) that exist only below the
-//! mutability phases. Nothing else is stage-sensitive, so one hash serves every
+//! mutability phases. Nothing else is phase-sensitive, so one hash serves every
 //! [`Phase`](crate::ccl::context::Phase).
 //!
 //! # Complexity

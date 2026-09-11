@@ -19,7 +19,10 @@ use cambra::{
         lower::{LoweringContext, LoweringError, lower_stmts},
     },
     chl_parser,
-    interpreter::{Consumer, http_server::reserve_test_port},
+    interpreter::{
+        Consumer, DataSourceDomainExtentImpl, HttpServerDataSource,
+        http_server::{SharedHttpServer, reserve_test_port},
+    },
 };
 use rstest_log::rstest;
 use test_log::test;
@@ -379,5 +382,57 @@ fn test_http_serve_wrong_path_gets_404() {
     assert!(
         raw.starts_with("HTTP/1.1 404"),
         "expected 404 status, got: {raw:?}"
+    );
+}
+
+/// A retired route answers a request it had already accepted.
+///
+/// `answer_in_flight` is what retirement calls, and this is the stage a request
+/// reaches once the source has taken it off the dispatcher's channel: the reply
+/// is written from the shared pending map, and only the sink writes one. With no
+/// sink here nothing ever will, which is the position a client is in when the
+/// version that would have replied has been retired.
+///
+/// Driven at the source rather than through a program because the accepted-but
+/// -unanswered state is reachable deterministically here: `check_for_new_data`
+/// accepts without replying, where pumping a compiled program's scheduler
+/// answers a one-step route outright.
+/// `a_request_that_arrived_before_its_route_was_retired_is_answered` covers the
+/// other stage, a request still in the channel, through a real reload.
+#[test]
+fn a_retired_route_answers_a_request_it_had_accepted() {
+    let port = reserve_test_port();
+    let server = SharedHttpServer::new(port).expect("the reserved port binds");
+    let mut source = HttpServerDataSource::new(
+        &server,
+        "GET".to_string(),
+        "/x".to_string(),
+        "s".to_string(),
+    );
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || tx.send(http_get(port, "/x")).unwrap());
+
+    // Accept it. Polled rather than slept on, so the precondition holds however
+    // long the dispatcher takes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !source.check_for_new_data() {
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached the source",
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "the request is accepted and unanswered: no sink exists to reply",
+    );
+
+    source.answer_in_flight();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("retirement answers the request"),
+        "Not Found",
+        "the same answer the address gives once the route is gone",
     );
 }

@@ -1,4 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
 
 use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 
@@ -75,7 +79,7 @@ pub struct Scheduler {
 
 type SourceHandle = (
     Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    Vec<Box<dyn Consumer>>,
+    Vec<Weak<RefCell<dyn Consumer>>>,
 );
 
 impl Scheduler {
@@ -83,18 +87,44 @@ impl Scheduler {
         Self::default()
     }
 
+    /// Register `consumer` to be notified when `handle` has new data.
+    ///
+    /// The registration is **weak**, and the subscriber that made it owns the
+    /// consumer. A registration lasts exactly as long as the producer it wakes,
+    /// which is what a source handle outliving the graph subscribed to it
+    /// requires: replacing a program drops the operators it rebuilt, pruning
+    /// their registrations, while an operator carried across the replacement
+    /// keeps waking as before. A strong registration would instead keep every
+    /// operator any version ever subscribed alive and being notified.
     pub fn add_source_handle(
         &mut self,
         handle: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-        consumer: Box<dyn Consumer>,
+        consumer: Weak<RefCell<dyn Consumer>>,
     ) {
         let id = handle.borrow().get_id().to_string();
         if let Some(entry) = self.source_handles.get_mut(&id) {
-            assert!(Rc::ptr_eq(&handle, &entry.0));
+            assert!(
+                Rc::ptr_eq(&handle, &entry.0),
+                "two sources are registered as `{id}`, so a poll of one wakes the \
+other's subscribers",
+            );
             entry.1.push(consumer);
         } else {
             self.source_handles.insert(id, (handle, vec![consumer]));
         }
+    }
+
+    /// Stop polling the source registered as `id`.
+    ///
+    /// Called when a version stops serving the endpoint behind it
+    /// ([`SourceSinkRegistry::retire_routes_absent_from`](crate::ccl::context::SourceSinkRegistry)).
+    /// A source handle outlives the version that opened it, and nothing else ever
+    /// removes one, so without this the scheduler polls a retired route's source
+    /// for the life of the process. It is also what lets the address be served
+    /// again: a re-opened route mints a fresh source under the same id, which
+    /// `add_source_handle` refuses to register alongside the stale one.
+    pub fn forget_source(&mut self, id: &str) {
+        self.source_handles.remove(id);
     }
 
     /// A handle to the deferred-wakeup queue, for producers that must request
@@ -108,8 +138,13 @@ impl Scheduler {
         self.source_handles
             .values_mut()
             .for_each(|(source, consumers)| {
+                // Prune first, so a source whose every subscriber is gone stops
+                // accumulating dead registrations across program reloads.
+                consumers.retain(|c| c.strong_count() > 0);
                 if source.borrow_mut().check_for_new_data() {
-                    consumers.iter_mut().for_each(|c| c.notify());
+                    for consumer in consumers.iter().filter_map(Weak::upgrade) {
+                        consumer.borrow_mut().notify();
+                    }
                 }
             });
         // Deliver deferred wakeups now — outside any `get`, so a notification

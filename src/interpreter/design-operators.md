@@ -288,7 +288,7 @@ A single-writer induction store is the degenerate no-conflict case of this same 
 
 ### The decision record
 
-A writer body returns one **decision variant** per transaction, `` {`commit{𝑃} | `abort} `` (`ccl_utils::wrap_decision_variant`). `` `commit `` carries the payload record 𝑃 = `{writes, to_<defer>*}` — the positional tuple of proposed per-key new values, plus one field per reply tap — and `` `abort `` is the nullary whole-transaction deny: carry, no proposal. Making the grant/deny the *tag* rather than a `commit` field leaves "denied yet real writes" unrepresentable. `body_decision_at` decodes the tag by name, so the two ends agree without a canonical arm position. A tap's value is `` {`fired{𝑉} | `idle} `` — the fed value on the positions its own control-flow path admits, `` `idle `` on the rest (see [mutability.md](../ccl/design/mutability.md#general-in-transaction-conditionals-and-conditional-writes), "General in-transaction conditionals (and conditional writes)"). The grant path omits an `` `idle `` tap from the commit delta, so a routed reply fires only on its own route. A tap whose path *is* the commit — a single-guard or spine feed — wraps unconditionally. Carrying the gate as the value's tag is what lets a fed value be domain-restricted: a value beside a separate `Bool` gate would have to answer wherever the record commits.
+A writer body returns one **decision variant** per transaction, `` {`commit{𝑃} | `abort} `` (`ccl_utils::wrap_decision_variant`). `` `commit `` carries the payload record 𝑃 = `{writes, __to_<defer>*}` — the proposed new values keyed by the variable each is for, plus one field per reply tap — and `` `abort `` is the nullary whole-transaction deny: carry, no proposal. Making the grant/deny the *tag* rather than a `commit` field leaves "denied yet real writes" unrepresentable. `body_decision_at` decodes the tag by name, so the two ends agree without a canonical arm position. A tap's value is `` {`fired{𝑉} | `idle} `` — the fed value on the positions its own control-flow path admits, `` `idle `` on the rest (see [mutability.md](../ccl/design/mutability.md#general-in-transaction-conditionals-and-conditional-writes), "General in-transaction conditionals (and conditional writes)"). The grant path omits an `` `idle `` tap from the commit delta, so a routed reply fires only on its own route. A tap whose path *is* the commit — a single-guard or spine feed — wraps unconditionally. Carrying the gate as the value's tag is what lets a fed value be domain-restricted: a value beside a separate `Bool` gate would have to answer wherever the record commits.
 
 ### Convergence: the writer re-arms, one step per pull
 
@@ -601,11 +601,11 @@ read `w` directly — spanning a trailing run of carries — instead of reconstr
 the latest *change* tick.
 
 **Reply feeds ride the changelog as taps.** A feed inside the loop (`out << e`) rides the
-writer decision as a `to_<defer>` field, exactly as a commit writer's reply tap does. Op-
+writer decision as a `__to_<defer>` field, exactly as a commit writer's reply tap does. Op-
 conversion appends each tap as a write-only changelog key (after the accumulator keys), the
 producer applies the decision's `tap_fired` gate (a `` `fired `` tap joins the position's delta, an
 `` `idle `` one is omitted — the tag mechanism shared with the commit store), and a
-`to_<defer>` read is a **non-carry** `StoreDenseRead` (`carry_forward: false`): for each loop
+`__to_<defer>` read is a **non-carry** `StoreDenseRead` (`carry_forward: false`): for each loop
 position it reads the tap **only if that position's delta actually wrote it**
 (`store_delta_at`), so the feed's per-position stream spans exactly the fired positions. A
 **conditional feed** (`if p: out << e`) is the same shape — the letrec phase makes its guard path the
