@@ -351,6 +351,14 @@ equation](#a-shared-hole-naming-a-domain-states-an-equation)); without it the sp
 the other only through the argument edge keeps the wider reading. Pinned by
 `a_negative_position_meets_both_sides` and `a_groupby_over_a_singleton_element_literal`.
 
+The meet reaches a **variant** in a child slot, where it intersects the tags and closes an open
+demand's marker — a `case _:` demand is open, and the value side is a producer and so closed.
+Both halves are the approximate meet `CompactVariant::meet_openness` documents, and that
+approximation now has a caller: a tag the value carries and the demand does not name is dropped,
+and the marker then claims the remainder is exhaustive. No program observes the narrowed reading,
+a default arm being compiled from the `Case` (`test_default_arm_under_a_record_field`); the
+reading itself is pinned by `a_settled_negative_position_closes_an_open_child_demand`.
+
 **The merge is gated as if it were the collapse, and one variable therefore has two readings
 at one polarity.** `fallback_allowed` answers both, so a variable entered as a position reads
 the merge while the same variable reached through another variable's bound chain reads the

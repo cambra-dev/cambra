@@ -825,10 +825,16 @@ impl CompactVariant {
     ///
     /// The tag *map* still merges by the ordinary rule below. That is an
     /// approximation when exactly one side is open: an exact meet would keep the
-    /// closed side's tag set whole rather than intersecting the two. No program
-    /// reaches it — a scrutinee takes one `Case` demand per `match`, and two open
-    /// demands on one variable meet as `Open`/`Open` — so the exact rule is left
-    /// unstated rather than written and untested.
+    /// closed side's tag set whole rather than intersecting the two, so a value tag
+    /// the open demand does not name is dropped and the marker then claims the
+    /// remainder is exhaustive.
+    ///
+    /// The negative merge in [`compact_go`] reaches that case — an open `case _:`
+    /// demand meets the value side, which is a producer and so closed
+    /// (`a_settled_negative_position_closes_an_open_child_demand` pins the reading).
+    /// No program observes it: the narrowed reading is the domain's, and the default
+    /// arm is compiled from the `Case` rather than from that reading
+    /// (`test_default_arm_under_a_record_field`).
     fn meet_openness(a: Openness, b: Openness) -> Openness {
         match (a, b) {
             (Openness::Open, Openness::Open) => Openness::Open,
@@ -2156,12 +2162,13 @@ fn compact_go(
                     // Replacing rather than meeting is what an *undetermined*
                     // position needs, and the difference is that the collapse here is
                     // a choice rather than a narrowing: there is no settled structure
-                    // for the two sides to narrow jointly. At a negative position the
-                    // primary result may still hold a variant shape, and it is the
+                    // for the two sides to narrow jointly. A negative position reaches
+                    // this arm holding at most a variant shape, and that shape is the
                     // arms the body can handle rather than anything that flowed in, so
                     // meeting would intersect those tags into the domain. (At a
                     // positive position `no_concrete` implies there is no shape at all
-                    // to lose.)
+                    // to lose.) A variant the walk reaches *under* a settled shape is a
+                    // different position and does meet — the arm below.
                     //
                     // Refinements union instead of intersecting: a demanded
                     // predicate is checked against the value the fallback found,
@@ -2180,6 +2187,12 @@ fn compact_go(
                 // position's own polarity computes. One rule covers every slot: a
                 // refinement set narrows a position exactly as a record's fields do,
                 // and the negative merge unions both.
+                //
+                // A variant in a child slot meets here too, and that is the one caller
+                // reaching [`CompactVariant::meet_openness`]'s one-side-open case: the
+                // value side of a `case _:` demand is a producer and so closed, and the
+                // meet both closes the marker and intersects away a tag the demand does
+                // not name (`a_settled_negative_position_closes_an_open_child_demand`).
                 (Some(recovered), false) => {
                     bound = CompactType::merge(pol, bound, recovered);
                 }
@@ -2291,6 +2304,59 @@ mod tests {
         assert!(
             produced_fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
             "the field the demand omits survives: {produced_fields:?}"
+        );
+    }
+
+    /// `CompactVariant::meet_openness`'s one-side-open case, which the negative merge
+    /// reaches: a `case _:` demand is open and the value side is a producer and so
+    /// closed, so the reading closes the marker and intersects the tags.
+    ///
+    /// Both halves are approximations of the exact meet, which would keep the closed
+    /// side's tag set whole — `` `other `` is a tag the position genuinely carries.
+    /// Pinned rather than fixed: no program observes the narrowed reading
+    /// (`test_default_arm_under_a_record_field`), and the exact rule is a change to the
+    /// variant meet itself.
+    ///
+    /// The variant sits **under** a record field because that is what makes the outer
+    /// position settled. A bare variant demand leaves the position undetermined, which
+    /// takes the replacement instead and drops the demand whole.
+    #[test]
+    fn a_settled_negative_position_closes_an_open_child_demand() {
+        let int = || Type::Base(BaseType::Int);
+        let arm = |n: &str, t: Type| (FieldKey::Name(SmolStr::from(n)), t);
+        let rec = |t: Type| Type::Record(vec![("f".to_string(), t)]);
+        let dom = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        let value = Type::Variant(
+            vec![arm("some", int()), arm("other", Type::Base(BaseType::Unit))],
+            Openness::Closed,
+        );
+        let demand = Type::Variant(vec![arm("some", int())], Openness::Open);
+        constrain_subtype(&rec(value), &dom, &mut cache).expect("the value flows in");
+        constrain_subtype(&dom, &rec(demand), &mut cache).expect("and meets the demand");
+        let read = compact_type(&Type::fun(dom, int()))
+            .term
+            .fun
+            .expect("a function slot")
+            .domain
+            .as_ref()
+            .clone();
+        let field = read
+            .rec
+            .as_ref()
+            .and_then(|m| m.get(&FieldKey::Name(SmolStr::from("f"))))
+            .expect("the record's field");
+        let variant = field.var.as_ref().expect("a variant shape");
+        assert_eq!(
+            variant.openness,
+            Openness::Closed,
+            "the open demand's marker does not survive the meet"
+        );
+        assert_eq!(
+            variant.tags.keys().collect::<Vec<_>>(),
+            vec![&FieldKey::Name(SmolStr::from("some"))],
+            "and the tag the demand does not name is intersected away: {:?}",
+            variant.tags
         );
     }
 
