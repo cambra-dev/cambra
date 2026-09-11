@@ -145,6 +145,83 @@ fn a_loop_over_the_empty_list_keeps_its_seed() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `empty_map()`
+// ---------------------------------------------------------------------------
+
+// `empty_map()` is the collection with no entries, and its key and value types come
+// from the annotation on what it seeds. `Map(K, V)` and `Set(K)` are one type — the
+// latter at a `unit` codomain — so one term answers both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map_annotation("m: Map(String, Int) = empty_map()\nsum([v for v in m])")]
+#[case::int_keys("m: Map(Int, Int) = empty_map()\nsum([v for v in m])")]
+fn an_empty_map_takes_its_types_from_the_annotation(#[case] code: &str) {
+    check_scalar(code, Value::Int(0));
+}
+
+// `Set(K)` is `Map(K, unit)`, so the same term answers it — the annotation decides which
+// reading, and the codomain it pins is what tells them apart.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_empty_map_answers_a_set_annotation() {
+    check_tile(
+        "s: Set(String) = empty_map()\ns",
+        Tile::SealedFunction {
+            domain: ColumnValue::Strings(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// The empty map's columns are born at the annotated key and value types rather than at
+// whatever an entry would have carried — there is no entry. A `Strings` domain is what
+// lets a later `String` write join it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_empty_map_is_a_typed_empty_tile() {
+    check_tile(
+        "m: Map(String, Int) = empty_map()\nm",
+        Tile::SealedFunction {
+            domain: ColumnValue::Strings(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// A checked lookup on the empty map finds nothing. `` `none `` rather than a fault is the
+// whole difference between the two lookup forms, and the empty map is where it is sharpest.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_lookup_on_the_empty_map_is_none() {
+    check_scalar(
+        indoc! {r#"
+            m: Map(String, Int) = empty_map()
+            match m["x"]?:
+                case `some(v):
+                    v
+                case `none:
+                    7
+        "#},
+        Value::Int(7),
+    );
+}
+
+// Nothing else reaches the key and value types, so an unannotated `empty_map()` is
+// rejected. A keyed write does not supply them either: a write states its obligation on
+// the value it writes, not on the collection's key type.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::bare("empty_map()")]
+#[case::let_bound("m = empty_map()\nm")]
+fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
+    check_compile_error(code, "Unresolved inference variable");
+}
+
 // The re-keying constructors do not accept an empty literal: their key domain is
 // the key morphism's image (`src/ccl/design/collections.md`, "The key domain is the
 // key morphism's image"), and with no elements there is no image, so nothing
