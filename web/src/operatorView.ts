@@ -106,6 +106,11 @@ const SVG_NS = "http://www.w3.org/2000/svg";
  * Canvas measurement where there is one, and a per-character estimate where
  * there is not. jsdom has no 2D context, and a layout that could not run under
  * it could not be asserted on.
+ *
+ * The size tracks `--fs-sm`, which is what `.graph-node` renders at. It cannot
+ * read the token — the measurement happens before any node is in the document —
+ * so it is duplicated here, and a change to the scale belongs in both places.
+ * Measuring too wide only leaves slack inside the box; too narrow clips.
  */
 const measure: (text: string) => number = (() => {
   let ctx: CanvasRenderingContext2D | null = null;
@@ -156,6 +161,8 @@ export class OperatorView {
   private graph: DrawGraph;
   private detail: Detail;
   private readonly layout: GraphLayout;
+  /** Where each tree of the forest starts; the pane opens pointed at one. */
+  private readonly starts: readonly number[];
   private readonly canvas: HTMLElement;
   private readonly handles = new Map<number, Handle>();
   private marked: HTMLElement[] = [];
@@ -183,6 +190,7 @@ export class OperatorView {
     this.detail = detail ?? readDetail();
     this.graph = drawGraphOf(pane, this.detail);
     this.layout = layout ?? new ElkLayout();
+    this.starts = walkStarts(pane.nodes);
 
     parent.appendChild(this.detailControl());
     this.canvas = el("div", "graph-canvas");
@@ -433,7 +441,54 @@ export class OperatorView {
     this.canvas.addEventListener("pointerover", (event) => this.onHover(event));
     this.canvas.addEventListener("pointerleave", () => this.hideCard());
     this.canvas.addEventListener("dblclick", (event) => this.onPin(event));
+
+    this.frameOnStart(at);
     void forward;
+  }
+
+  /**
+   * Open the pane on the head of a tree rather than on the corner of the sheet.
+   *
+   * The sheet is as wide as the graph — thousands of pixels on a real program —
+   * and the pane showing it is a few hundred. Nothing puts a node near the
+   * origin: ELK orders the first layer by its own criteria, so on the demo's
+   * program every leftmost node sits nine hundred pixels down and the pane
+   * opened on blank canvas, which reads as a pane that failed to draw.
+   *
+   * The topmost walk start is the useful default: a node no value edge
+   * subscribes is the head of a subscription tree, so the reader lands on a
+   * source rather than in the middle of a fan. Falls back to whatever the
+   * layout put topmost, for a graph whose starts are all suppressed.
+   *
+   * This is only the default view. `draw` applies a selection that arrived
+   * before the first paint immediately afterwards, so a reader who followed a
+   * link still lands on what they clicked.
+   */
+  private frameOnStart(at: Map<string, { x: number; y: number }>): void {
+    const head =
+      this.topLeftOf(this.starts, at) ??
+      this.topLeftOf(this.graph.nodes.map((n) => n.id), at);
+    if (head === null) return;
+    // Centred across, not flush left: a start node's children fan both ways
+    // under it, and a pane this narrow holds two nodes across, so hugging the
+    // left edge cuts half the fan off screen.
+    this.handles.get(head)?.element.scrollIntoView({ block: "start", inline: "center" });
+  }
+
+  /** The id the layout placed nearest the top-left, or null if none are drawn. */
+  private topLeftOf(
+    ids: readonly number[],
+    at: Map<string, { x: number; y: number }>,
+  ): number | null {
+    let best: { id: number; x: number; y: number } | null = null;
+    for (const id of ids) {
+      const box = at.get(String(id));
+      if (!box) continue;
+      if (best === null || box.y < best.y || (box.y === best.y && box.x < best.x)) {
+        best = { id, x: box.x, y: box.y };
+      }
+    }
+    return best === null ? null : best.id;
   }
 
   private wire(edge: DrawEdge, points: Point[]): SVGElement {

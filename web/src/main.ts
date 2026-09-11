@@ -19,6 +19,8 @@
 // the store is the cross-pane link — a click anywhere resolves to a highlight
 // set in every pane via the pane link graph (links.ts).
 
+import { EditorView } from "@codemirror/view";
+
 import "./style.css";
 import { copyToClipboard } from "./clipboard";
 import { renderPaneMenu } from "./paneMenu";
@@ -210,6 +212,10 @@ export function describePanes(
   // Pin the operators a position reaches, and reveal the values pane so the
   // reader sees the result of the gesture they just made.
   onInspect?: (nodeId: number, operators: readonly number[]) => void,
+  // Recompile the edited source. Optional and last, so every caller that only
+  // wants to inspect a run — the tests, and the read-only server build — keeps
+  // the read-only pane it had.
+  onRebuild?: (source: string, options: { keepState: boolean }) => void,
 ): PaneDescriptor[] {
   const snap = store.snapshot;
   const panes: PaneDescriptor[] = [
@@ -222,7 +228,7 @@ export function describePanes(
       // source would come back from CodeMirror with the CRs stripped.
       copyText: () => snap.source.text,
       mount: (body) => {
-        const view = new SourceView(body, store, onInspect);
+        const view = new SourceView(body, store, onInspect, onRebuild);
         // A revealed editor has never measured against a real box, and it does
         // not reliably measure itself: CodeMirror's ResizeObserver path drops a
         // resize within 75ms of a docView update, and a selection made while
@@ -428,7 +434,12 @@ export function renderApp(
   root: HTMLElement,
   store: Store,
   live?: LiveStore,
-  config?: { hiddenPanes?: readonly string[]; pins?: readonly PinRequest[] },
+  config?: {
+    hiddenPanes?: readonly string[];
+    pins?: readonly PinRequest[];
+    /** Editable-pane hook; absent leaves the editor read-only. */
+    onRebuild?: (source: string, options: { keepState: boolean }) => void;
+  },
 ): void {
   // Set once the visibility controller exists, because pinning has to reveal
   // the pane and the controller is built from the pane list this produces.
@@ -442,7 +453,7 @@ export function renderApp(
         reveal?.("values");
       }
     : undefined;
-  const panes = describePanes(store, live, onInspect);
+  const panes = describePanes(store, live, onInspect, config?.onRebuild);
 
   // A storage that throws on access degrades the filter to one session.
   const storage = browserStorage();
@@ -525,6 +536,19 @@ export interface InjectedHost {
   hiddenPanes?: readonly string[];
   /** Source positions to open pinned in the values pane. */
   pins?: readonly PinRequest[];
+  /**
+   * Compile `source` as a new program and answer with its snapshot payload.
+   *
+   * `keepState` asks the embedder to carry the running program's state over;
+   * without it the new program starts empty. The inspector does not know how
+   * either is done — the deck replays its journal of pushed rows, and a
+   * server-backed host has a control port — it only knows which one the reader
+   * asked for.
+   *
+   * Absent means the pane stays read-only. An editable pane with nothing behind
+   * the chord would be a control that silently did nothing.
+   */
+  rebuild?: (source: string, options: { keepState: boolean }) => Promise<unknown>;
 }
 
 declare global {
@@ -549,6 +573,52 @@ async function loadSnapshot(injected: InjectedHost | undefined, again = false): 
   return resp.json();
 }
 
+/**
+ * The source editor inside `root`, if one is mounted.
+ *
+ * Found through the DOM rather than handed down: `renderApp` builds the panes
+ * and returns nothing, and threading a view handle back out of it for this
+ * alone would put a hole in the seam that keeps the panes independent.
+ */
+function sourceEditor(root: HTMLElement): EditorView | null {
+  const dom = root.querySelector<HTMLElement>(".cm-content");
+  return dom ? (EditorView.findFromDOM(dom) ?? null) : null;
+}
+
+/**
+ * Put the caret back where the reader left it, and give it the focus.
+ *
+ * A rebuild re-renders every pane, so the editor being typed in is destroyed
+ * and its replacement arrives blurred with the caret at the start. Without
+ * this, a presenter edits, compiles, and then has to click back into the
+ * editor before the next edit — between every iteration, in front of a room.
+ *
+ * The offset is clamped: the reader may have deleted past it, and a caret
+ * beyond the end of the document throws rather than degrading.
+ */
+function restoreCaret(root: HTMLElement, at: number): void {
+  const view = sourceEditor(root);
+  if (!view) return;
+  view.dispatch({ selection: { anchor: Math.min(at, view.state.doc.length) } });
+  view.focus();
+}
+
+/**
+ * Say that a rebuild round trip failed, without disturbing what is on screen.
+ *
+ * A failed *compile* is not this: that comes back as a snapshot with
+ * diagnostics and re-seeds normally. This is the embedder not answering at all,
+ * where the panes still show a program that is genuinely running, and throwing
+ * them away would lose more than it explains.
+ */
+function reportRebuildFault(root: HTMLElement, message: string): void {
+  const existing = root.querySelector(".rebuild-fault");
+  if (existing) existing.remove();
+  const banner = el("div", "rebuild-fault", `Rebuild failed: ${message}`);
+  root.appendChild(banner);
+  setTimeout(() => banner.remove(), 6000);
+}
+
 async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
@@ -565,11 +635,48 @@ async function main(): Promise<void> {
     const live = new LiveStore();
     if (injected?.openLive) connectLive(live, injected.openLive);
     else connectLive(live);
-    const config = {
-      hiddenPanes: injected?.hiddenPanes,
-      pins: injected?.pins,
+    // Re-seeding is a full re-render rather than a surgical update. Every pane
+    // is keyed to one snapshot and node ids are minted per compile, so there is
+    // no correspondence between the old panes and the new ones to preserve;
+    // `renderApp` clears the root, and building it again is both simpler and
+    // the only version that cannot show a pane from the previous program.
+    //
+    // `live` is deliberately not rebuilt: the frame stream belongs to the host
+    // and outlives any one compile. Pins are re-applied from the same source
+    // positions, which is why they are positions and not node ids.
+    const seed = (snapshot: unknown): void => {
+      // Tags name operators by node id, and ids are minted per compile, so a
+      // tag from the previous program points at nothing in this one. Pins are
+      // re-applied by `renderApp` from source positions, which survive an edit.
+      live.clearTags();
+      renderApp(root, new Store(validateSnapshot(snapshot)), live, {
+        hiddenPanes: injected?.hiddenPanes,
+        pins: injected?.pins,
+        onRebuild: rebuild,
+      });
     };
-    renderApp(root, new Store(snap), live, config);
+
+    const rebuild = injected?.rebuild
+      ? (source: string, options: { keepState: boolean }): void => {
+          const caret = sourceEditor(root)?.state.selection.main.head ?? 0;
+          void injected
+            .rebuild!(source, options)
+            .then((snapshot) => {
+              seed(snapshot);
+              restoreCaret(root, caret);
+            })
+            .catch((e: unknown) => {
+              // A program that will not compile is an ordinary outcome of
+              // editing, not a fault: the embedder answers with a degraded
+              // snapshot carrying diagnostics, and that re-seeds like any
+              // other. Reaching here means the round trip itself broke, so say
+              // so without tearing down the panes the reader still has.
+              reportRebuildFault(root, String(e));
+            });
+        }
+      : undefined;
+
+    seed(snap);
 
     // Follow a reload. A frame from a later generation describes a version this
     // payload does not — a rebuilt operator answers to a new `NodeId` — so the
@@ -579,13 +686,17 @@ async function main(): Promise<void> {
     // The pins survive because they are source positions rather than ids:
     // `applyPins` re-resolves them against the new program, and one naming a
     // construct this version dropped is simply not pinned.
+    //
+    // Reloads go through `seed` rather than calling `renderApp` directly, so a
+    // reload and an edit leave the panes in the same state: tags cleared, pins
+    // re-resolved, and the rebuild chord still wired.
     let drawn = snap.meta.generation;
     live.subscribe((state) => {
       if (state.generation <= drawn) return;
       drawn = state.generation;
       void (async () => {
         try {
-          renderApp(root, new Store(validateSnapshot(await loadSnapshot(injected, true))), live, config);
+          seed(await loadSnapshot(injected, true));
         } catch (e) {
           // The frames keep arriving and the panes keep describing the previous
           // version, which is wrong but legible; replacing the whole view with a
