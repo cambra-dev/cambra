@@ -280,6 +280,10 @@ The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/
    * *Co-occurrence merging:* if variable `v` and variable `w` always occur together at a given polarity (and symmetrically), they carry identical information, so `w` is merged into `v`.
    * *Atomic absorption:* if a concrete atom `A` co-occurs with variable `v` at *both* polarities, `v` is sandwiched between two identical `A` constraints and is redundant, so it is dropped.
    * The pass is currently cosmetic (everything is monomorphic) and becomes load-bearing once let-polymorphism introduces genuine polar asymmetry.
+   * All three rules read the variable sets `compact_type` deposits, and a negative position's
+     set holds both sides' variables — the merge unions identities as it unions fields. The
+     occurrences the analysis sees there are not the ones the coalesced type materializes.
+     Refinements are unaffected, sitting on the position while the rules rewrite variable ids.
 3. **`coalesce_compact`:** Materializes the simplified `CompactGraph` into the final `ccl::Type` by counting the concrete structural contributions (e.g. `Int`, a record, a variant) remaining at each position. Variable contributions never appear in the output — their bounds have already been expanded into the structural bags by `compact_type`.
    * *Zero shapes:* emit a fresh `Type::Infer` placeholder.
    * *Exactly one shape:* emit it as the `ccl::Type`. Records with dense `Index` keys (0..n) become `Type::Tuple`; `Name` keys become `Type::Record`; a *sparse* index product (a gap in the indices, which only an open/under-determined position can produce) coalesces to a fresh `Type::Infer` rather than a concrete product; variant maps preserve their tags and become `Type::Variant`.

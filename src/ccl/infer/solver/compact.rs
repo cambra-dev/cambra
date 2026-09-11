@@ -2136,8 +2136,8 @@ fn compact_go(
             // `src/ccl/design/type-inference.md`, "The collapse happens at the
             // position").
             let read_opposite = allow_fallback && (no_concrete || !pol);
-            let recovered = read_opposite.then(|| {
-                let mut recovered: Option<CompactType> = None;
+            let mut recovered: Option<CompactType> = None;
+            if read_opposite {
                 for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                     let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), st);
@@ -2146,9 +2146,8 @@ fn compact_go(
                         Some(acc) => CompactType::merge(!pol, acc, bc),
                     });
                 }
-                recovered
-            });
-            match (recovered.flatten(), no_concrete) {
+            }
+            match (recovered, no_concrete) {
                 (Some(mut recovered), true) => {
                     // Carry what the polarity-correct walk *did* find — variable
                     // identities and refinement demands — across without letting
@@ -2229,20 +2228,23 @@ mod tests {
     fn a_negative_position_meets_both_sides() {
         let int = || Type::Base(BaseType::Int);
         let field = |n: &str| (n.to_string(), int());
-        // `demand` is what the body asks of the parameter; `value` is what reaches it.
-        let domain_of = |value: Type, demand: Type| {
-            let dom = fresh_var(0);
+        // `demand` is what the body asks of the variable; `value` is what reaches it.
+        // `negative` places it at a function's domain rather than its codomain.
+        let read_at = |value: Type, demand: Type, negative: bool| {
+            let v = fresh_var(0);
             let mut cache = ConstrainCache::new();
-            constrain_subtype(&value, &dom, &mut cache).expect("the value flows in");
-            constrain_subtype(&dom, &demand, &mut cache).expect("and meets the demand");
-            compact_type(&Type::fun(dom, int()))
-                .term
-                .fun
-                .expect("a function slot")
-                .domain
-                .as_ref()
-                .clone()
+            constrain_subtype(&value, &v, &mut cache).expect("the value flows in");
+            constrain_subtype(&v, &demand, &mut cache).expect("and meets the demand");
+            let f = if negative {
+                Type::fun(v, int())
+            } else {
+                Type::fun(int(), v)
+            };
+            let slot = compact_type(&f).term.fun.expect("a function slot");
+            let read = if negative { slot.domain } else { slot.codomain };
+            read.as_ref().clone()
         };
+        let domain_of = |value: Type, demand: Type| read_at(value, demand, true);
 
         // Refinements: the demand settles the shape and carries none of its own.
         let refined = domain_of(crate::ccl::infer::lit_singleton(&Lit::Int(1)), int());
@@ -2268,6 +2270,27 @@ mod tests {
             fields.contains_key(&FieldKey::Name(SmolStr::from("a")))
                 && fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
             "both the demanded field and the one only the value carries: {fields:?}"
+        );
+
+        // A **positive** position is unaffected: its polarity-correct side is already
+        // the value's own facts, and a demand is not one. Both slots say so by what a
+        // positive merge would have done instead — intersect, erasing the singleton the
+        // value establishes and the field the body never reads.
+        let produced = read_at(crate::ccl::infer::lit_singleton(&Lit::Int(1)), int(), false);
+        assert_eq!(
+            produced.refinements.as_ref().map(RefinementSet::len),
+            Some(1),
+            "the value's singleton survives a demand carrying none"
+        );
+        let produced_wide = read_at(
+            Type::Record(vec![field("a"), field("b")]),
+            Type::Record(vec![field("a")]),
+            false,
+        );
+        let produced_fields = produced_wide.rec.expect("a record shape");
+        assert!(
+            produced_fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
+            "the field the demand omits survives: {produced_fields:?}"
         );
     }
 
