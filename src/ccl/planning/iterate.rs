@@ -20,7 +20,7 @@ use super::*;
 /// "Iteration site" means any position where op-conversion would otherwise
 /// compile with `input=None` and the expression is function-typed —
 /// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
-/// sources, value-position `Record` fields, `Copair` operands,
+/// sources, product components and program outputs, `Copair` operands,
 /// the program's top-level function-valued result, top-level let-bound
 /// function values, and a few other shapes enumerated by
 /// [`insert_iterate_recurse`].  At each site the pass dispatches via
@@ -104,14 +104,22 @@ pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
-    // Special-case `Apply(Tuple|Record, Zip)`: op-conversion's `Zip` arm
-    // fans the outer input out to each tuple/record field, so each field
-    // is compiled with `input=Some(fan_out_branch)`.  Field wrapping
-    // would still be semantically safe (the wrapped `iterate`'s
-    // trivially-true predicate just passes the input through), but it
-    // produces redundant operators and churns golden tests.  Recurse into
-    // each field without firing the value-position `Tuple`/`Record` case
-    // below.
+    // A list literal's elements are **values**: op-conversion evaluates each with
+    // `expr_to_value` and compiles none of them, so nothing inside one is an
+    // iteration site. A collection-valued element is the case that shows it — the
+    // element is a table written down, and a table written down is what a constant
+    // already is. Marking it would leave `iterate ≫ […]` where a value belongs, and
+    // constant evaluation would report a computation it cannot reduce.
+    if matches!(&expr.node, TypedExprNode::List(_)) {
+        return;
+    }
+    // A zipped product is a product *morphism*, not a product value: op-conversion's
+    // `Zip` arm fans the outer input out to each component, so each is compiled with
+    // `input=Some(fan_out_branch)`. The value-position arms below would mark a
+    // collection-valued component as an iteration site ([`mark_component_source`]),
+    // and an `iterate` chain takes no input — the same shape the `Copair` arm's
+    // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each
+    // component without firing those arms.
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))
     {
@@ -136,7 +144,7 @@ pub(super) fn insert_iterate_recurse(
     // Read before the match takes `expr.node` mutably. A `Data` domain is one the
     // runtime sweeps, which is what makes a node an iteration site rather than a
     // morphism waiting for an input.
-    let is_function = matches!(
+    let has_domain = matches!(
         &expr.ty,
         Type::Fun {
             fun_kind: crate::ccl::ty::FunKind::Data(..),
@@ -202,7 +210,7 @@ pub(super) fn insert_iterate_recurse(
         // [`FunKind`](crate::ccl::ty::FunKind) is exactly that distinction, so ask
         // it: a `Data` domain is one the runtime sweeps, which is what an
         // iteration site is.
-        TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands) if is_function => {
+        TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands) if has_domain => {
             for operand in operands.iter_mut() {
                 wrap_with_iterate(operand, discharged, "copair-operand");
             }
@@ -233,21 +241,55 @@ pub(super) fn insert_iterate_recurse(
                 wrap_with_iterate(&mut w.source, discharged, "transact-source");
             }
         }
-        // Value-position `Record` literals (not the special-cased
-        // `Apply(Record, Zip)` form, which `Zip`'s arm handles via fan-out):
-        // op-conversion's `Record` arm compiles each field with
-        // `input=None`, so every function-typed field is an iteration site.
-        // The fan-out form is unaffected because `walk_children_mut`
-        // visits the `Record` inside `Apply(_, Zip)` but the outer `Apply`
-        // does its own input-threading there.
+        // A product's components — and a program's outputs, which are the same
+        // node ([`crate::ccl::lower`] appends them as a trailing `Record`).
+        // Either way a component is an iteration site exactly when it holds a
+        // collection — see [`mark_component_source`].
+        TypedExprNode::Tuple(elts) => {
+            for elt in elts.iter_mut() {
+                mark_component_source(elt, discharged);
+            }
+        }
         TypedExprNode::Record(fields) => {
             for (_, field) in fields.iter_mut() {
-                if matches!(&field.ty, Type::Fun { .. }) {
-                    wrap_with_iterate(field, discharged, "record-field");
-                }
+                mark_component_source(field, discharged);
             }
         }
         _ => {}
+    }
+}
+
+/// Mark a product's `component` as an iteration site when it holds a collection.
+///
+/// A collection component compiles exactly as a collection compiles anywhere: the
+/// product holds the tile it produces, keeping its own domain
+/// ([`SelectField`](crate::interpreter::tile_operators::SelectField) is what reads one
+/// back out), and a program output is compiled with `input=None` by
+/// [`convert_outputs_to_operators`](crate::interpreter::operator_conversion::convert_outputs_to_operators).
+/// Both need the iteration every collection needs.
+///
+/// **Being a collection is the whole test**, and the two halves of it each rule out a
+/// shape that looks like the other. A refinement is a fact about the value rather than
+/// a different shape, so it peels first: a filtered collection is a collection, and
+/// iterating it is what makes its rows reach anything. A compute function tiles at a
+/// function extent too and is not swept, so `FunKind` is what separates them; handing
+/// one an iteration source gives it an input it rejects.
+///
+/// A tuple, a record and the program's trailing `Record` differ only in whether a
+/// component carries a name, so the rule is one rule.
+fn mark_component_source(
+    component: &mut Expr,
+    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+) {
+    let holds_a_collection = matches!(
+        component.ty.peel_refinements(),
+        Type::Fun {
+            fun_kind: crate::ccl::ty::FunKind::Data(..),
+            ..
+        }
+    );
+    if holds_a_collection {
+        wrap_with_iterate(component, discharged, "product-component-source");
     }
 }
 
@@ -331,11 +373,9 @@ pub(super) fn wrap_with_iterate(
     // arm runs before [`is_iteration_bearing`]'s early-return below
     // because Let isn't recognised as iteration-bearing on its own.
     //
-    // No matching `Record` arm here: [`insert_iterate_recurse`]'s value-
-    // position `Record` case already wraps function-typed fields wherever
-    // a Record appears in the AST (top-level, Let-bound, Apply-arg-of-
-    // catch-all), so a redundant descent here would just re-visit
-    // already-iterate-led fields.
+    // No matching product arm here: [`insert_iterate_recurse`] runs first and has
+    // already wrapped every component that holds a collection, so a descent here
+    // would re-visit iterate-led nodes.
     if let TypedExprNode::Let {
         bound_expr, body, ..
     } = &mut expr.node
@@ -648,6 +688,7 @@ mod tests {
     use crate::ccl::FieldKey;
     use crate::ccl::ccl_utils::is_trivially_true_predicate;
     use crate::ccl::symbolic::symbolic;
+    use rstest::rstest;
     // `super::*` also glob-imports `lambda_elim::compose`; name the test-helper
     // `compose` (`Expr::compose`) explicitly so it wins over the glob.
     use super::super::test_helpers::compose;
@@ -1047,11 +1088,8 @@ mod tests {
     #[test]
     fn test_wrap_with_iterate_record_is_noop() {
         // [`wrap_with_iterate`] no-ops on a Record: [`is_iteration_bearing`]
-        // returns `true` for Records (they reject `input=Some` and so
-        // can't be wrapped without breaking op-conversion), and field
-        // wrapping is the responsibility of [`insert_iterate_recurse`]'s
-        // value-position `Record` case — that pass walks the AST and
-        // wraps function-typed fields wherever a Record appears.
+        // returns `true` for Records, which reject `input=Some` and so cannot
+        // be wrapped without breaking op-conversion.
         let int = int_ty();
         let field_ty = fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
@@ -1278,11 +1316,41 @@ mod tests {
         );
     }
 
+    /// End-to-end coverage of the same rule is in `tests/compilation_pipeline/records.rs`:
+    /// `test_filter_over_a_projected_component` for a filtered component, and
+    /// `a_conditionally_fed_output_compiles` for the same shape as a program output. The
+    /// cases here reach one node for both meanings, since a program's outputs are a
+    /// `Record` like any other.
+    #[rstest]
+    #[case::collection(data_fun_ty(Type::UIntRange(3), int_ty()), true)]
+    #[case::compute_function(fun_ty(Type::UIntRange(3), int_ty()), false)]
+    #[case::scalar(int_ty(), false)]
+    fn test_a_product_component_is_a_site_exactly_when_it_holds_a_collection(
+        #[case] component_ty: Type,
+        #[case] expect_site: bool,
+    ) {
+        let component = list_123().with_ty(component_ty.clone());
+        let mut expr =
+            Expr::new(TypedExprNode::Record(vec![("out".to_string(), component)])).with_ty(
+                Type::Record(vec![("out".to_string(), component_ty.clone())]),
+            );
+        insert_iterate_recurse(&mut expr, &Default::default());
+        let TypedExprNode::Record(fields) = &expr.node else {
+            panic!("still a record: {}", symbolic(&expr));
+        };
+        assert_eq!(
+            is_iterate_apply(chain_head(&fields[0].1)),
+            expect_site,
+            "{component_ty} as a product component: got {}",
+            symbolic(&fields[0].1),
+        );
+    }
+
+    /// A record's collection-valued field is an iteration site, and its scalar
+    /// field is not. The product holds the tile each component produces, so a
+    /// component compiles as the collection it is.
     #[test]
-    fn test_insert_iterate_recurse_record_wraps_function_fields() {
-        // Value-position `Record` literal — each function-typed field is
-        // an iteration site (op-conversion's `Record` arm compiles each
-        // field with `input=None`).
+    fn test_insert_iterate_recurse_wraps_a_collection_record_field() {
         let int = int_ty();
         let mut expr = Expr::new(TypedExprNode::Record(vec![
             ("xs".to_string(), list_123()),
@@ -1294,18 +1362,13 @@ mod tests {
         ]));
         insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Record(fields) = &expr.node else {
-            panic!("expected Record, got: {}", symbolic(&expr));
+            panic!("still a record");
         };
-        let xs = &fields.iter().find(|(n, _)| n == "xs").unwrap().1;
         assert!(
-            is_iterate_apply(chain_head(xs)),
-            "function-typed field `xs` should be iterate-led, got: {}",
-            symbolic(xs)
+            symbolic(&fields[0].1).contains("iterate"),
+            "the collection field is a site: {}",
+            symbolic(&fields[0].1),
         );
-        let n = &fields.iter().find(|(n, _)| n == "n").unwrap().1;
-        assert!(
-            matches!(n.node, TypedExprNode::Lit(_)),
-            "scalar field `n` should be untouched"
-        );
+        assert_eq!(symbolic(&fields[1].1), "0", "the scalar field is untouched",);
     }
 }

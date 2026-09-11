@@ -34,7 +34,7 @@ use crate::{
         Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
         http_server::SharedHttpServer,
         operator_conversion::{
-            ConversionError, OpConversionContext, convert_record_fields_to_operators,
+            ConversionError, OpConversionContext, convert_outputs_to_operators,
             convert_to_operators,
         },
         operator_graph::{
@@ -733,18 +733,18 @@ impl Default for GlobalContext {
     }
 }
 
-/// The compiled output for one field of the program's trailing record.
+/// The compiled output for one of the program's outputs.
 ///
-/// A program's trailing record always has zero or one `main` fields plus zero
-/// or more sink fields.  The `main` field carries the program's primary output
-/// (the value of its trailing expression for pure programs); sink fields
-/// correspond to externally-managed [`DataSink`](crate::interpreter::DataSink)s
-/// such as `http_serve`'s response channel.
+/// A program has zero or one `main` outputs plus zero or more sink outputs.
+/// The `main` output carries the program's primary output (the value of its
+/// trailing expression for pure programs); sink outputs correspond to
+/// externally-managed [`DataSink`](crate::interpreter::DataSink)s such as
+/// `http_serve`'s response channel.
 pub struct CompiledOutput {
-    /// Field name from the trailing record.  `"main"` for the program's
-    /// primary output; otherwise the name of a registered sink binding.
+    /// Output name.  `"main"` for the program's primary output; otherwise the
+    /// name of a registered sink binding.
     pub name: String,
-    /// The compiled tile operator producing this field's stream.
+    /// The compiled tile operator producing this output's collection.
     pub op: Box<dyn TileOperator>,
     /// `Some` for `main` outputs — the producer the caller drives via
     /// [`TileProducer::get`] to consume primary-output values.  `None` for
@@ -764,15 +764,16 @@ impl CompiledOutput {
 
 /// A compiled CHL program ready for the scheduler to drive.
 ///
-/// Holds the join-planned AST, one [`CompiledOutput`] per trailing-record
-/// field, and a `done` receiver that fires when every sink output has reached
-/// a terminal tile.  Programs without sinks get an immediately-dropped sender,
-/// so `done.try_recv()` never returns `Ok`; pure programs are driven entirely
-/// by the `main` output's producer.
+/// Holds the join-planned AST, one [`CompiledOutput`] per program output, and a
+/// `done` receiver that fires when every sink output has reached a terminal tile.
+/// Programs without sinks get an immediately-dropped sender, so `done.try_recv()`
+/// never returns `Ok`; pure programs are driven entirely by the `main` output's
+/// producer.
 pub struct CompiledProgram {
     /// Join-planned CCL expression.  For sink programs this is `Let* Record{…}`;
     /// for pure programs it is the bare lowered expression at the tail of the
-    /// `Let*` chain (no synthetic `Record` wrapper).
+    /// `Let*` chain, with no trailing `Record` — there is nothing to name apart,
+    /// and `compile_program` synthesises the `main` entry for it.
     ///
     /// Boxed because a [`NodeId`](crate::ccl::content_hash::NodeId) is a node's
     /// address. Conversion records the operator it built for a node under that
@@ -783,7 +784,7 @@ pub struct CompiledProgram {
     /// unreachable.
     pub ast: Box<Expr>,
     /// One subscribed output per program output (`main` for pure programs;
-    /// one entry per record field for sink programs, in declaration order).
+    /// one entry per sink name for sink programs, in declaration order).
     pub outputs: Vec<CompiledOutput>,
     /// Fires once every sink consumer has received a terminal tile.  For pure
     /// programs the sender is dropped immediately, so `try_recv` never returns
@@ -2072,7 +2073,7 @@ fn compile_to_in(
 /// - **Pure programs** (no sinks): a single `("main", op)` entry whose
 ///   producer is subscribed to `main_consumer`.  The caller drives the main
 ///   loop by repeatedly calling [`TileProducer::get`] on that producer.
-/// - **Sink programs** (e.g. `http_serve`): one entry per sink field of the
+/// - **Sink programs** (e.g. `http_serve`): one entry per sink name of the
 ///   trailing `Record{…}`, each wired to a [`SinkConsumer`] that dispatches
 ///   to the registered [`DataSink`](crate::interpreter::DataSink).  For
 ///   sink-only programs the supplied `main_consumer` is dropped before
@@ -2171,11 +2172,11 @@ fn compile_version(
     let table_session =
         table_session.unwrap_or_else(|| unreachable!("a recording run installs the table"));
 
-    // Compile to one operator per field of the trailing record.  Pure
-    // programs (no sinks) end up at this point with a bare expression at the
-    // tail of the `Let*` chain rather than a `Record`; we synthesise a single
-    // `("main", op)` entry for them so the rest of the function operates
-    // uniformly on `Vec<(name, op)>`.
+    // Compile to one operator per program output.  Pure programs (no sinks) end
+    // up at this point with a bare expression at the tail of the `Let*` chain
+    // rather than a trailing `Record`, so a single `("main", op)` entry is
+    // synthesised for them and the rest of the function operates uniformly on
+    // `Vec<(name, op)>`.
     // Assign every mutable variable its identity before anything is built from the
     // tree, so a store is built under the identity `state_conflicts` checked this
     // version against. Both conversion entries below need it.
@@ -2201,7 +2202,7 @@ fn compile_version(
             convert_to_operators(&join_planned, ctx.conversion_ctx())
                 .map(|op| vec![("main".to_string(), op)])
         } else {
-            convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())
+            convert_outputs_to_operators(&join_planned, ctx.conversion_ctx())
         };
         // A source node names every expression that read it, so it can only be
         // minted once the walk has found them all. Inside the phase scope,
@@ -2235,7 +2236,7 @@ fn compile_version(
             // Subscribe the user-supplied consumer to drive the main output.
             let main_consumer = main_consumer
                 .take()
-                .expect("multiple `main` fields in trailing record");
+                .expect("multiple `main` outputs in the program's trailing record");
             let producer = op.subscribe(universal, main_consumer, ctx.scheduler());
             debug!(
                 "Main producer:\n{}",
