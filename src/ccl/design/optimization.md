@@ -132,21 +132,29 @@ When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bo
 
 ## Planning (`ccl/planning/`)
 
-`planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.  The pass does general iteration-site planning — hash-join planning is just one *specialised* strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  It performs two CCL-to-CCL rewrites and a final cleanup:
+`planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.  The pass does general iteration-site planning — hash-join planning is just one *specialised* strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  Its CCL-to-CCL rewrites, in the order `run` performs them:
 
-1. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the partition dispatch through `converse`.
-2. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every position where op-conversion would compile with `input=None`.  At each site the pass picks the best implementation strategy:
+1. **Conditional-collection realization** (`conditionals::realize_conditional_collections`) — a `Case` over collections becomes the gated union every later step then treats as an ordinary collection.
+2. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the partition dispatch through `converse`.
+3. **Constant folding** (`const_fold::fold_constants`) — a closed scalar computation becomes the literal it computes, which is what makes a collection literal's elements the compile-time values op conversion reads.  `src/ccl/planning/const_fold.rs` states which shapes fold and which it leaves.
+4. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every position where op-conversion would compile with `input=None`.  At each site the pass picks the best implementation strategy:
    - **Hash join** (`try_hash_join_rewrite` → `convert_loop_join` → `plan_loop_join` → `join_plan_to_expr`) when the site's domain is a refined tuple whose predicate decomposes into equality join conditions.  The emitted chain is itself iteration-bearing at its leaves (each `JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`), so no further marker is added.
    - **Iterate-then-restricts chain** (`wrap_with_iterate`'s fallback) — build the iteration source by *applying* one `restrict(p)` per refinement, in `ccl::application_order`, to a chain-head `Apply(true ▷ const, Iterate)`, then compose the value-producing body onto it, when the hash-join recogniser doesn't match.  `restrict` is a function transformer `(𝐷 ⇒ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⇒ 𝑇)` — applied, not composed — so each stage narrows the domain while preserving the value `𝑇`, and the chain stays well-typed (its honest second-order type would make a morphism-`Compose` ill-typed; `typecheck` rejects that).
+5. **Refinement-predicate compilation** (`compile_refinement_predicates`) — every remaining bare predicate is normalized tree-wide to point-free form, reaching the consumer contracts that sit outside any iteration site.
+6. **Per-group filter insertion** (`insert_map_filters`) — a refinement riding an inner collection's domain becomes a `map_filter`.
 
 Hash-join planning is the *specialised* strategy at an iteration site; the uniform iterate-then-restricts chain is the default.
 
 The full pipeline inside `run`:
 
 ```
+realize_conditional_collections(&mut expr);
 recognize_groupby_sites(&mut expr);
-let expr = simplify(expr);
-insert_iterate_markers(&mut expr);
+let mut expr = simplify(expr);
+fold_constants(&mut expr);
+insert_iterate_markers(&mut expr, &discharged);
+compile_refinement_predicates(&mut expr, &PredMemo::new());
+insert_map_filters(&mut expr);
 simplify(expr)
 ```
 

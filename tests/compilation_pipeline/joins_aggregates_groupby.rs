@@ -308,9 +308,9 @@ fn test_map_entry_pairs(#[case] code: &str, #[case] expected: Vec<(Value, Value)
 
 // A repeated key gives one group two entries, which `Sole` rejects. The spec makes a
 // duplicate key in a map literal a *compile-time* error; enforcing it here is later
-// than that, because only the key values decide it and nothing folds constants yet
-// (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
-// constant-folding later"). `set` has no such fault — `Drain` absorbs duplicates,
+// than that, because only the key values decide it and planning's constant fold stops at
+// the scalar (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
+// now, constant-folding later"). `set` has no such fault — `Drain` absorbs duplicates,
 // which is set semantics.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
@@ -354,10 +354,13 @@ fn a_bare_groupby_tail_is_driven() {
     "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
-#[case("1 + 2", "(1, 2) ▷ add:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+// Closed arithmetic reaches op conversion as the literal it computes, a whole chain of
+// it in one planning pass (`src/ccl/planning/const_fold.rs`). The operator chain these
+// two used to pin is still pinned by the cases below whose operands include a binder.
+#[case("1 + 2", "3:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case(
     "1 + 2 - 3 * 4",
-    "((1, 2) ▷ add, (3, 4) ▷ mul) ▷ sub:Int",
+    "-9:Int",
     Tile::Scalar(ColumnValue::Ints(vec![-9]))
 )]
 #[case(
@@ -380,9 +383,11 @@ fn a_bare_groupby_tail_is_driven() {
     "iterate ≫ [1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:([0, 2] ⤇ Int)",
     make_int_list(&[12,14,16])
 )]
+// The use of `y` is folded to the literal `y` is bound to; the binding itself stays,
+// nothing eliminating a `let` whose body no longer reads it.
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : {Int | __elem ▷ ((id, 10 ▷ const) ▷ zip ≫ eq)} = 10\nin iterate ≫ [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⤇ Int)",
+    "let y : {Int | __elem ▷ ((id, 10 ▷ const) ▷ zip ≫ eq)} = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⤇ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
