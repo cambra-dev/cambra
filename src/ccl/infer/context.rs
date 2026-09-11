@@ -601,14 +601,14 @@ impl Typing for InferCtx {
             _ => ann,
         };
         let ann_simple = self.normalize_annotation(ann_to_normalize);
-        // Snapshot the inferred type before the annotation bounds are added so
-        // the error shows what was actually inferred, not the partially
-        // modified state after a failed constrain_subtype.
+        // Snapshot the inferred type before any annotation bound is added. Both reports
+        // below read this one snapshot, so each shows what was inferred rather than the
+        // partially modified state a failed `constrain_subtype` leaves behind.
         let inferred_ty = coalesce_for_error(inferred);
         constrain_subtype(inferred, &ann_simple, &mut self.cache).map_err(|_| {
             self.raise(InferError::AnnotationMismatch {
                 annotation: ann.clone(),
-                inferred: inferred_ty,
+                inferred: inferred_ty.clone(),
             })
         })?;
         // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
@@ -642,7 +642,7 @@ impl Typing for InferCtx {
             constrain_subtype(inferred_dom, shared, &mut self.cache).map_err(|_| {
                 self.raise(InferError::AnnotationMismatch {
                     annotation: ann.clone(),
-                    inferred: coalesce_for_error(inferred),
+                    inferred: inferred_ty,
                 })
             })?;
         }
