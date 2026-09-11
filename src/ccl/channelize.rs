@@ -1006,6 +1006,11 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
                 .map(|(n, e)| (n, drop_expr_stmts(e)))
                 .collect(),
         ),
+        TypedExprNode::Outputs(outs) => TypedExprNode::Outputs(
+            outs.into_iter()
+                .map(|(n, e)| (n, drop_expr_stmts(e)))
+                .collect(),
+        ),
         TypedExprNode::Case {
             scrutinee,
             branches,
@@ -1131,7 +1136,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         | TypedExprNode::List(elts)
         | TypedExprNode::Compose(elts)
         | TypedExprNode::Copair(elts) => elts.iter().try_for_each(assert_no_defer_residue),
-        TypedExprNode::Record(fields) => fields
+        TypedExprNode::Record(fields) | TypedExprNode::Outputs(fields) => fields
             .iter()
             .try_for_each(|(_, e)| assert_no_defer_residue(e)),
         TypedExprNode::Case {
@@ -1845,7 +1850,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                     rec(e, bound, out);
                 }
             }
-            TypedExprNode::Record(fields) => {
+            TypedExprNode::Record(fields) | TypedExprNode::Outputs(fields) => {
                 for (_, e) in fields {
                     rec(e, bound, out);
                 }
@@ -2601,6 +2606,16 @@ fn extract_for_defer_impl(
                 ));
             }
             TypedExprNode::Record(new_fields)
+        }
+        TypedExprNode::Outputs(outs) => {
+            let mut new_outs = Vec::with_capacity(outs.len());
+            for (n, e) in outs {
+                new_outs.push((
+                    n,
+                    extract_for_defer(e, defer_name, feeds, define, in_inner_scope)?,
+                ));
+            }
+            TypedExprNode::Outputs(new_outs)
         }
         TypedExprNode::Lambda { param, body } => {
             // Lambda body is an inner scope.  Feeds extracted from inside

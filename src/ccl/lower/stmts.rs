@@ -102,45 +102,47 @@ pub(super) fn lower_stmts_recovering(
         return Some(body);
     }
 
-    // Build a Record whose fields are the sink-bound names in sorted order
-    // (sort for determinism — HashMap iteration is unordered). The record, its
-    // field `Var`s, and the tail `ExprStmt` are program-owned plumbing with no
-    // owning statement; they carry the whole-program span.
+    // Build the output list from the sink-bound names in sorted order (sort for
+    // determinism — HashMap iteration is unordered). The node, its output `Var`s,
+    // and the tail `ExprStmt` are program-owned plumbing with no owning
+    // statement; they carry the whole-program span.
     let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
     let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
     sink_names.sort();
-    let fields = sink_names
+    let outs = sink_names
         .iter()
         .map(|n| {
             let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_record");
             (n.clone(), var)
         })
         .collect();
-    let record = ctx.tag_machinery(
-        Expr::new(TypedExprNode::Record(fields)),
+    let outputs = ctx.tag_machinery(
+        Expr::new(TypedExprNode::Outputs(outs)),
         program_span,
         "lower.sink_record",
     );
     // Place ExprStmt(body, record) at the innermost position of the Let* chain
     // so the Record has the sink Var references in scope.
-    Some(append_record_at_tail(body, record, program_span, ctx))
+    Some(append_outputs_at_tail(body, outputs, program_span, ctx))
 }
 
 /// Walk to the innermost non-`Let`/`ExprStmt` continuation and wrap it with
-/// `ExprStmt(current_tail, record)`.
+/// `ExprStmt(current_tail, outputs)`.
 ///
 /// Recurses through both `Let` and `ExprStmt` nodes: a for-loop in the middle
 /// of the program produces an `ExprStmt(effect, continuation)` where the
 /// continuation may contain further `Let` bindings from later `http_serve`
-/// calls.  Stopping at the first `ExprStmt` would place the `Record` outside
-/// those inner bindings, making their names unbound.
+/// calls.  Stopping at the first `ExprStmt` would place the
+/// [`Outputs`](TypedExprNode::Outputs) outside those inner bindings, making its
+/// names unbound.
 ///
 /// The `ExprStmt` node "drives the feed": `simplify` drops it once
 /// [`crate::ccl::channelize`] has extracted all `Feed` nodes from the body,
-/// leaving a clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
-fn append_record_at_tail(
+/// leaving a clean `Let* Outputs{…}` shape that `compile_program` compiles one
+/// output at a time.
+fn append_outputs_at_tail(
     expr: Expr,
-    record: Expr,
+    outputs: Expr,
     program_span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
@@ -150,7 +152,7 @@ fn append_record_at_tail(
             bound_expr,
             body,
         } => {
-            let new_body = append_record_at_tail(*body, record, program_span, ctx);
+            let new_body = append_outputs_at_tail(*body, outputs, program_span, ctx);
             Expr {
                 node: TypedExprNode::Let {
                     binding,
@@ -165,7 +167,7 @@ fn append_record_at_tail(
             init,
             body,
         } => {
-            let new_body = append_record_at_tail(*body, record, program_span, ctx);
+            let new_body = append_outputs_at_tail(*body, outputs, program_span, ctx);
             Expr {
                 node: TypedExprNode::MutDecl {
                     binding,
@@ -176,7 +178,7 @@ fn append_record_at_tail(
             }
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
-            let new_body = append_record_at_tail(*body, record, program_span, ctx);
+            let new_body = append_outputs_at_tail(*body, outputs, program_span, ctx);
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
@@ -187,7 +189,7 @@ fn append_record_at_tail(
         }
         // Terminal continuation: wrap with ExprStmt so simplify can drop it.
         _ => ctx.tag_machinery(
-            Expr::expr_stmt(expr, record),
+            Expr::expr_stmt(expr, outputs),
             program_span,
             "lower.sink_record",
         ),

@@ -88,6 +88,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Tuple(_) => "Tuple".to_string(),
         Proj(k) => format!("Proj({k:?})"),
         Record(_) => "Record".to_string(),
+        Outputs(_) => "Outputs".to_string(),
         Source(s) => format!("Source({s})"),
         Compose(_) => "Compose".to_string(),
         // Two operations, not one with a mode: a copairing lands on the

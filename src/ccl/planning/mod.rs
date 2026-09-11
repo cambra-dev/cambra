@@ -739,31 +739,31 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_iterate_markers_record_root_wraps_each_function_field() {
-        // Programs that end in a sink-bound `Record` — each
-        // function-typed field is an iteration site (`compile_program`
-        // dispatches to `convert_record_fields_to_operators`, which
-        // compiles each field with `input=None`).
+    fn test_insert_iterate_markers_outputs_root_wraps_each_function_output() {
+        // Programs that bind a sink end in an `Outputs` — each function-typed
+        // output is an iteration site (`compile_program` dispatches to
+        // `convert_record_fields_to_operators`, which compiles each with
+        // `input=None`).
         let int = int_ty();
-        let field_ty = fun_ty(Type::UIntRange(3), int.clone());
-        let mut expr = Expr::new(TypedExprNode::Record(vec![
+        let out_ty = fun_ty(Type::UIntRange(3), int.clone());
+        let mut expr = Expr::new(TypedExprNode::Outputs(vec![
             ("out_a".to_string(), list_123()),
             ("out_b".to_string(), list_123()),
         ]))
         .with_ty(Type::Record(vec![
-            ("out_a".to_string(), field_ty.clone()),
-            ("out_b".to_string(), field_ty),
+            ("out_a".to_string(), out_ty.clone()),
+            ("out_b".to_string(), out_ty),
         ]));
 
         insert_iterate_markers(&mut expr, &Default::default());
 
-        let TypedExprNode::Record(fields) = &expr.node else {
-            panic!("expected Record, got: {}", symbolic(&expr));
+        let TypedExprNode::Outputs(outs) = &expr.node else {
+            panic!("expected Outputs, got: {}", symbolic(&expr));
         };
-        for (name, value) in fields {
+        for (name, value) in outs {
             assert!(
                 is_iterate_apply(chain_head(value)),
-                "sink field `{name}` should be iterate-led, got: {}",
+                "output `{name}` should be iterate-led, got: {}",
                 symbolic(value)
             );
         }

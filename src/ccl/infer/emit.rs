@@ -168,7 +168,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Tuple(elts) => emit_tuple(elts, ctx)?,
 
-        TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
+        TypedExprNode::Record(fs) | TypedExprNode::Outputs(fs) => emit_record(fs, ctx)?,
 
         TypedExprNode::Proj(key) => {
             // The projection's function type is built here: seed it with a
