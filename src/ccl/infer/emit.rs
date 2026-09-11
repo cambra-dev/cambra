@@ -981,9 +981,9 @@ pub(super) fn emit_apply<C: Typing>(
     // also pins the function/argument shapes with the one-way Apply edges
     // (see `Typing::constrain_argument` for the full story): the shape edge
     // `fn_ty <: (x: domain) ⇒ codomain` and the argument edge `arg <: domain`.
-    // A morphism's contravariant domain, left under-determined by the one-way
+    // A projection's contravariant domain, left under-determined by the one-way
     // edges, is recovered structurally at coalesce
-    // (`specialize_projection_domain` / `specialize_lambda_domain`).
+    // (`specialize_projection_domain`).
     let declared = function
         .user_annotation
         .as_ref()

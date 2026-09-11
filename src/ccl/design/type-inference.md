@@ -239,7 +239,31 @@ constrain(lhs, rhs):
 
 #### Apply is one-way
 
-**Under-determined domains are recovered as use-site specialization.** The `Apply` rule emits only the textbook constraints — the shape edge `constrain(fn_ty, domain ⇒ codomain)` and the argument edge `constrain(arg_ty, domain)` (`arg <: domain`). A function domain is contravariant, so one-way edges leave a *morphism*'s domain var under-determined: a `Proj` only constrains the one field it touches, so `.1` applied to a 2-tuple compacts to `Fun((?, T₁), T₁)` — a field-narrow / `Infer`-laden shape that never resolves — and a lambda's domain only ever receives what its *body* demands (a record narrowed to the fields the body reads, a sparsely-touched tuple shortened). That shape — the value actually flowing in — is recovered **structurally during the coalesce walk** by *monomorphizing the morphism to its input*: `coalesce_node`'s `Apply` arm rewrites a projection's or directly-applied lambda's domain to the resolved argument (and a lambda passed *as* the argument — the higher-order case: `filter`/`groupby` key functions, comprehension lowering — to the function's resolved inner domain), the `Compose` arm to the preceding morphism's codomain, and refinement predicates (the join-filter / cast-target case) recover the same way since `coalesce_type_predicates` runs `coalesce_node` over them (see [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)). This is the **closed-form case of use-site specialization** — the same operation `specialize_use` performs for a generalized `let` (specialize to the resolved use type), except the morphism's domain *equals* its input, so it collapses to a single overwrite instead of clone+pin+coalesce. See `infer::specialize_projection_domain` / `specialize_lambda_domain`.
+**Under-determined domains are recovered as use-site specialization.** The `Apply` rule emits only
+the textbook constraints — the shape edge `constrain(fn_ty, domain ⇒ codomain)` and the argument
+edge `constrain(arg_ty, domain)` (`arg <: domain`). A function domain is contravariant, so those
+one-way edges put the value on a *morphism*'s domain variable's lower side while its uses accumulate
+above. A **lambda**'s domain needs nothing further: binder and argument share one variable, and a
+negative position reads their meet
+([The collapse happens at the position](#the-collapse-happens-at-the-position)). A **projection**'s
+does, and not because anything was lost: `.𝑘` is polymorphic in its input's width, so a domain that
+does not name that width is its principal type. Op-conversion needs one width to emit a field
+access, and the use site is what has it. Where the argument's own type is concrete when
+`arg <: domain` is drawn, the width reaches the domain variable as a lower bound and the meet
+settles it; where the argument is still a variable there, the width arrives only as its coalesced
+node type. That shape — the value actually flowing in — is supplied **structurally during the
+coalesce walk**: `coalesce_node`'s `Apply` arm rewrites a projection's domain to the resolved
+argument, the `Compose` arm to the preceding morphism's codomain, and refinement predicates (the
+join-filter / cast-target case) are reached the same way since `coalesce_type_predicates` runs
+`coalesce_node` over them (see
+[Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)).
+This is the **closed-form case of use-site specialization** — the same operation `specialize_use`
+performs for a generalized `let` (specialize to the resolved use type), except the morphism's domain
+*equals* its input, so it collapses to a single overwrite instead of clone+pin+coalesce. See
+`infer::specialize_projection_domain`. `proj_requirement` still spells the demand as a dense prefix,
+`Tuple([fresh × 𝑘] ++ [field])`, because `Type::Tuple` cannot say "index 𝑘 at 𝑇, arity at least
+𝑘+1"; the fillers are placeholders for positions the projection has no opinion about, and the
+monomorphization overwrites them before any later phase reads one.
 
 The local per-morphism recovery suffices because projections and direct/argument-position lambdas are the morphisms whose domains coalesce under-determined. Function values reached through *opaque* positions (`Var`-bound functions applied at distant call sites, higher-order `Compose` of vars) are outside the closed-form recovery — the same opaque-vs-direct boundary as dependent application. (Genuine polymorphism is handled separately by generalize + per-type monomorphization — see §1, *Roadmap*.)
 
@@ -256,6 +280,10 @@ The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/
    * *Co-occurrence merging:* if variable `v` and variable `w` always occur together at a given polarity (and symmetrically), they carry identical information, so `w` is merged into `v`.
    * *Atomic absorption:* if a concrete atom `A` co-occurs with variable `v` at *both* polarities, `v` is sandwiched between two identical `A` constraints and is redundant, so it is dropped.
    * The pass is currently cosmetic (everything is monomorphic) and becomes load-bearing once let-polymorphism introduces genuine polar asymmetry.
+   * All three rules read the variable sets `compact_type` deposits, and a negative position's
+     set holds both sides' variables — the merge unions identities as it unions fields. The
+     occurrences the analysis sees there are not the ones the coalesced type materializes.
+     Refinements are unaffected, sitting on the position while the rules rewrite variable ids.
 3. **`coalesce_compact`:** Materializes the simplified `CompactGraph` into the final `ccl::Type` by counting the concrete structural contributions (e.g. `Int`, a record, a variant) remaining at each position. Variable contributions never appear in the output — their bounds have already been expanded into the structural bags by `compact_type`.
    * *Zero shapes:* emit a fresh `Type::Infer` placeholder.
    * *Exactly one shape:* emit it as the `ccl::Type`. Records with dense `Index` keys (0..n) become `Type::Tuple`; `Name` keys become `Type::Record`; a *sparse* index product (a gap in the indices, which only an open/under-determined position can produce) coalesces to a fresh `Type::Infer` rather than a concrete product; variant maps preserve their tags and become `Type::Variant`.
@@ -263,23 +291,116 @@ The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/
 
 ### Closing the single-sided blind spots (no separate pass)
 
-The solver's single-sided `Var <: Var` constrain rule leaves a few *structural* blind spots — positions where a variable receives a bound on only one side, so coalesce (which reads the polarity-correct side) can't materialize it. **Refinements are not among them** — they ride the lattice natively (see §4) and coalesce straight onto each node, including the predicate's own sub-expression types.
+The solver's single-sided `Var <: Var` constrain rule leaves a few *structural* blind spots —
+positions where a variable receives a bound on only one side, so coalesce (which reads the
+polarity-correct side) can't materialize it. Refinements ride the lattice natively (see §4) and
+coalesce straight onto each node, including the predicate's own sub-expression types, but that alone
+does not exempt them: a refinement arriving on the value side of a negative position is single-sided
+like any shape, and what lands it is
+[The collapse happens at the position](#the-collapse-happens-at-the-position).
 
 **Morphism domains (projections and lambdas) — rebuilt during the coalesce walk (`Apply` and `Compose`).** A morphism's domain appears only at a negative position, and the one-way constraints emitted around it (`fn_ty <: domain ⇒ codomain` and `arg <: domain` at an `Apply`; the adjacency `prev_cod <: next_dom` in a `Compose`) deliver the concrete value flowing in only as a *lower* bound, while the uppers carry just what the morphism's own body demands — so negative-polarity coalesce materializes the narrow body-demand shape. A `Proj`'s domain coalesces field-narrow (e.g. `.0` of a multi-accumulator loop's `step` tuple coalesces to a 1-tuple `(T)` instead of the full `(T, U)`); a lambda's record param narrows to the fields its body touches (`{label}` instead of `{id, label}`), with untouched params left `Infer`.
 
-`coalesce_node` rebuilds it **structurally, after coalescing the children**, via the shared `specialize_projection_domain` / `specialize_lambda_domain`: the `Apply` arm replaces a projection's or directly-applied lambda's domain with the resolved argument (and an argument-position lambda's with the function's resolved inner domain), the `Compose` arm with the preceding morphism's already-resolved codomain (and the chain's own type with `Fun(first.domain, last.codomain)`), and refinement predicates recover the same way through `coalesce_type_predicates`. A lambda's body-usage refinements are preserved by re-wrapping them around the new base (deduped by structural `Refinement` equality against refinements the input already carries), and its `param.ty` binder slot is re-derived from the rewritten domain (`refresh_lambda_param_slot`). This is **use-site specialization** — the closed-form sibling of `specialize_use`'s per-`let` specialization (the morphism's domain *equals* its input, so it is one overwrite rather than clone+pin+coalesce; see §2). Doing it post-coalesce — rather than recording a reverse bound at emit time — is what keeps it robust: an emit-time bound is recorded against a specific inference variable, and let-polymorphism's monomorphization re-mints those variables (splicing freshened definitions at use sites), so the bound would not follow to the variable the node's recorded type ends up carrying. Reading the resolved shapes directly sidesteps that entirely.
+`coalesce_node` rebuilds it **structurally, after coalescing the children**, via
+`specialize_projection_domain`: the `Apply` arm replaces a projection's domain with the resolved
+argument, the `Compose` arm with the preceding morphism's already-resolved codomain (and the chain's
+own type with `Fun(first.domain, last.codomain)`), and refinement predicates recover the same way
+through `coalesce_type_predicates`. A lambda needs no counterpart here — its binder is the domain
+variable, so its `param.ty` slot is derived from the coalesced domain (`refresh_lambda_param_slot`)
+and the body-usage refinements it carries are already in that reading. This is **use-site
+specialization** — the closed-form sibling of `specialize_use`'s per-`let` specialization (the
+morphism's domain *equals* its input, so it is one overwrite rather than clone+pin+coalesce; see
+§2). Doing it post-coalesce — rather than recording a reverse bound at emit time — is what keeps it
+robust: an emit-time bound is recorded against a specific inference variable, and let-polymorphism's
+monomorphization re-mints those variables (splicing freshened definitions at use sites), so the
+bound would not follow to the variable the node's recorded type ends up carrying. Reading the
+resolved shapes directly sidesteps that entirely.
 
 #### The collapse happens at the position
 
-The *bare* under-determined variable — a domain variable that receives only `arg` and nothing else — is the half `specialize_lambda_domain` cannot reassemble, and `compact_go` handles it in place: when a variable's polarity-correct bounds yield no shape, it reads the opposite side instead. The principal type of such a variable is `∀α ⊒ 𝐿. …`, and with no `Type::ForAll` and concrete code to emit, the quantifier collapses to its bound. That elimination is how a structurally-typed position acquires a type at all, in both directions: a domain reading the argument that flows in, and a parameter used only through projections reading the open records its uses demand of it.
+The *bare* under-determined variable — a domain variable that receives only `arg` and nothing else —
+is the half `specialize_projection_domain` cannot reassemble, and `compact_go` handles it in place:
+where a variable's polarity-correct bounds yield no shape, the opposite side supplies one. The
+principal type of such a variable is `∀α ⊒ 𝐿. …`, and with no `Type::ForAll` and concrete code to
+emit, the quantifier collapses to its bound. That elimination is how a structurally-typed position
+acquires a type at all, in both directions: a domain reading the argument that flows in, and a
+parameter used only through projections reading the open records its uses demand of it.
 
 A collapse is a *choice*, not a subtyping inference, so it does not propagate along subtyping edges — `𝐿 <: 𝑐` and `𝑎 <: 𝑐` together say nothing about `𝐿` versus `𝑎`. It belongs to the variable whose quantifier is being eliminated: the **position** the walk entered, never one reached by following another variable's bounds, which is why the walk resets its parent path at every structural child. `fallback_allowed` (`src/ccl/infer/solver/compact.rs`) carries the rule and its argument.
 
-**When the polarity-correct walk counts as having answered.** The collapse fires only where that walk found no shape, and a *variant* shape is read differently at the two polarities. Positively it comes off the lower bounds and is the value's own tags — what the thing is — so the collapse has nothing to add, and firing past it would replace the value with its own upper bound (a bounded annotation `𝑥 <: 𝑇` reading back as the binder's type). Negatively it comes off the upper bounds and is the arms a body can *handle*, which is not a determination of what flows in; there the collapse must still fetch the argument, or a domain becomes the sum of everything the `match` accepts. Records and atoms need no such split, being the same claim read from either side.
+**When the polarity-correct walk counts as having answered.** The shape collapse fires only where
+that walk found no shape, and a *variant* shape is read differently at the two polarities.
+Positively it comes off the lower bounds and is the value's own tags — what the thing is — so the
+collapse has nothing to add, and firing past it would replace the value with its own upper bound (a
+bounded annotation `𝑥 <: 𝑇` reading back as the binder's type). Negatively it comes off the upper
+bounds and is the arms a body can *handle*, which is not a determination of what flows in; there the
+collapse must still fetch the argument, or a domain becomes the sum of everything the `match`
+accepts. Records and atoms need no such split, being the same claim read from either side.
+
+**A negative position reads the opposite side whether or not the collapse fires.** Both sides narrow
+it — the uses state what they demand, the lower bounds what arrives — so the reading is their merge
+at the position's own polarity, which is one rule for every slot rather than one per shape. The
+collapse above is the *undetermined* case, and it replaces rather than merges because there is no
+settled structure for two sides to narrow jointly. A positive position is unaffected: its
+polarity-correct side is already the value's own facts, and a demand is not one. Merging is what
+makes an invariant [data domain](#data-domains-are-invariant) resolve to a single type where its
+two readings differ — `groupby([1], λ 𝑥 → 𝑥)`'s key variable carries `Int@1` below and `Int` above.
+That settles one position. Two spellings of one domain also have to be identified, which is what a
+shared hole states ([A shared hole naming a domain states an
+equation](#a-shared-hole-naming-a-domain-states-an-equation)); without it the spelling that reaches
+the other only through the argument edge keeps the wider reading. Pinned by
+`a_negative_position_meets_both_sides` and `a_groupby_over_a_singleton_element_literal`.
+
+The meet reaches a **variant** in a child slot, where it intersects the tags and closes an open
+demand's marker — a `case _:` demand is open, and the value side is a producer and so closed.
+Both halves are the approximate meet `CompactVariant::meet_openness` documents, and that
+approximation now has a caller: a tag the value carries and the demand does not name is dropped,
+and the marker then claims the remainder is exhaustive. No program observes the narrowed reading,
+a default arm being compiled from the `Case` (`test_default_arm_under_a_record_field`); the
+reading itself is pinned by `a_settled_negative_position_closes_an_open_child_demand`.
+
+**The merge is gated as if it were the collapse, and one variable therefore has two readings
+at one polarity.** `fallback_allowed` answers both, so a variable entered as a position reads
+the merge while the same variable reached through another variable's bound chain reads the
+demand side alone. Only the collapse needs that gate: a choice does not propagate along
+subtyping edges, and a narrowing does. What the difference leaves open is a mutable `Map`
+seeded with a one-entry literal — `box`'s instantiated domain reaches the key variable
+through a chain and keeps the bare reading, which invariance then rejects against the
+singleton the seed establishes (`a_one_entry_seed_does_not_reach_a_mutable_map`).
+
+Ungating the merge closes that shape and costs two things it does not pay for. Reading the
+opposite side at every negative variable compacts it in full there, so the walk doubles per
+level of type nesting — `def by_key(c, f): groupby(c, f)` applied at two types goes from 1.4s
+to 10s. And where a discharge is suspended on the chain, two data domains meet whose
+refinement sets differ only in the spelling of the discharged binder: `{[0, 2] | 𝑥 == 0}`
+against `{[0, 2] | 𝑥 == __arg}`. [`data_domains_disagree`] compares those sets structurally,
+so it reads one domain reached twice as two domains that disagree, and the position has no
+common answer — which `higher_order_dependent_application_discharges_the_binder` reports.
+Forcing the discharge on both contributions before they meet is the prerequisite for letting
+the merge follow a chain.
+
+**The gated merge pays a doubling of its own.** The gate confines the merge to the entered
+position, and a structural child *is* an entered position — `compact_go` resets `parents` to
+`None` at every one — so the merge re-opens one nesting level down and the walk doubles per
+contravariant flip. Measured in debug, median of three runs at equal test counts: the whole
+of `tests/type_check.rs` goes from 0.83s to 1.29s, and `test_groupby_key_relation_is_per_occurrence`
+— `def by_key(c, f): groupby(c, f)` at two types, the same program as above — from 0.56s to
+0.94s. `tests/compilation_pipeline` is flat, its time being execution rather than inference.
+
+What is absent is a **result memo**. `CompactState` carries `in_process`, which prunes cycles
+and caches nothing — it is removed again as each variable's walk returns — so a position
+reached twice is compacted twice. A `(uid, pol)` key would not be a correct memo: a position's
+reading also depends on `subst_acc` and on the refinement scope `st.scope` holds, so two
+entries at one variable and polarity are not interchangeable. Hash consing the rendered
+contribution keys on what was produced instead, and sidesteps that.
 
 **Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
 
-**Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no* scope lookup: it shares its binder's inference variable — a monomorphic `let` binds verbatim (`instantiate` freshens nothing) so every use coalesces to exactly what the binder coalesces to, and a *generalized* `let`'s uses are rewritten by the walk itself to reference per-type specializations (which does carry a scope — the walk's stack of specialization frames and shadow markers; see §3.1).
+**Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no*
+scope lookup: it shares its binder's inference variable — a monomorphic `let` binds verbatim
+(`instantiate` freshens nothing) so every use coalesces to exactly what the binder coalesces to, and
+a *generalized* `let`'s uses are rewritten by the walk itself to reference per-type specializations
+(which does carry a scope — the walk's stack of specialization frames and shadow markers; see §3.1).
 
 What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `For`'s target slot. Each is resolved explicitly in `coalesce_node`, mirroring its definition (inference runs before the mutability/transaction phases, so the recurrence carriers `LetRec`/`Transact` never reach coalesce):
 
@@ -981,8 +1102,35 @@ There is no conversion *into* a solver type — the solver consumes `ccl::Type` 
 
 * **Holes (`Type::Hole`):** become fresh `Type::Infer` variables at the current level.
 * **Bounds (`Type::BoundedHole(𝑇)`):** become fresh `Type::Infer` variables at the current level, carrying `𝑇` as an upper bound — `Hole` with a ceiling (see [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
+* **Shared holes (`Type::SharedHole(id)`):** the first occurrence of an id mints a fresh variable
+  and every later one reuses it, so two annotation positions carrying one id resolve to one
+  variable.
 * **Refinements:** are **kept** (recursing to normalize the inner) — they ride the lattice natively (above). A `Refinement(Hole, r)` source annotation thus becomes `Refinement(?fresh, r)`.
 * **Everything else** — including existing `Type::Infer` vars, `Tuple`/`Record` products, and `Type::Variant` sums — is kept verbatim and handled by the solver's structural constraint rules. Tuples and records are width-subtyped positionally/by name; variants are admissible at both polarities (the dual of records), so they need no fresh-var indirection.
+
+#### A shared hole naming a domain states an equation
+
+`bind_annotation` is one-way, and the domain position is contravariant, so a shared id lands below
+every domain annotated with it rather than equal to any of them. That is a common lower bound: it
+orders each domain under the variable and says nothing between the domains. Lowering writes the id
+to claim that two positions are one domain — an unfiltered single-generator comprehension and the
+source it iterates. A [data domain](#data-domains-are-invariant) is invariant, so the claim is an
+equation, and `bind_annotation` draws its other half.
+
+The equation is drawn only where the id names the domain. A domain variable reached any other way
+may receive several domains by design — a conditional collection's arms, a domain-generic consumer's
+parameter — and `constrain_go`'s invariant-domain arm declines to equate those for that reason.
+
+It is never drawn against a bound witness. A sum's domain is its binder's reference, and entering a
+sum is a term ([Only a term builds a sum](#only-a-term-builds-a-sum)), so equating that reference
+with a free variable escapes the binder instead of relating two positions.
+
+The merge at a negative position takes no matching exclusion, because it states nothing. A
+reference meeting a concrete type is settled where the edge is drawn: `constrain_go` distributes
+the demand over the witness's candidates, one invariant edge each, and reports a mismatch where
+the kind names no candidate. Compaction reads back only what those edges admitted, and a
+reference and a concrete atom arriving at one position are two shapes, which `coalesce_compact`
+reports as `IncompatibleBounds`.
 
 ### Flowing Out: coalescing
 
@@ -2212,8 +2360,8 @@ from](#where-the-candidates-come-from)).
 
   Two constraints shape the fix, and both are load-bearing. The standalone read must still
   *happen*, because a parent's structural recovery of a contravariant domain
-  (`specialize_projection_domain`, `specialize_lambda_domain`) reads it — a record-typed
-  parameter's uses are how a projection's domain is recovered at all. And the parameter slot
+  (`specialize_projection_domain`) reads it — a record-typed parameter's uses are how a
+  projection's domain is recovered at all. And the parameter slot
   must only fill uses the read *left* unresolved, because a use whose read succeeded is at
   least as precise as the slot and often more so: a monomorphized parameter's use carries the
   call's literal singleton where the slot, being the coalesced domain, has widened it. So the

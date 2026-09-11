@@ -672,6 +672,46 @@ fn test_match_on_parameter(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+/// A default arm on a `match` over a **field** of a parameter, whose value carries a
+/// tag no arm names.
+///
+/// The parameter's domain is a negative position, so its reading is the meet of both
+/// sides (`src/ccl/design/type-inference.md`, "The collapse happens at the position"),
+/// and that meet closes an open demand's marker and intersects its tags
+/// (`a_settled_negative_position_closes_an_open_child_demand`). The default arm fires
+/// regardless, being compiled from the `Case` — `final_or_default`'s default, as above —
+/// rather than from the domain's reading.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {r#"
+        def pick(r):
+            match r.v:
+                case `a(n):
+                    n
+                case _:
+                    0
+        pick((v=`b(5)))
+    "#},
+    Value::Int(0)
+)]
+// The named arm still matches, so the narrowed reading does not cost the tag it keeps.
+#[case(
+    indoc! {r#"
+        def pick(r):
+            match r.v:
+                case `a(n):
+                    n + 1
+                case _:
+                    0
+        pick((v=`a(5)))
+    "#},
+    Value::Int(6)
+)]
+fn test_default_arm_under_a_record_field(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // ---------------------------------------------------------------------------
 // Variant *types*
 //

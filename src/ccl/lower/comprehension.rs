@@ -263,13 +263,43 @@ pub(super) fn lower_list_comp(
         // outermost binder is the first generator's, so a source goes in front of the ones
         // already recorded.
         //
-        // Only a source that did not already name its domain is stamped — otherwise the id
-        // came *from* its annotation and re-stamping would discard it — and such a source
-        // contributes the kind that annotation states.
+        // The two branches differ in where the kind comes from, and in whether the shared
+        // domain still has to be stamped: an annotation naming a domain is where the id
+        // came from, and re-stamping would discard it.
         let source = match source.user_annotation.as_ref().and_then(Type::fun_kind) {
             Some(annotated) => {
                 result_kv.contributes_first(annotated.clone());
-                source
+                // An annotation states a kind, a domain, or both, and only the domain
+                // decides whether the id is already there. A source whose annotation
+                // states the kind alone leaves `domain: Hole`, so `named_data_domain`
+                // found no id to adopt and the shared one minted above still has to reach
+                // it — without that the two domains are ordered by the argument edge and
+                // nothing says they are one, which is what lets the two readings of one
+                // invariant position diverge.
+                //
+                // The test is the annotation's shape, `Type::data_fun(Hole, Hole)`, and
+                // not `groupby` in particular: a comprehension can iterate a `groupby`,
+                // the `set` / `map` re-keying constructors (`lower_rekeyed`), or a
+                // conditional comprehension's arm, each annotated that way. The equation
+                // holds for all of them, an unfiltered single-generator comprehension's
+                // domain being its source's domain whatever shape the source has.
+                match (&iter_dom, source.user_annotation.clone()) {
+                    (
+                        Some(shared),
+                        Some(Type::Fun {
+                            name,
+                            fun_kind,
+                            domain,
+                            codomain,
+                        }),
+                    ) if matches!(*domain, Type::Hole) => source.with_user_annotation(Type::Fun {
+                        name,
+                        fun_kind,
+                        domain: Box::new(shared.clone()),
+                        codomain,
+                    }),
+                    _ => source,
+                }
             }
             None => {
                 assert!(
