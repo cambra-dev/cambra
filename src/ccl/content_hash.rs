@@ -583,7 +583,7 @@ fn hash_payload<'a>(
         // pair them with, so it takes the names alone, sorted: a record's
         // labels are its own content, and a rename over an edited sibling would
         // otherwise go unreported.
-        N::Record(fields) => {
+        N::Record(fields) | N::Outputs(fields) => {
             fields.len().hash(h);
             if fold == Fold::Own {
                 let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
@@ -681,7 +681,7 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -
     match &e.node {
         // Records are unordered by field name; field names are unique, so
         // sorting the (name, child-hash) pairs yields a canonical order.
-        N::Record(fields) => {
+        N::Record(fields) | N::Outputs(fields) => {
             let mut entries: Vec<(&str, u64)> = fields
                 .iter()
                 .map(|(n, _)| n.as_str())

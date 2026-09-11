@@ -162,17 +162,18 @@ fn compile_let_binding(
     Ok(body_input)
 }
 
-/// Compile a `Let* Record{…}` tree into one operator per record field, sharing
-/// scope (and thus the [`FanOut`]/[`Memo`] handles for upstream `Let` bindings)
-/// across every field.
+/// Compile a `Let* Outputs{…}` tree into one operator per output, sharing scope
+/// (and thus the [`FanOut`]/[`Memo`] handles for upstream `Let` bindings) across
+/// every output.
 ///
-/// Used by [`crate::ccl::context::compile_program`] when the program ends in a
-/// trailing `Record` of sink-bound names: every field's operator subgraph
-/// branches off the same memoised upstream operators rather than each sink
-/// re-compiling the shared prefix into a fresh, independent subgraph.
+/// Used by [`crate::ccl::context::compile_program`] when the program binds a
+/// sink: every output's operator subgraph branches off the same memoised
+/// upstream operators rather than each sink re-compiling the shared prefix into
+/// a fresh, independent subgraph.
 ///
-/// The expression must consist of zero or more `Let` bindings followed by a
-/// trailing `Record`; any other shape returns [`ConversionError::Unsupported`].
+/// The expression must consist of zero or more `Let` bindings followed by an
+/// [`Outputs`](TypedExprNode::Outputs); any other shape returns
+/// [`ConversionError::Unsupported`].
 pub fn convert_record_fields_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
@@ -189,19 +190,19 @@ pub fn convert_record_fields_to_operators(
             compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
             convert_record_fields_to_operators(body, &mut scope)
         }
-        TypedExprNode::Record(fields) => fields
+        TypedExprNode::Outputs(outs) => outs
             .iter()
             .map(|(name, elt)| {
                 let op = convert_impl(elt, None, ctx)?;
                 // The sink is the program's output boundary, so it belongs to the
-                // field expression rather than to the record or the program root.
+                // output expression rather than to the `Outputs` or the program root.
                 let _scope = crate::ccl::provenance::converting(elt.node_id());
                 record_sink(name);
                 Ok((name.clone(), op))
             })
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
-            "convert_record_fields_to_operators: expected Let* Record, got {other:?}"
+            "convert_record_fields_to_operators: expected Let* Outputs, got {other:?}"
         ))),
     }
 }

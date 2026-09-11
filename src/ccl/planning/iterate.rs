@@ -20,7 +20,7 @@ use super::*;
 /// "Iteration site" means any position where op-conversion would otherwise
 /// compile with `input=None` and the expression is function-typed —
 /// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
-/// sources, value-position `Record` fields, `Copair` operands,
+/// sources, program outputs, `Copair` operands,
 /// the program's top-level function-valued result, top-level let-bound
 /// function values, and a few other shapes enumerated by
 /// [`insert_iterate_recurse`].  At each site the pass dispatches via
@@ -229,17 +229,15 @@ pub(super) fn insert_iterate_recurse(
                 wrap_with_iterate(&mut w.source, discharged, "transact-source");
             }
         }
-        // Value-position `Record` literals (not the special-cased
-        // `Apply(Record, Zip)` form, which `Zip`'s arm handles via fan-out):
-        // op-conversion's `Record` arm compiles each field with
-        // `input=None`, so every function-typed field is an iteration site.
-        // The fan-out form is unaffected because `walk_children_mut`
-        // visits the `Record` inside `Apply(_, Zip)` but the outer `Apply`
-        // does its own input-threading there.
-        TypedExprNode::Record(fields) => {
-            for (_, field) in fields.iter_mut() {
-                if matches!(&field.ty, Type::Fun { .. }) {
-                    wrap_with_iterate(field, discharged, "record-field");
+        // Each program output is its own stream, compiled with `input=None` by
+        // [`convert_record_fields_to_operators`](crate::interpreter::operator_conversion::convert_record_fields_to_operators),
+        // so a function-typed one is an iteration site. A `Record`'s fields are
+        // not: a record is one value, and a collection-valued field is a value
+        // it holds, which op-conversion materializes rather than iterating.
+        TypedExprNode::Outputs(outs) => {
+            for (_, out) in outs.iter_mut() {
+                if matches!(&out.ty, Type::Fun { .. }) {
+                    wrap_with_iterate(out, discharged, "output");
                 }
             }
         }
@@ -327,11 +325,9 @@ pub(super) fn wrap_with_iterate(
     // arm runs before [`is_iteration_bearing`]'s early-return below
     // because Let isn't recognised as iteration-bearing on its own.
     //
-    // No matching `Record` arm here: [`insert_iterate_recurse`]'s value-
-    // position `Record` case already wraps function-typed fields wherever
-    // a Record appears in the AST (top-level, Let-bound, Apply-arg-of-
-    // catch-all), so a redundant descent here would just re-visit
-    // already-iterate-led fields.
+    // No matching `Outputs` arm here: [`insert_iterate_recurse`] runs first and
+    // has already wrapped every function-typed output, so a descent here would
+    // re-visit iterate-led nodes.
     if let TypedExprNode::Let {
         bound_expr, body, ..
     } = &mut expr.node
@@ -595,7 +591,8 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         TypedExprNode::Copair(_)
         | TypedExprNode::DisjointJoin(_)
         | TypedExprNode::Tuple(_)
-        | TypedExprNode::Record(_) => true,
+        | TypedExprNode::Record(_)
+        | TypedExprNode::Outputs(_) => true,
         TypedExprNode::Var(_)
             if matches!(
                 &head.ty,
@@ -1043,11 +1040,8 @@ mod tests {
     #[test]
     fn test_wrap_with_iterate_record_is_noop() {
         // [`wrap_with_iterate`] no-ops on a Record: [`is_iteration_bearing`]
-        // returns `true` for Records (they reject `input=Some` and so
-        // can't be wrapped without breaking op-conversion), and field
-        // wrapping is the responsibility of [`insert_iterate_recurse`]'s
-        // value-position `Record` case — that pass walks the AST and
-        // wraps function-typed fields wherever a Record appears.
+        // returns `true` for Records, which reject `input=Some` and so cannot
+        // be wrapped without breaking op-conversion.
         let int = int_ty();
         let field_ty = fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
@@ -1275,10 +1269,40 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_iterate_recurse_record_wraps_function_fields() {
-        // Value-position `Record` literal — each function-typed field is
-        // an iteration site (op-conversion's `Record` arm compiles each
-        // field with `input=None`).
+    fn test_insert_iterate_recurse_outputs_wraps_function_outputs() {
+        // Each function-typed program output is an iteration site
+        // (`convert_record_fields_to_operators` compiles each with
+        // `input=None`).
+        let int = int_ty();
+        let mut expr = Expr::new(TypedExprNode::Outputs(vec![
+            ("xs".to_string(), list_123()),
+            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
+        ]))
+        .with_ty(Type::Record(vec![
+            ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
+            ("n".to_string(), int),
+        ]));
+        insert_iterate_recurse(&mut expr, &Default::default());
+        let TypedExprNode::Outputs(outs) = &expr.node else {
+            panic!("expected Outputs, got: {}", symbolic(&expr));
+        };
+        let xs = &outs.iter().find(|(n, _)| n == "xs").unwrap().1;
+        assert!(
+            is_iterate_apply(chain_head(xs)),
+            "function-typed output `xs` should be iterate-led, got: {}",
+            symbolic(xs)
+        );
+        let n = &outs.iter().find(|(n, _)| n == "n").unwrap().1;
+        assert!(
+            matches!(n.node, TypedExprNode::Lit(_)),
+            "scalar output `n` should be untouched"
+        );
+    }
+
+    /// A record is one value, so a collection-valued field stays a value:
+    /// op-conversion materializes it rather than iterating it.
+    #[test]
+    fn test_insert_iterate_recurse_leaves_a_record_field_alone() {
         let int = int_ty();
         let mut expr = Expr::new(TypedExprNode::Record(vec![
             ("xs".to_string(), list_123()),
@@ -1288,20 +1312,8 @@ mod tests {
             ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
             ("n".to_string(), int),
         ]));
+        let before = symbolic(&expr);
         insert_iterate_recurse(&mut expr, &Default::default());
-        let TypedExprNode::Record(fields) = &expr.node else {
-            panic!("expected Record, got: {}", symbolic(&expr));
-        };
-        let xs = &fields.iter().find(|(n, _)| n == "xs").unwrap().1;
-        assert!(
-            is_iterate_apply(chain_head(xs)),
-            "function-typed field `xs` should be iterate-led, got: {}",
-            symbolic(xs)
-        );
-        let n = &fields.iter().find(|(n, _)| n == "n").unwrap().1;
-        assert!(
-            matches!(n.node, TypedExprNode::Lit(_)),
-            "scalar field `n` should be untouched"
-        );
+        assert_eq!(symbolic(&expr), before);
     }
 }

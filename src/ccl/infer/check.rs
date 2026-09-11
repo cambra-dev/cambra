@@ -617,7 +617,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Tuple(elts) => emit_tuple(elts, ctx)?,
 
-        TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
+        TypedExprNode::Record(fs) | TypedExprNode::Outputs(fs) => emit_record(fs, ctx)?,
 
         // The projection's function type is already recorded; decompose it.
         TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, ctx)?,
