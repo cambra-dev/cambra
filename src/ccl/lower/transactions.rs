@@ -189,6 +189,19 @@ fn lower_tx_block_inner(
     fallback_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    // A `with begin():` body is a block, so it declares its own type aliases.
+    with_block_type_aliases(stmts, ctx, |ctx| {
+        lower_tx_block_scoped(stmts, outer_bindings, fallback_span, ctx)
+    })
+}
+
+/// [`lower_tx_block_inner`] with the block's type aliases already in scope.
+fn lower_tx_block_scoped(
+    stmts: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
+    fallback_span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
     // Multiple `if` guards, `elif` chains, `else` branches and `match` arms are all
     // supported: `transact_phase`'s path walk scopes each write to its own
     // control-flow path, rejoins each key with a carry-forward `Case`, and commits
@@ -239,6 +252,8 @@ fn lower_tx_block_inner(
             // `let`. `=` never writes a mutable variable; a plain `=` to a mutable variable would be
             // a silent no-op shadow that dies at block end, so reject it and point
             // at `:=`. (A genuine local shadowing the mutable variable's name is fine.)
+            // A type alias binds nothing, so the chain passes through unchanged.
+            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => chain,
             ChlStmt::Assign { target, value } => {
                 let name = extract_name_target(target, "assignment")?;
                 if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {

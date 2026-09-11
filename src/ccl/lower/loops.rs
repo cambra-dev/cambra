@@ -332,6 +332,20 @@ fn lower_for_body_stmts(
     stmts: &[Spanned<ChlStmt>],
     defer_name: Option<&str>,
     mutation_scope: &HashSet<String>,
+    frame_introduced: HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // A loop body is a block, so it declares its own type aliases.
+    with_block_type_aliases(stmts, ctx, |ctx| {
+        lower_for_body_stmts_scoped(stmts, defer_name, mutation_scope, frame_introduced, ctx)
+    })
+}
+
+/// [`lower_for_body_stmts`] with the body's type aliases already in scope.
+fn lower_for_body_stmts_scoped(
+    stmts: &[Spanned<ChlStmt>],
+    defer_name: Option<&str>,
+    mutation_scope: &HashSet<String>,
     mut frame_introduced: HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -350,6 +364,8 @@ fn lower_for_body_stmts(
 
     for stmt in rest {
         match &stmt.node {
+            // A type alias binds nothing, so it contributes no `Let` to the frame.
+            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => {}
             ChlStmt::Assign { target, value } => {
                 let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
@@ -918,6 +934,31 @@ fn lower_loop_body_chain(
     for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    // The body, and each `if`-branch it recurses into, is a block, so each
+    // declares its own type aliases.
+    with_block_type_aliases(body_stmts, ctx, |ctx| {
+        lower_loop_body_chain_scoped(
+            body_stmts,
+            acc_names,
+            yield_defer,
+            in_conditional,
+            outer_bindings,
+            for_span,
+            ctx,
+        )
+    })
+}
+
+/// [`lower_loop_body_chain`] with the body's type aliases already in scope.
+fn lower_loop_body_chain_scoped(
+    body_stmts: &[Spanned<ChlStmt>],
+    acc_names: &[String],
+    yield_defer: Option<&str>,
+    in_conditional: bool,
+    outer_bindings: &HashSet<String>,
+    for_span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
     // Every node this chain mints is recorded: an unrecorded lowering mint is a
     // `Leak::Unrecorded` at the lowering boundary. A statement's own image gets
     // `tag_image`; the `ExprStmt` that sequences one statement before the rest is
@@ -929,6 +970,8 @@ fn lower_loop_body_chain(
             // is a per-iteration shadowing `let`, *never* a mutable write: `=`
             // is not a mutation operator (accumulators are written with `:=`
             // / `+=`). A loop-carried accumulator therefore never appears here.
+            // A type alias binds nothing, so the chain passes through unchanged.
+            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => chain,
             ChlStmt::Assign { target, value } => {
                 let name = extract_name_target(target, "assignment")?;
                 check_mut_write_context(&name, stmt.span, ctx)?;

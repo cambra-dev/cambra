@@ -102,6 +102,10 @@ mod loops;
 mod stmts;
 mod transactions;
 
+/// The names a type alias may not rebind, re-exported so the test that pins the
+/// refusal iterates the same source [`is_builtin_type_name`] reads.
+pub use stmts::{RESERVED_TYPE_NAMES, is_builtin_type_name};
+
 // Pull every submodule's `pub(super)` helpers into the `lower` namespace so
 // that sibling submodules can reach them via `use super::*`. The external
 // `crate::ccl::lower::…` surface (`LoweringContext`, `LoweringError`,
@@ -378,6 +382,19 @@ pub struct LoweringContext {
     /// lowering error (reads must happen inside a `with begin():` block). Nested
     /// transactions are rejected by checking this flag before entering a block.
     pub(super) in_tx_body: bool,
+
+    /// Type aliases in scope, by the capitalized name each one binds.
+    ///
+    /// An alias names an existing type rather than making a new one, so the
+    /// entry holds the already-lowered [`Type`] and a use site substitutes it
+    /// (`docs/chl-spec.md`, "6.7 Type-alias statements"). Nothing downstream of
+    /// lowering sees the name: a program written with an alias and the same
+    /// program with the alias expanded lower to the same CCL.
+    ///
+    /// **Block-scoped**, snapshotted and restored around each block the way
+    /// [`transactional_vars`](Self::transactional_vars) is, and keyed by surface
+    /// spelling because lowering precedes uniquify.
+    pub(super) type_aliases: HashMap<String, Type>,
 
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
@@ -718,6 +735,31 @@ impl LoweringContext {
     /// Whether `name` was declared transactional via a `Mut(V, Txn)` annotation.
     pub(super) fn is_transactional_mut_var(&self, name: &str) -> bool {
         self.transactional_vars.contains(name)
+    }
+
+    /// Snapshot the type-alias table so a block's declarations can be undone on
+    /// exit. Paired with [`restore_type_aliases`](Self::restore_type_aliases).
+    pub(super) fn snapshot_type_aliases(&self) -> HashMap<String, Type> {
+        self.type_aliases.clone()
+    }
+
+    /// Restore the type-alias table to a
+    /// [`snapshot_type_aliases`](Self::snapshot_type_aliases) checkpoint,
+    /// discarding the aliases the block declared.
+    pub(super) fn restore_type_aliases(&mut self, snapshot: HashMap<String, Type>) {
+        self.type_aliases = snapshot;
+    }
+
+    /// Bind `name` to `ty` for the rest of the enclosing block. An alias in an
+    /// inner block shadows a same-named outer one until the block's snapshot is
+    /// restored.
+    pub(super) fn declare_type_alias(&mut self, name: impl Into<String>, ty: Type) {
+        self.type_aliases.insert(name.into(), ty);
+    }
+
+    /// The type `name` aliases, if any.
+    pub(super) fn type_alias(&self, name: &str) -> Option<&Type> {
+        self.type_aliases.get(name)
     }
 
     /// Record that `def name` carries a pass-by-reference `Mut` parameter, so it

@@ -45,6 +45,11 @@ pub(super) fn lower_stmts_recovering(
     // variable-writing loop is lowered before the `:=` / `def` that precedes it
     // textually. (No transactional-registry snapshot here — the top level is the
     // outermost scope, so nothing to restore to.)
+    // Type aliases are declared in the same forward pass, and for the same
+    // reason: an annotation below an alias is lowered before it. They go first
+    // because `pre_register_txn_decls` lowers the `Mut(V, Txn)` annotations it
+    // scans — see [`with_block_type_aliases`] for the constraint.
+    errors.extend(pre_declare_type_aliases(stmts, ctx));
     pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
@@ -221,7 +226,6 @@ pub(super) fn lower_stmts_inner(
     // Restored on both the success and error paths below.
     let snapshot = ctx.snapshot_transactional();
     let saved_mut_param_fns = ctx.mut_param_fns.clone();
-    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // The final statement must be a bare expression, an if/else block, or
@@ -229,13 +233,16 @@ pub(super) fn lower_stmts_inner(
     // preceding assignments and function definitions in Let bindings,
     // innermost-first. (Mutability is carried by `Type::History` and checked
     // post-inference; introduction-vs-write is decided by lexical scope.)
-    let result = lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
-        rest.iter()
-            .enumerate()
-            .rev()
-            .try_fold(final_expr, |acc, (i, stmt)| {
-                lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
-            })
+    let result = with_block_type_aliases(stmts, ctx, |ctx| {
+        pre_register_txn_decls(stmts, ctx);
+        lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
+            rest.iter()
+                .enumerate()
+                .rev()
+                .try_fold(final_expr, |acc, (i, stmt)| {
+                    lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
+                })
+        })
     });
     ctx.restore_transactional(snapshot);
     ctx.mut_param_fns = saved_mut_param_fns;
@@ -623,6 +630,10 @@ pub(super) fn lower_middle_stmt(
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // mutable write (the mutation operators are `:=` and `+=`), so even a
         // top-level `=` to a name that is *also* a live mutable variable just shadows it.
+        // A type alias declares no value, so the continuation passes through
+        // unchanged: `pre_declare_type_aliases` already put the name in scope, and
+        // the statement leaves no trace in the lowered program.
+        ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => Ok(body),
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
@@ -929,9 +940,13 @@ pub(super) fn lower_middle_stmt(
 
 /// Collect simple-name targets from assignment / function-def statements
 /// into `names`. Used to build `outer_bindings` for mutation checks.
+///
+/// A type alias binds no value and so contributes no name: nothing a mutation
+/// check asks about can be answered by a type.
 pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet<String>) {
     for stmt in stmts {
         match &stmt.node {
+            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => {}
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::AugAssign { target, .. }
@@ -960,6 +975,16 @@ pub(super) fn extract_name_target(
     context: &str,
 ) -> Result<String, LoweringError> {
     match &target.node {
+        // `Caps` means type, so a capitalized binder names no value. `X = T`
+        // declares a type alias and every other statement form wants a value
+        // binder, which is why this is the one message the case rule needs.
+        AssignTarget::Name(id) if is_type_name(id.as_str()) => Err(LoweringError::unsupported(
+            target.span,
+            format!(
+                "{context}: `{id}` is capitalized, so it names a type, not a value \
+                 (a capitalized name is bound only by the type alias `{id} = T`)"
+            ),
+        )),
         AssignTarget::Name(id) => Ok(id.as_str().to_string()),
         AssignTarget::Tuple(_) => Err(LoweringError::unsupported(
             target.span,
@@ -1303,6 +1328,8 @@ pub(super) fn lower_type_annotation(
 /// Recognised forms:
 /// - Capitalized primitive names (`Caps` means type — `docs/chl-spec.md`):
 ///   `Int`, `UInt`, `String`, `Bool` → [`Type::Base`].
+/// - A type alias declared by an enclosing block ([`pre_declare_type_aliases`]),
+///   which resolves to the type it names.
 /// - The wildcard `_` → [`Type::Hole`] ("infer this slot" — inference
 ///   normalizes an annotation `Hole` to a fresh variable, so the slot is
 ///   unconstrained; see `bind_annotation`).
@@ -1323,11 +1350,18 @@ pub(super) fn lower_type_expr(
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     match &annotation.node {
-        // A primitive (`Int`) or the wildcard `_`. A lone name is never a variant:
-        // a tag is written with its backtick wherever it appears.
-        ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
-            LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
-        }),
+        // A primitive (`Int`), a type alias, or the wildcard `_`. A lone name is
+        // never a variant: a tag is written with its backtick wherever it appears.
+        // An alias is substituted by the type it names, so no alias survives this
+        // function and nothing downstream of lowering knows the name.
+        ChlExpr::Name(id) => name_type(id.as_str())
+            .or_else(|| ctx.type_alias(id.as_str()).cloned())
+            .ok_or_else(|| {
+                LoweringError::unsupported(
+                    annotation.span,
+                    format!("unknown type annotation: {id}"),
+                )
+            }),
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
@@ -1425,10 +1459,58 @@ pub(super) fn lower_type_expr(
             annotation.span,
             "a tuple type is written with braces: `{T, U}`",
         )),
-        _ => Err(LoweringError::unsupported(
+        // A comparison in type position is a refinement's predicate written
+        // without its braces. `Int | _ >= 0` parses this way rather than as a
+        // `|`-chain, because comparison binds looser than `|`, so the arm above
+        // never sees it.
+        ChlExpr::Compare { .. } => Err(LoweringError::unsupported(
             annotation.span,
-            format!("unsupported type annotation form: {:?}", annotation.node),
+            "a comparison is a refinement's predicate, and a refinement is written in \
+             braces with `where`: `{Int where _ >= 0}`",
         )),
+        other => Err(LoweringError::unsupported(
+            annotation.span,
+            format!("{} is not a type", describe_type_form(other)),
+        )),
+    }
+}
+
+/// Name a CHL expression form in the surface's own words.
+///
+/// The alternative is `{:?}` on the parser AST, which puts a multi-line
+/// `Spanned`/`Span` dump in a diagnostic a reader has to look past. Every
+/// capitalized `=` routes through [`lower_type_expr`], so a plain typo
+/// (`Five = 5`) reaches this and the dump would be the whole message.
+fn describe_type_form(e: &ChlExpr) -> &'static str {
+    match e {
+        ChlExpr::Lit(ChlLit::Int(_)) => "an integer literal",
+        ChlExpr::Lit(ChlLit::String(_)) => "a string literal",
+        ChlExpr::Lit(ChlLit::Bool(_)) => "a boolean literal",
+        ChlExpr::BinOp { .. } | ChlExpr::UnaryOp { .. } => "an arithmetic expression",
+        ChlExpr::BoolOp { .. } => "a boolean expression",
+        ChlExpr::Compare { .. } => "a comparison",
+        ChlExpr::Call { .. } => "a call",
+        ChlExpr::List(_) => "a list",
+        ChlExpr::Record(_) => "a record value",
+        ChlExpr::Subscript { .. } => "a subscript",
+        ChlExpr::Attribute { .. } => "a field access",
+        ChlExpr::Lambda { .. } => "a lambda",
+        ChlExpr::IfExp { .. } => "a conditional expression",
+        ChlExpr::ListComp(_) | ChlExpr::GenExp(_) => "a comprehension",
+        ChlExpr::Yield(_) => "a `yield`",
+        ChlExpr::Feed { .. } => "a feed",
+        ChlExpr::Block(_) => "a block",
+        // `Error` is a parser recovery placeholder, which the caller surfaces
+        // through `ParseResult::errors` before this message is ever read.
+        ChlExpr::Error => "a malformed expression",
+        // The forms with their own arms in `lower_type_expr` never reach here.
+        ChlExpr::Name(_)
+        | ChlExpr::BraceRecord(_)
+        | ChlExpr::BraceGroup(_)
+        | ChlExpr::BraceRefinement { .. }
+        | ChlExpr::FunctionType { .. }
+        | ChlExpr::VariantCtor { .. }
+        | ChlExpr::Tuple(_) => "this expression",
     }
 }
 
@@ -1504,6 +1586,162 @@ fn collect_variant_arms(
             "a variant type's arms are backticked tags: `` `some{Int} | `none ``",
         )),
     }
+}
+
+/// The capitalized names the type language spells that are not base types: the
+/// constructors [`lower_type_application`] dispatches on, the two heads resolved
+/// ahead of it (`Mut` in [`mut_annotation_parts`], `Feed` on a `def` parameter),
+/// and `Mut`'s sequencing domain `Txn`.
+///
+/// A new type constructor is added here in the same change that teaches
+/// [`lower_type_application`] its head. `builtin_type_names_are_refused` iterates
+/// this slice, so the test cannot drift from it; nothing catches a constructor
+/// added to [`lower_type_application`] and omitted here.
+pub const RESERVED_TYPE_NAMES: &[&str] = &[
+    "Array",
+    "Collection",
+    "Feed",
+    "FullMap",
+    "List",
+    "Map",
+    "Mut",
+    "Option",
+    "Set",
+    "Txn",
+];
+
+/// Whether `name` is a capitalized name the type language already spells, and so
+/// is refused as a type-alias target.
+///
+/// The base types come from [`BaseType::from_keyword`], which is their single
+/// source; [`RESERVED_TYPE_NAMES`] carries the rest. An alias name and a built-in
+/// name therefore never both resolve.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    BaseType::from_keyword(name).is_some() || RESERVED_TYPE_NAMES.contains(&name)
+}
+
+/// Whether `name` is written in the type world rather than the term world.
+///
+/// `Caps` means type, without exception (`docs/chl-spec.md`, "6.1 Direction:
+/// term/type syntax split [Decided]"), so the first character decides it and no
+/// other signal is consulted.
+pub(super) fn is_type_name(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// The name and right-hand side of a type-alias statement, or `None` when the
+/// assignment binds a value.
+///
+/// `Item = {price: Int}` declares an alias and `item = …` binds a value; the case
+/// of the name is the whole discriminator (`docs/chl-spec.md`, "6.7 Type-alias
+/// statements"). A tuple or subscript target names no single type and so is never
+/// an alias.
+pub(super) fn type_alias_decl<'a>(
+    target: &'a Spanned<AssignTarget>,
+    value: &'a Spanned<ChlExpr>,
+) -> Option<(&'a str, &'a Spanned<ChlExpr>)> {
+    match &target.node {
+        AssignTarget::Name(id) if is_type_name(id.as_str()) => Some((id.as_str(), value)),
+        _ => None,
+    }
+}
+
+/// Declare every type alias of a block, in source order, before the block's
+/// statements are lowered.
+///
+/// A forward pass, unlike the statement fold it precedes: blocks lower
+/// right-to-left, so an alias declared on reaching its own statement would be
+/// invisible to every annotation below it. Declaring the block's aliases up front
+/// puts each one in scope throughout its block, and running in source order is
+/// what holds an alias's right-hand side to the aliases above it — `A = A` and a
+/// chain naming an alias declared later are unresolved names here.
+///
+/// The right-hand side is lowered once, at the declaration, so a refinement
+/// predicate sees the scope the alias statement sees. Every use substitutes that
+/// type.
+///
+/// Returns every alias the block got wrong rather than stopping at the first, so
+/// the aliases after a rejected one are still declared. Only [`lower_stmts_recovering`]
+/// reads past the first: it collects per-statement errors, so at the top level a
+/// rejected declaration costs the block its own name and nothing else. Through
+/// [`with_block_type_aliases`] the first error aborts the block.
+pub(super) fn pre_declare_type_aliases(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+) -> Vec<LoweringError> {
+    let mut errors = Vec::new();
+    let mut declared: HashSet<&str> = HashSet::new();
+    for stmt in stmts {
+        let ChlStmt::Assign { target, value } = &stmt.node else {
+            continue;
+        };
+        let Some((name, rhs)) = type_alias_decl(target, value) else {
+            continue;
+        };
+        if is_builtin_type_name(name) {
+            errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!("`{name}` is a built-in type and cannot be given another meaning"),
+            ));
+            continue;
+        }
+        if !declared.insert(name) {
+            errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!(
+                    "`{name}` is declared twice in this block; a type alias names \
+                     one type for the whole block"
+                ),
+            ));
+            continue;
+        }
+        match lower_type_expr(rhs, ctx) {
+            Ok(ty) => ctx.declare_type_alias(name, ty),
+            // The inner error names the form in surface words
+            // ([`describe_type_form`]), so it composes into one sentence.
+            Err(inner) => errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!(
+                    "`{name}` is capitalized, so `{name} = …` declares a type alias \
+                     and its right-hand side must be a type: {inner}"
+                ),
+            )),
+        }
+    }
+    errors
+}
+
+/// Lower a block with its own type aliases in scope, restoring the enclosing
+/// block's on the way out.
+///
+/// This is what makes an alias block-scoped, so every walker that lowers a block
+/// goes through it. The block's first rejected alias short-circuits `lower`, and
+/// the restore runs on both paths.
+///
+/// **Every block-entry pass that lowers a type annotation belongs inside `lower`.**
+/// [`pre_register_txn_decls`] is one: it reads each `Mut(V, Txn)` annotation through
+/// [`mut_annotation_parts`], which lowers the value type. Run before the aliases are
+/// declared, it sees `Mut(Cents, Txn)` as an unresolved name, declines to register
+/// the variable as transactional, and the failure surfaces phases later as
+/// "`balance` is not a transactional mutable variable" with no mention of the alias.
+/// Nothing type-enforces the order; it is held by keeping such a pass in `lower`.
+///
+/// The top-level block is the exception: it is the outermost scope, with nothing
+/// to restore to and an error sink that takes every rejected alias rather than the
+/// first ([`lower_stmts_recovering`], which runs the two passes in this order
+/// directly).
+pub(super) fn with_block_type_aliases<T>(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+    lower: impl FnOnce(&mut LoweringContext) -> Result<T, LoweringError>,
+) -> Result<T, LoweringError> {
+    let saved = ctx.snapshot_type_aliases();
+    let result = match pre_declare_type_aliases(stmts, ctx).into_iter().next() {
+        Some(e) => Err(e),
+        None => lower(ctx),
+    };
+    ctx.restore_type_aliases(saved);
+    result
 }
 
 /// Resolve a capitalized primitive type name (`Caps` means type —
