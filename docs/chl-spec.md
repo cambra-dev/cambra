@@ -1702,13 +1702,26 @@ proof, so a key from `for k -> v in m` (or `for k in s`) satisfies the proven
 lookup `m[k] : V` (§3.9). Reaching a map's keys or values as their own
 collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
 
-> **[Interim].** Today `for`-in binds the **value** (codomain) for every
-> collection — so a map iterates its values (as `groupby` results do) and a set
-> iterates `unit`. A destructuring target parses in either spelling, `(k, v)` and
-> `k -> v` alike, and lowering takes only a simple name. Entry/key iteration is
-> the [Planned] work; it only *adds* the type-directed element choice, so
-> `for k -> v in m` is the form to write once it lands. Design:
-> [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
+> **[Interim].** The element choice is not type-directed yet — the **binder's
+> arity** selects instead. A *name* binder binds the value (codomain) for every
+> collection, exactly as before, so a map iterates its values (as `groupby`
+> results do) and a set iterates `unit`. A *two-tuple* binder — `k -> v` and
+> `(k, v)` alike, one target in two spellings — binds the entry, for every
+> collection type: the key is the position and the value is what is stored at it.
+> That is uniform entry iteration, which a `Set` answers as `(K, unit)`, and it
+> is what lets entry iteration exist before `Set` and `Map` can be told apart.
+>
+> Selecting on arity rather than on type costs one row of the table above: over a
+> `List` whose element is itself a pair, `for (a, b) in xs` binds the index and
+> the pair rather than destructuring the value. Nothing regresses — no tuple
+> binder lowered at all before — and the row returns with the type-directed
+> choice.
+>
+> Entry iteration is **partly built**: a `map(…)`/`set(…)` source with a scalar
+> key works; a compound key, an annotated `Map(K, V)`, a `groupby` result, a list
+> literal, a filter, a second generator, and a transactional map's snapshot do
+> not, each for a reason upstream of the binder. Design and the full list:
+> [collections.md, "Entry iteration `for k -> v in m` [Partly implemented]"](../src/ccl/design/collections.md#entry-iteration-for-k---v-in-m-partly-implemented).
 
 **Iterations are unordered and may run in parallel** (§3): unless the
 body introduces a data dependency from one iteration to the next, the
@@ -2965,6 +2978,25 @@ for req in incr_reqs:
   block** (rejected with a diagnostic). Write it after the block, or, if
   it should be shared across the transaction, declare it `Mut(…, Txn)`
   and write it on the spine.
+- **`for` loops over a list literal.** A block may carry `for x in [a, b]:`.
+  The loop is a **fold over the block**: each iteration sees the previous
+  one's writes and the statements after the loop see the last one's
+  (read-your-writes, §8.3), and every write the loop makes joins the one
+  commit the block is — a loop under a guard commits with that guard's
+  other writes or not at all. Its writes commit on the path the `for` sits
+  on — the enclosing guard, or unconditionally on the spine — and **never
+  on the loop's length**: a loop that iterates zero times contributes no
+  write and neither grants nor denies, since an unwritten key carries its
+  snapshot and "wrote nothing" and "wrote everything back unchanged" are
+  the same commit. A `<<` inside the body is one reply per iteration, all
+  on that one commit.
+- **A `for` in a block whose source is not a list literal is rejected
+  [Open].** A block denotes one decision over one snapshot, so the loop is
+  expanded into it at compile time and its elements have to be written out.
+  A source whose length is known only at runtime — the shape a checkout
+  handler draining a cart wants — needs a **bulk keyed update** the
+  language does not have: one write per key over a collection the snapshot
+  itself supplies.
 - **Transaction handle — `with t = begin():` [Decided].** Binds `t` to the
   transaction's commit time (a `Txn` value); designed but rejected at
   lowering today.

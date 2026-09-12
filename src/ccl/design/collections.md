@@ -182,15 +182,81 @@ document:
 Nothing in [`Type`] carries a collection type constructor today, so none of this is an
 implemented property.
 
-**Until this is settled** `for ... in` binds the codomain for every collection type, so
+**Until this is settled** a *name* binder binds the codomain for every collection type, so
 `for g in groupby(xs, key)` binds each group rather than each key. The spec's choice is
 kind-directed ([chl-spec §4.6](../../../docs/chl-spec.md#46-for--iteration)), so what blocks
 it is the missing `Set`/`Map` distinction rather than the unbuilt operation layer: key and
-entry iteration is exactly that distinction. If the operation layer is needed first, the
-interim to reach for is **uniform entry iteration**: a `Set`'s entry is `(𝐾, unit)` and the
-projection to `𝐾` is lossless, so `Map` gets correct entry iteration without the distinction
-existing. That is surface-visible — `for k in s` would bind a pair — so it is a spec
-decision, not a silent one.
+entry iteration is exactly that distinction.
+
+A **two-tuple binder** is the interim, and it is built — see
+[Entry iteration `for k -> v in m` [Partly implemented]](#entry-iteration-for-k---v-in-m-partly-implemented)
+below. It is the **uniform entry iteration** this section previously proposed — a `Set`'s
+entry is `(𝐾, unit)` and the projection to `𝐾` is lossless, so `Map` gets correct entry
+iteration without the distinction existing — with the one change that makes it cost nothing:
+the binder's *arity* selects, not the collection's type. The proposal as written made every
+keyed binder bind a pair, which changes what `for k in s` means and so needed a spec
+decision; selecting on arity leaves every name binder reading exactly as it read before, and
+only `for k -> v in m` asks for the entry.
+
+## Entry iteration `for k -> v in m` [Partly implemented]
+
+A two-tuple binder — `for k -> v in m`, or the parenthesised `for (k, v) in m` the pair
+arrow is sugar for — takes the **entry**. It lowers (`src/ccl/lower/entries.rs`) to
+
+```text
+λ __iter_record → __iter_record ▷ (m ▷ map_domain) ▷ (λ k → let v = m[k] in body)
+```
+
+— the source is the collection's *keys*, and the value comes back through the proven lookup
+that key's own domain discharges ([Lookup: membership discharge](#lookup-membership-discharge)).
+
+**The source has to be the collection's keys, and that is the whole design.** Two shapes are
+more obvious and both fail for one reason. Binding the key to the iteration position the
+encoding already has — `λ i → let k = i in i ▷ m ▷ …` — and re-viewing the source as entry
+pairs — `λ k → (k, k ▷ m)`, which lambda elimination turns into the fanout `⟨id, m⟩` — leave
+a site that is not *iteration-bearing* (`src/ccl/planning/iterate.rs`), so planning sources
+it from the site's domain **type**: a chain-head `iterate` over the domain's unrefined base,
+plus one `restrict` per refinement. For a keyed collection that base is the bare key type,
+which names no extent, and the refinement is a `collection_contains` membership term that is
+carried and never executed. `map_domain` is in the iteration-internalising group, so a site
+headed by one is sourced from the collection and planning adds nothing. [`Builtin::MapDomain`]
+accordingly gained an [`OperatorSchemes`] entry — `∀δ ε. (δ ⤇ ε) ⇒ (δ ⤇ δ)`, the argument a
+*consumer's* collection so a sum satisfies it — where before it was minted only by join
+planning, which stamps its own type.
+
+**What works today**: a `map(…)` or `set(…)` source, with a scalar key, read or unread, in
+comprehension position — including inside a `with begin():` block over a collection the block
+does not own. Pinned in `tests/compilation_pipeline/comprehensions.rs`. **Statement position**
+(`for k -> v in m:`) lowers through the same binder and then meets the wall a *name* binder
+meets there: a `for` with an accumulator is an induction loop, whose source must be indexed by
+iteration position, and a keyed collection's positions are its keys.
+
+**What does not, and why** — each pinned in the same file, and each blocked *upstream of the
+binder*, which lowers identically in all of them:
+
+- **A compound key** (`for (a, t) -> q in cart`). Projecting a key whose type is a
+  present-key domain over a tuple leaves the component types undetermined. Not the binder:
+  a hand-written `k.0` fails the same way.
+- **An annotated `Map(𝐾, 𝑉)`**, i.e. a sum. The keys of a sum are the keys of whichever
+  candidate the witness picked, so the key binder lands on the witness and collides with the
+  `𝐾` the annotation names. This is consuming a sum at its witness, open with the sum rules.
+- **A `groupby` result**, which the storefront rollup
+  `[k -> agg(g) for k -> g in groupby(c, key)]` needs. A group's codomain depends on its key
+  ([`groupby`'s exact type](#groupbys-exact-type)), and re-viewing at the keys carries that
+  dependency out of its binder's scope.
+- **A list literal.** `map_domain` compiles its argument with no upstream input, and a bare
+  list literal is an iteration site planning only sources when something downstream asks.
+  Entry iteration over a list is the index/value pair and is well-defined; what is missing is
+  planning seeding a combinator's collection argument.
+- **A second generator** beside an entry-iterating one: the two readings of the collection
+  acquire different domain refinements, and a data domain is invariant.
+- **A filter** (`for k -> v in m if …`). Not entry iteration at all — the same comprehension
+  with a name binder fails identically, because the restrict chain planning builds for the
+  filter also tries to compile the domain's carried `collection_contains`.
+- **A transactional map's snapshot**, the shape every storefront/demo entry-iteration site
+  takes. A `Mut(…)` never derefs to the collection inside it at a function position; the
+  name-binder case fails on the same program. Reading a transactional collection as a
+  collection is unbuilt; `src/ccl/design/mutability.md` is where that work lands.
 
 ## `groupby`'s exact type
 

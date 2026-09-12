@@ -24,7 +24,7 @@ builtin a prerequisite for serving any non-string value. A host sink takes the v
 the question does not arise.
 
 `http_serve` remains the right surface for a program that is a server. A host channel is for a
-program that is a component.
+program that is a component, and [Routes](#routes) is the shape a component serves an address in.
 
 ## The source
 
@@ -67,6 +67,62 @@ CCL is a pure value language" requires — `Defer` carries no behaviour.
 
 A declared sink the program never feeds is rejected at lowering, as any unfed sink is.
 
+## Routes
+
+`wasm_serve(method, path)` binds a request/response pair of host channels registered under one
+address. It is `http_serve`'s shape minus the port, and its arguments are compile-time constants as
+`http_serve`'s are — an address is the identity of a route, decided while the program is still a
+tree.
+
+```python
+cart_changes, cart_change_acks = wasm_serve("PATCH", "/cart")
+
+for c in cart_changes:
+    with begin():
+        cart[(c.account, c.ticker)] := c.qty
+        cart_change_acks << (ok=True, ticker=c.ticker, qty=c.qty)
+```
+
+The embedding page is the listener, so there is nothing to bind. The host declares both halves
+before compiling, under the route spelled as a request line — `PATCH /cart`, which
+`ccl::lower::wasm_route_name` mints:
+
+```json
+{ "name": "PATCH /cart", "kind": "request",  "type": "{account: Int, ticker: String, qty: Int}" },
+{ "name": "PATCH /cart", "kind": "response", "type": "{ok: Bool, ticker: String, qty: Int}" }
+```
+
+A route is the one case where two declarations share a name, and the shared name is the pairing.
+`register_channels` rejects a half-declared route: a request with no response is an address whose
+callers never hear back, and a response with no request is a reply channel nothing can trigger.
+
+Three things separate this from `http_serve`, none of them cosmetic.
+
+**No transport is in it.** `http_serve` creates a `SharedHttpServer`, which binds a socket and
+spawns a dispatcher thread, so it is a lowering error on a target that has neither. `wasm_serve`
+creates nothing: both halves are host channels the host has already registered, and lowering looks
+them up. That is what lets the construct exist on `wasm32`, and it is why the page rather than the
+program decides how a call arrives.
+
+**Rows cross as declared records.** `HttpServerSharedState::process` accepts a `SealedFunction`
+whose codomain is `Scalar(Strings)` and silently returns on any other shape, so an HTTP program
+renders its replies to strings. A route's request and reply are the record types their declarations
+give them, so nothing in Cambra parses or renders a body.
+
+**The address binds nothing.** `http_serve` mints a source name from the address and sanitises it
+into an identifier; a route name is only ever a lookup key. `wasm_serve` binds the request source
+and the reply sink to the two names its tuple target spells, and those names are what the program
+reads and feeds. The reply sink is therefore declared through
+`GlobalContext::declare_route_sink` rather than `declare_host_sink`: the latter wraps the whole
+program in a `Defer` binding per declared name and rejects one nothing feeds, which would make
+every address the host knows about an address this version has to serve.
+
+A host drives a route through `Host::request(method, path, rows)`, and the reply leaves through the
+route's sink — so it arrives in the `outputs` of the tick that computes it, under the route's name.
+Correlation is arrival order, as it is for every host sink. A program that feeds no reply on some
+path answers that call with nothing, and the host sees a call with no row rather than a wrong row;
+that is a property of the program's shape, not of the route.
+
 ## Row types
 
 `ChannelDecl.row_type` is a CHL type expression, written the way a program would write it in an
@@ -75,6 +131,21 @@ annotation. `channels::parse_type` pairs `chl_parser::parse_expression` with `lo
 `extent_of_resolving` with no source registry: a channel's row type is declared before anything is
 compiled, so there is nothing to resolve a `Type::DataSource` against, and one appearing there is an
 error rather than a lookup failure.
+
+**Only an ingress channel needs an extent.** `HostSource` builds a column of arriving rows against
+one, so a `source` or a `request` whose row type cannot be grounded is a row the buffer cannot hold.
+`HostSink` takes a name and decodes whatever tiles the program hands it, so a `sink` or a
+`response` declares a type and grounds nothing. The asymmetry is what lets a reply carry a list:
+a list's extent names its length, a length is data, and a declaration has none to name — so
+requiring one on the way out would reject exactly the rows the runtime can produce.
+
+A `List(T)` crosses as a JSON array, in both directions. The runtime holds a list as a function over
+`0..n` (`bindings_are_list`), so `row_from_json` mints the positions and `row_to_json` reads them
+back off the bindings; order is the array's, and it is the whole content of a list. `row_to_json`
+decides by the value rather than by a declared type, because a list and a map are one
+`Value::Function` — a collection keyed by anything but its positions is a map, and says so rather
+than encoding something a host cannot read. `Type::list_element` is the inverse of `Type::list_of`
+and answers by the witness kind, which is `UIntRanges` for a list and `SubtypesOf(K)` for a map.
 
 ## Driving a program from a terminal
 

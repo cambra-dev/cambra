@@ -122,7 +122,11 @@ pub(super) fn lower_generator_for(
     for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let iter_var = extract_name_target(target, "for-loop target")?;
+    // A tuple target makes this loop iterate *entries*, which is a different
+    // source — the collection's keys — and a body that opens the key and looks
+    // the value up (`src/ccl/lower/entries.rs`). The binder decides all of it
+    // from the target once; every path below reads it rather than the target.
+    let binder = IterBinder::classify(target, "for-loop target")?;
 
     if for_body_has_yield(body) {
         // A generator with loop-carried state (the mutability design notes' §4b) — yield
@@ -155,12 +159,14 @@ pub(super) fn lower_generator_for(
             return Ok(generator_defer_binding(defer_name, inner, for_span, ctx));
         }
 
-        let source = lower_expr(iter, ctx)?;
-        let frame_introduced = HashSet::from([iter_var.clone()]);
+        let (source, binder) = binder.source(lower_expr(iter, ctx)?, iter.span, ctx);
+        let iter_var = binder.param().to_string();
+        let bound = binder.bound_names();
+        let frame_introduced: HashSet<String> = bound.iter().cloned().collect();
         // Plain yield without loop-carried mutation: desugar yield → defer + feed.
         let defer_name = ctx.fresh_result_name();
         // The loop target shadows a like-named transactional mutable variable in the body.
-        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+        let for_body = ctx.with_shadowed(bound, |ctx| {
             lower_for_body_stmts(
                 body,
                 Some(&defer_name),
@@ -169,6 +175,9 @@ pub(super) fn lower_generator_for(
                 ctx,
             )
         })?;
+        // The entry opens under the loop's lambda, where its key parameter is in
+        // scope — the same placement a comprehension's per-element body takes.
+        let for_body = binder.open(for_body, for_span, ctx);
         let for_node = tagged_for_loop(iter_var, source, for_body, for_span, ctx);
         let handle = ctx.tag_machinery(
             Expr::var(defer_name.clone()),
@@ -182,12 +191,15 @@ pub(super) fn lower_generator_for(
         );
         Ok(generator_defer_binding(defer_name, seq, for_span, ctx))
     } else {
-        let source = lower_expr(iter, ctx)?;
-        let frame_introduced = HashSet::from([iter_var.clone()]);
+        let (source, binder) = binder.source(lower_expr(iter, ctx)?, iter.span, ctx);
+        let iter_var = binder.param().to_string();
+        let bound = binder.bound_names();
+        let frame_introduced: HashSet<String> = bound.iter().cloned().collect();
         // The loop target shadows a like-named transactional mutable variable in the body.
-        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+        let for_body = ctx.with_shadowed(bound, |ctx| {
             lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
         })?;
+        let for_body = binder.open(for_body, for_span, ctx);
         Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx))
     }
 }
@@ -577,16 +589,19 @@ fn lower_for_body_terminal(
             ))
         }
         ChlStmt::For { target, iter, body } => {
-            let inner_var = extract_name_target(target, "for-loop target")?;
-            let inner_source = lower_expr(iter, ctx)?;
+            let binder = IterBinder::classify(target, "for-loop target")?;
+            let (inner_source, binder) = binder.source(lower_expr(iter, ctx)?, iter.span, ctx);
+            let inner_var = binder.param().to_string();
+            let bound = binder.bound_names();
             // New frame: the outer frame's names (including iter_var) move into
             // mutation_scope so that the inner body cannot mutate them.
             let inner_mutation_scope = body_scope(mutation_scope, frame_introduced);
-            let inner_frame = HashSet::from([inner_var.clone()]);
+            let inner_frame: HashSet<String> = bound.iter().cloned().collect();
             // The inner loop target shadows a like-named transactional mutable variable.
-            let inner_body = ctx.with_shadowed([inner_var.clone()], |ctx| {
+            let inner_body = ctx.with_shadowed(bound, |ctx| {
                 lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)
             })?;
+            let inner_body = binder.open(inner_body, stmt.span, ctx);
             Ok(tagged_for_loop(
                 inner_var,
                 inner_source,
@@ -874,14 +889,15 @@ pub(super) fn lower_direct_mirror_loop(
         outer_bindings,
         for_span,
     } = site;
-    let iter_var = extract_name_target(target, "for-loop target")?;
-    let source = lower_expr(iter, ctx)?;
+    let binder = IterBinder::classify(target, "for-loop target")?;
+    let (source, binder) = binder.source(lower_expr(iter, ctx)?, iter.span, ctx);
+    let iter_var = binder.param().to_string();
 
     // Build the statement chain right-to-left, ending in Unit (the For's
     // body is a statement, not a value). The loop target is in scope over the
     // body — shadow it so a body read of a like-named transactional mutable variable is
     // read as the loop local, not gated as an out-of-block mutable variable read.
-    let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
+    let chain = ctx.with_shadowed(binder.bound_names(), |ctx| {
         lower_loop_body_chain(
             body_stmts,
             acc_names,
@@ -892,6 +908,10 @@ pub(super) fn lower_direct_mirror_loop(
             ctx,
         )
     })?;
+    // An entry binder's key and value open inside the `For`'s body, under the
+    // binder the node declares — the mutable-writer counterpart of where a
+    // comprehension's per-element body opens them.
+    let chain = binder.open(chain, for_span, ctx);
 
     // The direct-mirror `For` images the for statement; the sequencing
     // `ExprStmt` splicing it before the continuation is manufactured.

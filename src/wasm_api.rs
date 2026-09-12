@@ -21,8 +21,10 @@
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+use crate::ccl::Type;
 use crate::ccl::channels::{ChannelDecl, row_from_json, row_to_json};
 use crate::embed::Host;
+use crate::interpreter::Value;
 
 /// Route a Rust panic to the browser console rather than an opaque trap.
 ///
@@ -38,6 +40,22 @@ pub fn init_panic_hook() {
 #[wasm_bindgen]
 pub struct Program {
     host: Host,
+}
+
+/// Decode a JS array of row objects against `row_type`.
+///
+/// `channel` names the source or route in the rejection, which is the only
+/// difference between the two ingress paths: a call's body and a pushed row
+/// cross the boundary as the same declared record.
+fn decode_rows(rows: JsValue, row_type: &Type, channel: &str) -> Result<Vec<Value>, JsValue> {
+    let rows: Vec<serde_json::Value> = serde_wasm_bindgen::from_value(rows)
+        .map_err(|e| JsValue::from_str(&format!("rows for '{channel}': {e}")))?;
+    rows.iter()
+        .map(|row| {
+            row_from_json(row, row_type)
+                .map_err(|e| JsValue::from_str(&format!("row for '{channel}': {e}")))
+        })
+        .collect()
 }
 
 #[wasm_bindgen]
@@ -68,8 +86,6 @@ impl Program {
     /// `rows` is a JSON array of objects matching the source's declared row
     /// type. A missing, extra or mistyped field throws.
     pub fn push(&mut self, source: &str, rows: JsValue) -> Result<(), JsValue> {
-        let rows: Vec<serde_json::Value> = serde_wasm_bindgen::from_value(rows)
-            .map_err(|e| JsValue::from_str(&format!("rows for '{source}': {e}")))?;
         let row_type = self
             .host
             .channels()
@@ -78,15 +94,29 @@ impl Program {
             .borrow()
             .row_type()
             .clone();
-        let mut decoded = Vec::with_capacity(rows.len());
-        for row in &rows {
-            decoded.push(
-                row_from_json(row, &row_type)
-                    .map_err(|e| JsValue::from_str(&format!("row for '{source}': {e}")))?,
-            );
-        }
+        let decoded = decode_rows(rows, &row_type, source)?;
         self.host
             .push(source, decoded)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Make one call against the route `method path`, as `rows`.
+    ///
+    /// The page is the listener a `wasm_serve` in the program binds, so this is
+    /// what a `fetch` in the page turns into: the request crosses as rows of the
+    /// route's declared record type rather than as a body, and the reply comes
+    /// back in the next `tick`'s `outputs` under the route's own name
+    /// (`"PATCH /cart"`). Nothing in the program parses or renders a body.
+    pub fn request(&mut self, method: &str, path: &str, rows: JsValue) -> Result<(), JsValue> {
+        let (source, _) = self
+            .host
+            .channels()
+            .route(method, path)
+            .ok_or_else(|| JsValue::from_str(&format!("no route serves '{method} {path}'")))?;
+        let row_type = source.borrow().row_type().clone();
+        let decoded = decode_rows(rows, &row_type, &format!("{method} {path}"))?;
+        self.host
+            .request(method, path, decoded)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

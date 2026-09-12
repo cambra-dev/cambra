@@ -1,7 +1,15 @@
 # A live asset cart. Four host channels, declared beside this file; prices are
-# integers scaled by 10^8. See `mod.rs` for the rules this shape obeys, and for
-# the TODO: one reader over one keyed collection, once `Mut(Map(K, V), Txn)`
-# lands and a multi-slot read stops costing what it does.
+# integers scaled by 10^8. See `mod.rs` for the rules this shape obeys.
+#
+# This is the version that runs, and the one the deck presents. The six slots
+# and the sink per ticker are not the design — they are what the compiler admits
+# today. `v1.cambra` is the same app written as one reader over keyed
+# collections, and its header lists the three things standing between the two.
+#
+# The TODO that used to sit here said this waited on `Mut(Map(K, V), Txn)`. That
+# type now exists; writing a key and reading one key both work. What does not is
+# reading a whole collection out of a `Mut`, which is the one that keeps the six
+# slots here.
 
 btc_updates = [u for u in price_updates() if u.ticker == "BTC-USD"]
 eth_updates = [u for u in price_updates() if u.ticker == "ETH-USD"]

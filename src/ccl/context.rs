@@ -408,6 +408,12 @@ pub struct SourceSinkRegistry {
     /// one: a declaration the host made once has to reach every version, the
     /// way a registered source does.
     host_sinks: HashMap<String, Rc<dyn DataSink>>,
+    /// The reply sink of every `wasm_serve` route a host declared, by route name
+    /// ([`wasm_route_name`](crate::ccl::lower::wasm_route_name)). Held for the
+    /// reason [`host_sinks`](Self::host_sinks) is, and separately from it
+    /// because a route sink is bound by the program's `wasm_serve` statement
+    /// rather than by a `Defer` lowering wraps around the whole program.
+    route_sinks: HashMap<String, Rc<dyn DataSink>>,
 }
 
 impl SourceSinkRegistry {
@@ -566,6 +572,9 @@ impl SourceSinkRegistry {
         lowering.adopt_servers(self.shared_servers.iter().map(|(p, s)| (*p, s.clone())));
         for (name, sink) in &self.host_sinks {
             lowering.declare_host_sink(name.clone(), sink.clone());
+        }
+        for (route, sink) in &self.route_sinks {
+            lowering.declare_route_sink(route.clone(), sink.clone());
         }
         lowering
     }
@@ -797,6 +806,22 @@ impl GlobalContext {
         let name = sink.name().to_string();
         self.lowering.declare_host_sink(name.clone(), sink.clone());
         self.sources_and_sinks.host_sinks.insert(name, sink);
+    }
+
+    /// Pre-declare the reply half of a `wasm_serve` route, named
+    /// [`wasm_route_name(method, path)`](crate::ccl::lower::wasm_route_name).
+    ///
+    /// The egress counterpart of the request source a route registers through
+    /// [`register_source`](Self::register_source), and the difference from
+    /// [`declare_host_sink`](Self::declare_host_sink) is which statement binds
+    /// it: a route's reply channel is named by the program's `wasm_serve`, so
+    /// lowering emits no binding of its own and a route the program does not
+    /// serve leaves no unfed sink.
+    pub fn declare_route_sink(&mut self, sink: Rc<HostSink>) {
+        let route = sink.name().to_string();
+        self.lowering
+            .declare_route_sink(route.clone(), sink.clone());
+        self.sources_and_sinks.route_sinks.insert(route, sink);
     }
 }
 

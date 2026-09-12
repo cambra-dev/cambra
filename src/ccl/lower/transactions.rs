@@ -202,20 +202,37 @@ fn lower_tx_block_scoped(
     fallback_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // Multiple `if` guards, `elif` chains, `else` branches and `match` arms are all
-    // supported: `transact_phase`'s path walk scopes each write to its own
-    // control-flow path, rejoins each key with a carry-forward `Case`, and commits
-    // on the disjunction of the write paths (see `src/ccl/design/mutability.md`).
-    // A guard is not transaction-scoped — a spine write beside a branch commits
-    // unconditionally.
-    //
     // The chain terminal is manufactured sequencing (spanned to the block's
     // statements — the `with` construct when the block is empty).
     let block_span = match (stmts.first(), stmts.last()) {
         (Some(first), Some(last)) => first.span.join(last.span),
         _ => fallback_span,
     };
-    let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
+    let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
+    lower_tx_stmts_onto(stmts, unit, outer_bindings, ctx)
+}
+
+/// [`lower_tx_block_scoped`]'s fold, over a caller-supplied `tail` rather than the
+/// block's `Unit` terminal.
+///
+/// The terminal is a parameter because a `for` inside the block is expanded *into*
+/// the chain ([`lower_tx_for`]): each copy of the loop body continues into the
+/// statements after the loop, not into a `Unit` of its own. A block's own chain
+/// ends in `Unit` because a block is a statement, and `lower_tx_block_scoped`
+/// passes that.
+fn lower_tx_stmts_onto(
+    stmts: &[Spanned<ChlStmt>],
+    tail: Expr,
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // Multiple `if` guards, `elif` chains, `else` branches and `match` arms are all
+    // supported: `transact_phase`'s path walk scopes each write to its own
+    // control-flow path, rejoins each key with a carry-forward `Case`, and commits
+    // on the disjunction of the write paths (see `src/ccl/design/mutability.md`).
+    // A guard is not transaction-scoped — a spine write beside a branch commits
+    // unconditionally.
+    let mut chain = tail;
     for stmt in stmts.iter().rev() {
         chain = match &stmt.node {
             // `balance := value` — the transactional mutable variable write. `:=` is the
@@ -308,6 +325,14 @@ fn lower_tx_block_scoped(
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
+            // `for x in [a, b]: <writes>` — the loop, expanded into this chain
+            // (see [`lower_tx_for`]). The expansion is why the arm produces the
+            // whole remaining chain rather than one statement spliced before
+            // `chain`: a copy of the body per element, each continuing into the
+            // one after it and the last into the statements below the loop.
+            ChlStmt::For { target, iter, body } => {
+                lower_tx_for(target, iter, body, chain, outer_bindings, stmt.span, ctx)?
+            }
             ChlStmt::With { .. } => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -319,10 +344,121 @@ fn lower_tx_block_scoped(
                     stmt.span,
                     "a `with begin():` block supports mutable writes (`x := …`, `x += …`), \
                      local bindings (`x = …`), `if cond:` guards, `match` dispatch, \
-                     and feeds (`out << e`)",
+                     `for` loops over a list literal, and feeds (`out << e`)",
                 ));
             }
         };
+    }
+    Ok(chain)
+}
+
+/// Lower a `for x in [e₀, …, eₙ₋₁]: <body>` **inside** a `with begin():` block by
+/// expanding it into the block's statement chain: one copy of the body per
+/// element, the binder a `Let` over that copy, the last copy continuing into
+/// `tail` (the statements below the loop).
+///
+/// # The loop is a fold over the block's read-your-writes environment
+///
+/// A block denotes one decision — `snapshot ⇒ {`commit{writes} | `abort}` — whose
+/// per-key write is a **term over that one snapshot**
+/// (`src/ccl/design/mutability.md`, "A `for` inside a block (over a list
+/// literal)"). A loop inside the block is therefore a fold: iteration *i* runs
+/// the body against the environment iterations `0..i` left, and the block
+/// continues from the environment the last one left. Nothing about that is new machinery —
+/// `transact_phase::walk_block` already threads exactly this environment through a
+/// straight-line chain of `Let`s and `MutWrite`s, and read-your-writes through the
+/// expansion is the same substitution it does between two sibling statements. That
+/// is the whole reason the loop is expanded *here*, in lowering, rather than
+/// carried into the phase as a marker node: the fold's meaning is a chain of
+/// statements, so writing it as one leaves every downstream rule (the path walk,
+/// the per-key carry-forward `Case`, the `__to_<defer>` feed taps, the dense commit
+/// payload) applying unchanged, with no arm to add anywhere below.
+///
+/// # The commit condition is the loop's position, never its length
+///
+/// The writes a loop body performs commit on the path condition of the statement
+/// position the `for` occupies — the enclosing guard, or `true` on the spine —
+/// exactly as if the body had been written out by hand. A loop that iterates zero
+/// times contributes no write and no feed, and so contributes nothing to the
+/// commit disjunction; it does **not** deny the transaction. Two independent
+/// reasons, and either alone settles it:
+///
+/// - The `commit` payload is dense: an unwritten key on a committing path carries
+///   its snapshot value, a no-op re-write. "The loop ran zero times" and "the loop
+///   wrote every key back unchanged" are therefore the same observation, so a
+///   zero-iteration loop cannot be allowed to change the grant/deny tag.
+/// - A path condition is a `Bool` term over the snapshot. A source's cardinality is
+///   not such a term, so "the loop is non-empty" is not a condition the decision
+///   could carry even if we wanted it to.
+///
+/// This is the same rule a spine write beside a false guard follows (`commit =
+/// p ∨ true`, pinned by `spine_write_commits_beside_false_guard`): a construct
+/// that writes nothing neither grants nor denies on its own.
+///
+/// # Why the source must be a list literal
+///
+/// Because the decision is one term, the fold has to be **finitely denoted**, and
+/// the only finite denotation available is the expansion above — there is no fold
+/// term in the algebra to defer to. A source whose length is known only at runtime
+/// would need the block's write for a key to be `merge(snapshot, ⟨the loop's
+/// contribution⟩)`: a bulk keyed update, built per transaction from a collection
+/// the snapshot itself supplies. Neither half exists — there is no merge builtin
+/// (`Builtin::Insert` writes one key), and a comprehension inside a block that
+/// reads the snapshot does not survive op-conversion today. Rejecting the source
+/// outright, rather than silently accepting the literal case under a general-looking
+/// syntax, is what keeps that gap visible; `src/ccl/design/mutability.md` carries
+/// the shape the general case wants.
+///
+/// The binder shadows a like-named transactional mutable variable over the body
+/// (`with_shadowed`), as every other binding site does, and the body is a block, so
+/// it declares its own type aliases.
+fn lower_tx_for(
+    target: &Spanned<AssignTarget>,
+    iter: &Spanned<ChlExpr>,
+    body: &[Spanned<ChlStmt>],
+    tail: Expr,
+    outer_bindings: &HashSet<String>,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let iter_var = extract_name_target(target, "for-loop target")?;
+    let ChlExpr::List(elements) = &iter.node else {
+        return Err(LoweringError::unsupported(
+            iter.span,
+            "a `for` inside a `with begin():` block iterates a list literal \
+             (`for x in [a, b]:`): the block is one decision over one snapshot, so the \
+             loop is expanded into it at compile time and its elements have to be \
+             written out. A source whose length is only known at runtime needs a bulk \
+             keyed update (`m := merge(m, …)`), which does not exist yet",
+        ));
+    };
+    // Every element expression is lowered here, in the scope *around* the loop and
+    // in source order — a source is evaluated once, before the binder exists, and
+    // minting synthetic names in the order the user wrote them keeps a lowering log
+    // readable. The expansion below walks them backwards, which is a property of
+    // building a statement chain right-to-left, not of the source.
+    let values: Vec<Expr> = elements
+        .iter()
+        .map(|element| lower_expr(element, ctx))
+        .collect::<Result<_, _>>()?;
+
+    // The binder is in scope over the body for the same reason a `let` above the
+    // loop would be: a nested block value (`x = if …:`) lowered inside the body
+    // resolves names against it.
+    let mut scope = outer_bindings.clone();
+    scope.insert(iter_var.clone());
+
+    let mut chain = tail;
+    for value in values.into_iter().rev() {
+        let continuation = chain;
+        let copy = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            with_block_type_aliases(body, ctx, |ctx| {
+                lower_tx_stmts_onto(body, continuation, &scope, ctx)
+            })
+        })?;
+        // Each copy's binder images the `for` statement: it is the loop target,
+        // bound to the one element this copy runs for.
+        chain = ctx.tag_image(Expr::let_bind(iter_var.clone(), value, copy), span);
     }
     Ok(chain)
 }

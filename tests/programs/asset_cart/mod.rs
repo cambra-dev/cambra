@@ -43,17 +43,24 @@
 //!
 //! # The ladder above this rung
 //!
-//! `Mut(Map(String, Int), Txn)` replaces the six slots with two collections;
-//! `for t -> q in cart` collapses the three readers into one that serves the
-//! whole cart, subtotal included. Both are language work tracked separately,
-//! and neither changes what this program means.
+//! `v1.cambra` is that ladder written down. `Mut(Map({AccountId, Ticker}, Int),
+//! Txn)` replaces the six slots with three keyed collections, `for (a, t) -> q
+//! in cart` collapses the three readers into one that serves the whole cart
+//! (subtotal included), and three `wasm_serve` routes replace the three sources
+//! and the sink per ticker — so the page calls `PATCH /cart`, `PUT /checkout`
+//! and `GET /cart` instead of pushing rows at named channels. It does not
+//! compile; [`asset_cart_v1_currently_blocked_on_entry_iteration`] is what it
+//! waits on, and the file is here so the shape is reviewable while those
+//! constructs are built.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use cambra::ccl::channels::ChannelFile;
+use cambra::ccl::channels::{ChannelFile, ChannelKind};
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::{Consumer, HostSink, HostSource, Value};
+
+use super::common::expect_compile_error;
 
 /// Dollars × 10⁸ — the scale every price crosses a channel in.
 const SCALE: i64 = 100_000_000;
@@ -394,4 +401,112 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
             r#"{"sink":"eth_line","rows":[{"price":0,"qty":0,"total":0}]}"#,
         ],
     );
+}
+
+// ---------------------------------------------------------------------------
+// v1 — the map-based cart
+// ---------------------------------------------------------------------------
+
+/// `v1.cambra` is blocked in the front end, on entry iteration.
+///
+/// `for (a, t) -> q in m` is the construct, and v1 needs it in both positions
+/// the language offers. As a loop header inside `with begin():` it is the
+/// checkout's credit-and-drain, and it fails in the parser: `->` is no
+/// expression operator, so the header runs on into a `:` the expression grammar
+/// cannot take. As a comprehension generator it is the due total and each of
+/// the view's two lists, and it reaches lowering, which takes a simple name as
+/// a generator target and nothing else.
+///
+/// Both of those have since been built, and the needle moved with them: the
+/// two-tuple binder lowers in either position, and a block now takes a `for`.
+/// What v1 meets now is a **filter in a statement `for` header** —
+/// `for (a, t) -> q in cart if a == r.account:` — which the expression grammar
+/// ends at the `:`, reporting a binary operator expected. A comprehension takes
+/// `if`; a loop header does not, and the checkout's drain is written as one.
+///
+/// Behind that sit the two the entry-iteration work measured and could not
+/// clear, both upstream of any binder. A `Mut(…)` does not deref to the
+/// collection inside it at a function position, so a transactional map cannot be
+/// swept at all — a plain `sum(s)` over one dies in the runtime needing a
+/// `CurriedFunction`, with no comprehension involved. And a compound key
+/// `(a, t)` is refused by the projection rule whichever binder names it. Both
+/// are why none of v1's four sites are unblocked by entry iteration alone.
+///
+/// The same run reports the three routes as undeclared, because
+/// [`expect_compile_error`] compiles against a bare context with no host
+/// channels registered. That is what every program with host channels looks
+/// like there, and [`asset_cart_needs_the_channels_declared_beside_it`] pins the
+/// same fact for `v0.cambra`; [`asset_cart_v1_declares_the_routes_it_serves`] is
+/// the test that reads v1's own declarations.
+///
+/// Two further blockers sit behind these, unreachable until the front end
+/// clears and so pinned by no needle here. A `Mut(Map(K, V), Txn)` seeded from
+/// `map([…])` is rejected by inference, which meets a compute function and a
+/// data collection at the initializer's position with no ordering between the
+/// two kinds; and `box(map([]))` — what the cart and the prices are seeded with
+/// — panics in post-letrec with unresolved inference variables. Neither is
+/// about the program's shape: both are the seed of a keyed transactional store,
+/// which no gallery program has needed before.
+#[test]
+fn asset_cart_v1_currently_blocked_on_entry_iteration() {
+    // The needle is the parse of the checkout's drain header. It is deliberately
+    // the *first* thing v1 meets rather than the deepest: a pin on a later wall
+    // would go green the moment an earlier one moved, and this test's whole job
+    // is to fail loudly when the blocker changes — which is how it caught that
+    // entry iteration and `for`-in-a-block had landed.
+    expect_compile_error(include_str!("v1.cambra"), "found ':', expected binary operator");
+}
+
+/// v1's wiring, beside it: three routes and the price feed.
+///
+/// `v1.channels.json` rather than `channels.json`, because v0 holds that name
+/// and the two versions are wired differently — v1 replaces three sources and
+/// three per-ticker sinks with three request/response pairs. One file carrying
+/// the union would give each version sinks it never feeds, which lowering
+/// rejects, so `ChannelFile::beside` reads a program-qualified file first.
+///
+/// The view reply is what this asserts registers. It is a record carrying two
+/// lists, and a list's extent names a length that is data — so it is declarable
+/// exactly because an egress row type needs no extent
+/// (`src/interpreter/design-host-channels.md`, "Row types"). The program cannot
+/// yet *produce* that row, but the declaration and the JSON codec beneath it are
+/// no longer what stands in the way.
+#[test]
+fn asset_cart_v1_declares_the_routes_it_serves() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
+    let program = std::path::Path::new(dir).join("v1.cambra");
+    let declared = ChannelFile::beside(&program)
+        .expect("the channel file parses")
+        .expect("the program has a channel file");
+
+    let declares = |name: &str, kind: ChannelKind| {
+        declared
+            .channels
+            .iter()
+            .any(|d| d.name == name && d.kind == kind)
+    };
+    let routes = ["PATCH /cart", "PUT /checkout", "GET /cart"];
+    for route in routes {
+        assert!(
+            declares(route, ChannelKind::Request) && declares(route, ChannelKind::Response),
+            "'{route}' is declared as a request/response pair"
+        );
+    }
+    assert_eq!(
+        declared.channels.len(),
+        7,
+        "two halves per route, plus the price feed"
+    );
+
+    let mut ctx = GlobalContext::default();
+    let channels = ctx
+        .register_channels(&declared.channels)
+        .expect("v1's declarations are well formed");
+    for route in routes {
+        let (method, path) = route.split_once(' ').expect("a route is a request line");
+        assert!(
+            channels.route(method, path).is_some(),
+            "'{route}' resolves to both of its halves"
+        );
+    }
 }

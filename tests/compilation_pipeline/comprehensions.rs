@@ -258,3 +258,269 @@ fn test_filtered_comprehension_over_a_filtered_literal() {
         Value::Int(2),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Entry iteration — `for k -> v in m`
+// ---------------------------------------------------------------------------
+
+// A two-tuple binder iterates a collection's **entries**: the key and the value it
+// stores, rather than the value alone (`docs/chl-spec.md`, "4.6 `for` — iteration").
+// The generator's source becomes the collection's keys and the value comes back
+// through the proven lookup the key's own domain discharges
+// (`src/ccl/lower/entries.rs`).
+//
+// Both spellings are one target — `k -> v` *is* `(k, v)` (`docs/chl-spec.md`,
+// "2.4 Atoms") — so the arrow buys readability at the iteration site and nothing
+// below the parser distinguishes them. Pinned as one case each so a divergence
+// would fail rather than go unnoticed.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::arrow("sum([k * v for k -> v in m])")]
+#[case::parenthesised("sum([k * v for (k, v) in m])")]
+fn an_entry_binder_reads_the_key_and_the_value(#[case] comprehension: &str) {
+    check_scalar(
+        &format!("m = map([(1, 10), (2, 20)])\n{comprehension}"),
+        // 1*10 + 2*20.
+        Value::Int(50),
+    );
+}
+
+/// A key the body never reads is still bound. Nothing downstream has to know
+/// whether it was used — the source is the collection's keys either way, and the
+/// value is looked up at each of them — so the iteration is the same one the
+/// reading case gets.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_entry_binders_key_may_go_unread() {
+    check_scalar(
+        r#"m = map([("a", 1), ("b", 2)])
+sum([v for k -> v in m])"#,
+        Value::Int(3),
+    );
+}
+
+/// A `Set(𝐾)` is `Map(𝐾, unit)`, so its entry is `(𝐾, unit)` and the projection
+/// to the key is lossless — which is the whole reason entry iteration can be
+/// uniform across collection types while `Set` and `Map` remain the one pair the
+/// kind does not separate (`src/ccl/design/collections.md`, "Telling `Set` and
+/// `Map` apart [Open]"). Iterating a set's entries is how a program reaches its
+/// keys today.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_sets_entry_is_its_key_and_unit() {
+    check_scalar(
+        "s = set([1, 2, 3])\nsum([k for k -> u in s])",
+        Value::Int(6),
+    );
+}
+
+/// Entry iteration inside a `with begin():` block, over a collection the block
+/// does **not** own. The block contributes nothing to the iteration — the
+/// comprehension is an ordinary value computed per transaction — which is what
+/// makes this the boundary case worth pinning beside
+/// `an_entry_binder_over_a_transactional_map_is_not_reachable` below: the
+/// block is not what blocks that one, the transactional *source* is.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_entry_binder_reads_a_plain_map_inside_a_block() {
+    check_scalar(
+        indoc! {r"
+            m = map([(1, 10), (2, 20)])
+            n: Mut(Int, Txn) := 0
+            for r in [1]:
+                with begin():
+                    n := n + sum([k * v for k -> v in m])
+            await_final(n)
+        "},
+        Value::Int(50),
+    );
+}
+
+/// An entry is a key and a value and nothing else, so a binder with any other
+/// arity names a component the collection does not have. Refused at lowering,
+/// where the message can say what the binder is *for*, rather than left to fail
+/// as an unresolvable projection in inference.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::three("m = map([(1, 10)])\nsum([a for (a, b, c) in m])")]
+#[case::one("m = map([(1, 10)])\nsum([a for (a,) in m])")]
+fn an_entry_binder_takes_exactly_two_components(#[case] code: &str) {
+    check_compile_error(code, "exactly two components");
+}
+
+// --- What entry iteration does not reach yet -------------------------------
+//
+// Each case below is a *source* or *key shape* entry iteration cannot serve, and
+// each fails for a reason upstream of the binder — the binder lowers identically
+// in all of them. Pinned on the failure rather than deferred: an `#[ignore]`
+// reports the same green whether the gap closed, regressed, or went away, which
+// is the convention the conditional-source case above already follows.
+//
+// The common cause of the first four is that an entry-iterating site is sourced
+// from the collection's keys (`m ▷ map_domain`), which puts the collection in a
+// **combinator argument** position it is not reached in anywhere else. Each one
+// names a capability that position needs and the compiler does not have.
+
+/// A **list literal** as the source. `map_domain` compiles its argument with no
+/// upstream input, and a bare list literal is an iteration site that planning
+/// only ever gives a source to when something downstream asks for one — so the
+/// literal arrives at op-conversion unsourced. Entry iteration over a list is the
+/// index/value pair, which is well-defined and worth having; what is missing is
+/// planning seeding a combinator's collection argument.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "list literal reached op-conversion without an input")]
+fn an_entry_binder_over_a_list_literal_is_not_reachable() {
+    check_scalar("sum([v for i -> v in [10, 20, 30]])", Value::Int(60));
+}
+
+/// An **annotated `Map(𝐾, 𝑉)`** as the source — a sum over its key domain
+/// (`src/ccl/design/collections.md`, "The six collection types"). The keys of a
+/// sum are the keys of whichever candidate the witness picked, so the key binder
+/// lands on the witness rather than on `𝐾`, and every use of it collides with
+/// the key type the annotation names. Consuming a sum at its witness is the open
+/// part of the sum rules, not of entry iteration.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "Incompatible")]
+fn an_entry_binder_over_an_annotated_map_is_not_reachable() {
+    check_scalar(
+        "m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nsum([k * v for k -> v in m])",
+        Value::Int(50),
+    );
+}
+
+/// A **`groupby` result** as the source, which is what the storefront rollup
+/// `[k -> agg(g) for k -> g in groupby(c, key)]` needs. A group-by's codomain
+/// *depends* on its key (`src/ccl/design/collections.md`, "`groupby`'s exact
+/// type"), and re-viewing it at its keys carries that dependency through a
+/// position whose binder is not in scope — the escape the telescope invariant
+/// rejects.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "open bound recorded on")]
+fn an_entry_binder_over_a_groupby_is_not_reachable() {
+    check_scalar(
+        r"g = groupby([1, 2, 3, 4], \x -> x // 2)
+sum([k for k -> grp in g])",
+        Value::Int(3),
+    );
+}
+
+/// A **second generator** beside an entry-iterating one. The entry generator's
+/// source and its lookup read the same collection at two positions, and the
+/// filtered reading one of them acquires does not equate with the unfiltered
+/// reading the other keeps — a data domain being invariant, that is a mismatch
+/// rather than a widening.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "post-inference produced an invalid tree")]
+fn an_entry_binder_beside_a_second_generator_is_not_reachable() {
+    check_scalar(
+        "m = map([(1, 10)])\nsum([k * v * x for k -> v in m for x in [1, 2]])",
+        Value::Int(30),
+    );
+}
+
+/// A **compound key**, which the storefront's cart (`Map({AccountId, Ticker},
+/// Int)`) and every other product-keyed collection need. Projecting a key whose
+/// type is a present-key domain over a tuple leaves the component types
+/// undetermined — and it does so whether lowering writes the projection for a
+/// `(a, t) -> q` binder or the program writes `k.0` itself, so this is the
+/// projection rule and not the binder.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::pattern("sum([a + b + v for (a, b) -> v in m])")]
+#[case::written_out("sum([k.0 + k.1 + v for k -> v in m])")]
+#[should_panic(expected = "Unresolved inference variable")]
+fn an_entry_binder_over_a_compound_key_is_not_reachable(#[case] comprehension: &str) {
+    check_scalar(
+        &format!("m = map([((1, 2), 5), ((3, 4), 7)])\n{comprehension}"),
+        Value::Int(22),
+    );
+}
+
+/// A **filtered** entry comprehension. The filter refines the site's domain, and
+/// a map's domain already carries the present-key membership predicate — a term
+/// that is carried and never executed (`src/ccl/ops.rs`,
+/// `Builtin::CollectionContains`) — so the restrict chain planning builds for the
+/// filter tries to compile it too. This one is not about entry iteration at all:
+/// the same comprehension with a plain value binder fails identically, which is
+/// what the second case pins.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::entry_binder("sum([v for k -> v in m if v > 10])")]
+#[case::value_binder("sum([v for v in m if v > 10])")]
+#[should_panic(expected = "non-combinator collection_contains")]
+fn a_filtered_comprehension_over_a_map_is_not_reachable(#[case] comprehension: &str) {
+    check_scalar(
+        &format!("m = map([(1, 10), (2, 20)])\n{comprehension}"),
+        Value::Int(20),
+    );
+}
+
+/// A **transactional map's snapshot** as the source — the shape all four of the
+/// storefront/demo entry-iteration sites take. Nothing here is about the binder:
+/// a plain value binder fails on the same program, and an induction `Mut`
+/// outside any block fails the same way too. A `Mut(…)` type never derefs to the
+/// collection inside it at a function position, so the generator's source meets
+/// the wrapper rather than the map. Reading a transactional collection *as* a
+/// collection is the missing piece, and `src/ccl/design/mutability.md` is where
+/// that work lands.
+///
+/// The two binders fail at different messages, and the difference is itself the
+/// point: the value binder meets the `Mut` wrapper at the comprehension's source
+/// annotation, while the entry binder's `map_domain` takes a *consumer's*
+/// collection — which a `Mut` wrapping one satisfies — and so gets one step
+/// further, to the `Σ` witness that
+/// `an_entry_binder_over_an_annotated_map_is_not_reachable` pins on its own.
+/// Two gaps in a row, not one.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::entry_binder("sum([v for k -> v in m])", "Incompatible")]
+#[case::value_binder("sum([v for v in m])", "Annotation mismatch")]
+fn an_entry_binder_over_a_transactional_map_is_not_reachable(
+    #[case] comprehension: &str,
+    #[case] expected: &str,
+) {
+    check_compile_error(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+                n: Mut(Int, Txn) := 0
+                for r in [1]:
+                    with begin():
+                        n := n + {}
+                await_final(n)
+            "#},
+            comprehension
+        ),
+        expected,
+    );
+}
+
+/// Entry iteration in **statement** position. The binder is read off the target
+/// and the body opened exactly as a comprehension's is
+/// (`src/ccl/lower/entries.rs`), so the two positions agree by construction
+/// rather than by two implementations happening to match — which is what this
+/// pins, because the program still does not compile.
+///
+/// What it meets is not the binder. A `for` over a collection with an
+/// accumulator is an induction loop, whose source must be indexed by *iteration
+/// position*, and a map's positions are its keys. The name binder fails on the
+/// same program at the same message, which is the case beside it.
+///
+/// Before this change the entry binder was refused at lowering — "only simple
+/// name targets are supported" — so what moved is that the two binders now reach
+/// the same wall, and closing that wall closes both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::entry_binder("for k -> v in m:\n    acc += k * v")]
+#[case::name_binder("for v in m:\n    acc += v")]
+#[should_panic(expected = "must be indexed by iteration position")]
+fn a_for_statement_over_a_map_is_not_reachable(#[case] loop_stmt: &str) {
+    check_scalar(
+        &format!("m = map([(1, 10), (2, 20)])\nacc := 0\n{loop_stmt}\nacc"),
+        Value::Int(50),
+    );
+}

@@ -79,18 +79,28 @@ pub(super) fn lower_list_comp(
     // that body and predicate expressions can reference it.
     let mut gen_sources: Vec<Expr> = Vec::new();
     let mut gen_iter_vars: Vec<String> = Vec::new();
+    let mut gen_binders: Vec<IterBinder> = Vec::new();
     let mut gen_spans: Vec<Span> = Vec::new();
 
     for (target, iter, _) in generators.iter() {
+        // A tuple target makes this generator iterate *entries*: same source,
+        // same lambda, one more `let` binding the key off the position the
+        // encoding already binds. [`IterBinder`] reads that off the target once
+        // and is consulted again in Phases 2, 5 and 6, so the edits one
+        // entry-iterating generator needs cannot disagree about the target's
+        // shape (`src/ccl/lower/entries.rs`).
+        let binder = IterBinder::classify(target, "comprehension target")?;
         // Mint binder uids inside the source *now*, before Phase 5/6 clone it
         // into both the body chain and the loop-join predicate: copies of a
         // minted tree stay structurally equal (uids are preserved by
         // cloning), which is what lets inference dedup the predicate-side
         // refinements against the body-side ones. See the "mint before
-        // copy" contract in `crate::ccl::uniquify`.
-        let source = uniquify::run(lower_expr(iter, ctx)?);
-        let var_name = extract_name_target(target, "comprehension target")?;
-        gen_iter_vars.push(var_name);
+        // copy" contract in `crate::ccl::uniquify`. The entry binder's own copy
+        // of the collection is taken from the minted tree for the same reason.
+        let collection = uniquify::run(lower_expr(iter, ctx)?);
+        let (source, binder) = binder.source(collection, iter.span, ctx);
+        gen_iter_vars.push(binder.param().to_string());
+        gen_binders.push(binder);
         gen_sources.push(source);
         gen_spans.push(iter.span);
     }
@@ -104,7 +114,15 @@ pub(super) fn lower_list_comp(
         .iter()
         .flat_map(|(_, _, ifs)| ifs.iter().copied())
         .collect();
-    let (body, lowered_preds) = ctx.with_shadowed(gen_iter_vars.clone(), |ctx| {
+    // The names a generator *introduces*, which is its binder's leaves and not
+    // its lambda parameter: an entry binder's parameter is the synthetic pair
+    // name, which shadows nothing a program can spell, while `k` and `v` are
+    // what the body and the guards actually read.
+    let bound_names: Vec<String> = gen_binders
+        .iter()
+        .flat_map(IterBinder::bound_names)
+        .collect();
+    let (body, lowered_preds) = ctx.with_shadowed(bound_names, |ctx| {
         let body = lower_expr(&comp.element, ctx)?;
         // We hold on to the original CHL guard nodes only to build human-readable
         // description strings; all detection logic operates on the lowered CCL.
@@ -180,7 +198,7 @@ pub(super) fn lower_list_comp(
         let source = gen_sources.pop().expect("single generator has one source");
         return Ok(fan_out_element_case(
             source,
-            &gen_iter_vars[0],
+            &gen_binders[0],
             outer_var,
             body,
             comp.element.span,
@@ -319,7 +337,13 @@ pub(super) fn lower_list_comp(
             }
         };
         let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
-        let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
+        // An entry binder's lambda takes the key, and everything else it
+        // owes — the key pattern, the value's lookup, the value pattern —
+        // opens under that lambda, where the key is in scope. That puts the
+        // names over everything one iteration does, including any generator
+        // nested inside it.
+        let opened = gen_binders[i].open(body_expr, gspan, ctx);
+        let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, opened), gspan, lc);
         body_expr = ctx.tag_machinery(Expr::apply(indexed_source, per_elem), gspan, lc);
     }
     // One contribution per generator, which is what makes position *i* of the result the
@@ -343,9 +367,13 @@ pub(super) fn lower_list_comp(
             .enumerate()
             .rev()
         {
+            // The guard reads the binder's names, so the predicate chain opens
+            // the entry exactly as the body chain does — untagged, predicate
+            // position being swept whole by `tag_predicate` below.
+            let opened = gen_binders[i].open_in_predicate(pred_expr, ctx);
             pred_expr = Expr::apply(
                 Expr::apply(make_idx_arg(Name::elem(), i), pred_source),
-                Expr::lambda(iter_var, Type::Hole, pred_expr),
+                Expr::lambda(iter_var, Type::Hole, opened),
             );
         }
         // A refined parameter lowers to a `cast(refined_data_fun, λ outer_var →
@@ -422,12 +450,13 @@ fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
 /// position into the fully-mapped collection.
 fn fan_out_element_case(
     source: Expr,
-    iter_var: &str,
+    binder: &IterBinder,
     outer_var: &str,
     body: Expr,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
+    let iter_var = binder.param();
     let TypedExprNode::Case { branches, .. } = body.node else {
         unreachable!("fan_out_element_case requires a Case body")
     };
@@ -449,7 +478,12 @@ fn fan_out_element_case(
             let idx_var = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), span, ec);
             let arm_src = fan_out_copy(&source, "lower.comp_elem_case_source");
             let read = ctx.tag_machinery(Expr::apply(idx_var, arm_src), span, ec);
-            let arm_body = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, b.body), span, ec);
+            // Both the arm's value and its gate read the binder's names, so
+            // both open the entry — the gate untagged, predicate position
+            // being swept whole below.
+            let arm_value = binder.open(b.body, span, ctx);
+            let arm_body =
+                ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, arm_value), span, ec);
             let applied = ctx.tag_machinery(Expr::apply(read, arm_body), span, ec);
             // The arm *is* a filtered comprehension — a collection — so it carries
             // the `Data` stamp, like every other comprehension lambda. The cast
@@ -468,7 +502,7 @@ fn fan_out_element_case(
                     Expr::var(Name::elem()),
                     fan_out_copy(&source, "lower.comp_elem_case_source"),
                 ),
-                Expr::lambda(iter_var, Type::Hole, gate),
+                Expr::lambda(iter_var, Type::Hole, binder.open_in_predicate(gate, ctx)),
             );
             // `gate_on_source` rides the cast target's refinement predicate — a
             // type slot outside the `walk_children` walk — so nothing else will

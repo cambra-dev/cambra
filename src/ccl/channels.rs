@@ -17,11 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::ccl::Type;
 use crate::ccl::context::GlobalContext;
-use crate::ccl::lower::{LoweringContext, lower_type_expr};
+use crate::ccl::lower::{LoweringContext, lower_type_expr, wasm_route_name};
 use crate::ccl::provenance::NodeId;
 use crate::chl_parser;
 use crate::interpreter::{
-    BaseType, Extent, HostSink, HostSource, Value,
+    BaseType, Extent, FuncBinding, HostSink, HostSource, Value, bindings_are_list,
     operator_conversion::ground_extent_of,
     operator_graph::{OperatorGraph, sink_nodes, source_nodes},
     value_recorder::SharedRecorder,
@@ -35,12 +35,32 @@ pub enum ChannelKind {
     Source,
     /// The program feeds rows out; the host drains the name.
     Sink,
+    /// The ingress half of a route: the host pushes one row per call, and the
+    /// program reads it through the `wasm_serve` that names the route.
+    Request,
+    /// The egress half of a route: the program feeds one reply per call, and the
+    /// host drains it to answer the call the request came from.
+    Response,
+}
+
+impl ChannelKind {
+    /// Whether this kind is half of a route rather than a standalone channel.
+    fn is_route_half(self) -> bool {
+        matches!(self, ChannelKind::Request | ChannelKind::Response)
+    }
+
+    /// Whether rows cross this channel into the program.
+    fn is_ingress(self) -> bool {
+        matches!(self, ChannelKind::Source | ChannelKind::Request)
+    }
 }
 
 /// One channel a host declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelDecl {
-    /// The name the program uses.
+    /// The name the program uses, or — for a route's `request` and `response` —
+    /// the route the program's `wasm_serve` names, spelled as a request line:
+    /// `PATCH /cart` ([`wasm_route_name`]).
     pub name: String,
     /// Which way rows cross.
     pub kind: ChannelKind,
@@ -69,12 +89,25 @@ impl ChannelFile {
         serde_json::from_str(text).map_err(|e| e.to_string())
     }
 
-    /// The declarations a program at `program` expects, from `channels.json`
-    /// beside it, or `None` where the program declares no channels.
+    /// The declarations a program at `program` expects, from
+    /// `<program>.channels.json` or `channels.json` beside it, or `None` where
+    /// the program declares no channels.
+    ///
+    /// The program-qualified name is read first so that two versions of one
+    /// program can sit in a directory with different wiring: a version that
+    /// replaces three sources with three routes is a different set of
+    /// declarations, and the alternative — one file that is the union of both —
+    /// gives each version sinks it never feeds, which lowering rejects.
     pub fn beside(program: &Path) -> Result<Option<Self>, String> {
-        let path = match program.parent() {
-            Some(dir) => dir.join("channels.json"),
-            None => return Ok(None),
+        let Some(dir) = program.parent() else {
+            return Ok(None);
+        };
+        let qualified = program
+            .file_stem()
+            .map(|stem| dir.join(format!("{}.channels.json", stem.to_string_lossy())));
+        let path = match qualified {
+            Some(qualified) if qualified.exists() => qualified,
+            _ => dir.join("channels.json"),
         };
         if !path.exists() {
             return Ok(None);
@@ -105,6 +138,24 @@ impl ChannelDecl {
             row_type: row_type.into(),
         }
     }
+
+    /// The request half of the route `method path`, carrying rows of `row_type`.
+    pub fn request(method: &str, path: &str, row_type: impl Into<String>) -> Self {
+        Self {
+            name: wasm_route_name(method, path),
+            kind: ChannelKind::Request,
+            row_type: row_type.into(),
+        }
+    }
+
+    /// The reply half of the route `method path`, carrying rows of `row_type`.
+    pub fn response(method: &str, path: &str, row_type: impl Into<String>) -> Self {
+        Self {
+            name: wasm_route_name(method, path),
+            kind: ChannelKind::Response,
+            row_type: row_type.into(),
+        }
+    }
 }
 
 /// Why a set of channel declarations was rejected.
@@ -118,6 +169,13 @@ pub enum ChannelError {
     NoExtent { channel: String, message: String },
     /// Two channels claim the same name.
     DuplicateName(String),
+    /// A route was declared with one half only.
+    HalfRoute {
+        /// The route both halves name.
+        route: String,
+        /// The kind that is missing, as it is spelled in a declaration.
+        missing: &'static str,
+    },
 }
 
 impl std::fmt::Display for ChannelError {
@@ -134,6 +192,13 @@ impl std::fmt::Display for ChannelError {
             }
             ChannelError::DuplicateName(name) => {
                 write!(f, "channel '{name}' is declared twice")
+            }
+            ChannelError::HalfRoute { route, missing } => {
+                write!(
+                    f,
+                    "route '{route}' declares no {missing}: a route is a \
+                     request and a response under one name"
+                )
             }
         }
     }
@@ -220,7 +285,29 @@ pub fn row_from_json(json: &serde_json::Value, ty: &Type) -> Result<Value, Strin
             }
             Ok(Value::Record(row))
         }
-        other => Err(format!("no JSON encoding for the row type {other}")),
+        // A `List(T)` crosses as a JSON array and arrives as the run of positions
+        // the runtime represents a list by: a function whose domain is `0..n`
+        // ([`bindings_are_list`]). Order is the array's, and it is the whole
+        // content of a list — `[a, b]` and `[b, a]` are different rows, where two
+        // field orders in an object are one row.
+        other => {
+            let Some(element) = other.list_element() else {
+                return Err(format!("no JSON encoding for the row type {other}"));
+            };
+            let items = json
+                .as_array()
+                .ok_or_else(|| format!("expected an array, got {json}"))?;
+            let mut bindings = Vec::with_capacity(items.len());
+            for (position, item) in items.iter().enumerate() {
+                let decoded =
+                    row_from_json(item, element).map_err(|e| format!("item {position}: {e}"))?;
+                bindings.push(FuncBinding {
+                    input: Value::UInt(position),
+                    output: decoded,
+                });
+            }
+            Ok(Value::Function(bindings))
+        }
     }
 }
 
@@ -256,21 +343,48 @@ pub fn row_to_json(value: &Value) -> Result<serde_json::Value, String> {
             }
             Ok(serde_json::Value::Object(object))
         }
+        // The runtime holds a list as a function over `0..n`, so this is the one
+        // encoding decided by the *value* rather than by the declared type: a
+        // function keyed by anything else is a map, and a map has no JSON array
+        // to be. Saying which it was is worth the longer message, because the two
+        // are one Rust variant and a host reading "no JSON encoding for a
+        // Function" learns nothing about which of its rows was wrong.
+        Value::Function(bindings) if bindings_are_list(bindings) => bindings
+            .iter()
+            .map(|binding| row_to_json(&binding.output))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        Value::Function(_) => Err(
+            "a collection keyed by anything but its positions is a map, and no JSON \
+             encoding carries one"
+                .to_string(),
+        ),
         other => Err(format!("no JSON encoding for the value {other:?}")),
     }
 }
 
-/// A channel's row type, as both halves the runtime needs.
-fn row_type_of(decl: &ChannelDecl) -> Result<(Type, Extent), ChannelError> {
-    let ty = parse_type(&decl.row_type).map_err(|message| ChannelError::TypeSyntax {
+/// A channel's declared row type.
+fn row_type_of(decl: &ChannelDecl) -> Result<Type, ChannelError> {
+    parse_type(&decl.row_type).map_err(|message| ChannelError::TypeSyntax {
         channel: decl.name.clone(),
         message,
-    })?;
-    let extent = ground_extent_of(&ty).map_err(|e| ChannelError::NoExtent {
+    })
+}
+
+/// The extent of an ingress channel's row, which is what tiles what arrives.
+///
+/// Asked for a `source` and a `request` and of nothing else. [`HostSource`]
+/// builds a column of arriving rows against it, so a row with no extent is a row
+/// the buffer cannot hold; [`HostSink`] takes a name and decodes the tiles the
+/// program hands it, so the declared type on the way out is a contract nothing
+/// grounds. Deriving one there would reject every row type the runtime can
+/// produce but a declaration cannot ground — a list, whose extent names a length
+/// that is data.
+fn row_extent_of(decl: &ChannelDecl, ty: &Type) -> Result<Extent, ChannelError> {
+    ground_extent_of(ty).map_err(|e| ChannelError::NoExtent {
         channel: decl.name.clone(),
         message: format!("{e:?}"),
-    })?;
-    Ok((ty, extent))
+    })
 }
 
 /// The channels a host registered, by name, so it can push and drain them.
@@ -299,6 +413,23 @@ impl Channels {
     /// The sink named `name`, for draining rows out.
     pub fn sink(&self, name: &str) -> Option<&Rc<HostSink>> {
         self.sinks.get(name)
+    }
+
+    /// Both halves of the route `method path`: the source a call's request goes
+    /// into, and the sink its reply comes out of.
+    ///
+    /// A route's halves live in the same maps every other channel does, keyed by
+    /// the route rather than by a name the program spells, so a host that drives
+    /// a route by name through [`source`](Self::source) and
+    /// [`drain_sink`](Self::drain_sink) drives it the same way. This is the
+    /// lookup that spares a caller from spelling the route itself.
+    pub fn route(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<(&Rc<RefCell<HostSource>>, &Rc<HostSink>)> {
+        let route = wasm_route_name(method, path);
+        Some((self.sources.get(&route)?, self.sinks.get(&route)?))
     }
 
     /// Take what the sink named `name` has served, recording it on the way out.
@@ -362,14 +493,30 @@ impl GlobalContext {
     /// for its channel to be bound.
     pub fn register_channels(&mut self, decls: &[ChannelDecl]) -> Result<Channels, ChannelError> {
         let mut channels = Channels::default();
-        let mut seen: HashMap<&str, ()> = HashMap::new();
+        // One claim per name per direction. A name carrying two claims is a
+        // route and nothing else: the request and the response are one address,
+        // bound together by one `wasm_serve`, so they are the one case where
+        // "the same name" means "the same thing". A `source` and a `sink`
+        // sharing a name are two channels a host believes are one.
+        let mut ingress: HashMap<&str, ChannelKind> = HashMap::new();
+        let mut egress: HashMap<&str, ChannelKind> = HashMap::new();
         for decl in decls {
-            if seen.insert(decl.name.as_str(), ()).is_some() {
+            let name = decl.name.as_str();
+            let (claimed, opposite) = if decl.kind.is_ingress() {
+                (&mut ingress, &egress)
+            } else {
+                (&mut egress, &ingress)
+            };
+            let crosses_directions = opposite
+                .get(name)
+                .is_some_and(|k| !(k.is_route_half() && decl.kind.is_route_half()));
+            if claimed.insert(name, decl.kind).is_some() || crosses_directions {
                 return Err(ChannelError::DuplicateName(decl.name.clone()));
             }
-            let (ty, extent) = row_type_of(decl)?;
+            let ty = row_type_of(decl)?;
             match decl.kind {
-                ChannelKind::Source => {
+                ChannelKind::Source | ChannelKind::Request => {
+                    let extent = row_extent_of(decl, &ty)?;
                     let source = Rc::new(RefCell::new(HostSource::new(&decl.name, ty, extent)));
                     self.register_source(source.clone());
                     channels.sources.insert(decl.name.clone(), source);
@@ -379,6 +526,29 @@ impl GlobalContext {
                     self.declare_host_sink(sink.clone());
                     channels.sinks.insert(decl.name.clone(), sink);
                 }
+                ChannelKind::Response => {
+                    let sink = Rc::new(HostSink::new(&decl.name));
+                    self.declare_route_sink(sink.clone());
+                    channels.sinks.insert(decl.name.clone(), sink);
+                }
+            }
+        }
+        // A half-declared route is rejected here rather than at the `wasm_serve`
+        // that binds it, because the missing half is the host's to supply and
+        // the program naming the route is evidence that it meant to: a request
+        // with no response is an address whose callers never hear back, and a
+        // response with no request is a reply channel nothing can trigger.
+        for decl in decls.iter().filter(|d| d.kind.is_route_half()) {
+            let (other_half, missing) = if decl.kind.is_ingress() {
+                (&egress, "response")
+            } else {
+                (&ingress, "request")
+            };
+            if !other_half.contains_key(decl.name.as_str()) {
+                return Err(ChannelError::HalfRoute {
+                    route: decl.name.clone(),
+                    missing,
+                });
             }
         }
         Ok(channels)
@@ -497,6 +667,115 @@ mod tests {
         assert!(
             row_from_json(&serde_json::json!(JSON_SAFE_INT + 1), &ty).is_err(),
             "an integer past 2^53 - 1 does not survive a JSON round trip"
+        );
+    }
+
+    /// A list crosses as a JSON array, in both directions.
+    ///
+    /// The runtime holds one as a function over `0..n`, so the decoder mints the
+    /// positions and the encoder reads them back off the bindings.
+    #[test]
+    fn a_list_row_round_trips_through_json() {
+        let ty = parse_type("List(Int)").expect("a list type parses");
+        let json = serde_json::json!([10, 20, 30]);
+        let row = row_from_json(&json, &ty).expect("an array decodes");
+        assert_eq!(
+            row,
+            Value::Function(vec![
+                FuncBinding {
+                    input: Value::UInt(0),
+                    output: Value::Int(10)
+                },
+                FuncBinding {
+                    input: Value::UInt(1),
+                    output: Value::Int(20)
+                },
+                FuncBinding {
+                    input: Value::UInt(2),
+                    output: Value::Int(30)
+                },
+            ]),
+            "positions are the list's own, minted in arrival order"
+        );
+        assert_eq!(row_to_json(&row).expect("a list encodes"), json);
+    }
+
+    /// The demo's view reply: a record carrying two lists of records.
+    ///
+    /// This is the row the page reads a cart off, so nothing about it may be
+    /// approximated on the way across.
+    #[test]
+    fn a_record_of_lists_round_trips_through_json() {
+        let ty = parse_type(
+            "{cash: Int, lines: List({ticker: String, qty: Int}), positions: List(Int)}",
+        )
+        .expect("a record of lists parses");
+        let json = serde_json::json!({
+            "cash": 50_000_000_000i64,
+            "lines": [{"ticker": "BTC", "qty": 2}, {"ticker": "ETH", "qty": 3}],
+            "positions": [],
+        });
+        let row = row_from_json(&json, &ty).expect("the view reply decodes");
+        assert_eq!(row_to_json(&row).expect("the view reply encodes"), json);
+    }
+
+    /// A collection keyed by anything but its positions is a map, and says so.
+    ///
+    /// Both are `Value::Function`, so the encoder decides by the keys. A host
+    /// told only "no JSON encoding for a Function" learns nothing about which of
+    /// its rows was wrong.
+    #[test]
+    fn a_map_value_is_refused_as_a_list() {
+        let map = Value::Function(vec![FuncBinding {
+            input: Value::String("BTC".into()),
+            output: Value::Int(2),
+        }]);
+        let err = row_to_json(&map).expect_err("a keyed collection has no JSON array");
+        assert!(
+            err.contains("map"),
+            "the rejection says which it was: {err}"
+        );
+    }
+
+    /// An egress channel's row type needs no extent, which is what lets a reply
+    /// carry a list.
+    ///
+    /// The extent tiles what arrives, and nothing arrives on a sink. A list's
+    /// extent names a length, and a length is data — so requiring one on the way
+    /// out would reject exactly the rows the runtime can produce and a
+    /// declaration cannot ground.
+    #[test]
+    fn an_egress_row_type_carries_a_list() {
+        let view_reply = "{cash: Int, lines: List({ticker: String, qty: Int})}";
+        for decl in [
+            ChannelDecl::sink("cart_view", view_reply),
+            ChannelDecl::response("GET", "/cart", view_reply),
+        ] {
+            let mut ctx = GlobalContext::default();
+            let paired = decl.kind == ChannelKind::Response;
+            let mut decls = vec![decl];
+            if paired {
+                decls.insert(0, ChannelDecl::request("GET", "/cart", "{account: Int}"));
+            }
+            ctx.register_channels(&decls)
+                .expect("a reply carrying a list is declarable");
+        }
+    }
+
+    /// An ingress channel's row type needs one, and a list has none.
+    ///
+    /// [`HostSource`] builds a column of arriving rows against the extent, so a
+    /// row type that cannot be grounded is a row the buffer cannot hold. The
+    /// rejection names the channel.
+    #[test]
+    fn an_ingress_row_type_may_not_carry_a_list() {
+        let err = GlobalContext::default()
+            .register_channels(&[ChannelDecl::source("quotes", "List(Int)")])
+            .err()
+            .expect("a list has no ground extent");
+        assert!(
+            matches!(&err, ChannelError::NoExtent { channel, .. } if channel == "quotes"),
+            "the rejection names the channel; got: {err}"
         );
     }
 

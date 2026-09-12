@@ -296,7 +296,27 @@ pub enum Builtin {
     Apply,
     /// `map : (B → C) → ((A → B) → (A → C))` — post-composition.
     Map,
-    /// `map_domain : (A → B) → (A → A)` — domain-to-domain identity stream.
+    /// `map_domain : ∀δ ε. (δ ⤇ ε) ⇒ (δ ⤇ δ)` — a collection's **keys**, as a collection
+    /// over the same positions. The domain-to-domain identity stream.
+    ///
+    /// Two producers, which is unusual here. Join planning mints it post-inference to
+    /// expose a materialised join's tuple domain as its iteration domain
+    /// (`src/ccl/design/optimization.md`, the `uncurry ▷ map_domain` chain) and stamps the
+    /// type itself. **Lowering also mints it**, for an entry-iterating `for k -> v in m`
+    /// (`src/ccl/lower/entries.rs`), and that use is typed by the
+    /// [`crate::ccl::infer::OperatorSchemes`] scheme above — shared `δ` across all three
+    /// positions, because the claim is that a collection's keys *are* its positions, and a
+    /// **consumer's** collection in the argument so a `Map(𝐾, 𝑉)` (a sum) satisfies it
+    /// alongside a bare one.
+    ///
+    /// Why entry iteration needs it rather than binding the position it already has: this
+    /// is in the iteration-internalising group ([`Self::iterates_arg`]), so a site headed
+    /// by one is sourced from the *collection*. A site that merely reads the position is
+    /// not, and planning then sources it from the domain **type** — a chain-head `iterate`
+    /// over the key type, which names no extent, filtered by a
+    /// [`Self::CollectionContains`] term that is never executable
+    /// (`src/ccl/design/collections.md`, "Entry iteration `for k -> v in m`
+    /// [Partly implemented]").
     MapDomain,
     /// `compose : ((A → B), (B → C)) → (A → C)` — composition as a morphism.
     Compose,

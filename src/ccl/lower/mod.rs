@@ -65,13 +65,13 @@
 //! the historical `crate::ccl::lower::…` paths continue to resolve:
 //!
 //! - [`stmts`] — statement-block lowering (`Let` chains, `if`/`else`, the
-//!   `http_serve` tuple-assign wiring, mutation-loop dispatch).
+//!   `http_serve` / `wasm_serve` tuple-assign wiring, mutation-loop dispatch).
 //! - [`exprs`] — per-[`ChlExpr`] expression lowering (binops, comparisons,
 //!   boolean ops, calls, unary ops, feeds, defines, constants).
 //! - [`functions`] — lambda / `def` / parameter lowering (uncurrying).
 //! - [`loops`] — `for`-loop, generator, and mutation-accumulation-loop lowering.
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
-//! - [`http`] — `http_serve` recognition predicates.
+//! - [`serve`] — `http_serve` / `wasm_serve` recognition predicates.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -97,10 +97,11 @@ use crate::{
 };
 
 mod comprehension;
+mod entries;
 mod exprs;
 mod functions;
-mod http;
 mod loops;
+mod serve;
 mod stmts;
 
 pub use stmts::lower_type_expr;
@@ -117,10 +118,11 @@ pub use stmts::{RESERVED_TYPE_NAMES, is_builtin_type_name};
 // is defined directly in this module as `pub`, so these imports stay private
 // — there is nothing public left to re-export onward.
 use comprehension::*;
+use entries::*;
 use exprs::*;
 use functions::*;
-use http::*;
 use loops::*;
+use serve::*;
 use stmts::*;
 use transactions::*;
 
@@ -370,6 +372,29 @@ pub struct LoweringContext {
     /// re-lowering the same route in a later version is the reuse path.
     pub(super) http_routes_this_pass: HashSet<String>,
 
+    /// The reply sink of every `wasm_serve` route the host declared, by route
+    /// name ([`wasm_route_name`]).
+    ///
+    /// Separate from [`sink_bindings`](Self::sink_bindings), which is keyed by
+    /// the CCL binding a feed writes: a route's reply binding is the name the
+    /// program's tuple target spells, and a new version may spell it
+    /// differently, so the route rather than the binding is the sink's identity.
+    /// Separate from [`host_sinks`](Self::host_sinks) because a route sink is
+    /// bound by the `wasm_serve` statement rather than by a `Defer` wrapped
+    /// around the program: a route the program does not serve is an address it
+    /// stopped serving, where a declared channel the program never feeds is an
+    /// unfed sink.
+    pub(super) route_sinks: HashMap<String, Rc<dyn DataSink>>,
+
+    /// Every `wasm_serve` route bound in this pass, by route name.
+    ///
+    /// Two `wasm_serve` calls on one route within a program would give the
+    /// address two request readers and two reply writers, with nothing deciding
+    /// which reply answers a call. Tracked per pass rather than against
+    /// [`route_sinks`](Self::route_sinks), which holds the declarations and is
+    /// the same in every version.
+    pub(super) wasm_routes_this_pass: HashSet<String>,
+
     /// What this pass may do with an `http_serve` naming a route the registry does
     /// not already hold.
     pub(super) endpoints: Endpoints,
@@ -591,6 +616,19 @@ impl LoweringContext {
             self.host_sinks.push(name.clone());
         }
         self.sink_bindings.insert(name, sink);
+    }
+
+    /// Declare the reply sink of the route named `route`, for a `wasm_serve` to
+    /// bind.
+    ///
+    /// Unlike [`declare_host_sink`](Self::declare_host_sink) this asks lowering
+    /// to emit no binding. The route's `wasm_serve` statement is the binding:
+    /// it names the reply channel, and only then is there a name a feed can be
+    /// written against. A route the program never mentions therefore leaves no
+    /// unfed sink behind — the address is simply one this version does not
+    /// serve.
+    pub fn declare_route_sink(&mut self, route: impl Into<String>, sink: Rc<dyn DataSink>) {
+        self.route_sinks.insert(route.into(), sink);
     }
 
     /// Drain all sink bindings accumulated for this compilation.
@@ -914,6 +952,23 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
     // Sanitise path for use inside a Rust/CCL identifier.
     let path_id = path.replace(['/', '-', '.'], "_");
     format!("__http_requests_{port}_{method}_{path_id}")
+}
+
+/// The canonical name of the route `wasm_serve(method, path)` binds.
+///
+/// A request line: the method, a space, the path. Both halves of the route —
+/// the host source carrying requests and the host sink carrying replies — are
+/// registered under it, which is what makes the pair one address rather than
+/// two channels a host has to remember to keep in step. It is also what a host
+/// writes in `channels.json` (`src/interpreter/design-host-channels.md`,
+/// "Routes"), so the declaration reads as the address it serves.
+///
+/// Unlike [`http_requests_source_name`] this is not sanitised into an
+/// identifier. Nothing binds it: `wasm_serve` binds the route's source and sink
+/// to the names the program's tuple target spells, so the route name is only
+/// ever a lookup key.
+pub fn wasm_route_name(method: &str, path: &str) -> String {
+    format!("{method} {path}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,5 +1363,20 @@ mod tests {
                 "expected the keyed-write diagnostic for:\n{code}\ngot {errs:?}"
             );
         }
+    }
+}
+#[cfg(test)]
+mod entry_scratch {
+    #[test]
+    fn dump() {
+        let code = "m = map([(\"a\", 1), (\"b\", 2)])\nsum([v for k -> v in m if k == \"a\"])";
+        let module = crate::chl_parser::parse_module(code)
+            .into_result()
+            .expect("parses");
+        let mut ctx = super::LoweringContext::default();
+        let expr = super::lower_stmts(&module.body, &mut ctx)
+            .into_result()
+            .expect("lowers");
+        println!("{expr:#?}");
     }
 }

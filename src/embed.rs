@@ -50,6 +50,8 @@ pub enum EmbedError {
     Compile(Vec<CompileError>),
     /// A row was pushed to a name no source has.
     UnknownSource(String),
+    /// A call was made against an address no route serves.
+    UnknownRoute { method: String, path: String },
 }
 
 impl std::fmt::Display for EmbedError {
@@ -58,6 +60,9 @@ impl std::fmt::Display for EmbedError {
             EmbedError::Channels(e) => write!(f, "{e}"),
             EmbedError::Compile(errors) => write!(f, "the program did not compile: {errors:?}"),
             EmbedError::UnknownSource(name) => write!(f, "no source named '{name}'"),
+            EmbedError::UnknownRoute { method, path } => {
+                write!(f, "no route serves '{method} {path}'")
+            }
         }
     }
 }
@@ -207,6 +212,32 @@ impl Host {
             .source(source)
             .ok_or_else(|| Box::new(EmbedError::UnknownSource(source.to_string())))?;
         handle.borrow_mut().push(rows);
+        Ok(())
+    }
+
+    /// Make one call against the route `method path`, as `rows`.
+    ///
+    /// The ingress half of what a `wasm_serve` in the program binds. The reply
+    /// leaves through the route's sink, so it arrives in the
+    /// [`outputs`](TickResult::outputs) of the tick that computes it, named by
+    /// the route — the host correlates a reply to its call by that name and by
+    /// arrival order, which is all a single-threaded program can permute.
+    ///
+    /// A call is a row like any other, which is why this is [`push`](Self::push)
+    /// with the route spelled for the caller rather than a second ingress path.
+    pub fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        rows: impl IntoIterator<Item = Value>,
+    ) -> Result<(), Box<EmbedError>> {
+        let (source, _) = self.channels.route(method, path).ok_or_else(|| {
+            Box::new(EmbedError::UnknownRoute {
+                method: method.to_string(),
+                path: path.to_string(),
+            })
+        })?;
+        source.borrow_mut().push(rows);
         Ok(())
     }
 

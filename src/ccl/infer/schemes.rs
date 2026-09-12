@@ -138,6 +138,19 @@ pub struct OperatorSchemes {
     /// is what pins a key domain's key type from inside that domain's own
     /// refinement.
     collection_contains: PolyScheme,
+    /// `∀δ ε. (δ ⤇ ε) ⇒ (δ ⤇ δ)` — [`Builtin::MapDomain`], a collection's **keys**
+    /// as a collection over the same domain. Inline-built because `δ` occupies three
+    /// positions at once — the argument's domain and both sides of the result — and
+    /// that is the whole content of the operator: it says the keys are the positions.
+    ///
+    /// This is the one scheme here whose builtin is *also* minted after inference, by
+    /// join planning (`src/ccl/planning/join.rs`), which stamps its own type and never
+    /// consults this. Having a scheme is what lets entry iteration name the keys in
+    /// the surface language (`src/ccl/lower/entries.rs`): a key binder needs an
+    /// iteration source that comes from the collection, and a domain *type* is not
+    /// one — a present-key domain's base is the unrefined key type, which has no
+    /// extent.
+    map_domain: PolyScheme,
 }
 
 impl OperatorSchemes {
@@ -200,6 +213,29 @@ impl OperatorSchemes {
             fun(
                 Type::data_fun(iota, kappa.clone()),
                 fun(kappa, prim(BaseType::Bool)),
+            ),
+        );
+
+        // MapDomain: ∀δ ε. (δ ⤇ ε) ⇒ (δ ⤇ δ). The argument is a **data** function and so
+        // is the result: this re-views a collection at the same positions, carrying its
+        // keys where it carried its values, which is a collection and not a capability.
+        // `δ` is shared across all three positions — one variable, not three — because
+        // the keys of a collection are its positions, and a result domain free of the
+        // argument's would let the two drift while the operator's whole claim is that
+        // they cannot.
+        let delta_keys = fresh_var(BODY_LEVEL);
+        let epsilon_keys = fresh_var(BODY_LEVEL);
+        let map_domain = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(
+                // A **consumer's** collection in the argument, like `Sum`'s: the kind is
+                // data by construction but polymorphic in the slot, so a plain collection
+                // and a `Map(𝐾, 𝑉)` — a sum over its key domain — satisfy it alike. An
+                // annotated map is the commonest thing entry iteration is written over,
+                // and `data_fun` would refuse it for being a sum rather than for anything
+                // about its keys.
+                Type::consumer_fun(delta_keys.clone(), epsilon_keys),
+                Type::data_fun(delta_keys.clone(), delta_keys),
             ),
         );
 
@@ -331,6 +367,7 @@ impl OperatorSchemes {
         Self {
             box_intro,
             collection_contains,
+            map_domain,
             bool_logic,
             concat,
             not_op,
@@ -419,6 +456,7 @@ impl OperatorSchemes {
         match b {
             Builtin::Box => Some(&self.box_intro),
             Builtin::CollectionContains => Some(&self.collection_contains),
+            Builtin::MapDomain => Some(&self.map_domain),
             Builtin::FinalOrDefault => Some(&self.final_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             Builtin::GetPrevTxn => Some(&self.get_prev_txn),

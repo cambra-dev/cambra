@@ -1,0 +1,161 @@
+# The map-based cart. One `Map` per collection instead of a slot per ticker,
+# and three routes the embedding page calls instead of three sources and a sink
+# per ticker. `v0.cambra` is the rung below.
+#
+# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
+# them. Each is pinned by a runnable test, so the message below is what you will
+# actually see rather than a description of it.
+#
+#   1. A filter in a `for` header.  `for (a, t) -> q in cart if a == r.account:`
+#      ends at the `:` — a comprehension takes `if`, a loop header does not.
+#      Only the checkout's drain needs it, and it could be written another way.
+#      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
+#
+#   2. Reading a transactional collection as a collection.  `Mut(...)` does not
+#      deref to the map inside it at a function position, so every read of the
+#      whole `cart` or `holdings` — the due total and both view lists — meets
+#      the wrapper instead of the map. This is the one that matters: it is not
+#      about transactions (a plain mutable map fails the same way) and not about
+#      the entry binder (a plain value binder fails the same way).
+#      Pinned: `an_entry_binder_over_a_transactional_map_is_not_reachable`.
+#
+#   3. Taking a compound key apart.  The cart is keyed by `(account, ticker)`,
+#      and projecting a component out of a key leaves the component types
+#      undetermined — whether the binder writes the projection or the program
+#      writes `k.0` itself. Keying a map by a tuple works; reading the tuple
+#      back does not.
+#      Pinned: `an_entry_binder_over_a_compound_key_is_not_reachable`.
+#
+# What does work, and is worth knowing before rewriting anything: writing a key
+# (`cart[(a, t)] := q`) and reading one key are both fine. It is only reading a
+# whole collection that is blocked — which is why `PATCH /cart` is expressible
+# today and the cart view is not.
+#
+# `mod.rs` carries the same list beside the test that pins it.
+
+one_btc = 10**8
+one_dollar = 10**8        # microcents; matches the feed's existing 10^8 scale
+
+# TODO alias types, refinement predicates
+AccountId = Int
+Microcents = Int
+Balance = {Microcents where  _ > 0}
+Ticker = String
+
+# Two accounts, not one: `map([(k, v)])` with a single entry panics in
+# post-lambda-elim.
+accts: Mut(Map(AccountId, Balance), Txn) := map([
+    (1, 500 * one_dollar),
+    (2, 250 * one_dollar),
+])
+
+# TODO tuple keys in maps
+# `Txn`, because checkout credits this inside a transaction and an induction
+# `Mut` may not be written inside a `with begin():` block.
+holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := map([
+    ((1, "BTC"), 2 * one_btc),
+    ((2, "ETH"), 5 * one_btc),
+])
+
+# --- cart ------------------------------------------------------------------
+
+# A pending quantity per (account, ticker), in the asset's base units — the
+# same units `holdings` carries. A checkout drains it; a PATCH sets one line.
+# TODO tuple keys in maps
+cart: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([]))
+
+# The last price the feed quoted, in Microcents per *whole* unit. Written by
+# the `ticker_updates` loop at the foot of this file, read by checkout inside
+# the transaction that spends the cash, so a quote and a debit share a snapshot.
+prices: Mut(Map(Ticker, Microcents), Txn) := box(map([]))
+
+# --- endpoints -------------------------------------------------------------
+
+# `wasm_serve(method, path)` is `http_serve`'s shape without the port: the
+# embedding page is the listener, so there is nothing to bind. Each call binds
+# a host-channel pair registered under (method, path), and rows cross as
+# declared record types rather than strings — which is why nothing below parses
+# a body. Row types, declared by the host:
+#   PATCH /cart      {account: Int, ticker: String, qty: Int}
+#                 -> {ok: Bool, ticker: String, qty: Int}
+#   PUT   /checkout  {account: Int}
+#                 -> {ok: Bool, due: Microcents, cash: Microcents}
+#   GET   /cart      {account: Int}
+#                 -> {cash: Microcents, lines: List(...), positions: List(...)}
+cart_changes,  cart_change_acks = wasm_serve("PATCH", "/cart")
+checkout_reqs, checkout_acks    = wasm_serve("PUT",   "/checkout")
+view_requests, view_replies     = wasm_serve("GET",   "/cart")
+
+for c in cart_changes:
+    with begin():
+        # The deny idiom: a bare `if` with no `else`. A quantity that is not a
+        # sane count of base units contributes no write, and this path does not
+        # commit.
+        if c.qty >= 0:
+            cart[(c.account, c.ticker)] := c.qty
+        # On the spine beside the guard, so the ack commits either way
+        # (`commit = p or true`) and the page always hears back. It has to sit
+        # inside the block: a sibling feed after the block may not read a
+        # `Mut(_, Txn)`.
+        cart_change_acks << (ok=(c.qty >= 0), ticker=c.ticker, qty=c.qty)
+
+for r in checkout_reqs:
+    with begin():
+        cash = accts[r.account]
+        # Every pending line, priced at the latest quote. `one_btc` is the
+        # divisor for every asset — the fixed-scale assumption v2 unwinds.
+        # TODO entry iteration (`for k -> v in m`) is [Planned], unparsed
+        # TODO a comprehension over a transactional map is [Decided], unparsed
+        # TODO a bare `m[k]` needs `FullMap`; today it is `m[k]?` plus `match`
+        due = sum([q * prices[t] // one_btc
+                   for (a, t) -> q in cart if a == r.account])
+        # One guard over three keyed writes: the debit, the credit and the
+        # drain commit together or not at all. This is the atomicity claim.
+        if cash >= due:
+            accts[r.account] := cash - due
+            # TODO a `for` inside `with begin():` is not accepted today — a
+            # TODO block takes writes, bindings, `if`, `match` and feeds only
+            for (a, t) -> q in cart if a == r.account:
+                holdings[(a, t)] := holdings[(a, t)] + q
+                cart[(a, t)] := 0
+        # Read-your-writes: the debited balance on the committing path, the
+        # untouched one on the denied path.
+        remaining = accts[r.account]
+        checkout_acks << (ok=(cash >= due), due=due, cash=remaining)
+
+for v in view_requests:
+    with begin():
+        # A read-only block, so the reply stays inside it: that is what pins
+        # every line, every position and the cash to one commit snapshot.
+        # The reply is a record of two lists. The channel carries one — a
+        # reply's row type needs no extent, and a list crosses as a JSON array —
+        # so what remains is the program producing it, which is why `v0.cambra`
+        # still has btc_line/eth_line/sol_line.
+        view_replies << (
+            cash = accts[v.account],
+            lines = [(ticker=t, qty=q, price=prices[t],
+                      total=q * prices[t] // one_btc)
+                     for (a, t) -> q in cart if a == v.account],
+            positions = [(ticker=t, qty=q)
+                         for (a, t) -> q in holdings if a == v.account],
+        )
+
+# --- feed ------------------------------------------------------------------
+
+# The host's websocket, in the same shape as a host source: it connects, sends
+# the subscription, decodes each message and pushes one typed row per quote —
+# so no JSON parsing or string splitting happens in Cambra. Native builds do
+# this with `tungstenite`; the page uses the browser's own WebSocket, and the
+# recorded slice replays into the same channel offline. Arguments are
+# compile-time constants, as `wasm_serve`'s are. Rows carry the bare ticker
+# ("BTC"), not the product id.
+#   -> {ticker: String, price: Microcents}
+ticker_updates = wasm_socket_subscribe(
+    "wss://ws-feed.exchange.coinbase.com",
+    "ticker_batch",
+    ["BTC-USD", "ETH-USD", "SOL-USD"],
+)
+
+for u in ticker_updates:
+    with begin():
+        prices[u.ticker] := u.price

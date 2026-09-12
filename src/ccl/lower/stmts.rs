@@ -1,5 +1,5 @@
-//! Statement-block lowering: `Let` chains, `if`/`else`, the `http_serve`
-//! tuple-assign wiring, and mutation-loop dispatch.
+//! Statement-block lowering: `Let` chains, `if`/`else`, the `http_serve` and
+//! `wasm_serve` tuple-assign wiring, and mutation-loop dispatch.
 
 use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
@@ -572,7 +572,7 @@ pub(super) fn lower_middle_stmt(
                      not inside an if/else branch or function body",
                 ));
             }
-            let (req_name, resp_name) = extract_http_serve_names(target)?;
+            let (req_name, resp_name) = extract_serve_names(target, "http_serve")?;
             let (port, method, path) = extract_http_serve_args(value)?;
             // Create and register the source now; the caller drains new_sources
             // via take_new_sources() after lower_stmts returns, before type inference.
@@ -670,6 +670,93 @@ pub(super) fn lower_middle_stmt(
                 Expr::let_bind(resp_name, responses_expr, body),
                 stmt.span,
                 "lower.http_serve",
+            );
+            let let_expr = Expr::let_bind(req_name, requests_expr, inner_let);
+            Ok(ctx.tag_image(let_expr, stmt.span))
+        }
+        // Special case: `requests, responses = wasm_serve(method, path)`.
+        //
+        // Lowers to the pair `http_serve` lowers to:
+        //   let <requests> = Source("<METHOD> <path>") in
+        //   let <responses> = Defer                    in
+        //   <body>
+        // TODO the multi-return note on the `http_serve` arm applies here too:
+        // TODO neither construct should need a special case.
+        //
+        // `http_serve`'s shape minus the port, because the embedding page is the
+        // listener and there is nothing to bind. What the two arms share ends
+        // there. This one opens no socket and spawns no thread, so it is not
+        // gated on a target that has neither; the route it binds is a pair of
+        // host channels the host declared before compiling
+        // (`src/interpreter/design-host-channels.md`, "Routes"); and a request
+        // arrives as the record its declaration gives it while a reply leaves as
+        // the record the program feeds, so nothing on this path parses or
+        // renders a body. That last difference is why this is not `http_serve`
+        // with the port defaulted: `http_serve`'s replies are strings by
+        // construction (`HttpServerSharedState::process` accepts a codomain of
+        // `Scalar(Strings)` and silently returns on any other shape), which a
+        // program serving a computed number would have to render itself.
+        ChlStmt::Assign { target, value } if is_wasm_serve_tuple_assign(target, value) => {
+            if !is_top_level {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "wasm_serve is only supported at the top level of a program, \
+                     not inside an if/else branch or function body",
+                ));
+            }
+            let (req_name, resp_name) = extract_serve_names(target, "wasm_serve")?;
+            let (method, path) = extract_wasm_serve_args(value)?;
+            let route = wasm_route_name(&method, &path);
+            if !ctx.wasm_routes_this_pass.insert(route.clone()) {
+                return Err(LoweringError::unsupported(
+                    value.span,
+                    format!("duplicate wasm_serve registration: method={method}, path={path}"),
+                ));
+            }
+            // Both halves are looked up, never created. A route's row types and
+            // the transport that carries them are the host's; the address it
+            // serves is the program's. A `wasm_serve` naming a route the host
+            // did not declare is a program serving an address nothing can
+            // reach, and it is refused here — where the statement names the
+            // address — for the reason `http_serve` refuses a port it cannot
+            // bind rather than failing once the program is already running.
+            let declared_route = ctx
+                .sources
+                .contains_key(&route)
+                .then(|| ctx.route_sinks.get(&route).cloned())
+                .flatten();
+            let Some(sink) = declared_route else {
+                return Err(LoweringError::unsupported(
+                    value.span,
+                    format!(
+                        "no host channel declares the route '{route}': a host declares \
+                         a route as a `request` and a `response` both named '{route}' \
+                         before compiling"
+                    ),
+                ));
+            };
+            let requests_expr = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Source(route.clone())),
+                stmt.span,
+                "lower.wasm_serve",
+            );
+            // The reply binding is a plain `Defer`, and the sink is recorded
+            // against the name the tuple target spells, exactly as the
+            // `http_serve` arm above records its response channel — the
+            // scheduler subscribes both by binding name.
+            let responses_expr = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Defer),
+                stmt.span,
+                "lower.wasm_serve",
+            );
+            ctx.register_sink_binding(resp_name.clone(), sink);
+            // The outer `requests` binding images the assignment statement; the
+            // inner `Defer` let, the `Source` node and the `Defer` are
+            // manufactured plumbing of the expansion.
+            let inner_let = ctx.tag_machinery(
+                Expr::let_bind(resp_name, responses_expr, body),
+                stmt.span,
+                "lower.wasm_serve",
             );
             let let_expr = Expr::let_bind(req_name, requests_expr, inner_let);
             Ok(ctx.tag_image(let_expr, stmt.span))
@@ -1043,7 +1130,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
 /// Returns the name when the target is an [`AssignTarget::Name`], or
 /// [`LoweringError::Unsupported`] for tuple-destructuring patterns (which
 /// lowering does not yet support — the `http_serve` 2-tuple case is handled
-/// separately via [`extract_http_serve_names`]).
+/// separately via [`extract_serve_names`]).
 pub(super) fn extract_name_target(
     target: &Spanned<AssignTarget>,
     context: &str,

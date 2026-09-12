@@ -561,6 +561,280 @@ fn progress_feed_grant_deny() {
     );
 }
 
+/// A feed on the block's **spine**, beside a guard that fails — the feed half of
+/// `spine_write_commits_beside_false_guard`.
+///
+/// The commit condition is the disjunction of every write's *and every feed's* path
+/// (`or_commit`), so a spine feed contributes `true` and the transaction commits
+/// whatever the guard beside it did. The reply therefore fires on the denied path
+/// too, carrying the value the spine reads there: the *snapshot*, since the denied
+/// arm wrote nothing. That is what makes the deny idiom usable for a request/reply
+/// endpoint — a bare `if` guards the state change, the reply sits on the spine, and
+/// the caller always hears back.
+///
+/// 70 grants (pool → 30, reply 30); 50 then fails `30 >= 50`, writes nothing, and
+/// still commits for the reply (30, unchanged) at tick 2. Contrast
+/// `progress_feed_grant_deny`, where the same feed sits *under* the guard: there
+/// the denied transaction has no committing path at all and the tick never exists.
+///
+/// Pinned because the distinction is invisible in the source — one indentation
+/// level — and silent if it regresses: a spine feed folded into the guard's path
+/// would simply stop replying on the denied path, which reads as a stalled client
+/// rather than as a compiler change.
+#[test]
+fn spine_feed_commits_beside_false_guard() {
+    check_tile(
+        indoc! {r#"
+            out = defer()
+            pool: Mut(Int, Txn) := 100
+            for r in [70, 50]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+                    out << pool
+            out
+        "#},
+        commit_stream(&[1, 2], &[30, 30]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `for` inside a `with begin():` block
+//
+// The loop is a fold over the block's read-your-writes environment, expanded into
+// the block's statement chain at lowering (`lower/transactions.rs`'s
+// `lower_tx_for`). It adds no phase machinery: every case below is the block rules
+// already pinned above, applied to statements the user wrote once and the compiler
+// wrote out n times.
+// ---------------------------------------------------------------------------
+
+/// The fold, in one transaction and then across two.
+///
+/// Each iteration reads what the one before it wrote (`x := x + i` over `[1,2,3]`
+/// is 6, not 3), and the next transaction folds again from the committed value
+/// (12). Asserting the *sum* rather than the last write is the point: a loop
+/// compiled as "the final iteration's write, evaluated against the snapshot" —
+/// the shape a naive expansion that forgot to thread the environment would
+/// produce — answers 3 and 6 here.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_for_in_a_block_folds_the_read_your_writes_environment() {
+    check_scalar(
+        indoc! {"
+            x: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                with begin():
+                    for i in [1, 2, 3]:
+                        x := x + i
+            await_final(x)"},
+        Value::Int(12),
+    );
+}
+
+/// The block continues from the environment the loop left: a spine feed *after*
+/// the loop replies the folded value, not the snapshot.
+///
+/// Read-your-writes across the join back onto the spine is what the demo's
+/// checkout beat reads back (`remaining = accts[r.account]` after the drain), so it
+/// gets its own case rather than riding the one above — that one could pass with
+/// the loop's writes visible only to later iterations.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_block_reads_its_own_loop_s_writes_after_the_loop() {
+    check_tile(
+        indoc! {"
+            out = defer()
+            x: Mut(Int, Txn) := 0
+            with begin():
+                for i in [1, 2, 3]:
+                    x := x + i
+                out << x
+            out"},
+        commit_stream(&[1], &[6]),
+    );
+}
+
+/// **The atomicity claim.** One guard over a spine write and a loop's keyed
+/// writes: they commit together or not at all.
+///
+/// The debit is on the guard's arm, the credits are in a loop on that same arm, and
+/// each credit reads the debited balance — so a run where the loop's writes escaped
+/// the guard onto the block's spine, or where they were computed against the
+/// snapshot instead of the debited value, is a different map here rather than a
+/// crash. `[30, 200]` grants once and denies once against a 100 seed, so one
+/// program exercises both paths and the denied transaction's absence is visible as
+/// the keys it did *not* overwrite.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_for_under_a_guard_commits_with_the_guard_s_other_writes() {
+    let program = indoc! {"
+        cash: Mut(Int, Txn) := 100
+        held: Mut(Map(Int, Int), Txn) := box(map([(0, 0), (9, 9)]))
+        for r in [30, 200]:
+            with begin():
+                if cash >= r:
+                    cash := cash - r
+                    for t in [1, 2]:
+                        held[t] := cash * 10 + t
+        await_final(held)"};
+    assert_eq!(
+        map_entries_int(&final_mut_var_value(program)),
+        // The seed's keys carry; the grant writes 1 and 2 from the *debited* 70.
+        // The deny contributes nothing — had its writes reached the spine they
+        // would read the snapshot 70 and land the same values, which is why the
+        // companion assertion below seeds the denial differently.
+        vec![(0, 0), (1, 701), (2, 702), (9, 9)]
+    );
+    let all_denied = indoc! {"
+        cash: Mut(Int, Txn) := 10
+        held: Mut(Map(Int, Int), Txn) := box(map([(0, 0), (9, 9)]))
+        for r in [30, 200]:
+            with begin():
+                if cash >= r:
+                    cash := cash - r
+                    for t in [1, 2]:
+                        held[t] := cash * 10 + t
+        await_final(held)"};
+    assert_eq!(
+        map_entries_int(&final_mut_var_value(all_denied)),
+        // Both transactions deny, so the loop never writes: the map is its seed.
+        vec![(0, 0), (9, 9)]
+    );
+}
+
+/// The debit's half of the claim above: a denied transaction leaves the scalar
+/// alone too, so neither side of the beat landed without the other.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_denied_guard_holds_back_the_spine_write_and_the_loop_alike() {
+    check_scalar(
+        indoc! {"
+            cash: Mut(Int, Txn) := 10
+            held: Mut(Int, Txn) := 0
+            for r in [30]:
+                with begin():
+                    if cash >= r:
+                        cash := cash - r
+                        for q in [1, 2]:
+                            held := held + q
+            await_final(cash) * 1000 + await_final(held)"},
+        Value::Int(10_000),
+    );
+}
+
+/// **Zero iterations neither grant nor deny.** The loop contributes no write, and a
+/// spine write beside it commits as it would beside any other non-writing
+/// statement.
+///
+/// This is the dense-payload argument made observable: "the loop ran zero times"
+/// and "the loop wrote every key back unchanged" are the same commit record, so an
+/// empty loop cannot be allowed to move the grant/deny tag — and it does not. The
+/// failure this pins is the plausible mistake in the other direction: treating the
+/// loop as a writer whose path condition is "the source is non-empty" would abort
+/// the whole transaction here and leave `cash` at 100.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_zero_iteration_for_neither_grants_nor_denies() {
+    check_scalar(
+        indoc! {"
+            cash: Mut(Int, Txn) := 100
+            held: Mut(Int, Txn) := 7
+            for r in [30]:
+                with begin():
+                    cash := cash - r
+                    for q in []:
+                        held := held + q
+            await_final(cash) * 1000 + await_final(held)"},
+        Value::Int(70_007),
+    );
+}
+
+/// A feed in the loop body is one tap per iteration, all on the one decision —
+/// the same thing two `<<` statements written out side by side are, since that is
+/// what the expansion makes them.
+///
+/// Each tap carries its own read-your-writes value (1 after the first write, 3
+/// after the second), and both ride the single commit: a loop body cannot reply
+/// more times than the compiler wrote copies of it, which is the honest consequence
+/// of a compile-time expansion and worth pinning as behaviour rather than leaving
+/// to be discovered.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_feed_in_a_loop_body_taps_the_decision_once_per_iteration() {
+    check_scalar(
+        indoc! {"
+            out = defer()
+            x: Mut(Int, Txn) := 0
+            with begin():
+                for i in [1, 2]:
+                    x := x + i
+                    out << x
+            sum(out)"},
+        Value::Int(4),
+    );
+}
+
+/// A guard *inside* the loop body. Each copy of the body carries its own branch, so
+/// the iterations route independently and the transaction commits on the
+/// disjunction of the ones that wrote — the composition point between this feature
+/// and the path walk above, where a shared-guard mistake (one `Case` reused across
+/// the copies, or one commit path taken for all of them) would show as a wrong
+/// total rather than as a failure.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_guard_inside_a_loop_body_routes_per_iteration() {
+    check_scalar(
+        indoc! {"
+            x: Mut(Int, Txn) := 0
+            with begin():
+                for i in [1, 2, 3]:
+                    if i > 1:
+                        x := x + i
+            await_final(x)"},
+        Value::Int(5),
+    );
+}
+
+/// The loop target shadows a like-named transactional variable over the body, as
+/// every other binding site does — so the block below writes `n` and never `x`,
+/// and `x` is not even in the transaction's footprint.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_loop_target_shadows_a_transactional_variable() {
+    check_scalar(
+        indoc! {"
+            x: Mut(Int, Txn) := 0
+            n: Mut(Int, Txn) := 0
+            with begin():
+                for x in [1, 2, 3]:
+                    n := n + x
+            await_final(n)"},
+        Value::Int(6),
+    );
+}
+
+/// A source whose length is not known at lowering is rejected, with the reason.
+///
+/// The gap is real and the message names it: the block is one decision over one
+/// snapshot, the expansion is the only fold denotation available, and a
+/// runtime-sized source would need a bulk keyed update that does not exist. A test
+/// here because the tempting "fix" is to accept the source and expand nothing —
+/// which would compile a loop that silently writes nothing at all.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_for_in_a_block_rejects_a_runtime_source() {
+    check_compile_error(
+        indoc! {"
+            xs = [1, 2, 3]
+            x: Mut(Int, Txn) := 0
+            with begin():
+                for i in xs:
+                    x := x + i
+            await_final(x)"},
+        "iterates a list literal",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Value types: a transactional mutable variable holds any base value, not just int
 // ---------------------------------------------------------------------------

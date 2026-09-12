@@ -11,9 +11,11 @@ one starts failing), the test goes red and prompts an update.
 
 ## Running a program manually
 
-Every program in the table below is a runnable `.cambra` file (named
-`program.cambra`, except `storefront`, which has `v0.cambra` and `v1.cambra`
-— the two sides of its version upgrade).  To run one by hand:
+Every program in the table below is a runnable `.cambra` file, named
+`program.cambra` except where a program carries two versions: `storefront` has
+`v0.cambra` and `v1.cambra`, the two sides of its version upgrade, and
+`asset_cart` has `v0.cambra` and `v1.cambra`, the slot-per-ticker cart and the
+map-based one.  To run one by hand:
 
 ```bash
 cargo run -- tests/programs/<name>/program.cambra
@@ -108,7 +110,7 @@ plan and the full dependency map.
 | [defer_generators](../tests/programs/defer_generators/) | Two `yield` generators feeding one `defer()` channel | `def` + `yield`, `defer()`, `<<` feed | ✅ working | Returns `20`. The two feed sites deliver different shapes into one channel: an aggregate over the first generator, and one position per iteration of a loop over the second. |
 | [txn_multi_read](../tests/programs/txn_multi_read/) | Read a transactional store twice per block | `Mut(Int, Txn)`, `with begin()`, guarded write | ⚠ wrong answer | Should return `Function [ 40 ]`; returns `Function [ 100 ]`. The write sits inside an `if` inside the transaction and does not survive the conditional, so the feed sees the seed. Pinned by `expect_scalar_currently_buggy`. |
 | [type_error](../tests/programs/type_error/) | A deliberate type error | `and` on `Int` operands | 🚫 rejected, by design | The corpus's one failing program, and the only source of the inspector's degraded payload — source and diagnostics with empty panes and `meta.payloadKind: "failed"` (fixture `failed`). |
-| [asset_cart](../tests/programs/asset_cart/) | A live asset cart: a filtered price stream, a transactional quantity per ticker, and a priced line served per view request | host channels (`channels.json`), record-valued sources, a comprehension filtering on a field, `Mut(Int, Txn)` written from a stream and read live in another loop, one sink per ticker | ✅ working (sink) | The gallery's first program whose meaning depends on a file beside it: `price_updates` is a name the *host* binds. Drives the pitch demo. Its reader is split one-per-ticker and its subtotal is left to the host because a block reading all six slots costs ~2 s per row — see the program text's TODO. |
+| [asset_cart](../tests/programs/asset_cart/) | A live asset cart: a filtered price stream, a transactional quantity per ticker, and a priced line served per view request | host channels (`channels.json`), record-valued sources, a comprehension filtering on a field, `Mut(Int, Txn)` written from a stream and read live in another loop, one sink per ticker | ✅ working (sink) | The gallery's first program whose meaning depends on a file beside it: `price_updates` is a name the *host* binds. Drives the pitch demo. Its reader is split one-per-ticker and its subtotal is left to the host because a block reading all six slots costs ~2 s per row — see the program text's TODO. `v1.cambra` is the rung above and is 🚧 blocked: three keyed collections and three `wasm_serve` routes in place of six slots and a sink per ticker, waiting on entry iteration (`for k -> v in m`) in a loop header and in a comprehension, and on a `for` inside `with begin():`. Its wiring is `v1.channels.json` beside it. |
 | [arithmetic](../tests/programs/arithmetic/) | Chain two bindings | `let`, binops | ✅ working | Smoke-test for sequencing and reference resolution. |
 | [prefix_lines](../tests/programs/prefix_lines/) | Transform a list of strings | list comprehension, string concat | ✅ working | The canonical streaming-pipeline shape; precursor to a real stdin/echo program. |
 | [filter_and_aggregate](../tests/programs/filter_and_aggregate/) | "SELECT SUM(score) FROM users WHERE age >= 18" | record literal, field access, comp filter on let-bound source, `sum` | ✅ working | Returns `253`. Exercises a comp filter on a let-bound source — the filter must survive lowering through planning (it rides a `Cast` node on the refined domain). |

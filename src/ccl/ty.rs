@@ -2601,6 +2601,38 @@ impl Type {
         Type::sum_over(TypeKind::UIntRanges, None, elem)
     }
 
+    /// The element type of a **list**, if this is one — the inverse of
+    /// [`list_of`](Self::list_of).
+    ///
+    /// The witness kind is what answers the question: `UIntRanges` is a dense
+    /// prefix of positions and belongs to no other collection, where a map's is
+    /// `SubtypesOf(K)` and a collection's is `Type`
+    /// ([`TypeKind::UIntRanges`]). Reading the kind rather than the domain's
+    /// shape is what makes the answer independent of how the sum was spelled.
+    ///
+    /// A list literal's own type — a bare `[0, k) ⤇ T`, with no sum over it — is
+    /// not one of these, and deliberately: it names a length, so a caller with a
+    /// length to check reads [`Type::UIntRange`] itself rather than being told
+    /// the length is unknown.
+    pub fn list_element(&self) -> Option<&Type> {
+        let Type::Fun {
+            fun_kind,
+            domain,
+            codomain,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let [witness] = fun_kind.witnesses() else {
+            return None;
+        };
+        let is_positional = matches!(witness.type_kind(), TypeKind::UIntRanges);
+        let over_its_own_witness =
+            matches!(domain.as_ref(), Type::WitnessRef(id) if id == witness.id());
+        (is_positional && over_its_own_witness).then_some(codomain.as_ref())
+    }
+
     /// The type of a **map**: the dependent sum `Σ (𝜎 : SubtypesOf(key)). 𝜎 ⤇ value`.
     ///
     /// Its domain is whichever set of keys the map turned out to hold, and the kind bounds
@@ -3555,6 +3587,21 @@ fn eq_term_modulo_ty_slots_go(
         (N::Builtin(x), N::Builtin(y)) => x == y,
         (N::Proj(x), N::Proj(y)) => x == y,
         (N::Source(x), N::Source(y)) => x == y,
+        // `Carried` is `@LoadFrom`'s reference to a variable a retired version
+        // held, and it carries nothing but that variable's name — so two of them
+        // are the same term exactly when they name the same variable, which is
+        // `Source`'s rule and for the same reason.
+        //
+        // It is listed here rather than left to the fallthrough because the
+        // fallthrough's assertion reads a missing arm as a phase-order violation:
+        // its note names `LetRec` and `Transact`, the two shapes the
+        // mutability-elimination phases mint after inference has run. `Carried`
+        // is neither. It is minted before inference and simply postdates the
+        // arms around it, so reaching the assertion reported a phase error for
+        // what was an ordinary gap — which is how it surfaced, as
+        // `hot_reload::cases::a_load_inside_an_instantiation_reaches_its_own_variable`
+        // panicking with "a rebuilt term no longer equals itself".
+        (N::Carried(x), N::Carried(y)) => x == y,
         (N::Defer, N::Defer) | (N::Error, N::Error) => true,
         (
             N::Apply {

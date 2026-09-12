@@ -1318,6 +1318,53 @@ read.
 the lazy `filter_values` union-of-restricts, so a guard-protected `//`/`%` is never evaluated on the
 path its guard excludes.
 
+### A `for` inside a block (over a list literal)
+
+> **Status: implemented for a list-literal source** (`lower/transactions.rs`'s `lower_tx_for`,
+> pinned by `a_for_in_a_block_folds_the_read_your_writes_environment` and its neighbours in
+> `tests/compilation_pipeline/transactions.rs`). A runtime-sized source is rejected — see
+> "the general case" below.
+
+A `for` inside a `with begin():` block is a **fold over the block's read-your-writes environment**:
+iteration 𝑖 runs the body against the environment iterations `0..𝑖` left, and the statements below
+the loop continue from the environment the last one left. That is not a new construct — it is what
+the walk in the section above already does between two sibling statements, iterated — so the loop is
+**expanded into the block's statement chain at lowering**, one copy of the body per element with the
+binder a `Let` over that copy. Nothing below lowering learns a new node: the path walk, the per-key
+carry-forward `Case`, the `__to_<defer>` taps and the dense commit payload all apply to the expansion
+exactly as they apply to statements a programmer wrote out by hand.
+
+**Commit is the loop's position, never its length.** The writes a loop body performs carry the path
+condition of the statement position the `for` occupies — the enclosing guard, or `true` on the spine
+— so a loop under a guard commits with that guard's other writes and a zero-iteration loop
+contributes nothing to the commit disjunction. It does *not* deny. Two independent reasons, either
+sufficient: the `` `commit `` payload is **dense**, so an unwritten key carries its snapshot and "the
+loop ran zero times" and "the loop wrote every key back unchanged" are the same commit record; and a
+path condition is a `Bool` term over the snapshot, which a source's cardinality is not. This is the
+spine-write rule (`commit = 𝑝 ∨ true`) applied to a construct that may write nothing: writing nothing
+neither grants nor denies.
+
+**The general case — a runtime-sized source — is not built.** Because the block denotes one decision
+over one snapshot, the fold has to be *finitely denoted*, and the expansion is the only denotation
+available: there is no fold term in the algebra to defer to. A source whose length is known only at
+runtime would need each written key's value to be `merge(snapshot, ⟨the loop's contribution⟩)` — a
+**bulk keyed update**, built per transaction from a collection the snapshot itself supplies. Both
+halves are missing:
+
+- **No merge.** [`Builtin::Insert`] writes one key (it is what `desugar_keyed_writes` lowers
+  `m[k] := v` to). The bulk form is its obvious sibling — pointwise over a `(map, map)` pair,
+  right-biased, one map in and one map out — and would be a small addition on the `FunctionDef`
+  path.
+- **No per-transaction contribution.** Building the contribution means a comprehension *inside* the
+  block that reads the snapshot, and that does not survive op-conversion today ("found input for
+  non-combinator curry"): the writer body is a straight-line computation over the decision's columns,
+  and a correlated collection per transaction is a nested plan it has no shape for. This is the
+  larger half, and it is the same wall an entry iteration over a transactional map's snapshot hits,
+  so the two want doing together.
+
+Lowering rejects the source rather than accepting it and expanding nothing, so the gap stays visible
+at the one place a program can hit it.
+
 ### `with t = begin():` transaction handle
 
 Designed — it binds `t` to the transaction's commit time (see the CHL spec,
