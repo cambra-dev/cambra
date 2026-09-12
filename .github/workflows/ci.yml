@@ -198,14 +198,6 @@ jobs:
         # Read more about the "hidden ifs" and general inanity here
         # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
         if: steps.filter.outputs.code == 'true' && (success() || failure())
-        # The opt-in per-operation typecheck (the `deep-typecheck` feature) is **not**
-        # enabled here, pending its removal: the assertion types a subtree mid-rewrite,
-        # where a node's kind may legitimately disagree with a stamp a later step settles,
-        # so it reports a pass's transient states as failures. The always-on
-        # pass-boundary walls (`check_pre_channelize` at every phase) are the correctness
-        # net; this only ever added localization, and it stays available locally
-        # (`cargo test --features deep-typecheck`) for bisecting a miscompile.
-        #
         # `CAMBRA_PROVENANCE_GATE=1` makes every compile fold every gated pane pair
         # and gate the leak classes, so the gate's corpus is the whole test suite
         # rather than the handful of programs `context.rs`'s `corpus()` lists. Two

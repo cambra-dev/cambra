@@ -159,9 +159,8 @@ fn realize_and_unbox(
     // predicate with one reading that leg's arm ([`read_the_arm_instead`]), so nothing
     // inside this copy survives to be compiled. Descending would only *break* it, and does:
     // erasing the `box` off each arm leaves a `Case` joining collections over distinct
-    // domains, which is exactly the type error `box` exists to prevent. Nothing on the
-    // normal path notices — the pass-boundary typecheck does not descend into predicates —
-    // so it shows up only under the `deep-typecheck` feature.
+    // domains, which is exactly the type error `box` exists to prevent. Nothing reports it:
+    // the pass-boundary typecheck does not descend into predicates.
     if in_predicate && collection_value_ty(&expr.ty).is_some() && is_value_case(expr) {
         return changed;
     }
@@ -1214,8 +1213,7 @@ mod tests {
         // Each arm is **boxed**, as inference leaves it: two collections over distinct
         // domains have no common type, so the arms of a conditional that types as a sum
         // are one-candidate sums themselves. An unboxed arm is not merely unrealistic
-        // here — it is ill-typed, which the `deep-typecheck` feature checks at every
-        // rewrite `substitute` performs.
+        // here — it is ill-typed.
         let arm = |dom: usize| {
             let coll = Type::data_fun(Type::UIntRange(dom), int.clone());
             let aw = fresh_witness_binder_id();
