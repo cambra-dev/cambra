@@ -297,22 +297,23 @@ collapses with the terminal `Drain` to the one `unit` a `Set` holds; `list([𝑒
 positional domain (`Array` widened to `List`). The result is the `Map`/`Set` Σ or `List`, and
 [`lower_rekeyed`] builds both re-keyings.
 
-Two consequences are **deferred to a future constant-folding pass**, recorded
-here so the shortcut is explicit:
+Two consequences are **deferred to a constant fold that reaches collections**, recorded here
+so the shortcut is explicit. Planning's fold (`src/ccl/planning/const_fold.rs`) stops at the
+scalar. It evaluates a closed scalar computation, so a literal's elements are constant and
+the re-keying over them stays a runtime `groupby`.
 
 - **Compile-time construction.** A literal argument has statically-known keys, so
   the ideal is to build the sealed keyed tile at compile time rather than run a
-  `groupby` over a constant. Cambra has no constant-folding today; when it lands,
-  folding a re-keying over a constant collection *is* the compile-time
-  construction, with no literal-detection special-case (the fold either succeeds
-  on constant inputs or falls through to the runtime operator).
+  `groupby` over a constant. Folding a re-keying over a constant collection *is* the
+  compile-time construction, with no literal-detection special-case (the fold either
+  succeeds on constant inputs or falls through to the runtime operator).
 - **Duplicate-key error timing.** The spec makes a duplicate key in a map
   *literal* a *compile-time* error
   ([§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)). At runtime, a duplicate produces a
   non-singleton group, which `map`'s `sole` collapse **rejects at run time** (that
   is its whole point) — so the error is *enforced*, just later than the spec wants.
-  Moving it to compile time needs the key *values*, which only a constant fold
-  has; so the compile-time-ness (not the enforcement) rides on constant-folding.
+  Moving it to compile time needs the key *values*, which only a fold over the
+  collection has; so the compile-time-ness (not the enforcement) rides on that fold.
 
 **The collapse aggregate is the whole difference between absorbing a duplicate and
 faulting on one.** `set([1,2,2,3])` and `map([(1,10),(1,20)])` are one [`lower_rekeyed`] over

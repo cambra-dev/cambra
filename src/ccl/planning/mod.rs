@@ -36,6 +36,7 @@ use crate::ccl::{
 };
 
 mod conditionals;
+mod const_fold;
 mod groupby;
 mod iterate;
 mod join;
@@ -102,6 +103,11 @@ pub fn run(mut expr: Expr) -> Expr {
     let discharged = conditionals::realize_conditional_collections(&mut expr);
     groupby::recognize_groupby_sites(&mut expr);
     let mut expr = simplify(expr);
+    // Constant-fold before the iteration walk so a collection literal's elements are
+    // already values when op conversion reads them. It runs after `simplify` because
+    // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the
+    // fold dispatches on the operator it is handed.
+    const_fold::fold_constants(&mut expr);
     insert_iterate_markers(&mut expr, &discharged);
     // Normalize every remaining bare predicate tree-wide to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a

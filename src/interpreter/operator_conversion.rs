@@ -2588,8 +2588,11 @@ fn compile_list_fn(
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
 /// The constant *value* formers, each recursing on its children so a constant
-/// nests: a literal, a tuple, a record, and a variant constructor. Anything else is
-/// a computation, which a list literal's element position cannot express.
+/// nests: a literal, a tuple, a record, and a variant constructor. A computation over
+/// them is already a literal by the time it arrives, planning having folded it
+/// (`src/ccl/planning/const_fold.rs` states which shapes it folds and which it leaves);
+/// what reaches the fallback arm is what the fold declined, and a list literal's element
+/// position cannot express it.
 fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
@@ -2624,7 +2627,8 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         }),
         _ => Err(ConversionError::Unsupported(format!(
             "a list element must be a constant — a literal, tuple, record or variant \
-             constructor — but this one is a computation: {}",
+             constructor — but this one is a computation constant folding did not \
+             evaluate: {}",
             symbolic(expr)
         ))),
     }

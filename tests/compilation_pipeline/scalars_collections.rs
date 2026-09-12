@@ -244,6 +244,70 @@ fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
     check_compile_error(code, "Unresolved inference variable");
 }
 
+// A collection literal's elements are compile-time values, so an element written as a
+// scaled constant reaches op conversion only because planning folded it
+// (`src/ccl/planning/const_fold.rs`). The chain cases pin that one pass folds a whole
+// chain: each `let` binds the literal its own bound expression folded to.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum([1 + 2, 3])", Value::Int(6))]
+#[case(
+    "one_dollar = 100000000\nsum([500 * one_dollar])",
+    Value::Int(50_000_000_000)
+)]
+#[case("one = 100\nsum([one, 2])", Value::Int(102))]
+#[case(indoc! {r"
+    a = 2
+    b = a * 3
+    c = b + 1
+    sum([c])"}, Value::Int(7))]
+// A shadowing binder hides the constant rather than substituting through it: `x` in the
+// comprehension body is the element, not the 100 the outer `let` binds.
+#[case("x = 100\nsum([x * 2 for x in [1, 2, 3]])", Value::Int(12))]
+fn test_folded_collection_elements(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A definition the body's type **discharges** does not fold, and the program still runs.
+// `^+` records what it computed, so `x`'s definition ends up inside the refinement the
+// `let` carries; the post-planning wall re-runs that discharge over the definition the
+// tree holds by then and compares the two refinements structurally
+// (`src/ccl/planning/const_fold.rs`, "A definition the body's type discharges"). Folding
+// the definition leaves `4` on one side of that comparison and `1 ^+ 3` on the other.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_discharged_definition_survives_planning() {
+    check_scalar(
+        indoc! {r#"
+            x = 1 ^+ 3
+            y = x ^+ 2
+            y
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// An element the fold leaves alone is still rejected, which is what keeps the guard from
+/// accepting anything at all. Here the element reads a collection, and the fold stops at
+/// the scalar.
+#[test]
+#[should_panic(expected = "a list element must be a constant")]
+fn a_collection_reading_element_is_rejected() {
+    run_pipeline(indoc! {r"
+        xs = [1, 2]
+        sum([sum(xs), 3])"});
+}
+
+/// The second way the fold declines: both operands are literals, and folding would answer
+/// a question `docs/chl-spec.md`, "3.3 Arithmetic and logical operators" (floor division)
+/// and the runtime (truncation toward zero) disagree on. Settling that disagreement is
+/// what makes this element foldable.
+#[test]
+#[should_panic(expected = "a list element must be a constant")]
+fn a_negative_floor_division_element_is_rejected() {
+    run_pipeline("sum([(0 - 7) // 2])");
+}
+
 // A UDF parameter annotated as an abstract collection is a *consumer* of a whole
 // collection, not a per-element map body. At a concrete call site the UDF inlines and
 // beta-reduces, so the abstract witness resolves to the argument's concrete domain and
@@ -375,6 +439,19 @@ fn test_compare(#[case] code: &str, #[case] expected: Value) {
 #[case("True and False", Value::Bool(false))]
 #[case("True or False", Value::Bool(true))]
 fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// The same operators with one operand computed per element, so the fold
+// (`src/ccl/planning/const_fold.rs`) declines and the tile operator runs. Every case
+// above folds to its result at compile time, and `xor` is reached at run time nowhere
+// else in the suite.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum([1 for x in [1, 2, 3] if (x > 1) ^ True])", Value::Int(1))]
+#[case("sum([1 for x in [1, 2, 3] if (x > 1) & True])", Value::Int(2))]
+#[case("sum([1 for x in [1, 2, 3] if (x > 1) | False])", Value::Int(2))]
+fn test_bool_ops_on_computed_operands(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
