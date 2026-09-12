@@ -594,24 +594,29 @@ fn an_entry_binder_over_a_transactional_map_is_not_reachable() {
 
 /// A **filtered** entry comprehension over a transactional map. It types — the site is
 /// `Σ (σ : SubtypesOf(Int)). ({σ | …} ⤇ Int)`, the witness bound and the entry binder at the
-/// key type its kind bounds it by — and the predicate it carries names `m`, which is where
-/// it stops: the type is stored at a node the mutable variable does not reach.
+/// key type its kind bounds it by — and what it meets is the `lambda_elim` rewrite
+/// [`an_entry_binder_over_a_transactional_map_is_not_reachable`] meets: the curried body
+/// does not carry the Σ binder its domain names, so the witness is free at the pass
+/// boundary.
+///
+/// The predicate the filter carries names `m`, and that is not what stops it. A mutable
+/// variable binds over its body as a `let` does, so a type interior to that body may name
+/// it (`check_scope_valid`, in `src/ccl/infer/solve.rs`).
 ///
 /// Neither half of the entry binder escapes it — filtering on the key and filtering on the
-/// value report the same thing — so what the filter meets is the predicate naming its
-/// source rather than which of the two binders the predicate reads.
+/// value report the same thing — so what the filter meets is the rewrite rather than which
+/// of the two binders the predicate reads.
 ///
-/// Three neighbours place it. Dropping the filter leaves no predicate to carry the name and
-/// fails later instead ([`an_entry_binder_over_a_transactional_map_is_not_reachable`], at
-/// `lambda_elim`); dropping the entry binder reports this same violation; and the same
-/// filtered comprehension over a **plain** map types and reaches op-conversion
-/// ([`a_filtered_comprehension_over_a_map_is_not_reachable`]), because a let-bound
-/// collection is in scope where the predicate lands.
+/// Two neighbours place it. Dropping the filter reports the same thing with no predicate to
+/// carry a name at all ([`an_entry_binder_over_a_transactional_map_is_not_reachable`]); the
+/// same filtered comprehension over a **plain** map gets further, to op-conversion
+/// ([`a_filtered_comprehension_over_a_map_is_not_reachable`]), because a plain map's domain
+/// is no witness and the rewrite has no binder to drop.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::on_the_key("sum([q for a -> q in m if a == 1])")]
 #[case::on_the_value("sum([q for a -> q in m if q > 10])")]
-#[should_panic(expected = "references out-of-scope binder(s) [\"m\"]")]
+#[should_panic(expected = "free witness reference")]
 fn a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable(
     #[case] comprehension: &str,
 ) {

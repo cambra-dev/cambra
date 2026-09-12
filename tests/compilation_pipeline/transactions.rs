@@ -4178,15 +4178,19 @@ fn a_reply_carrying_a_collection_is_not_reachable() {
 /// `__pos ▷ [1, 2]` and reaches the feed inside a binder rather than free
 /// (`feed_contribution` in `src/ccl/infer/emit.rs`).
 ///
-/// What stops it is the filtered entry comprehension underneath. The site types —
-/// `Σ (σ : SubtypesOf(Int)). ({σ | …} ⤇ Int)` — and the predicate it carries names `m`,
-/// which the reply then hands to a channel the mutable variable does not reach.
-/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable` reports the
-/// same violation with no reply, no feed and no correlation, on a filter comparing against
-/// a literal. So this program is now blocked on a defect that is not about correlation.
+/// The position binder is what escapes. `feed_contribution` mints `__pos` for the
+/// contribution it builds, and the predicate riding the replied collection reads `v`
+/// through it, so the channel's type — recorded at the `defer()` that introduced the
+/// channel, outside any contribution — names a binder nothing there provides. The
+/// diagnostic is `check_scope_valid`'s, on `__pos` rather than on `m`: a mutable variable
+/// binds over its body, so the `m` the same predicate also reads is in scope.
+///
+/// So the correlation is what this program is blocked on, and
+/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable` no longer
+/// reports it — that one reaches `lambda_elim` with no reply, no feed and no correlation.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "references out-of-scope binder(s) [\"m\"]")]
+#[should_panic(expected = "references out-of-scope binder(s) [\"__pos\"]")]
 fn a_reply_filtered_by_the_request_is_not_reachable() {
     check_scalar(
         indoc! {r"
