@@ -598,6 +598,7 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
         ChlBinOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
         ChlBinOp::AddRefined => BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
         ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
+        ChlBinOp::SubRefined => BinOpKind::Arithmetic(ArithmeticKind::SubRefined),
         ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         ChlBinOp::MulRefined => BinOpKind::Arithmetic(ArithmeticKind::MulRefined),
         ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),

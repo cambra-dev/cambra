@@ -103,6 +103,11 @@ pub enum Trait {
     AddableRefined,
     /// `-` over `(𝐴, 𝐵)`, associating `Output`.
     Subtractable,
+    /// `^-` over `(𝐴, 𝐵)`, associating `Output`.
+    ///
+    /// [`AddableRefined`](Trait::AddableRefined) for subtraction: one row, refining
+    /// the output by the difference of the operands.
+    SubtractableRefined,
     /// `*` over `(𝐴, 𝐵)`, associating `Output`.
     Multipliable,
     /// `^*` over `(𝐴, 𝐵)`, associating `Output`.
@@ -216,6 +221,11 @@ fn refinement_for_add(args: &[TypedExpr]) -> TypedExpr {
 }
 
 /// See [`refinement_for_add`].
+fn refinement_for_sub(args: &[TypedExpr]) -> TypedExpr {
+    refinement_recording(ArithmeticKind::SubRefined, args)
+}
+
+/// See [`refinement_for_add`].
 fn refinement_for_mul(args: &[TypedExpr]) -> TypedExpr {
     refinement_recording(ArithmeticKind::MulRefined, args)
 }
@@ -224,6 +234,12 @@ fn refinement_for_mul(args: &[TypedExpr]) -> TypedExpr {
 const ADDITION_REFINED: &[TraitInstance] = &[TraitInstance {
     args: &[BaseType::Int, BaseType::Int],
     assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_add))],
+}];
+
+/// `(Int, Int) ⇝ {Int | __elem == 𝑎₁ ^- 𝑎₂}` — the one row of `^-`.
+const SUBTRACTION_REFINED: &[TraitInstance] = &[TraitInstance {
+    args: &[BaseType::Int, BaseType::Int],
+    assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_sub))],
 }];
 
 /// `(Int, Int) ⇝ {Int | __elem == 𝑎₁ ^* 𝑎₂}` — the one row of `^*`.
@@ -313,6 +329,7 @@ impl Trait {
         match self {
             Trait::Addable => NUMERIC_OR_STRING,
             Trait::AddableRefined => ADDITION_REFINED,
+            Trait::SubtractableRefined => SUBTRACTION_REFINED,
             Trait::MultipliableRefined => MULTIPLICATION_REFINED,
             Trait::Subtractable | Trait::Multipliable | Trait::Divisible | Trait::Exponentiable => {
                 NUMERIC
@@ -366,6 +383,7 @@ impl Trait {
             Trait::Addable => "Addable",
             Trait::AddableRefined => "AddableRefined",
             Trait::Subtractable => "Subtractable",
+            Trait::SubtractableRefined => "SubtractableRefined",
             Trait::Multipliable => "Multipliable",
             Trait::MultipliableRefined => "MultipliableRefined",
             Trait::Divisible => "Divisible",
@@ -1807,6 +1825,11 @@ mod tests {
             deposited(Trait::AddableRefined),
             vec!["{Int | __elem == 1 ^+ 2}"],
         );
+        assert_eq!(deposited(Trait::Subtractable), vec!["Int"]);
+        assert_eq!(
+            deposited(Trait::SubtractableRefined),
+            vec!["{Int | __elem == 1 ^- 2}"],
+        );
         assert_eq!(deposited(Trait::Multipliable), vec!["Int"]);
         assert_eq!(
             deposited(Trait::MultipliableRefined),
@@ -1887,6 +1910,7 @@ mod tests {
             Trait::Addable,
             Trait::AddableRefined,
             Trait::Subtractable,
+            Trait::SubtractableRefined,
             Trait::Multipliable,
             Trait::MultipliableRefined,
             Trait::Divisible,

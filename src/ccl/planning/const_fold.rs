@@ -266,7 +266,7 @@ fn eval_binop(op: BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
         // fold.
         (BinOpKind::Arithmetic(op), Lit::Int(l), Lit::Int(r)) => Some(Lit::Int(match op {
             ArithmeticKind::Add | ArithmeticKind::AddRefined => l.checked_add(*r)?,
-            ArithmeticKind::Sub => l.checked_sub(*r)?,
+            ArithmeticKind::Sub | ArithmeticKind::SubRefined => l.checked_sub(*r)?,
             ArithmeticKind::Mul | ArithmeticKind::MulRefined => l.checked_mul(*r)?,
             // Only where floor division and truncation coincide — see the module
             // docs. The bound also excludes a zero divisor.

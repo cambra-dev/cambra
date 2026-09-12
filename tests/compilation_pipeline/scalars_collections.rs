@@ -355,6 +355,9 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // operand of the product and not the other way round.
 #[case("2 ^* 3", Value::Int(6))]
 #[case("1 + 2 ^* 3 - 4", Value::Int(3))]
+// `^-` stands in the same relation to `-`.
+#[case("2 ^- 3", Value::Int(-1))]
+#[case("1 ^- 2 * 3 + 4", Value::Int(-1))]
 // `**` scales a constant without spelling out the zeroes.
 #[case("10 ** 8", Value::Int(100_000_000))]
 // Right-associative: `2 ** (3 ** 2)` is 512, where a left fold would be 64.

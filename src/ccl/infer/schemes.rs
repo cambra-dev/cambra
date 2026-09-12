@@ -448,6 +448,9 @@ impl OperatorSchemes {
             BinOpKind::Arithmetic(ArithmeticKind::Add) => arithmetic(Trait::Addable),
             BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => arithmetic(Trait::AddableRefined),
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::Subtractable),
+            BinOpKind::Arithmetic(ArithmeticKind::SubRefined) => {
+                arithmetic(Trait::SubtractableRefined)
+            }
             BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::Multipliable),
             BinOpKind::Arithmetic(ArithmeticKind::MulRefined) => {
                 arithmetic(Trait::MultipliableRefined)

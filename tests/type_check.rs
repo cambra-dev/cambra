@@ -266,6 +266,36 @@ fn refining_addition_is_int_only() {
     );
 }
 
+/// `^-` records the difference, as `^+` records the sum: one row over `Int`, and a
+/// result refined by the operand terms.
+#[rstest]
+#[case::literals("2 ^- 3", "{Int | __elem == 2 ^- 3}")]
+#[case::parameters(
+    indoc! {r#"
+        def f(a: Int, b: Int):
+            a ^- b
+
+        f
+    "#},
+    "((__arg_tuple_0: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_0.0 ^- __arg_tuple_0.1})"
+)]
+fn refining_subtraction_records_the_difference(#[case] code: &str, #[case] expected: &str) {
+    assert_eq!(format!("{}", infer_program(code)), expected);
+}
+
+/// `^-` accepts `Int` and nothing else, as `^+` does: `Subtractable` rejects a
+/// `String` operand too, so the row set is what differs, not the arity.
+#[test]
+fn refining_subtraction_is_int_only() {
+    let errs = infer_program_err(r#""a" ^- "b""#);
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|m| m.contains("No SubtractableRefined instance")),
+        "expected a missing-instance diagnostic for SubtractableRefined, got {errs:?}",
+    );
+}
+
 /// `^*` records the product, as `^+` records the sum: one row over `Int`, and a
 /// result refined by the operand terms.
 #[rstest]
