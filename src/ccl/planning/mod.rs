@@ -742,7 +742,7 @@ mod tests {
     fn test_insert_iterate_markers_outputs_root_wraps_each_function_output() {
         // Programs that bind a sink end in an `Outputs` — each function-typed
         // output is an iteration site (`compile_program` dispatches to
-        // `convert_record_fields_to_operators`, which compiles each with
+        // `convert_outputs_to_operators`, which compiles each with
         // `input=None`).
         let int = int_ty();
         let out_ty = fun_ty(Type::UIntRange(3), int.clone());

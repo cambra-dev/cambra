@@ -104,14 +104,13 @@ pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
-    // Special-case `Apply(Tuple|Record, Zip)`: op-conversion's `Zip` arm
-    // fans the outer input out to each tuple/record field, so each field
-    // is compiled with `input=Some(fan_out_branch)`.  Field wrapping
-    // would still be semantically safe (the wrapped `iterate`'s
-    // trivially-true predicate just passes the input through), but it
-    // produces redundant operators and churns golden tests.  Recurse into
-    // each field without firing the value-position `Tuple`/`Record` case
-    // below.
+    // A zipped product is a product *morphism*, not a product value: op-conversion's
+    // `Zip` arm fans the outer input out to each component, so each is compiled with
+    // `input=Some(fan_out_branch)`. The value-position arms below would mark a
+    // collection-valued component as an iteration site ([`mark_component_source`]),
+    // and an `iterate` chain takes no input — the same shape the `Copair` arm's
+    // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each
+    // component without firing those arms.
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))
     {
@@ -235,11 +234,9 @@ pub(super) fn insert_iterate_recurse(
                 wrap_with_iterate(&mut w.source, discharged, "transact-source");
             }
         }
-        // Each program output is its own stream, compiled with `input=None` by
-        // [`convert_record_fields_to_operators`](crate::interpreter::operator_conversion::convert_record_fields_to_operators),
-        // so a function-typed one is an iteration site. A `Record`'s fields are
-        // not: a record is one value, and a collection-valued field is a value
-        // it holds, which op-conversion materializes rather than iterating.
+        // Each program output is its own collection, compiled with `input=None` by
+        // [`convert_outputs_to_operators`](crate::interpreter::operator_conversion::convert_outputs_to_operators),
+        // so a function-typed one is an iteration site.
         TypedExprNode::Outputs(outs) => {
             for (_, out) in outs.iter_mut() {
                 if matches!(&out.ty, Type::Fun { .. }) {
@@ -247,7 +244,54 @@ pub(super) fn insert_iterate_recurse(
                 }
             }
         }
+        // A product's components are not iteration sites as components — see
+        // [`mark_component_source`] for what makes one a site anyway.
+        TypedExprNode::Tuple(elts) => {
+            for elt in elts.iter_mut() {
+                mark_component_source(elt, discharged);
+            }
+        }
+        TypedExprNode::Record(fields) => {
+            for (_, field) in fields.iter_mut() {
+                mark_component_source(field, discharged);
+            }
+        }
         _ => {}
+    }
+}
+
+/// Mark `component`, a component of a product value, as an iteration site if
+/// producing its value takes an iteration.
+///
+/// A collection-valued component is **materialized**, not iterated: a product is one
+/// value and the component is a value it holds, which is why
+/// [`convert_component`](crate::interpreter::operator_conversion::convert_component)
+/// collects it rather than compiling it as one. Collecting still needs something to
+/// collect, so the component is an iteration site for the sake of what
+/// [`Materialize`](crate::interpreter::tile_operators::Materialize) consumes, not
+/// because a component is swept.
+///
+/// A list literal is the exception at both ends: it is born materialized, its table
+/// *is* the value, and `compile_list_fn` builds that table with no iteration in between.
+///
+/// Tuples and records differ only in whether a component carries a name, and
+/// op-conversion compiles both through `convert_component`, so the rule is one rule.
+/// The kind test is that function's, down to peeling the refinement a filtered
+/// component carries: a component marked here and not materialized there would be
+/// handed an iteration source nothing reads.
+fn mark_component_source(
+    component: &mut Expr,
+    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+) {
+    let holds_a_collection = matches!(
+        component.ty.peel_refinements(),
+        Type::Fun {
+            fun_kind: crate::ccl::ty::FunKind::Data(..),
+            ..
+        }
+    );
+    if holds_a_collection && !matches!(&component.node, TypedExprNode::List(_)) {
+        wrap_with_iterate(component, discharged, "product-component-source");
     }
 }
 
@@ -1277,7 +1321,7 @@ mod tests {
     #[test]
     fn test_insert_iterate_recurse_outputs_wraps_function_outputs() {
         // Each function-typed program output is an iteration site
-        // (`convert_record_fields_to_operators` compiles each with
+        // (`convert_outputs_to_operators` compiles each with
         // `input=None`).
         let int = int_ty();
         let mut expr = Expr::new(TypedExprNode::Outputs(vec![

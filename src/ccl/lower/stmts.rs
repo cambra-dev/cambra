@@ -112,17 +112,17 @@ pub(super) fn lower_stmts_recovering(
     let outs = sink_names
         .iter()
         .map(|n| {
-            let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_record");
+            let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_outputs");
             (n.clone(), var)
         })
         .collect();
     let outputs = ctx.tag_machinery(
         Expr::new(TypedExprNode::Outputs(outs)),
         program_span,
-        "lower.sink_record",
+        "lower.sink_outputs",
     );
-    // Place ExprStmt(body, record) at the innermost position of the Let* chain
-    // so the Record has the sink Var references in scope.
+    // Place ExprStmt(body, outputs) at the innermost position of the Let* chain
+    // so the output list has the sink `Var` references in scope.
     Some(append_outputs_at_tail(body, outputs, program_span, ctx))
 }
 
@@ -191,7 +191,7 @@ fn append_outputs_at_tail(
         _ => ctx.tag_machinery(
             Expr::expr_stmt(expr, outputs),
             program_span,
-            "lower.sink_record",
+            "lower.sink_outputs",
         ),
     }
 }

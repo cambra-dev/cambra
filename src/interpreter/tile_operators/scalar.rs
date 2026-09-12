@@ -6,7 +6,8 @@ use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
-        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Scheduler, Value,
+        BaseType, ColumnValue, Consumer, Extent, FuncBinding, FunctionDef, Predicate, Scheduler,
+        Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -879,10 +880,399 @@ impl TileProducer for ToScalarProducer {
     }
 }
 
+/// Collects an iterated collection into one value: a `Scalar` tile at an
+/// [`Extent::Function`], carrying the whole bindings table in a single cell.
+///
+/// A collection has two runtime forms, and which one a site gets is the site's
+/// to state — see [`Constant::new`] and [`Constant::collection`], the pair that
+/// names the same choice for a constant. **Iterated** is a `SealedFunction`
+/// tiling, one row per key, which is what something iterating the collection
+/// consumes. **Materialized** is this: one value, which is what a record field or
+/// a tuple component needs — a position that holds the collection rather than
+/// iterating it. [`IterateTable`] is the inverse direction.
+///
+/// A scalar has one position and no way to answer part of it, so the table is
+/// answered only once the input's domain is complete; every pull before that
+/// yields ⊥.
+///
+/// See `src/interpreter/design-operators.md`, "Iterated and materialized
+/// collections".
+pub struct Materialize {
+    /// The iterated collection to collect.
+    input: Box<dyn TileOperator>,
+    /// Output tiling: `Scalar(Function { domain, codomain })` over the input's
+    /// domain and codomain extents.
+    base: OperatorBase,
+}
+
+impl Materialize {
+    /// Construct a `Materialize` over an iterated collection.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `input` has a `SealedFunction` tiling. A `CurriedFunction`
+    /// is a partition rather than a collection of values, and has no bindings
+    /// table to carry.
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
+        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
+            panic!(
+                "Materialize collects an iterated collection, so its input tiles as a \
+                 sealed function; got {}",
+                input.tiling()
+            );
+        };
+        let tiling = Tiling::Scalar(Extent::Function {
+            domain: Box::new(domain.clone()),
+            codomain: Box::new(codomain.extent()),
+        });
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
+    }
+}
+
+impl TileOperator for Materialize {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input_producer =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        Box::new(MaterializeProducer {
+            base: ProducerBase::new(MaterializeProducer::alloc_id(), self.tiling()),
+            input: input_producer,
+            keys: None,
+            values: None,
+            released: false,
+        })
+    }
+}
+
+/// Put a materialized collection back in the form its consumers iterate: a
+/// `SealedFunction` tile whose
+/// domain and codomain carry the table's own bindings.
+///
+/// The inverse of [`Materialize`], and the second of the two forms its doc names. A
+/// product component holds a collection materialized, so projecting one back out
+/// goes through here to reach the form every consumer of a collection reads.
+///
+/// **The output domain is the keys the table binds, not the input's domain extent.** A
+/// filtered collection binds a subset of its extent — `[y for y in [1, 2, 3] if y > 2]`
+/// binds one index of three — and only the table knows which, the predicate having
+/// been decided upstream of [`Materialize`]. Iterating the extent instead would ask
+/// the table for keys it does not bind.
+///
+/// [`Materialize`] answers nothing until its input's domain is complete, so the table
+/// arriving here is whole and the output is decided in one delivery.
+///
+/// See `src/interpreter/design-operators.md`, "Iterated and materialized
+/// collections".
+pub struct IterateTable {
+    /// The materialized collection to put back in iterated form.
+    input: Box<dyn TileOperator>,
+    /// Output tiling: `SealedFunction` over the input's function extent.
+    base: OperatorBase,
+}
+
+impl IterateTable {
+    /// Construct a `IterateTable` over a materialized collection.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `input` tiles as a `Scalar` at an [`Extent::Function`] — the one
+    /// cell a bindings table occupies.
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
+        let Tiling::Scalar(Extent::Function { domain, codomain }) = input.tiling() else {
+            panic!(
+                "IterateTable reads a materialized collection, so its input tiles as a scalar \
+                 at a function extent; got {}",
+                input.tiling()
+            );
+        };
+        let tiling = Tiling::SealedFunction {
+            domain: (**domain).clone(),
+            codomain: Box::new(Tiling::Scalar((**codomain).clone())),
+        };
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
+    }
+}
+
+impl TileOperator for IterateTable {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input_producer =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        Box::new(IterateTableProducer {
+            base: ProducerBase::new(IterateTableProducer::alloc_id(), self.tiling()),
+            input: input_producer,
+            table: None,
+        })
+    }
+}
+
+/// Producer for [`IterateTable`]: splits the table into its two columns, once.
+struct IterateTableProducer {
+    base: ProducerBase,
+    /// The subscribed input producer.
+    input: Box<dyn TileProducer>,
+    /// The output tile, built on the first pull that finds a complete table.
+    ///
+    /// The table cannot change once [`Materialize`] has answered it, so rebuilding
+    /// the columns per pull re-clones every key and value to reach the same answer.
+    /// Only the obsolete guard varies, and that applies to the copy handed out.
+    table: Option<Tile>,
+}
+
+impl TileProducer for IterateTableProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let table = match self.table.take() {
+            Some(table) => table,
+            None => {
+                let i_tiling = self.input.tiling().clone();
+                let delivered = self.input.get(i_tiling.universal_guard());
+                let Tile::Scalar(column) = delivered else {
+                    panic!("IterateTable expected a scalar tile, got {delivered:?}");
+                };
+                // ⊥ until the whole table is there: a partial table is a different
+                // collection rather than a smaller one, so there is no prefix of the
+                // prefix to emit from one.
+                if column.is_empty() {
+                    return self.tiling().empty_tile();
+                }
+                let Value::Function(bindings) = column.index_at(0) else {
+                    panic!(
+                        "IterateTable expected a bindings table, got {}",
+                        column.index_at(0)
+                    );
+                };
+                let Tiling::SealedFunction { domain, codomain } = self.tiling() else {
+                    unreachable!("`IterateTable::new` builds exactly this tiling")
+                };
+                let (keys, values): (Vec<Value>, Vec<Value>) =
+                    bindings.into_iter().map(|b| (b.input, b.output)).unzip();
+                // `Predicate::True` because the table is final: every key it will ever
+                // bind is bound, so there is no region left to answer.
+                Tile::SealedFunction {
+                    domain: ColumnValue::from_values(keys, domain),
+                    codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
+                        values,
+                        &codomain.extent(),
+                    ))),
+                    domain_predicate: Predicate::True,
+                    deleted: BitSet::new(),
+                }
+            }
+        };
+        let mut tile = table.clone();
+        self.table = Some(table);
+        // A collection's consumers release the keys they are done with, so the whole
+        // table is not what a later pull may return; returning released rows is what
+        // `get`'s post-condition forbids.
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile
+    }
+
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        // A collection is released a key at a time and `get_impl` filters against the
+        // guard `release` accumulates, so a single release records nothing. Once every
+        // key is gone the table behind them is dead too, and the scalar holding it has
+        // no partial release — it goes in one piece or not at all.
+        if self.obsolete_guard().is_universal() {
+            self.table = None;
+            self.input.release(self.input.tiling().universal_guard());
+        }
+    }
+}
+
+/// Producer for [`Materialize`]: accumulates each delivery, answers the table once.
+struct MaterializeProducer {
+    base: ProducerBase,
+    /// The subscribed input producer.
+    input: Box<dyn TileProducer>,
+    /// Domain values accumulated so far; `None` until the first delivery types
+    /// the column. Kept alongside `values` in matching row order.
+    keys: Option<ColumnValue>,
+    /// Codomain values accumulated so far, in `keys` order.
+    values: Option<ColumnValue>,
+    /// Set once the consumer has released this output. The table is the whole
+    /// output, so re-emitting it afterwards would return released data.
+    released: bool,
+}
+
+impl TileProducer for MaterializeProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        if self.released {
+            return self.tiling().empty_tile();
+        }
+        let i_tiling = self.input.tiling().clone();
+        let mut input_result = self.input.get(i_tiling.universal_guard());
+        let upstream_guard = input_result.to_guard();
+        // `compact` resolves the tile's `deleted` rows, so what is appended below
+        // is the delivery's live rows and nothing else.
+        input_result.compact();
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = input_result
+        else {
+            panic!("Materialize expected a sealed-function tile, got {input_result:?}");
+        };
+        // Released as taken delivery of, as `Memo` does: the accumulated table is
+        // this producer's own state, so holding the region upstream as well would
+        // keep the source from reclaiming it.
+        self.input.release(upstream_guard);
+        let delivered = scalar_tile_to_column_value(*codomain);
+        match (&mut self.keys, &mut self.values) {
+            (Some(keys), Some(values)) => {
+                keys.append(domain);
+                values.append(delivered);
+            }
+            _ => {
+                self.keys = Some(domain);
+                self.values = Some(delivered);
+            }
+        }
+
+        // A partial table is not a smaller table — it is a different collection —
+        // so nothing is answered until the domain is complete.
+        if !self.input.obsolete_guard().is_universal() {
+            return self.tiling().empty_tile();
+        }
+        let (Some(keys), Some(values)) = (self.keys.clone(), self.values.clone()) else {
+            unreachable!("both columns are set together by the delivery above")
+        };
+        let bindings = (0..keys.len())
+            .map(|i| FuncBinding {
+                input: keys.index_at(i),
+                output: values.index_at(i),
+            })
+            .collect();
+        Tile::Scalar(ColumnValue::single(Value::Function(bindings)))
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // A scalar has one position and no way to name part of it, which is what
+        // makes its only release the whole of it. `get_impl` has already released
+        // each delivery, so what this adds is the region the input never
+        // delivered — the consumer being done before the source ran dry.
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
+            self.released = true;
+            self.keys = None;
+            self.values = None;
+            self.input.release(self.input.tiling().universal_guard());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
+
+    /// The two forms a collection takes, at the boundary between them: a partial
+    /// domain is a *different* collection rather than a smaller one, so the
+    /// table is answered only once the input has delivered all of it.
+    #[test]
+    fn materialize_answers_the_table_only_once_the_domain_is_complete() {
+        let tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let out_tiling = Tiling::Scalar(Extent::Function {
+            domain: Box::new(Extent::uint_range(2)),
+            codomain: Box::new(Extent::Base(BaseType::Int)),
+        });
+        // A delivery that leaves the domain undecided: `domain_predicate` is
+        // `False`, so the input is not terminal.
+        let partial = Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        };
+        let mut producer = MaterializeProducer {
+            base: ProducerBase::new(MaterializeProducer::alloc_id(), &out_tiling),
+            input: Box::new(TestTileProducer::new(partial, tiling.clone())),
+            keys: None,
+            values: None,
+            released: false,
+        };
+        let answered = producer.get(out_tiling.universal_guard());
+        assert_eq!(
+            answered,
+            out_tiling.empty_tile(),
+            "a table whose domain is still open must not be answered as the whole collection"
+        );
+    }
+
+    /// A scalar has one position, so the only release it can take is the whole
+    /// of it — and that release must reach the input, which `get` has otherwise
+    /// only released as far as the input delivered.
+    #[test]
+    fn materialize_forwards_a_universal_release_to_its_input() {
+        let tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let out_tiling = Tiling::Scalar(Extent::Function {
+            domain: Box::new(Extent::uint_range(2)),
+            codomain: Box::new(Extent::Base(BaseType::Int)),
+        });
+        let (spy, released) = ReleaseSpy::new(tiling.empty_tile(), tiling.clone());
+        let mut producer = MaterializeProducer {
+            base: ProducerBase::new(MaterializeProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            keys: None,
+            values: None,
+            released: false,
+        };
+        producer.release(out_tiling.universal_guard());
+        assert!(
+            released.borrow().iter().any(TileGuard::is_universal),
+            "a universal release must reach the input, got {:?}",
+            released.borrow()
+        );
+        assert_eq!(
+            producer.get(out_tiling.universal_guard()),
+            out_tiling.empty_tile(),
+            "the table is the whole output, so nothing may come back after it is released"
+        );
+    }
 
     /// A test operator that yields one fixed tile, so a `VariantProject`/union
     /// chain can be `subscribe`d and driven end-to-end.

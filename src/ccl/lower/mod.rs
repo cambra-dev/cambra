@@ -1147,11 +1147,11 @@ fn lower_expr_inner(
 ///
 /// When sink bindings are registered during lowering (e.g. from `http_serve`),
 /// the final expression is wrapped so the program ends in
-/// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
-/// sink-binding contract; each field is the name that [`crate::ccl::channelize`]
-/// resolves to the computed response morphism.  After `channelize` removes
-/// all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
-/// `Let* Record{…}` shape for `compile_program`.
+/// `ExprStmt(<body>, Outputs{sink: Var(sink), …})`.  The
+/// [`Outputs`](TypedExprNode::Outputs) is the sink-binding contract; each entry is
+/// the name that [`crate::ccl::channelize`] resolves to the computed response
+/// morphism.  After `channelize` removes all `Feed` nodes, `simplify` drops the
+/// `ExprStmt`, leaving a clean `Let* Outputs{…}` shape for `compile_program`.
 pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
     let mut errors: Vec<LoweringError> = Vec::new();
     let value = lower_stmts_recovering(stmts, ctx, &mut errors);
