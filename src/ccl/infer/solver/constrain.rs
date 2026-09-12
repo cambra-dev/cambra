@@ -26,6 +26,7 @@ use crate::ccl::{
     Type,
 };
 
+use super::smt::{NoScope, ScopeEnv, SmtError};
 use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
 use crate::ccl::FieldKey;
@@ -152,6 +153,20 @@ pub enum ConstrainError {
         /// What that position could still have accepted, given everything already
         /// known about the other operand.
         accepted: Vec<BaseType>,
+    },
+    /// An attempt to compare two refinement bodies using an SMT
+    /// solver failed, and the bodies could not be semantically
+    /// compared.
+    SmtError {
+        /// The supplied type, refinements included.
+        lhs: Type,
+        /// The type demanded at the position.
+        rhs: Type,
+        /// Boxed to keep this variant off `clippy::result_large_err`'s
+        /// threshold: `constrain` returns `Result<(), ConstrainError>` on every
+        /// edge it walks, so the enum's size is on the hot path and the payload
+        /// is not.
+        error: Box<SmtError>,
     },
 }
 
@@ -314,17 +329,58 @@ impl ConstrainCache {
 /// (see Parreaux 2020 §3.4).
 pub type ExtrudeCache = HashMap<(InferVarId, bool), Rc<InferVar>>;
 
+/// The empty scope that also suppresses the deficit rule's semantic fallback, so a
+/// refinement deficit under it is decided structurally.
+///
+/// Caller policy rather than a lexical environment — see
+/// [`ScopeEnv::is_skip_smt`](super::smt::ScopeEnv::is_skip_smt), which names the
+/// argument this wants to be instead. [`NoScope`] is the other empty scope and
+/// differs only in letting the query run.
+pub struct SkipSmtScope;
+
+impl ScopeEnv for SkipSmtScope {
+    fn binder_type(&self, _name: &Name) -> Option<Type> {
+        None
+    }
+    fn is_skip_smt(&self) -> bool {
+        true
+    }
+}
+
 /// Constrain `lhs <: rhs`, mutating variable bounds in place.
 ///
 /// The cache argument breaks cycles; pass a fresh empty `HashSet` at
 /// the top of each constraint emission and reuse it for the recursive
 /// subtyping the rule fires.
+///
+/// Supplies [`SkipSmtScope`]: no scope to resolve a refinement's free names
+/// against, and no query raised either. A caller holding the lexical scope uses
+/// [`constrain_subtype_in`]; a caller holding none that still wants the fallback
+/// passes [`NoScope`], as [`constrain_subtype_under`] does.
 pub fn constrain_subtype(
     lhs: &Type,
     rhs: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
+    constrain_subtype_in(lhs, rhs, cache, &SkipSmtScope)
+}
+
+/// [`constrain_subtype`] with the lexical scope the edge is drawn in.
+///
+/// The scope reaches exactly one rule: the refinement deficit's semantic
+/// fallback, where `Γ ⊢ ⋀S₁ ⇒ ⋀S₂` is decided against what the scope knows
+/// about the free names the two sides' predicates mention (see
+/// [`smt_sub`](super::smt::smt_sub)). A caller with no scope — a probe over
+/// types built outside any program, or a re-derivation over a tree whose
+/// binders it does not hold — uses [`constrain_subtype`] and gets [`NoScope`],
+/// which only weakens what the fallback can prove.
+pub fn constrain_subtype_in(
+    lhs: &Type,
+    rhs: &Type,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
+    constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
 }
 
 /// [`constrain_subtype`], with both sides judged **under `binders`**.
@@ -346,8 +402,11 @@ pub fn constrain_subtype_under(
     // the instantiation off the two types is what puts both sides in one spelling, so the
     // reference comparison below is name equality rather than two unrelated names.
     let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
+    // [`NoScope`], for the reason [`constrain_subtype`] takes it: this entry serves
+    // Check's re-derivation, which resolves no names and so holds no binder types for
+    // the semantic fallback to read.
     cache.under(lhs_binders, rhs_binders, |cache| {
-        constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache)
+        constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache, &NoScope)
     })
 }
 
@@ -723,6 +782,7 @@ pub(super) fn answer_type_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> 
 /// displaces a demand from above. A verdict against it would depend on when the edge was
 /// drawn. This is the same reason [`constrain_fun_kind`] records against a variable instead of
 /// deciding.
+#[allow(clippy::too_many_arguments)]
 fn constrain_type_kinds(
     sub: &TypeKind,
     sup: &TypeKind,
@@ -731,6 +791,7 @@ fn constrain_type_kinds(
     lhs: &Type,
     rhs: &Type,
     cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     let mismatch = || ConstrainError::Mismatch {
         lhs: lhs.clone(),
@@ -742,14 +803,16 @@ fn constrain_type_kinds(
         // Candidates are members, so containment is membership, once per member.
         (TypeKind::Enumerated(subs), _) => {
             for d in subs {
-                candidate_in_kind(d, sup, sl, sr, lhs, rhs, cache)?;
+                candidate_in_kind(d, sup, sl, sr, lhs, rhs, cache, scope)?;
             }
             Ok(())
         }
         // **Two bounds are ordered by their bounds.** Every domain below `a` is below `b`
         // exactly when `a <: b`, which is one ordinary covariant edge — and the edge is
         // what determines an unannotated `b`.
-        (TypeKind::SubtypesOf(a), TypeKind::SubtypesOf(b)) => constrain_go(a, b, sl, sr, cache),
+        (TypeKind::SubtypesOf(a), TypeKind::SubtypesOf(b)) => {
+            constrain_go(a, b, sl, sr, cache, scope)
+        }
         (TypeKind::UIntRanges, TypeKind::UIntRanges) => Ok(()),
         // A kind that names no members offers none to place in the kind above it, so nothing
         // relates it upward: the universe, every `UIntRange`, and every type below a key
@@ -789,9 +852,10 @@ fn candidate_in_kind(
     lhs: &Type,
     rhs: &Type,
     cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     match sup {
-        TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache),
+        TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache, scope),
         TypeKind::Enumerated(sups) if sups.contains(d) => Ok(()),
         TypeKind::Enumerated(_) => Err(ConstrainError::Mismatch {
             lhs: lhs.clone(),
@@ -822,6 +886,7 @@ fn constrain_go(
     sl: &Subst,
     sr: &Subst,
     cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     // Checked *before* the short-circuit, deliberately: the case the two
     // disagree on is `𝑡 <: 𝑡` itself, which the short-circuit would answer and
@@ -832,7 +897,7 @@ fn constrain_go(
     // Structural descent over two types at once, one frame per constructor pair;
     // grow on demand as the other deep walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        constrain_go_impl(lhs, rhs, sl, sr, cache)
+        constrain_go_impl(lhs, rhs, sl, sr, cache, scope)
     })
 }
 
@@ -842,6 +907,7 @@ fn constrain_go_impl(
     sl: &Subst,
     sr: &Subst,
     cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     // The trivial-equality short-circuit is only sound when the edge carries
     // no transformation — under non-identity morphisms `lhs` and `rhs` live
@@ -939,7 +1005,16 @@ fn constrain_go_impl(
             // does not — it reads what each side states.
             if let (Some(w0), Some(w1)) = (k0.sum_binders(), k1.sum_binders()) {
                 for (a, b) in w0.iter().zip(w1.iter()) {
-                    constrain_type_kinds(&a.type_kind(), &b.type_kind(), sl, sr, lhs, rhs, cache)?;
+                    constrain_type_kinds(
+                        &a.type_kind(),
+                        &b.type_kind(),
+                        sl,
+                        sr,
+                        lhs,
+                        rhs,
+                        cache,
+                        scope,
+                    )?;
                 }
             }
             let corresponding;
@@ -1077,18 +1152,31 @@ fn constrain_go_impl(
                 if invariant_domains {
                     // Swapped with the substitutions: this edge relates the sides the other
                     // way round, and a reference in `d1` is classified by `d1`'s binders.
-                    let ok = cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache).is_ok())
-                        && (matches!(**d0, Type::Infer(_))
-                            || matches!(**d1, Type::Infer(_))
-                            || constrain_go(d0, d1, sl, sr, cache).is_ok());
-                    if !ok {
-                        return Err(ConstrainError::DataDomainMismatch {
-                            lhs: (**d0).clone(),
-                            rhs: (**d1).clone(),
+                    let decided = cache
+                        .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
+                        .and_then(|()| {
+                            if matches!(**d0, Type::Infer(_)) || matches!(**d1, Type::Infer(_)) {
+                                Ok(())
+                            } else {
+                                constrain_go(d0, d1, sl, sr, cache, scope)
+                            }
                         });
+                    // Whichever edge found the two domains unequal, the report is the
+                    // inequality and not the sub-comparison that exposed it — except
+                    // for an `SmtError`, which established nothing: relabelling it
+                    // would claim a conflict that no comparison decided. See
+                    // [`super::smt`].
+                    if let Err(err) = decided {
+                        return match err {
+                            ConstrainError::SmtError { .. } => Err(err),
+                            _ => Err(ConstrainError::DataDomainMismatch {
+                                lhs: (**d0).clone(),
+                                rhs: (**d1).clone(),
+                            }),
+                        };
                     }
                 } else {
-                    cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache))?;
+                    cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))?;
                 }
                 constrain_go(
                     c0_opened.as_ref().map_or(&**c0, |c| c),
@@ -1096,6 +1184,7 @@ fn constrain_go_impl(
                     &cod_sl,
                     sr,
                     cache,
+                    scope,
                 )
             })
         }
@@ -1113,7 +1202,7 @@ fn constrain_go_impl(
         (Type::Tuple(a), Type::Tuple(b)) => {
             for (i, t1) in b.iter().enumerate() {
                 match a.get(i) {
-                    Some(t0) => constrain_go(t0, t1, sl, sr, cache)?,
+                    Some(t0) => constrain_go(t0, t1, sl, sr, cache, scope)?,
                     None => {
                         // A `Tuple` is **dense**, so the failure here is one of *width*
                         // and the widest position rhs demands is its sharpest witness —
@@ -1135,7 +1224,7 @@ fn constrain_go_impl(
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
                 match a.iter().find(|(n, _)| n == name) {
-                    Some((_, t0)) => constrain_go(t0, t1, sl, sr, cache)?,
+                    Some((_, t0)) => constrain_go(t0, t1, sl, sr, cache, scope)?,
                     None => {
                         return Err(ConstrainError::MissingField {
                             key: FieldKey::Name(SmolStr::from(name.as_str())),
@@ -1228,8 +1317,8 @@ fn constrain_go_impl(
                 });
             };
             for c in &candidates {
-                constrain_go(c, other, sl, sr, cache)?;
-                constrain_go(other, c, sr, sl, cache)?;
+                constrain_go(c, other, sl, sr, cache, scope)?;
+                constrain_go(other, c, sr, sl, cache, scope)?;
             }
             Ok(())
         }
@@ -1260,7 +1349,7 @@ fn constrain_go_impl(
             );
             for (k, t0) in a {
                 match b.iter().find(|(bk, _)| bk == k) {
-                    Some((_, t1)) => constrain_go(t0, t1, sl, sr, cache)?,
+                    Some((_, t1)) => constrain_go(t0, t1, sl, sr, cache, scope)?,
                     None if openness.permits_extra_tags() => continue,
                     None => {
                         return Err(ConstrainError::ExtraTag {
@@ -1301,10 +1390,10 @@ fn constrain_go_impl(
                 history_kind: k1,
             },
         ) if k0 == k1 => {
-            constrain_go(v0, v1, &Subst::id(), &Subst::id(), cache)?;
-            constrain_go(v1, v0, &Subst::id(), &Subst::id(), cache)?;
-            constrain_go(d0, d1, &Subst::id(), &Subst::id(), cache)?;
-            constrain_go(d1, d0, &Subst::id(), &Subst::id(), cache)
+            constrain_go(v0, v1, &Subst::id(), &Subst::id(), cache, scope)?;
+            constrain_go(v1, v0, &Subst::id(), &Subst::id(), cache, scope)?;
+            constrain_go(d0, d1, &Subst::id(), &Subst::id(), cache, scope)?;
+            constrain_go(d1, d0, &Subst::id(), &Subst::id(), cache, scope)
         }
         // There is deliberately **no deref arm here.** A mutable variable mention that denotes
         // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so a
@@ -1379,6 +1468,7 @@ fn constrain_go_impl(
                     &Subst::then(&low.ty_subst, &tau_l),
                     &Subst::then(sr, &tau_u),
                     cache,
+                    scope,
                 )?;
             }
             Ok(())
@@ -1439,6 +1529,7 @@ fn constrain_go_impl(
                     &Subst::then(sl, &tau_l),
                     &Subst::then(&up.ty_subst, &tau_u),
                     cache,
+                    scope,
                 )?;
             }
             Ok(())
@@ -1448,11 +1539,11 @@ fn constrain_go_impl(
         // Lift the other side down via extrude and retry.
         (Type::Infer(lv), _) => {
             let new_rhs = extrude(rhs, false, lv.level, &mut ExtrudeCache::new());
-            constrain_go(lhs, &new_rhs, sl, sr, cache)
+            constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
             let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
-            constrain_go(&new_lhs, rhs, sl, sr, cache)
+            constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
         }
 
         // Feed handles are invariant in the payload: feeding writes into
@@ -1493,7 +1584,7 @@ fn constrain_go_impl(
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
-            constrain_go(&chan, rhs, sl, sr, cache)
+            constrain_go(&chan, rhs, sl, sr, cache, scope)
         }
         // A *channel-shaped* lhs meeting a feed requirement is the read view of
         // that handle: a use position that both held the handle and was read
@@ -1516,7 +1607,7 @@ fn constrain_go_impl(
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
-            constrain_go(lhs, &chan, sl, sr, cache)
+            constrain_go(lhs, &chan, sl, sr, cache, scope)
         }
         // Any other plain value can never satisfy a feed requirement: reading is
         // transparent, but the write capability cannot be conjured (`g(5)` where
@@ -1619,13 +1710,46 @@ fn constrain_go_impl(
                 .collect();
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
-                constrain_go(lbase, rbase, sl, sr, cache)
+                constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
                 // resolves to a concrete base lacking those refinements.
                 let demanded = Type::refined(rbase.clone(), deficit);
-                constrain_go(lbase, &demanded, sl, sr, cache)
+                constrain_go(lbase, &demanded, sl, sr, cache, scope)
+            } else if scope.is_skip_smt() {
+                Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                })
+            } else if super::smt::smt_sub(
+                lbase,
+                &lrefs_in_ambient,
+                // Transported, unlike `deficit`'s members: `smt_sub` reads both
+                // sides' predicates as terms of one formula, so a name has to mean
+                // the same thing on both. It is also what makes the entailment
+                // decidable at all here — an untransported lhs predicate mentions
+                // the `let` binder a discharge edge on `sl` replaces with the bound
+                // term.
+                &rrefs
+                    .iter()
+                    .map(|r| sr.force_refinement(r))
+                    .collect::<Vec<_>>(),
+                scope,
+            )
+            .or_else(|error| match error {
+                // A predicate the encoder cannot read leaves the deficit undecided,
+                // and undecided is the answer structural matching already gave:
+                // a mismatch. Reporting the encoder's limit instead would turn an
+                // ill-typed program's diagnostic into a note about this module.
+                SmtError::Encoding { .. } => Ok(false),
+                error => Err(ConstrainError::SmtError {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    error: Box::new(error),
+                }),
+            })? {
+                constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
                 Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),

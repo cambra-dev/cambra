@@ -183,15 +183,21 @@ def identity(x):
 **Not yet implemented:**
 
 * **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. Does not block today's coverage; a natural next step.
-* **SMT-backed refinements.** Augmenting the lattice-carried refinements (today compared by structural equality only) with logical payloads (e.g. `v > 0`) reasoned about — implication, not just equality — by an external SMT solver such as Z3.
+* **SMT-backed refinements outside linear integer arithmetic, and after `lambda_elim`.**
+  [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) discharges an
+  `Int`/`Bool` predicate in linear integer arithmetic to Z3 when structural matching leaves a
+  deficit. A deficit the encoder cannot read is decided structurally, as it was before the
+  fallback existed. The encoded fragment is over surface-syntax predicate shapes, and
+  `lambda_elim` rewrites every predicate point-free, so no check at or after that pass reaches
+  the fallback at all — the reach is inference and `inline`.
 
 *(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
 ---
 
-## 2. The Two-Pass Pipeline
+## 2. The Inference Pipeline
 
-The inference engine drives the AST through two passes, defined in `ccl/infer/`, mirroring the academic paper's `typeTerm`/`constrain` and `coalesce` algorithms. Two Cambra-specific mechanisms ride *inside* the coalesce walk rather than as separate passes: binder-slot filling (see Pass 2) and let-polymorphism's per-type specialization (integrated monomorphization — see §3.1).
+The inference engine drives the AST through two passes, defined in `ccl/infer/`, mirroring the academic paper's `typeTerm`/`constrain` and `coalesce` algorithms, then a third that erases what coalesce leaves inside refinement predicates ([Pass 3: Stripping Predicate Interiors](#pass-3-stripping-predicate-interiors)). Two Cambra-specific mechanisms ride *inside* the coalesce walk rather than as separate passes: binder-slot filling (see Pass 2) and let-polymorphism's per-type specialization (integrated monomorphization — see §3.1).
 
 ### Pass 1: Constraint Emission
 
@@ -412,6 +418,40 @@ What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**:
 That residue is invisible in most programs because something else rebuilds the binder — a *generalized* `let`'s definition is re-coalesced by `specialize_use` at each specialization. It is a **value** binding that exposes it: nothing rebuilds it, so the slot is the only chance. Two independent shapes reach it — a `groupby` (a collection, so a value binding, and dependently refined, so its binder type carries a predicate at all) and a `match` over a conditionally-built collection (whose arm domains carry the conditional's gate).
 
 Refinement predicates are otherwise coalesced by recursing into them (in the `Lambda` arm and `coalesce_type_predicates`); their free variables share the enclosing bindings' vars and coalesce identically, just like ordinary `Var` uses — and their projections recover their domains through the same `Apply`/`Compose` arms (see §2).
+
+### Pass 3: Stripping Predicate Interiors
+
+`strip_predicate_interiors` (`ccl/infer/strip.rs`) drops the refinements riding the type slots
+*inside* a refinement predicate.
+
+A predicate is a term, so every node in it carries a type, and those interior types accumulate
+refinements of their own: `^+` records its sum, which types the `1 ^+ 3` node inside the predicate
+`__elem == 1 ^+ 3 ^+ 2` as `{Int | __elem == 1 ^+ 3}`. The interior copy restates what the predicate
+holding it already says, and it is the copy a substitution leaves stale. Coalesce discharges the
+predicate a type carries as that type crosses a binder; an interior copy the discharge did not reach
+goes on naming the binder, and the end-of-inference scope-validity check (`check_scope_valid`)
+reports that as a `ScopeViolation` — a compiler-bug diagnostic on a well-typed program. Erasing the
+second copy is what closes that class; keeping two copies in step is the alternative.
+
+Two kinds of interior type survive.
+
+A refinement on a **data function's data** is exempt, body and all. Planning compiles such a
+predicate into a `Restrict`/`Iterate` at the iteration boundary and operator conversion dispatches
+on the types of the nodes inside it, so its interior types are read rather than restated. `𝐴 ⤇ 𝐵`
+reads "the domain is the data", so the domain is the position that carries filters, at whatever
+depth its structure puts them.
+
+Exemption is a property of the refinement rather than of the position it was found at, and is
+matched by `Refinement`'s structural equality. One predicate term rides many type slots — a
+comprehension's filtered domain appears on its source, map, cast, and consumer-contract types — so a
+rule keyed on position exempts that term at one slot and rewrites it at another, leaving the origin
+and the rewrite both live and structurally equal. That is the split `tests/predicate_sharing.rs`
+guards. Keying on the predicate `Rc` splits the same way wherever two structurally-equal terms
+already sit at distinct allocations.
+
+A `Cast`'s `target` is kept wherever it sits. It is the cast's operand rather than an ascription of
+the node's type — `cast` takes the type it casts to as an argument — and a comprehension's filter is
+read off it, so replacing it changes what the term computes.
 
 ### The post-inference check (shared rules)
 
@@ -894,7 +934,110 @@ Singletons are *not* erased after inference. They are ordinary refinements and r
 
 #### Refinements on the lattice
 
-A **refined type** `{T | p}` carries a *set* of [`Refinement`]s, and the lattice treats each as a black box: it accumulates them and matches them by identity, never reasoning about what they imply (the predicate's logical content is real and used by the runtime, just opaque *here*). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{b₁ | S₁} <: {b₂ | S₂}` iff `b₁ <: b₂` and `S₂ ⊆ S₁ ∪ refinements(b₁)`** — more refinements ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}`. Refinements match by **type-blind structural equality of their predicate terms** (`Refinement`'s `PartialEq` / `eq_refinement_predicate`) — *not* by predicate implication (`{T | x > 0} ⊀ {T | x > -1}`). Structural matching makes refinement identity agnostic to *where* a predicate was constructed (join planning re-mints `{D | p}` at every marker it emits — `make_iterate` / `make_restrict` / `refine_with` — and must match the structurally-identical contract recorded elsewhere on the tree) and to in-place type resolution (copies of one predicate along a monomorphization descent line differ only in their inferred-type slots); a pointer-equal predicate `Rc` short-circuits as the fast path, since a refinement that merely flows around shares its `Rc`. The refinement set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (refinements are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
+A **refined type** `{T | p}` carries a *set* of [`Refinement`]s, and the lattice treats each as a black box: it accumulates them and matches them by identity, reasoning about what they imply only through the fallback below (the predicate's logical content is real and used by the runtime, otherwise opaque *here*). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{b₁ | S₁} <: {b₂ | S₂}` iff `b₁ <: b₂` and `S₂ ⊆ S₁ ∪ refinements(b₁)`** — more refinements ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}`. Refinements match by **type-blind structural equality of their predicate terms** (`Refinement`'s `PartialEq` / `eq_refinement_predicate`) and not by predicate implication, which is what [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) supplies for the cases structural matching leaves. Structural matching makes refinement identity agnostic to *where* a predicate was constructed (join planning re-mints `{D | p}` at every marker it emits — `make_iterate` / `make_restrict` / `refine_with` — and must match the structurally-identical contract recorded elsewhere on the tree) and to in-place type resolution (copies of one predicate along a monomorphization descent line differ only in their inferred-type slots); a pointer-equal predicate `Rc` short-circuits as the fast path, since a refinement that merely flows around shares its `Rc`. The refinement set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (refinements are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
+
+##### Semantic entailment as a fallback
+
+A deficit `S₂ \ S₁` over a concrete `b₁` asks `smt_sub`
+([`crate::ccl::infer::solver::smt`]) whether `S₁` entails `S₂` before the rule reports a
+mismatch. `{Int | __elem == 1 ^+ 3 ^+ 2} <: {Int | __elem == 1 ^+ 5}` holds by that route and
+not by structural matching.
+
+The query is `∀ __elem. ⋀Γ ∧ ⋀S₁ ⇒ ⋀S₂`, decided by asking Z3 for unsatisfiability of
+`⋀Γ ∧ ⋀S₁ ∧ ¬⋀S₂`. `__elem` is declared once at `b₁`'s sort and shared by both sides, or, where
+`b₁` is a product, read through its fields
+([A product is reached through its fields](#a-product-is-reached-through-its-fields)). Both
+sides are transported into the ambient frame (`Subst::force_refinement`) first, because the
+query compares terms and the two sides' predicates are written in different binder contexts.
+
+`Γ` is [The scope a query runs in](#the-scope-a-query-runs-in): every other free name is
+declared at a sort as well, so it is universally quantified too, and what is assumed about it
+comes from the scope the caller supplies.
+
+The encoding covers linear integer arithmetic over scalars: literals, variables, field
+reads, `+`/`-`, `*` with a literal factor, the comparisons, and the boolean
+connectives. `smt_sub` returns `false` for one reason: the solver produced a model of
+`⋀S₁ ∧ ¬⋀S₂`, a value satisfying `S₁` and violating `S₂`. Every other outcome is an
+`SmtError` naming what happened, because a query that was not asked or not answered has no
+result of its own to report.
+
+The deficit rule decides an unreadable predicate anyway, as a mismatch: that is the answer
+structural matching had already reached, so falling back to it is incomplete and never unsound.
+The remaining errors — a solver that will not start, one that breaks mid-query, an `unknown` —
+reach `map_constrain_err`, which aborts on each. `TODO(smt-undecided)` there records the policy
+those want instead.
+
+##### A product is reached through its fields
+
+An SMT constant stands for a scalar, and the unit one is minted for is an **access path**: a root
+name and the projections read through it (`Path`, in `src/ccl/infer/solver/smt.rs`). A record or a
+tuple has no sort, so a product-typed name denotes no constant; `x.b` denotes one, and keying that
+constant by the path is what makes two occurrences of `x.b` one constant.
+
+`x = (a = 10, b = 2 ^+ 1); def foo(t: Int) => {Int where _ == t + 3}: t ^+ x.b` is the case that
+needs it: the body is inferred `{Int | __elem == t ^+ x.b}`, and the entailment follows from
+`x.b == 3`.
+
+A path's type is the type its root is bound at, read once per key, and that type wins over the slot
+on the term that read it — the scope records what the value is, while a projection's slot
+mid-emission is an inference variable. The subject is rooted at `b₁` the same way: a scalar base
+declares one constant, a product base declares none and each path read out of it is declared where
+it is read. A base that is neither leaves every predicate about it unencodable.
+
+Assumptions come from every prefix of a path rather than from its leaf alone, because a refinement
+on a product states its predicate about the product: that `x.b` is `3` can be written on `x` as
+`{{b: Int} | __elem.b == 3}` or on its field as `{b: Int@3}`, and the two are one assumption.
+`__elem` addresses the subject of the predicate it appears in, so a read inside `x`'s own refinement
+reroots onto `x` — `__elem.b` there and `x.b` outside are one leaf.
+
+##### The scope a query runs in
+
+`smt_sub` takes a `ScopeEnv` — a lookup from a free name to the type it is bound at. A path rooted
+at a name the scope binds is declared at the sort its type gives it, and the refinements the types
+along it carry join the antecedent, restated about the path. A path the scope settles nothing about
+is declared at the sort of the node reading it and nothing is assumed about it.
+
+`x = 2; def foo(t: Int) => {Int where _ == t + 2}: t ^+ x` is the case that needs it: the body
+is inferred `{Int | __elem == t ^+ x}`, and `t ^+ x == t + 2` follows only from `x == 2`, which
+is the refinement on the type `x` is bound at.
+
+Assumptions chain, because a binder is looked up when a predicate mentions it and the lookup
+runs on its own refinements too: `x = 2; y = x ^+ 1` reaches `y == 3` by declaring `y`, meeting
+`x` inside `y`'s predicate, and declaring `x` with its own. The binder is declared before its
+refinements are translated, so binders that reference each other terminate.
+
+A lookup and not an enumeration. Declaring every binder in scope would let one nothing mentions
+change the answer — a contradictory binder proves the entailment outright — and it costs a
+declaration per binder on a query that names two. A product's fields are not enumerated either,
+for the same reason.
+
+Two environments implement the lookup, and a third suppresses the query:
+
+- **Emission** passes its lexical scope (`InferCtx`'s `ScopeStack`), through
+  `constrain_subtype_in`. It is the only one that answers a lookup. A binder's slot
+  mid-emission is an inference variable, so the scheme body is resolved before it can be read
+  as a fact — `value_type`, the compact → simplify → coalesce pipeline with the
+  opposite-polarity fallback suppressed. The positive reading is what makes the assumption
+  sound: the slot also carries what the binder's *uses* demanded of it, and assuming a demand
+  would let an entailment prove itself from what it was asked to establish. `x = 2` needs no
+  resolution (the literal's singleton is on the node), `x = 2 ^+ 1` does — the sum's singleton
+  is on the variable's bounds, and unresolved the binder has no sort at all. A generalized
+  binder's quantified variables stay uninstantiated; a polytype has no sort, so it is dropped
+  rather than assumed wrong.
+- **`NoScope`** is the empty environment, what every caller outside emission supplies:
+  `constrain_subtype_under` (the post-inference check resolves no names, so it holds no binder
+  types) and `inline`'s discharge check, which runs over a tree whose binders it does not hold.
+  An empty scope only weakens what the fallback can prove, so it can reject what emission
+  admitted and never the reverse.
+- **`SkipSmtScope`** decides a deficit structurally, raising no query at all.
+  `constrain_subtype` supplies it, so the post-pass tree check reaches the fallback through
+  `constrain_subtype_under` and not through `Typing::constrain`. That split is caller policy
+  riding the scope trait rather than a third environment; the `ScopeEnv::is_skip_smt` doc names
+  the shape it wants instead.
+
+Dropping is the discipline throughout: a path with no sort, a predicate body outside the
+fragment, a name two binders disagree about. An assumption left out weakens the antecedent and
+cannot make an invalid entailment provable.
 
 ##### The set is the representation, not just the reading
 
@@ -1164,7 +1307,7 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 
 **Discharged-argument slot resolution.** A predicate's interior is typed **by construction**, and the invariant that makes that hold is that *substitution never discards a type*. A `Discharge` carries a typed argument term and clones it; a `Rename` materializes as a fresh `Var` node and takes the type of the occurrence it replaces, because α-renaming cannot change a term's type — the type belongs to the position, not to the name. Nothing re-derives a predicate's types afterwards, and nothing may: a predicate's interior is outside the walk that resolves node types (its terms ride a *type*), so a slot left untyped here would survive to the post-inference wall as an unresolved variable with no way to recover it except lexical scope — which is a *name* lookup standing in for a type that was thrown away. (`freshen_above` separately copy-and-freshens a specialization clone's predicate type slots.)
 
-**`let`-closing (codomain extraction).** A `let 𝑥 = 𝑣 in body` node's type is the body's type, which may close over `𝑥`. As that type is lifted out of the `let`'s scope, `coalesce_node` discharges `[𝑥 ↦ 𝑣]` into it (derived from the body's already-closed type, so chained `let`s close to fixpoint) — the design's `let`-closing refinement-move site. Together with the contravariant discharge above, every coalesced node's type is **well-formed in its lexical scope**, checked at the end of inference by `check_scope_valid` (§6.2) in debug builds: a free predicate variable must be bound by an enclosing Pi binder or AST binder, or be a source. A violation is a compiler bug (a substitution-descent miss leaving a dangling predicate binder), reported as an internal `InferError::ScopeViolation`. This is a debug-build regression net: because substitution rewrites type-borne occurrences in the same pass as the term, a dangling predicate binder is structurally unrepresentable; the per-substitution `debug_assert`s in `ccl::subst` remain as fast-path guards.
+**`let`-closing (codomain extraction).** A `let 𝑥 = 𝑣 in body` node's type is the body's type, which may close over `𝑥`. Emission records the lift as a suspended discharge on the `let` node's own variable (see [`let` binders and scope exit](#let-binders-and-scope-exit)), and `coalesce_node` discharges `[𝑥 ↦ 𝑣]` into the resolved type (derived from the body's already-closed type, so chained `let`s close to fixpoint) — the design's `let`-closing refinement-move site. The discharge quotes `𝑣`, so a pass that rewrites `𝑣` re-runs it: `lambda_elim`'s two `Let` arms rebuild the node's type from the eliminated body and definition, and the post-pass check reconstructs it from the tree it is handed, which holds the eliminated `𝑣` alone. Only a dependent binding is rebuilt, so elimination changes a node's type exactly where the term it quotes changed. Together with the contravariant discharge above, every coalesced node's type is **well-formed in its lexical scope**, checked at the end of inference by `check_scope_valid` (§6.2) in debug builds: a free predicate variable must be bound by an enclosing Pi binder or AST binder, or be a source. A violation is a compiler bug (a substitution-descent miss leaving a dangling predicate binder), reported as an internal `InferError::ScopeViolation`. This is a debug-build regression net: because substitution rewrites type-borne occurrences in the same pass as the term, a dangling predicate binder is structurally unrepresentable; the per-substitution `debug_assert`s in `ccl::subst` remain as fast-path guards.
 
 **Lambda elimination.** A `λ 𝑥 → e` whose binder is free only in `e`'s *type* (a refinement closes over it) — not its value — eliminates to the **Pi-const** form `const(e) : (𝑥) ⇒ e.ty` (`is_free_in_value` distinguishes the two). It also fires after the currying/pairing rule rewrites a captured partition predicate onto a pair domain: the residual `λ __pair → <point-free value>` has its binder free only in that refinement.
 
@@ -1279,10 +1422,17 @@ that should dedup, and a `Data` domain admits no join across the split: with ind
 
 A `let` telescope entry carries its definiens. A refinement may reference it while in scope, which a
 user-written refinement type needs (`{Int | __elem > n}` with `n` let-bound). Lifting a type past
-the binding discharges the reference to the definiens, through the existing `let`-closing discharge
-in `coalesce_node`. No re-addressing is needed: a uniquified name is its telescope entry's
-address, so the name-keyed discharge already speaks in entries. A Pi entry has no definiens, and
-lifting past one abstracts instead of discharging.
+the binding discharges the reference to the definiens. No re-addressing is needed: a uniquified name
+is its telescope entry's address, so the name-keyed discharge already speaks in entries. A Pi entry
+has no definiens, and lifting past one abstracts instead of discharging.
+
+Emission records the lift, and cannot perform it: the body's type is an inference variable there,
+whose refinements sit in its bounds rather than in the type. `InferCtx::close_let_type` mints the
+`let` node's type outside the binder and records the body's type on its lower edge under `[𝑥 ↦ 𝑣]`,
+a suspended discharge read as an application. Every bound naming `𝑥` then crosses an edge that
+discharges the name, and β fires at coalesce. Returning the body's variable verbatim instead lets a
+refinement over `𝑥` reach the enclosing lambda's codomain, which is minted outside the binder and
+so trips the record-time closure check at the first call site that reads the codomain.
 
 #### Discharge is application
 
@@ -1335,7 +1485,10 @@ name it closes over is the annotation's.
 
 **A refinement closes against the enclosing functions of the walk carrying it.** `compact_go` and
 the `SpecKey` walk both do so in the same two arms that force the edge substitutions into it
-(`force_refinement`). Nothing earlier can: `CompactType::merge` dedups refinements while bounds
+(`force_refinement`), and `coalesce_type_predicates` does so again on what it rebuilds. That third
+site is a re-entry: a predicate's sub-expression type slots hold inference variables `compact_go`
+steps over, and resolving them afterwards reads name-spelled references out of the live graph and
+puts them back into a type the walk already closed. Nothing earlier can: `CompactType::merge` dedups refinements while bounds
 fold, before any function is assembled, so a closed cast and a live emitted function meeting at one
 variable would otherwise put an index-spelled refinement and a name-spelled one at a single
 position. `subst::RefinementScope` is the state both walks thread — the enclosing-binder stack and
@@ -1586,7 +1739,10 @@ inversion left admitted — refinement **acquisition**, `𝐷 ⤇ 𝑉 <: {𝐷 
 unfiltered collection standing where a filtered domain is declared. A failure in
 either direction is reported as `ConstrainError::DataDomainMismatch`, naming the two
 domains; `a_data_domain_relates_only_to_itself` pins all four directions plus the
-reflexive case, and the compute counterpart that still relates contravariantly.
+reflexive case, and the compute counterpart that still relates contravariantly. The
+exception is a domain comparison that raised a query and got no answer back: an
+`SmtError` decided nothing, so it is reported as itself rather than relabelled into a
+conflict.
 
 **Emitting both directions does not preempt a join.** Two domains meeting at one
 variable is a join like any other, and it has the same answer as anywhere else: none,
@@ -2754,7 +2910,7 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | **`FieldKey`** | Algebraic subtyping | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
 | **`Variant` (tagged sum)** | Both | The single sum representation: `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `` `tag(…) ``; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). |
 | **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Hole` is normalized to a fresh var, while `Refinement` is kept and rides the lattice as a refinement. |
-| **Refinement** | Both | A `Type::Refinement(T, r)` carries a refinement `r` (an immutable predicate `Rc<TypedExpr>`) — a refinement in its role as a black box to the subtyping lattice. A type holds a *set* of refinements, width-subtyped like records (more refinements ⇒ subtype; `{T\|p,q} <: {T\|p}`). Refinements compare by type-blind structural predicate equality (`Refinement`'s `PartialEq`; pointer-equal predicates short-circuit) — not implication. A refinement is *required* — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
+| **Refinement** | Both | A `Type::Refinement(T, r)` carries a refinement `r` (an immutable predicate `Rc<TypedExpr>`) — a refinement in its role as a black box to the subtyping lattice. A type holds a *set* of refinements, width-subtyped like records (more refinements ⇒ subtype; `{T\|p,q} <: {T\|p}`). Refinements compare by type-blind structural predicate equality (`Refinement`'s `PartialEq`; pointer-equal predicates short-circuit), with implication reached for only as a fallback (`smt_sub`). A refinement is *required* — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
 | **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |
 | **`InferArena`** | Cambra-Specific | The single owner of every inference variable minted during one `infer()` run. Captures each mint through a thread-local sink and, on `Drop`, clears all variables' bounds to break the `Rc` cycles that mutual subtyping constraints form — the end-of-inference cleanup that reference counting alone cannot do. See §3.2. |
 | **Pi type** | Both | A `Type::Fun` with `name: Some(𝑥)` — the dependent function type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain` and referenceable by nested refinement predicates. `name: None` is the ordinary function type. See §4.5. |

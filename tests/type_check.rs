@@ -4236,17 +4236,18 @@ fn products_sharing_a_field_join_on_it() {
 /// whose telescope has to carry the binder `p` names, the same traveler class
 /// group-by's lowering produces.
 ///
-/// The observable is the diagnostic. Nothing discharges a user-written
-/// predicate — a refined parameter admits an argument only when the argument's
-/// own refinement set already carries the predicate — so every case here is rejected
-/// at the subsumption step, and what the assertion reads is the refinement the
-/// solver arrived at.
+/// The observable is the diagnostic. Every case here is rejected at the
+/// subsumption step — the argument's own refinement set neither carries the
+/// demanded predicate nor entails it, `n` included, since the scope pins `n`
+/// above the argument — and what the assertion reads is the refinement the solver
+/// arrived at.
 #[rstest]
 // A `let` binder is a telescope entry, and a refinement may reference one while it
-// is in scope.
+// is in scope. `n` is `9`, so `7 > n` is what the solver refutes; the diagnostic
+// still names the binder.
 #[case::let_bound(
     indoc! {r#"
-        n = 5
+        n = 9
         def f(x: {Int where _ > n}):
             x
 
@@ -4254,13 +4255,14 @@ fn products_sharing_a_field_join_on_it() {
     "#},
     "{Int | __elem > n}"
 )]
-// A predicate that projects out of the refined element keeps the projection.
+// A predicate that projects out of the refined element keeps the projection. The
+// argument pins `y` to `0`, which is what the projected demand refutes.
 #[case::projection(
     indoc! {r#"
         def f(r: { {x: Int, y: Int} where _.y != 0}):
             r.x
 
-        f((x=1, y=2))
+        f((x=1, y=0))
     "#},
     "{{x: Int, y: Int} | __elem.y != 0}"
 )]
@@ -4368,49 +4370,42 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
     );
 }
 
-/// TODO(refinement-let-scope): a `let` in a function body whose binder reaches
-/// the result refinement produces an ill-formed function type. **This test pins
-/// a defect, not a decision — it should start failing when the defect is fixed.**
+/// A `let` whose binder reaches the enclosing function's result refinement is
+/// eliminated as that refinement leaves the binder's scope, by substituting the
+/// `let`'s definition into the predicate. `m` defined as `n ^+ 1` makes the
+/// refinement `{Int | __elem == n ^+ 1 ^+ 1}`, whose only free name is the
+/// parameter, which the function type binds.
 ///
-/// `^+` records its sum in the result type, so `m ^+ 1` has type
-/// `{Int | __elem == m ^+ 1}` whose predicate holds the operand terms. Inference
-/// derives that refinement from the body and lands it on the lambda's own type,
-/// where a `let` inside the body has not opened, so the predicate names a binder
-/// that is not in scope at the position the type sits. `ScopeViolation` is
-/// labelled a compiler bug, so a reachable program reports an internal invariant
-/// failure.
+/// Asserted as the whole type rather than as a probe over the rendering: the
+/// design doc states what the type is (`src/ccl/design/type-inference.md`,
+/// "`let` binders and scope exit"), and a `Display` change then reads as a diff
+/// rather than as a check that silently stopped constraining anything.
 ///
-/// The fix is to eliminate the binder as the refinement leaves its scope, by
-/// substituting the `let`'s definition into the predicate: `m` defined as
-/// `n ^+ 1` makes the refinement `{Int | __elem == (n ^+ 1) ^+ 1}`, whose only
-/// free name is the parameter, which the function type binds. Two things to
-/// settle first: nested `let`s compose, so the predicate grows multiplicatively
-/// and wants a size bound; and a binder that cannot be eliminated should widen
-/// the type to the unrefined base rather than error.
+/// TODO(refinement-let-scope): two concerns the elimination raises are open.
+/// Nested `let`s compose, so the predicate grows multiplicatively and wants a
+/// size bound. And a binder that cannot be eliminated should widen the type to
+/// the unrefined base rather than leave the name dangling — a `:=` definiens is
+/// the live case, held back from the discharge by `InferCtx::close_let_type` and
+/// reported by `check_scope_valid` (`tests/compilation_pipeline/transactions.rs`,
+/// `TODO(refined-txn-body)`).
 ///
 /// This also blocks binding a multi-argument function's parameters rather than
 /// substituting them away — see `src/ccl/design/ir.md`, "A substituted
 /// parameter's site rides its projection". The two are one fix.
 #[test]
-fn let_binder_escaping_into_a_result_refinement_is_ill_scoped() {
-    let errors = infer_program_err(indoc! {r#"
+fn let_binder_does_not_escape_into_result_refinement() {
+    let ty = infer_program(indoc! {r#"
         def g(n: Int):
             m = n ^+ 1
             m ^+ 1
 
         g
     "#});
-    assert!(
-        errors.iter().any(|e| matches!(
-            e,
-            InferError::ScopeViolation { unbound, .. } if unbound.iter().any(|b| b == "m")
-        )),
-        "expected a ScopeViolation naming `m`; got {errors:?}"
-    );
+    assert_eq!(ty.to_string(), "((n: Int) ⇒ {Int | __elem == n ^+ 1 ^+ 1})");
 }
 
-/// The contrast that isolates the defect above: the same refinement over the
-/// **parameter** is well-formed, because the function type binds it.
+/// The contrast: a result refinement over the **parameter** needs no
+/// elimination, because the function type binds the name it closes over.
 #[test]
 fn a_result_refinement_over_the_parameter_is_well_scoped() {
     let ty = infer_program(indoc! {r#"

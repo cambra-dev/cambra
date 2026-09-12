@@ -1,3 +1,4 @@
+use indoc::indoc;
 use rstest::rstest;
 
 use crate::helpers::{check_compile_error, check_scalar};
@@ -10,6 +11,9 @@ fn refinement() {
         include_str!("type_annotations/refined_div_zero.cambra"),
         "expected {Int | __elem != 0}",
     );
+    // The demanded predicate reads a field of the record it refines, and the
+    // argument's own type pins that field to `0`, so the rejection is a
+    // refutation rather than a comparison nothing decided.
     check_compile_error(
         include_str!("type_annotations/complex_refinement.cambra"),
         "expected {{x: Int, y: Int} | __elem.y != 0}, found {x: Int@1, y: Int@0}",
@@ -342,4 +346,375 @@ fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] nam
 #[test]
 fn refined_add() {
     check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
+}
+
+// ---------------------------------------------------------------------------
+// Semantic entailment of a refinement
+//
+// Every case below leaves a structural deficit, so the verdict comes from the
+// semantic fallback (`src/ccl/design/type-inference.md`, "Semantic entailment as
+// a fallback"): the annotation's predicate and the body's are unequal terms, and
+// what decides the subtyping is whether the second entails the first.
+// ---------------------------------------------------------------------------
+
+/// A chain of `let`s whose definitions are substituted into the body's
+/// refinement: `y` is `1 ^+ 3 ^+ 2`, which entails `_ == 1 ^+ 5` without matching
+/// it.
+#[test]
+fn a_let_chain_entails_the_result_annotation() {
+    check_scalar(
+        indoc! {r#"
+            def foo(t: Int) => {Int where _ == 1 ^+ 5}:
+                x = 1 ^+ 3
+                y = x ^+ 2
+                y
+            ()
+        "#},
+        Value::Unit,
+    )
+}
+
+/// A `let` whose definition names the parameter. The substitution puts the
+/// parameter into the result refinement, where the function type binds it.
+#[test]
+fn a_let_definition_naming_the_parameter_composes() {
+    check_scalar(
+        indoc! {r#"
+            def foo(t: Int):
+                x = t ^+ 3
+                x ^+ 2
+            foo(1)
+        "#},
+        Value::Int(6),
+    )
+}
+
+/// The same sum written without the `let`: no substitution runs, and the
+/// refinement is the one the `let` form has to arrive at.
+#[test]
+fn a_nested_sum_with_no_let_refines_the_same_way() {
+    check_scalar(
+        indoc! {r#"
+            def foo(t: Int):
+                (t ^+ 3) ^+ 2
+            foo(1)
+        "#},
+        Value::Int(6),
+    )
+}
+
+/// A parameter refinement the argument entails semantically but not structurally:
+/// `1 ^+ 3 ^+ 2` and `1 ^+ 5` are unequal terms denoting one value. Inference accepts
+/// the call through `smt_sub`, and `inline`'s beta-reduction discharges the same
+/// precondition the same way (see `src/ccl/design/type-inference.md`, "Semantic
+/// entailment as a fallback").
+#[test]
+fn refined_arg_entailed_only_semantically() {
+    check_scalar(
+        indoc! {r#"
+            def foo(t: {Int where _ == 1 ^+ 5}):
+                t
+            foo((1 ^+ 3) ^+ 2)
+        "#},
+        Value::Int(6),
+    )
+}
+
+/// A `let` the body returns unchanged. Its refinement names nothing, so the
+/// result type is closed before the substitution runs at all.
+#[test]
+fn a_let_bound_constant_returned_directly() {
+    check_scalar(
+        indoc! {r#"
+            def foo(t: Int):
+                x = 1 ^+ 3
+                x
+            foo(1)
+        "#},
+        Value::Int(4),
+    )
+}
+
+/// **This test pins a defect, not a decision — it should start failing when the
+/// defect is fixed.**
+///
+/// `2` is not `0`, so inference admits the call: the argument's type
+/// is `Int@2`, which entails both written demands through the fallback. Planning's
+/// post-pass check then rejects the same call. Both predicates are point-free by
+/// then — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — which is outside the encoded
+/// fragment, so the deficit falls back to the structural matching the fallback
+/// exists to get past, and a well-typed program reports an internal invariant
+/// failure.
+///
+/// Widening the encoding past surface syntax retires this pin, as would checking
+/// against the pre-elimination predicate. Once it passes, the program evaluates
+/// `4 // 2`. The rejecting counterpart is `tests/programs/refinement/`.
+#[test]
+#[should_panic(expected = "produced an invalid tree: [Type mismatch")]
+fn refinements_that_survive_to_post_planning_check_are_rejected() {
+    check_scalar(
+        indoc! {r#"
+            def no_zero_no_one_div(left: Int, right: {Int where _ != 0}):
+                left // right
+
+            no_zero_no_one_div(4, 2)
+        "#},
+        Value::Int(2),
+    )
+}
+
+/// A `let` bound to a call carries no refinement to compose with: `//` records no
+/// sum, so `x` is a bare `Int` and `x ^+ 2` refines over it rather than over a
+/// term naming `t`.
+#[test]
+fn a_let_bound_call_result_carries_no_refinement() {
+    check_scalar(
+        indoc! {r#"
+            def bar(i: Int):
+                i // 2
+
+            def foo(t: Int):
+                x = bar(t)
+                x ^+ 2
+            foo(2)
+        "#},
+        Value::Int(3),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// What a query may assume about a name in scope
+//
+// `src/ccl/design/type-inference.md`, "The scope a query runs in".
+// ---------------------------------------------------------------------------
+
+/// `t ^+ x == t + 2` follows only from `x == 2`, which is the refinement on the
+/// type the top-level binder holds. The literal puts that singleton on the node,
+/// so the scope answers without resolving anything.
+#[test]
+fn a_top_level_binder_is_assumed_at_its_own_type() {
+    check_scalar(
+        indoc! {r#"
+            x = 2
+
+            def foo(t: Int) => {Int where _ == t + 2}:
+                t ^+ x
+
+            foo(2)
+        "#},
+        Value::Int(4),
+    )
+}
+
+/// The same, with the binder's singleton on its inference variable's bounds
+/// rather than on the node. Unresolved it has no SMT sort, so the scope resolves
+/// the scheme body before reading it as a fact.
+#[test]
+fn a_top_level_binder_whose_singleton_needs_resolving() {
+    check_scalar(
+        indoc! {r#"
+            x = 2 ^+ 1
+
+            def foo(t: Int) => {Int where _ == t + 3}:
+                t ^+ x
+
+            foo(2)
+        "#},
+        Value::Int(5),
+    )
+}
+
+/// Assumptions chain: `y` is declared, `x` is met inside `y`'s own predicate, and
+/// `x`'s refinement joins the antecedent in turn.
+#[test]
+fn assumptions_chain_through_a_binders_own_refinement() {
+    check_scalar(
+        indoc! {r#"
+            x = 2
+
+            y = x ^+ 1
+
+            def foo(t: Int) => {Int where _ == t + 3}:
+                t ^+ y
+
+            foo(2)
+        "#},
+        Value::Int(5),
+    )
+}
+
+/// TODO(refinement-through-a-call): a call in the body leaves the result
+/// unrefined. `bar(t)` types as an `Apply`, which carries no predicate relating
+/// its result to its argument, so the body's refinement quotes the call term
+/// itself — `t ▷ bar` — which is outside the encoded fragment and decides
+/// nothing. Inlining `bar` first would make the annotation hold.
+#[test]
+fn a_call_in_the_body_leaves_the_result_unrefined() {
+    check_compile_error(
+        indoc! {r#"
+            x = 2
+
+            y = x ^+ 1
+
+            def bar(x: Int):
+                y ^+ x ^+ x
+
+            def foo(t: Int) => {Int where _ == t + 3 + t + 5}:
+                t ^+ y ^+ bar(t)
+
+            foo(2)
+        "#},
+        "inferred as {Int | __elem == t ^+ y ^+ t ▷ bar}",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates carry no refinement
+//
+// TODO(refined-aggregate): `max` over a filtered comprehension types as a bare
+// `Int`. A refinement-propagating aggregate would carry the comprehension's own
+// domain filter into the result; each case below says what it would then decide.
+// ---------------------------------------------------------------------------
+
+/// The filter is on a record field, so the bound the aggregate would carry comes
+/// from the projected domain rather than from the elements.
+#[test]
+fn an_aggregate_over_a_record_collection_carries_no_refinement() {
+    check_compile_error(
+        indoc! {r#"
+            def f(u: Int) => {Int where _ <= 15}:
+                products = [
+                    (name="foo", quant=10),
+                    (name="bar", quant=20),
+                ]
+                max([p.quant for p in products if p.quant <= 15])
+
+            f(0)
+        "#},
+        "but inferred as Int",
+    )
+}
+
+/// `_ <= 15` restates the comprehension's own filter, so the weakest
+/// refinement-propagating `max` accepts it. This case flips on that fix.
+#[test]
+fn an_aggregate_bound_following_from_the_filter_alone() {
+    check_compile_error(
+        indoc! {r#"
+            def f(u: Int) => {Int where _ <= 15}:
+                products = [ 10, 20 ]
+                max([p for p in products if p <= 15])
+
+            f(0)
+        "#},
+        "Annotation mismatch: annotated as {Int | __elem <= 15}, but inferred as Int",
+    )
+}
+
+/// `_ <= 10` is true of this collection — `max` is `10` — but it does not follow
+/// from the filter, which permits `15`. Deciding it needs the elements' own
+/// singletons, so this case stays rejected under the fix above and flips only
+/// under a stronger one.
+#[test]
+fn an_aggregate_bound_needing_the_elements() {
+    check_compile_error(
+        indoc! {r#"
+            def f(u: Int) => {Int where _ <= 10}:
+                products = [ 10, 20 ]
+                max([p for p in products if p <= 15])
+
+            f(0)
+        "#},
+        "Annotation mismatch: annotated as {Int | __elem <= 10}, but inferred as Int",
+    )
+}
+
+/// `_ <= 5` is false — `max` is `10` — so this case stays rejected under every
+/// aggregate rule, and is what tells the two above apart from a fix that simply
+/// stopped checking.
+#[test]
+fn an_aggregate_bound_the_elements_refute() {
+    check_compile_error(
+        indoc! {r#"
+            def f(u: Int) => {Int where _ <= 5}:
+                products = [ 10, 20 ]
+                max([p for p in products if p <= 15])
+
+            f(0)
+        "#},
+        "Annotation mismatch: annotated as {Int | __elem <= 5}, but inferred as Int",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Products are reached through their fields
+//
+// `src/ccl/design/type-inference.md`, "A product is reached through its fields".
+// ---------------------------------------------------------------------------
+
+/// A record has no SMT sort, so `x.b` is the leaf a constant is minted for, and
+/// `x.b == 3` is what the entailment runs on.
+#[test]
+fn a_field_read_of_a_top_level_record_is_assumed() {
+    check_scalar(
+        indoc! {r#"
+            x = ( a = 10, b = 2 ^+ 1 )
+
+            def foo(t: Int) => {Int where _ == t + 3}:
+                t ^+ x.b
+
+            foo(2)
+        "#},
+        Value::Int(5),
+    )
+}
+
+/// Two roots read through: the parameter, whose field the annotation names, and
+/// the top-level record, whose field the scope supplies a refinement for.
+#[test]
+fn a_field_read_of_the_parameter_and_of_a_record_in_scope() {
+    check_scalar(
+        indoc! {r#"
+            x = ( a = 10, b = 2 ^+ 1 )
+
+            def foo(t: {a:Int, b:Int}) => {Int where _ == t.a + 3}:
+                t.a ^+ x.b
+
+            foo((a=2, b=3))
+        "#},
+        Value::Int(5),
+    )
+}
+
+/// A record equality in the *body* is rejected before any refinement question is
+/// reached: no composite satisfies `Equatable`
+/// (`tests/type_check.rs`, `a_composite_satisfies_no_trait`).
+#[test]
+fn a_record_equality_in_the_body_has_no_instance() {
+    check_compile_error(
+        indoc! {r#"
+            def foo(t: {a:Int, b:Int}) => {Bool where _ == true}:
+                t == t
+
+            foo((a=2, b=3))
+        "#},
+        "No Equatable instance for BinOp",
+    )
+}
+
+/// TODO(refined-composite-eq): the same rejection from inside a refinement
+/// *predicate*, where a record equality is the natural way to write "this value"
+/// and the trait table has no row for it. Enabling `==` over an arbitrary type in
+/// a predicate is what flips this.
+#[test]
+fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
+    check_compile_error(
+        indoc! {r#"
+            def foo(t: {a:Int, b:Int}) => {{a:Int, b:Int} where _ == t}:
+                t
+
+            foo((a=1, b=2)).a
+        "#},
+        "No Equatable instance for BinOp",
+    )
 }

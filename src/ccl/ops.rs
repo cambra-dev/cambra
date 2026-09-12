@@ -868,12 +868,24 @@ impl fmt::Display for Builtin {
 ///
 /// Supports both positional tuple fields (`.0`, `.1`, …) and named record
 /// fields (`.name`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProjKey {
     /// Integer-indexed tuple projection: `.0`, `.1`, …
     Index(usize),
     /// Named record-field projection: `.fieldname`.
     Field(String),
+}
+
+/// Renders bare — `0`, `name` — with the leading dot supplied by the caller, the
+/// convention [`FieldKey`](crate::ccl::ty::FieldKey) follows for the dual keys of
+/// a sum.
+impl fmt::Display for ProjKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProjKey::Index(n) => write!(f, "{n}"),
+            ProjKey::Field(name) => f.write_str(name),
+        }
+    }
 }
 
 #[cfg(test)]

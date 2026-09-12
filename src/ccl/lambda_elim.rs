@@ -1542,6 +1542,20 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     // did) and re-closes a Σ over the result. The debug-build invariant asserts
     // below also compare against it.
     let original_ty = ty.clone();
+    // Set by the `Let` arm when it re-ran the closing discharge: that arm is the
+    // one place elimination is meant to change a node's type, because the type
+    // quotes a term the pass rewrote. Read only by the invariant assert below,
+    // so it exists only where that assert does.
+    //
+    // It **disables** the invariant for that arm rather than restating it. The
+    // strong form is to compare `original_ty` against the recorded discharge
+    // re-applied — `[v ↦ elim(def)]` on the type the node arrived with, which is
+    // what the arm computes — and it is not asserted because `original_ty` quotes
+    // the uneliminated `def` at an unknown depth inside a predicate, so recovering
+    // the pre-image needs the same walk the arm performs and the assert would
+    // compare the arm against itself.
+    #[cfg(debug_assertions)]
+    let mut reclosed_let_ty = false;
     let result = match node {
         // Lambda: eliminate then continue. (Domain refinements ride the type
         // lattice via `cast`; the cast-wrapped-lambda arm below handles the
@@ -1767,7 +1781,58 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             "unsupported node kind in lambda elimination: {node:?}"
         ))),
 
-        // Pure structural recursion: Apply, plain Compose, Let, Tuple, Record,
+        // A `let`'s type is its body's, lifted past the binder by the closing
+        // discharge `[v ↦ def]` (`src/ccl/design/type-inference.md`, "`let`
+        // binders and scope exit"). Elimination rewrites `def`, so a type
+        // embedding it is rebuilt from the eliminated definition: the recorded
+        // type carries the term as it stood before this pass, and the post-pass
+        // check reconstructs the node from the tree it is handed.
+        // `elim_lambda_kinded`'s `Let` arm closes the same way; this is that
+        // rule where no lambda encloses the binding.
+        //
+        // A binding whose body type does not name the binder keeps the recorded
+        // type verbatim, so elimination changes a node's type only where the
+        // term it quotes changed.
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let def = elim_lambdas(ctx, *bound_expr)?;
+            let new_body = elim_lambdas(ctx, *body)?;
+            let ty = if crate::ccl::subst::type_free_vars(&new_body.ty).contains(&binding.name) {
+                #[cfg(debug_assertions)]
+                {
+                    reclosed_let_ty = true;
+                }
+                // `clone_preserving_ids` splices the *eliminated* definition into
+                // the node's type, so this type quotes a term that a
+                // structurally-equal predicate elsewhere on the tree — one riding
+                // a node the pass reached by another route — need not quote. That
+                // is the sharing split `tests/predicate_sharing.rs` guards
+                // against, and the discharge has to quote the eliminated term:
+                // the post-pass check reconstructs this node from the tree it is
+                // handed, which holds only that one. Whether the two ever diverge
+                // in practice is open.
+                crate::ccl::subst::Subst::discharge(
+                    binding.name.clone(),
+                    def.clone_preserving_ids(),
+                )
+                .apply_type(&new_body.ty)
+            } else {
+                ty
+            };
+            let mut expr = Expr::new(TypedExprNode::Let {
+                binding,
+                bound_expr: Box::new(def),
+                body: Box::new(new_body),
+            })
+            .with_ty(ty);
+            expr.user_annotation = user_annotation;
+            Ok(dbg_typecheck_mv(expr))
+        }
+
+        // Pure structural recursion: Apply, plain Compose, Tuple, Record,
         // List, ExprStmt, Feed, Define, and the atoms (no children to walk).
         node => {
             // TODO(preserve): a pure structural recursion rebuilds the same
@@ -1798,7 +1863,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         debug_typecheck(e);
         #[cfg(debug_assertions)]
         assert!(
-            original_ty.without_pi_names() == e.ty.without_pi_names(),
+            reclosed_let_ty || original_ty.without_pi_names() == e.ty.without_pi_names(),
             "{} vs {}",
             original_ty,
             e.ty

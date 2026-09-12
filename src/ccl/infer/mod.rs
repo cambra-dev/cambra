@@ -80,6 +80,7 @@ mod emit;
 mod schemes;
 pub(crate) mod solve;
 pub mod solver;
+mod strip;
 mod typing;
 
 // Public surface (consumed by `crate::ccl::infer`): the entry points, the check
@@ -103,6 +104,7 @@ use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedE
 use context::InferCtx;
 use emit::emit_node;
 use solve::{coalesce_pass, resolve_var_type};
+use solver::smt::SmtError;
 
 // `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
 // refinement binder in every build.
@@ -332,6 +334,29 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         ConstrainError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
             domains: domains.iter().map(coalesce_for_error).collect(),
             origin: ctx_label.to_string(),
+        },
+        // TODO(smt-undecided): every arm below aborts the compiler, which is a
+        // prototype tripwire rather than the policy. The policy this wants is the
+        // one `constrain`'s deficit rule already applies to a predicate the
+        // encoder cannot read — an undecided query is a structural mismatch —
+        // extended to `unknown`, which z3 answers for reasons outside this
+        // encoder's control, and to `SolverError`, which the variant's own doc
+        // calls a misencoding on this side and which
+        // `smt::tests::the_solver_will_error_on_type_errors` reaches from a
+        // well-formed query. A solver that will not start stays a hard failure
+        // under any policy: it is a fact about the machine, not about the program.
+        ConstrainError::SmtError { lhs, rhs, error } => match error.as_ref() {
+            // `constrain` decides an unreadable predicate as a mismatch, so the
+            // variant reaches no caller.
+            SmtError::Encoding { .. } => {
+                unreachable!("an Encoding failure is decided at the deficit rule: {error}")
+            }
+            // Names no types: which comparison raised the query says nothing about
+            // a solver that is not there.
+            SmtError::Process { .. } => panic!("{error}"),
+            SmtError::SolverReportedUnknown | SmtError::SolverError { .. } => {
+                panic!("could not compare {lhs} <: {rhs}: {error}")
+            }
         },
     }
 }
@@ -582,6 +607,14 @@ pub(crate) fn run(
     if !errors.is_empty() {
         return Err(errors);
     }
+
+    // Pass 3: drop the refinements riding type slots *inside* a refinement
+    // predicate. Coalesce discharges the predicate a type carries as that type
+    // crosses a binder; an interior copy of the same claim, one level down in the
+    // predicate's own type slots, restates it and is the copy a discharge can
+    // leave naming a binder it has left. Runs before the scope check below, which
+    // is what reports such a leftover. See `strip`.
+    strip::strip_predicate_interiors(expr);
     #[cfg(debug_assertions)]
     // Scope-validity check (design §6.2): every coalesced node's type is
     // well-formed in the lexical scope at that node — every free term-variable

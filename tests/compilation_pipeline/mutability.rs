@@ -1711,19 +1711,33 @@ fn a_declared_curried_parameter_still_accepts_its_own_type() {
 
 /// The curried chain is genuinely nested, so the annotation's scope holds the
 /// parameters to its left — why `reject_annotation_references` skips this path.
-/// The reference resolves: the diagnostic names the refinement it could not
-/// discharge rather than an unbound variable. A forward reference names a binder
-/// no enclosing scope holds, so it is an ordinary unbound variable and nothing
-/// needs to reject it.
+/// The reference resolves: the call is decided against the refinement with the
+/// parameter to its left discharged (`__elem >= 1`), rather than reported as an
+/// unbound variable. A forward reference names a binder no enclosing scope holds,
+/// so it is an ordinary unbound variable and nothing needs to reject it.
 #[test]
 fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             def f(a: Int, c: {Int where _ >= a}, m: Mut(Int)):
                 m := c
 
             total: Mut(Int) := 0
             f(1, 5, total)
+            total
+        "#},
+        Value::Int(5),
+    );
+    // The same call with the refinement violated. `Int@1` entails neither
+    // `__elem >= 5` structurally nor semantically, and the diagnostic names the
+    // refinement rather than the binder it mentions.
+    check_compile_error(
+        indoc! {r#"
+            def f(a: Int, c: {Int where _ >= a}, m: Mut(Int)):
+                m := c
+
+            total: Mut(Int) := 0
+            f(5, 1, total)
             total
         "#},
         "expected {Int | __elem >= a}",
