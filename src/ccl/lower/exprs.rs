@@ -482,20 +482,26 @@ fn present_key_domain(
     Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
-/// Lower a subscript `target[index]`, or its **checked** form `target[index]?`.
+/// Lower a subscript `target[index]`, the **proven** lookup, or `target[index]?`, the
+/// **checked** one.
 ///
-/// Subscript and application are the *same* operation — evaluate a finite function at a
-/// point (`docs/chl-spec.md`, "3.9 Subscript and attribute access") — so the plain form
-/// lowers to exactly what the application `target(index)` does, and inherits its proof
-/// obligation: the index must be in the collection's domain, which for a `Map` means the
-/// key's type carries that collection's key domain.
+/// Both are keyed accesses rather than applications, differing in how the answer is
+/// presented — the value itself, or `` `some ``/`` `none `` (`src/ccl/design/collections.md`,
+/// "Lookup: membership discharge"). So one shape lowers both: `(collection, key)` tupled
+/// under the operator, whose domain is therefore a pair. It never carries a function value,
+/// and the point-free form is an ordinary morphism from a zip. A keyed write takes the same
+/// shape, so the read and the write of one keyed access compile the same way.
 ///
-/// `[…]` is therefore **only** collection lookup, with no case on the index's shape. A
-/// tuple is a heterogeneous product rather than a finite function, so projecting one is a
-/// different operation and gets a different spelling: `t.0`, alongside `r.name`. Deciding
-/// between them by whether the index happened to be a literal was a guess lowering had no
-/// types to make, and it made `xs[0]` — the commonest thing to write — mean projection and
-/// fail obscurely.
+/// `[…]` is **only** collection lookup, with no case on the index's shape. A tuple is a
+/// heterogeneous product rather than a finite function, so projecting one is a different
+/// operation and gets a different spelling: `t.0`, alongside `r.name`. Deciding between them
+/// by whether the index happened to be a literal was a guess lowering had no types to make,
+/// and it made `xs[0]` — the commonest thing to write — mean projection and fail obscurely.
+///
+/// The call spelling `target(index)` stays an application, and so keeps the obligation that
+/// the index lie in the collection's domain. `docs/chl-spec.md`, "3.9 Subscript and
+/// attribute access" is where the two spellings part company, and says why the proven lookup
+/// does not yet discharge it.
 pub(super) fn lower_subscript(
     target: &Spanned<ChlExpr>,
     index: &Spanned<ChlExpr>,
@@ -505,30 +511,22 @@ pub(super) fn lower_subscript(
 ) -> Result<Expr, LoweringError> {
     let collection = lower_expr(target, ctx)?;
     let key = lower_expr(index, ctx)?;
-    if checked {
-        // `(collection, key) ▷ lookup?` — tupled, so the operator's domain is a pair. It
-        // therefore never carries a function value, and the point-free form is an ordinary
-        // morphism from a zip. A keyed write takes the same shape when it lands, so the
-        // read and the write of one keyed access compile the same way.
-        //
-        // Both minted nodes are recorded: the operator and the pair it is applied to are
-        // machinery this rule introduces, and an unrecorded mint is a lineage leak at the
-        // lowering boundary (`src/ccl/design/provenance.md`, "The recorder"). The `Apply`
-        // root is tagged by the caller.
-        let op = ctx.tag_machinery(
-            Expr::builtin(Builtin::LookupChecked),
-            span,
-            "lower.lookup_checked",
-        );
-        let pair = ctx.tag_machinery(
-            Expr::tuple(vec![collection, key]),
-            span,
-            "lower.lookup_checked.pair",
-        );
-        return Ok(Expr::apply(pair, op));
-    }
-    // Evaluate the finite function at the point.
-    Ok(Expr::apply(key, collection))
+    let builtin = if checked {
+        Builtin::LookupChecked
+    } else {
+        Builtin::LookupProven
+    };
+    // Both minted nodes are recorded: the operator and the pair it is applied to are
+    // machinery this rule introduces, and an unrecorded mint is a lineage leak at the
+    // lowering boundary (`src/ccl/design/provenance.md`, "The recorder"). The `Apply` root
+    // is tagged by the caller.
+    let op = ctx.tag_machinery(Expr::builtin(builtin), span, "lower.lookup");
+    let pair = ctx.tag_machinery(
+        Expr::tuple(vec![collection, key]),
+        span,
+        "lower.lookup.pair",
+    );
+    Ok(Expr::apply(pair, op))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only

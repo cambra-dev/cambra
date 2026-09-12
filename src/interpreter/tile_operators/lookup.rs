@@ -3,7 +3,7 @@ use bit_set::BitSet;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::{
-    ccl::FieldKey,
+    ccl::{FieldKey, LookupForm},
     interpreter::{
         ColumnValue, Consumer, Scheduler, Value, forwarding_consumer, shared_consumer,
         tiling::FunctionGuard, tuple_field,
@@ -13,29 +13,58 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// CheckedLookup / CheckedLookupProducer
+// Lookup / LookupProducer
 // ---------------------------------------------------------------------------
 
-/// The checked lookup `c[k]?` — decide whether `k` is a key of `c`, and answer
-/// `` `some(c(k)) `` or `` `none ``.
+/// A keyed access — decide whether `k` is a key of `c`, and present the answer as the
+/// [`LookupForm`] says.
 ///
 /// **Membership is decided here, not read off an empty tile.** A collection is a total
 /// function on its own domain, so applying it at a key outside that domain is not an
-/// operation the type system offers; what `c[k]?` returns is a tagged sum, and producing
-/// one means deciding the predicate. An empty tile cannot stand in for that decision,
-/// because it means "no rows known here" — which covers a key genuinely absent *and* a
-/// producer that has not converged. Reading `` `none `` off it would make the answer a
-/// function of how far the source had run rather than of the collection's value, so a
-/// lookup on a live source would answer `` `none `` and later `` `some ``.
+/// operation the type system offers; what a lookup returns is a decision, and producing one
+/// means deciding the predicate. An empty tile cannot stand in for that decision, because it
+/// means "no rows known here" — which covers a key genuinely absent and a producer that has
+/// not converged. Reading absence off it would make the answer a function of how far the
+/// source had run rather than of the collection's value, so a lookup on a live source would
+/// answer `` `none `` and later `` `some ``.
 ///
 /// Terminality is therefore the **readiness** condition rather than the answer: until the
 /// domain is decided this operator emits nothing, exactly as any operator awaiting its
 /// input does.
-pub struct CheckedLookup {
-    /// Identity and the answer's tiling, one `` {`none | `some{𝑉}} `` per key.
+pub struct Lookup {
+    /// Identity and the answer's tiling, one answer per key.
     base: OperatorBase,
     /// Where the collection and the keys come from — see [`LookupSource`].
     source: LookupSource,
+    /// Which lookup this is, and so how it presents what the search found.
+    form: LookupForm,
+}
+
+/// The value found at a key, as `form` presents it.
+fn present(form: LookupForm, v: Value) -> Value {
+    match form {
+        LookupForm::Proven => v,
+        LookupForm::Checked => Value::Union {
+            tag: FieldKey::Name(crate::ccl::V_SOME.into()),
+            inner: Box::new(v),
+        },
+    }
+}
+
+/// A **decided** absence, as `form` presents it: the tag, or the fault the proven lookup
+/// owes because its key's membership is not discharged at compile time yet
+/// (`src/ccl/design/collections.md`, "The proven lookup `𝑐[𝑘]`").
+fn absent(form: LookupForm, key: &Value) -> Value {
+    match form {
+        LookupForm::Proven => panic!(
+            "proven lookup `c[k]`: the key {key:?} is not a key of the collection. Write \
+             `c[k]?` to decide presence instead"
+        ),
+        LookupForm::Checked => Value::Union {
+            tag: FieldKey::Name(crate::ccl::V_NONE.into()),
+            inner: Box::new(Value::Unit),
+        },
+    }
 }
 
 /// The two ways a lookup's operands reach this operator.
@@ -56,33 +85,39 @@ enum LookupSource {
     Paired(Box<dyn TileOperator>),
 }
 
-impl CheckedLookup {
+impl Lookup {
     /// Look keys up in `collection`, with both operands as their own sources. The answer
-    /// takes the keys' shape: a scalar for `m[1]?`, a stream wherever the keys are one.
+    /// takes the keys' shape: a scalar for `m[1]`, a stream wherever the keys are one.
     pub fn split(
         collection: Box<dyn TileOperator>,
         keys: Box<dyn TileOperator>,
-        option_extent: Extent,
+        answer_extent: Extent,
+        form: LookupForm,
     ) -> Self {
-        let tiling = answer_tiling(keys.tiling(), option_extent);
+        let tiling = answer_tiling(keys.tiling(), answer_extent);
         Self {
             base: OperatorBase::new(tiling),
             source: LookupSource::Split { collection, keys },
+            form,
         }
     }
 
     /// Look each row's key up in that row's collection, over an assembled stream of
     /// `(collection, key)` pairs. The answer's domain is the stream's own.
-    pub fn paired(pairs: Box<dyn TileOperator>, option_extent: Extent) -> Result<Self, String> {
+    pub fn paired(
+        pairs: Box<dyn TileOperator>,
+        answer_extent: Extent,
+        form: LookupForm,
+    ) -> Result<Self, String> {
         let Tiling::SealedFunction { domain, codomain } = pairs.tiling() else {
             return Err(format!(
-                "`lookup?` over an assembled pair needs a stream of rows, got {}",
+                "a lookup over an assembled pair needs a stream of rows, got {}",
                 pairs.tiling()
             ));
         };
         let Tiling::Record(fields) = codomain.as_ref() else {
             return Err(format!(
-                "`lookup?`'s input rows must be `(collection, key)` pairs, got {codomain}"
+                "a lookup's input rows must be `(collection, key)` pairs, got {codomain}"
             ));
         };
         // Field 0 is the collection. A nested function tiling is one collection shared by
@@ -90,12 +125,12 @@ impl CheckedLookup {
         // collection whose values are themselves collections, which has no answer shape.
         let collection = fields
             .get(&tuple_field(0))
-            .ok_or_else(|| "`lookup?`'s input rows have no collection field".to_string())?;
+            .ok_or_else(|| "a lookup's input rows have no collection field".to_string())?;
         match collection {
             Tiling::SealedFunction { .. } | Tiling::Scalar(Extent::Function { .. }) => {}
             other => {
                 return Err(format!(
-                    "`c[k]?` over a collection whose values are themselves collections is not \
+                    "a lookup over a collection whose values are themselves collections is not \
                      supported yet: the answer would carry a collection as its `some` \
                      payload, and its tiling is {other}"
                 ));
@@ -107,7 +142,7 @@ impl CheckedLookup {
             Some(Tiling::Scalar(_)) => {}
             other => {
                 return Err(format!(
-                    "`lookup?`'s input rows carry one key each, so field 1 tiles as a scalar; \
+                    "a lookup's input rows carry one key each, so field 1 tiles as a scalar; \
                      got {}",
                     other.map_or_else(|| "no field".to_string(), Tiling::to_string)
                 ));
@@ -115,28 +150,29 @@ impl CheckedLookup {
         }
         let tiling = Tiling::SealedFunction {
             domain: domain.clone(),
-            codomain: Box::new(Tiling::Scalar(option_extent)),
+            codomain: Box::new(Tiling::Scalar(answer_extent)),
         };
         Ok(Self {
             base: OperatorBase::new(tiling),
             source: LookupSource::Paired(pairs),
+            form,
         })
     }
 }
 
-/// The answer's tiling for a given key tiling: one option per key, in the keys' own shape.
-fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
+/// The answer's tiling for a given key tiling: one answer per key, in the keys' own shape.
+fn answer_tiling(keys: &Tiling, answer_extent: Extent) -> Tiling {
     match keys {
-        Tiling::Scalar(_) => Tiling::Scalar(option_extent),
+        Tiling::Scalar(_) => Tiling::Scalar(answer_extent),
         Tiling::SealedFunction { domain, .. } => Tiling::SealedFunction {
             domain: domain.clone(),
-            codomain: Box::new(Tiling::Scalar(option_extent)),
+            codomain: Box::new(Tiling::Scalar(answer_extent)),
         },
-        other => panic!("CheckedLookup keys must be a scalar or a stream, got {other}"),
+        other => panic!("Lookup keys must be a scalar or a stream, got {other}"),
     }
 }
 
-impl TileOperator for CheckedLookup {
+impl TileOperator for Lookup {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -181,17 +217,19 @@ impl TileOperator for CheckedLookup {
                 scheduler,
             )),
         };
-        Box::new(CheckedLookupProducer {
-            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &self.base.tiling),
+        Box::new(LookupProducer {
+            base: ProducerBase::new(LookupProducer::alloc_id(), &self.base.tiling),
             source,
+            form: self.form,
             released: false,
         })
     }
 }
 
-struct CheckedLookupProducer {
+struct LookupProducer {
     base: ProducerBase,
     source: ProducerSource,
+    form: LookupForm,
     released: bool,
 }
 
@@ -204,34 +242,18 @@ enum ProducerSource {
     Paired(Box<dyn TileProducer>),
 }
 
-/// `` `some(v) `` — the tag a present key answers with.
-fn some_of(v: Value) -> Value {
-    Value::Union {
-        tag: FieldKey::Name(crate::ccl::V_SOME.into()),
-        inner: Box::new(v),
-    }
-}
-
-/// `` `none `` — the tag a decided absence answers with.
-fn none() -> Value {
-    Value::Union {
-        tag: FieldKey::Name(crate::ccl::V_NONE.into()),
-        inner: Box::new(Value::Unit),
-    }
-}
-
 /// The answer for one key against a **materialized** map value.
 ///
 /// A map value is a binding list, so it carries its own keys: it is complete wherever it is
 /// present, and absence needs no terminality wait. This is how a mutable collection's
 /// mutable variable holds its collection, at one store key.
-fn answer_in_value(key: &Value, m: &Value) -> Value {
+fn answer_in_value(form: LookupForm, key: &Value, m: &Value) -> Value {
     match m {
         Value::Function(bindings) => bindings
             .iter()
             .find(|b| &b.input == key)
-            .map_or_else(none, |b| some_of(b.output.clone())),
-        other => panic!("CheckedLookup: collection is not a map value: {other:?}"),
+            .map_or_else(|| absent(form, key), |b| present(form, b.output.clone())),
+        other => panic!("Lookup: collection is not a map value: {other:?}"),
     }
 }
 
@@ -240,7 +262,7 @@ fn answer_in_value(key: &Value, m: &Value) -> Value {
 /// A **streamed** collection carries its keys in the domain column, so an absent key is only
 /// an answer once that domain is decided. A **materialized** one is a single map value and
 /// answers immediately ([`answer_in_value`]).
-fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
+fn answer_for(form: LookupForm, key: &Value, coll: &Tile) -> Option<Value> {
     match coll {
         Tile::SealedFunction {
             domain, codomain, ..
@@ -251,19 +273,19 @@ fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
                 // `reject_unanswerable_lookup_collection` is what makes this unreachable.
                 let Tile::Scalar(values) = codomain.as_ref() else {
                     panic!(
-                        "CheckedLookup: an answer's `some` payload is one column value, so the \
-                         collection's codomain tiles as a scalar; got {codomain:?}"
+                        "Lookup: an answer's payload is one column value, so the collection's \
+                         codomain tiles as a scalar; got {codomain:?}"
                     )
                 };
-                Some(some_of(values.index_at(i)))
+                Some(present(form, values.index_at(i)))
             }
-            None if coll.is_terminal() => Some(none()),
+            None if coll.is_terminal() => Some(absent(form, key)),
             None => None,
         },
-        Tile::Scalar(col) if !col.is_empty() => Some(answer_in_value(key, &col.index_at(0))),
+        Tile::Scalar(col) if !col.is_empty() => Some(answer_in_value(form, key, &col.index_at(0))),
         // A materialized collection that has not arrived yet.
         Tile::Scalar(_) => None,
-        other => panic!("CheckedLookup: collection is not a collection: {other:?}"),
+        other => panic!("Lookup: collection is not a collection: {other:?}"),
     }
 }
 
@@ -276,13 +298,14 @@ enum RowCollection<'a> {
     PerRow(&'a ColumnValue),
 }
 
-impl CheckedLookupProducer {
+impl LookupProducer {
     /// The rows' answers, paired with the domain positions they were answered at.
     ///
     /// A key the collection has not decided yet contributes no row, so the answer is a
     /// *prefix* of the key stream and grows with it. Keeping the rows aligned means carrying
     /// each answered key's own domain position.
     fn answer_rows(
+        form: LookupForm,
         domain: &ColumnValue,
         keys: &ColumnValue,
         collection: &RowCollection<'_>,
@@ -291,9 +314,9 @@ impl CheckedLookupProducer {
         let mut answers = Vec::with_capacity(domain.len());
         for i in 0..domain.len() {
             let answer = match collection {
-                RowCollection::Shared(tile) => answer_for(&keys.index_at(i), tile),
+                RowCollection::Shared(tile) => answer_for(form, &keys.index_at(i), tile),
                 RowCollection::PerRow(col) => {
-                    Some(answer_in_value(&keys.index_at(i), &col.index_at(i)))
+                    Some(answer_in_value(form, &keys.index_at(i), &col.index_at(i)))
                 }
             };
             if let Some(v) = answer {
@@ -305,7 +328,7 @@ impl CheckedLookupProducer {
     }
 }
 
-impl TileProducer for CheckedLookupProducer {
+impl TileProducer for LookupProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -321,7 +344,7 @@ impl TileProducer for CheckedLookupProducer {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
             Tiling::SealedFunction { codomain, .. } => codomain.extent(),
-            other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
+            other => panic!("Lookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
         if self.released {
@@ -340,8 +363,9 @@ impl TileProducer for CheckedLookupProducer {
                 match key_tile {
                     // No key has arrived yet, so there is nothing to answer.
                     Tile::Scalar(ref keys) if keys.is_empty() => empty_scalar,
-                    // One key: the scalar form `m[k]?`.
-                    Tile::Scalar(ref keys) => match answer_for(&keys.index_at(0), &coll) {
+                    // One key: the scalar form `m[k]`.
+                    Tile::Scalar(ref keys) => match answer_for(self.form, &keys.index_at(0), &coll)
+                    {
                         Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
                         None => empty_scalar,
                     },
@@ -355,16 +379,20 @@ impl TileProducer for CheckedLookupProducer {
                     } => {
                         let Tile::Scalar(key_col) = codomain.as_ref() else {
                             panic!(
-                                "CheckedLookup: a key is one value, so the key stream's codomain \
+                                "Lookup: a key is one value, so the key stream's codomain \
                                  tiles as a scalar; got {codomain:?}"
                             )
                         };
-                        let (kept, answers) =
-                            Self::answer_rows(domain, key_col, &RowCollection::Shared(&coll));
+                        let (kept, answers) = Self::answer_rows(
+                            self.form,
+                            domain,
+                            key_col,
+                            &RowCollection::Shared(&coll),
+                        );
                         self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
                     }
                     other => {
-                        panic!("CheckedLookup keys tile as a scalar or a stream, got {other:?}")
+                        panic!("Lookup keys tile as a scalar or a stream, got {other:?}")
                     }
                 }
             }
@@ -385,22 +413,20 @@ impl TileProducer for CheckedLookupProducer {
                 };
                 // The row shape, on the other hand, `Self::paired` has already checked.
                 let Tile::Record(fields) = codomain.as_ref() else {
-                    panic!(
-                        "CheckedLookup: input rows are `(collection, key)` pairs; got {codomain:?}"
-                    )
+                    panic!("Lookup: input rows are `(collection, key)` pairs; got {codomain:?}")
                 };
                 let (Some(coll_tile), Some(Tile::Scalar(key_col))) =
                     (fields.get(&tuple_field(0)), fields.get(&tuple_field(1)))
                 else {
                     panic!(
-                        "CheckedLookup: input rows carry a collection at .0 and one key at .1; got {codomain:?}"
+                        "Lookup: input rows carry a collection at .0 and one key at .1; got {codomain:?}"
                     )
                 };
                 let collection = match coll_tile {
                     Tile::Scalar(col) => RowCollection::PerRow(col),
                     shared => RowCollection::Shared(shared),
                 };
-                let (kept, answers) = Self::answer_rows(domain, key_col, &collection);
+                let (kept, answers) = Self::answer_rows(self.form, domain, key_col, &collection);
                 self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
             }
         }
@@ -432,7 +458,7 @@ impl TileProducer for CheckedLookupProducer {
     }
 }
 
-impl CheckedLookupProducer {
+impl LookupProducer {
     /// Assemble the answered rows into this producer's own stream tiling.
     ///
     /// `domain` is the input's domain column, which `kept` is a subsequence of.
@@ -448,7 +474,7 @@ impl CheckedLookupProducer {
             domain: dom_ext, ..
         } = self.tiling()
         else {
-            panic!("CheckedLookup answers a stream when its keys are one")
+            panic!("Lookup answers a stream when its keys are one")
         };
         // The answer seals only where it holds a row for every key. A key the collection has
         // not decided is a *missing* row, not a decided absence, so passing the input's own
