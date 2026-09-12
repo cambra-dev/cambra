@@ -777,3 +777,53 @@ fn if_then_else4() {
         Value::Int(3),
     );
 }
+
+// This test fails to typecheck, because the updated value of `pool`
+// does not satisfy its refinement.
+#[test]
+fn transaction1() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ >= 0}, Txn) := 100
+            with begin():
+                pool := -1
+            await_final(pool)
+        "#},
+        "Type mismatch for write to mutable variable `pool`: expected {Int | __elem >= 0}, found Int@-1",
+    );
+}
+
+// This test passes typechecking, only failing during the
+// post-planning check which cannot use SMT to compare refinements
+// semantically.
+//
+// As long as the post-planning check is in place, "post-inference
+// produced an invalid tree" is the success condition for these
+// refinement typechecking tests.
+#[test]
+fn transaction2() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ >= 0}, Txn) := 100
+            with begin():
+                pool := 1
+            await_final(pool)
+        "#},
+        "post-inference produced an invalid tree: [Type mismatch for initializer of mutable `pool`: expected {Int | __elem >= 0}, found Int@100]",
+    );
+}
+
+// This test pins the first problem: mutable variables are not
+// considered in-scope for refinement checks.
+#[test]
+fn transaction3() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ >= 0}, Txn) := 100
+            with begin():
+                pool := pool ^+ 1
+            await_final(pool)
+        "#},
+        "Scope violation (compiler bug, design §6.2): type {Int | __elem == pool ^+ 1} at pool ^+ 1 references out-of-scope binder(s) [\"pool\"]",
+    );
+}
