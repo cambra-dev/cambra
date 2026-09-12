@@ -181,8 +181,18 @@ the two readings `Converse` already had — a key drawn from a collection's own 
 back as itself. And `Lookup` answers a *group of keys per row*, keeping the grouping: one
 answer per key, where its key sits.
 
-A correlated **filter** is the shape still not compiled; it lowers to a predicate that names
-the outer binder at op-conversion ("unrecognised Var").
+A correlated **filter** rides the pair it filters. Planning re-bases its predicate off the
+pair's second component and onto the pair, so the outer value is reached through the
+refinement's own binder rather than through a free reference, and emits it as `filter_values`
+— a term, which is what makes it run (`src/ccl/planning/correlated.rs`). `Filter` reads the
+resulting mask **positionally**, one boolean per entry in entry order, and so serves a
+predicate and an input that are in step. A source delivering its rows one at a time — a
+transaction's — lets the predicate reach entries the input has not, and that is the case it
+refuses rather than masking across the misalignment.
+
+Still not compiled: a correlated filter whose **body reads nothing outer**. Its binder is
+free only in the type, so lambda elimination takes the Pi-const arm and the site never
+becomes a pair at all.
 
 ### Reading a collection held per row
 

@@ -273,6 +273,9 @@ fn test_refiltered_let_bound_comprehension() {
     "c = map([(1, 10), (2, 20)])\nsum([sum([k * r for k -> v in c]) for r in [1, 2]])",
     9
 )]
+// A correlated **filter** beside a correlated body, the filter riding the pair it filters
+// (`src/ccl/planning/correlated.rs`): 1*(2+3) + 2*3.
+#[case::correlated_filter("sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])", 11)]
 // (1+2+3) twice, the inner sum shared.
 #[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
 // The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
