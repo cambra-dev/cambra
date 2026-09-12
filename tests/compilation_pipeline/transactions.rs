@@ -3409,6 +3409,61 @@ fn a_proven_lookup_reads_a_mutable_collection() {
     assert_eq!(snapshot, Value::Int(30));
 }
 
+/// A **product** keys a mutable collection: written at a tuple key, read back at one, and
+/// read at a key the loop computes.
+///
+/// The snapshot read is what the transactional path adds over the immutable cases
+/// (`tests/compilation_pipeline/joins_aggregates_groupby.rs`'s
+/// `a_product_keys_a_collection`): the mutable variable arrives as a projection of the
+/// writer's snapshot tuple, so the key is a per-row product built from the loop binder
+/// rather than a literal.
+#[test]
+fn a_product_keys_a_mutable_collection() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map({Int, Int}, Int), Txn) := box(map([((1, 1), 1), ((2, 2), 2)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m[(9, 9)] := 3
+            final: Map({Int, Int}, Int) = await_final(m)
+            final[(9, 9)]
+        "#},
+        Value::Int(3),
+    );
+    let snapshot = final_mut_var_value(indoc! {r#"
+        m: Mut(Map({Int, Int}, Int), Txn) := box(map([((1, 1), 10), ((2, 2), 20)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                n := n + m[(r, r)]
+        await_final(n)
+    "#});
+    assert_eq!(snapshot, Value::Int(30));
+}
+
+/// A mutable collection whose keys all share a component, seeded with one entry.
+///
+/// A shared component's type is that component's own singleton rather than the join two
+/// distinct values would give, and the seed reaches `box`'s instantiated domain through a
+/// bound chain rather than as a position (`src/ccl/design/type-inference.md`, "An invariant
+/// position reads both sides however the walk reached it"). Keyed data is usually this
+/// shape — every holding for one account, every order for one SKU — so the sibling above
+/// varying both components states less than it appears to.
+#[test]
+fn a_shared_key_component_keys_a_mutable_collection() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map({Int, String}, Int), Txn) := box(map([((1, "BTC"), 5)]))
+            for r in [1, 2]:
+                with begin():
+                    m[(1, "BTC")] := m[(1, "BTC")] + r
+            final: Map({Int, String}, Int) = await_final(m)
+            final[(1, "BTC")]
+        "#},
+        Value::Int(8),
+    );
+}
+
 /// A read-modify-write through the proven lookup: `m[r] := m[r] + 1` over the keys the
 /// mutable collection already holds.
 #[test]

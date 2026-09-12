@@ -686,28 +686,32 @@ fn a_field_read_of_the_parameter_and_of_a_record_in_scope() {
     )
 }
 
-/// A record equality in the *body* is rejected before any refinement question is
-/// reached: no composite satisfies `Equatable`
-/// (`tests/type_check.rs`, `a_composite_satisfies_no_trait`).
+/// A record equality in the *body* is accepted, and the refinement above it is what
+/// the program then fails: `Equatable` reads a product componentwise
+/// (`tests/type_check.rs`, `products_are_equatable_componentwise`), so `t == t` is an
+/// ordinary `Bool`, and a `Bool` carries no singleton for `Bool@true` to match.
+///
+/// A refinement is discharged by matching the predicate rather than by proving it, so
+/// the body being true at every argument does not reach the question.
 #[test]
-fn a_record_equality_in_the_body_has_no_instance() {
+fn a_record_equality_leaves_a_singleton_annotation_undischarged() {
     check_compile_error(
         indoc! {r#"
-            def foo(t: {a:Int, b:Int}) => {Bool where _ == true}:
+            def foo(t: {a:Int, b:Int}) => {Bool where _ == True}:
                 t == t
 
             foo((a=2, b=3))
         "#},
-        "No Equatable instance for BinOp",
+        "Annotation mismatch: annotated as Bool@true, but inferred as Bool",
     )
 }
 
-/// TODO(refined-composite-eq): the same rejection from inside a refinement
-/// *predicate*, where a record equality is the natural way to write "this value"
-/// and the trait table has no row for it. Enabling `==` over an arbitrary type in
-/// a predicate is what flips this.
+/// The same reading from inside a refinement *predicate*, where a record equality is the
+/// natural way to write "this value". The predicate typechecks, and what remains is the
+/// discharge: the body is the parameter itself, which carries no refinement to match
+/// `__elem == t` against.
 #[test]
-fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
+fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
     check_compile_error(
         indoc! {r#"
             def foo(t: {a:Int, b:Int}) => {{a:Int, b:Int} where _ == t}:
@@ -715,7 +719,7 @@ fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
 
             foo((a=1, b=2)).a
         "#},
-        "No Equatable instance for BinOp",
+        "Annotation mismatch: annotated as {{a: Int, b: Int} | __elem == t}, but inferred as {a: Int, b: Int}",
     )
 }
 

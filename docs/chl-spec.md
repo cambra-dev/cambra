@@ -746,6 +746,15 @@ with a guard or as an aggregate.
 Comparing values of incompatible types is a compile-time type error,
 not a runtime error.
 
+**`==` and `!=` compare a product componentwise.** Two tuples or two
+records are equal when they are the same shape and every field is
+equal, which is what makes a product a key type (§3.11) and so a key
+of a `Set` or a `Map` (§6.3). The two operands must be the *same*
+product: a wider one is a different shape, not a comparison over the
+fields they share. The ordering comparators have no product reading —
+`<` needs an order on the components and a record's fields carry none
+— and neither does a collection, whose elements are not fields.
+
 > **Direction [Decided].** Planned membership *expressions*: `e in s` tests set membership, `k in m` tests for a key
 > in a map (2026-06-29 §2).
 > `in` as the iteration keyword (`for x in xs`) is unchanged; the
