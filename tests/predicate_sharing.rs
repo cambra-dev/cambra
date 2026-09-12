@@ -122,7 +122,7 @@ fn assert_no_split(code: &str) {
 ///
 /// A duplicate is currently absorbed rather than observed, because the two copies
 /// of the value's refinement are `eq` and a `RefinementSet` deduplicates them. It
-/// stops being absorbed as soon as they are not — `eq_refinement_predicate`
+/// stops being absorbed as soon as they are not — `eq_term_modulo_ty_slots`
 /// compares a cast's target predicate, so two vintages of one refinement do not
 /// dedup, and the recomputation then disagrees with the recorded type while
 /// printing the same. This asserts the disjointness rather than that surface,
