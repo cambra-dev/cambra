@@ -357,7 +357,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
 }
 
 /// Produce all values for the given extent.
-fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
+pub(crate) fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
     match extent {
         Extent::Base(BaseType::Unit) => ColumnValue::Units(1),
         Extent::UIntRange(remaining) => {

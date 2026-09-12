@@ -151,6 +151,29 @@ A product value is where the materialized form is required. A record or tuple is
 
 The two conversions are asymmetric. Materializing is the [`Materialize`] operator, because collecting a stream needs state. Streaming a table back is a composition — `MapResult` of the table over an iteration of its own domain — which is what op-conversion's `List` arm already builds for a list literal, and what `stream_collection` builds at a projection out of a product. A collection therefore leaves a product streamed, so every consumer downstream of a projection sees the one form it reads.
 
+### A correlated inner comprehension
+
+An inner comprehension whose body reads the **outer** binder runs once per outer row, over its
+own copy of the inner positions. `lambda_elim` writes that as `curry(𝑔)` composed onto the
+outer stream, where `𝑔` takes the pair of the outer value and the inner position — the pair is
+what carries the correlation, and an *uncorrelated* body never forms one, leaving a `const`
+that is computed once and broadcast.
+
+Compiling it is the pairing. [`ProductWithExtent`] gives each outer row a group holding every
+inner position, which is `Tiling::CurriedFunction` — a collection per row — and `𝑔` then
+compiles over that like any other morphism over a stream, its result inheriting the grouping.
+`MapAggregate` consumes it. The inner side is an **extent** rather than a second stream, which
+is what it means for the inner source to be closed: every row iterates the same positions, and
+the type is what names them. A per-row inner collection is the same output shape from a
+different builder ([Reading a collection held per row](#reading-a-collection-held-per-row)).
+
+Two shapes still reach this and are not compiled. A correlated comprehension over a
+**collection** source composes `map_domain` mid-chain, which asserts it takes no input,
+because a collection reached through the pair is applied at the incoming key rather than
+iterated. And a correlated **filter** lowers to a shape whose predicate still names the outer
+binder at op-conversion ("unrecognised Var"). Both are needed before `asset_cart/v1.cambra`
+compiles; a list source in either position works today.
+
 ### Reading a collection held per row
 
 A **column** of materialized collections is the third form, and it is what a transactional

@@ -247,6 +247,25 @@ fn test_refiltered_let_bound_comprehension() {
     );
 }
 
+/// A **correlated** inner comprehension — its body reads the outer binder, so each outer row
+/// gets its own inner pass. `lambda_elim` writes that as `curry(𝑔)` over the outer stream,
+/// where `𝑔` takes the pair of the outer value and the inner position, and op-conversion pairs
+/// them (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
+///
+/// The **uncorrelated** case is beside it because it compiles by a different route and always
+/// did: a body closing over nothing outer leaves a `const`, computed once and broadcast.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::correlated("sum([sum([v * r for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// (1+2+3) twice, the inner sum shared.
+#[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
+// The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
+#[case::outer_binder_outside("sum([r * sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+fn a_correlated_inner_comprehension_runs_per_outer_row(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
 /// The inlined counterpart of the let-bound case above — filtering a filtered comprehension
 /// works when the inner one sits directly in the generator. Pins that the binding, not the
 /// nesting, is what the case above trips over.
@@ -459,6 +478,26 @@ fn a_filtered_comprehension_over_a_map_is_not_reachable(#[case] comprehension: &
     check_scalar(
         &format!("m = map([(1, 10), (2, 20)])\n{comprehension}"),
         Value::Int(20),
+    );
+}
+
+/// A correlated inner comprehension **inside a transaction**, where the outer binder is the
+/// transaction's own row. Nothing about it is transactional: the same pairing serves it as
+/// serves a bare nested comprehension, which is why a list source works here before a
+/// collection source does anywhere.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_comprehension_runs_inside_a_transaction() {
+    check_scalar(
+        indoc! {r"
+            n: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                with begin():
+                    n := n + sum([v * r for v in [1, 2, 3]])
+            await_final(n)
+        "},
+        // 1*(1+2+3) + 2*(1+2+3).
+        Value::Int(18),
     );
 }
 
