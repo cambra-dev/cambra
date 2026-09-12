@@ -771,7 +771,7 @@ fn if_then_else1() {
                     0
             foo(2)
         "#},
-        Value::Int(3)
+        Value::Int(3),
     );
 }
 #[test]
@@ -785,7 +785,7 @@ fn if_then_else2() {
                     x
             foo(2)
         "#},
-        "mismatch"
+        "mismatch",
     );
 }
 #[test]
@@ -799,7 +799,6 @@ fn if_then_else3() {
                     x
             foo(2)
         "#},
-        Value::Int(3)
+        Value::Int(3),
     );
 }
-

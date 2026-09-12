@@ -33,6 +33,7 @@ use std::io;
 
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
+use crate::ccl::infer::solve::resolve_var_type;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, LogicKind, Name, ProjKey, Refinement,
@@ -260,6 +261,63 @@ impl std::fmt::Display for Path {
             write!(f, ".{key}")?;
         }
         Ok(())
+    }
+}
+
+/// Whether a term is an access path: a name under zero or more projections
+/// ([`Path::of`]). What it denotes is whatever its root is bound to, so — unlike
+/// every other shape [`reads`] admits — its own syntax says nothing about the kind
+/// of value it is.
+pub fn is_access_path(e: &TypedExpr) -> bool {
+    Path::of(e).is_some()
+}
+
+/// Whether the encoder reads this term — the shapes [`Encode::expr`] translates,
+/// tested without a solver and without the types a translation would need.
+///
+/// A caller minting a predicate out of program terms asks this first: a predicate
+/// the encoder cannot read decides nothing, and one built into a *type* is carried
+/// by every pass that type reaches. The two walks are one fragment and must agree
+/// on its shape (`a_readable_term_is_what_the_encoder_translates`); this one is
+/// deliberately blind to sorts, which are a property of a query's scope rather
+/// than of the term.
+pub fn reads(e: &TypedExpr) -> bool {
+    match &e.node {
+        TypedExprNode::Lit(Lit::Int(_) | Lit::Bool(_)) => true,
+        // A name, or a field read through one. Any other `Apply` addresses no leaf.
+        TypedExprNode::Var(_) | TypedExprNode::Apply { .. } => Path::of(e).is_some(),
+        TypedExprNode::UnaryOp(_, operand) => reads(operand),
+        TypedExprNode::BinOp { left, op, right } => {
+            reads_op(*op, left, right) && reads(left) && reads(right)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an operator has an encoding at these operands — the operator half of
+/// [`reads`], matching [`Encode::binop`]'s arms.
+fn reads_op(op: BinOpKind, left: &TypedExpr, right: &TypedExpr) -> bool {
+    match op {
+        // A product stays linear when one factor is a constant.
+        BinOpKind::Arithmetic(ArithmeticKind::Mul) => is_int_literal(left) || is_int_literal(right),
+        // SMT-LIB's `div` is Euclidean rather than floor division, and `++` is on
+        // strings, which have no arithmetic here.
+        BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) | BinOpKind::Concat => false,
+        BinOpKind::Arithmetic(_) | BinOpKind::Compare(_) | BinOpKind::BoolLogic(_) => true,
+    }
+}
+
+/// The type at `key` of a product, or `None` when `ty` is not a product carrying
+/// it. A refinement layer states a fact about the product as a whole and addresses
+/// no field, so the walk peels through it.
+fn field_type(ty: &Type, key: &ProjKey) -> Option<Type> {
+    match (ty.peel_refinements(), key) {
+        (Type::Record(fields), ProjKey::Field(name)) => fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, ty)| ty.clone()),
+        (Type::Tuple(elems), ProjKey::Index(i)) => elems.get(*i).cloned(),
+        _ => None,
     }
 }
 
@@ -494,7 +552,7 @@ impl<'a> Encode<'a> {
     fn assume_refinements(&mut self, path: &Path, ty: &Type) {
         let enclosing = self.subject.replace(path.clone());
         for r in ty.refinements() {
-            if let Ok(e) = self.expr(&r.predicate) {
+            if let Ok(e) = self.expr(&r.predicate, Some(Sort::Bool)) {
                 self.assumptions.push(e);
             }
         }
@@ -506,7 +564,7 @@ impl<'a> Encode<'a> {
     fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<SExpr>, SmtError> {
         refs.iter()
             .map(|r| {
-                self.expr(&r.predicate)
+                self.expr(&r.predicate, Some(Sort::Bool))
                     .map_err(|message| SmtError::Encoding {
                         body: r.clone(),
                         message,
@@ -520,6 +578,20 @@ impl<'a> Encode<'a> {
     /// The sort a name is declared at carries the constraint pinning it to the
     /// Cambra type, which [`Sort::declare`] asserts: non-negativity for `UInt`,
     /// non-negativity and the upper bound for `UIntRange`.
+    ///
+    /// An inference variable is resolved for its **shape**, demands included: a
+    /// query raised mid-emission reads slots that are still variables, and without
+    /// this every such leaf leaves the query unasked. A sort is a representation
+    /// choice and not an assumption — it says the leaf is an integer, which the
+    /// edge demanding it is what establishes — so reading a demand here does not
+    /// let an entailment prove itself from what it was asked to show. What may be
+    /// *assumed* about a leaf still comes from the positive reading alone
+    /// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
+    ///
+    /// The resolution runs inside [`with_solver`]'s borrow, so it must raise no
+    /// query of its own: the compact → simplify → coalesce pipeline records no
+    /// constraints, and a path from it back to [`smt_sub`] would panic on the
+    /// re-entrant borrow rather than corrupt the query in flight.
     fn sort(&self, ty: &Type) -> Option<Sort> {
         match ty.peel_refinements() {
             Type::Base(BaseType::Int) => Some(Sort::Int),
@@ -528,13 +600,24 @@ impl<'a> Encode<'a> {
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
             Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
             Type::History { value, .. } => self.sort(value),
+            Type::Infer(_) => match resolve_var_type(ty) {
+                // A variable resolving to itself has nothing further to read.
+                Ok(Type::Infer(_)) | Err(_) => None,
+                Ok(resolved) => self.sort(&resolved),
+            },
             _ => None,
         }
     }
 
     /// A predicate term as an s-expression, or a description of the part with no
     /// encoding. The caller pairs that description with the body it came from.
-    fn expr(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
+    ///
+    /// `expected` is the sort the position gives the term, which is what a leaf
+    /// whose own type settles nothing is declared at
+    /// ([`Encode::leaf`]). An operator's operands share a sort, so the one whose
+    /// type has a sort supplies it for the other — `x <= 5` declares `x` at `Int`
+    /// however little the slot on `x` has resolved to.
+    fn expr(&mut self, e: &TypedExpr, expected: Option<Sort>) -> Result<SExpr, String> {
         match &e.node {
             TypedExprNode::Lit(Lit::Int(n)) => Ok(self.numeral(*n)),
             TypedExprNode::Lit(Lit::Bool(b)) => Ok(if *b {
@@ -546,22 +629,44 @@ impl<'a> Encode<'a> {
             // the root denotes, and the path is what names that leaf. An `Apply`
             // that is not a projection chain addresses no leaf and falls through.
             TypedExprNode::Var(_) | TypedExprNode::Apply { .. } => match Path::of(e) {
-                Some(path) => self.leaf(path, &e.ty),
+                Some(path) => self.leaf(path, &e.ty, expected),
                 None => Err(unencodable(e)),
             },
             TypedExprNode::UnaryOp(op, operand) => {
-                let operand = self.expr(operand)?;
+                let inner = match op {
+                    // Negation preserves its operand's sort; `not` fixes it.
+                    UnaryOpKind::Neg => self.operand_sort(operand, operand).or(expected),
+                    UnaryOpKind::Not => Some(Sort::Bool),
+                };
+                let operand = self.expr(operand, inner)?;
                 Ok(match op {
                     UnaryOpKind::Neg => self.ctx.negate(operand),
                     UnaryOpKind::Not => self.ctx.not(operand),
                 })
             }
             TypedExprNode::BinOp { left, op, right } => {
-                let (l, r) = (self.expr(left)?, self.expr(right)?);
+                let operands = match op {
+                    // Arithmetic is closed over its operands' sort, so the position's
+                    // own expectation reaches them; a comparison's does not — it is
+                    // `Bool` and its operands are not.
+                    BinOpKind::Arithmetic(_) => self.operand_sort(left, right).or(expected.clone()),
+                    BinOpKind::Compare(_) => self.operand_sort(left, right),
+                    BinOpKind::BoolLogic(_) => Some(Sort::Bool),
+                    BinOpKind::Concat => None,
+                };
+                let l = self.expr(left, operands.clone())?;
+                let r = self.expr(right, operands)?;
                 self.binop(*op, left, right, l, r)
             }
             _ => Err(unencodable(e)),
         }
+    }
+
+    /// The sort two operands share, read off whichever of them has one. A
+    /// well-typed operator relates operands of one type, so either answers for
+    /// both.
+    fn operand_sort(&self, left: &TypedExpr, right: &TypedExpr) -> Option<Sort> {
+        self.sort(&left.ty).or_else(|| self.sort(&right.ty))
     }
 
     fn binop(
@@ -637,7 +742,7 @@ impl<'a> Encode<'a> {
     /// back to the slot and assumes nothing, on the same footing as a path nothing
     /// settles: declaring the leaf is what the surrounding predicate needs, and the
     /// assumption is the part that can be dropped.
-    fn leaf(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
+    fn leaf(&mut self, path: Path, ty: &Type, expected: Option<Sort>) -> Result<SExpr, String> {
         let path = self.reroot(path);
         if let Some(e) = self.vars.get(&path) {
             return Ok(*e);
@@ -654,6 +759,7 @@ impl<'a> Encode<'a> {
             None => {
                 let sort = self
                     .sort(ty)
+                    .or(expected)
                     .ok_or_else(|| format!("{path} is typed {ty}, which has no SMT sort"))?;
                 Ok(self.declare(path, sort))
             }
@@ -959,6 +1065,45 @@ mod tests {
             matches!(&err, SmtError::Encoding { message, .. } if message.contains("//")),
             "expected the operator reported: {err:?}"
         );
+    }
+
+    /// [`reads`] and the encoder agree on the fragment: a term either walk admits
+    /// is one the other does too.
+    ///
+    /// Checked by *running* the encoder rather than by restating its arms, since
+    /// restating them is what the two walks already risk drifting on. Each case is
+    /// a predicate `__elem == 𝑡` asked against itself, so the only thing that can
+    /// fail it is `𝑡`.
+    #[test]
+    fn a_readable_term_is_what_the_encoder_translates() {
+        let name = || TypedExpr::var(Name::raw("t")).with_ty(int());
+        let arith = |op| TypedExpr::binop(name(), BinOpKind::Arithmetic(op), lit(2)).with_ty(int());
+        let cases: [TypedExpr; 8] = [
+            lit(5),
+            name(),
+            read(name(), "a"),
+            arith(ArithmeticKind::Add),
+            arith(ArithmeticKind::Mul),
+            arith(ArithmeticKind::FloorDiv),
+            TypedExpr::unary(UnaryOpKind::Neg, name()).with_ty(int()),
+            // An application that is not a projection addresses no leaf.
+            TypedExpr::apply(name(), name()).with_ty(int()),
+        ];
+        for term in cases {
+            let rendered = symbolic(&term);
+            // The field read needs a product to reach, which only a scope supplies.
+            let scope = scoped("t", Type::Record(vec![("a".to_string(), int())]));
+            let refs = [elem_cmp(CompareKind::Equals, term)];
+            let translated = !matches!(
+                smt_sub(&int(), &refs, &refs, &scope),
+                Err(SmtError::Encoding { .. })
+            );
+            assert_eq!(
+                reads(&refs[0].predicate),
+                translated,
+                "`reads` and the encoder disagree on {rendered}"
+            );
+        }
     }
 
     /// An encoding failure sends nothing, so it leaves the thread's solver usable
