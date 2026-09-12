@@ -718,3 +718,47 @@ fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
         "No Equatable instance for BinOp",
     )
 }
+
+#[test]
+fn if_then_else1() {
+    check_scalar(
+        indoc! {r#"
+            def foo(x) => {Int where _ <= 6}:
+                if x <= 5:
+                    x ^+ 1
+                else:
+                    0
+            foo(2)
+        "#},
+        Value::Int(3)
+    );
+}
+#[test]
+fn if_then_else2() {
+    check_compile_error(
+        indoc! {r#"
+            def foo(x) => {Int where _ <= 5}:
+                if x <= 5:
+                    x ^+ 1
+                else:
+                    x
+            foo(2)
+        "#},
+        "mismatch"
+    );
+}
+#[test]
+fn if_then_else3() {
+    check_scalar(
+        indoc! {r#"
+            def foo(x) => {Int where _ <= 6 or _ == x}:
+                if x <= 5:
+                    x ^+ 1
+                else:
+                    x
+            foo(2)
+        "#},
+        Value::Int(3)
+    );
+}
+
