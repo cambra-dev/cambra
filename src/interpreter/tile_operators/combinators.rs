@@ -926,6 +926,226 @@ impl TileProducer for RestrictProducer {
     }
 }
 
+/// A column of **materialized** collection values, read as a collection per row.
+///
+/// A collection reaches an operator in one of two shapes, and the runtime already names
+/// both: a **streamed** one carries its keys in a domain column, and a **materialized** one
+/// is a single map value — `Value::Function`, a binding list carrying its own keys — which
+/// is how a transactional collection's store key holds it ([`CheckedLookup`]). A keyed read
+/// takes either shape; every consumer that iterates a collection reads the streamed one. This
+/// is the adapter between them: `SealedFunction { domain: 𝐷, codomain: Scalar(𝐾 ⇒ 𝑉) }`
+/// becomes `CurriedFunction { domain1: 𝐷, domain2: 𝐾, codomain: 𝑉 }`, each row's bindings
+/// becoming that row's group.
+///
+/// The keys are each row's own, so the groups are **ragged** — two commits of one map need
+/// not carry the same keys, which is what the offsets express and a sealed function cannot
+/// ([`Tiling::CurriedFunction`]).
+///
+/// **A row whose collection is empty contributes no group**, because a curried-function
+/// tile cannot hold one: its offsets are strictly ascending, so every group has at least
+/// one entry (`validate_tile`). A consumer therefore sees that row as absent rather than as
+/// an empty collection, which for an aggregate is the difference between no answer and the
+/// identity.
+pub struct IterateRowCollection {
+    /// Output tiling: `CurriedFunction { domain1: input.domain, domain2: 𝐾, codomain: 𝑉 }`.
+    base: OperatorBase,
+    /// The column of collection values.
+    input: Box<dyn TileOperator>,
+}
+
+impl IterateRowCollection {
+    /// Whether `tiling` is a column of materialized collection values — the one shape this
+    /// operator adapts, and the question a consumer asks before inserting one.
+    pub fn adapts(tiling: &Tiling) -> bool {
+        matches!(
+            tiling,
+            Tiling::SealedFunction { codomain, .. }
+                if matches!(codomain.as_ref(), Tiling::Scalar(Extent::Function { .. }))
+        )
+    }
+
+    /// Create an `IterateRowCollection` over a column of collection values.
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
+        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
+            panic!(
+                "IterateRowCollection expected SealedFunction, got {:?}",
+                input.tiling()
+            )
+        };
+        let Tiling::Scalar(Extent::Function {
+            domain: key,
+            codomain: value,
+        }) = codomain.as_ref()
+        else {
+            panic!(
+                "IterateRowCollection expected a column of collection values, got {:?}",
+                codomain
+            )
+        };
+        let tiling = Tiling::CurriedFunction {
+            domain1: domain.clone(),
+            domain2: (**key).clone(),
+            codomain: (**value).clone(),
+        };
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
+    }
+}
+
+impl TileOperator for IterateRowCollection {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let (key, value) = match self.tiling() {
+            Tiling::CurriedFunction {
+                domain2, codomain, ..
+            } => (domain2.clone(), codomain.clone()),
+            other => {
+                unreachable!("IterateRowCollection tiles as a curried function, got {other:?}")
+            }
+        };
+        Box::new(IterateRowCollectionProducer {
+            base: ProducerBase::new(IterateRowCollectionProducer::alloc_id(), self.tiling()),
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            key,
+            value,
+        })
+    }
+}
+
+/// Producer for [`IterateRowCollection`].
+struct IterateRowCollectionProducer {
+    base: ProducerBase,
+    /// The upstream producer of collection values.
+    input: Box<dyn TileProducer>,
+    /// The key extent, for building each group's domain column.
+    key: Extent,
+    /// The value extent, for building each group's codomain column.
+    value: Extent,
+}
+
+impl TileProducer for IterateRowCollectionProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        let Tile::SealedFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            deleted,
+        } = input_tile
+        else {
+            panic!("IterateRowCollection expected a SealedFunction tile, got {input_tile:?}")
+        };
+        let Tile::Scalar(values) = *codomain else {
+            panic!("IterateRowCollection expected a scalar codomain column")
+        };
+        // One group per row whose collection has an entry, in row order. A row is kept by
+        // index so `domain1` and the offsets stay parallel after the empty ones drop.
+        let mut kept: Vec<usize> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut keys: Vec<Value> = Vec::new();
+        let mut outputs: Vec<Value> = Vec::new();
+        for row in 0..values.len() {
+            let Value::Function(bindings) = values.index_at(row) else {
+                panic!("IterateRowCollection: a collection value is a binding list")
+            };
+            if bindings.is_empty() {
+                continue;
+            }
+            kept.push(row);
+            offsets.push(keys.len());
+            for b in bindings {
+                keys.push(b.input);
+                outputs.push(b.output);
+            }
+        }
+        // A curried tile's `deleted` indexes its **flat innermost** entries
+        // ([`Tile::CurriedFunction`]), so a deleted row is a deleted *group*: what is marked
+        // is the run of keys that row opened, not the group's own ordinal. Marking the
+        // ordinal deletes whichever key happens to sit at that flat position, which
+        // [`Tile::retain`] then drops in place of the row.
+        let deleted: BitSet = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| deleted.contains(**row))
+            .flat_map(|(group, _)| {
+                let start = offsets[group];
+                let end = offsets.get(group + 1).copied().unwrap_or(keys.len());
+                start..end
+            })
+            .collect();
+        let group_count = kept.len();
+        let domain1 = domain.select_indices(kept.into_iter(), group_count);
+        // **Every row delivered here is final**, which is what this operator knows and its
+        // input does not. A `domain_predicate` names the region of `domain1` that will see
+        // no new elements, *together with its whole list* — and a materialized map value
+        // carries its own keys, so it is complete wherever it is present ([`CheckedLookup`]). The
+        // input's own region is unioned in rather than replaced: whether further rows
+        // arrive is its claim, not this one's, and without the union an aggregate over a
+        // live store would never reach a terminal answer for the rows it already has.
+        let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain1));
+        let mut tile = Tile::curried_function(
+            domain1,
+            ColumnValue::UInts(offsets),
+            ColumnValue::from_values(keys, &self.key),
+            ColumnValue::from_values(outputs, &self.value),
+            domain_predicate,
+            deleted,
+        );
+        // **What this producer released, it drops here**, because it cannot drop it
+        // upstream: a released key is one binding of a materialized map, and the map is a
+        // single cell the input keeps whole. Rebuilding from that cell would hand the
+        // consumer the binding a second time, which an accumulating consumer adds twice.
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile
+    }
+
+    /// A row releases upstream; a **key within a row** releases nothing.
+    ///
+    /// The output's outer domain is the input's, so a guard on it passes through. Its inner
+    /// domain is the key set of one materialized map, and that map is a single cell of the
+    /// input — nothing upstream holds a binding of it separately, so there is nothing to
+    /// release. The row's own release is what frees it.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        match obsolete_guard {
+            g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
+            g if g.is_empty() => self.input.release(self.input.tiling().empty_guard()),
+            TileGuard::Function(FunctionGuard::Domain(p)) => self
+                .input
+                .release(TileGuard::Function(FunctionGuard::Domain(p))),
+            TileGuard::Function(FunctionGuard::Codomain(_)) => {}
+            // A consumer that has taken a whole row names both halves — the keys it
+            // folded and the row they came from — so the arms are applied in turn and the
+            // row half is the one that reaches the input.
+            TileGuard::Or(arms) => {
+                for arm in arms {
+                    self.release_impl(arm);
+                }
+            }
+            g => todo!("IterateRowCollection cannot honor the release guard {g:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,5 +1610,81 @@ mod tests {
         expected.insert(0);
         expected.insert(1);
         assert_eq!(deleted, expected);
+    }
+
+    /// A deleted input row is a deleted **group**, and a curried tile's `deleted` indexes
+    /// flat innermost entries ([`Tile::CurriedFunction`]), so the row's whole run of keys is
+    /// marked. Marking the group's ordinal instead deletes whichever key sits at that flat
+    /// position, which [`Tile::retain`] drops in place of the row.
+    #[test]
+    fn iterate_row_collection_deletes_a_row_as_its_whole_group() {
+        use crate::interpreter::FuncBinding;
+
+        let coll_extent = Extent::Function {
+            domain: Box::new(Extent::Base(BaseType::String)),
+            codomain: Box::new(Extent::Base(BaseType::Int)),
+        };
+        let map_value = |pairs: &[(&str, i64)]| {
+            Value::Function(
+                pairs
+                    .iter()
+                    .map(|(k, v)| FuncBinding {
+                        input: Value::String((*k).into()),
+                        output: Value::Int(*v),
+                    })
+                    .collect(),
+            )
+        };
+        let in_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(coll_extent.clone())),
+        };
+        let mut deleted = BitSet::new();
+        deleted.insert(0);
+        let tile = Tile::SealedFunction {
+            domain: ColumnValue::from_uints(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
+                vec![
+                    map_value(&[("a", 1), ("b", 2)]),
+                    map_value(&[("c", 3), ("d", 4)]),
+                ],
+                &coll_extent,
+            ))),
+            domain_predicate: Predicate::True,
+            deleted,
+        };
+        let out_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::String),
+            codomain: Extent::Base(BaseType::Int),
+        };
+        let mut producer = IterateRowCollectionProducer {
+            base: ProducerBase::new(IterateRowCollectionProducer::alloc_id(), &out_tiling),
+            input: Box::new(TestTileProducer::new(tile, in_tiling)),
+            key: Extent::Base(BaseType::String),
+            value: Extent::Base(BaseType::Int),
+        };
+        let Tile::CurriedFunction {
+            offsets,
+            domain2,
+            deleted,
+            ..
+        } = producer.get(out_tiling.universal_guard())
+        else {
+            panic!("IterateRowCollection tiles as a curried function")
+        };
+        assert_eq!(
+            offsets,
+            ColumnValue::from_uints(vec![0, 2]),
+            "two groups of two"
+        );
+        assert_eq!(domain2.len(), 4, "four flat entries");
+        let mut expected = BitSet::new();
+        expected.insert(0);
+        expected.insert(1);
+        assert_eq!(
+            deleted, expected,
+            "row 0 opened flat entries 0..2, so both are deleted"
+        );
     }
 }
