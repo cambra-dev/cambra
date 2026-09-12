@@ -417,16 +417,25 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
 /// the induction path classifies it, so a two-tuple binder is refused there and
 /// nowhere else.
 ///
-/// Behind that sits one wall, not the three the entry-iteration work measured.
-/// A compound key `(a, t)` is taken apart now, by the binder or by the program's
-/// own `k.0`
+/// Two things sit behind that, and they are independent. A compound key `(a, t)`
+/// is taken apart now, by the binder or by the program's own `k.0`
 /// ([`crate::compilation_pipeline`]'s `an_entry_binder_takes_a_compound_key_apart`),
 /// and a transactional collection is read as a collection by its **values**,
-/// materialized per commit and opened into a collection per transaction. What
-/// remains is sweeping one by its **entries**: `lambda_elim` curries the
-/// comprehension's body over the transaction's reads, and the curried type does
-/// not carry the Σ binder its domain names — which op-conversion meets as a
-/// `curry` it cannot compile.
+/// materialized per commit and opened into a collection per transaction.
+///
+/// What remains first is the key leaving the binder that scopes it.
+/// `lambda_elim` curries the comprehension body over the transaction's reads and
+/// pairs the key beside the sum that binds it rather than under it, so the
+/// witness is free where the body uses it: a key compared against `r.account`
+/// reports as a join of `Int` and a witness during inference, and one merely
+/// bound reports as a free witness reference on `curry` after `lambda_elim`. One
+/// escape, two phases.
+///
+/// Second, and reachable with no transaction and no correlation, the filter on
+/// the key refines the key domain and that refinement arrives at op-conversion
+/// as a `collection_contains` term needing an input. Binding
+/// `c = map([(1, 10), (2, 20)])` and summing `[q for a -> q in c if a == 1]`
+/// produces it.
 ///
 /// The same run reports the three routes as undeclared, because
 /// [`expect_compile_error`] compiles against a bare context with no host
@@ -435,14 +444,12 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
 /// same fact for `v0.cambra`; [`asset_cart_v1_declares_the_routes_it_serves`] is
 /// the test that reads v1's own declarations.
 ///
-/// Two further blockers sit behind these, unreachable until the front end
-/// clears and so pinned by no needle here. A `Mut(Map(K, V), Txn)` seeded from
-/// `map([…])` is rejected by inference, which meets a compute function and a
-/// data collection at the initializer's position with no ordering between the
-/// two kinds; and `box(map([]))` — what the cart and the prices are seeded with
-/// — panics in post-letrec with unresolved inference variables. Neither is
-/// about the program's shape: both are the seed of a keyed transactional store,
-/// which no gallery program has needed before.
+/// The seeds no longer block. A `Mut(Map(K, V), Txn)` initializer takes
+/// `box(map([…]))` for a seeded store and `empty_map()` for an empty one, which
+/// is what v1 writes; a bare `map([…])` there still meets a compute function and
+/// a data collection with no ordering between the two kinds, and `map([])` is
+/// rejected by the language (`docs/chl-spec.md`, "3.11 List, tuple, record
+/// literals").
 #[test]
 fn asset_cart_v1_currently_blocked_on_entry_iteration() {
     // The needle is the parse of the checkout's drain header. It is deliberately

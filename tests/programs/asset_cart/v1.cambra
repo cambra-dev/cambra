@@ -2,30 +2,41 @@
 # and three routes the embedding page calls instead of three sources and a sink
 # per ticker. `v0.cambra` is the rung below.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Two things stop it, in the order it meets
+# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
 # them. Each is pinned by a runnable test, so the message below is what you will
 # actually see rather than a description of it.
 #
-#   1. A filter in a `for` header.  `for (a, t) -> q in cart if a == r.account:`
-#      ends at the `:` — a comprehension takes `if`, a loop header does not.
-#      Only the checkout's drain needs it, and it could be written another way.
+#   1. The checkout's drain.  `for (a, t) -> q in cart if a == r.account:`
+#      inside `with begin():` binds a pattern over a source whose length is a
+#      runtime fact. `lower_tx_for` takes a name target over a list literal, and
+#      reports the target first; the source restriction sits behind it. A block
+#      denotes one decision over one snapshot, so the loop is expanded into it at
+#      compile time, and a runtime-sized source instead wants a bulk keyed
+#      update — `merge(snapshot, the loop's contribution)` — of which neither
+#      half exists (`src/ccl/design/mutability.md`, "A `for` inside a block (over
+#      a list literal)").
 #      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
 #
-#   2. Sweeping a transactional collection by its **entries**.  The due total
-#      and both view lists bind the key, and that is what is left: the source
-#      types and the value comes back through the proven lookup, but
-#      `lambda_elim` curries the comprehension's body over the transaction's
-#      reads and the curried type does not carry the Σ binder its domain names,
-#      which op-conversion meets as a `curry` it cannot compile.
-#      Pinned: `an_entry_binder_over_a_transactional_map_is_not_reachable`.
+#   2. A key that leaves the binder scoping it.  `due` and both view lists bind
+#      the key of a transactional map and then use it — compared against
+#      `r.account`, or taken apart. `lambda_elim` curries the comprehension body
+#      over the transaction's reads and pairs the key beside the sum that binds
+#      it rather than under it, so the witness is free where it is used.
+#      Inference reports the join of `Int` and a witness; post-lambda-elim
+#      reports a free witness reference on `curry`.
+#
+#   3. The filter on the key.  `if a == r.account` refines the key domain, and
+#      the refinement reaches op-conversion as a `collection_contains` term
+#      needing an input. Neither a transaction nor the correlation is required:
+#      two lines binding `c = map([(1, 10), (2, 20)])` and summing
+#      `[q for a -> q in c if a == 1]` produce it.
 #
 # What does work, and is worth knowing before rewriting anything: writing a key
 # (`cart[(a, t)] := q`) and reading one key are both fine; so is a compound key,
-# taken apart by the binder or by the program's own `k.0`; and so is reading a
-# whole transactional collection by its **values** (`sum([q for q in cart])`),
-# which is the store's map opened into a collection per transaction. It is the
-# key binder that is blocked — which is why `PATCH /cart` is expressible today
-# and the cart view is not.
+# taken apart by the binder or by the program's own `k.0`; so is reading a whole
+# transactional collection by its values (`sum([q for q in cart])`), entry
+# iteration over a map outside a transaction, and a comprehension whose body
+# reads the row of the loop around it.
 #
 # `mod.rs` carries the same list beside the test that pins it.
 
@@ -39,29 +50,31 @@ Balance = {Microcents where  _ > 0}
 Ticker = String
 
 # Two accounts, not one: `map([(k, v)])` with a single entry panics in
-# post-lambda-elim.
-accts: Mut(Map(AccountId, Balance), Txn) := map([
+# post-lambda-elim. `box` seeds the store: a bare `map([…])` at a
+# `Mut(Map(…), Txn)` initializer meets a compute function and a data collection
+# with no ordering between the two kinds.
+accts: Mut(Map(AccountId, Balance), Txn) := box(map([
     (1, 500 * one_dollar),
     (2, 250 * one_dollar),
-])
+]))
 
 # `Txn`, because checkout credits this inside a transaction and an induction
 # `Mut` may not be written inside a `with begin():` block.
-holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := map([
+holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([
     ((1, "BTC"), 2 * one_btc),
     ((2, "ETH"), 5 * one_btc),
-])
+]))
 
 # --- cart ------------------------------------------------------------------
 
 # A pending quantity per (account, ticker), in the asset's base units — the
 # same units `holdings` carries. A checkout drains it; a PATCH sets one line.
-cart: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([]))
+cart: Mut(Map({AccountId, Ticker}, Int), Txn) := empty_map()
 
 # The last price the feed quoted, in Microcents per *whole* unit. Written by
 # the `ticker_updates` loop at the foot of this file, read by checkout inside
 # the transaction that spends the cash, so a quote and a debit share a snapshot.
-prices: Mut(Map(Ticker, Microcents), Txn) := box(map([]))
+prices: Mut(Map(Ticker, Microcents), Txn) := empty_map()
 
 # --- endpoints -------------------------------------------------------------
 
