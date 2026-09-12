@@ -1026,6 +1026,21 @@ fn check_scope_valid_go(
             s.insert(binding.name.clone());
             check_scope_valid_go(body, &s, witnesses, errors);
         }
+        // A mutable variable binds over its body as a `let` does. A read of one types
+        // the reading node with a refinement naming it — `pool ^+ 1` carries
+        // `{Int | __elem == pool ^+ 1}` — so the binder is in scope there. A mention
+        // that reaches the body's own type is rejected at this node by
+        // `InferError::MutableInRefinedType`; one interior to the body is well-scoped.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            check_scope_valid_go(init, scope, witnesses, errors);
+            let mut s = scope.clone();
+            s.insert(binding.name.clone());
+            check_scope_valid_go(body, &s, witnesses, errors);
+        }
         TypedExprNode::Case {
             scrutinee,
             branches,

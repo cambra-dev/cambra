@@ -824,7 +824,7 @@ fn transaction3() {
                 pool := pool ^+ 1
             await_final(pool)
         "#},
-        "Scope violation (compiler bug, design §6.2): type {Int | __elem == pool ^+ 1} at pool ^+ 1 references out-of-scope binder(s) [\"pool\"]",
+        "post-inference produced an invalid tree",
     );
 }
 
