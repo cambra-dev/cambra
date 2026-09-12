@@ -3318,6 +3318,46 @@ fn a_keyed_write_through_a_mut_parameter() {
     );
 }
 
+/// A transactional map seeded **empty** and filled by its writers — the shape a request
+/// handler takes, where no key is known until a request names one.
+///
+/// The seed carries no key or value type of its own; `Mut(Map(String, Int), Txn)` supplies
+/// both ([`cambra::ccl::Builtin::EmptyMap`]). Asserting the entries is what makes this more
+/// than a compile check: each write joins a map that started with nothing, so the writes
+/// alone account for every entry.
+#[test]
+fn an_empty_map_seeds_a_transactional_store() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := empty_map()
+        for k in ["a", "b", "c"]:
+            with begin():
+                m[k] := 1
+        await_final(m)
+    "#});
+    assert_eq!(
+        map_entries(&value),
+        vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 1),
+            ("c".to_string(), 1)
+        ]
+    );
+}
+
+/// Repeated writes to one key on an empty-seeded map, so the last write is what the key
+/// holds. The seed contributes no entry, so the key exists only because a write made it.
+#[test]
+fn an_empty_map_takes_repeated_writes_to_one_key() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := empty_map()
+        for n in [1, 2, 3]:
+            with begin():
+                m["c"] := n
+        await_final(m)
+    "#});
+    assert_eq!(map_entries(&value), vec![("c".to_string(), 3)]);
+}
+
 /// A map value's bindings, key-sorted — a `Value::Function`'s order follows construction,
 /// which is not what a test about *contents* should depend on.
 fn map_entries(v: &Value) -> Vec<(String, i64)> {

@@ -253,6 +253,21 @@ pub(super) fn lower_call(
             let op = ctx.tag_machinery(Expr::builtin(Builtin::Box), func.span, "lower.box");
             Ok(Expr::apply(inner, op))
         }
+        // `empty_map()` — the collection with no entries ([`Builtin::EmptyMap`], which
+        // carries why it is a sum rather than something `box` lifts).
+        //
+        // Both holes are the use site's to fill: `Map(𝐾, 𝑉)` and `Set(𝐾)` are this one
+        // type, the latter at a `unit` codomain, so one term serves both annotations.
+        "empty_map" => {
+            if !args.is_empty() {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "`empty_map` takes no arguments; its key and value types come from \
+                     the annotation on what it seeds",
+                ));
+            }
+            Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
+        }
         "defer" => Ok(Expr::new(TypedExprNode::Defer)),
         name if ctx.sources.contains_key(name) => {
             Ok(Expr::new(TypedExprNode::Source(name.to_string())))

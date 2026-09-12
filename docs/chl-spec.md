@@ -548,8 +548,9 @@ payload's whenever the payload has any, and the tag's when it does not.
 > are superseded: map entries as `[k: v, …]` (`:` is settling on
 > annotation/type duty), as `[k=v, …]` (which read as keyword
 > arguments), and Unicode `[k ↦ v, …]` (CHL is ASCII-only —
-> §1.8). Still **[Open]**: the spelling of an *empty* map under the
-> new scheme. The record-syntax / call-argument interaction is
+> §1.8). An *empty* map is `empty_map()` (§3.11), which the `[k -> v, …]`
+> form has no way to write: with no entry there is no key to read a type
+> off. The record-syntax / call-argument interaction is
 > resolved by the functions-take-one-product-argument direction
 > (§3.8): `f(x=1)` *is* `f` applied to a record — keyword arguments
 > and record arguments are the same thing.
@@ -1077,6 +1078,28 @@ form; the literal parses, and `map([…])` is what reads it as a `Map` (§6.3).
 distinct from it, so it is equally what an "empty record" would denote. Its type
 is the unit type, written `{}` (§6.6). `[]` is the empty list.
 
+**`[]` names no element type**, so the element type comes from whatever demands
+one: an annotation on the binding it seeds (`xs: List(Int) = box([])`), an
+operator that reads an element, or a collection it joins with. Where nothing
+demands one the element type is `unit` — the empty list has no position to read a
+value from, so no program can observe the choice.
+
+The re-keying constructors need a key type and have no elements to take one from,
+so `map([])` and `set([])` are rejected. **`empty_map()` is the empty map and the
+empty set**: it takes no arguments, and its key and value types come from the
+annotation on what it seeds.
+
+```python
+cart: Mut(Map(String, Int), Txn) := empty_map()
+prices: Map(String, Int) = empty_map()
+seen: Set(String) = empty_map()
+```
+
+`Set(K)` is `Map(K, unit)` (§6.3), so one term answers both annotations and the
+codomain is what tells the readings apart. The annotation is the only source for
+the two types — a keyed write constrains the value it writes, not the key type — so
+an `empty_map()` nothing annotates is an error.
+
 > **Direction [Decided].** The literal forms migrate with the
 > delimiter split (§2.4) and the collections model (§6.3), form by
 > form:
@@ -1088,7 +1111,7 @@ is the unit type, written `{}` (§6.6). `[]` is the empty list.
 > | finite map | `[k -> v, …]` — a collection of entry pairs (§2.4); `[ … ]` is the collection delimiter |
 > | `[1, 2, 3]` — list | same spelling, but shared across collection types: the literal can denote an `Array`, `List`, or `Set`, disambiguated by annotation or usage, with `list([…])` / `set([…])` constructors for explicitness (**[Tentative]** — §6.3) |
 > | empty record / unit | `()`, the unit value: with no fields there is nothing to tell a record from a tuple, so an empty record, an empty tuple, and unit coincide (§3.1, §6.6) |
-> | `[]` — empty list | same spelling; the empty-**map** spelling is **[Open]** (§2.4) |
+> | `[]` — empty list | same spelling; the empty **map** is `empty_map()` (§3.11) |
 >
 > `{ … }` itself moves wholesale to the type level (§2.4, §6.1); no
 > term-level literal keeps braces.

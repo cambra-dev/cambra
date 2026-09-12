@@ -273,6 +273,19 @@ pub enum Builtin {
     /// exactly — `box(5)` is `Σ (σ : [5]). σ`, not `Σ (σ : [Int]). σ`. Retaining the
     /// alternatives rather than joining past them is the whole service.
     Box,
+    /// `empty_map : Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉` — the collection with no entries.
+    ///
+    /// The one collection term that **is** a sum rather than entering one through
+    /// [`Box`](Self::Box). `box` pins its candidate to the argument's own type, which a
+    /// value with no entries does not have: a re-keying reads its key domain off the key
+    /// morphism's image, and with nothing to map there is no image
+    /// (`src/ccl/design/collections.md`, "The empty collection has no key morphism"). So
+    /// the term states the sum it is and leaves both parameters to the use site.
+    ///
+    /// A `Map(𝐾, 𝑉)` or `Set(𝐾)` annotation is what supplies them. Nothing else reaches
+    /// them — a keyed write states its obligation on the value, not the key — so an
+    /// unannotated `empty_map()` is an unresolved-variable error.
+    EmptyMap,
     /// `curry : ((A, B) → C) → (A → (B → C))`.
     Curry,
     /// `const : A → (B → A)` — lift a value to a constant function.
@@ -778,6 +791,7 @@ impl Builtin {
         match self {
             Self::Id => "id",
             Self::Box => "box",
+            Self::EmptyMap => "empty_map",
             Self::Curry => "curry",
             Self::Const => "const",
             Self::Zip => "zip",

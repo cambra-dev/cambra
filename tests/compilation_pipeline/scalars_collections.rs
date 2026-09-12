@@ -67,6 +67,183 @@ fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+// ---------------------------------------------------------------------------
+// The empty list literal
+// ---------------------------------------------------------------------------
+
+// `[]` names no element type, so the element type comes from whatever demands one:
+// an annotation on the binding it seeds, or an operator that reads an element. The
+// literal is empty either way — what the cases pin down is that the *type* follows
+// the demand rather than being fixed at the literal.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// An annotation on the binding the literal seeds.
+#[case::annotation(
+    indoc! {r#"
+        xs: List(Int) = box([])
+        sum([x for x in xs]) + 1
+    "#},
+    Value::Int(1)
+)]
+// An operator reading an element. Nothing here names `Int`; `+` does.
+#[case::operator_read(
+    indoc! {r#"
+        xs = []
+        sum([x + 1 for x in xs]) + 2
+    "#},
+    Value::Int(2)
+)]
+// A join with a list that does name one.
+#[case::join_with_a_typed_list(
+    indoc! {r#"
+        xs = []
+        sum([x for x in xs]) + sum([10, 20])
+    "#},
+    Value::Int(30)
+)]
+fn empty_list_takes_its_element_type_from_the_use_site(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+// With nothing demanding an element type the literal still compiles, and the
+// element type is `unit`. The empty list denotes the function with no positions, so
+// no program can read a value out of it, and the choice is `unit` because the type
+// language has no uninhabited type to name "nothing here" with (CHL spec, "6.6 The
+// empty product is unit"). `pin_empty_list_element` makes it, after the constraints
+// are in — which is what leaves the cases above free to name another element type.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_unobserved_empty_list_takes_unit() {
+    check_tile(
+        "[]",
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// A loop over the empty list runs its body zero times, leaving the accumulator at
+// its seed. The iteration binder's type is unobserved in the same way the element
+// type is, and nothing in the program names it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_loop_over_the_empty_list_keeps_its_seed() {
+    check_scalar(
+        indoc! {r#"
+            x := 7
+            for i in []:
+                x += 1
+            x
+        "#},
+        Value::Int(7),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `empty_map()`
+// ---------------------------------------------------------------------------
+
+// `empty_map()` is the collection with no entries, and its key and value types come
+// from the annotation on what it seeds. `Map(K, V)` and `Set(K)` are one type — the
+// latter at a `unit` codomain — so one term answers both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map_annotation("m: Map(String, Int) = empty_map()\nsum([v for v in m])")]
+#[case::int_keys("m: Map(Int, Int) = empty_map()\nsum([v for v in m])")]
+fn an_empty_map_takes_its_types_from_the_annotation(#[case] code: &str) {
+    check_scalar(code, Value::Int(0));
+}
+
+// `Set(K)` is `Map(K, unit)`, so the same term answers it — the annotation decides which
+// reading, and the codomain it pins is what tells them apart.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_empty_map_answers_a_set_annotation() {
+    check_tile(
+        "s: Set(String) = empty_map()\ns",
+        Tile::SealedFunction {
+            domain: ColumnValue::Strings(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// The empty map's columns are born at the annotated key and value types rather than at
+// whatever an entry would have carried — there is no entry. A `Strings` domain is what
+// lets a later `String` write join it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_empty_map_is_a_typed_empty_tile() {
+    check_tile(
+        "m: Map(String, Int) = empty_map()\nm",
+        Tile::SealedFunction {
+            domain: ColumnValue::Strings(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// A checked lookup on the empty map finds nothing. `` `none `` rather than a fault is the
+// whole difference between the two lookup forms, and the empty map is where it is sharpest.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_lookup_on_the_empty_map_is_none() {
+    check_scalar(
+        indoc! {r#"
+            m: Map(String, Int) = empty_map()
+            match m["x"]?:
+                case `some(v):
+                    v
+                case `none:
+                    7
+        "#},
+        Value::Int(7),
+    );
+}
+
+// Nothing else reaches the key and value types, so an unannotated `empty_map()` is
+// rejected. A keyed write does not supply them either: a write states its obligation on
+// the value it writes, not on the collection's key type.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::bare("empty_map()")]
+#[case::let_bound("m = empty_map()\nm")]
+fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
+    check_compile_error(code, "Unresolved inference variable");
+}
+
+// The re-keying constructors do not accept an empty literal: their key domain is
+// the key morphism's image (`src/ccl/design/collections.md`, "The key domain is the
+// key morphism's image"), and with no elements there is no image, so nothing
+// determines the key type. `pin_empty_list_element` does not answer for it — the
+// literal the constructor re-keys is copied into the key domain's predicate, and a
+// pin there would decide for the copy alone.
+//
+// So an empty `Map` has no spelling yet (CHL spec, "3.11 List, tuple, record
+// literals"). The rejection is an inference error rather than a diagnosis of the
+// construct.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map("map([])")]
+#[case::set("set([])")]
+#[case::map_under_an_annotation(indoc! {r#"
+    m: Map(String, Int) = box(map([]))
+    m
+"#})]
+fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
+    check_compile_error(code, "Unresolved inference variable");
+}
+
 // A UDF parameter annotated as an abstract collection is a *consumer* of a whole
 // collection, not a per-element map body. At a concrete call site the UDF inlines and
 // beta-reduces, so the abstract witness resolves to the argument's concrete domain and
