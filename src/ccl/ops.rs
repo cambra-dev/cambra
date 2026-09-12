@@ -90,6 +90,13 @@ pub enum ArithmeticKind {
     AddRefined,
     /// Integer subtraction (`-`).
     Sub,
+    /// Integer subtraction whose result type records the difference (`^-`).
+    ///
+    /// [`AddRefined`](Self::AddRefined)'s counterpart for `-`: the same arithmetic
+    /// as [`Sub`](Self::Sub), stating `SubtractableRefined` instead of
+    /// `Subtractable`, whose one row accepts `Int` operands and refines the result
+    /// by `__elem == a₁ - a₂`.
+    SubRefined,
     /// Integer multiplication (`*`).
     Mul,
     /// Floor division (`//`).
@@ -154,6 +161,7 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::Add) => "+",
             Self::Arithmetic(ArithmeticKind::AddRefined) => "^+",
             Self::Arithmetic(ArithmeticKind::Sub) => "-",
+            Self::Arithmetic(ArithmeticKind::SubRefined) => "^-",
             Self::Arithmetic(ArithmeticKind::Mul) => "*",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "//",
             Self::Concat => "++",
@@ -184,6 +192,7 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::Add) => "add",
             Self::Arithmetic(ArithmeticKind::AddRefined) => "add_refined",
             Self::Arithmetic(ArithmeticKind::Sub) => "sub",
+            Self::Arithmetic(ArithmeticKind::SubRefined) => "sub_refined",
             Self::Arithmetic(ArithmeticKind::Mul) => "mul",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",
             Self::Concat => "concat",

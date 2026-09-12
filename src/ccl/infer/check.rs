@@ -2,6 +2,8 @@
 // Check pass: post-inference structural re-validation
 // ---------------------------------------------------------------------------
 
+use std::rc::Rc;
+
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
 use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
@@ -270,6 +272,20 @@ impl Typing for CheckCtx {
         }
         Ok(())
     }
+
+    fn under_condition<R>(
+        &mut self,
+        _condition: Rc<TypedExpr>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        // Check assumes nothing about the scope — its `require_sub` passes no
+        // environment at all — so it assumes no condition either. A demand that
+        // held only under a guard is one this wall reports, for the reason
+        // [`Typing::under_condition`] gives.
+        f(self)
+    }
+
+    fn retire_conditions(&mut self, _name: &Name) {}
 
     fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         // Check trusts each `Var`/binder node's recorded `Type` rather than
@@ -741,7 +757,7 @@ fn check_predicates(
     ) {
         if let Type::Refinement(base, refinements) = ty {
             for r in refinements {
-                if !visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                if !visited.insert(Rc::as_ptr(&r.predicate)) {
                     continue;
                 }
                 // **The scratch lambda never enters a tree, so it consumes no identity.**

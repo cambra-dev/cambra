@@ -348,6 +348,23 @@ fn refined_add() {
     check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
 }
 
+#[test]
+fn refined_sub() {
+    check_scalar("z: {Int where _ == 9 ^- 3} = 9 ^- 3\n()", Value::Unit)
+}
+
+/// `^-`'s refinement is an equation the solver reads rather than a term the
+/// annotation has to match: `9 ^- 3` entails `_ == 6`, and `_ == 7` is refused.
+#[test]
+fn a_difference_entails_its_value() {
+    check_scalar("z: {Int where _ == 6} = 9 ^- 3\n()", Value::Unit)
+}
+
+#[test]
+fn a_difference_does_not_entail_another_value() {
+    check_compile_error("z: {Int where _ == 7} = 9 ^- 3\n()", "Annotation mismatch")
+}
+
 // ---------------------------------------------------------------------------
 // Semantic entailment of a refinement
 //
@@ -813,8 +830,6 @@ fn transaction2() {
     );
 }
 
-// This test pins the first problem: mutable variables are not
-// considered in-scope for refinement checks.
 #[test]
 fn transaction3() {
     check_compile_error(
@@ -845,4 +860,102 @@ fn transaction4() {
         "#},
         "post-inference produced an invalid tree",
     );
+}
+
+#[test]
+fn transaction5() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ >= 0}, Txn) := 100
+            def foo(x):
+                with begin():
+                    if pool ^- x >= 0:
+                        pool := pool ^- x
+            foo(30)
+            await_final(pool)
+        "#},
+        "post-inference produced an invalid tree",
+    );
+}
+
+#[test]
+fn transaction6() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ >= 0}, Txn) := 100
+            def foo(x):
+                with begin():
+                    if pool ^- x >= -1:
+                        pool := pool ^- x
+            foo(30)
+            await_final(pool)
+        "#},
+        "Type mismatch for write to mutable variable",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conditions: what an arm's guard makes assumable inside it
+//
+// An arm's body runs only where that arm is the first whose guard held, so an
+// obligation raised inside it may assume that predicate. Inference does; the
+// post-inference check does not, re-deriving every obligation from the recorded
+// types alone — so a demand met only under a guard passes inference and is
+// reported at that wall.
+// ---------------------------------------------------------------------------
+
+/// The guard supplies what the argument's own refinement does not: `x ^- 1` says
+/// the value is `x - 1`, and only `x ^- 1 >= 0` makes that non-negative.
+#[test]
+fn a_guard_discharges_a_demand_inside_its_arm() {
+    check_compile_error(
+        indoc! {r#"
+            def needs_nonneg(v: {Int where _ >= 0}):
+                v
+            def foo(x: Int):
+                if x ^- 1 >= 0:
+                    needs_nonneg(x ^- 1)
+                else:
+                    0
+            foo(3)
+        "#},
+        "post-inference produced an invalid tree",
+    )
+}
+
+/// The same call outside any arm. Inference rejects it, which is what says the
+/// case above was decided by the guard and not by the argument's refinement.
+#[test]
+fn the_same_demand_outside_an_arm_is_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            def needs_nonneg(v: {Int where _ >= 0}):
+                v
+            def foo(x: Int):
+                needs_nonneg(x ^- 1)
+            foo(3)
+        "#},
+        "Type mismatch for Apply: expected {Int | __elem >= 0}, \
+         found {Int | __elem == x ^- 1}",
+    )
+}
+
+/// A write retires the conditions that read what it wrote. The first write meets
+/// the guard; the second reads a `pool` the first replaced, so it is rejected —
+/// even though `pool ^- 30 >= 0` would entail `pool ^- 10 >= 0` for the value the
+/// guard tested.
+#[test]
+fn a_write_retires_the_conditions_reading_it() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ >= 0}, Txn) := 100
+            with begin():
+                if pool ^- 30 >= 0:
+                    pool := pool ^- 30
+                    pool := pool ^- 10
+            await_final(pool)
+        "#},
+        "write to mutable variable `pool`: expected {Int | __elem >= 0}, \
+         found {Int | __elem == pool ^- 10}",
+    )
 }

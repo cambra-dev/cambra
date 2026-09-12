@@ -3,9 +3,9 @@
 // ---------------------------------------------------------------------------
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::ccl::ccl_utils::TermMemo;
+use crate::ccl::ccl_utils::{TermMemo, free_names};
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
@@ -59,6 +59,34 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
     }
     fn is_skip_smt(&self) -> bool {
         false
+    }
+}
+
+/// The environment a query raised during emission runs in: the lexical scope,
+/// plus the conditions in force where it is raised.
+///
+/// Two halves because they answer different questions — what a name *is*, and
+/// what was *tested* on the way here — and only the first is a property of the
+/// scope stack. Assembled per query rather than stored, so the borrow of each
+/// half lasts exactly as long as the call.
+struct QueryEnv<'a> {
+    scopes: &'a ScopeStack<Name, Binding>,
+    conditions: &'a [Condition],
+}
+
+impl ScopeEnv for QueryEnv<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.scopes.binder_type(name)
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
+    fn conditions(&self) -> Vec<Rc<TypedExpr>> {
+        self.conditions
+            .iter()
+            .filter(|c| c.live)
+            .map(|c| Rc::clone(&c.term))
+            .collect()
     }
 }
 
@@ -175,6 +203,32 @@ pub(super) struct InferCtx {
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
     telescope: Telescope,
+    /// The conditions in force at the current emission position, innermost last —
+    /// what a query raised here may assume beyond the types of the names it reads
+    /// ([`ScopeEnv::conditions`]).
+    ///
+    /// A stack rather than a set because an arm restores what was in force when it
+    /// ends, and entries are retired in place rather than removed
+    /// ([`Condition::live`]) so that restoring stays a truncation.
+    conditions: Vec<Condition>,
+}
+
+/// One condition in force: a predicate every path to the current position
+/// satisfies.
+///
+/// Pushed by [`Typing::under_condition`] around an arm's body and dropped when
+/// that arm ends. What a condition is *about* is the values its names hold where
+/// it was tested, which is why a write retires it rather than leaving it to be
+/// read against a later value ([`InferCtx::retire_conditions`]).
+struct Condition {
+    /// The predicate assumed.
+    term: Rc<TypedExpr>,
+    /// The names the term reads. A write to one of them retires this condition.
+    names: HashSet<Name>,
+    /// Cleared by a write to one of [`names`](Self::names). A retired condition is
+    /// kept in place so the enclosing arm's restore is still a truncation, and is
+    /// filtered out of every query from then on.
+    live: bool,
 }
 
 impl InferCtx {
@@ -192,6 +246,7 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             telescope: Telescope::empty(),
+            conditions: Vec::new(),
         }
     }
 
@@ -479,8 +534,37 @@ impl Typing for InferCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        constrain_subtype_in(sub, sup, &mut self.cache, &self.scopes)
+        let env = QueryEnv {
+            scopes: &self.scopes,
+            conditions: &self.conditions,
+        };
+        constrain_subtype_in(sub, sup, &mut self.cache, &env)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
+    }
+
+    fn under_condition<R>(
+        &mut self,
+        condition: Rc<TypedExpr>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let depth = self.conditions.len();
+        self.conditions.push(Condition {
+            names: free_names(&condition),
+            term: condition,
+            live: true,
+        });
+        let r = f(self);
+        // A truncation, which is why a retirement clears a flag rather than
+        // removing an entry: an inner arm's restore must not renumber what an
+        // outer one is holding.
+        self.conditions.truncate(depth);
+        r
+    }
+
+    fn retire_conditions(&mut self, name: &Name) {
+        for c in &mut self.conditions {
+            c.live &= !c.names.contains(name);
+        }
     }
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {

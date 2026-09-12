@@ -950,9 +950,10 @@ The query is `∀ __elem. ⋀Γ ∧ ⋀S₁ ⇒ ⋀S₂`, decided by asking Z3 f
 sides are transported into the ambient frame (`Subst::force_refinement`) first, because the
 query compares terms and the two sides' predicates are written in different binder contexts.
 
-`Γ` is [The scope a query runs in](#the-scope-a-query-runs-in): every other free name is
-declared at a sort as well, so it is universally quantified too, and what is assumed about it
-comes from the scope the caller supplies.
+`Γ` is [The scope a query runs in](#the-scope-a-query-runs-in) together with
+[The conditions in force](#the-conditions-in-force): every other free name is declared at a sort as
+well, so it is universally quantified too, and what is assumed about it comes from the environment
+the caller supplies.
 
 The encoding covers linear integer arithmetic over scalars: literals, variables, field
 reads, `+`/`-`, `*` with a literal factor, the comparisons, and the boolean
@@ -1045,7 +1046,8 @@ Two environments implement the lookup, and a third suppresses the query:
   is on the variable's bounds, and unresolved the binder has no sort at all. A generalized
   binder's quantified variables stay uninstantiated; a polytype has no sort, so it is dropped
   rather than assumed wrong.
-- **`NoScope`** is the empty environment, what every caller outside emission supplies:
+- **`NoScope`** is the empty environment, what every caller outside emission supplies, and it
+  carries no condition either:
   `constrain_subtype_under` (the post-inference check resolves no names, so it holds no binder
   types) and `inline`'s discharge check, which runs over a tree whose binders it does not hold.
   An empty scope only weakens what the fallback can prove, so it can reject what emission
@@ -1068,6 +1070,45 @@ a demand cannot let an entailment prove itself. Failing that, the leaf takes the
 little the slot on `x` has resolved to. Without either, a query raised mid-emission over an
 unannotated parameter is unaskable: the parameter's type is settled by its uses, and its uses are
 what the query is about.
+
+##### The conditions in force
+
+A `ScopeEnv` also carries the **conditions** in force where the query was raised: predicates every
+path reaching that point satisfies, each a bare `Bool` term over the names the lookup answers for,
+conjoined into `Γ` alongside what those names' types claim.
+
+The two halves answer different questions and neither subsumes the other. A binder's type says what
+a name *is*; a condition says what was *tested*. `if x > 0` puts no refinement on `x`, and `x`'s type
+states nothing about which arm ran.
+
+Emission supplies one condition per enclosing arm: `synthesize_arm_predicate`'s first-match encoding,
+the arm's own guard conjoined with the negation of every earlier one, which is exactly when the body
+runs. `ArmFacts` disjoins the same predicates into the node's refinement; the two uses are
+independent, since a body that writes to a mutable variable produces no value for a fact to be about
+and its write still has to meet the variable's declared refinement.
+
+```
+pool: Mut({Int where _ >= 0}, Txn) := 100
+with begin():
+    if pool ^- 30 >= 0:
+        pool := pool ^- 30
+```
+
+The write offers `{Int | __elem == pool ^- 30}` and the variable demands `{Int | __elem >= 0}`. The
+condition `pool ^- 30 >= 0` is what closes the gap, and nothing in either type carries it.
+
+**A write retires the conditions that read what it wrote.** A condition is a fact about the values
+its names held where it was tested, so a second `pool := pool ^- 10` after the write above is judged
+with the guard withdrawn — the `pool` it reads is not the one the guard tested. The retirement is
+positional, and so rests on emission visiting a body in evaluation order, which lowering's statement
+chain gives it. The write rule retires after raising its own obligation, which the condition does
+still cover.
+
+**The post-inference check assumes no condition**, as it assumes no binder type: it re-derives every
+obligation from the recorded types alone. So a demand met only under a guard passes inference and is
+reported at that wall. Closing that gap means the accepted node carrying the conditioned fact in its
+own type, the way `let`-closing makes a body's refinement self-contained; until then the guard
+reaches inference and stops there.
 
 ##### The set is the representation, not just the reading
 

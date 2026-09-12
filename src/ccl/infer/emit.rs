@@ -308,6 +308,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     Some(_) => emit_keyed_write(mut_val, &key_ty, &value_ty, &write_label, ctx)?,
                 }
             }
+            // This write's own obligation was raised under the conditions that
+            // reached it, and reads of `name` after it see a different value, so the
+            // conditions testing it retire here rather than before. The cut is
+            // positional and so rests on the walk visiting a body in evaluation
+            // order, which lowering's statement chain gives it.
+            ctx.retire_conditions(name);
             Type::Base(BaseType::Unit)
         }
 
@@ -2167,9 +2173,13 @@ pub(super) fn emit_case<C: Typing>(
             .pattern
             .as_ref()
             .map(|p| (p.binding.name.clone(), p.binding.ty.clone()));
+        // Borrowed, not cloned: a clone copies the guards' nodes, and a copy is a
+        // duplication the provenance fold demands a recording over. The one place
+        // these terms are copied is inside the arm condition's own recording.
+        let prior = &arms.prior;
         let body_ty = match scope_info {
-            Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
-            None => emit_case_branch(b, ctx)?,
+            Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, prior, ctx))?,
+            None => emit_case_branch(b, prior, ctx)?,
         };
         arms.record(b);
         ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
@@ -2194,6 +2204,12 @@ fn reads_a_history(e: &Expr) -> bool {
 /// The recording every term of an arm fact is attributed to: the copies of the
 /// guards and bodies it reads, and the connectives minted around them.
 const ARM_FACTS: provenance::RewriteLabel = "infer.case_arm_facts";
+
+/// The recording the condition an arm's body is emitted under is attributed to.
+/// Separate from [`ARM_FACTS`] because the terms go to different places: a fact is
+/// deposited on the node's type and outlives emission, while a condition is an
+/// antecedent consumed by the queries the body raises and is dropped with the arm.
+const ARM_CONDITION: provenance::RewriteLabel = "infer.case_arm_condition";
 
 /// What each arm establishes about the value a `Case` produces, accumulated across
 /// the branch walk and disjoined into the node's refinement.
@@ -2367,20 +2383,42 @@ impl ArmFacts {
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
 /// body's type. The pattern binding (if any) is already in scope.
-fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, LocatedInferError> {
+///
+/// `prior` is the guards of the arms before this one, which together with this
+/// arm's guard say when the body runs — the condition the body is emitted under.
+fn emit_case_branch<C: Typing>(
+    b: &mut Branch,
+    prior: &[Expr],
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
     let guard_ty = emit_value_read(&mut b.guard, ctx)?;
     // One-way: a guard must *be* a `Bool`, not be exactly `Bool`. A refined boolean
     // is still a boolean, and a refinement drops on the way up.
     ctx.require_sub(&guard_ty, &prim(BaseType::Bool), &|| {
         "Case guard".to_string()
     })?;
+    // The body is reached only where this arm is the first whose guard held, so
+    // that predicate is assumable throughout it — the same first-match encoding
+    // [`ArmFacts`] disjoins, here as an antecedent for the obligations the body
+    // raises rather than as a fact about the value it produces. The two are
+    // independent: a body that writes to a mutable variable produces no value for
+    // `ArmFacts` to state anything about, and its write still has to meet the
+    // variable's declared refinement.
+    let condition = {
+        let _g = provenance::enter(
+            ctx.current_node(),
+            ARM_CONDITION,
+            provenance::Nature::Machinery,
+        );
+        Rc::new(synthesize_arm_predicate(&b.guard, prior))
+    };
     // A **value** operand: the arms join, and rule 2 keeps `Mut` out of every
     // composite, so a mutable variable mention in an arm is a read. Letting the handle
     // through instead makes the join itself `Mut`-typed — `x if c else y` over two
     // mutable variables would denote a handle whose writer the compiler cannot trace, and
     // the position that catches that (`bump(x if c else y)`) reads the argument
     // *node*, not its type, precisely because the type is a value.
-    emit_value_read(&mut b.body, ctx)
+    ctx.under_condition(condition, |ctx| emit_value_read(&mut b.body, ctx))
 }
 
 pub(super) fn emit_variant_ctor<C: Typing>(

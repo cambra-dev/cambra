@@ -129,6 +129,9 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // maps both to the one runtime addition.
 #[case("2 ^+ 3", Value::Int(5))]
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
+// `^-` stands in the same relation to `-`.
+#[case("2 ^- 3", Value::Int(-1))]
+#[case("1 ^- 2 * 3 + 4", Value::Int(-1))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

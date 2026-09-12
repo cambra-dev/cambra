@@ -117,6 +117,16 @@ pub enum Token {
     /// Experimental, and so absent from `docs/chl-spec.md`.
     #[token("^+")]
     CaretPlus,
+    /// Refining subtraction `^-` — subtraction whose result type records the
+    /// difference (`ArithmeticKind::SubRefined`, in `src/ccl/ops.rs`). Two chars, so
+    /// maximal munch takes it over `Caret` then `Minus` where the two are adjacent:
+    /// `a ^-b` is refining subtraction, and the xor against a negation it competes
+    /// with keeps its own spelling as `a ^ -b`. That competitor is ill-typed either
+    /// way — `^` accepts `Bool` and unary `-` produces `Int`.
+    ///
+    /// Experimental, and so absent from `docs/chl-spec.md`.
+    #[token("^-")]
+    CaretMinus,
     #[token("-=")]
     MinusEq,
     /// Lambda body arrow `->`. Also the planned pair / map-entry arrow — `a -> b`
@@ -261,6 +271,7 @@ impl fmt::Display for Token {
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",
             Token::CaretPlus => "^+",
+            Token::CaretMinus => "^-",
             Token::MinusEq => "-=",
             Token::Arrow => "->",
             Token::DoubleArrow => "=>",
@@ -652,7 +663,7 @@ mod tests {
     #[test]
     fn multi_char_operators() {
         assert_eq!(
-            tokens("<< <<= == != <= >= // //= += -= *= ^+"),
+            tokens("<< <<= == != <= >= // //= += -= *= ^+ ^-"),
             vec![
                 Token::LShift,
                 Token::LShiftEq,
@@ -666,6 +677,7 @@ mod tests {
                 Token::MinusEq,
                 Token::StarEq,
                 Token::CaretPlus,
+                Token::CaretMinus,
                 Token::Newline,
             ]
         );
@@ -685,6 +697,32 @@ mod tests {
                 Token::Ident("c".into()),
                 Token::Plus,
                 Token::Ident("d".into()),
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// `^-` and `^` followed by a negation are separated by adjacency alone: maximal
+    /// munch claims `^-` where the two characters touch, and a space between them
+    /// leaves the xor.
+    #[test]
+    fn caret_minus_is_separated_from_caret_then_negation_by_adjacency() {
+        assert_eq!(
+            tokens("a ^-b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::CaretMinus,
+                Token::Ident("b".into()),
+                Token::Newline,
+            ]
+        );
+        assert_eq!(
+            tokens("a ^ -b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::Caret,
+                Token::Minus,
+                Token::Ident("b".into()),
                 Token::Newline,
             ]
         );
