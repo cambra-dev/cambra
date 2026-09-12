@@ -246,7 +246,7 @@ fn name_identity(n: &Name) -> String {
 /// `scope` holds the binders the predicate has introduced, innermost last. A
 /// reference resolving into it becomes a `boundVar` index; anything else is a
 /// reference to a binder *outside* the predicate and keeps its identity. That
-/// split is `eq_refinement_predicate`'s rule — an interior binder compares by
+/// split is `eq_term_modulo_ty_slots`'s rule — an interior binder compares by
 /// position, an exterior one by identity — moved from comparison time to encode
 /// time, which is what lets the model's structural `Predicate` equality mean the same
 /// relation. Innermost-first lookup mirrors the `rposition` that makes shadowing
@@ -267,7 +267,7 @@ fn pred_json(e: &TypedExpr, scope: &mut Vec<Name>) -> Option<String> {
             None => format!(r#"{{"k":"var","x":"{}"}}"#, name_identity(n)),
         }),
         // A cast's target contributes only its domain's refinement *predicates*
-        // (`cast_target_refinement`), which is all `eq_refinement_predicate`
+        // (`cast_target_refinement`), which is all `eq_term_modulo_ty_slots`
         // reads of it — the target's base types are skipped there and absent
         // from the model. The set is emitted in a canonical order because
         // `Predicate`'s structural equality compares the list positionally while the

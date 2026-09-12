@@ -81,7 +81,7 @@ concrete fragment is the closed one.
 
 `Ty.lean` states the rest where it defines it: `Ty.WellFormed`'s invariants, why the refinement set
 is a list whose order is proved unobservable, and the `Predicate` vocabulary — including the two
-type-blind exceptions `eq_refinement_predicate` makes, α-invariance and a `Cast`'s target, which the
+type-blind exceptions `eq_term_modulo_ty_slots` makes, α-invariance and a `Cast`'s target, which the
 wire encoder discharges rather than Lean (`pred_json`, `tests/differential_oracle.rs`).
 
 ## The declarative subtype relation
@@ -344,7 +344,7 @@ applied by the *encoder*, so no comparison is made against a slot the model does
 - **Open variant arm sets**, which `Ty` has no node for.
 - **A refinement predicate node outside the modeled vocabulary.** Every `Predicate` constructor is
   exercised: `gen_pred` emits each one and `pred_json` encodes it, `lam`, `boundVar`, and `cast`
-  included, so both of `eq_refinement_predicate`'s type-blind exceptions reach the comparison. What
+  included, so both of `eq_term_modulo_ty_slots`'s type-blind exceptions reach the comparison. What
   no case reaches is a `TypedExpr` node the vocabulary has no constructor for — a predicate built
   from a `Let` or an aggregate. `pred_json` answers `None` there and the harness panics, so this gap
   is in the generator and is loud rather than silent.

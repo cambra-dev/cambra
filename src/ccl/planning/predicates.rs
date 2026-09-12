@@ -62,7 +62,7 @@ use crate::ccl::RefinementSet;
 ///
 /// Type slots are skipped on purpose: lambda elimination leaves `__pair` only
 /// as a `Fun.name` Pi binder in a type slot, which every equality path ignores
-/// (`eq_refinement_predicate` is type-blind; the structural reconcile strips Pi
+/// (`eq_term_modulo_ty_slots` is type-blind; the structural reconcile strips Pi
 /// names via `without_pi_names`). The invariant this backs is purely about the
 /// compared term. Only reached from a `debug_assert!`, but it must compile in
 /// release too (the macro still type-checks its argument), so it is not gated.
@@ -304,7 +304,7 @@ fn compile_refinements(
             // being a deterministic value function, which requires that lambda
             // elimination's freshly-minted `__pair` (`Uid::fresh()`) never survive
             // into the compared *term*. It legitimately survives as a `Fun.name` Pi
-            // binder in a type slot (which `eq_refinement_predicate` is type-blind
+            // binder in a type slot (which `eq_term_modulo_ty_slots` is type-blind
             // to), so the check is term-only. Assert that load-bearing invariant
             // rather than leaving it argued.
             debug_assert!(

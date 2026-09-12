@@ -574,7 +574,7 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// precondition rather than dropping it.
 ///
 /// Structural entailment first, by the type-blind predicate relation
-/// ([`eq_refinement_predicate`](crate::ccl::eq_refinement_predicate), via `Refinement`'s
+/// ([`eq_term_modulo_ty_slots`](crate::ccl::eq_term_modulo_ty_slots), via `Refinement`'s
 /// `PartialEq`), because the case that must succeed — an argument whose type carries
 /// the very refinement the parameter acquired *from* it — is an equality and the two
 /// copies legitimately differ in inference metadata. A demand the argument entails
