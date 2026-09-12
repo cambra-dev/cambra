@@ -238,6 +238,14 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// ([`crate::ccl::simplify`]'s pairwise rewrite takes the chain's kind there for the same
 /// reason). Every caller has the kind it is building at: an elimination arm has the
 /// lambda's, a rewrite has the chain's.
+///
+/// **The binder is either operand's.** Both are morphisms over the one domain the pair
+/// shares, so either may be the dependent one, and the pair's codomain holds both of
+/// theirs: a binder the second alone names still has a reference in that codomain and so
+/// still has to ride it. Reading only the first leaves an *unnamed* function whose codomain
+/// references a binder, which [`crate::ccl::subst::open_codomain`] rejects at the next line
+/// of the `Apply` arm — the shape a correlated filter beside a correlated body produces.
+/// Where both name one, they name the same one: each is this elimination's own `param`.
 pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
     match (&f.ty, &g.ty) {
         (
@@ -247,10 +255,19 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
                 codomain: b,
                 ..
             },
-            Type::Fun { codomain: c, .. },
+            Type::Fun {
+                name: g_name,
+                codomain: c,
+                ..
+            },
         ) => {
+            debug_assert!(
+                !matches!((name, g_name), (Some(x), Some(y)) if x != y),
+                "a zip's operands are morphisms over one domain, so a binder either names \
+                 is that domain's: {name:?} and {g_name:?}",
+            );
             let codomain = Type::Tuple(vec![*b.clone(), *c.clone()]);
-            match name {
+            match name.as_ref().or(g_name.as_ref()) {
                 Some(n) => Type::pi_kinded(n.clone(), *a.clone(), codomain, fun_kind.clone()),
                 None => Type::Fun {
                     name: None,
@@ -1880,7 +1897,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
 mod tests {
     use super::*;
     use crate::ccl::{
-        ArithmeticKind, BaseType, BinOpKind, CompareKind, Expr, Lit, Type, symbolic::symbolic,
+        ArithmeticKind, BaseType, BinOpKind, CompareKind, Expr, Lit, Name, Refinement,
+        RefinementSet, Type, symbolic::symbolic,
     };
     use test_log::test;
 
@@ -1890,6 +1908,37 @@ mod tests {
 
     fn var(s: &str) -> Expr {
         Expr::var(s)
+    }
+
+    /// A zip whose **second** operand is the dependent one keeps the binder.
+    ///
+    /// The pair's codomain holds both operands' codomains, so a reference the second
+    /// carries is in the pair's codomain too, and an unnamed function whose codomain
+    /// references a binder is what `subst::open_codomain` rejects — the `Apply` arm calls it
+    /// on this very type one line after building it.
+    #[test]
+    fn a_zip_takes_its_binder_from_either_operand() {
+        let int = Type::Base(BaseType::Int);
+        let binder = Name::raw("k");
+        // `f : Int ⇒ Int`, plain; `g : (k: Int) ⇒ {Int | …}`, dependent on its binder.
+        let dependent = Type::pi_kinded(
+            &binder,
+            int.clone(),
+            Type::refined(
+                int.clone(),
+                RefinementSet::one(Refinement::born(Rc::new(
+                    Expr::var(binder.clone()).with_ty(int.clone()),
+                ))),
+            ),
+            FunKind::Compute,
+        );
+        let f = var("f").with_ty(Type::fun(int.clone(), int.clone()));
+        let g = var("g").with_ty(dependent);
+        let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
+        assert!(
+            matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
+            "the pair binds what its second operand names, got {paired}",
+        );
     }
 
     /// Eliminating a lambda preserves its [`FunKind`].
