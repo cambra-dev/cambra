@@ -761,3 +761,19 @@ fn if_then_else3() {
         Value::Int(3),
     );
 }
+#[test]
+fn if_then_else4() {
+    check_scalar(
+        indoc! {r#"
+            def foo(x) => {Int where _ <= 6}:
+                if x <= 5:
+                    x ^+ 1
+                elif x <= 6:
+                    x
+                else:
+                    0
+            foo(2)
+        "#},
+        Value::Int(3),
+    );
+}
