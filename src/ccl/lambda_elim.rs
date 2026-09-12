@@ -434,7 +434,12 @@ fn build_value_case_cform(
     let union = Expr::copair(arms).with_ty(union_ty.clone());
 
     // (union, eₙ) ▷ final_or_default : V
-    let tuple_ty = Type::Tuple(vec![union_ty, result_ty.clone()]);
+    //
+    // The default's own type, not the `Case`'s: an arm's value can sit strictly
+    // below the node's, exactly as an arm's codomain can in [`arm_compose`], and a
+    // tuple claiming what its element does not provide is what the
+    // type-preservation wall reads back.
+    let tuple_ty = Type::Tuple(vec![union_ty, default_body.ty.clone()]);
     let arg = Expr::tuple(vec![union, default_body]).with_ty(tuple_ty);
     Ok(apply_primitive(arg, Builtin::FinalOrDefault, result_ty))
 }

@@ -2723,6 +2723,12 @@ fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
 // Case / if expression tests
 // ---------------------------------------------------------------------------
 
+/// The arms join to one base, and the node carries what the arms establish
+/// between them: the first-match predicate that selects the arm, and the value that
+/// arm produces. A leading `if True:` makes every later arm's predicate `false`,
+/// which is what the chain means. Every arm carrying the manufactured `true` guard
+/// — a two-arm `if True: … else: …`, and every structural `match` — states
+/// nothing at all.
 #[rstest]
 #[case::int(
     r"
@@ -2731,7 +2737,7 @@ if True:
 else:
     0
 ",
-    BaseType::Int
+    "Int"
 )]
 #[case::string(
     r#"
@@ -2740,7 +2746,7 @@ if True:
 else:
     "no"
 "#,
-    BaseType::String
+    "String"
 )]
 #[case::with_let(
     r"
@@ -2750,7 +2756,7 @@ if x > 3:
 else:
     0
 ",
-    BaseType::Int
+    "{Int | 5 > 3 and __elem == 10 or true and not 5 > 3 and __elem == 0}"
 )]
 #[case::elif_chain(
     r"
@@ -2761,10 +2767,11 @@ elif False:
 else:
     3
 ",
-    BaseType::Int
+    "{Int | true and __elem == 1 or false and not true and __elem == 2 or true and not true \
+     and not false and __elem == 3}"
 )]
-fn test_if_else(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+fn test_if_else(#[case] code: &str, #[case] expected: &str) {
+    assert_eq!(infer_program(code).to_string(), expected);
 }
 
 #[rstest]
@@ -3036,19 +3043,27 @@ xs = [1, 2, 3]
     );
 }
 
-/// A `Case`'s type is the **join** of its arms, so a refinement survives exactly
-/// when every arm establishes it. Two arms that are the same literal *are* that
-/// literal; two different ones are only their base.
+/// A `Case`'s type is the **join** of its arms, so a refinement survives the join
+/// exactly when every arm establishes it: two arms that are the same literal *are*
+/// that literal, two different ones are only their base. The arms' disjunction
+/// rides on top of that join and states what one arm alone does not — which arm
+/// ran, and what it produced.
+///
+/// An arm the solver fragment does not read states nothing, so a tuple-valued
+/// conditional carries the join and no disjunction.
 #[rstest]
-#[case::same_literal("c = 1 > 0\n5 if c else 5", int_lit(5))]
-#[case::different_literals("c = 1 > 0\n1 if c else 2", int())]
-#[case::inside_a_tuple("c = 1 > 0\n(1, 2) if c else (3, 4)", Type::Tuple(vec![int(), int()]))]
-#[case::at_depth(
-    "c = 1 > 0\n((1, 2), 3) if c else ((4, 5), 6)",
-    Type::Tuple(vec![Type::Tuple(vec![int(), int()]), int()])
+#[case::same_literal(
+    "c = 1 > 0\n5 if c else 5",
+    "{Int | 1 > 0 and __elem == 5 or true and not 1 > 0 and __elem == 5, __elem == 5}"
 )]
-fn test_case_arms_join(#[case] code: &str, #[case] expected: Type) {
-    assert_eq!(infer_and_check(code), expected);
+#[case::different_literals(
+    "c = 1 > 0\n1 if c else 2",
+    "{Int | 1 > 0 and __elem == 1 or true and not 1 > 0 and __elem == 2}"
+)]
+#[case::inside_a_tuple("c = 1 > 0\n(1, 2) if c else (3, 4)", "(Int, Int)")]
+#[case::at_depth("c = 1 > 0\n((1, 2), 3) if c else ((4, 5), 6)", "((Int, Int), Int)")]
+fn test_case_arms_join(#[case] code: &str, #[case] expected: &str) {
+    assert_eq!(infer_and_check(code).to_string(), expected);
 }
 
 /// Arms whose domains differ, both refinements of the *same* source domain. Two
@@ -4750,7 +4765,10 @@ fn a_conditional_over_parameters_forms_its_sum_at_the_call_not_the_definition() 
 def f(a, b, d):
     b if a else d
 ";
-    // Scalar arms: an ordinary join, no collection involved.
+    // Scalar arms: an ordinary join, no collection involved. Both arms are bare
+    // parameters, which settle nothing about the kind of value the node holds — the
+    // same reason no candidate set exists here — so the node states no arm facts
+    // either (`ArmFacts::proves_scalar`).
     assert_eq!(infer_program(&format!("{f}f(True, 1, 2)")), int());
     // Collection arms: the candidates come from the *arguments*.
     assert_eq!(

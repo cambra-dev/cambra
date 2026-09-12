@@ -3,23 +3,26 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::cast_target_refinement;
+use crate::ccl::ccl_utils::{cast_target_refinement, synthesize_arm_predicate};
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{InferError, LocatedInferError};
-use crate::ccl::provenance::NodeId;
+use crate::ccl::provenance::{self, NodeId};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    AggregateKind, BaseType, Branch, Expr, LookupForm, Name, ProjKey, Refinement, TransactKey,
-    Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
+    AggregateKind, BaseType, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind, LookupForm,
+    Name, ProjKey, Refinement, TransactKey, Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT,
+    WriterSite,
 };
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
+use super::solver::smt::{is_access_path, reads};
 use super::typing::Typing;
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::Trait;
@@ -78,10 +81,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // The recording names the literal's own node, which is the edge
             // `predicate-domain-report` records as missing: nothing used to link
             // a singleton refinement back to the literal the user wrote.
-            let _g = crate::ccl::provenance::enter(
+            let _g = provenance::enter(
                 node_id,
                 "infer.lit_singleton",
-                crate::ccl::provenance::Nature::Machinery,
+                provenance::Nature::Machinery,
             );
             ctx.lit_singleton(lit)
         }
@@ -1542,11 +1545,8 @@ fn feed_contribution<C: Typing>(value_ty: &Type, ctx: &mut C) -> Type {
             // Names the node being typed: the element term's mints hang off it, and the
             // copy of the loop's source sits beside them — the duplication-as-part-of-a-
             // rewrite case `provenance::copy_frame` declines.
-            let _frame = crate::ccl::provenance::enter(
-                node,
-                "infer.feed_position",
-                crate::ccl::provenance::Nature::Machinery,
-            );
+            let _frame =
+                provenance::enter(node, "infer.feed_position", provenance::Nature::Machinery);
             let element = iter.element_at(&position, &domain);
             crate::ccl::subst::Subst::discharge(iter.binder.clone(), element).apply_type(value_ty)
         }
@@ -2226,11 +2226,14 @@ pub(super) fn emit_case<C: Typing>(
     // arms have in common, exactly as a list's element type is the join of its
     // elements. Refinements ride in untouched and the join is what decides which
     // survive: arms depositing different singletons intersect to none (`if c: 1
-    // else: 2` is an `Int`), while a restriction *every* arm establishes is kept
+    // else: 2` joins to `Int`), while a restriction *every* arm establishes is kept
     // (identical filtered comprehensions stay filtered). Relating each arm to a
     // *stripped* sibling instead loses that, and for a collection arm — whose
     // domain rides the contravariant `Fun` domain — it demands `D <: {D | p}`,
     // rejecting two arms that are the same expression.
+    //
+    // What the arms establish *between* them — which one ran, and what it produced
+    // — the join cannot state, and [`ArmFacts`] refines it with their disjunction.
     //
     // Data-collection arms with distinct domains coalesce to a
     // conditional-collection Sigma. (Heterogeneous *scalar* arms remain a hard
@@ -2244,6 +2247,7 @@ pub(super) fn emit_case<C: Typing>(
     // the argument *node*, not its type (mutability.md, "No aliasing: `Mut`
     // values are second-class (downward-only)").
     let result_ty = ctx.fresh();
+    let mut arms = ArmFacts::at(ctx.current_node());
     for b in branches.iter_mut() {
         let scope_info = b
             .pattern
@@ -2253,9 +2257,198 @@ pub(super) fn emit_case<C: Typing>(
             Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
             None => emit_case_branch(b, ctx)?,
         };
+        arms.record(b);
         ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
     }
-    Ok(result_ty)
+    Ok(arms.refine(result_ty))
+}
+
+/// Whether any leaf of `e` reads a history — a mutable variable or a feed.
+///
+/// A history-typed name denotes the whole recurrence rather than a value, and
+/// nothing carries a predicate about it out of the binder: the
+/// mutability-elimination phases rewrite the binder away, and a type mentioning it
+/// outside its scope is the open bound the bound recorder rejects
+/// (`src/ccl/design/type-inference.md`, "The invariant"). An arm reading one
+/// states nothing here.
+fn reads_a_history(e: &Expr) -> bool {
+    let read_here = matches!(&e.node, TypedExprNode::Var(_))
+        && matches!(e.ty.peel_refinements(), Type::History { .. });
+    read_here || e.fold_children(false, |acc, c| acc || reads_a_history(c))
+}
+
+/// The recording every term of an arm fact is attributed to: the copies of the
+/// guards and bodies it reads, and the connectives minted around them.
+const ARM_FACTS: provenance::RewriteLabel = "infer.case_arm_facts";
+
+/// What each arm establishes about the value a `Case` produces, accumulated across
+/// the branch walk and disjoined into the node's refinement.
+///
+/// An arm establishes two things, and a demand on the node needs both to be
+/// discharged: **when** it is taken — its guard holds and every earlier one failed
+/// — and **which value** it then produces. `if x <= 5: x ^+ 1 else: 0` meets
+/// `{Int | __elem <= 6}` from `x <= 5 ∧ __elem == x ^+ 1` on one arm and
+/// `¬(x <= 5) ∧ __elem == 0` on the other, and from neither alone.
+///
+/// The guards state the first of those: arm 𝑖 runs where its own guard holds and
+/// no earlier one did, which is the pipeline's first-match encoding
+/// ([`synthesize_arm_predicate`]) — the same predicate `channelize` and
+/// `lambda_elim` partition a domain with, built here from the guards as written.
+///
+/// Exactly one arm runs, so the node's fact is the arms' **disjunction**. The join
+/// of the arms' types states less: the lattice merges two refinement sets by
+/// intersecting them (`CompactType::merge_refinements`), which for arms
+/// establishing different things is the empty set. Disjoining is what recovers it,
+/// and a demand decomposes back over the disjuncts — `(𝑝₁ ∨ 𝑝₂) ⊨ 𝑞` iff each
+/// `𝑝ᵢ ⊨ 𝑞`.
+///
+/// Minted here, at the node, rather than inside the refinement merge, which
+/// reaches no node to attribute a minted term to and runs over the arms of a list
+/// literal as readily as over these.
+struct ArmFacts {
+    /// The `Case` node whose arms these are. Names the recording every minted
+    /// connective and copied term is attributed to.
+    at: NodeId,
+    /// One predicate per arm walked so far, or `None` once an arm has stated
+    /// nothing. An arm that states nothing is a `true` disjunct, which makes the
+    /// disjunction restrict nothing — so one silent arm drops the node's fact
+    /// rather than weakening it to noise.
+    disjuncts: Option<Vec<Expr>>,
+    /// The guards of the arms walked so far, in order — what
+    /// [`synthesize_arm_predicate`] negates to state that this arm is the first
+    /// whose guard held.
+    prior: Vec<Expr>,
+    /// Whether an arm carried a guard of its own. Lowering gives an `else` arm and
+    /// every arm of a structural `match` the literal `true`.
+    tested: bool,
+    /// Whether an arm has proved the node is a scalar ([`ArmFacts::proves_scalar`]).
+    scalar: bool,
+}
+
+impl ArmFacts {
+    fn at(at: NodeId) -> Self {
+        ArmFacts {
+            at,
+            disjuncts: Some(Vec::new()),
+            prior: Vec::new(),
+            tested: false,
+            scalar: false,
+        }
+    }
+
+    /// Take this arm's fact, and record its guard as one every later arm is
+    /// reached past. A walk that has already given up mints nothing further: a
+    /// term built here is a node with an id and a provenance row, whether or not
+    /// anything reads it.
+    fn record(&mut self, b: &Branch) {
+        let Some(disjuncts) = &mut self.disjuncts else {
+            return;
+        };
+        let _g = provenance::enter(self.at, ARM_FACTS, provenance::Nature::Machinery);
+        self.scalar |= Self::proves_scalar(&b.body);
+        self.tested |= !Self::is_manufactured_true(&b.guard);
+        match Self::arm_fact(&self.prior, b) {
+            Some(fact) => disjuncts.push(fact),
+            None => {
+                self.disjuncts = None;
+                return;
+            }
+        }
+        self.prior.push(b.guard.clone());
+    }
+
+    /// `result_ty` refined by the arms' disjunction, or unchanged where an arm
+    /// stated nothing.
+    fn refine(self, result_ty: Type) -> Type {
+        let _g = provenance::enter(self.at, ARM_FACTS, provenance::Nature::Machinery);
+        // Two arms, a guard of some arm's own, and an arm that settles the node's
+        // kind. A structural `match` selects by tag, which no predicate over the
+        // scope states, so every one of its arms carries the manufactured `true` and
+        // it states nothing here.
+        let stated = self
+            .disjuncts
+            .filter(|ds| ds.len() > 1 && self.tested && self.scalar);
+        match stated.and_then(Self::any_of) {
+            Some(pred) => Type::refined_one(result_ty, Refinement::born(Rc::new(pred))),
+            None => result_ty,
+        }
+    }
+
+    /// Everything one arm establishes, conjoined: the path it is reached by, and
+    /// that the value it produces *is* what its body computes.
+    ///
+    /// Read off the arm's **terms**, never its types. A type is more resolved at
+    /// the post-inference check than at emission — a binder that was a variable
+    /// has acquired its singleton — so a fact read off one is a different fact at
+    /// each wall, while the terms are the same terms and refinement equality is
+    /// type-blind (`eq_refinement_predicate`).
+    ///
+    /// `None` for a guard or a body the solver fragment does not read ([`reads`])
+    /// or that reads a history ([`reads_a_history`]). A fact a query cannot read
+    /// decides nothing and takes down the query it rides in — the encoder stops at
+    /// the first body it cannot translate — so a term outside the fragment is left
+    /// out rather than stated.
+    fn arm_fact(prior: &[Expr], b: &Branch) -> Option<Expr> {
+        let states = |e: &Expr| reads(e) && !reads_a_history(e);
+        if !states(&b.guard) || !states(&b.body) {
+            return None;
+        }
+        Some(Self::connective(
+            synthesize_arm_predicate(&b.guard, prior),
+            LogicKind::And,
+            Self::produces(&b.body),
+        ))
+    }
+
+    /// Whether this arm's body settles that the node is a scalar: a term the
+    /// fragment reads that is not a bare access path.
+    ///
+    /// An operator term or a literal is a scalar by construction. An access path is
+    /// whatever its root is bound to, which at emission is usually still a
+    /// variable, and a refinement on a data function says its *elements* are
+    /// filtered rather than anything about the arm — so a conditional over two
+    /// collection-valued names must state nothing. The arms join, so one that
+    /// settles this settles it for all of them.
+    ///
+    /// Read off the syntax and not the types, for the reason [`ArmFacts::arm_fact`]
+    /// gives: a type is more resolved at the post-inference check than at emission,
+    /// and a gate that answers differently at the two walls records a type the
+    /// check does not reproduce.
+    fn proves_scalar(body: &Expr) -> bool {
+        reads(body) && !is_access_path(body)
+    }
+
+    /// `__elem == body` — the value this arm produces, as a predicate about it.
+    fn produces(body: &Expr) -> Expr {
+        Expr::binop(
+            Expr::var(Name::elem()).with_ty(body.ty.clone()),
+            BinOpKind::Compare(CompareKind::Equals),
+            body.clone(),
+        )
+        .with_ty(prim(BaseType::Bool))
+    }
+
+    /// A boolean connective over predicate terms, built **typed**: a predicate is
+    /// not re-inferred where it is minted by a rule rather than written by a user,
+    /// so an untyped node here strands an unresolved variable at the
+    /// post-inference wall ([`crate::ccl::infer::lit_singleton`]). Every type is
+    /// known — the connective and both operands are `Bool`.
+    fn connective(left: Expr, op: LogicKind, right: Expr) -> Expr {
+        Expr::binop(left, BinOpKind::BoolLogic(op), right).with_ty(prim(BaseType::Bool))
+    }
+
+    /// Whether this guard is the literal `true` lowering manufactures for an
+    /// `else` arm and for a pattern arm (`lower_if`, in `src/ccl/lower/stmts.rs`).
+    fn is_manufactured_true(guard: &Expr) -> bool {
+        matches!(&guard.node, TypedExprNode::Lit(Lit::Bool(true)))
+    }
+
+    /// The arms' disjunction, or `None` when there is no arm to disjoin.
+    fn any_of(disjuncts: Vec<Expr>) -> Option<Expr> {
+        disjuncts
+            .into_iter()
+            .reduce(|acc, d| Self::connective(acc, LogicKind::Or, d))
+    }
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
