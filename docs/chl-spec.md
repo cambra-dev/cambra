@@ -1717,8 +1717,8 @@ collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
 > binder lowered at all before — and the row returns with the type-directed
 > choice.
 >
-> Entry iteration is **partly built**: a `map(…)`/`set(…)` source with a scalar or
-> compound key works; an annotated `Map(K, V)`, a `groupby` result, a list
+> Entry iteration is **partly built**: a `map(…)`/`set(…)` source or an annotated
+> `Map(K, V)`, with a scalar or compound key, works; a `groupby` result, a list
 > literal, a filter, a second generator, and a transactional map's snapshot do
 > not, each for a reason upstream of the binder. Design and the full list:
 > [collections.md, "Entry iteration `for k -> v in m` [Partly implemented]"](../src/ccl/design/collections.md#entry-iteration-for-k---v-in-m-partly-implemented).

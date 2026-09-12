@@ -2080,6 +2080,30 @@ grammar and a Σ's witness is a data function's domain, so every type a type kin
   wherever a type reaches it. Rejecting it instead would reject a generalized definition
   whose source only its uses can supply.
 
+##### A witness is below the bound its kind names
+
+`𝜎 : SubtypesOf(𝐾)` says the domain `𝜎` took is below `𝐾`, so `𝜎 <: 𝐾`, and a
+reference in sub position discharges its demand by promoting to that bound
+(`constrain_go`'s witness arm). The other direction has no rule: `𝐾 <: 𝜎` would claim
+every `𝐾` is a key the collection holds, which is what the kind declines to say. That
+asymmetry is why this is not the `Enumerated` arm's per-candidate invariance with one
+candidate — an enumerated kind names its members, so a demand must hold of each; a bounded
+one names only a ceiling.
+
+**At a position, the witness absorbs the bound.** `𝐾` arriving beside `𝜎` is a consequence
+of `𝜎`'s own kind, not a second shape, so `coalesce_compact_go` drops it and materializes
+the reference — at either polarity. The position a witness reaches is a data function's
+domain or a value read out of one: a data domain is invariant, so there is no direction for
+a join to rise in, and a value's demand is discharged by the promotion above, so keeping the
+witness answers it and more precisely. Counting the two reports an untagged join for a
+position that has an answer, which is what `[k * v for k -> v in m]` over a `Map(𝐾, 𝑉)`
+produces: the multiplication's demand and the domain's witness land together.
+
+Absorption reads the kind off the **scope**, so it holds only where the binder is in scope.
+That is what makes an operator's result carry its argument's binders load-bearing:
+`map_domain`'s result kind is built over its argument's (`OperatorSchemes`), so the witness
+a consumed sum pins reaches the result's own slot instead of standing free at its domain.
+
 ### The domain join needs `box`
 
 A join of two data functions is not the contravariant meet of their domains. The domain of

@@ -289,6 +289,35 @@ fn coalesce_compact_go(
             // lattice happened to store first (`tests/constraint_order_fuzz.rs`).
             None => *seen.iter().min().expect("seen is non-empty"),
         };
+        // **A witness and the type its kind bounds it by are one contribution, not two, and
+        // the witness is the one.** `SubtypesOf(𝐾)` says the domain the witness took is
+        // below `𝐾`, so `𝐾` carries nothing the witness does not — it is a consequence of
+        // the kind, arriving beside the name of the very thing it describes. Counting the
+        // two as separate shapes reports an untagged join for a position that has an
+        // answer, which is what a key drawn from a `Map(𝐾, 𝑉)`'s own domain and then used
+        // as a `𝐾` produces: the use's demand and the domain's witness land together.
+        //
+        // **At either polarity, and that is not a meet/join asymmetry being ignored.** The
+        // position a witness reaches is a data function's domain or a value read out of
+        // one. A data domain is invariant, so there is no direction for a join to rise in;
+        // and a value's demand is discharged by promoting the witness to its bound
+        // (`crate::ccl::infer::solver::constrain`), so keeping the witness answers that
+        // too, and more precisely.
+        //
+        // Only a binder **in scope** can be absorbed against: out of scope the kind is not
+        // readable here, and coalesce runs bottom-up so what binds the position is decided
+        // above it — the reason the escape check is a tree-level pass and not this walk.
+        if let Some(bound) =
+            scope
+                .iter()
+                .find(|b| b.id() == &resolved)
+                .and_then(|b| match b.type_kind() {
+                    crate::ccl::ty::TypeKind::SubtypesOf(k) => Some((*k).clone()),
+                    _ => None,
+                })
+        {
+            atoms.retain(|a| a != &bound);
+        }
         atoms.push(Type::WitnessRef(resolved));
     }
     let mut shapes: Vec<Type> = Vec::new();

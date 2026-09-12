@@ -224,11 +224,12 @@ accordingly gained an [`OperatorSchemes`] entry — `∀δ ε. (δ ⤇ ε) ⇒ (
 *consumer's* collection so a sum satisfies it — where before it was minted only by join
 planning, which stamps its own type.
 
-**What works today**: a `map(…)` or `set(…)` source, with a scalar or compound key, read or
-unread, in comprehension position — including inside a `with begin():` block over a collection
-the block does not own. A compound key is taken apart by the binder (`for (a, t) -> q in cart`)
-or by the program (`k.0`), which are one program below the binder. Pinned in
-`tests/compilation_pipeline/comprehensions.rs`. **Statement position**
+**What works today**: a `map(…)` or `set(…)` source, or an annotated `Map(𝐾, 𝑉)`, with a
+scalar or compound key, read or unread, in comprehension position — including inside a
+`with begin():` block over a collection the block does not own. A compound key is taken apart
+by the binder (`for (a, t) -> q in cart`) or by the program (`k.0`), which are one program
+below the binder. Pinned in `tests/compilation_pipeline/comprehensions.rs`. **Statement
+position**
 (`for k -> v in m:`) lowers through the same binder and then meets the wall a *name* binder
 meets there: a `for` with an accumulator is an induction loop, whose source must be indexed by
 iteration position, and a keyed collection's positions are its keys.
@@ -236,9 +237,6 @@ iteration position, and a keyed collection's positions are its keys.
 **What does not, and why** — each pinned in the same file, and each blocked *upstream of the
 binder*, which lowers identically in all of them:
 
-- **An annotated `Map(𝐾, 𝑉)`**, i.e. a sum. The keys of a sum are the keys of whichever
-  candidate the witness picked, so the key binder lands on the witness and collides with the
-  `𝐾` the annotation names. This is consuming a sum at its witness, open with the sum rules.
 - **A `groupby` result**, which the storefront rollup
   `[k -> agg(g) for k -> g in groupby(c, key)]` needs. A group's codomain depends on its key
   ([`groupby`'s exact type](#groupbys-exact-type)), and re-viewing at the keys carries that
@@ -253,9 +251,12 @@ binder*, which lowers identically in all of them:
   with a name binder fails identically, because the restrict chain planning builds for the
   filter also tries to compile the domain's carried `collection_contains`.
 - **A transactional map's snapshot**, the shape every storefront/demo entry-iteration site
-  takes. A `Mut(…)` never derefs to the collection inside it at a function position; the
-  name-binder case fails on the same program. Reading a transactional collection as a
-  collection is unbuilt; `src/ccl/design/mutability.md` is where that work lands.
+  takes. The entry binder types — `map_domain` takes a consumer's collection, which a `Mut`
+  wrapping one satisfies — and meets `lambda_elim`: the curried body does not carry the Σ
+  binder its domain names, so the witness is free at the pass boundary. The **name**-binder
+  case does not get that far: a `Mut(…)` never derefs to the collection inside it at the
+  comprehension's source annotation. Reading a transactional collection as a collection is
+  unbuilt; `src/ccl/design/mutability.md` is where that work lands.
 
 ## `groupby`'s exact type
 

@@ -4,13 +4,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, HistoryKind, Level,
     Type, UnaryOpKind,
 };
+use crate::ccl::{FieldKey, FunKind};
 
 use super::product;
 
@@ -138,10 +138,12 @@ pub struct OperatorSchemes {
     /// is what pins a key domain's key type from inside that domain's own
     /// refinement.
     collection_contains: PolyScheme,
-    /// `∀δ ε. (δ ⤇ ε) ⇒ (δ ⤇ δ)` — [`Builtin::MapDomain`], a collection's **keys**
-    /// as a collection over the same domain. Inline-built because `δ` occupies three
-    /// positions at once — the argument's domain and both sides of the result — and
-    /// that is the whole content of the operator: it says the keys are the positions.
+    /// `∀δ ε κ. δ <: κ ⊢ (δ ⤇ ε) ⇒ (δ ⤇ κ)` — [`Builtin::MapDomain`], a collection's
+    /// **keys** as a collection over the same domain. Inline-built because the relation
+    /// between the three variables is the whole content of the operator: one domain on
+    /// both sides says the keys are the positions, and a codomain bounded below by it
+    /// says each position carries its own key without making a demand on the value a
+    /// demand on the domain.
     ///
     /// This is the one scheme here whose builtin is *also* minted after inference, by
     /// join planning (`src/ccl/planning/join.rs`), which stamps its own type and never
@@ -187,7 +189,7 @@ impl OperatorSchemes {
             fun(
                 Type::Fun {
                     name: Some(elem.clone()),
-                    fun_kind: crate::ccl::FunKind::Data(None),
+                    fun_kind: FunKind::Data(None),
                     domain: Box::new(delta.clone()),
                     codomain: Box::new(epsilon.clone()),
                 },
@@ -216,26 +218,67 @@ impl OperatorSchemes {
             ),
         );
 
-        // MapDomain: ∀δ ε. (δ ⤇ ε) ⇒ (δ ⤇ δ). The argument is a **data** function and so
-        // is the result: this re-views a collection at the same positions, carrying its
-        // keys where it carried its values, which is a collection and not a capability.
-        // `δ` is shared across all three positions — one variable, not three — because
-        // the keys of a collection are its positions, and a result domain free of the
-        // argument's would let the two drift while the operator's whole claim is that
-        // they cannot.
+        // MapDomain: ∀δ ε κ. δ <: κ ⊢ (δ ⤇ ε) ⇒ (δ ⤇ κ). The argument is a **data**
+        // function and so is the result: this re-views a collection at the same positions,
+        // carrying its keys where it carried its values, which is a collection and not a
+        // capability.
+        //
+        // `δ` is the **domain** on both sides — one variable, not two — because the keys of
+        // a collection are its positions, and a result domain free of the argument's would
+        // let the two drift while the operator's whole claim is that they cannot.
+        //
+        // The result's **codomain** is a third variable bounded below by `δ`, and the
+        // difference is the polarity of the two positions. A data domain is invariant, so a
+        // demand landing on `δ` is a demand that the collection *be indexed by* that type;
+        // a codomain is covariant, so a demand there is a demand on the value read out.
+        // With one variable in both, `[k * v for k -> v in m]` makes the multiplication's
+        // `Int` a claim about the domain, and over a `Map(𝐾, 𝑉)` — whose domain is a
+        // witness — the position then holds a witness and an `Int` at once, which coalesce
+        // reports as an untagged join. Splitting them lets the value's demand be discharged
+        // where it belongs: the witness promotes to the bound its kind names
+        // (`src/ccl/design/type-inference.md`, "Type kind containment").
         let delta_keys = fresh_var(BODY_LEVEL);
         let epsilon_keys = fresh_var(BODY_LEVEL);
+        let kappa_out = fresh_var(BODY_LEVEL);
+        if let Type::Infer(out) = &kappa_out {
+            out.bounds
+                .borrow_mut()
+                .lower_mut()
+                .push(crate::ccl::Bound::conc(delta_keys.clone()));
+        }
+        // A **consumer's** collection in the argument, like `Sum`'s: the kind is data by
+        // construction but polymorphic in the slot, so a plain collection and a
+        // `Map(𝐾, 𝑉)` — a sum over its key domain — satisfy it alike. An annotated map is
+        // the commonest thing entry iteration is written over, and `data_fun` would refuse
+        // it for being a sum rather than for anything about its keys.
+        let argument_kind = FunKind::fresh_data();
+        // **The result is built over the argument**, which is how the binders a consumed
+        // sum pins reach the result's own slot. Without the edge the result is a collection
+        // over a fresh index, and a witness the argument pinned arrives at the result's
+        // domain naming a binder that position does not carry — free, so coalesce meets it
+        // against the key type the kind bounds it by and reports two shapes at one
+        // position. Lowering states the same relation between a comprehension's source and
+        // its result (`crate::ccl::lower`), and for the same reason.
+        let result_kind = FunKind::fresh_data();
+        let FunKind::Var(result_kv) = &result_kind else {
+            unreachable!("fresh_data is a kind variable")
+        };
+        result_kv.contributes_first(argument_kind.clone());
         let map_domain = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                // A **consumer's** collection in the argument, like `Sum`'s: the kind is
-                // data by construction but polymorphic in the slot, so a plain collection
-                // and a `Map(𝐾, 𝑉)` — a sum over its key domain — satisfy it alike. An
-                // annotated map is the commonest thing entry iteration is written over,
-                // and `data_fun` would refuse it for being a sum rather than for anything
-                // about its keys.
-                Type::consumer_fun(delta_keys.clone(), epsilon_keys),
-                Type::data_fun(delta_keys.clone(), delta_keys),
+                Type::Fun {
+                    name: None,
+                    fun_kind: argument_kind,
+                    domain: Box::new(delta_keys.clone()),
+                    codomain: Box::new(epsilon_keys),
+                },
+                Type::Fun {
+                    name: None,
+                    fun_kind: result_kind,
+                    domain: Box::new(delta_keys.clone()),
+                    codomain: Box::new(kappa_out),
+                },
             ),
         );
 

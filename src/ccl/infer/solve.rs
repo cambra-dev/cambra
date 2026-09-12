@@ -1673,11 +1673,11 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // alternatives looks like from a bare position. The use is then left var-laden, and
     // the parameter slot is what downstream reads.
     //
-    // Note the standing gap: nothing stamps such a use from its binder afterwards, so if
-    // this branch ever fires, the use reaches the post-inference wall var-laden and is
-    // reported there. It does
-    // not fire today: no test in the suite reaches it. Whoever makes it reachable owns
-    // giving the use a type at the point of the yield.
+    // The slot answers it afterwards: `refresh_param_references` stamps a reference the
+    // graph left a bare variable with the lambda's coalesced domain, which is where the
+    // binder's own type is materialized. A comprehension over an annotated `Map(K, V)` is
+    // what reaches this — its index binder's domain is the map's witness, and a bare read
+    // of it meets the key type the witness's kind bounds it by.
     //
     // Any *other* coalesce failure here is reported as usual — the narrow condition is
     // what keeps this from swallowing unrelated errors. Note that yielding to the binder
@@ -2517,10 +2517,26 @@ fn refresh_param_references(expr: &mut Expr) {
         return;
     };
     let bound = bound.to_vec();
-    let TypedExprNode::Lambda { param, body } = &expr.node else {
+    let TypedExprNode::Lambda { param, .. } = &expr.node else {
         return;
     };
     let name = param.name.clone();
+    // **A reference the graph answered with nothing takes the binder's type outright.**
+    // The `Var` arm yields to the binder when a use of a lambda parameter collides at a
+    // positive position — which is what a domain read bare does, its candidates being
+    // alternatives only as a domain — and leaves the use var-laden for the slot to answer.
+    // This is the slot answering it: nothing else stamps such a use, and the post-inference
+    // wall reports it otherwise. Only a use with no answer at all, because a use that has
+    // one is deliberately bare of the refinements its binder carries (below).
+    if let Some(domain) = expr.ty.domain() {
+        let TypedExprNode::Lambda { body, .. } = &mut expr.node else {
+            unreachable!("matched a lambda just above")
+        };
+        stamp_unanswered_references(body, &name, &domain);
+    }
+    let TypedExprNode::Lambda { body, .. } = &expr.node else {
+        unreachable!("matched a lambda just above")
+    };
     let mut renames = crate::ccl::subst::Subst::id();
     collect_param_spelling(body, &name, &bound, &mut renames);
     if renames.is_id() {
@@ -2535,6 +2551,29 @@ fn refresh_param_references(expr: &mut Expr) {
         unreachable!("matched a lambda just above")
     };
     retype_body(body, &renames);
+}
+
+/// Give every reference to `name` whose type the graph left a bare variable the binder's
+/// own `ty`.
+///
+/// Stops at a binder of the same name, as [`collect_param_spelling`] does: an inner
+/// occurrence is a different variable.
+fn stamp_unanswered_references(expr: &mut Expr, name: &Name, ty: &Type) {
+    if matches!(&expr.node, TypedExprNode::Var(n) if n == name) && matches!(expr.ty, Type::Infer(_))
+    {
+        expr.ty = ty.clone();
+        return;
+    }
+    let mut shadowed = false;
+    crate::ccl::scope::for_each_scoped_item_mut(expr, &mut |item| match item {
+        crate::ccl::scope::ScopedItemMut::Scope(binders) => {
+            shadowed = binders.contains(name);
+        }
+        crate::ccl::scope::ScopedItemMut::Child(child) if !shadowed => {
+            stamp_unanswered_references(child, name, ty);
+        }
+        _ => {}
+    });
 }
 
 /// Apply `renames` to every type in `expr` and below it.

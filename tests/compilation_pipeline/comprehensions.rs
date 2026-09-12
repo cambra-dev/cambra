@@ -319,6 +319,23 @@ fn an_entry_binder_takes_a_compound_key_apart(#[case] comprehension: &str) {
     );
 }
 
+/// An **annotated `Map(𝐾, 𝑉)`** as the source — a sum over its key domain
+/// (`src/ccl/design/collections.md`, "The six collection types"), which is the
+/// collection type every declared map has. The key binder lands on the witness,
+/// because that is what the keys of a sum are: the keys of whichever candidate it
+/// took. Using one as a `𝐾` is what its kind says it is
+/// (`src/ccl/design/type-inference.md`, "Type kind containment"), so the key reads
+/// and multiplies here exactly as a plain map's does.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_entry_binder_reads_an_annotated_maps_entries() {
+    check_scalar(
+        "m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nsum([k * v for k -> v in m])",
+        // 1*10 + 2*20.
+        Value::Int(50),
+    );
+}
+
 /// A `Set(𝐾)` is `Map(𝐾, unit)`, so its entry is `(𝐾, unit)` and the projection
 /// to the key is lossless — which is the whole reason entry iteration can be
 /// uniform across collection types while `Set` and `Map` remain the one pair the
@@ -394,22 +411,6 @@ fn an_entry_binder_over_a_list_literal_is_not_reachable() {
     check_scalar("sum([v for i -> v in [10, 20, 30]])", Value::Int(60));
 }
 
-/// An **annotated `Map(𝐾, 𝑉)`** as the source — a sum over its key domain
-/// (`src/ccl/design/collections.md`, "The six collection types"). The keys of a
-/// sum are the keys of whichever candidate the witness picked, so the key binder
-/// lands on the witness rather than on `𝐾`, and every use of it collides with
-/// the key type the annotation names. Consuming a sum at its witness is the open
-/// part of the sum rules, not of entry iteration.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "Incompatible")]
-fn an_entry_binder_over_an_annotated_map_is_not_reachable() {
-    check_scalar(
-        "m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nsum([k * v for k -> v in m])",
-        Value::Int(50),
-    );
-}
-
 /// A **`groupby` result** as the source, which is what the storefront rollup
 /// `[k -> agg(g) for k -> g in groupby(c, key)]` needs. A group-by's codomain
 /// *depends* on its key (`src/ccl/design/collections.md`, "`groupby`'s exact
@@ -461,43 +462,52 @@ fn a_filtered_comprehension_over_a_map_is_not_reachable(#[case] comprehension: &
     );
 }
 
-/// A **transactional map's snapshot** as the source — the shape all four of the
-/// storefront/demo entry-iteration sites take. Nothing here is about the binder:
-/// a plain value binder fails on the same program, and an induction `Mut`
-/// outside any block fails the same way too. A `Mut(…)` type never derefs to the
-/// collection inside it at a function position, so the generator's source meets
-/// the wrapper rather than the map. Reading a transactional collection *as* a
-/// collection is the missing piece, and `src/ccl/design/mutability.md` is where
-/// that work lands.
-///
-/// The two binders fail at different messages, and the difference is itself the
-/// point: the value binder meets the `Mut` wrapper at the comprehension's source
-/// annotation, while the entry binder's `map_domain` takes a *consumer's*
-/// collection — which a `Mut` wrapping one satisfies — and so gets one step
-/// further, to the `Σ` witness that
-/// `an_entry_binder_over_an_annotated_map_is_not_reachable` pins on its own.
-/// Two gaps in a row, not one.
+/// A transactional map read through a **value** binder. The comprehension's source
+/// annotation names a data function, and a `Mut(…)` does not deref to the collection
+/// inside it there, so the generator meets the wrapper rather than the map. Reading a
+/// transactional collection *as* a collection is the missing piece, and
+/// `src/ccl/design/mutability.md` is where that work lands.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::entry_binder("sum([v for k -> v in m])", "Incompatible")]
-#[case::value_binder("sum([v for v in m])", "Annotation mismatch")]
-fn an_entry_binder_over_a_transactional_map_is_not_reachable(
-    #[case] comprehension: &str,
-    #[case] expected: &str,
-) {
+fn a_value_binder_over_a_transactional_map_is_not_reachable() {
     check_compile_error(
-        &format!(
-            indoc! {r#"
-                m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
-                n: Mut(Int, Txn) := 0
-                for r in [1]:
-                    with begin():
-                        n := n + {}
-                await_final(n)
-            "#},
-            comprehension
-        ),
-        expected,
+        indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            n: Mut(Int, Txn) := 0
+            for r in [1]:
+                with begin():
+                    n := n + sum([v for v in m])
+            await_final(n)
+        "#},
+        "Annotation mismatch",
+    );
+}
+
+/// A transactional map read through an **entry** binder — the shape all four of the
+/// storefront/demo entry-iteration sites take. It types: `map_domain` takes a
+/// *consumer's* collection, which a `Mut` wrapping one satisfies, so the source is the
+/// map's key domain and the value comes back through the proven lookup, exactly as over
+/// a plain map.
+///
+/// What it meets is in `lambda_elim`: the point-free rewrite curries the comprehension's
+/// body, and the curried type does not carry the Σ binder its domain names, so the
+/// witness is free at the pass boundary. That is about rebuilding a sum-typed function,
+/// not about transactions — the binder comes from the `Map(𝐾, 𝑉)` inside the `Mut`, and
+/// the same rewrite over a plain map has no binder to carry.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "free witness reference")]
+fn an_entry_binder_over_a_transactional_map_is_not_reachable() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            n: Mut(Int, Txn) := 0
+            for r in [1]:
+                with begin():
+                    n := n + sum([v for k -> v in m])
+            await_final(n)
+        "#},
+        Value::Int(3),
     );
 }
 

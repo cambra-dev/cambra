@@ -407,30 +407,24 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
 // v1 — the map-based cart
 // ---------------------------------------------------------------------------
 
-/// `v1.cambra` is blocked in the front end, on entry iteration.
+/// `v1.cambra` is blocked in the front end, on a **filter in a statement `for`
+/// header**.
 ///
-/// `for (a, t) -> q in m` is the construct, and v1 needs it in both positions
-/// the language offers. As a loop header inside `with begin():` it is the
-/// checkout's credit-and-drain, and it fails in the parser: `->` is no
-/// expression operator, so the header runs on into a `:` the expression grammar
-/// cannot take. As a comprehension generator it is the due total and each of
-/// the view's two lists, and it reaches lowering, which takes a simple name as
-/// a generator target and nothing else.
+/// `for (a, t) -> q in cart if a == r.account:` — the checkout's
+/// credit-and-drain — is what the expression grammar ends at the `:`, reporting
+/// a binary operator expected. A comprehension takes `if`; a loop header does
+/// not, and the drain is written as one.
 ///
-/// Both of those have since been built, and the needle moved with them: the
-/// two-tuple binder lowers in either position, and a block now takes a `for`.
-/// What v1 meets now is a **filter in a statement `for` header** —
-/// `for (a, t) -> q in cart if a == r.account:` — which the expression grammar
-/// ends at the `:`, reporting a binary operator expected. A comprehension takes
-/// `if`; a loop header does not, and the checkout's drain is written as one.
-///
-/// Behind that sit the two the entry-iteration work measured and could not
-/// clear, both upstream of any binder. A `Mut(…)` does not deref to the
-/// collection inside it at a function position, so a transactional map cannot be
-/// swept at all — a plain `sum(s)` over one dies in the runtime needing a
-/// `CurriedFunction`, with no comprehension involved. And a compound key
-/// `(a, t)` is refused by the projection rule whichever binder names it. Both
-/// are why none of v1's four sites are unblocked by entry iteration alone.
+/// Behind that sits one wall, not the three the entry-iteration work measured.
+/// A compound key `(a, t)` is taken apart now, by the binder or by the program's
+/// own `k.0`
+/// ([`crate::compilation_pipeline`]'s `an_entry_binder_takes_a_compound_key_apart`),
+/// and an entry binder over a transactional map types — `map_domain` takes a
+/// consumer's collection, which a `Mut` wrapping one satisfies. What remains is
+/// **reading a transactional collection as a collection**: the entry binder
+/// meets `lambda_elim`, whose curried body does not carry the Σ binder its
+/// domain names, and a plain value binder meets the `Mut` wrapper at the
+/// comprehension's source annotation before that.
 ///
 /// The same run reports the three routes as undeclared, because
 /// [`expect_compile_error`] compiles against a bare context with no host
@@ -453,7 +447,7 @@ fn asset_cart_v1_currently_blocked_on_entry_iteration() {
     // the *first* thing v1 meets rather than the deepest: a pin on a later wall
     // would go green the moment an earlier one moved, and this test's whole job
     // is to fail loudly when the blocker changes — which is how it caught that
-    // entry iteration and `for`-in-a-block had landed.
+    // entry iteration, `for`-in-a-block and the compound key had landed.
     expect_compile_error(
         include_str!("v1.cambra"),
         "found ':', expected binary operator",

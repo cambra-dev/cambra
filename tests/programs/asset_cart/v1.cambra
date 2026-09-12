@@ -2,7 +2,7 @@
 # and three routes the embedding page calls instead of three sources and a sink
 # per ticker. `v0.cambra` is the rung below.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
+# THIS PROGRAM DOES NOT COMPILE YET. Two things stop it, in the order it meets
 # them. Each is pinned by a runnable test, so the message below is what you will
 # actually see rather than a description of it.
 #
@@ -11,25 +11,21 @@
 #      Only the checkout's drain needs it, and it could be written another way.
 #      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
 #
-#   2. Reading a transactional collection as a collection.  `Mut(...)` does not
-#      deref to the map inside it at a function position, so every read of the
-#      whole `cart` or `holdings` — the due total and both view lists — meets
-#      the wrapper instead of the map. This is the one that matters: it is not
-#      about transactions (a plain mutable map fails the same way) and not about
-#      the entry binder (a plain value binder fails the same way).
+#   2. Reading a transactional collection as a collection.  Every read of the
+#      whole `cart` or `holdings` — the due total and both view lists — is one.
+#      The entry binder types: `map_domain` takes a consumer's collection, which
+#      a `Mut` wrapping one satisfies, so the source is the map's key domain and
+#      the value comes back through the proven lookup. It meets `lambda_elim`,
+#      whose curried body does not carry the Σ binder its domain names. A plain
+#      value binder does not get that far — a `Mut(...)` never derefs to the map
+#      inside it at the comprehension's source annotation.
 #      Pinned: `an_entry_binder_over_a_transactional_map_is_not_reachable`.
 #
-#   3. Taking a compound key apart.  The cart is keyed by `(account, ticker)`,
-#      and projecting a component out of a key leaves the component types
-#      undetermined — whether the binder writes the projection or the program
-#      writes `k.0` itself. Keying a map by a tuple works; reading the tuple
-#      back does not.
-#      Pinned: `an_entry_binder_over_a_compound_key_is_not_reachable`.
-#
 # What does work, and is worth knowing before rewriting anything: writing a key
-# (`cart[(a, t)] := q`) and reading one key are both fine. It is only reading a
-# whole collection that is blocked — which is why `PATCH /cart` is expressible
-# today and the cart view is not.
+# (`cart[(a, t)] := q`) and reading one key are both fine, and so is a compound
+# key, taken apart by the binder or by the program's own `k.0`. It is only
+# reading a whole collection that is blocked — which is why `PATCH /cart` is
+# expressible today and the cart view is not.
 #
 # `mod.rs` carries the same list beside the test that pins it.
 
@@ -49,7 +45,6 @@ accts: Mut(Map(AccountId, Balance), Txn) := map([
     (2, 250 * one_dollar),
 ])
 
-# TODO tuple keys in maps
 # `Txn`, because checkout credits this inside a transaction and an induction
 # `Mut` may not be written inside a `with begin():` block.
 holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := map([
@@ -61,7 +56,6 @@ holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := map([
 
 # A pending quantity per (account, ticker), in the asset's base units — the
 # same units `holdings` carries. A checkout drains it; a PATCH sets one line.
-# TODO tuple keys in maps
 cart: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([]))
 
 # The last price the feed quoted, in Microcents per *whole* unit. Written by
@@ -104,8 +98,6 @@ for r in checkout_reqs:
         cash = accts[r.account]
         # Every pending line, priced at the latest quote. `one_btc` is the
         # divisor for every asset — the fixed-scale assumption v2 unwinds.
-        # TODO entry iteration (`for k -> v in m`) is [Planned], unparsed
-        # TODO a comprehension over a transactional map is [Decided], unparsed
         # TODO a bare `m[k]` needs `FullMap`; today it is `m[k]?` plus `match`
         due = sum([q * prices[t] // one_btc
                    for (a, t) -> q in cart if a == r.account])
@@ -113,8 +105,6 @@ for r in checkout_reqs:
         # drain commit together or not at all. This is the atomicity claim.
         if cash >= due:
             accts[r.account] := cash - due
-            # TODO a `for` inside `with begin():` is not accepted today — a
-            # TODO block takes writes, bindings, `if`, `match` and feeds only
             for (a, t) -> q in cart if a == r.account:
                 holdings[(a, t)] := holdings[(a, t)] + q
                 cart[(a, t)] := 0

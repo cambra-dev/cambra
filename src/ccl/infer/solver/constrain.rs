@@ -1310,17 +1310,34 @@ fn constrain_go_impl(
             // below record against it like any other bound, and what the position ends up
             // ranging over has to admit this type. There is nothing to defer and nowhere
             // separate to defer it to.
-            let Some(TypeKind::Enumerated(candidates)) = gamma.type_kind_of(w) else {
-                return Err(ConstrainError::Mismatch {
+            match gamma.type_kind_of(w) {
+                Some(TypeKind::Enumerated(candidates)) => {
+                    for c in &candidates {
+                        constrain_go(c, other, sl, sr, cache, scope)?;
+                        constrain_go(other, c, sr, sl, cache, scope)?;
+                    }
+                    Ok(())
+                }
+                // **A witness bounded above is below its bound, and that is the whole
+                // rule.** `SubtypesOf(𝐾)` names no candidate to constrain, so the
+                // per-candidate invariance above has nothing to range over; what the kind
+                // does say is that whichever domain the witness took is below `𝐾`. So a
+                // reference in *sub* position promotes to its bound and the demand is
+                // discharged there — the standard rule for a bounded quantifier, and what
+                // lets a key drawn from a `Map(𝐾, 𝑉)`'s own domain be used as a `𝐾`.
+                //
+                // The other direction has no rule and stays a mismatch: `𝐾 <: 𝜎` would
+                // claim every `𝐾` is a key the collection holds, which is what the kind
+                // declines to say. That asymmetry is why this is not the `Enumerated`
+                // arm's invariance with one candidate.
+                Some(TypeKind::SubtypesOf(bound)) if matches!(lhs, Type::WitnessRef(_)) => {
+                    constrain_go(&bound, other, sl, sr, cache, scope)
+                }
+                _ => Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                });
-            };
-            for c in &candidates {
-                constrain_go(c, other, sl, sr, cache, scope)?;
-                constrain_go(other, c, sr, sl, cache, scope)?;
+                }),
             }
-            Ok(())
         }
 
         // Variant: width-subtyping is the dual. lhs's tags must all appear
