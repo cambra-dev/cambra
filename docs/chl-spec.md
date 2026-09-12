@@ -227,7 +227,12 @@ type's arms are `` ` ``-tagged, and a refinement predicate — the one place a
 term appears inside `{…}` — is introduced by `where` (§6.4), which is exactly
 why the refinement separator moved off `|`.
 
-### 1.9 Semicolons
+### 1.9 Decorators
+
+`@` introduces a decorator on the line above a declaration. `LoadFrom` is the
+only one (§8.8), so `@` never appears in any other position.
+
+### 1.10 Semicolons
 
 `;` is a statement separator on a single line: `x = 1; y = 2` is two
 statements. A trailing `;` before a newline is allowed. Multiple
@@ -297,6 +302,7 @@ assign_target   ::= ident
                  |  assign_target ( "," assign_target )+ [ "," ]
 
 compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
+                 |  load_from_stmt
 
 if_stmt         ::= "if" expression ":" block
                     ( "elif" expression ":" block )*
@@ -313,6 +319,12 @@ with_stmt       ::= "with" [ ident "=" ] expression ":" block
 
 def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" [ "=>" expression ] ":" block
 param           ::= ident [ ":" expression ]
+
+-- A declaration seeded from the version this source replaces (§8.8). The
+-- decorator and the declaration are one statement, which is why a declaration
+-- may carry an annotation and no value here and nowhere else.
+load_from_stmt  ::= "@" "LoadFrom" "(" ident ")" NEWLINE
+                    ident ( ":" | "<:" ) expression NEWLINE
 
 block           ::= NEWLINE INDENT statement+ DEDENT
 ```
@@ -3105,6 +3117,87 @@ Supporting decisions (same source):
   `tx`, which collides with "transmit"); operations `begin()` / `abort()`.
 - **Implicit *parameters* only — never implicit conversions**; given
   visibility stays explicit and resolution inspectable (hence `summon`).
+
+### 8.8 `@LoadFrom`
+
+`@LoadFrom(x)` decorates a declaration, binding it to the value the version this
+source replaces held for the mutable variable `x`, read once when the
+replacement takes over:
+
+```python
+# v1
+qty: Mut(Int, Txn) := 0
+
+# v2
+@LoadFrom(qty)
+qty_units: Int
+```
+
+This is the one declaration that carries an annotation and no value — the
+decorator is where the value comes from. A bare `y: T` elsewhere is a parse error
+(§4). `LoadFrom` is the only decorator CHL has.
+
+A load is a declaration, so it appears where declarations do: the top level, or a
+`def` body. A `for` body and a `with begin():` block take statements rather than
+declarations and reject one. Inside a `def`, the name resolves to the variable
+that function's own instantiation declares before it resolves to a top-level one,
+the way a name resolves anywhere else.
+
+`x` is a name, not an expression, and it is a variable the *previous* version
+declared: the version being compiled need not declare it, and retiring `qty`
+while seeding `qty_units` from it is the case the decorator exists for.
+
+**What it binds is an ordinary binding.** Nothing requires the declaration to be
+mutable. A version that only reads what its predecessor held declares nothing
+mutable at all; one that carries state forward names the binding in the
+initialiser of the variable that replaces it:
+
+```python
+@LoadFrom(qty)
+held: Int
+qty_units: Mut(Int, Txn) := held * 10000
+```
+
+**It is a snapshot, not a read.** The value is what the predecessor held at the
+swap, and is a constant from then on — not a dependency on `x` going forward. It
+is therefore not a read of a transactional variable and needs no `with begin():`
+block (§8.3).
+
+**A variable may be declared, loaded, or both.** A variable the new version
+declares takes the value it held whether or not anything names it. `@LoadFrom` is
+for the variable it declares under a different name, or retires. Doing both keeps
+the old variable live while seeding a new one from it.
+
+**The annotation states the shape, and its mode matters.** What the running
+program holds has to fit the annotation exactly, so an exact `y: T` is right
+wherever the value is used whole. A collection's domain is its data and is
+invariant, so an exact annotation on one pins the domain too and a comprehension
+over the binding is rejected; the bounded form (§6) is what leaves the domain to
+be inferred:
+
+```python
+@LoadFrom(qty)
+held <: Map(String, Int)
+qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+```
+
+A comprehension over a map binds each value and keeps the keys, so that scales
+every quantity the predecessor held.
+
+**A running program is required.** A source containing `@LoadFrom(x)` is an
+upgrade of a specific predecessor: compiled from nothing, it is an error naming
+`x`, and so is one naming a variable the running program does not hold. There is
+no `@LoadFrom(x, default)` — a default would turn that error back into a silent
+wrong answer.
+
+**It is transitional.** The seeding happens once, so the decorator comes out in
+the next version. A name a version loads and does not declare is gone after that
+version, which is why recompiling a migrating source unchanged is refused: there
+is no longer anything of that name to load.
+
+What `@LoadFrom` does not do is make units checkable. Both variables above hold
+an `Int`, and nothing checks that ten thousand is the right number; what is
+checked is that a value was about to be dropped and the source did not say so.
 
 ## 9. Sinks
 

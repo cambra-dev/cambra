@@ -530,7 +530,14 @@ fn has_unordered_children(e: &TypedExpr) -> bool {
 fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
     use super::TypedExprNode as N;
     match &e.node {
-        N::Lit(_) | N::Var(_) | N::Builtin(_) | N::Proj(_) | N::Source(_) | N::Defer | N::Error => {
+        N::Lit(_)
+        | N::Var(_)
+        | N::Builtin(_)
+        | N::Proj(_)
+        | N::Source(_)
+        | N::Carried(_)
+        | N::Defer
+        | N::Error => {
             vec![]
         }
         N::Apply { function, argument } => vec![function, argument],

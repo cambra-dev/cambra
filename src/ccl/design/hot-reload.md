@@ -212,15 +212,16 @@ fail.
 ## The one guard: a version must be able to take over the state
 
 `LiveProgram::reload` compares the variables the running program holds against those the new version
-declares, read off its planned tree (`OpConversionContext::state_conflicts`). Three things are
+declares, read off its planned tree (`OpConversionContext::state_conflicts`). Four things are
 refused:
 
-- **A variable the new version no longer declares.** Its value has nowhere to be seeded and would be
-  discarded.
-- **A variable it declares at a different type.** Its value cannot seed a store built for another
-  shape. Allowed through, the store is constructed around a constant of the wrong extent and the
-  process dies on the next pull (`Scalar(Strings([…])) vs Scalar(Int)`), taking every endpoint with
-  it, which is why this is checked rather than left to fail later.
+- **A variable the new version no longer declares and does not load with `@LoadFrom`.** Its value
+  has nowhere to be seeded and would be discarded. Loading it gives it somewhere to go
+  ([Seeding a variable from the value the predecessor held](#seeding-a-variable-from-the-value-the-predecessor-held)).
+- **A variable it declares, or loads with `@LoadFrom`, at a different type.** Its value cannot seed
+  a store built for another shape. Allowed through, the store is constructed around a constant of
+  the wrong extent and the process dies on the next pull (`Scalar(Strings([…])) vs Scalar(Int)`),
+  taking every endpoint with it, which is why this is checked rather than left to fail later.
 - **A value that would move between two declarations the source does not distinguish.** Two
   anonymous call sites of one stateful function are told apart by position alone, so reordering
   them, or inserting a third ahead, hands each variable its neighbour's value. The site's own
@@ -228,6 +229,13 @@ refused:
   while one still present under a different variable has moved (`site_moved`). Refused rather than
   followed, because nothing in the source says which declaration the value belongs to — the refusal
   names both and says that binding each call site to a name is what makes the edit carry.
+- **A `@LoadFrom(x)` naming a variable nothing holds.** There is nothing to read: a first
+  compilation has no predecessor at all, and otherwise no variable of that spelling is in scope at
+  that point in the version being replaced.
+- **A `@LoadFrom(x)` naming a variable the running program has decided no value for.** A store
+  nothing reads is never driven, so it declares its variables and hands on nothing. Reported apart
+  from the two above because the name addresses a real variable and the source is right about where
+  its value goes: what is missing is the value.
 
 The check runs before anything is torn down, so a refused reload leaves the program whole.
 
@@ -272,6 +280,122 @@ to another port releases the one it left, instead of the process keeping every p
 Dropping the handle is what closes it — `SharedHttpServer` holds the listener alongside the
 dispatcher thread and unblocks the thread on drop, so the thread's own shutdown path runs and its
 `Server` goes with it. `a_port_whose_last_route_goes_is_released` covers both halves.
+
+## Seeding a variable from the value the predecessor held
+
+`@LoadFrom(x)` decorates a declaration and binds it to the value the retired version held for the
+mutable variable `x`. The declaration is where the migration goes:
+
+```python
+@LoadFrom(qty)
+held: Int
+qty_units: Mut(Int, Txn) := held * 10000
+```
+
+Silence still means inherit. A variable the new version declares under the same identity takes the
+value it held whether or not anything names it, which is what an ordinary reload does. `@LoadFrom`
+is for the variable the new version declares under another identity, or does not declare at all.
+Declaring `x` and loading it are independent: a version that does both keeps the old variable live
+while seeding a new one from it. What it binds is an ordinary `let` — a version that declares
+nothing mutable may still read what its predecessor held.
+
+A load is a declaration, so it sits where declarations do — the top level, or a function body. A
+loop body and a `with begin():` block take statements rather than declarations and reject one, which
+is the existing grammar rather than a rule of its own; the value is a snapshot, so a per-iteration
+load would bind the same constant every time.
+
+Lowering erases the decorator: the statement becomes a `let` bound to `TypedExprNode::Carried`, a
+leaf holding the source's own spelling and resolved at operator conversion. That is the same shape
+as `Source`, and for the same reason — the name addresses something the compilation is handed
+rather than something the tree computes. It is not a variable reference, so no scope resolution
+reaches it and `uniquify` leaves the spelling alone; the version that retires `x` has no binder for
+it to refer to.
+
+A loaded collection is a collection, not a cell holding one: op-conversion builds the constant with
+`Constant::collection`, which tiles it as a sealed function
+(`src/interpreter/design-operators.md`, "Tile Operators"), so a comprehension over it iterates it.
+Tiling is not readable off the value — a bindings table in function position is one value a consumer
+applies, which is what a list literal's table is — so the site that knows a loaded value is a `Map`
+is the site that says so. That is what makes a unit change on persisted state a declaration:
+`[q * 10000 for q in held]` scales every value the retired version held and keeps its keys, because
+a comprehension over a map binds each value and the domain is the data.
+
+Which variable a name addresses is answered from what the retired version **declared**, not from
+what it currently holds a value for. A store the running program never drove holds no value while
+still being the variable the name means, so answering from the values would report such a name as
+addressing nothing and refuse the version for dropping a variable it says where to put.
+
+### Which variable a site addresses
+
+`state_identities` assigns declarations and `carried` sites their addresses in one walk, so the two
+cannot disagree about what the binding chain at a point is. A declaration's address is the chain
+enclosing it (`VarPath`); a site's is read off the same chain and then resolved outward, the way a
+name resolves in the source — the innermost enclosing chain holding a variable of that spelling
+wins. A diagnostic names the spelling alone, which is what the source contains.
+
+The binding a load seeds is not on the chain. A `@LoadFrom` lowers into that binding, so the chain
+would otherwise carry its name, and the innermost candidate would be one no source can name: a
+predecessor declaring a variable of the loaded spelling inside an instantiation bound to the load's
+own target name would answer for it. Nothing is declared under a load's binding — its definition is the
+leaf and nothing else — so the walk pushes no segment for it (`state_identities`).
+
+The index is always `0`. It tells apart declarations sharing both a chain and a spelling, which
+happens only at two anonymous call sites of one stateful function, and those are internal to the
+function — no source can name one.
+
+Searching outward and not inward is what makes the address the source's. A stateful function's body
+is inlined into the binding the call was assigned to, so the variable it declares is ``a`.`total``
+and a load in that same body sits under `a`: the search starts at the instantiation's chain and
+stops there. The same spelling at the top level reaches nothing, which is correct — a variable
+inside an instantiation is not a name the source can write there.
+
+### A loaded value summarizes positions
+
+A store resumes above the positions its seed summarizes and begins at its input otherwise. Each
+store builder decides that as `continues` and hands it to `OpConversionContext::iteration_input`.
+The question is about the seed, not about the variable: an ordinary reload answers it by identity,
+because a variable that carries its own value carries its own positions with it, and a load breaks
+that coincidence. Its target's identity is new, so it carries nothing, while the value it starts at
+is one the retired version folded positions into — so `continues` reads `carried_derived_nodes` as
+well, and a store seeded from a load resumes.
+
+Answered for the store rather than for each of its keys, because one store drives one position
+sequence: a key added beside one that resumes begins wherever that store resumes.
+
+What that resumes over is decided where it already was. A loop reading the same collection has a
+correspondent, so the kept iteration hands on the positions it has left and each element is folded
+once. A loop reading a different one has none, so it is built fresh and the collection is folded
+whole on top of the loaded value — the sequence the loaded positions were counted in is gone, which
+is the same rule a variable moving between collections follows.
+
+### Typing
+
+Inference gives the node a fresh variable and the declaration's annotation pins it. The values
+arrive at operator conversion, long after inference, and a runtime `Value` carries no CCL type to
+read a shape off, so nothing in the source names the predecessor's type.
+
+What the predecessor holds is checked against what inference concluded, by the comparison a
+declaration gets — a value read at another shape would become a constant of the wrong extent, and
+the operator built around it fails on its first pull rather than at the swap. A record annotated at
+one of its two fields is that refusal (`StateConflict::CarriedAt`) rather than a narrowing.
+
+The annotation's **mode** decides whether a collection can then be iterated. A collection's domain
+is its data and is invariant, so an exact `held: Map(K, V)` pins the domain as well as the shape and
+a comprehension over `held` wants its own; the bounded `held <: Map(K, V)` states the shape and
+leaves the domain to be inferred, which is what a transformation needs.
+
+### A version with a `@LoadFrom` is an upgrade of a specific predecessor
+
+Started from nothing, a source containing `@LoadFrom(x)` is a compile error naming `x`. The cost is
+that such a version cannot be redeployed into a fresh environment, a new region, or CI, and the
+remedy is the version the author needs anyway: the one with the migration taken out, which retires
+nothing further because a name loaded and not declared is gone after the version that loaded it.
+
+Recompiling a migrating source unchanged is refused for that reason: the version performing the
+migration retires `x`, so by the time it is running there is nothing of that name left to load.
+
+There is no `@LoadFrom(x, default)`. A default turns the error back into a silent wrong answer,
+which is the failure this guard exists to remove.
 
 ## A subscription lasts as long as its producer
 

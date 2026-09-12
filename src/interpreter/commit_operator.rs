@@ -359,12 +359,21 @@ fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDra
                 // settles on the pull that yields it; taking an undecided one would seed the
                 // store with whichever keys had arrived, which is a partial map presented as
                 // the initial state.
-                let Tile::Scalar(values) = *codomain else {
-                    continue;
-                };
                 if !matches!(domain_predicate, Predicate::True) {
                     continue;
                 }
+                // A compound-valued map's codomain arrives in either representation of a
+                // column of records: boxed as a `Tile::Scalar` over `ColumnValue::Records`,
+                // or struct-of-arrays as a `Tile::Record`. Which one depends on what
+                // computed the seed — a value carried whole keeps the boxed form it was
+                // stored in, and a comprehension over that value builds each field
+                // separately. `scalar_tile_to_column_value` normalizes both, as it does for
+                // the non-keyed init above.
+                let values = match *codomain {
+                    Tile::Scalar(values) => values,
+                    tile @ Tile::Record(_) => scalar_tile_to_column_value(tile),
+                    _ => continue,
+                };
                 let map: HashMap<Value, Value> = (0..domain.len())
                     .map(|i| (domain.index_at(i), values.index_at(i)))
                     .collect();
@@ -6433,6 +6442,76 @@ mod tests {
             read_initial_scalar(&mut *p),
             Err(InitDrainFailure::Diverged)
         ));
+    }
+
+    /// A record-valued map's seed reads the same from either representation of
+    /// its codomain: boxed, as a `Tile::Scalar` over `ColumnValue::Records`, or
+    /// struct-of-arrays, as a `Tile::Record`. A value carried whole arrives
+    /// boxed and a comprehension over that value arrives struct-of-arrays, so a
+    /// drain taking only one of them never settles on the other.
+    #[test]
+    fn read_initial_scalar_takes_a_record_valued_map_either_way() {
+        let seed = |codomain: Tile, codomain_tiling: Tiling| {
+            let mut source = FixedSource {
+                tiling: Tiling::SealedFunction {
+                    domain: Extent::Base(BaseType::String),
+                    codomain: Box::new(codomain_tiling),
+                },
+                tile: Tile::SealedFunction {
+                    domain: ColumnValue::from_values(
+                        vec![Value::String("btc".into()), Value::String("eth".into())],
+                        &Extent::Base(BaseType::String),
+                    ),
+                    codomain: Box::new(codomain),
+                    domain_predicate: Predicate::True,
+                    deleted: bit_set::BitSet::new(),
+                },
+            };
+            let g = source.tiling().universal_guard();
+            let mut p = source.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+            let Ok(value) = read_initial_scalar(&mut *p) else {
+                panic!("a decided seed settles on the first pull");
+            };
+            value
+        };
+
+        fn field<T>(t: T) -> HashMap<String, T> {
+            HashMap::from([("units".to_string(), t)])
+        }
+        // Each representation comes with the tiling that describes it: a column of
+        // record values is one scalar of `Extent::Record`, and a record of columns is
+        // a `Tiling::Record` over the fields.
+        let units = ColumnValue::from_ints(vec![2, 1]);
+        let boxed = seed(
+            Tile::Scalar(ColumnValue::Records(field(units.clone()))),
+            Tiling::Scalar(Extent::Record(field(Extent::Base(BaseType::Int)))),
+        );
+        let struct_of_arrays = seed(
+            Tile::Record(field(Tile::Scalar(units))),
+            Tiling::Record(field(Tiling::Scalar(Extent::Base(BaseType::Int)))),
+        );
+
+        // The seed is a map, so its bindings carry no order; compare the entries.
+        let entries = |seed: Value| {
+            let Value::Function(bindings) = seed else {
+                panic!("a map seeds as a function from keys to values");
+            };
+            let mut out: Vec<(String, i64)> = bindings
+                .into_iter()
+                .map(|b| match (b.input, b.output) {
+                    (Value::String(k), Value::Record(fields)) => match fields["units"] {
+                        Value::Int(n) => (k.to_string(), n),
+                        ref other => panic!("`units` is an Int, got {other:?}"),
+                    },
+                    other => panic!("expected String to a record, got {other:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let expected = vec![("btc".to_string(), 2), ("eth".to_string(), 1)];
+        assert_eq!(entries(boxed), expected);
+        assert_eq!(entries(struct_of_arrays), expected);
     }
 
     // ── Tile::Store step-function reads (Stage 2) ─────────────────────────────

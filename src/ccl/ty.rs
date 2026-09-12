@@ -3555,6 +3555,12 @@ fn eq_term_modulo_ty_slots_go(
         (N::Builtin(x), N::Builtin(y)) => x == y,
         (N::Proj(x), N::Proj(y)) => x == y,
         (N::Source(x), N::Source(y)) => x == y,
+        // A `Carried` name is not a reference to a binder the compared term introduces:
+        // it addresses a variable the *retired* version declared, so it is that source's
+        // own spelling and compares as one (`src/ccl/scope.rs`, where it is a leaf rather
+        // than a `VarRef`). Resolving it through the pairing would equate two spellings
+        // that name different predecessors' variables.
+        (N::Carried(x), N::Carried(y)) => x == y,
         (N::Defer, N::Defer) | (N::Error, N::Error) => true,
         (
             N::Apply {

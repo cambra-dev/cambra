@@ -5,35 +5,82 @@ use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
 use crate::{
-    interpreter::{BaseType, ColumnValue, Consumer, Extent, FunctionDef, Scheduler, Value},
+    interpreter::{
+        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Scheduler, Value,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
 
-/// A tile operator that always produces the same scalar value.
+/// A tile operator that always produces the same value.
 pub struct Constant {
     /// The fixed value emitted on every `get`.
     value: Value,
     /// The extent (type) of the produced value.
     pub extent: Extent,
-    /// The tiling — always `Tiling::Scalar`.
+    /// `Tiling::Scalar` from [`Constant::new`], `Tiling::SealedFunction` from
+    /// [`Constant::collection`].
     base: OperatorBase,
 }
 
 impl Constant {
-    /// Create a new `Constant` operator for the given value.
+    /// Create a new `Constant` operator producing `value` as a single scalar.
     ///
     /// The extent is a *parameter* rather than derived from `value`, because a value
     /// does not determine one: a `Value::Union` knows the arm it occupies but not the
     /// arm set it belongs to, and a `Value::Function` binding table knows its own
     /// keys but not the domain they are drawn from. Every caller has the node's type,
     /// which does.
+    ///
+    /// A `Value::Function` at an [`Extent::Function`] is a scalar here too: a
+    /// bindings table standing in **function position** is one value the consumer
+    /// applies, which is what a list literal's table is
+    /// (`src/interpreter/operator_conversion.rs`, `compile_list_fn`). Tiling is not
+    /// derivable from the value's shape, so the caller that means a collection says
+    /// so by calling [`Constant::collection`] instead.
     pub fn new(value: Value, extent: Extent) -> Self {
-        let tiling = Tiling::Scalar(extent.clone());
         Self {
+            base: OperatorBase::new(Tiling::Scalar(extent.clone())),
             value,
             extent,
+        }
+    }
+
+    /// Create a `Constant` producing `bindings` as a **collection**: one tile
+    /// carrying the whole table, keyed by its own domain.
+    ///
+    /// Every operator downstream derives its tiling from its input's, so this is
+    /// what decides whether the table or its outputs are what a consumer iterates.
+    /// A comprehension over a loaded `Map` is the case that separates the two: at
+    /// the scalar tiling of [`Constant::new`] it transforms the table as one value
+    /// and the arithmetic under it meets a `Value::Function`, while here it
+    /// transforms each output and keeps the domain.
+    ///
+    /// Which of the two a constant is cannot be read off the value, so the call
+    /// site states it — see [`TypedExprNode::Carried`](crate::ccl::TypedExprNode),
+    /// the one site that does.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `bindings` is a `Value::Function` at an [`Extent::Function`].
+    /// A `Value::ComputableFunction` computes its outputs rather than tabulating
+    /// them, so it has no domain column to hand over and is not a collection.
+    pub fn collection(bindings: Value, extent: Extent) -> Self {
+        let (Value::Function(_), Extent::Function { domain, codomain }) = (&bindings, &extent)
+        else {
+            panic!(
+                "a collection constant is a bindings table at a function extent, got {bindings:?} \
+                 at {extent}"
+            );
+        };
+        let tiling = Tiling::SealedFunction {
+            domain: (**domain).clone(),
+            codomain: Box::new(Tiling::Scalar((**codomain).clone())),
+        };
+        Self {
             base: OperatorBase::new(tiling),
+            value: bindings,
+            extent,
         }
     }
 }
@@ -87,14 +134,52 @@ impl TileProducer for ConstantProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        if self.released {
-            self.tiling().empty_tile()
-        } else {
-            Tile::Scalar(ColumnValue::single(self.value.clone()))
+        // `Predicate::True` because a constant is decided in full on the pull that
+        // yields it: the bindings are the whole collection, so there is no key it
+        // has yet to answer. A consumer reading a partial domain as the whole one
+        // is what the predicate exists to prevent, and there is no partial state
+        // here to mistake.
+        if let Tiling::SealedFunction { domain, codomain } = self.tiling() {
+            let Value::Function(bindings) = &self.value else {
+                unreachable!(
+                    "a collection constant holds a bindings table — `Constant::collection` is \
+                     the only way to this tiling and checks it"
+                )
+            };
+            let (keys, values): (Vec<Value>, Vec<Value>) = bindings
+                .iter()
+                .map(|b| (b.input.clone(), b.output.clone()))
+                .unzip();
+            let mut tile = Tile::SealedFunction {
+                domain: ColumnValue::from_values(keys, domain),
+                codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
+                    values,
+                    &codomain.extent(),
+                ))),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            };
+            // A collection's consumers release the keys they are done with, so the
+            // whole table is not what a later pull may return. `release` has already
+            // accumulated every guard into `obsolete_guard`, and returning released
+            // rows is what `get`'s post-condition forbids.
+            tile.remove_guarded(self.obsolete_guard().clone());
+            return tile;
         }
+        if self.released {
+            return self.tiling().empty_tile();
+        }
+        Tile::Scalar(ColumnValue::single(self.value.clone()))
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // A collection is released a key at a time, and `get_impl` filters against
+        // the guard `release` accumulates, so there is nothing to record here. A
+        // scalar has one position and no way to name part of it, which is what
+        // makes its only release the whole of it.
+        if matches!(self.tiling(), Tiling::SealedFunction { .. }) {
+            return;
+        }
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
         }

@@ -416,10 +416,20 @@ pub struct OpConversionContext {
     /// Installed by [`set_var_paths`](Self::set_var_paths) before conversion
     /// begins; empty for a context converting no `Transact`.
     var_paths: HashMap<NodeId, Vec<VarPath>>,
+    /// The value each `carried(x)` site of that tree reads, by the node that
+    /// reads it, resolved against what the retired version held
+    /// ([`Inheritance::mutable_state`]). Installed by the same call, and empty
+    /// for a first compilation — which is why a version containing one is
+    /// refused there rather than converted.
+    carried_values: HashMap<NodeId, Value>,
     /// The nodes of that tree a fresh compilation would not reproduce, from
     /// [`unrecomputable_nodes`]. Installed by the same call, because both answer
     /// about the tree rather than about the compilation.
     unrecomputable: HashSet<NodeId>,
+    /// The nodes of that tree whose value comes from a `@LoadFrom`, from
+    /// [`carried_derived_nodes`]. Installed by the same call, and read where a
+    /// store decides whether its seed summarizes positions.
+    carried_derived: HashSet<NodeId>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
     /// `let __hist = Transact{…}` builds the shared store once and mutable variables
     /// it here; each variable read `__hist.k` projects key `k` off the shared
@@ -471,6 +481,19 @@ impl Inheritance {
             Recorded::Store(info) => Some(info),
             Recorded::Operator(_) => None,
         })
+    }
+
+    /// Every mutable variable the graph declares, by identity.
+    ///
+    /// What a name addresses, as against [`Self::mutable_state`], which is what
+    /// a variable currently holds. The two differ for a store the running
+    /// program never drove: it declares its variables and holds no value for
+    /// them.
+    fn declared_paths(&self) -> HashSet<VarPath> {
+        self.stores()
+            .flat_map(StoreReadInfo::carried_keys)
+            .map(|(path, _)| path.clone())
+            .collect()
     }
 }
 
@@ -615,8 +638,14 @@ impl OpConversionContext {
     /// derivation of one, and so a rebuild is declined against the same reading
     /// of the tree the guard refused against.
     pub fn set_var_paths(&mut self, expr: &Expr) {
-        self.var_paths = mutable_variable_paths(expr);
+        let identities = state_identities(expr);
+        self.var_paths = identities.variable_paths();
+        self.carried_values = identities.carried_values(
+            &self.inherited.declared_paths(),
+            &self.inherited.mutable_state,
+        );
         self.unrecomputable = unrecomputable_nodes(expr);
+        self.carried_derived = carried_derived_nodes(expr);
     }
 
     /// Install where each node of the tree about to be converted stood in the
@@ -1042,21 +1071,78 @@ in it has a correspondent",
         }
     }
 
-    /// Every variable the running program holds that `planned` cannot take over.
+    /// Everything that stops `planned` and the running program's state from
+    /// meeting: a variable the running program holds that `planned` cannot take
+    /// over, and a `carried(x)` in `planned` that no held variable answers.
     ///
     /// Checked before anything is torn down, so a version that would lose a
     /// value or change its type is refused while the running program is whole.
     /// A type change is refused rather than reseeded because the value would
     /// become the seed of a store built for another shape, and the store fails
     /// on its first pull rather than at the swap.
+    ///
+    /// Both directions are answered here rather than half of them at conversion,
+    /// because conversion runs after the teardown: a failure there is a panic
+    /// with no running program left to keep serving.
     pub fn state_conflicts(&self, planned: &Expr) -> Vec<StateConflict> {
-        let declared = declared_state(planned);
+        let identities = state_identities(planned);
+        let declared = identities.declared();
+        // Off the stores, not off `minted.mutable_state`: that field is filled at
+        // handover ([`Self::into_inheritance`]), so the copy this compilation is
+        // still accumulating into carries none. The guard runs while the program
+        // it is guarding is the running one.
+        let held = self.live_state();
         let mut out = Vec::new();
+
+        // What `carried(x)` reads, which decides two things: a site addressing a
+        // variable no predecessor holds is refused here rather than at
+        // conversion, which runs after the teardown and has nothing to reject
+        // to; and a variable a site takes over has somewhere to go, so retiring
+        // it is not a drop.
+        let declared_by_predecessor = self.minted.declared_paths();
+        let mut taken_over: HashSet<VarPath> = HashSet::new();
+        for (site, resolved) in identities.read_carried(&declared_by_predecessor) {
+            let Some(path) = resolved else {
+                out.push(StateConflict::NoPredecessor {
+                    name: site.name.clone(),
+                });
+                continue;
+            };
+            // Declared by the running program but holding nothing. The name
+            // addresses a real variable, so this is not a drop and not a missing
+            // predecessor — the value simply is not there to take.
+            if !held.contains_key(&path) {
+                out.push(StateConflict::Undecided { path: path.clone() });
+                taken_over.insert(path);
+                continue;
+            }
+            // The same comparison a declaration gets, for the same reason: a
+            // value used at another shape is a constant of the wrong extent, and
+            // the operator built around it fails on its first pull rather than
+            // at the swap. A type the conversion context cannot resolve is a
+            // compile error the real compile raises with its own diagnostic.
+            if let (Some(declared), Ok(read_at)) =
+                (self.declared_extent(&path), self.extent_of(&site.ty))
+                && read_at != declared
+            {
+                out.push(StateConflict::CarriedAt {
+                    path: path.clone(),
+                    held: declared,
+                    read: read_at,
+                });
+            }
+            taken_over.insert(path);
+        }
 
         for info in self.minted.stores() {
             for (path, key) in info.carried_keys() {
                 let Some(decl) = declared.get(path) else {
-                    out.push(StateConflict::Dropped { path: path.clone() });
+                    // Declared by the new version or read by `carried`: an *or*,
+                    // and doing both is ordinary — that is how a program keeps
+                    // the old variable live while seeding a new one from it.
+                    if !taken_over.contains(path) {
+                        out.push(StateConflict::Dropped { path: path.clone() });
+                    }
                     continue;
                 };
                 // A declared type the conversion context cannot resolve to an
@@ -1218,6 +1304,16 @@ identities is not distinguishing them",
             }
         }
         out
+    }
+
+    /// The extent the running graph's store declares for `path`, which is what a
+    /// value read off it is.
+    fn declared_extent(&self, path: &VarPath) -> Option<Extent> {
+        self.minted
+            .stores()
+            .flat_map(StoreReadInfo::carried_keys)
+            .find(|(p, _)| *p == path)
+            .map(|(_, key)| key.value_extent.clone())
     }
 
     /// Everything the running graph holds: its bindings and stores, and the
@@ -2344,6 +2440,42 @@ fn convert_impl_inner(
             Ok(Box::new(reader))
         }
 
+        // `carried(x)`: the value the retired version held, as a constant.
+        //
+        // Which variable `x` addresses, and whether this site reads it at all,
+        // are answered by the walk `set_var_paths` runs — the same one that
+        // assigns the identities stores are built under, so the site and the
+        // variable cannot disagree.
+        //
+        // The missing value is the cold start: a first compilation inherits
+        // nothing, and nothing guards it, because there is no running program to
+        // refuse on behalf of. A *reload* never arrives here without one —
+        // `state_conflicts` has already refused that version while the running
+        // program was whole ([`StateConflict::NoPredecessor`]), which it must,
+        // since conversion runs after the teardown and its caller turns a failure
+        // here into a panic.
+        TypedExprNode::Carried(name) => {
+            expect_no_input(input, "carried")?;
+            let Some(value) = ctx.carried_values.get(&expr.node_id()) else {
+                return Err(ConversionError::Unsupported(format!(
+                    "`@LoadFrom({name})` has no previous version to read from. This source is an \
+                     upgrade of a running program and cannot be started from nothing."
+                )));
+            };
+            let extent = ctx.extent_of(&expr.ty)?;
+            // A loaded value is a CHL value of the type the declaration states, so a
+            // function extent here is a `Map` — a collection, which is what decides
+            // whether a comprehension over the binding transforms the table or its
+            // outputs. Nothing applies this constant the way a list literal's table
+            // is applied, which is the distinction `Constant` cannot read off the
+            // value and takes from the call site instead.
+            let op: Box<dyn TileOperator> = match extent {
+                Extent::Function { .. } => Box::new(Constant::collection(value.clone(), extent)),
+                _ => Box::new(Constant::new(value.clone(), extent)),
+            };
+            Ok(op)
+        }
+
         // A raw `LetRec` never compiles directly: op-conversion *recognizes
         // patterns* in the group (a `get_prev_seq`-causal self-cycle → the
         // induction-store engine, commit-record shapes → the commit operator) and
@@ -2623,12 +2755,27 @@ fn build_commit_store(
     // homogeneous store collapses the union to its single extent (the common
     // case, unchanged).
     // Whether this store continues a recurrence the retired version was running.
-    // A store carrying a value has folded the positions that value summarizes, so
-    // its drive resumes above them; one carrying none starts at its declared init
-    // and has folded nothing, so its drive needs its source from the beginning.
+    // A store whose seed summarizes positions has folded them already, so its
+    // drive resumes above them; one whose seed summarizes none needs its source
+    // from the beginning.
+    //
+    // Two ways a seed summarizes positions, and the identity of the variable is
+    // only the first. A variable that carries its own value is the ordinary
+    // reload. A variable seeded from a `@LoadFrom` is the other: its identity is
+    // new, so it carries nothing, while the value it starts at is one the retired
+    // version folded positions into. Asking only the identity would send such a
+    // store back over an input it has already counted.
+    //
+    // Answered for the store rather than for each key, because one store drives
+    // one position sequence: a key added beside one that resumes begins wherever
+    // that store resumes, and folding the two over different prefixes of one
+    // drive is not a thing the store can do.
     let continues = paths
         .iter()
-        .any(|path| ctx.inherited.mutable_state.contains_key(path));
+        .any(|path| ctx.inherited.mutable_state.contains_key(path))
+        || keys
+            .iter()
+            .any(|k| ctx.carried_derived.contains(&k.init.node_id()));
 
     let mut value_extents: Vec<Extent> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2900,27 +3047,6 @@ fn source_start(domain: &Type, ctx: &OpConversionContext) -> usize {
     })
 }
 
-/// Every mutable variable `expr` declares, by identity, with the type it is
-/// declared at.
-///
-/// One walk, shared by the guard and by conversion, so the identity a version is
-/// checked against is the identity its stores are built under. Deriving it twice
-/// would mean two computations that have to agree, and a disagreement reads as a
-/// variable that is still declared having been dropped.
-pub fn declared_state(expr: &Expr) -> HashMap<VarPath, DeclaredVariable> {
-    let mut out = HashMap::new();
-    for v in mutable_variables(expr) {
-        out.insert(
-            v.path,
-            DeclaredVariable {
-                ty: v.key.init.ty.clone(),
-                site: v.site,
-            },
-        );
-    }
-    out
-}
-
 /// The variable `site` declares in the new version, when that is not `path`.
 ///
 /// A variable is named by the bindings enclosing its declaration, its spelling,
@@ -2973,11 +3099,7 @@ pub struct DeclaredVariable {
 /// Handed to conversion so that a store is built under the identities the guard
 /// checked, rather than under a second derivation of them.
 pub fn mutable_variable_paths(expr: &Expr) -> HashMap<NodeId, Vec<VarPath>> {
-    let mut out: HashMap<NodeId, Vec<VarPath>> = HashMap::new();
-    for v in mutable_variables(expr) {
-        out.entry(v.declared_by).or_default().push(v.path);
-    }
-    out
+    state_identities(expr).variable_paths()
 }
 
 /// Each `Transact` in `expr`, by its node, with the iteration source of every
@@ -3020,16 +3142,47 @@ fn writer_sources(expr: &Expr) -> HashMap<NodeId, Vec<&Expr>> {
 /// a free name at this point is a builtin, and the tree reaching planning is
 /// point-free.
 pub fn unrecomputable_nodes(expr: &Expr) -> HashSet<NodeId> {
-    fn go(e: &Expr, bound: &mut Vec<(Name, bool)>, out: &mut HashSet<NodeId>) -> bool {
-        let mut unrecomputable = match &e.node {
-            TypedExprNode::Source(_) => true,
-            TypedExprNode::Var(name) => bound
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .is_some_and(|(_, u)| *u),
-            _ => false,
-        };
+    nodes_reaching(expr, |node| matches!(node, TypedExprNode::Source(_)))
+}
+
+/// Every node of `expr` whose value comes from a `@LoadFrom`.
+///
+/// A loaded value summarizes the positions the retired version had folded into
+/// the variable it was loaded from, which is what a store built around it has to
+/// know: a seed that summarizes positions makes the store *continue* a
+/// recurrence rather than begin one, whatever the identity of the variable it
+/// seeds ([`OpConversionContext::iteration_input`]).
+///
+/// A set rather than a predicate over one node, because the seed reaches the
+/// store through the bindings between: `@LoadFrom` binds a `let`, and the
+/// declaration that uses it names that binding rather than containing the leaf.
+pub fn carried_derived_nodes(expr: &Expr) -> HashSet<NodeId> {
+    nodes_reaching(expr, |node| matches!(node, TypedExprNode::Carried(_)))
+}
+
+/// Every node of `expr` whose value comes from a leaf `is_source` accepts.
+///
+/// One walk for the two questions asked of a term this way — whether it reads a
+/// data source, and whether it reads a loaded value — because they differ only
+/// in the leaf. What makes them the same walk is the propagation: a `Var` answers
+/// for what its binding was bound to, so the property reaches a use through every
+/// binding between, and a term's answer is otherwise its children's.
+fn nodes_reaching(expr: &Expr, is_source: impl Fn(&TypedExprNode) -> bool) -> HashSet<NodeId> {
+    fn go(
+        e: &Expr,
+        is_source: &impl Fn(&TypedExprNode) -> bool,
+        bound: &mut Vec<(Name, bool)>,
+        out: &mut HashSet<NodeId>,
+    ) -> bool {
+        let mut reaches = is_source(&e.node)
+            || match &e.node {
+                TypedExprNode::Var(name) => bound
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n == name)
+                    .is_some_and(|(_, u)| *u),
+                _ => false,
+            };
         // A `Let`'s binding is in scope for its body and not for its bound
         // expression, so the two halves are walked either side of the push.
         if let TypedExprNode::Let {
@@ -3038,22 +3191,22 @@ pub fn unrecomputable_nodes(expr: &Expr) -> HashSet<NodeId> {
             body,
         } = &e.node
         {
-            let bound_is = go(bound_expr, bound, out);
+            let bound_is = go(bound_expr, is_source, bound, out);
             bound.push((binding.name.clone(), bound_is));
-            let body_is = go(body, bound, out);
+            let body_is = go(body, is_source, bound, out);
             bound.pop();
-            unrecomputable |= bound_is | body_is;
+            reaches |= bound_is | body_is;
         } else {
-            e.walk_children(|child| unrecomputable |= go(child, bound, out));
+            e.walk_children(|child| reaches |= go(child, is_source, bound, out));
         }
-        if unrecomputable {
+        if reaches {
             out.insert(e.node_id());
         }
-        unrecomputable
+        reaches
     }
 
     let mut out = HashSet::new();
-    go(expr, &mut Vec::new(), &mut out);
+    go(expr, &is_source, &mut Vec::new(), &mut out);
     out
 }
 
@@ -3072,29 +3225,99 @@ struct MutableVariable<'e> {
     site: ContentHash,
 }
 
-/// Every mutable variable in `expr`, in tree order, with its identity.
+/// One `carried(x)` site, as the identity walk sees it.
+///
+/// A declaration and a `carried` are the two halves of one question — which
+/// variable a name addresses — so one walk answers both and they cannot
+/// disagree about what the chain at a point is.
+pub(crate) struct CarriedSite {
+    /// The [`TypedExprNode::Carried`] node, which is how conversion finds the
+    /// value again.
+    node: NodeId,
+    /// The source's own spelling of the variable, as written, and what a
+    /// diagnostic names when nothing answers: a site that resolves to no
+    /// variable has no address to report, and the spelling is what the source
+    /// contains.
+    name: String,
+    /// The bindings enclosing the site, outermost first — the chain a
+    /// declaration here would take.
+    chain: Vec<String>,
+    /// What inference concluded the value is, which the value the predecessor
+    /// holds has to fit.
+    ty: Type,
+}
+
+impl CarriedSite {
+    /// The variable this addresses among those the retired version `declared`.
+    ///
+    /// Resolved against what that version declared rather than against what it
+    /// currently holds a value for: which variable a name addresses is a
+    /// question about identity, and a store the running program never drove
+    /// holds no value while still being the variable the name means. Answering
+    /// it from the values would report such a name as addressing nothing, and
+    /// the version would be refused for dropping a variable it says where to put.
+    ///
+    /// Resolved outward, the way scope resolves a name: the innermost enclosing
+    /// chain that holds a variable of this spelling wins, so a `@LoadFrom(n)`
+    /// inside `a`'s definition finds ``a`.`n`` where there is one and the
+    /// top-level `n` otherwise. A declaration's chain is the bindings enclosing
+    /// the declaration rather than the reference, so the site's own chain is
+    /// where the search starts and not where it ends.
+    ///
+    /// The binding the load seeds is not on that chain
+    /// ([`state_identities`]), so the search starts outside it. Carrying it
+    /// would make the innermost candidate one no source can name: a predecessor
+    /// that declared a variable of this spelling inside an instantiation bound
+    /// to the load's own target name would answer for it.
+    ///
+    /// The index is always `0`. It tells apart declarations that share a chain
+    /// and a spelling, which only happens where the source supplies no name to
+    /// distinguish them — two anonymous call sites of one stateful function —
+    /// and those are internal to the function, so no `carried` can name one.
+    fn resolve(&self, declared: &HashSet<VarPath>) -> Option<VarPath> {
+        (0..=self.chain.len()).rev().find_map(|n| {
+            let path = VarPath {
+                chain: self.chain[..n].to_vec(),
+                name: self.name.clone(),
+                index: 0,
+            };
+            declared.contains(&path).then_some(path)
+        })
+    }
+}
+
+/// Every mutable variable and every `carried(x)` site in `expr`, in tree order,
+/// with its identity.
 ///
 /// The one place identities are assigned. `Transact` is the only node that
-/// declares a mutable variable, so the walk is over those.
-fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
+/// declares a mutable variable, so the declarations are the keys of those; a
+/// `carried` site is addressed by the same chain, which is why one walk carries
+/// both rather than two walks agreeing about it.
+struct StateIdentities<'e> {
+    variables: Vec<MutableVariable<'e>>,
+    carried: Vec<CarriedSite>,
+}
+
+fn state_identities(expr: &Expr) -> StateIdentities<'_> {
     type Counts = HashMap<(Vec<String>, String), usize>;
 
-    fn go<'e>(
-        e: &'e Expr,
-        chain: &mut Vec<String>,
-        counts: &mut Counts,
-        out: &mut Vec<MutableVariable<'e>>,
-    ) {
+    struct Walk<'e> {
+        chain: Vec<String>,
+        counts: Counts,
+        out: StateIdentities<'e>,
+    }
+
+    fn go<'e>(e: &'e Expr, w: &mut Walk<'e>) {
         if let TypedExprNode::Transact { keys, .. } = &e.node {
             // One hash per `Transact`, shared by every key it declares: the site
             // is the node, not the key.
             let site = content_hash(e);
             for k in keys {
                 let name = k.name.field_key();
-                let index = counts.entry((chain.clone(), name.clone())).or_insert(0);
-                out.push(MutableVariable {
+                let index = w.counts.entry((w.chain.clone(), name.clone())).or_insert(0);
+                w.out.variables.push(MutableVariable {
                     path: VarPath {
-                        chain: chain.clone(),
+                        chain: w.chain.clone(),
                         name,
                         index: *index,
                     },
@@ -3104,6 +3327,14 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
                 });
                 *index += 1;
             }
+        }
+        if let TypedExprNode::Carried(name) = &e.node {
+            w.out.carried.push(CarriedSite {
+                node: e.node_id(),
+                name: name.clone(),
+                chain: w.chain.clone(),
+                ty: e.ty.clone(),
+            });
         }
         // A binding's definition is an address the source names, so a `Transact`
         // inside one is addressed under that name. The binding's *body* is not:
@@ -3124,25 +3355,109 @@ fn mutable_variables(expr: &Expr) -> Vec<MutableVariable<'_>> {
         };
         match binding_parts {
             Some((binding, definition, body)) => {
-                let named = binding.name.source_spelling().map(str::to_string);
+                // A `@LoadFrom`'s binding is not an address. Its definition is the
+                // leaf and nothing else, so nothing is ever declared under it,
+                // while the site inside it would otherwise start its outward
+                // search one segment too deep: a predecessor declaring a variable
+                // of the loaded spelling inside an instantiation bound to the
+                // load's own target name would answer for it, and that variable is
+                // one no source can name ([`CarriedSite::resolve`]).
+                let named = match &definition.node {
+                    TypedExprNode::Carried(_) => None,
+                    _ => binding.name.source_spelling().map(str::to_string),
+                };
                 if let Some(spelling) = named.clone() {
-                    chain.push(spelling);
+                    w.chain.push(spelling);
                 }
-                go(definition, chain, counts, out);
+                go(definition, w);
                 if named.is_some() {
-                    chain.pop();
+                    w.chain.pop();
                 }
-                go(body, chain, counts, out);
+                go(body, w);
             }
-            None => e.walk_children(|c| go(c, chain, counts, out)),
+            None => e.walk_children(|c| go(c, w)),
         }
     }
 
-    let mut chain = Vec::new();
-    let mut counts = Counts::new();
-    let mut out = Vec::new();
-    go(expr, &mut chain, &mut counts, &mut out);
-    out
+    let mut w = Walk {
+        chain: Vec::new(),
+        counts: Counts::new(),
+        out: StateIdentities {
+            variables: Vec::new(),
+            carried: Vec::new(),
+        },
+    };
+    go(expr, &mut w);
+    w.out
+}
+
+impl<'e> StateIdentities<'e> {
+    /// Every mutable variable's identity, in key order, by the `Transact` node
+    /// that declares it.
+    ///
+    /// Handed to conversion so that a store is built under the identities the
+    /// guard checked, rather than under a second derivation of them.
+    fn variable_paths(&self) -> HashMap<NodeId, Vec<VarPath>> {
+        let mut out: HashMap<NodeId, Vec<VarPath>> = HashMap::new();
+        for v in &self.variables {
+            out.entry(v.declared_by).or_default().push(v.path.clone());
+        }
+        out
+    }
+
+    /// What each mutable variable is declared as, by identity — enough to decide
+    /// whether the running program's value can be seeded into it.
+    ///
+    /// Off the same walk conversion takes its identities from, so the identity a
+    /// version is checked against is the identity its stores are built under.
+    /// Deriving it twice would mean two computations that have to agree, and a
+    /// disagreement reads as a variable that is still declared having been
+    /// dropped.
+    fn declared(&self) -> HashMap<VarPath, DeclaredVariable> {
+        self.variables
+            .iter()
+            .map(|v| {
+                (
+                    v.path.clone(),
+                    DeclaredVariable {
+                        ty: v.key.init.ty.clone(),
+                        site: v.site,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The value each `carried(x)` site this version reads resolves to, given
+    /// what the retired version `held`.
+    ///
+    /// A site that resolves to nothing is left out rather than reported: the
+    /// guard has already refused such a version before anything was torn down
+    /// ([`OpConversionContext::state_conflicts`]), so reaching conversion with
+    /// one is a compiler bug, and conversion says so where it meets it.
+    fn carried_values(
+        &self,
+        declared: &HashSet<VarPath>,
+        held: &HashMap<VarPath, Value>,
+    ) -> HashMap<NodeId, Value> {
+        self.read_carried(declared)
+            .filter_map(|(site, path)| Some((site.node, held.get(&path?)?.clone())))
+            .collect()
+    }
+
+    /// Each `carried(x)` site, with the variable it addresses among those the
+    /// retired version `declared` — `None` where nothing does.
+    ///
+    /// The guard and conversion both read this, so the two cannot disagree about
+    /// which variable a site names.
+    fn read_carried<'s>(
+        &'s self,
+        declared: &'s HashSet<VarPath>,
+    ) -> impl Iterator<Item = (&'s CarriedSite, Option<VarPath>)> {
+        self.carried
+            .iter()
+            .map(|site| (site, site.resolve(declared)))
+    }
 }
 
 /// A variable the running program is holding that a new version cannot take
@@ -3168,6 +3483,42 @@ pub enum StateConflict {
     /// The site that declared it still exists in the new version, declaring a
     /// different variable. See [`site_moved`].
     Moved { path: VarPath, now: VarPath },
+    /// The new version loads a variable the running program declares but has
+    /// decided no value for.
+    ///
+    /// A store nothing reads is never driven, so it holds nothing to hand on.
+    /// Separate from [`Self::NoPredecessor`] because the name addresses a real
+    /// variable: the source is right about where the value goes, and the value
+    /// is what is missing.
+    Undecided { path: VarPath },
+    /// The new version reads `@LoadFrom(x)` at a shape the running program does
+    /// not hold it at.
+    ///
+    /// The site's type is what inference concluded from the expression around
+    /// it, so a record used one field at a time concludes a record of that one
+    /// field. The value would become a constant of the wrong extent, as under
+    /// [`Self::Retyped`] — separate from it because no declaration changed: the
+    /// remedy is to state the shape, not to change one.
+    CarriedAt {
+        path: VarPath,
+        held: Extent,
+        read: Extent,
+    },
+    /// The new version has a `@LoadFrom(x)` for a variable no running program
+    /// holds. There is nothing to read: on a cold start there is no predecessor
+    /// at all, and otherwise the predecessor has no variable of that name in
+    /// scope at that point.
+    ///
+    /// Carries the bare spelling rather than a [`VarPath`], because nothing
+    /// resolved: an address with an empty chain would read as one the source
+    /// named, and the source names only `x`.
+    ///
+    /// No `@LoadFrom(x, default)` escape hatch answers this. A default turns the
+    /// hard error back into a silent wrong answer, which is the failure the
+    /// guard exists to remove — so a version containing a `@LoadFrom` is an
+    /// upgrade of a specific predecessor, and the remedy is the version the
+    /// author needs anyway: the one with the migration taken out.
+    NoPredecessor { name: String },
 }
 
 /// A loop this version declares that begins above the beginning of what it
@@ -3206,6 +3557,18 @@ impl std::fmt::Display for StateConflict {
                 held,
                 declared,
             } => write!(f, "{path} is now {declared} rather than {held}"),
+            StateConflict::CarriedAt { path, held, read } => write!(
+                f,
+                "`@LoadFrom` reads {path} as {read} where the running program holds it as {held}",
+            ),
+            StateConflict::Undecided { path } => write!(
+                f,
+                "{path} is declared but has decided no value, so there is nothing to load from it \
+                 yet",
+            ),
+            StateConflict::NoPredecessor { name } => {
+                write!(f, "`@LoadFrom({name})` has no variable to read")
+            }
             StateConflict::Moved { path, now } => {
                 // Both directions of a swap are conflicts and describe one thing,
                 // so they render identically and the caller's sort collapses them.
@@ -3295,12 +3658,27 @@ fn build_induction_store_single(
     let domain = strip_refinements(domain);
 
     // Whether this store continues a recurrence the retired version was running.
-    // A store carrying a value has folded the positions that value summarizes, so
-    // its drive resumes above them; one carrying none starts at its declared init
-    // and has folded nothing, so its drive needs its source from the beginning.
+    // A store whose seed summarizes positions has folded them already, so its
+    // drive resumes above them; one whose seed summarizes none needs its source
+    // from the beginning.
+    //
+    // Two ways a seed summarizes positions, and the identity of the variable is
+    // only the first. A variable that carries its own value is the ordinary
+    // reload. A variable seeded from a `@LoadFrom` is the other: its identity is
+    // new, so it carries nothing, while the value it starts at is one the retired
+    // version folded positions into. Asking only the identity would send such a
+    // store back over an input it has already counted.
+    //
+    // Answered for the store rather than for each key, because one store drives
+    // one position sequence: a key added beside one that resumes begins wherever
+    // that store resumes, and folding the two over different prefixes of one
+    // drive is not a thing the store can do.
     let continues = paths
         .iter()
-        .any(|path| ctx.inherited.mutable_state.contains_key(path));
+        .any(|path| ctx.inherited.mutable_state.contains_key(path))
+        || keys
+            .iter()
+            .any(|k| ctx.carried_derived.contains(&k.init.node_id()));
 
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the

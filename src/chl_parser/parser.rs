@@ -1205,6 +1205,54 @@ where
                 name_span,
                 annotation,
             });
+        // ---- @LoadFrom(x) ------------------------------------------
+        //
+        // A decorator and the declaration it decorates are one statement, not a
+        // general decorator grammar attached to an arbitrary one. `LoadFrom` is
+        // the only decorator CHL has, and the declaration it takes is the only
+        // one that may carry an annotation without a value — the decorator is
+        // where the value comes from. Parsing the two together is what keeps a
+        // bare `y: T` a parse error everywhere else.
+        //
+        // The decorator name is matched as an identifier and checked after, so
+        // an unknown one is reported by name rather than as a failure to find
+        // `@`.
+        let load_from_stmt = just(Token::At)
+            .ignore_then(select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span())))
+            .then(
+                select! { Token::Ident(s) => s }
+                    .map_with(|s, e| Spanned::new(e.span(), s))
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then_ignore(just(Token::Newline))
+            .then(
+                select! { Token::Ident(s) => s }
+                    .map_with(|s, e| Spanned::new(e.span(), AssignTarget::Name(s))),
+            )
+            .then(
+                annotation_mode()
+                    .then(expr.clone())
+                    .map(|(mode, ty)| TypeAnnotation { mode, ty }),
+            )
+            .then_ignore(just(Token::Newline))
+            .try_map_with(|(((decorator, source), target), annotation), e| {
+                let (name, name_span) = decorator;
+                if name != "LoadFrom" {
+                    return Err(Rich::custom(
+                        name_span,
+                        format!("unknown decorator `{name}`; the only one is `LoadFrom`"),
+                    ));
+                }
+                Ok(Spanned::new(
+                    e.span(),
+                    Stmt::LoadFrom {
+                        target,
+                        annotation,
+                        source,
+                    },
+                ))
+            });
+
         let def_stmt = just(Token::Def)
             .ignore_then(select! { Token::Ident(s) => s }.labelled("function name"))
             .then(
@@ -1354,6 +1402,7 @@ where
             for_stmt,
             with_stmt,
             def_stmt,
+            load_from_stmt,
             block_assign,
             simple_stmt,
         ))
@@ -2028,6 +2077,52 @@ mod tests {
         assert!(
             !r.errors.is_empty(),
             "expected parse error for non-binding assignment LHS"
+        );
+    }
+
+    /// A blank line between the two is a blank line like any other: the lexer
+    /// folds a run of them into one `Newline`, so the statement is unaffected.
+    #[test]
+    fn a_blank_line_between_the_decorator_and_its_declaration_is_ignored() {
+        let m = parse_m("@LoadFrom(qty)\n\nheld: Int\nheld\n");
+        assert!(matches!(&m.body[0].node, Stmt::LoadFrom { .. }));
+    }
+
+    #[test]
+    fn load_from_declaration() {
+        let m = parse_m("@LoadFrom(qty)\nheld: Int\nheld\n");
+        let Stmt::LoadFrom {
+            target,
+            annotation,
+            source,
+        } = &m.body[0].node
+        else {
+            panic!("expected a LoadFrom statement, got {:?}", m.body[0].node);
+        };
+        assert!(matches!(&target.node, AssignTarget::Name(n) if n == "held"));
+        assert_eq!(annotation.mode, AnnotationMode::Exact);
+        assert_eq!(source.node, "qty");
+    }
+
+    /// The bounded mode rides the same declaration — it is what a collection
+    /// this version then iterates is written with.
+    #[test]
+    fn load_from_declaration_bounded() {
+        let m = parse_m("@LoadFrom(qty)\nheld <: Map(String, Int)\nheld\n");
+        let Stmt::LoadFrom { annotation, .. } = &m.body[0].node else {
+            panic!("expected a LoadFrom statement");
+        };
+        assert_eq!(annotation.mode, AnnotationMode::Bounded);
+    }
+
+    /// A declaration may carry an annotation and no value only under the
+    /// decorator, which is what supplies the value.
+    #[test]
+    fn a_bare_annotation_is_still_a_parse_error() {
+        let r = parse_module("x: Int\n");
+        assert!(
+            !r.errors.is_empty(),
+            "a declaration with no value and no decorator is a parse error"
         );
     }
 
