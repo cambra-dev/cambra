@@ -309,8 +309,10 @@ pub(super) fn lower_final_stmt(
         ChlStmt::For {
             target,
             iter,
+            guard,
             body: for_body,
         } => {
+            let for_body = &guarded_body(guard, for_body);
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
@@ -985,9 +987,10 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::For {
             target,
             iter,
+            guard,
             body: for_body,
-            ..
         } => {
+            let for_body = &guarded_body(guard, for_body);
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
 

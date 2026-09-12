@@ -244,10 +244,13 @@ pub enum Stmt {
         arms: Vec<MatchArm>,
     },
 
-    /// `for target in iter: body`.
+    /// `for target in iter [if guard]: body`.
     For {
         target: Spanned<AssignTarget>,
         iter: Spanned<Expr>,
+        /// The header's `if`, where it has one — kept as written rather than folded
+        /// into `body`, as a comprehension keeps its own ([`CompClause::If`]).
+        guard: Option<Spanned<Expr>>,
         body: Vec<Spanned<Stmt>>,
     },
 

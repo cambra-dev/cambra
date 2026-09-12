@@ -631,6 +631,28 @@ fn a_for_in_a_block_folds_the_read_your_writes_environment() {
     );
 }
 
+/// A **guarded** `for` header inside a transaction — the checkout drain's shape.
+///
+/// The guard runs the body only where it holds and leaves the iteration alone, so it is the
+/// body wrapped in `if` (`docs/chl-spec.md`, "4.6 `for` — iteration"). Nothing about it is
+/// transactional; what makes it worth pinning here is that the writes it guards are.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_for_header_takes_a_guard() {
+    check_scalar(
+        indoc! {r"
+            m: Mut(Int, Txn) := 0
+            for req in [1]:
+                with begin():
+                    for r in [1, 2, 3, 4] if r > 2:
+                        m := m + r
+            await_final(m)
+        "},
+        // 3 + 4; the rows below the guard contribute nothing.
+        Value::Int(7),
+    );
+}
+
 /// The block continues from the environment the loop left: a spine feed *after*
 /// the loop replies the folded value, not the snapshot.
 ///

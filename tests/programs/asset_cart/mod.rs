@@ -407,13 +407,15 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
 // v1 — the map-based cart
 // ---------------------------------------------------------------------------
 
-/// `v1.cambra` is blocked in the front end, on a **filter in a statement `for`
-/// header**.
+/// `v1.cambra` is blocked in lowering, on an **entry binder in a statement `for`
+/// inside a transaction**.
 ///
 /// `for (a, t) -> q in cart if a == r.account:` — the checkout's
-/// credit-and-drain — is what the expression grammar ends at the `:`, reporting
-/// a binary operator expected. A comprehension takes `if`; a loop header does
-/// not, and the drain is written as one.
+/// credit-and-drain — parses now: a loop header takes an `if`, which folds into
+/// the body it guards (`docs/chl-spec.md`, "4.6 `for` — iteration"). What it
+/// meets is the target: the transaction path reads a loop's binder by name where
+/// the induction path classifies it, so a two-tuple binder is refused there and
+/// nowhere else.
 ///
 /// Behind that sits one wall, not the three the entry-iteration work measured.
 /// A compound key `(a, t)` is taken apart now, by the binder or by the program's
@@ -447,10 +449,11 @@ fn asset_cart_v1_currently_blocked_on_entry_iteration() {
     // the *first* thing v1 meets rather than the deepest: a pin on a later wall
     // would go green the moment an earlier one moved, and this test's whole job
     // is to fail loudly when the blocker changes — which is how it caught that
-    // entry iteration, `for`-in-a-block and the compound key had landed.
+    // entry iteration, `for`-in-a-block, the compound key and the header's `if`
+    // had landed.
     expect_compile_error(
         include_str!("v1.cambra"),
-        "found ':', expected binary operator",
+        "for-loop target: only simple name targets are supported",
     );
 }
 

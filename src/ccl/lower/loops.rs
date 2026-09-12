@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 
+use std::borrow::Cow;
+
 use super::*;
 use crate::{
     ccl::{Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
@@ -588,7 +590,13 @@ fn lower_for_body_terminal(
                 stmt.span,
             ))
         }
-        ChlStmt::For { target, iter, body } => {
+        ChlStmt::For {
+            target,
+            iter,
+            guard,
+            body,
+        } => {
+            let body = &guarded_body(guard, body);
             let binder = IterBinder::classify(target, "for-loop target")?;
             let (inner_source, binder) = binder.source(lower_expr(iter, ctx)?, iter.span, ctx);
             let inner_var = binder.param().to_string();
@@ -1289,6 +1297,36 @@ pub(super) fn lower_generator_or_mutation_loop(
     } else {
         lower_direct_mirror_loop(site, continuation, None, ctx)
     }
+}
+
+/// A `for` header's `if`, folded into the body it guards.
+///
+/// `for x in xs if p: body` runs `body` only where `p` holds, which is `for x in xs: if p:
+/// body` — the guard is a fact about the body rather than about the iteration, so the loop's
+/// source is untouched and the extent it sweeps is unchanged. That is the difference from a
+/// comprehension's `if`, which narrows the collection being built
+/// (`docs/chl-spec.md`, "4.6 `for` — iteration").
+///
+/// Folding here rather than in the parser keeps the header as written in the AST, which is
+/// where a comprehension keeps its own clause, and gives every lowering context one answer
+/// instead of three.
+pub(super) fn guarded_body<'a>(
+    guard: &Option<Spanned<ChlExpr>>,
+    body: &'a [Spanned<ChlStmt>],
+) -> Cow<'a, [Spanned<ChlStmt>]> {
+    let Some(cond) = guard else {
+        return Cow::Borrowed(body);
+    };
+    Cow::Owned(vec![Spanned::new(
+        cond.span,
+        ChlStmt::If {
+            branches: vec![IfBranch {
+                cond: cond.clone(),
+                body: body.to_vec(),
+            }],
+            else_body: None,
+        },
+    )])
 }
 
 #[cfg(test)]

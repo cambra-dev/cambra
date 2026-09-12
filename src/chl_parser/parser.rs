@@ -1194,17 +1194,29 @@ where
                 Spanned::new(e.span(), Stmt::Match { scrutinee, arms })
             });
 
-        // ---- for x in iter: body ------------------------------------
+        // ---- for x in iter [if guard]: body -------------------------
+        // The guard is the loop's own `if`, the same clause a comprehension takes
+        // (`docs/chl-spec.md`, "4.6 `for` — iteration"). It sits before the colon, so the
+        // iteration expression must not swallow it: `expr` here is the source alone.
         let for_stmt = just(Token::For)
             .ignore_then(expr.clone().try_map(|t, _| {
                 expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid for-loop target"))
             }))
             .then_ignore(just(Token::In))
             .then(expr.clone())
+            .then(just(Token::If).ignore_then(expr.clone()).or_not())
             .then_ignore(just(Token::Colon))
             .then(block.clone())
-            .map_with(|((target, iter), body), e| {
-                Spanned::new(e.span(), Stmt::For { target, iter, body })
+            .map_with(|(((target, iter), guard), body), e| {
+                Spanned::new(
+                    e.span(),
+                    Stmt::For {
+                        target,
+                        iter,
+                        guard,
+                        body,
+                    },
+                )
             });
 
         // ---- with <binding> = begin(): body -------------------------

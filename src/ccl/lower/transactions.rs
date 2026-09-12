@@ -330,7 +330,13 @@ fn lower_tx_stmts_onto(
             // whole remaining chain rather than one statement spliced before
             // `chain`: a copy of the body per element, each continuing into the
             // one after it and the last into the statements below the loop.
-            ChlStmt::For { target, iter, body } => {
+            ChlStmt::For {
+                target,
+                iter,
+                guard,
+                body,
+            } => {
+                let body = &guarded_body(guard, body);
                 lower_tx_for(target, iter, body, chain, outer_bindings, stmt.span, ctx)?
             }
             ChlStmt::With { .. } => {
