@@ -570,6 +570,22 @@ pub enum TypedExprNode {
     /// Field access `r.field` lowers to `Apply(r, Proj(ProjKey::Field("field")))`.
     Record(Vec<(String, TypedExpr)>),
 
+    /// The program's output list: one named output per entry.
+    ///
+    /// Lowering mints it at the tail of the root `Let*` chain when the program
+    /// binds a sink, so each entry's expression is in scope of the bindings
+    /// above it. Each entry compiles to its own operator and its own stream, and
+    /// the node never becomes a value — unlike a [`Record`](Self::Record), whose
+    /// fields are one value's.
+    ///
+    /// Shape does not recover the distinction: a program whose trailing
+    /// expression is a record literal has the same `Let*`-then-named-fields
+    /// form. Every pass that treats the two differently matches on the node.
+    ///
+    /// See `src/ccl/design/ir.md`, "`Outputs` — the program's output list, not a
+    /// record".
+    Outputs(Vec<(String, TypedExpr)>),
+
     /// A reference to an externally-registered data source, identified by name.
     ///
     /// Emitted by [`crate::ccl::lower`] when a zero-argument call is recognised
@@ -755,6 +771,7 @@ impl TypedExprNode {
             TypedExprNode::Tuple(_) => "Tuple",
             TypedExprNode::Proj(_) => "Proj",
             TypedExprNode::Record(_) => "Record",
+            TypedExprNode::Outputs(_) => "Outputs",
             TypedExprNode::Source(_) => "Source",
             TypedExprNode::Carried(_) => "Carried",
             TypedExprNode::Compose(_) => "Compose",
@@ -1568,7 +1585,9 @@ impl TypedExpr {
                 }
             }
             TypedExprNode::VariantCtor { payload, .. } => f(payload.as_ref()),
-            TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
+            TypedExprNode::Record(fields) | TypedExprNode::Outputs(fields) => {
+                fields.iter().for_each(|(_, e)| f(e))
+            }
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
             // skips it (its type residue is reached via `expr.ty` walks). Child
             // order mirrors `walk_transact`: each key's init, then each writer's
@@ -1759,7 +1778,9 @@ impl TypedExpr {
                 }
             }
             TypedExprNode::VariantCtor { payload, .. } => f(payload.as_mut()),
-            TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
+            TypedExprNode::Record(fields) | TypedExprNode::Outputs(fields) => {
+                fields.iter_mut().for_each(|(_, e)| f(e))
+            }
             // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
             // Child order mirrors `walk_transact`.
             TypedExprNode::Transact { keys, writers, .. } => {
@@ -1852,6 +1873,7 @@ impl TypedExpr {
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
             | TypedExprNode::Record(_)
+            | TypedExprNode::Outputs(_)
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
             | TypedExprNode::DisjointJoin(_)
@@ -1902,6 +1924,7 @@ impl TypedExpr {
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
             | TypedExprNode::Record(_)
+            | TypedExprNode::Outputs(_)
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
             | TypedExprNode::DisjointJoin(_)

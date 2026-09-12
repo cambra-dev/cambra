@@ -405,6 +405,14 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
 
+        TypedExprNode::Outputs(outs) => {
+            let items: Vec<_> = outs
+                .iter()
+                .map(|(k, e)| format!("{k}: {}", fmt(e, Precedence::Lowest, opts)))
+                .collect();
+            (Precedence::Atom, format!("outputs({})", items.join(", ")))
+        }
+
         TypedExprNode::Case {
             scrutinee,
             branches,

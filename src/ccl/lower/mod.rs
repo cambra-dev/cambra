@@ -40,6 +40,7 @@
 //! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
 //! | Positional access `t.0` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Index`]`)` |
 //! | Collection lookup `c[k]` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
+//! | The output list of a program that binds a sink | [`TypedExprNode::Outputs`] at the tail of the root `Let*` chain |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
