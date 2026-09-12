@@ -258,6 +258,21 @@ fn test_refiltered_let_bound_comprehension() {
 #[timeout(Duration::from_secs(10))]
 // 1*(1+2+3) + 2*(1+2+3).
 #[case::correlated("sum([sum([v * r for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// A **collection** source, whose positions no extent describes: 1*(1+2) + 2*(1+2).
+#[case::collection_source(
+    "c = map([(\"a\", 1), (\"b\", 2)])\nsum([sum([v * r for v in c]) for r in [1, 2]])",
+    9
+)]
+// The same, binding the entry: the value comes back through the proven lookup, per row.
+#[case::collection_entry_value(
+    "c = map([(\"a\", 1), (\"b\", 2)])\nsum([sum([v * r for k -> v in c]) for r in [1, 2]])",
+    9
+)]
+// And reading the key: 1*(1+2) + 2*(1+2) over the keys 1 and 2.
+#[case::collection_entry_key(
+    "c = map([(1, 10), (2, 20)])\nsum([sum([k * r for k -> v in c]) for r in [1, 2]])",
+    9
+)]
 // (1+2+3) twice, the inner sum shared.
 #[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
 // The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
@@ -487,17 +502,29 @@ fn a_filtered_comprehension_over_a_map_is_not_reachable(#[case] comprehension: &
 /// collection source does anywhere.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_correlated_comprehension_runs_inside_a_transaction() {
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::list_source("sum([v * r for v in [1, 2, 3]])", 18)]
+// Over a collection, whose positions come from the data: 1*(1+2) + 2*(1+2).
+#[case::collection_source("sum([v * r for k -> v in c])", 9)]
+fn a_correlated_comprehension_runs_inside_a_transaction(
+    #[case] comprehension: &str,
+    #[case] total: i64,
+) {
     check_scalar(
-        indoc! {r"
-            n: Mut(Int, Txn) := 0
-            for r in [1, 2]:
-                with begin():
-                    n := n + sum([v * r for v in [1, 2, 3]])
-            await_final(n)
-        "},
-        // 1*(1+2+3) + 2*(1+2+3).
-        Value::Int(18),
+        &format!(
+            indoc! {r#"
+                c = map([("a", 1), ("b", 2)])
+                n: Mut(Int, Txn) := 0
+                for r in [1, 2]:
+                    with begin():
+                        n := n + {}
+                await_final(n)
+            "#},
+            comprehension
+        ),
+        Value::Int(total),
     );
 }
 

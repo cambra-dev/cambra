@@ -36,8 +36,8 @@ use crate::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
             FlattenTupleDomain, IterateExtent, Lookup, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Materialize, Memo, PermuteRecordDomain, ProductWithExtent,
-            Restrict, StreamMaterialized, TileOperator, Tiling, Uncurry, UnionOperator, VariantIs,
+            MapResultWithSource, Materialize, Memo, PermuteRecordDomain, Product, Restrict,
+            StreamMaterialized, TileOperator, Tiling, Uncurry, UnionOperator, VariantIs,
             VariantProject, VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
@@ -1812,11 +1812,20 @@ fn convert_impl_inner(
         }
 
         // map_domain transforms the codomain of its argument to a copy of the domain.
+        //
+        // With an input it is **applied** at each incoming value rather than iterated, the
+        // same two readings [`Converse`] has: a collection reached mid-chain is a function
+        // of what flows in. A key drawn from the collection's own domain comes back as
+        // itself, which is what makes `.1 ≫ (c ▷ map_domain)` the identity on the positions
+        // a correlated comprehension pairs.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::MapDomain) =>
         {
-            expect_no_input(input, "map_domain")?;
-            Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
+            let keys = Box::new(MapDomain::new(convert_impl(argument, None, ctx)?));
+            match input {
+                Some(input) => Ok(Box::new(MapResult::new(input, keys))),
+                None => Ok(keys),
+            }
         }
 
         // uncurry flattens a curried function into a sealed function with a pair domain.
@@ -2146,6 +2155,31 @@ fn convert_impl_inner(
             )))
         }
 
+        // A correlated inner comprehension whose inner source planning **named**
+        // (`src/ccl/planning/correlated.rs`). The source carries the positions in its
+        // codomain, so it compiles as its own iteration and [`Product`] pairs it with each
+        // outer row; everything after that is the arm below.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::CurryOver) =>
+        {
+            let outer = expect_input(input, "curry_over")?;
+            let TypedExprNode::Tuple(operands) = &argument.node else {
+                return Err(ConversionError::Unsupported(format!(
+                    "`curry_over` takes its source and its morphism as a pair, got `{}`",
+                    symbolic(argument)
+                )));
+            };
+            let [source, morphism] = operands.as_slice() else {
+                return Err(ConversionError::Unsupported(format!(
+                    "`curry_over` takes exactly a source and a morphism, got {} operands",
+                    operands.len()
+                )));
+            };
+            let inner = convert_impl(source, None, ctx)?;
+            let pairs = Box::new(Product::new(outer, inner));
+            convert_impl(morphism, Some(pairs), ctx)
+        }
+
         // **A correlated inner comprehension**: `curry(𝑔)` composed onto the outer stream,
         // where `𝑔` takes the pair `(outer value, inner position)` because the inner body reads
         // the outer binder. Running `𝑔` once per pair and grouping by the outer row is a
@@ -2177,7 +2211,7 @@ fn convert_impl_inner(
                 )));
             };
             let inner = ctx.extent_of(inner)?;
-            let pairs = Box::new(ProductWithExtent::new(outer, inner));
+            let pairs = Box::new(Product::new(outer, Box::new(IterateExtent::new(inner))));
             convert_impl(argument, Some(pairs), ctx)
         }
 

@@ -288,6 +288,21 @@ pub enum Builtin {
     EmptyMap,
     /// `curry : ((A, B) → C) → (A → (B → C))`.
     Curry,
+    /// `curry_over : ((𝐷 ⤇ 𝐾), ((𝐴, 𝐾) ⇒ 𝑉)) ⇒ (𝐴 ⇒ (𝐾 ⤇ 𝑉))` — [`Curry`](Self::Curry)
+    /// with the positions of the collection it produces **named by a source**.
+    ///
+    /// A curried morphism's collection is over the second half of its pair domain, and a
+    /// `curry` alone leaves that to the type. A type answers only where the positions are
+    /// an extent — a list's index range. Where they are a collection's own domain the type
+    /// says `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`, whose extent is all of `𝐾`
+    /// (`extent_of` strips refinements) and whose refinement is carried and never executed
+    /// (`src/ccl/ops.rs`, `Builtin::CollectionContains`). The positions are in the data,
+    /// and this is the term that says which data.
+    ///
+    /// **Born in planning**, by the recognizer in `src/ccl/planning/groupby.rs`, and so
+    /// carries no scheme: it stamps its own type, as planning's [`MapDomain`](Self::MapDomain)
+    /// mint does.
+    CurryOver,
     /// `const : A → (B → A)` — lift a value to a constant function.
     Const,
     /// `zip : ((A → B), (A → C)) → (A → (B, C))` — point-free product/fanout.
@@ -813,6 +828,7 @@ impl Builtin {
             Self::Box => "box",
             Self::EmptyMap => "empty_map",
             Self::Curry => "curry",
+            Self::CurryOver => "curry_over",
             Self::Const => "const",
             Self::Zip => "zip",
             Self::Apply => "apply",

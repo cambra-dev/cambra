@@ -1131,64 +1131,78 @@ impl TileProducer for StreamMaterializedProducer {
     }
 }
 
-/// Each row of a stream paired with every value of an **extent** — the cartesian product
+/// Each row of one stream paired with every position of another — the cartesian product
 /// that makes a *correlated* inner comprehension compilable.
 ///
-/// `lambda_elim` turns `[… f(r, v) … for v in xs]` written inside a `for r in …` into
-/// `curry(g)` over the outer stream, where `g` takes the pair `(r, v)`. Compiling that means
-/// running `g` once per pair and grouping the results by the outer row, which is
-/// [`Tiling::CurriedFunction`] — a collection per row. This builds the pairs; `g` then
-/// compiles over them like any other morphism over a stream, and the grouping is already
-/// there because this operator emits it.
+/// `lambda_elim` turns `[… f(r, v) … for v in xs]` written inside a `for r in …` into a
+/// curried morphism over the outer stream, taking the pair `(r, v)`. Compiling that means
+/// running the morphism once per pair and grouping the results by the outer row, which is
+/// [`Tiling::CurriedFunction`] — a collection per row. This builds the pairs; the morphism
+/// then compiles over them like any other morphism over a stream, and the grouping is
+/// already there because this operator emits it.
 ///
-/// The inner side is an **extent** rather than a second stream, which is what the inner
-/// source being closed over the outer binder means: every row's group is the same set of
-/// positions, known from the type. A correlated source — each row's own collection — is the
-/// same output shape from a different builder ([`StreamMaterialized`]).
+/// **The inner side is a stream, not an extent**, and that is what lets one builder serve
+/// both sources a comprehension can have. A list's positions are its index range, so the
+/// inner stream is an `IterateExtent` over it. A collection's positions are its own domain,
+/// which no extent describes — `extent_of` strips the present-key refinement and answers
+/// the whole key type — so the inner stream is `MapDomain` of the collection. Both carry
+/// the positions in their codomain, which is all this reads.
 ///
-/// The codomain is the pair `g` reads: `_0` the row's value, `_1` the inner position.
-pub struct ProductWithExtent {
-    /// Output tiling: `CurriedFunction { domain1: input.domain, domain2: inner, codomain:
-    /// {_0: input codomain, _1: inner} }`.
+/// The codomain is the pair the morphism reads: `_0` the row's value, `_1` the position.
+pub struct Product {
+    /// Output tiling: `CurriedFunction { domain1: outer.domain, domain2: inner positions,
+    /// codomain: {_0: outer codomain, _1: inner positions} }`.
     base: OperatorBase,
     /// The outer stream, one group per row.
-    input: Box<dyn TileOperator>,
-    /// The inner positions, the same for every row.
-    inner: Extent,
+    outer: Box<dyn TileOperator>,
+    /// The inner stream, whose codomain is the positions every group holds.
+    inner: Box<dyn TileOperator>,
 }
 
-impl ProductWithExtent {
-    /// Pair every row of `input` with every value of `inner`.
-    pub fn new(input: Box<dyn TileOperator>, inner: Extent) -> Self {
-        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
+impl Product {
+    /// Pair every row of `outer` with every position `inner` carries.
+    pub fn new(outer: Box<dyn TileOperator>, inner: Box<dyn TileOperator>) -> Self {
+        let Tiling::SealedFunction { domain, codomain } = outer.tiling() else {
             panic!(
-                "ProductWithExtent expected a SealedFunction input, got {:?}",
-                input.tiling()
+                "Product expected a SealedFunction outer stream, got {:?}",
+                outer.tiling()
             )
         };
-        // The row's value as one extent, however many columns carry it: a product row spreads
-        // over a column per field, and the pair this builds holds it whole.
+        let Tiling::SealedFunction {
+            codomain: positions,
+            ..
+        } = inner.tiling()
+        else {
+            panic!(
+                "Product reads the inner positions off a stream's codomain, got {:?}",
+                inner.tiling()
+            )
+        };
+        let positions = positions.extent();
+        // The row's value as one extent, however many columns carry it: a product row
+        // spreads over a column per field, and the pair this builds holds it whole.
         let tiling = Tiling::CurriedFunction {
             domain1: domain.clone(),
-            domain2: inner.clone(),
+            domain2: positions.clone(),
             codomain: Extent::Record(HashMap::from([
                 (tuple_field(0), codomain.extent()),
-                (tuple_field(1), inner.clone()),
+                (tuple_field(1), positions),
             ])),
         };
         Self {
             base: OperatorBase::new(tiling),
-            input,
+            outer,
             inner,
         }
     }
 }
 
-impl TileOperator for ProductWithExtent {
+impl TileOperator for Product {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
-        visit(value("input", &*self.input));
+        visit(value("outer", &*self.outer));
+        visit(value("inner", &*self.inner));
     }
 
     fn subscribe_impl(
@@ -1197,69 +1211,102 @@ impl TileOperator for ProductWithExtent {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(ProductWithExtentProducer {
-            base: ProducerBase::new(ProductWithExtentProducer::alloc_id(), self.tiling()),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
-            inner: self.inner.clone(),
+        let shared = shared_consumer(consumer);
+        Box::new(ProductProducer {
+            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling()),
+            outer: self.outer.subscribe(
+                self.outer.tiling().universal_guard(),
+                forwarding_consumer(&shared),
+                scheduler,
+            ),
+            inner: self.inner.subscribe(
+                self.inner.tiling().universal_guard(),
+                forwarding_consumer(&shared),
+                scheduler,
+            ),
+            positions: None,
         })
     }
 }
 
-/// Producer for [`ProductWithExtent`].
-struct ProductWithExtentProducer {
+/// Producer for [`Product`].
+struct ProductProducer {
     base: ProducerBase,
     /// The outer stream.
-    input: Box<dyn TileProducer>,
-    /// The inner positions.
-    inner: Extent,
+    outer: Box<dyn TileProducer>,
+    /// The inner stream, read once for its positions.
+    inner: Box<dyn TileProducer>,
+    /// The positions, kept after the inner stream has delivered all of them.
+    ///
+    /// **Every group holds every position**, so a row cannot be emitted until the inner
+    /// side is complete — a group built from a prefix would claim a row finished with
+    /// positions still to come. The inner side of a correlated comprehension is closed over
+    /// the outer binder, so it is the same stream for every row and reading it once is all
+    /// this needs.
+    positions: Option<ColumnValue>,
 }
 
-impl TileProducer for ProductWithExtentProducer {
+impl TileProducer for ProductProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+        node.child("outer", self.outer.inspect(opts))
+            .child("inner", self.inner.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        if self.positions.is_none() {
+            let inner_tile = self.inner.get(self.inner.tiling().universal_guard());
+            if inner_tile.is_terminal() {
+                let Tile::SealedFunction { codomain, .. } = inner_tile else {
+                    panic!("Product expected a SealedFunction inner tile")
+                };
+                self.positions = Some(scalar_tile_to_column_value(*codomain));
+            }
+        }
+        let outer_tile = self.outer.get(self.outer.tiling().universal_guard());
         let Tile::SealedFunction {
             domain,
             codomain,
             domain_predicate,
             deleted,
-        } = input_tile
+        } = outer_tile
         else {
-            panic!("ProductWithExtent expected a SealedFunction tile, got {input_tile:?}")
+            panic!("Product expected a SealedFunction outer tile")
         };
         let outer = scalar_tile_to_column_value(*codomain);
-        let positions = iterate_extent(&self.inner, "ProductWithExtent");
-        let (rows, width) = (domain.len(), positions.len());
-        // An empty inner extent gives every row an empty group, which a curried tile cannot
-        // hold — its offsets are strictly ascending — so there is no group to emit at all.
-        if width == 0 {
-            return Tile::curried_function(
+        let empty = |positions: ColumnValue| {
+            Tile::curried_function(
                 domain.select_indices(iter::empty(), 0),
                 ColumnValue::UInts(Vec::new()),
-                positions.clone(),
+                positions.select_indices(iter::empty(), 0),
                 ColumnValue::Records(HashMap::from([
                     (tuple_field(0), outer.select_indices(iter::empty(), 0)),
-                    (tuple_field(1), positions),
+                    (tuple_field(1), positions.select_indices(iter::empty(), 0)),
                 ])),
-                domain_predicate,
+                Predicate::False,
                 BitSet::new(),
-            );
+            )
+        };
+        // Nothing to pair against yet, or nothing to pair: an empty inner side gives every
+        // row an empty group, which a curried tile cannot hold — its offsets are strictly
+        // ascending — so there is no group to emit.
+        let Some(positions) = self.positions.clone() else {
+            return empty(ColumnValue::UInts(Vec::new()));
+        };
+        let (rows, width) = (domain.len(), positions.len());
+        if width == 0 || rows == 0 {
+            return empty(positions);
         }
         let total = rows * width;
-        // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the outer value
+        // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the row's value
         // repeats across its own group and the positions repeat across rows.
         let outer_column = outer.select_indices((0..total).map(|i| i / width), total);
         let position_column = positions.select_indices((0..total).map(|i| i % width), total);
-        // **Every row's group is the whole extent**, so a row is complete as soon as it
+        // **Every row's group is every position**, so a row is complete as soon as it
         // arrives — the same statement [`StreamMaterialized`] makes about a map value
-        // carrying its own keys, and what lets an aggregate over one settle per row.
+        // carrying its own keys, and what lets an aggregate over one settle per row while
+        // the outer side stays open.
         let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain));
         let mut tile = Tile::curried_function(
             domain,
@@ -1276,14 +1323,20 @@ impl TileProducer for ProductWithExtentProducer {
         tile
     }
 
-    /// A row releases upstream; a **position within a row** releases nothing, the inner
-    /// extent being a fact about the type rather than something the input holds.
+    /// A row releases to the **outer** stream; a position within a row releases nothing.
+    ///
+    /// The positions are the inner stream's whole content, held here because every group
+    /// holds all of them, so one group being done says nothing about them. The inner side
+    /// is released when everything is.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         match obsolete_guard {
-            g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
-            g if g.is_empty() => self.input.release(self.input.tiling().empty_guard()),
+            g if g.is_universal() => {
+                self.outer.release(self.outer.tiling().universal_guard());
+                self.inner.release(self.inner.tiling().universal_guard());
+            }
+            g if g.is_empty() => self.outer.release(self.outer.tiling().empty_guard()),
             TileGuard::Function(FunctionGuard::Domain(p)) => self
-                .input
+                .outer
                 .release(TileGuard::Function(FunctionGuard::Domain(p))),
             TileGuard::Function(FunctionGuard::Codomain(_)) => {}
             TileGuard::Or(arms) => {
@@ -1291,7 +1344,7 @@ impl TileProducer for ProductWithExtentProducer {
                     self.release_impl(arm);
                 }
             }
-            g => todo!("ProductWithExtent cannot honor the release guard {g:?}"),
+            g => todo!("Product cannot honor the release guard {g:?}"),
         }
     }
 }

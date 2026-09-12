@@ -167,12 +167,22 @@ is what it means for the inner source to be closed: every row iterates the same 
 the type is what names them. A per-row inner collection is the same output shape from a
 different builder ([Reading a collection held per row](#reading-a-collection-held-per-row)).
 
-Two shapes still reach this and are not compiled. A correlated comprehension over a
-**collection** source composes `map_domain` mid-chain, which asserts it takes no input,
-because a collection reached through the pair is applied at the incoming key rather than
-iterated. And a correlated **filter** lowers to a shape whose predicate still names the outer
-binder at op-conversion ("unrecognised Var"). Both are needed before `asset_cart/v1.cambra`
-compiles; a list source in either position works today.
+**Where the positions come from is what the term has to say.** A list's are its index range,
+which the type names. A collection's are its own domain, which no extent describes —
+`extent_of` strips the present-key refinement and answers the whole key type, and the
+refinement is carried and never executed. So planning names the source
+(`src/ccl/planning/correlated.rs`) and the site becomes [`Builtin::CurryOver`], whose first
+operand compiles as its own iteration; the extent read stays as the fallback for a site
+planning did not rewrite.
+
+Two operators gain a second reading from this, each one a consumer now meeting a per-row
+stream. `map_domain` with an input is **applied** at the incoming value rather than iterated,
+the two readings `Converse` already had — a key drawn from a collection's own domain comes
+back as itself. And `Lookup` answers a *group of keys per row*, keeping the grouping: one
+answer per key, where its key sits.
+
+A correlated **filter** is the shape still not compiled; it lowers to a predicate that names
+the outer binder at op-conversion ("unrecognised Var").
 
 ### Reading a collection held per row
 

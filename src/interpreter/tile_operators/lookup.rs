@@ -172,6 +172,16 @@ fn answer_tiling(keys: &Tiling, answer_extent: Extent) -> Tiling {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(answer_extent)),
         },
+        // A **collection of keys per row** — what a correlated comprehension's key binder
+        // is, one group of keys per outer row. The answer keeps the grouping: one answer
+        // per key, where its key sits.
+        Tiling::CurriedFunction {
+            domain1, domain2, ..
+        } => Tiling::CurriedFunction {
+            domain1: domain1.clone(),
+            domain2: domain2.clone(),
+            codomain: answer_extent,
+        },
         other => panic!("Lookup keys must be a scalar or a stream, got {other}"),
     }
 }
@@ -366,6 +376,8 @@ impl TileProducer for LookupProducer {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
             Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+            // A collection of answers per row, one per key of that row's group.
+            Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
             other => panic!("Lookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
@@ -412,6 +424,42 @@ impl TileProducer for LookupProducer {
                             &RowCollection::Shared(&coll),
                         );
                         self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
+                    }
+                    // A group of keys per row: every key answered against the same
+                    // collection, the grouping carried through untouched. An undecided key
+                    // would have to re-offset the groups it left, so a tile that cannot
+                    // answer them all answers none and waits.
+                    Tile::CurriedFunction {
+                        ref domain1,
+                        ref offsets,
+                        ref domain2,
+                        ref codomain,
+                        ref domain_predicate,
+                        ..
+                    } => {
+                        let (kept, answers) = Self::answer_rows(
+                            self.form,
+                            domain2,
+                            codomain,
+                            &RowCollection::Shared(&coll),
+                        );
+                        if kept.len() < domain2.len() {
+                            return empty_scalar;
+                        }
+                        let Tiling::CurriedFunction {
+                            codomain: out_ext, ..
+                        } = self.tiling()
+                        else {
+                            panic!("Lookup answers a collection per row when its keys are one")
+                        };
+                        Tile::curried_function(
+                            domain1.clone(),
+                            offsets.clone(),
+                            domain2.clone(),
+                            ColumnValue::from_values(answers, out_ext),
+                            domain_predicate.clone(),
+                            BitSet::new(),
+                        )
                     }
                     other => {
                         panic!("Lookup keys tile as a scalar or a stream, got {other:?}")
