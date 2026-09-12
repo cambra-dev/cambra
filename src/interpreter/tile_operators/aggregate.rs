@@ -520,20 +520,40 @@ impl TileProducer for MapAggregateProducer {
         self.input.release(upstream_guard);
 
         // Build the output tile from all known per-key accumulators.
-        // TODO apply the domain predicate to each domain value.
-        let is_terminal = domain_predicate.as_bool().unwrap_or(false);
-        let n = self.accumulators.len();
-        let (domain_values, accumulator_values): (Vec<Value>, Vec<Value>) = self
+        //
+        // **Terminal per key, which is what the predicate says.** A `domain_predicate` names
+        // the region of `domain1` that will see no new elements, each key together with its
+        // whole list ([`Tile::CurriedFunction`]) — so a key inside it has a complete group
+        // and its accumulator is the answer, whatever the rest of the domain is still doing.
+        // Reading the predicate as one bool answers "not yet" for every key whenever any
+        // part of the domain is open, which is never right for a live source: a collection
+        // held per row is complete as soon as its row arrives, and an aggregate over one
+        // would otherwise never settle.
+        let (domain_values, accumulator_values, terminal): (Vec<Value>, Vec<Value>, BitVec) = self
             .accumulators
             .iter()
-            .map(|(key, acc)| (key.clone(), acc.as_single().unwrap()))
-            .unzip();
+            .map(|(key, acc)| {
+                (
+                    key.clone(),
+                    acc.as_single().unwrap(),
+                    domain_predicate.contains(key),
+                )
+            })
+            .fold(
+                (Vec::new(), Vec::new(), BitVec::new()),
+                |(mut keys, mut accs, mut term), (key, acc, is_terminal)| {
+                    keys.push(key);
+                    accs.push(acc);
+                    term.push(is_terminal);
+                    (keys, accs, term)
+                },
+            );
         Tile::SealedFunction {
             domain: ColumnValue::from_values(domain_values, &domain_extent),
             codomain: Box::new(Tile::Aggregation {
                 kind: self.kind,
                 accumulator: ColumnValue::from_values(accumulator_values, &output_extent),
-                terminal: ColumnValue::Bools(BitVec::from_elem(n, is_terminal)),
+                terminal: ColumnValue::Bools(terminal),
             }),
             domain_predicate,
             deleted: BitSet::new(),
@@ -631,12 +651,16 @@ mod tests {
         let _ = in_tiling;
     }
 
-    /// A **per-key** release must drop exactly those accumulators and forward the
-    /// same domain predicate upstream. `get_impl` rebuilds its output from every
-    /// accumulator it holds, so a kept-but-released key is re-emitted; and the
-    /// input's `domain1` is the same key set, so nothing else would reclaim it.
+    /// A **per-key** release drops exactly those accumulators. `get_impl` rebuilds its
+    /// output from every accumulator it holds, so a kept-but-released key is re-emitted.
+    ///
+    /// The input here declares itself final, so the first pull already releases it whole
+    /// ([`Tile::to_guard`]) and every later guard is covered by that one. Forwarding is
+    /// therefore not observable on this fixture, and
+    /// [`map_aggregate_forwards_a_per_key_release_to_an_open_input`] pins it on one where
+    /// it is.
     #[test]
-    fn map_aggregate_drops_and_forwards_a_per_key_release() {
+    fn map_aggregate_drops_a_per_key_release() {
         let key_extent = Extent::Base(BaseType::Int);
         let in_tiling = Tiling::CurriedFunction {
             domain1: key_extent.clone(),
@@ -682,9 +706,14 @@ mod tests {
         )));
         producer.release(key_one.clone());
 
+        // Key 1 is released at the input, by the universal release the first pull already
+        // issued. Which guard covered it is the sibling test's subject, not this one's.
         assert!(
-            released.borrow().contains(&key_one),
-            "the per-key release must reach the input, got {:?}",
+            released
+                .borrow()
+                .iter()
+                .any(|g| g.is_universal() || *g == key_one),
+            "the released key must be covered at the input, got {:?}",
             released.borrow()
         );
         let second = producer.get(out_tiling.universal_guard());
@@ -697,5 +726,63 @@ mod tests {
             "only the unreleased key may be emitted, got {second:?}"
         );
         assert_eq!(domain.len(), 1, "the released key must be gone: {second:?}");
+    }
+
+    /// A per-key release **reaches the input**, which the case above cannot show.
+    ///
+    /// The input's `domain_predicate` calls both groups whole without being `True`, so
+    /// [`Tile::to_guard`] answers a bounded `Domain` rather than the universal guard that
+    /// covers every later release. The only guard naming key 1 on its own is then the one
+    /// `release_impl` forwards. The input's `domain1` is this producer's accumulator key
+    /// set, so nothing else would reclaim the key.
+    #[test]
+    fn map_aggregate_forwards_a_per_key_release_to_an_open_input() {
+        let key_extent = Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::CurriedFunction {
+            domain1: key_extent.clone(),
+            domain2: Extent::Base(BaseType::Int),
+            codomain: Extent::Base(BaseType::Int),
+        };
+        let tile = Tile::curried_function(
+            ColumnValue::Ints(vec![1, 2]),
+            ColumnValue::from_uints(vec![0, 2]),
+            ColumnValue::Ints(vec![0, 1, 0, 1]),
+            ColumnValue::Ints(vec![10, 20, 30, 40]),
+            Predicate::LessThanEq(Value::Int(2)),
+            BitSet::new(),
+        );
+        let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
+        let out_tiling = Tiling::SealedFunction {
+            domain: key_extent,
+            codomain: Box::new(Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Extent::Base(BaseType::Int),
+            }),
+        };
+        let mut producer = MapAggregateProducer {
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+        };
+        producer.get(out_tiling.universal_guard());
+        assert!(
+            !released.borrow().iter().any(TileGuard::is_universal),
+            "a bounded predicate is not released whole, got {:?}",
+            released.borrow()
+        );
+
+        let key_one = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
+            intervalsets::IntervalSet::from(intervalsets::Interval::closed(
+                Value::Int(1),
+                Value::Int(1),
+            )),
+        )));
+        producer.release(key_one.clone());
+        assert!(
+            released.borrow().contains(&key_one),
+            "the per-key release must reach the input, got {:?}",
+            released.borrow()
+        );
     }
 }

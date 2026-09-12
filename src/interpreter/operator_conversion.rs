@@ -34,10 +34,11 @@ use crate::{
         operator_graph::{record_kept_operators, record_sink, record_source_read},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
-            MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling,
-            Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in, fan_in_named,
+            Filter, FlattenTupleDomain, IterateExtent, IterateRowCollection, MapAggregate,
+            MapDomain, MapExtractAggregate, MapFilter, MapResult, MapResultToConst,
+            MapResultToConstMode, MapResultWithSource, Memo, PermuteRecordDomain, Restrict,
+            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
+            fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -2236,10 +2237,22 @@ fn convert_impl_inner(
                 b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
                 b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(
-                    Box::new(MapAggregate::new(input, kind)),
-                    kind,
-                ))),
+                b if let Some(kind) = b.as_aggregate() => {
+                    // An aggregate iterates each row's collection, so it reads the
+                    // **streamed** shape. A transactional collection arrives materialized
+                    // — one map value per commit — which is the shape its store key holds
+                    // and the one [`CheckedLookup`] already reads; [`IterateRowCollection`] is the
+                    // adapter between the two.
+                    let input = if IterateRowCollection::adapts(input.tiling()) {
+                        Box::new(IterateRowCollection::new(input)) as Box<dyn TileOperator>
+                    } else {
+                        input
+                    };
+                    Ok(Box::new(MapExtractAggregate::new(
+                        Box::new(MapAggregate::new(input, kind)),
+                        kind,
+                    )))
+                }
                 _ => Err(ConversionError::Unsupported(format!(
                     "unsupported Builtin({}) in λ-free CCL",
                     b.name()
