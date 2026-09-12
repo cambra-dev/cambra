@@ -1589,11 +1589,21 @@ rejected as "if used as an expression, all branches must produce a value."
 ```python
 for target in iter:
     body
+
+for target in iter if guard:
+    body
 ```
 
 `target` is an `AssignTarget`; `iter` is any expression denoting a
 collection. The body executes once per element of `iter`, with
 `target` bound to the current element.
+
+A header's **`if`** runs the body only where the guard holds. It is the body
+wrapped in `if guard:`, so the iteration is unchanged and the loop sweeps the
+same extent either way — the difference from a comprehension's `if`, which
+narrows the collection being built. A guard over a body that opens a
+[transaction](#82-transactions-with-begin) is refused, the same refusal a
+written `if` around that block gets.
 
 **What the element is depends on the collection kind [Planned].** The iteration
 element is chosen per type — it is *not* uniformly the value:

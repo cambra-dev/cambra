@@ -25,6 +25,17 @@ for i in [1, 2, 3]:
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
+// A **guard** in the loop header. The body runs only where the guard holds, so the rows
+// below it contribute nothing; the iteration is untouched, which is the difference from a
+// comprehension's `if` (`docs/chl-spec.md`, "4.6 `for` — iteration").
+#[case(
+    r#"
+x := 0
+for i in [1, 2, 3, 4] if i > 2:
+    x += i
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![7]))
+)]
 // A mutable variable seeded from a **computed** expression rather than a literal.
 //
 // Every other case here seeds from a bare literal, which is a weaker exercise of the

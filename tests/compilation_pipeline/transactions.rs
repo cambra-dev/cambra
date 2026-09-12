@@ -3414,3 +3414,23 @@ fn guarded_induction_write_in_a_match_arm_is_rejected() {
         "is written under an `if` or a `match` arm inside",
     );
 }
+
+/// A header guard over a body that **opens a transaction** is refused.
+///
+/// The guard is the body wrapped in `if` (`docs/chl-spec.md`, "4.6 `for` — iteration"), so
+/// the refusal is the one a written `if` around the same block already gets — it falls out
+/// of the fold rather than being checked for at the header.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_for_header_guard_over_a_transaction_is_refused() {
+    check_compile_error(
+        indoc! {r"
+            x: Mut(Int, Txn) := 0
+            for i in [1, 2, 3, 4] if i > 2:
+                with begin():
+                    x := x + i
+            await_final(x)
+        "},
+        "a `with begin():` transaction inside an `if` in a for-loop body is not supported",
+    );
+}
