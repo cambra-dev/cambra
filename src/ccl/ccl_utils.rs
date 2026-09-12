@@ -1911,6 +1911,12 @@ impl<C> MemoStore<C> {
     /// Point `refinement` at `to`, counting it when the `Rc` actually changes.
     fn point_at(&mut self, refinement: &mut Refinement, to: Rc<Expr>) {
         if !Rc::ptr_eq(&refinement.predicate, &to) {
+            // The rewrite half of the boundary `Refinement::born` guards: a pass that
+            // substitutes into a predicate can put a whole function body there, and
+            // this is where such a term would be installed. Checked only where the
+            // term actually changes — re-pointing at the `Rc` already installed
+            // re-checks what was checked when it was installed.
+            crate::ccl::ty::debug_assert_predicate_shape(&to);
             self.revision += 1;
         }
         refinement.predicate = to;

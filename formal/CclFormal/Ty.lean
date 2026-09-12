@@ -62,18 +62,18 @@ inductive Predicate where
   | proj (a : Predicate) (k : FieldKey)
   | app (f a : Predicate)
   /-- A binder the predicate itself introduces — a filter's lambda. Carries no
-  parameter type: `eq_refinement_predicate`'s `Lambda` arm pairs the binders and
+  parameter type: `eq_term_modulo_ty_slots`'s `Lambda` arm pairs the binders and
   compares the bodies, and reads no type slot. -/
   | lam (body : Predicate)
   /-- A reference to one of this predicate's own `lam` binders, as the number of
   `lam`s crossed to reach it. The Rust compares such a reference **by position**
-  (`eq_refinement_predicate` pairs the two sides' binders), so spelling it as an index is what makes
+  (`eq_term_modulo_ty_slots` pairs the two sides' binders), so spelling it as an index is what makes
   structural equality here mean α-invariance there. A reference to a binder *outside* the predicate
   stays a `var`, compared by
   identity, which is the other half of that rule. -/
   | boundVar (k : Nat)
   /-- A cast embedded in a predicate, carrying its value and the refinement
-  predicates of its target's domain — and nothing else. `eq_refinement_predicate` compares a cast's
+  predicates of its target's domain — and nothing else. `eq_term_modulo_ty_slots` compares a cast's
   target because that target is a semantic filter: two predicates whose embedded comprehensions
   filter `> 0` and `< 0` denote different refinements, and conflating them would let a deficit
   accept an unsatisfied demand. It reads only what `cast_target_refinement` returns, the domain's

@@ -292,7 +292,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
         return None;
     }
     let path_pf = lambda_elim::run((**path_of).clone()).ok()?;
-    if !crate::ccl::eq_refinement_predicate(&path_pf, collection) {
+    if !crate::ccl::eq_term_modulo_ty_slots(&path_pf, collection) {
         return None;
     }
 
