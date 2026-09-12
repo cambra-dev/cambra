@@ -1317,8 +1317,8 @@ pub struct CompactGraph {
 /// Walk a `Type`, transitively expanding variable bounds at the
 /// appropriate polarity, and produce a CompactType.
 ///
-/// The `parents` set tracks variables whose bounds we are currently
-/// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
+/// The walk's [`Position`] tracks the variables whose bounds it is currently
+/// following, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
     compact_type_with(ty, true)
@@ -1349,7 +1349,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         collapse,
         scope: RefinementScope::default(),
     };
-    let term = compact_go(ty, true, &Subst::id(), None, false, &mut st);
+    let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
         refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
         "a position carrying content must carry a refinement slot: only a hole and a \
@@ -1433,6 +1433,46 @@ impl ParentPath<'_> {
     }
 }
 
+/// Where the walk stands relative to the position it entered.
+///
+/// The two fields say which position the walk is reading and how, and every step moves
+/// them together. Bundling them makes that hold by construction: a structural child takes
+/// `Position::default()`, a step along a variable's bound chain takes
+/// [`Position::under`], and a function's domain takes [`Position::domain_of`]. Nothing
+/// else constructs one, so no call site can reset half of a position.
+#[derive(Clone, Copy, Default)]
+struct Position<'a> {
+    /// The variables whose bounds the walk is currently following, deepest first.
+    /// `None` is the position itself; `Some` is one reached along a chain.
+    parents: Option<&'a ParentPath<'a>>,
+    /// Whether this position is a **data function's domain**, where variance does not
+    /// distinguish the two sides ([`crate::ccl::ty::FunKind::Data`]).
+    invariant: bool,
+}
+
+impl<'a> Position<'a> {
+    /// A function's domain, invariant when the function is a data function. A kind
+    /// variable that compaction has not narrowed resolves to `Unpinned`, which is not
+    /// data, so an undecided kind's domain is read like a compute one — the same
+    /// reading `Display` gives it (`⇒`).
+    fn domain_of(fun_kind: &crate::ccl::ty::FunKind) -> Self {
+        Position {
+            parents: None,
+            invariant: fun_kind.resolved().is_data(),
+        }
+    }
+
+    /// One step along a variable's bound chain: the same position, reached through
+    /// `path`. Whether it is a data domain rides along, because the chain has not left
+    /// the position.
+    fn under<'b>(self, path: &'b ParentPath<'b>) -> Position<'b> {
+        Position {
+            parents: Some(path),
+            invariant: self.invariant,
+        }
+    }
+}
+
 /// Whether any refinement in this position's own set references `binder` by *name*.
 ///
 /// The negation is the compaction boundary's form of **landing closes**: a refinement
@@ -1481,14 +1521,14 @@ fn refinements_name_binder(ct: &CompactType, binder: &Name) -> bool {
 /// and the join sitting there comes back as the domain's demand. See
 /// `design/type-inference.md`, "The collapse happens at the position".
 ///
-/// A structural boundary starts a new position, which is why [`compact_go`] resets
-/// `parents` to `None` at every structural child.
-fn fallback_allowed(parents: Option<&ParentPath<'_>>, st: &CompactState) -> bool {
-    st.collapse && parents.is_none()
+/// A structural boundary starts a new position, which is why [`compact_go`] passes
+/// `Position::default()` at every structural child.
+fn fallback_allowed(pos: Position<'_>, st: &CompactState) -> bool {
+    st.collapse && pos.parents.is_none()
 }
 
 /// Walk-wide state threaded through [`compact_go`]: the cycle-tracking tables.
-/// (`parents` stays a per-path argument — it is scoped to one variable's bound
+/// ([`Position`] stays a per-path argument — it is scoped to one variable's bound
 /// chain and reset across structural boundaries — and the substitution
 /// accumulator composes per edge.)
 struct CompactState {
@@ -1622,12 +1662,16 @@ fn compact_type_kind(
         TypeKind::Enumerated(domains) => CompactTypeKind::Enumerated(
             domains
                 .iter()
-                .map(|d| compact_go(d, pol, subst_acc, None, false, st))
+                .map(|d| compact_go(d, pol, subst_acc, Position::default(), st))
                 .collect(),
         ),
-        TypeKind::SubtypesOf(k) => {
-            CompactTypeKind::SubtypesOf(Box::new(compact_go(k, pol, subst_acc, None, false, st)))
-        }
+        TypeKind::SubtypesOf(k) => CompactTypeKind::SubtypesOf(Box::new(compact_go(
+            k,
+            pol,
+            subst_acc,
+            Position::default(),
+            st,
+        ))),
         TypeKind::UIntRanges => CompactTypeKind::UIntRanges,
         TypeKind::Type => CompactTypeKind::Type,
     }
@@ -1757,17 +1801,17 @@ fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> S
 /// silent, and what it produces is a shared clone whose interior was resolved
 /// against a different use's argument.
 ///
-/// `invariant` says the walk is inside a **data function's domain**, where variance
-/// does not distinguish the two sides. It propagates exactly where `parents` does —
-/// along a variable's bound chain and through a refinement's base, reset at every
-/// other structural child — because it answers a question about the position, and a
-/// structural child is a new one.
+/// `pos` says where the walk stands relative to the position it entered — the bound
+/// chain it is following, and whether that position is a data function's domain, where
+/// variance does not distinguish the two sides ([`Position`]). Both halves are set at a
+/// function's domain from its kind, propagate along a variable's bound chain and through
+/// a refinement's base, and reset at every other structural child, because they answer a
+/// question about the position and a structural child is a new one.
 fn compact_go(
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
-    parents: Option<&ParentPath<'_>>,
-    invariant: bool,
+    pos: Position<'_>,
     st: &mut CompactState,
 ) -> CompactType {
     match ty {
@@ -1810,7 +1854,7 @@ fn compact_go(
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
         Type::Refinement(inner, refinements) => {
-            let mut ct = compact_go(inner, pol, subst_acc, parents, invariant, st);
+            let mut ct = compact_go(inner, pol, subst_acc, pos, st);
             for r in refinements {
                 let r = subst_acc.force_refinement(r);
                 // References to the walk's enclosing binders become indices
@@ -1835,11 +1879,11 @@ fn compact_go(
             // arm's occurrences arrive already spelled in this function's binders.
             let owned_acc = fun_kind_correspondence(fun_kind, subst_acc);
             let subst_acc = &owned_acc;
-            // Function: domain is contravariant. A fresh `parents` set
-            // per child mirrors Scala's `Set.empty` argument — cycles
-            // span only one variable's bound chain, not across
-            // function boundaries.
-            let dom = compact_go(d, !pol, subst_acc, None, fun_kind.resolved().is_data(), st);
+            // Function: domain is contravariant, and each child is a new
+            // position — which for the parent path mirrors Scala's `Set.empty`
+            // argument, cycles spanning only one variable's bound chain and not
+            // crossing a function boundary.
+            let dom = compact_go(d, !pol, subst_acc, Position::domain_of(fun_kind), st);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain (it binds the name locally), so restrict it there.
             let cod_acc = match name {
@@ -1849,7 +1893,7 @@ fn compact_go(
             // Entering the codomain crosses this function — named or not, it
             // deepens what a refinement landing below closes against.
             st.scope.enter(name.clone());
-            let cod = compact_go(c, pol, &cod_acc, None, false, st);
+            let cod = compact_go(c, pol, &cod_acc, Position::default(), st);
             st.scope.exit();
             debug_assert!(
                 name.as_ref()
@@ -1943,7 +1987,7 @@ fn compact_go(
             for (i, v) in ts.iter().enumerate() {
                 compacted.insert(
                     FieldKey::Index(i),
-                    compact_go(v, pol, subst_acc, None, false, st),
+                    compact_go(v, pol, subst_acc, Position::default(), st),
                 );
             }
             CompactType {
@@ -1956,7 +2000,7 @@ fn compact_go(
             for (n, v) in fs {
                 compacted.insert(
                     FieldKey::Name(SmolStr::from(n.as_str())),
-                    compact_go(v, pol, subst_acc, None, false, st),
+                    compact_go(v, pol, subst_acc, Position::default(), st),
                 );
             }
             CompactType {
@@ -1971,7 +2015,10 @@ fn compact_go(
             // payload depth is unaffected.
             let mut compacted = BTreeMap::new();
             for (k, v) in tags {
-                compacted.insert(k.clone(), compact_go(v, pol, subst_acc, None, false, st));
+                compacted.insert(
+                    k.clone(),
+                    compact_go(v, pol, subst_acc, Position::default(), st),
+                );
             }
             CompactType {
                 var: Some(CompactVariant {
@@ -1984,15 +2031,15 @@ fn compact_go(
         // A history's children compact at the same polarity as the reference —
         // invariant in both (enforced at constraint time, so this is
         // materialization only; see the `CompactType::history_slot` docs).
-        // Fresh `parents` per child. The `kind` (overwrite vs
+        // A new position per child. The `kind` (overwrite vs
         // feed) rides along so coalesce rebuilds the same flavour.
         Type::History {
             value,
             domain,
             history_kind,
         } => {
-            let value = compact_go(value, pol, subst_acc, None, false, st);
-            let domain = compact_go(domain, pol, subst_acc, None, false, st);
+            let value = compact_go(value, pol, subst_acc, Position::default(), st);
+            let domain = compact_go(domain, pol, subst_acc, Position::default(), st);
             CompactType {
                 history_slot: Some((Box::new(value), Box::new(domain), *history_kind)),
                 ..CompactType::value()
@@ -2002,7 +2049,7 @@ fn compact_go(
             let uid = state.uid;
             let key = (uid, pol);
             if st.in_process.contains(&key) {
-                if parents.is_some_and(|p| p.contains(uid)) {
+                if pos.parents.is_some_and(|p| p.contains(uid)) {
                     // Spurious cycle (a <: b and b <: a with no
                     // structural intermediary). Drop the bound.
                     return CompactType::empty();
@@ -2091,8 +2138,11 @@ fn compact_go(
             // Whether this variable is the *position* being materialized, which is
             // the only place the opposite-polarity collapse below may happen
             // ([`fallback_allowed`]).
-            let allow_fallback = fallback_allowed(parents, st);
-            let new_parents = ParentPath { uid, prev: parents };
+            let allow_fallback = fallback_allowed(pos, st);
+            let new_parents = ParentPath {
+                uid,
+                prev: pos.parents,
+            };
             let mut bound = CompactType::from_var(uid);
             for b in primary_bounds.iter() {
                 // Compose this edge's morphisms onto the accumulator before
@@ -2100,7 +2150,7 @@ fn compact_go(
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_go(&b.ty, pol, &inner_acc, Some(&new_parents), invariant, st);
+                let bc = compact_go(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
                 bound = CompactType::merge(pol, bound, bc);
             }
             // Whether the *shape* collapse fires: the primary walk produced no
@@ -2162,12 +2212,12 @@ fn compact_go(
             // both sides however the walk reached it"). `allow_fallback` still gates
             // the shape collapse, which is a choice rather than a narrowing.
             let read_opposite =
-                (allow_fallback && no_concrete) || (!pol && (allow_fallback || invariant));
+                (allow_fallback && no_concrete) || (!pol && (allow_fallback || pos.invariant));
             let mut recovered: Option<CompactType> = None;
             if read_opposite {
                 for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), invariant, st);
+                    let bc = compact_go(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
                     recovered = Some(match recovered {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
