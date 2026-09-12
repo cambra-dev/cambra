@@ -41,7 +41,19 @@ export type LiveGroup = {
       staleBy: number;
       producers: LiveProducer[];
     }
-  | { kind: "source"; nodeId: number; source: LiveSource }
+  | {
+      kind: "source";
+      nodeId: number;
+      source: LiveSource;
+      /**
+       * What crossed the channel, which the retained window cannot answer.
+       *
+       * A consumer releases a row from inside the pull that reads it, so the
+       * window is what no reader has finished with rather than what arrived.
+       * Empty for a source registered before anything was pushed.
+       */
+      producers: LiveProducer[];
+    }
   // Asked for, but nothing has ever arrived for it. Rendered rather than
   // omitted: a group that vanishes is indistinguishable from one never asked
   // for.
@@ -119,7 +131,9 @@ function group(
   label: string | undefined,
   status: LiveStatus,
 ): LiveGroup {
-  if (source !== undefined) return { kind: "source", nodeId, source, tags, label };
+  if (source !== undefined) {
+    return { kind: "source", nodeId, source, producers: entry?.producers ?? [], tags, label };
+  }
   if (entry !== undefined) {
     return {
       kind: "operator",
@@ -159,14 +173,14 @@ function serializeGroup(group: LiveGroup): string {
   switch (group.kind) {
     case "silent":
       return `${prefix}${headText(group)}\n  ${
-        group.ran ? "produced nothing during the run" : "not pulled yet"
+        group.ran ? "nothing flowed here during the run" : "nothing has flowed here yet"
       }`;
     case "source": {
-      const head = `${prefix}${headText(group)} — retained ${countOf(
-        group.source.rows.length,
-        group.source.total,
-      )}`;
-      return [head, ...group.source.rows.map((r) => `  ${rowText(r)}`)].join("\n");
+      const retained = `retained ${countOf(group.source.rows.length, group.source.total)}`;
+      const crossed = crossedText(group.producers);
+      const meta = crossed === null ? retained : `${crossed} · ${retained}`;
+      const head = `${prefix}${headText(group)} — ${meta}`;
+      return [head, ...rowsOf(group).map((r) => `  ${rowText(r)}`)].join("\n");
     }
     case "operator":
       return group.producers
@@ -480,17 +494,33 @@ export class LiveView {
 }
 
 function rowsOf(group: LiveGroup): LiveRow[] {
-  if (group.kind === "source") return group.source.rows;
+  // What crossed the channel, falling back to what it still holds: a source
+  // registered before anything was pushed has a window and no tail.
+  if (group.kind === "source") {
+    const crossed = group.producers.flatMap((p) => p.rows);
+    return crossed.length > 0 ? crossed : group.source.rows;
+  }
   if (group.kind === "operator") return group.producers.flatMap((p) => p.rows);
   return [];
 }
 
 function droppedOf(group: LiveGroup): number {
-  if (group.kind === "source") return group.source.dropped;
+  if (group.kind === "source") {
+    const crossed = group.producers.reduce((sum, p) => sum + p.dropped, 0);
+    return group.producers.length > 0 ? crossed : group.source.dropped;
+  }
   if (group.kind === "operator") {
     return group.producers.reduce((sum, p) => sum + p.dropped, 0);
   }
   return 0;
+}
+
+/** `shown of total` over a group's producers. */
+function crossedText(producers: readonly LiveProducer[]): string | null {
+  if (producers.length === 0) return null;
+  const shown = producers.reduce((sum, p) => sum + p.rows.length, 0);
+  const total = producers.reduce((sum, p) => sum + p.total, 0);
+  return `${countOf(shown, total)} crossed`;
 }
 
 function headText(group: LiveGroup): string {
@@ -512,14 +542,20 @@ function headText(group: LiveGroup): string {
 function metaText(group: LiveGroup, tick: number): string | null {
   switch (group.kind) {
     case "silent":
-      // Not "no values recorded", which reads as a defect. Nothing has pulled
-      // this operator: a recording is taken inside `get`, so an unexercised
-      // demand path has produced nothing. An `ExtractFinal` over a stream that
-      // never terminates is the permanent case, and after the run ends every
-      // silent operator is.
-      return group.ran ? "produced nothing during the run" : "not pulled yet";
-    case "source":
-      return `retained ${countOf(group.source.rows.length, group.source.total)}`;
+      // What the pane knows is that no row has ever reached this node, not why.
+      // A node whose last row-carrying answer is kept for the life of the run is
+      // silent either because nothing pulled it or because every pull answered
+      // empty, and the frame does not separate the two. An `ExtractFinal` over a
+      // stream that never terminates is the permanent case, and after the run
+      // ends every silent node is.
+      return group.ran ? "nothing flowed here during the run" : "nothing has flowed here yet";
+    case "source": {
+      // Both, because they answer different questions: what the stream has
+      // carried, and what the release protocol is still holding.
+      const retained = `retained ${countOf(group.source.rows.length, group.source.total)}`;
+      const crossed = crossedText(group.producers);
+      return crossed === null ? retained : `${crossed} · ${retained}`;
+    }
     case "operator": {
       const first = group.producers[0];
       if (first === undefined) return null;

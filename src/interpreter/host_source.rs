@@ -23,9 +23,10 @@
 //! [`TestDataSource`]: crate::interpreter::TestDataSource
 
 use crate::ccl::Type;
+use crate::ccl::provenance::NodeId;
 use crate::interpreter::{
     BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
-    stream_buffer::UIntStreamBuffer, tiling::Predicate,
+    stream_buffer::UIntStreamBuffer, tiling::Predicate, value_recorder::SharedRecorder,
 };
 
 /// A named, typed source whose rows arrive by [`push`](HostSource::push).
@@ -50,6 +51,14 @@ pub struct HostSource {
     ///
     /// [`check_for_new_data`]: DataSourceDomainExtentImpl::check_for_new_data
     pending: bool,
+
+    /// Where to record what arrives, and the graph node to record it under.
+    ///
+    /// Installed by [`Channels::observe`](crate::ccl::channels::Channels::observe)
+    /// after a compile, because the node is minted by that compile while the
+    /// source outlives it. `None` for a run with no inspector attached, which is
+    /// what makes recording cost nothing when nobody is watching.
+    observer: Option<(SharedRecorder, Option<NodeId>)>,
 }
 
 impl HostSource {
@@ -65,7 +74,13 @@ impl HostSource {
             row_type,
             row_extent,
             pending: false,
+            observer: None,
         }
+    }
+
+    /// Record what arrives here under `node_id`.
+    pub fn observe(&mut self, recorder: SharedRecorder, node_id: Option<NodeId>) {
+        self.observer = Some((recorder, node_id));
     }
 
     /// Append `rows` in order, minting one key per row.
@@ -76,9 +91,26 @@ impl HostSource {
     /// pushed; a new version of the source is a reload instead, which keeps the
     /// rows this source already holds.
     pub fn push(&mut self, rows: impl IntoIterator<Item = Value>) {
+        let first_key = self.buf.ready_size;
+        let mut arrived = Vec::new();
         for row in rows {
+            if self.observer.is_some() {
+                arrived.push(row.clone());
+            }
             self.buf.push(row);
             self.pending = true;
+        }
+        // After the buffer takes them, so a recorded row is one the program can
+        // be offered. Rows are cloned only under an observer: a run with no
+        // inspector pushes exactly what it did before.
+        if let Some((recorder, node_id)) = self.observer.as_ref() {
+            recorder.borrow_mut().record_channel(
+                *node_id,
+                &self.name,
+                "Source",
+                Some(first_key),
+                &arrived,
+            );
         }
     }
 

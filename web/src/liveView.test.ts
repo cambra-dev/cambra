@@ -101,6 +101,33 @@ describe("livePanelState", () => {
     const group = panel.groups[0];
     expect(group?.kind).toBe("source");
   });
+
+  // The window holds what no reader has finished with, which for a stream every
+  // consumer keeps up with is nothing. What crossed is the separate record.
+  it("shows what crossed a source whose window has been released", () => {
+    const drained: LiveSource = { ...source, total: 0, rows: [] };
+    const crossed = producer({
+      producer: "price_updates",
+      shape: "Source",
+      watermark: null,
+      total: 40,
+      dropped: 8,
+      rows: [{ key: "u39", value: '{ticker: "BTC-USD"}', deleted: false }],
+    });
+    const panel = livePanelState(
+      state({
+        tags: [{ id: "t208", label: "T208", anchorId: 208, nodes: [208], shown: true }],
+        sources: new Map([[208, drained]]),
+        nodes: new Map([[208, { tick: 5, producers: [crossed] }]]),
+      }),
+    );
+    if (panel.kind !== "groups") throw new Error("expected groups");
+    const group = panel.groups[0];
+    expect(group?.kind).toBe("source");
+    expect(serializeLivePanel(panel)).toContain("1 of 40 rows crossed");
+    expect(serializeLivePanel(panel)).toContain("retained 0 rows");
+    expect(serializeLivePanel(panel)).toContain('{ticker: "BTC-USD"}');
+  });
 });
 
 describe("serializeLivePanel", () => {

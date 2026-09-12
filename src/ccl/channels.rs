@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 use crate::ccl::Type;
 use crate::ccl::context::GlobalContext;
 use crate::ccl::lower::{LoweringContext, lower_type_expr};
+use crate::ccl::provenance::NodeId;
 use crate::chl_parser;
 use crate::interpreter::{
-    BaseType, Extent, HostSink, HostSource, Value, operator_conversion::ground_extent_of,
+    BaseType, Extent, HostSink, HostSource, Value,
+    operator_conversion::ground_extent_of,
+    operator_graph::{OperatorGraph, sink_nodes, source_nodes},
+    value_recorder::SharedRecorder,
 };
 
 /// Which way rows cross a channel.
@@ -274,6 +278,16 @@ fn row_type_of(decl: &ChannelDecl) -> Result<(Type, Extent), ChannelError> {
 pub struct Channels {
     sources: HashMap<String, Rc<RefCell<HostSource>>>,
     sinks: HashMap<String, Rc<HostSink>>,
+    /// Where to record what leaves through a sink, and the node to record it
+    /// under, installed by [`observe`](Channels::observe).
+    ///
+    /// Here rather than on [`HostSink`] because a sink is held as a bare `Rc`:
+    /// giving it an observer would mean new interior mutability on a participant
+    /// in the operator graph, where `Channels` is already the host's own handle
+    /// and already the place rows are drained. A source needs none of this — it
+    /// is held as `Rc<RefCell<HostSource>>`, so its observer rides the cell the
+    /// host already goes through to push.
+    sink_observer: RefCell<Option<(SharedRecorder, HashMap<String, NodeId>)>>,
 }
 
 impl Channels {
@@ -287,6 +301,29 @@ impl Channels {
         self.sinks.get(name)
     }
 
+    /// Take what the sink named `name` has served, recording it on the way out.
+    ///
+    /// The recording happens here rather than where a row arrives because a
+    /// drain is what takes the rows away: a host that drains every tick would
+    /// otherwise leave nothing for a frame to show. Every host drains through
+    /// this, so none of them has to remember to record.
+    pub fn drain_sink(&self, name: &str) -> Vec<Value> {
+        let Some(sink) = self.sinks.get(name) else {
+            return Vec::new();
+        };
+        let rows = sink.drain();
+        if let Some((recorder, nodes)) = self.sink_observer.borrow().as_ref() {
+            recorder.borrow_mut().record_channel(
+                nodes.get(name).copied(),
+                name,
+                "Sink",
+                None,
+                &rows,
+            );
+        }
+        rows
+    }
+
     /// Every sink, in declaration order of name.
     pub fn sinks(&self) -> impl Iterator<Item = (&str, &Rc<HostSink>)> {
         self.sinks.iter().map(|(n, s)| (n.as_str(), s))
@@ -295,6 +332,25 @@ impl Channels {
     /// Every source.
     pub fn sources(&self) -> impl Iterator<Item = (&str, &Rc<RefCell<HostSource>>)> {
         self.sources.iter().map(|(n, s)| (n.as_str(), s))
+    }
+
+    /// Record what crosses every channel into `recorder`, under the nodes
+    /// `graph` minted for them.
+    ///
+    /// Called after each compile, including a reload's: the channels outlive a
+    /// version while the nodes naming them do not, so a version's ids have to be
+    /// installed against the same handles the previous version's were.
+    ///
+    /// A channel the compiled program does not mention gets `None` for its node,
+    /// which records its rows under no node rather than under another version's.
+    pub fn observe(&self, recorder: &SharedRecorder, graph: &OperatorGraph) {
+        let sources = source_nodes(graph);
+        for (name, source) in self.sources() {
+            source
+                .borrow_mut()
+                .observe(recorder.clone(), sources.get(name).copied());
+        }
+        *self.sink_observer.borrow_mut() = Some((recorder.clone(), sink_nodes(graph)));
     }
 }
 

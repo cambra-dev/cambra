@@ -590,6 +590,21 @@ pub fn source_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, 
         .collect()
 }
 
+/// Every compiled sink's node, by the name it feeds.
+///
+/// Re-derived per version for the same reason [`source_nodes`] is: the ids are
+/// minted fresh on every compile.
+pub fn sink_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, NodeId> {
+    graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            GraphNode::Sink { id, name, .. } => Some((name.clone(), *id)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Note that the expression `expr` reads the source registered under `name`.
 ///
 /// The node itself is minted later, by [`materialize_sources`]: its row names

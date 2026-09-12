@@ -45,14 +45,23 @@ edges it already walks, which is why a node carries no depth.
 
 ### The live model is a separate path
 
-**Planned.** Inspecting a running program means reading values: clicking a `source` shows its most
-recent, not-yet-released data. A value is data-dependent and keyed by a tick, so it cannot ride a
-payload built at compile time.
-
-That path needs node identity in operator conversion and a tick channel. The first exists —
-conversion records, and `post-conversion` is a pane — and the tick channel does not. On the first,
-see
+A value is data-dependent and keyed by a tick, so it cannot ride a payload built at compile time.
+The live path is `frame.rs` over `/api/live`, and it names its nodes with the ids operator
+conversion records — see
 [provenance.md](../ccl/design/provenance.md#operator-conversion).
+
+A frame carries two records, which answer different questions.
+
+**What flowed through a node** is its tail. An operator's tail is its newest answer that carried
+rows, taken inside `TileProducer::get`; a channel's is the last rows to cross it, accumulated as
+they cross. Both are held for the life of the run. A ring of recent calls cannot stand in for
+either: a producer under a settling scheduler answers empty hundreds of times per row, so the ring
+holds nothing but empties by the time a frame renders, and a host pushing one row per tick would
+leave a one-row tail however long the feed ran.
+
+**What a source still holds** is its window: the keys no reader has released. A consumer releases a
+row from inside the pull that reads it, so a stream every consumer keeps up with has a full tail and
+an empty window.
 
 It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.

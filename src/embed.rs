@@ -144,6 +144,7 @@ impl Host {
                 .map_err(|errors| Box::new(EmbedError::Compile(errors)))?
         };
         let snapshot = snapshot_json(live.program(), name, 0);
+        channels.observe(&recorder, &live.program().operator_graph);
         let source_nodes = source_nodes(&live.program().operator_graph);
         Ok(Self {
             ctx,
@@ -234,7 +235,11 @@ impl Host {
         let windows = self.source_windows();
         self.ctx.scheduler().check_for_notifications();
 
-        let recorded = self.recorder.borrow().recorded();
+        // Production rather than recordings: every producer the pull touches
+        // records an answer whether or not it carried rows, so a quiet tick
+        // counted as production would replace `last_windows` with a window
+        // sampled when there was nothing in the buffer.
+        let recorded = self.recorder.borrow().produced();
         let produced = recorded != self.published_through.get();
         if produced {
             self.published_through.set(recorded);
@@ -243,10 +248,15 @@ impl Host {
         }
 
         let mut outputs = Vec::new();
-        for (name, sink) in self.channels.sinks() {
-            let rows = sink.drain();
+        let names: Vec<String> = self
+            .channels
+            .sinks()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        for name in names {
+            let rows = self.channels.drain_sink(&name);
             if !rows.is_empty() {
-                outputs.push((name.to_string(), rows));
+                outputs.push((name, rows));
             }
         }
         // A stable order, because `Channels` holds its sinks in a map and a host

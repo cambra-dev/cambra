@@ -153,8 +153,7 @@ pub fn write_sink_rows(channels: &Channels, out: &mut impl Write) -> std::io::Re
     let mut names: Vec<&str> = channels.sinks().map(|(name, _)| name).collect();
     names.sort_unstable();
     for name in names {
-        let sink = channels.sink(name).expect("a listed sink is registered");
-        let drained = sink.drain();
+        let drained = channels.drain_sink(name);
         if drained.is_empty() {
             continue;
         }

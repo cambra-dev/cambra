@@ -13,6 +13,11 @@
 //! the row cap is what makes the footprint `producers × recordings × rows`.
 //! Rendering on the driver thread is the cost of that bound, and it is also why
 //! no tile is cloned.
+//!
+//! What a pane asks of a node is what flowed through it, which a ring of recent
+//! calls cannot answer on its own: empties outnumber row-carrying answers by
+//! orders of magnitude, so each producer holds its last row-carrying recording
+//! outside the ring.
 
 use std::{
     cell::RefCell,
@@ -22,7 +27,10 @@ use std::{
 
 use crate::{
     ccl::provenance::NodeId,
-    interpreter::{tiling::Tile, types::ColumnValue},
+    interpreter::{
+        tiling::Tile,
+        types::{ColumnValue, Value},
+    },
 };
 
 /// Rows kept per recording.
@@ -110,9 +118,30 @@ impl Recording {
 pub struct ValueRecorder {
     tick: u64,
     next_seq: u64,
+    next_flow: u64,
     rows_per_recording: usize,
     recordings_per_producer: usize,
-    by_producer: HashMap<(Option<NodeId>, usize), VecDeque<Recording>>,
+    by_producer: HashMap<(Option<NodeId>, usize), ProducerLog>,
+}
+
+/// What one producer has returned: its recent calls, and the last call that
+/// carried rows.
+///
+/// Two questions rather than one. `recent` answers what the producer has been
+/// doing, empties included, which is where a watermark's progress is read. `tail`
+/// answers what flowed through it, and sits outside the ring because the two
+/// counts are orders of magnitude apart: an operator under a settling scheduler
+/// answers empty hundreds of times per row, so a ring deep enough to hold the
+/// row would have to be deeper than the busiest pass.
+///
+/// One recording, under the same row cap as any other, so the footprint stays
+/// `producers × (recordings + 1) × rows`.
+#[derive(Default)]
+struct ProducerLog {
+    /// Recent calls, empty or not, oldest first.
+    recent: VecDeque<Recording>,
+    /// The newest call that carried rows, which `recent` may have evicted.
+    tail: Option<Recording>,
 }
 
 impl ValueRecorder {
@@ -121,6 +150,7 @@ impl ValueRecorder {
         Self {
             tick: 0,
             next_seq: 0,
+            next_flow: 0,
             rows_per_recording,
             recordings_per_producer,
             by_producer: HashMap::new(),
@@ -156,6 +186,17 @@ impl ValueRecorder {
         self.next_seq
     }
 
+    /// Recordings that carried rows, since this recorder was built.
+    ///
+    /// Monotone like [`recorded`](Self::recorded), and what a publisher compares
+    /// against: a producer answers empty far more often than it answers with
+    /// data, so a tick counted by `recorded` counts the driver's timer rather
+    /// than the program's progress — and a frame published on one of those
+    /// re-samples every source window after the pull that drained it.
+    pub fn produced(&self) -> u64 {
+        self.next_flow
+    }
+
     /// Render `tile` and keep it, evicting this producer's oldest recording
     /// once the cap is reached.
     pub fn record(
@@ -179,16 +220,80 @@ impl ValueRecorder {
             total: rendered.total,
         };
         self.next_seq += 1;
+        let carried_rows = !recording.is_empty();
+        if carried_rows {
+            self.next_flow += 1;
+        }
 
         let cap = self.recordings_per_producer;
-        let slot = self
-            .by_producer
-            .entry((node_id, producer_id))
-            .or_insert_with(|| VecDeque::with_capacity(cap));
-        if slot.len() == cap {
-            slot.pop_front();
+        let log = self.by_producer.entry((node_id, producer_id)).or_default();
+        if carried_rows {
+            log.tail = Some(recording.clone());
         }
-        slot.push_back(recording);
+        if log.recent.len() == cap {
+            log.recent.pop_front();
+        }
+        log.recent.push_back(recording);
+    }
+
+    /// Extend one channel's tail with the rows that just crossed it.
+    ///
+    /// A channel's tail is the last [`rows_per_recording`](Self::new) rows to
+    /// cross it, accumulated; an operator's is its newest row-carrying answer.
+    /// The difference is in the thing being recorded rather than in the policy:
+    /// one `get` delivers a whole tile, so the tile is the unit, while rows cross
+    /// a channel a batch at a time and a host that pushes one row per tick would
+    /// otherwise leave a one-row tail no matter how long the feed ran.
+    ///
+    /// `first_key` is the arrival index of `rows[0]`, so the keys a reader sees
+    /// are the ones the source minted rather than a position within the tail.
+    /// `None` counts from what this channel has already carried, which is what a
+    /// sink has: its rows are numbered by arrival and nothing else mints a key.
+    ///
+    /// A channel builds no producer and takes no `get`, so it occupies producer
+    /// slot 0 under its own graph node, which no producer shares, and its ring
+    /// of recent calls stays empty.
+    pub fn record_channel(
+        &mut self,
+        node_id: Option<NodeId>,
+        name: &str,
+        shape: &'static str,
+        first_key: Option<usize>,
+        rows: &[Value],
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        self.next_seq += 1;
+        self.next_flow += 1;
+
+        let cap = self.rows_per_recording;
+        let log = self.by_producer.entry((node_id, 0)).or_default();
+        let tail = log.tail.get_or_insert_with(|| Recording {
+            tick: self.tick,
+            seq: 0,
+            node_id,
+            producer_id: 0,
+            producer: name.to_string(),
+            shape,
+            watermark: None,
+            note: None,
+            rows: Vec::new(),
+            total: 0,
+        });
+        let first_key = first_key.unwrap_or(tail.total);
+        tail.tick = self.tick;
+        tail.seq = self.next_seq - 1;
+        tail.total += rows.len();
+        tail.rows
+            .extend(rows.iter().enumerate().map(|(i, row)| RecordedRow {
+                key: Some(format!("u{}", first_key + i)),
+                value: row.to_string(),
+                deleted: false,
+            }));
+        if tail.rows.len() > cap {
+            tail.rows.drain(..tail.rows.len() - cap);
+        }
     }
 
     /// Forget everything one producer recorded.
@@ -218,7 +323,7 @@ impl ValueRecorder {
         self.by_producer
             .get(&(node_id, producer_id))
             .into_iter()
-            .flatten()
+            .flat_map(|log| log.recent.iter())
     }
 
     /// The producers recorded so far.
@@ -226,34 +331,45 @@ impl ValueRecorder {
         self.by_producer.keys().copied()
     }
 
-    /// The newest non-empty recording for one producer, and whether newer
-    /// recordings exist that carried nothing.
+    /// The newest recording for one producer that carried rows, and whether
+    /// newer recordings exist that carried nothing.
     ///
-    /// Collapsing here rather than at [`record`](Self::record) keeps the policy
-    /// revisable: a producer pulled twice in one tick answers the second call
-    /// empty, and another answers with the same tile twice, so neither
-    /// last-write-wins nor `Tile::merge` is correct. Two consumers pulling with
-    /// different projection guards could return disjoint partial answers, which
-    /// this drops; the kept recordings show that case if it occurs.
+    /// Read from [`ProducerLog`]'s preserved slot, which the call ring cannot
+    /// evict, so a producer that answered with rows once and empty a thousand
+    /// times since still reports the rows. Scanning the ring instead loses them:
+    /// the ring is sized for a progress signal, not for how long a row survives
+    /// a settling pass.
+    ///
+    /// Which recording wins is a choice rather than a merge: a producer pulled
+    /// twice in one tick answers the second call empty, and another answers with
+    /// the same tile twice, so neither last-write-wins nor `Tile::merge` is
+    /// correct. Two consumers pulling with different projection guards could
+    /// return disjoint partial answers, which this drops; the ring shows that
+    /// case if it occurs.
     pub fn latest_non_empty(
         &self,
         node_id: Option<NodeId>,
         producer_id: usize,
     ) -> Option<(&Recording, bool)> {
-        let slot = self.by_producer.get(&(node_id, producer_id))?;
-        let newest = slot.back()?;
-        let found = slot.iter().rev().find(|recording| !recording.is_empty())?;
-        Some((found, found.seq != newest.seq))
+        let log = self.by_producer.get(&(node_id, producer_id))?;
+        let found = log.tail.as_ref()?;
+        // A channel records no calls, so there is nothing newer for its rows to
+        // be stale against: what crossed it is what it last carried.
+        let stale = log
+            .recent
+            .back()
+            .is_some_and(|newest| found.seq != newest.seq);
+        Some((found, stale))
     }
 
     /// Total recordings kept, across every producer.
     pub fn len(&self) -> usize {
-        self.by_producer.values().map(VecDeque::len).sum()
+        self.by_producer.values().map(|log| log.recent.len()).sum()
     }
 
     /// Whether nothing has been recorded.
     pub fn is_empty(&self) -> bool {
-        self.by_producer.values().all(VecDeque::is_empty)
+        self.by_producer.values().all(|log| log.recent.is_empty())
     }
 }
 
@@ -434,16 +550,32 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             }],
             total: 1,
         },
-        Tile::Store { changes, .. } => Rendered {
-            shape: "Store",
-            watermark: None,
-            note: Some(
-                "a store is a changelog whose absent positions are decided by the latest \
-                 earlier change, so rendering it means folding rather than indexing",
-            ),
-            rows: Vec::new(),
-            total: changes.len(),
-        },
+        Tile::Store {
+            changes,
+            deltas,
+            frontier,
+            ..
+        } => {
+            // The change events themselves, rather than the step function they
+            // decide. A store is right-continuous over its whole decided prefix,
+            // so reading it *at a tick* means folding every earlier change; but
+            // what a reader asks of a slot is what was written to it and when,
+            // and that is the changelog unfolded.
+            let total = changes.len();
+            Rendered {
+                shape: "Store",
+                watermark: Some(format!("{frontier:?}")),
+                note: None,
+                rows: tail(total, limit)
+                    .map(|i| RecordedRow {
+                        key: Some(cell(changes, i)),
+                        value: cell(deltas, i),
+                        deleted: false,
+                    })
+                    .collect(),
+                total,
+            }
+        }
     }
 }
 
@@ -492,7 +624,7 @@ fn one_level(tile: &Tile, i: usize) -> String {
 fn group_len(offsets: &ColumnValue, flat_len: usize, i: usize) -> usize {
     let at = |j: usize| -> usize {
         match offsets.index_at(j) {
-            crate::interpreter::types::Value::UInt(u) => u,
+            Value::UInt(u) => u,
             other => panic!("a curried tile's offsets are UInts, found {other:?}"),
         }
     };
@@ -629,6 +761,45 @@ mod tests {
         assert_eq!(values(recording), vec!["\"a\"", "\"skip\"", "\"c\""]);
     }
 
+    /// A producer answers empty far more often than it answers with rows — an
+    /// operator under a settling scheduler does so hundreds of times per row —
+    /// so the ring of recent calls cannot be what the pane reads. Without a slot
+    /// the ring cannot evict, every such operator reports as though it had never
+    /// been pulled.
+    #[test]
+    fn rows_survive_more_empty_calls_than_the_ring_can_hold() {
+        let mut recorder = ValueRecorder::with_defaults();
+        recorder.record(None, 1, "Restrict#1", &sealed(&[0], &["a"], &[]));
+        for _ in 0..DEFAULT_RECORDINGS_PER_PRODUCER * 4 {
+            recorder.record(None, 1, "Restrict#1", &sealed(&[], &[], &[]));
+        }
+
+        let (recording, stale) = recorder
+            .latest_non_empty(None, 1)
+            .expect("the rows are kept");
+        assert_eq!(values(recording), vec!["\"a\""]);
+        assert!(stale, "newer calls carried nothing, so the rows are stale");
+        assert!(
+            recorder.recordings(None, 1).all(Recording::is_empty),
+            "the ring itself has evicted the row-carrying call",
+        );
+    }
+
+    /// The publish gate counts production rather than calls: a driver polling on
+    /// a timer records an empty answer per poll, and a frame published on one of
+    /// those re-samples every source window after the pull that drained it.
+    #[test]
+    fn only_a_call_carrying_rows_counts_as_production() {
+        let mut recorder = ValueRecorder::with_defaults();
+        recorder.record(None, 1, "Restrict#1", &sealed(&[], &[], &[]));
+        assert_eq!(recorder.produced(), 0);
+        assert_eq!(recorder.recorded(), 1);
+
+        recorder.record(None, 1, "Restrict#1", &sealed(&[0], &["a"], &[]));
+        assert_eq!(recorder.produced(), 1);
+        assert_eq!(recorder.recorded(), 2);
+    }
+
     #[test]
     fn a_recording_keeps_the_last_rows_and_counts_the_rest() {
         let mut recorder = ValueRecorder::new(2, 4);
@@ -748,8 +919,16 @@ mod tests {
         let recording = recorder.recordings(None, 1).next().expect("recorded");
         assert_eq!(recording.shape, "Store");
         assert_eq!(recording.total, 2);
-        assert!(recording.rows.is_empty());
-        assert!(recording.note.is_some(), "an unrendered shape says why");
+        assert_eq!(
+            recording
+                .rows
+                .iter()
+                .map(|r| r.key.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("u0".into()), Some("u1".into())],
+            "a store's rows are its change ticks",
+        );
+        assert_eq!(recording.watermark.as_deref(), Some("True"));
     }
 
     /// The count a publisher compares against to skip an unchanged frame. The

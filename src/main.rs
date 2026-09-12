@@ -9,7 +9,7 @@ use std::{
 
 use cambra::{
     ccl::{
-        channels::{ChannelDecl, ChannelFile},
+        channels::{ChannelDecl, ChannelFile, Channels},
         context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
         provenance::NodeId,
     },
@@ -102,6 +102,12 @@ struct InspectorView<'a> {
     source_node_ids: RefCell<HashMap<String, NodeId>>,
     /// The program's name, for the payload it renders.
     name: &'a str,
+    /// The host's channels, and where what crosses them is recorded.
+    ///
+    /// Held here because a channel's tail is named by the node this compile
+    /// minted for it, which is the one thing every field of this struct has in
+    /// common.
+    channels: Option<(&'a Channels, &'a SharedRecorder)>,
 }
 
 impl InspectorView<'_> {
@@ -112,6 +118,9 @@ impl InspectorView<'_> {
     fn follow(&self, live: &LiveProgram) {
         self.generation.set(self.generation.get() + 1);
         *self.source_node_ids.borrow_mut() = source_nodes(&live.program().operator_graph);
+        if let Some((channels, recorder)) = self.channels {
+            channels.observe(recorder, &live.program().operator_graph);
+        }
         if let Some(payload) = self.payload {
             payload.replace(snapshot_json(
                 live.program(),
@@ -197,7 +206,14 @@ fn run_program(
         generation: Cell::new(0),
         source_node_ids: RefCell::new(source_nodes(&live.program().operator_graph)),
         name: src_name,
+        channels: recorder.as_ref().map(|r| (&host_channels, r)),
     };
+    // What crosses a channel is recorded under the node this compile minted for
+    // it, so inspecting a source shows the feed and inspecting a sink shows what
+    // the program served. A reload re-installs these through `follow`.
+    if let Some((channels, recorder)) = view.channels {
+        channels.observe(recorder, &live.program().operator_graph);
+    }
 
     let control = match control_port.map(ControlPort::new).transpose() {
         Ok(control) => control,
@@ -207,24 +223,24 @@ fn run_program(
         }
     };
 
-    // Publishing sits between the pull and the release, so a source's retained
-    // window is sampled before anything is dropped from it.
-    //
-    // Only when a producer actually produced. The sink loop below polls on a
-    // 10ms timer and most polls record nothing, so publishing per iteration
-    // would broadcast an unchanged frame a hundred times a second and make
-    // `tick` count timer ticks rather than data. Returns whether it published,
-    // so the caller advances `tick` only over a tick that carried something.
+    // Only when a producer answered with rows. The sink loop below polls on a
+    // 10ms timer, and a poll that delivers nothing still records an empty answer
+    // from every producer it pulls — so gating on recordings rather than on
+    // production would broadcast an unchanged frame a hundred times a second,
+    // make `tick` count timer ticks rather than data, and pair each of those
+    // frames with a window sampled on a tick that carried nothing. Returns
+    // whether it published, so the caller advances `tick` only over a tick that
+    // carried something.
     let published_through = std::cell::Cell::new(0u64);
     let publish = |tick: u64, sources: &[SourceWindow]| -> bool {
         let (Some(frames), Some(recorder)) = (frames.as_ref(), recorder.as_ref()) else {
             return false;
         };
-        let recorded = recorder.borrow().recorded();
-        if recorded == published_through.get() {
+        let produced = recorder.borrow().produced();
+        if produced == published_through.get() {
             return false;
         }
-        published_through.set(recorded);
+        published_through.set(produced);
         frames.publish(recorder, sources, tick, view.generation.get());
         true
     };
@@ -362,8 +378,12 @@ fn run_program(
                     host_driver::push_line(&host_channels, &line);
                 }
             }
-            ctx.scheduler().check_for_notifications();
+            // Sampled before the pull, not after. A `Memo` releases its input
+            // from inside `get_impl`, so the release cascade reaches the source
+            // buffer partway through the pull, and a window read afterwards
+            // reports what the tick consumed rather than what it delivered.
             let sources = sample_sources(ctx.scheduler());
+            ctx.scheduler().check_for_notifications();
             if publish(tick, &sources) {
                 tick += 1;
             }

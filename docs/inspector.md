@@ -24,6 +24,13 @@ serves.
   the retained per-phase provenance shipped dense (self-edges included, so a
   monomorphization fan-out is just the non-self edges). Pre-inference holes
   (`_`/`?N`) show their resolved downstream type on hover.
+- **Values pane** — for a running program, what has flowed through the nodes a
+  reader has pinned. An operator shows its newest answer that carried rows, kept
+  for the life of the run however many empty pulls follow it; a host source
+  shows the rows that crossed it and, separately, the ones no reader has
+  released yet; a host sink shows what the program served. A node that has
+  carried nothing says so. The records and why they differ are in
+  [`src/inspector_model/design.md`](../src/inspector_model/design.md#the-live-model-is-a-separate-path).
 - **Refinement predicates** — a predicate riding a type slot is a node like any
   other, reaching the frontend as a child edge marked `predicate: true` rather
   than a positional one, so it links across panes the same way the value tree

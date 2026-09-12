@@ -35,6 +35,25 @@ fn ticker_row(field: &str, ticker: &str, value: i64) -> Value {
     )
 }
 
+/// One channel's recorded tail, by the name it was registered under.
+fn channel_tail<'a>(frame: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    frame["nodes"]
+        .as_array()?
+        .iter()
+        .flat_map(|node| node["producers"].as_array().into_iter().flatten())
+        .find(|producer| producer["producer"] == name)
+}
+
+/// The rendered values of a recorded producer's rows.
+fn row_values(producer: &serde_json::Value) -> Vec<String> {
+    producer["rows"]
+        .as_array()
+        .expect("a producer carries rows")
+        .iter()
+        .map(|row| row["value"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// Push a row and tick until the sinks answer, returning what they produced.
 ///
 /// A reader fires a tick or more after the write it reads, so a host that ticks
@@ -119,6 +138,161 @@ fn a_frame_carries_the_nodes_and_the_source_windows() {
     assert!(
         !named.contains(&"stdin"),
         "a source the program never reads is not part of the program; got {named:?}"
+    );
+}
+
+/// Inspecting a source shows the feed, including the rows the program filters
+/// out.
+///
+/// The retained window cannot answer this: a consumer releases a row from inside
+/// the pull that reads it, so by the time any frame renders, the buffer holds
+/// nothing. What crossed the channel is recorded as it crosses.
+#[test]
+fn a_source_tail_carries_the_whole_feed_after_its_rows_are_released() {
+    let mut host = asset_cart();
+    for (i, ticker) in ["BTC-USD", "DOGE-USD", "ETH-USD"].iter().enumerate() {
+        push_and_settle(
+            &mut host,
+            "price_updates",
+            ticker_row("price", ticker, (80_000 + i as i64) * SCALE),
+        );
+    }
+    push_and_settle(&mut host, "view_requests", Value::Bool(true));
+
+    let frame: serde_json::Value =
+        serde_json::from_str(&host.frame(false)).expect("a frame is valid JSON");
+    let feed = channel_tail(&frame, "price_updates").expect("the source records what crosses it");
+    assert_eq!(feed["total"], 3, "every pushed row crossed the channel");
+    let rows = row_values(feed);
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().any(|row| row.contains("DOGE-USD")),
+        "a ticker the program filters out still crossed the source; got {rows:?}"
+    );
+    assert!(
+        frame["sources"]
+            .as_array()
+            .expect("a frame carries a sources array")
+            .iter()
+            .any(|s| s["name"] == "price_updates"),
+        "the retained window still ships beside the tail"
+    );
+}
+
+/// Inspecting a sink shows the rows the program served, which a drain would
+/// otherwise have taken before any frame rendered.
+#[test]
+fn a_sink_tail_carries_the_line_the_program_served() {
+    let mut host = asset_cart();
+    push_and_settle(&mut host, "cart_changes", ticker_row("qty", "BTC-USD", 2));
+    push_and_settle(
+        &mut host,
+        "price_updates",
+        ticker_row("price", "BTC-USD", 81_692 * SCALE),
+    );
+    let outputs = push_and_settle(&mut host, "view_requests", Value::Bool(true));
+    assert!(!outputs.is_empty(), "the drain took the rows");
+
+    let frame: serde_json::Value =
+        serde_json::from_str(&host.frame(false)).expect("a frame is valid JSON");
+    let line = channel_tail(&frame, "btc_line").expect("the sink records what it served");
+    let rows = row_values(line);
+    assert_eq!(rows.len(), 1, "one view request serves one line");
+    assert!(
+        rows[0].contains(&format!("{}", 2 * 81_692 * SCALE)),
+        "the served line carries the priced total; got {rows:?}"
+    );
+}
+
+/// An operator that answered with rows once and empty ever since still reports
+/// the rows.
+///
+/// A filter over a host source is pulled hundreds of times per row by a settling
+/// scheduler, so the ring of recent calls has evicted the row-carrying answer
+/// long before a frame renders. Without the preserved tail every operator in the
+/// program reads as though it had never been pulled.
+#[test]
+fn an_operator_reports_rows_the_call_ring_has_evicted() {
+    let mut host = asset_cart();
+    push_and_settle(
+        &mut host,
+        "price_updates",
+        ticker_row("price", "BTC-USD", 81_692 * SCALE),
+    );
+    push_and_settle(&mut host, "view_requests", Value::Bool(true));
+
+    let frame: serde_json::Value =
+        serde_json::from_str(&host.frame(false)).expect("a frame is valid JSON");
+    let filtering: Vec<&serde_json::Value> = frame["nodes"]
+        .as_array()
+        .expect("a frame carries nodes")
+        .iter()
+        .flat_map(|n| n["producers"].as_array().expect("producers").iter())
+        .filter(|p| {
+            p["shape"] == "SealedFunction"
+                && p["producer"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("Restrict"))
+        })
+        .collect();
+    assert!(
+        !filtering.is_empty(),
+        "the three ingest filters lower to Restrict operators"
+    );
+    assert!(
+        filtering.iter().all(|p| p["total"].as_u64() == Some(1)),
+        "each filter saw the pushed row"
+    );
+    assert!(
+        filtering.iter().all(|p| p["stale"] == true),
+        "newer calls carried nothing, so the rows report as stale"
+    );
+}
+
+/// Inspecting a transactional slot shows what was written to it and when.
+///
+/// A store is a changelog, and reading it *at a tick* means folding every
+/// earlier change — which is why it once rendered as a count with no rows. What
+/// a reader asks of a slot is the changes themselves.
+#[test]
+fn a_store_carries_the_writes_that_landed_on_it() {
+    let mut host = asset_cart();
+    push_and_settle(&mut host, "cart_changes", ticker_row("qty", "BTC-USD", 2));
+    for i in 0..3 {
+        push_and_settle(
+            &mut host,
+            "price_updates",
+            ticker_row("price", "BTC-USD", (80_000 + i) * SCALE),
+        );
+    }
+
+    let frame: serde_json::Value =
+        serde_json::from_str(&host.frame(false)).expect("a frame is valid JSON");
+    let store = frame["nodes"]
+        .as_array()
+        .expect("a frame carries nodes")
+        .iter()
+        .flat_map(|n| n["producers"].as_array().into_iter().flatten())
+        // Found by what it carries rather than by its producer name: a name's
+        // ordinal counts every producer of that kind built in the process, so it
+        // names a different store depending on what else has compiled.
+        .find(|p| p["shape"] == "Store" && row_values(p).iter().any(|row| row.contains("btc_px")))
+        .expect("the btc slots commit through a store");
+
+    let rows = row_values(store);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("btc_qty") && row.contains("2")),
+        "the quantity write landed; got {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("btc_px") && row.contains(&format!("{}", 80_002 * SCALE))),
+        "the latest price write landed; got {rows:?}"
+    );
+    assert_eq!(
+        store["dropped"], 0,
+        "five writes sit well inside the row cap, so none are dropped"
     );
 }
 
