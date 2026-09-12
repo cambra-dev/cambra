@@ -365,6 +365,23 @@ and the marker then claims the remainder is exhaustive. No program observes the 
 a default arm being compiled from the `Case` (`test_default_arm_under_a_record_field`); the
 reading itself is pinned by `a_settled_negative_position_closes_an_open_child_demand`.
 
+**The gated merge pays a doubling of its own.** The gate confines the merge to the entered
+position, and a structural child *is* an entered position — `compact_go` takes a fresh
+`Position` at every one — so the merge re-opens one nesting level down and the walk doubles per
+contravariant flip. Measured in debug, median of three runs at equal test counts: the whole
+of `tests/type_check.rs` goes from 0.83s to 1.29s, and `test_groupby_key_relation_is_per_occurrence`
+— `def by_key(c, f): groupby(c, f)` at two types, the same program as above — from 0.56s to
+0.94s. `tests/compilation_pipeline` is flat, its time being execution rather than inference.
+
+What is absent is a **result memo**. `CompactState` carries `in_process`, which prunes cycles
+and caches nothing — it is removed again as each variable's walk returns — so a position
+reached twice is compacted twice. A `(uid, pol)` key would not be a correct memo: a position's
+reading also depends on `subst_acc` and on the refinement scope `st.scope` holds, so two
+entries at one variable and polarity are not interchangeable. Hash consing the rendered
+contribution keys on what was produced instead, and sidesteps that.
+
+**Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
+
 ##### An invariant position reads both sides however the walk reached it
 
 Elsewhere the merge fires only at a position, which `fallback_allowed` answers. That gate
@@ -393,28 +410,13 @@ domain reached twice reads as two that disagree
 (`higher_order_dependent_application_discharges_the_binder`). Identifying those two spellings
 is what letting the merge follow *every* chain would need first.
 
-**The gated merge pays a doubling of its own.** The gate confines the merge to the entered
-position, and a structural child *is* an entered position — `compact_go` resets `parents` to
-`None` at every one — so the merge re-opens one nesting level down and the walk doubles per
-contravariant flip. Measured in debug, median of three runs at equal test counts: the whole
-of `tests/type_check.rs` goes from 0.83s to 1.29s, and `test_groupby_key_relation_is_per_occurrence`
-— `def by_key(c, f): groupby(c, f)` at two types, the same program as above — from 0.56s to
-0.94s. `tests/compilation_pipeline` is flat, its time being execution rather than inference.
+#### Binder slots — filled during the coalesce walk (no lexical scope needed)
 
-What is absent is a **result memo**. `CompactState` carries `in_process`, which prunes cycles
-and caches nothing — it is removed again as each variable's walk returns — so a position
-reached twice is compacted twice. A `(uid, pol)` key would not be a correct memo: a position's
-reading also depends on `subst_acc` and on the refinement scope `st.scope` holds, so two
-entries at one variable and polarity are not interchangeable. Hash consing the rendered
-contribution keys on what was produced instead, and sidesteps that.
-
-**Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
-
-**Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no*
-scope lookup: it shares its binder's inference variable — a monomorphic `let` binds verbatim
-(`instantiate` freshens nothing) so every use coalesces to exactly what the binder coalesces to, and
-a *generalized* `let`'s uses are rewritten by the walk itself to reference per-type specializations
-(which does carry a scope — the walk's stack of specialization frames and shadow markers; see §3.1).
+A `Var` use needs *no* scope lookup: it shares its binder's inference variable — a monomorphic
+`let` binds verbatim (`instantiate` freshens nothing) so every use coalesces to exactly what the
+binder coalesces to, and a *generalized* `let`'s uses are rewritten by the walk itself to
+reference per-type specializations (which does carry a scope — the walk's stack of specialization
+frames and shadow markers; see §3.1).
 
 What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `For`'s target slot. Each is resolved explicitly in `coalesce_node`, mirroring its definition (inference runs before the mutability/transaction phases, so the recurrence carriers `LetRec`/`Transact` never reach coalesce):
 
