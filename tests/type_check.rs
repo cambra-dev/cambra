@@ -2947,7 +2947,7 @@ fn infer_and_check(code: &str) -> Type {
 /// The arms' refinements differ in the uid of the term lambda their filter
 /// introduces — `λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`, one per lowering —
 /// so the join rests on refinement identity being α-invariant
-/// (`eq_refinement_predicate`). Comparing that binder by name splits the refinement
+/// (`eq_term_modulo_ty_slots`). Comparing that binder by name splits the refinement
 /// set and a `Data` domain then reports two domains that do not join.
 #[test]
 fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {

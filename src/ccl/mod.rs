@@ -56,9 +56,9 @@ pub use ty::*;
 // `crate::ccl::X` paths:
 //   - `arena_enter` / `arena_exit` are used by `infer.rs`;
 //   - `fresh_infer_var_id` is used by `solver`;
-//   - `eq_refinement_predicate` is used by `subst.rs`.
+//   - `eq_term_modulo_ty_slots` is used by `subst.rs`.
 pub(crate) use infer_var::{arena_enter, arena_exit, fresh_infer_var_id};
-pub(crate) use ty::eq_refinement_predicate;
+pub(crate) use ty::eq_term_modulo_ty_slots;
 
 /// Reset all IDs allocated by ccl module counters. Test-only convenience for
 /// differential harnesses that re-run lowering + inference and need stable

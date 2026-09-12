@@ -3175,6 +3175,58 @@ pub const REFINEMENT_BINDER: &str = "__elem";
 /// ([`TraitInstance`](crate::ccl::infer::solver::traits::TraitInstance)).
 pub type RefinementTemplate = fn(&[TypedExpr]) -> TypedExpr;
 
+/// A refinement predicate is a **boolean expression over
+/// [`crate::ccl::REFINEMENT_BINDER`]**, so it holds none of the statement shapes a
+/// program body is built from.
+///
+/// Stated here because nothing else states it. It was previously implicit in
+/// [`eq_term_modulo_ty_slots`] having no arm for those shapes — which also made that
+/// walk answer for predicates only, while its other caller compares captured argument
+/// terms where the same shapes are ordinary. Separating the two puts the restriction
+/// at the boundary that installs a predicate, where a violation names the pass that
+/// built it instead of surfacing as an equality that lost reflexivity.
+///
+/// `LetRec` and `Transact` are excluded by phase order rather than by shape: the
+/// mutability-elimination phases mint them, and they run after everything that builds
+/// a predicate.
+#[track_caller]
+pub(crate) fn debug_assert_predicate_shape(predicate: &TypedExpr) {
+    #[cfg(debug_assertions)]
+    {
+        fn offending(e: &TypedExpr) -> Option<&'static str> {
+            use TypedExprNode as N;
+            let here = match &e.node {
+                N::MutDecl { .. } => Some("MutDecl"),
+                N::MutWrite { .. } => Some("MutWrite"),
+                N::For { .. } => Some("For"),
+                N::Begin { .. } => Some("Begin"),
+                N::LetRec { .. } => Some("LetRec"),
+                N::Transact { .. } => Some("Transact"),
+                _ => None,
+            };
+            if here.is_some() {
+                return here;
+            }
+            let mut found = None;
+            e.walk_children(|c| {
+                if found.is_none() {
+                    found = offending(c);
+                }
+            });
+            found
+        }
+        if let Some(shape) = offending(predicate) {
+            panic!(
+                "a refinement predicate holds a `{shape}`, which is a statement shape \
+                 rather than a boolean expression over the element binder: {}",
+                symbolic::symbolic(predicate),
+            );
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = predicate;
+}
+
 impl Refinement {
     /// Construct a refinement over a **genuinely new** predicate term — one this
     /// call site is *creating*, with no prior refinement identity to preserve
@@ -3185,6 +3237,7 @@ impl Refinement {
     /// [`crate::ccl::ccl_utils::PredMemo`] to keep occurrences that shared one
     /// `Rc` sharing one `Rc` (see the note on [`Refinement::predicate`]).
     pub fn born(predicate: Rc<TypedExpr>) -> Self {
+        debug_assert_predicate_shape(&predicate);
         Refinement { predicate }
     }
 
@@ -3216,7 +3269,7 @@ impl Refinement {
 
 impl PartialEq for Refinement {
     /// Two refinements match iff they carry structurally equal predicate
-    /// *terms* ([`eq_refinement_predicate`]). Structural equality makes
+    /// *terms* ([`eq_term_modulo_ty_slots`]). Structural equality makes
     /// refinement-bearing `Type`/`Expr` equality agnostic to *where* a
     /// predicate was constructed, so a `{D | p}` that join planning
     /// re-minted at a marker (`make_iterate` / `make_restrict` /
@@ -3244,23 +3297,30 @@ impl PartialEq for Refinement {
             return true;
         }
 
-        eq_refinement_predicate(&self.predicate, &other.predicate)
+        eq_term_modulo_ty_slots(&self.predicate, &other.predicate)
     }
 }
 
 impl Eq for Refinement {}
 
-/// The **"same-restriction" relation** on refinement predicate terms: the
-/// equality that backs [`Refinement`] and the counterpart of
-/// [`hash_refinement_predicate`]. It is *deliberately* type-blind — it compares
-/// node shape, scalar leaves (operators, builtins, literals, names, tags),
-/// binder names, and child `Expr`s pairwise, but never the embedded `Type`s
-/// (`ty` slots, annotations, binding types). Those are inference metadata, not
-/// part of what restriction a refinement imposes, and copies of one predicate
-/// legitimately differ in them (freshened for a specialization, rebuilt by a
-/// discharge, pinned at different use types). So this is a structural relation
-/// chosen for its context, not an approximation of a finer one — there is no
-/// plan to make it a derived `==` (which would wrongly compare those slots).
+/// Structural equality on **terms**, ignoring their type slots, and the counterpart
+/// of [`hash_term_modulo_ty_slots`]. It compares node shape, scalar leaves
+/// (operators, builtins, literals, names, tags), binder names, and child `Expr`s
+/// pairwise, but never the embedded `Type`s (`ty` slots, annotations, binding
+/// types). Those are inference metadata, and copies of one term legitimately differ
+/// in them (freshened for a specialization, rebuilt by a discharge, pinned at
+/// different use types). So this is a structural relation chosen for its context,
+/// not an approximation of a finer one — there is no plan to make it a derived `==`
+/// (which would wrongly compare those slots).
+///
+/// **Two callers, one relation, and the domain is the wider of the two.**
+/// [`Refinement`]'s `PartialEq` asks it about predicate terms, where it is the
+/// "same restriction" relation. [`crate::ccl::subst::Subst::eq_modulo_ty_slots`]
+/// asks it about a discharge's captured argument, which is *any* expression the
+/// program wrote — a function body among them. So every node a program can build
+/// needs an arm here, and the restriction that a predicate is a boolean expression
+/// over [`crate::ccl::REFINEMENT_BINDER`] is asserted where predicates are
+/// installed ([`Refinement::born`]) rather than left implicit in this match.
 ///
 /// The relation is **α-invariant**: a reference to a binder the predicate
 /// itself introduces compares by *position* rather than by name, so two
@@ -3273,7 +3333,7 @@ impl Eq for Refinement {}
 /// name, which is what keeps two refinements about different enclosing binders
 /// apart (uids make that comparison exact).
 ///
-/// [`hash_refinement_predicate`] threads the same scope and hashes a bound
+/// [`hash_term_modulo_ty_slots`] threads the same scope and hashes a bound
 /// reference by position, so the `Eq`/`Hash` contract survives α-invariance.
 ///
 /// One type-anchored slot **is** compared: a [`TypedExprNode::Cast`]'s
@@ -3288,15 +3348,15 @@ impl Eq for Refinement {}
 /// which is acyclic, so cast targets cannot cycle back into a term under
 /// comparison — no coinduction guard is needed.
 ///
-/// Everything this distinguishes beyond [`hash_refinement_predicate`]'s
+/// Everything this distinguishes beyond [`hash_term_modulo_ty_slots`]'s
 /// stream (binder names, `Source` names, record field names, pattern tags,
 /// cast-target predicates) makes eq finer than hash, preserving the
 /// `Eq`/`Hash` contract.
-pub(crate) fn eq_refinement_predicate(a: &TypedExpr, b: &TypedExpr) -> bool {
-    eq_refinement_predicate_go(a, b, &mut Vec::new())
+pub(crate) fn eq_term_modulo_ty_slots(a: &TypedExpr, b: &TypedExpr) -> bool {
+    eq_term_modulo_ty_slots_go(a, b, &mut Vec::new())
 }
 
-/// Binders the two sides of an [`eq_refinement_predicate`] comparison have
+/// Binders the two sides of an [`eq_term_modulo_ty_slots`] comparison have
 /// introduced, paired and innermost last. Two references match when they
 /// resolve to the same pair, or when neither resolves and they are the same
 /// name; a reference bound on one side only never matches. `rposition` is what
@@ -3328,13 +3388,13 @@ fn eq_under_binder(
     pairs.push((l.clone(), r.clone()));
     let matched = children
         .iter()
-        .all(|(x, y)| eq_refinement_predicate_go(x, y, pairs));
+        .all(|(x, y)| eq_term_modulo_ty_slots_go(x, y, pairs));
     pairs.pop();
     matched
 }
 
 /// Compare two cast targets' domain-refinement predicates term-wise (see
-/// [`eq_refinement_predicate`]). Pointer-equal predicates short-circuit;
+/// [`eq_term_modulo_ty_slots`]). Pointer-equal predicates short-circuit;
 /// otherwise the comparison recurses structurally (acyclic terms, so it
 /// terminates without a cycle guard).
 fn eq_cast_target_predicates(
@@ -3363,7 +3423,7 @@ fn eq_cast_target_predicates(
                 && s1.iter().all(|r1| {
                     s2.iter().any(|r2| {
                         Rc::ptr_eq(&r1.predicate, &r2.predicate)
-                            || eq_refinement_predicate_go(&r1.predicate, &r2.predicate, pairs)
+                            || eq_term_modulo_ty_slots_go(&r1.predicate, &r2.predicate, pairs)
                     })
                 })
         }
@@ -3471,8 +3531,8 @@ pub(crate) fn mentions_witness(ty: &Type, binder: &WitnessId) -> bool {
 /// A renaming of witness references, applied by [`Type::rename_witnesses`].
 pub type WitnessRenaming = std::collections::BTreeMap<WitnessId, WitnessId>;
 
-/// Recursive worker for [`eq_refinement_predicate`].
-fn eq_refinement_predicate_go(
+/// Recursive worker for [`eq_term_modulo_ty_slots`].
+fn eq_term_modulo_ty_slots_go(
     a: &TypedExpr,
     b: &TypedExpr,
     pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
@@ -3487,7 +3547,7 @@ fn eq_refinement_predicate_go(
             && xs
                 .iter()
                 .zip(ys)
-                .all(|(x, y)| eq_refinement_predicate_go(x, y, pairs))
+                .all(|(x, y)| eq_term_modulo_ty_slots_go(x, y, pairs))
     }
     match (&a.node, &b.node) {
         (N::Lit(x), N::Lit(y)) => x == y,
@@ -3505,7 +3565,7 @@ fn eq_refinement_predicate_go(
                 function: f2,
                 argument: a2,
             },
-        ) => eq_refinement_predicate_go(f1, f2, pairs) && eq_refinement_predicate_go(a1, a2, pairs),
+        ) => eq_term_modulo_ty_slots_go(f1, f2, pairs) && eq_term_modulo_ty_slots_go(a1, a2, pairs),
         (
             N::Cast {
                 value: v1,
@@ -3515,7 +3575,7 @@ fn eq_refinement_predicate_go(
                 value: v2,
                 target: t2,
             },
-        ) => eq_refinement_predicate_go(v1, v2, pairs) && eq_cast_target_predicates(t1, t2, pairs),
+        ) => eq_term_modulo_ty_slots_go(v1, v2, pairs) && eq_cast_target_predicates(t1, t2, pairs),
         (
             N::BinOp {
                 left: l1,
@@ -3529,11 +3589,11 @@ fn eq_refinement_predicate_go(
             },
         ) => {
             o1 == o2
-                && eq_refinement_predicate_go(l1, l2, pairs)
-                && eq_refinement_predicate_go(r1, r2, pairs)
+                && eq_term_modulo_ty_slots_go(l1, l2, pairs)
+                && eq_term_modulo_ty_slots_go(r1, r2, pairs)
         }
         (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => {
-            k1 == k2 && eq_refinement_predicate_go(e1, e2, pairs)
+            k1 == k2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)
         }
         (
             N::Lambda {
@@ -3559,7 +3619,7 @@ fn eq_refinement_predicate_go(
                 input: i2,
                 kind: k2,
             },
-        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2, pairs),
+        ) => k1 == k2 && eq_term_modulo_ty_slots_go(i1, i2, pairs),
         (
             N::Let {
                 binding: bd1,
@@ -3573,9 +3633,65 @@ fn eq_refinement_predicate_go(
             },
         ) => {
             // The definiens sits outside the binder, the body inside it.
-            eq_refinement_predicate_go(e1, e2, pairs)
+            eq_term_modulo_ty_slots_go(e1, e2, pairs)
                 && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
         }
+        (
+            N::MutDecl {
+                binding: bd1,
+                init: i1,
+                body: b1,
+            },
+            N::MutDecl {
+                binding: bd2,
+                init: i2,
+                body: b2,
+            },
+            // A mutable variable introduction binds exactly as a `let` does: the seed sits
+            // outside the binder, the body inside it.
+        ) => {
+            eq_term_modulo_ty_slots_go(i1, i2, pairs)
+                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
+        }
+        (
+            N::For {
+                target: t1,
+                iter: it1,
+                body: b1,
+            },
+            N::For {
+                target: t2,
+                iter: it2,
+                body: b2,
+            },
+            // The source is evaluated outside the loop; the target is bound over the body.
+        ) => {
+            eq_term_modulo_ty_slots_go(it1, it2, pairs)
+                && eq_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)])
+        }
+        (
+            N::MutWrite {
+                name: n1,
+                key: k1,
+                value: v1,
+            },
+            N::MutWrite {
+                name: n2,
+                key: k2,
+                value: v2,
+            },
+            // The written name is a *use* of the binder the introduction made, so it
+            // resolves through the pairing exactly as a `Feed`/`Define` name does.
+        ) => {
+            paired_refs_match(pairs, n1, n2)
+                && match (k1, k2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => eq_term_modulo_ty_slots_go(x, y, pairs),
+                    _ => false,
+                }
+                && eq_term_modulo_ty_slots_go(v1, v2, pairs)
+        }
+        (N::Begin { body: b1 }, N::Begin { body: b2 }) => eq_term_modulo_ty_slots_go(b1, b2, pairs),
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
@@ -3593,7 +3709,7 @@ fn eq_refinement_predicate_go(
         ) => {
             let scrutinee_eq = match (s1, s2) {
                 (None, None) => true,
-                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y, pairs),
+                (Some(x), Some(y)) => eq_term_modulo_ty_slots_go(x, y, pairs),
                 _ => false,
             };
             scrutinee_eq
@@ -3614,8 +3730,8 @@ fn eq_refinement_predicate_go(
                                 )
                         }
                         (None, None) => {
-                            eq_refinement_predicate_go(&x.guard, &y.guard, pairs)
-                                && eq_refinement_predicate_go(&x.body, &y.body, pairs)
+                            eq_term_modulo_ty_slots_go(&x.guard, &y.guard, pairs)
+                                && eq_term_modulo_ty_slots_go(&x.body, &y.body, pairs)
                         }
                         _ => false,
                     })
@@ -3629,15 +3745,15 @@ fn eq_refinement_predicate_go(
                 tag: t2,
                 payload: p2,
             },
-        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2, pairs),
+        ) => t1 == t2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
                 && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
-                    n1 == n2 && eq_refinement_predicate_go(e1, e2, pairs)
+                    n1 == n2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)
                 })
         }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
-            eq_refinement_predicate_go(e1, e2, pairs) && eq_refinement_predicate_go(b1, b2, pairs)
+            eq_term_modulo_ty_slots_go(e1, e2, pairs) && eq_term_modulo_ty_slots_go(b1, b2, pairs)
         }
         (
             N::Feed {
@@ -3660,22 +3776,28 @@ fn eq_refinement_predicate_go(
             },
             // A `Feed`/`Define` name is a *use* of the binder that introduced
             // the handle (`ccl::scope`), so it resolves like any reference.
-        ) => paired_refs_match(pairs, n1, n2) && eq_refinement_predicate_go(v1, v2, pairs),
+        ) => paired_refs_match(pairs, n1, n2) && eq_term_modulo_ty_slots_go(v1, v2, pairs),
         // A realized conditional collection. Reachable inside a predicate because a
         // filter's predicate carries its own copy of the source (`__elem ▷ src ▷ 𝑓`), so
         // when `src` is a conditional, realization rewrites it *in the predicate*.
-        (N::Realize(v1), N::Realize(v2)) => eq_refinement_predicate_go(v1, v2, pairs),
+        (N::Realize(v1), N::Realize(v2)) => eq_term_modulo_ty_slots_go(v1, v2, pairs),
         _ => {
             // **A missing arm is not "unequal", it is unanswered.** Falling through with
             // two nodes of the *same* shape means this function has no rule for that
-            // shape, and reporting `false` makes a predicate compare unequal to a
-            // structural copy of itself — reflexivity, quietly lost. It surfaces far away
-            // as a type mismatch whose two sides print identically, since the predicate is
-            // the one part of a type `Display` does not show.
+            // shape, and reporting `false` makes a term compare unequal to a structural
+            // copy of itself — reflexivity, quietly lost. It surfaces far away as a type
+            // mismatch whose two sides print identically, since a predicate is the one
+            // part of a type `Display` does not show.
+            //
+            // `LetRec` and `Transact` are the shapes deliberately left out: the
+            // mutability-elimination phases mint them, inference runs before those
+            // phases (`src/ccl/design/type-inference.md`, "Pass 2: Coalesce and
+            // Write-back"), and both callers of this walk run during inference. One
+            // reaching here is a phase-order violation rather than a missing arm.
             debug_assert!(
                 std::mem::discriminant(&a.node) != std::mem::discriminant(&b.node),
-                "eq_refinement_predicate has no arm for {:?}; two nodes of one shape \
-                 compared unequal, so a rebuilt predicate no longer equals itself",
+                "eq_term_modulo_ty_slots has no arm for {:?}; two nodes of one shape \
+                 compared unequal, so a rebuilt term no longer equals itself",
                 std::mem::discriminant(&a.node),
             );
             false
@@ -3684,7 +3806,7 @@ fn eq_refinement_predicate_go(
 }
 
 /// Structural hash of a refinement predicate, the hashing counterpart of
-/// [`eq_refinement_predicate`]: it hashes the predicate's node discriminant
+/// [`eq_term_modulo_ty_slots`]: it hashes the predicate's node discriminant
 /// and scalar leaves (operators, builtins, literals, names) and recurses
 /// into child `Expr`s, but never hashes the embedded `Type`s. Skipping
 /// types keeps the hash stable while inference resolves the predicate's
@@ -3694,10 +3816,10 @@ fn eq_refinement_predicate_go(
 /// A reference to a binder the predicate itself introduces hashes as that
 /// binder's **position**, not its name, which is what makes the hash
 /// α-invariant alongside `eq`. `scope` carries the binders in scope, innermost
-/// last, exactly as [`eq_refinement_predicate`] carries its pairing; a binder's
+/// last, exactly as [`eq_term_modulo_ty_slots`] carries its pairing; a binder's
 /// own name is never hashed, so hash stays coarser than `eq` and the
 /// `Eq`/`Hash` contract holds.
-fn hash_refinement_predicate<H: std::hash::Hasher>(
+fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
     e: &TypedExpr,
     state: &mut H,
     scope: &mut Vec<crate::ccl::Name>,
@@ -3736,15 +3858,31 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(
             bound_expr,
             body,
         } => {
-            hash_refinement_predicate(bound_expr, state, scope);
+            hash_term_modulo_ty_slots(bound_expr, state, scope);
             hash_under_binder(state, scope, &binding.name, &[body]);
+        }
+        // A mutable variable introduction and a loop bind over their bodies, and `eq`
+        // pairs those binders. Without the same scoping here a reference under one
+        // hashes by name where `eq` matched it by position, so two terms `eq` equates
+        // hash apart — the direction that breaks the `Eq`/`Hash` contract.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            hash_term_modulo_ty_slots(init, state, scope);
+            hash_under_binder(state, scope, &binding.name, &[body]);
+        }
+        TypedExprNode::For { target, iter, body } => {
+            hash_term_modulo_ty_slots(iter, state, scope);
+            hash_under_binder(state, scope, &target.name, &[body]);
         }
         TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
             if let Some(s) = scrutinee {
-                hash_refinement_predicate(s, state, scope);
+                hash_term_modulo_ty_slots(s, state, scope);
             }
             for b in branches {
                 match &b.pattern {
@@ -3752,13 +3890,13 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(
                         hash_under_binder(state, scope, &p.binding.name, &[&b.guard, &b.body]);
                     }
                     None => {
-                        hash_refinement_predicate(&b.guard, state, scope);
-                        hash_refinement_predicate(&b.body, state, scope);
+                        hash_term_modulo_ty_slots(&b.guard, state, scope);
+                        hash_term_modulo_ty_slots(&b.body, state, scope);
                     }
                 }
             }
         }
-        _ => e.walk_children(|child| hash_refinement_predicate(child, state, scope)),
+        _ => e.walk_children(|child| hash_term_modulo_ty_slots(child, state, scope)),
     }
 }
 
@@ -3774,22 +3912,22 @@ fn hash_under_binder<H: std::hash::Hasher>(
 ) {
     scope.push(binder.clone());
     for c in children {
-        hash_refinement_predicate(c, state, scope);
+        hash_term_modulo_ty_slots(c, state, scope);
     }
     scope.pop();
 }
 
 impl std::hash::Hash for Refinement {
     /// Hashes the predicate's *structure* (refined `Type`s are hashed as
-    /// `ConstrainCache` keys). [`hash_refinement_predicate`] hashes the
+    /// `ConstrainCache` keys). [`hash_term_modulo_ty_slots`] hashes the
     /// predicate's node shape and scalar leaves but skips embedded `Type`s,
     /// so the hash is stable even though a refinement's twin may carry
-    /// differently-resolved type slots; `==` ([`eq_refinement_predicate`]) is
+    /// differently-resolved type slots; `==` ([`eq_term_modulo_ty_slots`]) is
     /// the matching type-blind relation, finer only by leaves the hash skips,
     /// which keeps the `Eq`/`Hash` contract. The predicate is immutable, so a
     /// `Type` used as a `ConstrainCache` key never re-hashes differently.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_refinement_predicate(&self.predicate, state, &mut Vec::new());
+        hash_term_modulo_ty_slots(&self.predicate, state, &mut Vec::new());
     }
 }
 
@@ -3860,7 +3998,7 @@ impl RefinementSet {
     /// Add a refinement, keeping the set deduplicated. Returns whether it was new.
     ///
     /// A refinement already present is dropped rather than replacing the incumbent:
-    /// the two are equal as *restrictions* ([`eq_refinement_predicate`]), and
+    /// the two are equal as *restrictions* ([`eq_term_modulo_ty_slots`]), and
     /// keeping the incumbent preserves whatever predicate `Rc` sharing the
     /// position already had.
     pub fn insert(&mut self, r: Refinement) -> bool {
@@ -4196,7 +4334,7 @@ mod tests {
 
     /// **A rebuilt predicate equals itself, `Realize` included.** Refinement equality is
     /// structural precisely so a predicate re-minted by planning compares equal to the one
-    /// it was built from; a node variant with no arm in `eq_refinement_predicate_go` breaks
+    /// it was built from; a node variant with no arm in `eq_term_modulo_ty_slots_go` breaks
     /// that for every predicate containing it, and silently — pointer-equal predicates
     /// short-circuit, so it bites only where a predicate is *rebuilt*, which is exactly
     /// where the equality is load-bearing.
@@ -4287,11 +4425,11 @@ mod tests {
         h.finish()
     }
 
-    /// Two predicates equal under [`eq_refinement_predicate`] must hash alike,
+    /// Two predicates equal under [`eq_term_modulo_ty_slots`] must hash alike,
     /// or a refinement is two different `HashMap` keys.
     fn assert_same_restriction(a: &TypedExpr, b: &TypedExpr) {
         assert!(
-            eq_refinement_predicate(a, b),
+            eq_term_modulo_ty_slots(a, b),
             "expected the same restriction:\n  {}\n  {}",
             symbolic::symbolic(a),
             symbolic::symbolic(b),
@@ -4304,10 +4442,12 @@ mod tests {
     }
 
     /// A reference to a binder the predicate introduces compares by position,
-    /// so two lowerings of one filter are the same restriction. Each binding
-    /// form `eq_refinement_predicate` handles gets its own case: a form whose
-    /// binder is compared by name instead would split the refinement set and a
-    /// `Data` domain would then report two domains that do not join.
+    /// so two lowerings of one filter are the same restriction. Every binding form a
+    /// *predicate* can hold gets its own case here: a form whose binder is compared by
+    /// name instead would split the refinement set and a `Data` domain would then
+    /// report two domains that do not join. The binding forms only a **term** can hold
+    /// are covered by [`alpha_variant_terms_compare_and_hash_alike`], since
+    /// `Refinement::born` rejects them in a predicate.
     #[rstest]
     // `λ p → p > 1`, the shape a filter lowers to.
     #[case::lambda(0)]
@@ -4347,6 +4487,63 @@ mod tests {
         assert_same_restriction(&build("p"), &build("q"));
     }
 
+    /// The binding forms that reach this walk only as a **term**: a discharge captures
+    /// whatever expression the program wrote, so a function body with a mutable
+    /// accumulator and a loop is an ordinary argument to compare
+    /// ([`crate::ccl::subst::Subst::eq_modulo_ty_slots`]).
+    ///
+    /// Both halves are asserted because α-invariance is the direction that can break the
+    /// `Eq`/`Hash` contract: it makes `eq` *coarser*, so a hash that did not push the
+    /// same binders would tell two equal terms apart by the names under them.
+    #[test]
+    fn alpha_variant_terms_compare_and_hash_alike() {
+        let build = |acc: &str, item: &str, source: &str| {
+            let (acc, item) = (Name::raw(acc), Name::raw(item));
+            TypedExpr::mut_decl(
+                acc.clone(),
+                Type::History {
+                    value: Box::new(Type::Base(BaseType::Int)),
+                    domain: Box::new(Type::Hole),
+                    history_kind: HistoryKind::Overwrite,
+                },
+                TypedExpr::lit(Lit::Int(0)),
+                TypedExpr::for_loop(
+                    item.clone(),
+                    TypedExpr::var(Name::raw(source)),
+                    TypedExpr::mut_write(
+                        acc.clone(),
+                        TypedExpr::binop(
+                            TypedExpr::var(acc),
+                            BinOpKind::Arithmetic(crate::ccl::ops::ArithmeticKind::Add),
+                            TypedExpr::var(item),
+                        ),
+                    ),
+                ),
+            )
+        };
+        let hash_of = |e: &TypedExpr| {
+            use std::hash::Hasher;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            hash_term_modulo_ty_slots(e, &mut h, &mut Vec::new());
+            h.finish()
+        };
+        let (a, b) = (build("total", "x", "xs"), build("sum__2", "y", "xs"));
+        assert!(
+            eq_term_modulo_ty_slots(&a, &b),
+            "\u{3b1}-variants of one term:\n  {}\n  {}",
+            symbolic::symbolic(&a),
+            symbolic::symbolic(&b),
+        );
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&b),
+            "equal terms must hash alike (Eq/Hash contract)",
+        );
+        // A *free* reference is the control: it still compares by name, so renaming the
+        // loop's source makes a different term.
+        assert!(!eq_term_modulo_ty_slots(&a, &build("total", "x", "ys")));
+    }
+
     /// Shadowing resolves innermost-first on both sides: the inner binder is
     /// what an inner reference denotes, whatever either side spells it.
     #[test]
@@ -4370,7 +4567,7 @@ mod tests {
         assert_same_restriction(&nested("a", "a", "a"), &nested("x", "x", "x"));
         // Referencing the *outer* binder is a different restriction from
         // referencing the inner one.
-        assert!(!eq_refinement_predicate(
+        assert!(!eq_term_modulo_ty_slots(
             &nested("a", "b", "a"),
             &nested("x", "y", "y")
         ));
@@ -4394,7 +4591,7 @@ mod tests {
         };
         assert_same_restriction(&refinement("k"), &refinement("k"));
         assert!(
-            !eq_refinement_predicate(&refinement("k"), &refinement("m")),
+            !eq_term_modulo_ty_slots(&refinement("k"), &refinement("m")),
             "distinct enclosing binders must stay distinct"
         );
     }
@@ -4423,11 +4620,11 @@ mod tests {
         let leaves_it_free =
             TypedExpr::lambda(Name::raw("q"), Type::Base(BaseType::Int), gt_one("p"));
         assert!(
-            !eq_refinement_predicate(&binds_it, &leaves_it_free),
+            !eq_term_modulo_ty_slots(&binds_it, &leaves_it_free),
             "a bound reference and a free one of the same spelling are two restrictions"
         );
         assert!(
-            !eq_refinement_predicate(&leaves_it_free, &binds_it),
+            !eq_term_modulo_ty_slots(&leaves_it_free, &binds_it),
             "and the relation is symmetric, so the mirrored arm rejects too"
         );
     }
@@ -4553,7 +4750,7 @@ mod tests {
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
     /// only in the *target's* domain-refinement predicate denote different
     /// refinements: the nested filter is semantic, not inference metadata, so
-    /// [`eq_refinement_predicate`] must compare cast targets rather than skip
+    /// [`eq_term_modulo_ty_slots`] must compare cast targets rather than skip
     /// them as type slots (conflating them could drop a runtime `Restrict`).
     #[test]
     fn refinement_eq_distinguishes_cast_target_predicates() {
@@ -4629,7 +4826,7 @@ mod tests {
     /// The same equality from the other side: two cast-target vintages that
     /// render identically stay two refinements.
     ///
-    /// [`eq_refinement_predicate`] compares a cast's target predicate because
+    /// [`eq_term_modulo_ty_slots`] compares a cast's target predicate because
     /// that predicate is a semantic filter rather than inference metadata
     /// (pinned above by `refinement_eq_distinguishes_cast_target_predicates`).
     /// A resolved `ty` slot makes the rendering elide the target, so the two
