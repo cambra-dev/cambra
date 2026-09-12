@@ -2,12 +2,14 @@
 // Typing: the structural typing-rule interface
 // ---------------------------------------------------------------------------
 
+use std::rc::Rc;
+
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, Name, Type};
+use crate::ccl::{Expr, Name, Type, TypedExpr};
 
 /// The iteration a contribution is made under — a loop's binder and the source it draws
 /// from, in scope for the loop's body.
@@ -178,6 +180,31 @@ pub(super) trait Typing {
     /// to open, since only there is there a node for the mints to hang off
     /// ([`Iteration::element_at`]).
     fn iteration(&self) -> Option<&Iteration>;
+    /// Run `f` with `condition` assumed by every solver query it raises, restoring
+    /// what was in force afterward on both the success and error paths.
+    ///
+    /// `condition` must hold wherever `f` walks, and the caller owns that: an arm's
+    /// body is reached only where its guard held and no earlier one did
+    /// ([`synthesize_arm_predicate`](crate::ccl::ccl_utils::synthesize_arm_predicate)),
+    /// which is what makes the guard assumable there and nowhere else.
+    ///
+    /// **Emit** assumes it; **Check** does not. Check re-derives every obligation
+    /// from the recorded types alone ([`Typing::require_sub`]'s implementation
+    /// there passes no scope at all), so a demand discharged here against a
+    /// condition is one Check reports — which is the wall's job, since a fact that
+    /// held only under a guard is not a fact about the type it was written onto.
+    fn under_condition<R>(&mut self, condition: Rc<TypedExpr>, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized;
+
+    /// Retire every condition in force that reads `name`.
+    ///
+    /// A condition is a fact about the values its names held where it was tested. A
+    /// write moves one of them, so from here on the condition says nothing about
+    /// the name it reads — `if pool >= 5: pool := 0; pool := pool ^- 1` tests the
+    /// `pool` the first write replaced. Called by the write rule *after* its own
+    /// obligation, which the condition does still cover.
+    fn retire_conditions(&mut self, name: &Name);
 
     /// Emit/check a `let` RHS. Emit bumps the polymorphism level so RHS-local
     /// variables become generalizable at the binding site; Check (which trusts

@@ -761,6 +761,9 @@ pub enum BinOp {
     /// [`Add`](Self::Add), a different trait (`src/ccl/ops.rs`, `ArithmeticKind`).
     AddRefined,
     Sub,
+    /// `^-` — subtraction whose result type records the difference. Same arithmetic
+    /// as [`Sub`](Self::Sub), a different trait (`src/ccl/ops.rs`, `ArithmeticKind`).
+    SubRefined,
     Mul,
     FloorDiv,
     /// `**` — exponentiation. Right-associative, and tighter than the unary minus

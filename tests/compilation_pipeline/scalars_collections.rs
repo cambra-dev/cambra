@@ -365,6 +365,9 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // A negative exponent is `1 // (a ** n)` — see `negative_exponent_divides_one_by_the_power`.
 #[case("2 ** -1", Value::Int(0))]
 #[case("1 ** -3", Value::Int(1))]
+// `^-` stands in the same relation to `-`.
+#[case("2 ^- 3", Value::Int(-1))]
+#[case("1 ^- 2 * 3 + 4", Value::Int(-1))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

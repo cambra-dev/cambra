@@ -30,6 +30,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::rc::Rc;
 
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
@@ -182,6 +183,30 @@ pub trait ScopeEnv {
     /// `Option<&dyn ScopeEnv>`, where `None` is "do not ask" — which collapses
     /// the two empty scopes this flag forces apart.
     fn is_skip_smt(&self) -> bool;
+
+    /// The **conditions** in force where the query is raised: predicates that hold
+    /// on every path reaching that point, each a bare `Bool` term over the names
+    /// [`binder_type`](ScopeEnv::binder_type) answers for.
+    ///
+    /// A condition states what was *tested* to get here, which no binder's type
+    /// states: `if x > 0` puts no refinement on `x`, and `x`'s type says nothing
+    /// about which arm ran. Emission supplies the enclosing arms' guards
+    /// ([`Typing::under_condition`](crate::ccl::infer::typing::Typing::under_condition));
+    /// every other environment has none, which is why this defaults to empty
+    /// rather than being a method each implementor answers.
+    ///
+    /// Owned for the same reason [`binder_type`](ScopeEnv::binder_type) is: the
+    /// set is filtered per query, so there is no stored slice to hand out a borrow
+    /// of. The terms are `Rc`, so a clone copies no predicate.
+    ///
+    /// A condition mentioning [`REFINEMENT_BINDER`] would capture the query's
+    /// subject. Keeping it out is the caller's, and emission's guards are user
+    /// terms, where the name is unwritable.
+    ///
+    /// [`REFINEMENT_BINDER`]: crate::ccl::REFINEMENT_BINDER
+    fn conditions(&self) -> Vec<Rc<TypedExpr>> {
+        Vec::new()
+    }
 }
 
 /// The empty scope: no name is bound, so every free name in a query is
@@ -471,11 +496,30 @@ impl<'a> Encode<'a> {
         let mut conjuncts = self.conjuncts(lhs)?;
         let goals = self.conjuncts(rhs)?;
         let goal = self.ctx.not(self.ctx.and_many(goals));
+        // Before `Γ` is drained: translating a condition reads leaves of its own,
+        // and what the scope claims about those belongs in the antecedent too.
+        conjuncts.append(&mut self.conditions());
         // Gathered after both sides are translated: `Γ` covers a binder first met
         // in the goal as much as one the antecedent mentions.
         conjuncts.append(&mut self.assumptions);
         conjuncts.push(goal);
         Ok(self.ctx.and_many(conjuncts))
+    }
+
+    /// The scope's conditions, translated, with the ones outside the fragment
+    /// dropped.
+    ///
+    /// Dropped rather than reported, as in [`Encode::assume_refinements`]: a
+    /// condition is an antecedent, so leaving one out only weakens the query, and a
+    /// query the encoding can otherwise translate must not fail because of what a
+    /// guard somewhere above it happens to say.
+    fn conditions(&mut self) -> Vec<SExpr> {
+        // Collected before the translation, which needs `self` mutably.
+        let conditions = self.scope.conditions();
+        conditions
+            .iter()
+            .filter_map(|c| self.expr(c, Some(Sort::Bool)).ok())
+            .collect()
     }
 
     /// Declare the constant the query's subject denotes.
@@ -679,10 +723,10 @@ impl<'a> Encode<'a> {
     ) -> Result<SExpr, String> {
         let c = self.ctx;
         Ok(match op {
-            // `^+` computes what `+` computes and differs only in the trait it
-            // states (`src/ccl/ops.rs`), so both are SMT's `+`.
+            // `^+` and `^-` compute what `+` and `-` compute, differing only in the
+            // trait each states (`src/ccl/ops.rs`), so each pair is one SMT operation.
             BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => c.plus(l, r),
-            BinOpKind::Arithmetic(ArithmeticKind::Sub) => c.sub(l, r),
+            BinOpKind::Arithmetic(ArithmeticKind::Sub | ArithmeticKind::SubRefined) => c.sub(l, r),
             // A product stays linear when one factor is a constant.
             BinOpKind::Arithmetic(ArithmeticKind::Mul)
                 if is_int_literal(left) || is_int_literal(right) =>

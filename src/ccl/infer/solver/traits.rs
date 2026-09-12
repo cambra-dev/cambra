@@ -103,6 +103,11 @@ pub enum Trait {
     AddableRefined,
     /// `-` over `(𝐴, 𝐵)`, associating `Output`.
     Subtractable,
+    /// `^-` over `(𝐴, 𝐵)`, associating `Output`.
+    ///
+    /// [`AddableRefined`](Trait::AddableRefined) for subtraction: one row, refining
+    /// the output by the difference of the operands.
+    SubtractableRefined,
     /// `*` over `(𝐴, 𝐵)`, associating `Output`.
     Multipliable,
     /// `//` over `(𝐴, 𝐵)`, associating `Output`.
@@ -180,36 +185,51 @@ const NUMERIC: &[TraitInstance] = &[
     },
 ];
 
-/// The bare predicate `__elem == a1 ^+ a2` for the `AddableRefined(Int, Int ⇝ Int)`
-/// row: the result is the sum of the operands the instance accepted.
+/// The bare predicate `__elem == 𝑎₁ op 𝑎₂` for a refining arithmetic row: the result
+/// is `op` applied to the operands the instance accepted.
 ///
 /// Bare in the sense of [`crate::ccl::ccl_utils::refine_with_bare`] — [`Name::elem`] is
 /// free, and the refinement it lands in is what binds it. Every node is typed at
-/// construction because the row fixes both operand bases and the associated base at
+/// construction because such a row fixes both operand bases and the associated base at
 /// `Int`, leaving nothing for inference to resolve, the same reason
 /// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
-fn refinement_for_add(args: &[TypedExpr]) -> TypedExpr {
+///
+/// `op` is the refining operator rather than its plain counterpart, so the predicate a
+/// row deposits reads back in the syntax that produced it.
+fn refinement_recording(op: ArithmeticKind, args: &[TypedExpr]) -> TypedExpr {
     let [a1, a2] = args else {
-        panic!("AddableRefined is binary, so its instance's refinement receives two operands");
+        panic!("a refining arithmetic trait is binary, so its refinement receives two operands");
     };
     let int = prim(BaseType::Int);
     TypedExpr::binop(
         TypedExpr::var(Name::elem()).with_ty(int.clone()),
         BinOpKind::Compare(CompareKind::Equals),
-        TypedExpr::binop(
-            a1.clone(),
-            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
-            a2.clone(),
-        )
-        .with_ty(int),
+        TypedExpr::binop(a1.clone(), BinOpKind::Arithmetic(op), a2.clone()).with_ty(int),
     )
     .with_ty(prim(BaseType::Bool))
+}
+
+/// A [`RefinementTemplate`] is a bare `fn` pointer, so each row names its operator
+/// through its own function rather than by closing over one.
+fn refinement_for_add(args: &[TypedExpr]) -> TypedExpr {
+    refinement_recording(ArithmeticKind::AddRefined, args)
+}
+
+/// See [`refinement_for_add`].
+fn refinement_for_sub(args: &[TypedExpr]) -> TypedExpr {
+    refinement_recording(ArithmeticKind::SubRefined, args)
 }
 
 /// `(Int, Int) ⇝ {Int | __elem == 𝑎₁ ^+ 𝑎₂}` — the one row of `^+`.
 const ADDITION_REFINED: &[TraitInstance] = &[TraitInstance {
     args: &[BaseType::Int, BaseType::Int],
     assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_add))],
+}];
+
+/// `(Int, Int) ⇝ {Int | __elem == 𝑎₁ ^- 𝑎₂}` — the one row of `^-`.
+const SUBTRACTION_REFINED: &[TraitInstance] = &[TraitInstance {
+    args: &[BaseType::Int, BaseType::Int],
+    assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_sub))],
 }];
 
 /// The numeric rows plus `(String, String) ⇝ String`.
@@ -293,6 +313,7 @@ impl Trait {
         match self {
             Trait::Addable => NUMERIC_OR_STRING,
             Trait::AddableRefined => ADDITION_REFINED,
+            Trait::SubtractableRefined => SUBTRACTION_REFINED,
             Trait::Subtractable | Trait::Multipliable | Trait::Divisible | Trait::Exponentiable => {
                 NUMERIC
             }
@@ -345,6 +366,7 @@ impl Trait {
             Trait::Addable => "Addable",
             Trait::AddableRefined => "AddableRefined",
             Trait::Subtractable => "Subtractable",
+            Trait::SubtractableRefined => "SubtractableRefined",
             Trait::Multipliable => "Multipliable",
             Trait::Divisible => "Divisible",
             Trait::Exponentiable => "Exponentiable",
@@ -1754,10 +1776,12 @@ mod tests {
         assert!(matches!(only.assoc, [(Assoc::Output, BaseType::Int, None)]));
     }
 
-    /// `^+` deposits the sum on its output; `+` deposits a bare `Int`. The two
-    /// traits differ in exactly this, so one obligation of each pins it.
+    /// A refining operator deposits its equation on the output; its plain
+    /// counterpart deposits a bare `Int`. Each pair differs in exactly this, so one
+    /// obligation of each pins it — and each refining trait records its **own**
+    /// operator, which is what a single shared template would lose.
     #[test]
-    fn only_the_refining_addition_carries_a_predicate() {
+    fn only_the_refining_operators_carry_a_predicate() {
         let deposited = |trait_| {
             let node_id = provenance::NodeId::fresh();
             let out = fresh_var(0);
@@ -1768,7 +1792,7 @@ mod tests {
                 operands(),
             );
             ob.narrow(0, &BaseType::Int, &mut ConstrainCache::new())
-                .expect("Int adds to Int under either trait");
+                .expect("Int is accepted at position 0 by every trait here");
             let Type::Infer(v) = &out else { unreachable!() };
             let bounds = v.bounds.borrow();
             bounds
@@ -1782,6 +1806,11 @@ mod tests {
         assert_eq!(
             deposited(Trait::AddableRefined),
             vec!["{Int | __elem == 1 ^+ 2}"],
+        );
+        assert_eq!(deposited(Trait::Subtractable), vec!["Int"]);
+        assert_eq!(
+            deposited(Trait::SubtractableRefined),
+            vec!["{Int | __elem == 1 ^- 2}"],
         );
     }
 
@@ -1858,6 +1887,7 @@ mod tests {
             Trait::Addable,
             Trait::AddableRefined,
             Trait::Subtractable,
+            Trait::SubtractableRefined,
             Trait::Multipliable,
             Trait::Divisible,
             Trait::Exponentiable,
