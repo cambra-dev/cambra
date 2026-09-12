@@ -176,6 +176,21 @@ Neither is a "union", and the name matters: in type theory a *union type* is **u
 
 Op-conversion accordingly compiles a fed union as a flat merge — a disjoint join — and **rejects** a fed `Copair` rather than compiling it as the operation it is not. Nothing builds one today: `Builtin::Copair` needs a `++` inside a lambda over its parameter, which fails earlier. When something does, it needs a tagged fed form, not the flat merge.
 
+### `Outputs` — the program's output list, not a record
+
+`Outputs(Vec<(String, TypedExpr)>)` is what a program that binds a sink ends in: one named output per sink, each its own stream. `Record` has the same payload shape and denotes something else — one value whose fields are its components — and the two need opposite treatment everywhere a pass distinguishes a stream from a value.
+
+Shape does not recover the distinction. Lowering appends the output list at the tail of the root `Let*` chain so each entry is in scope of the bindings above it, and a program whose trailing expression is a record literal has that same shape:
+
+```
+x = 1
+(a=[1, 2, 3], b=[4, 5, 6])
+```
+
+While the two shared a node, `planning::insert_iterate_markers` read every `Record` as an output list and made each function-typed field an iteration site. That is right for an output and wrong for a record: a record's collection-valued field is a value it holds, so turning it into a stream left op-conversion's product arm assembling a product of collections with the combinator that zips them — `(D ⤇ A, D ⤇ B)` as `D ⤇ (A, B)`.
+
+`Outputs` is born in lowering and consumed by `convert_record_fields_to_operators`, which compiles one operator per entry and never builds a record. A pure program has a single output and no `Outputs` node — its trailing expression *is* that output, and a trailing product is a record value like any other.
+
 ### `Transact` — the domain-parameterized recurrence carrier
 
 CHL mutation-accumulation `for` loops **and** `with begin():` transactions share one carrier node, `Transact`, rather than recursive `Lambda`/`Let` combinations or a dedicated fold node. (For the lowering mechanics and the operator-graph realization, see [lowering.md](lowering.md#mutation-accumulation-loops) and [mutability.md](mutability.md).)

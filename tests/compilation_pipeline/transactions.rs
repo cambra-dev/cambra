@@ -604,9 +604,13 @@ fn string_valued_store() {
 /// program returns both as a tuple. Each rides the writer decision as its own
 /// `__to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
 /// of squares) = 1,5,14 over commit ticks 1,2,3.
+///
+/// The tuple is a value, so each component is a materialized collection keyed by
+/// commit tick rather than one collection of pairs. The two feeds have their own
+/// domains, and a pair of collections is not a collection of pairs.
 #[test]
 fn two_reply_feeds_one_transaction() {
-    check_tile(
+    check_collection_tile(
         indoc! {r#"
             outa = defer()
             outb = defer()
@@ -620,15 +624,18 @@ fn two_reply_feeds_one_transaction() {
                     outb << b
             (outa, outb)
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![1, 2, 3]),
-            codomain: Box::new(Tile::tuple(vec![
-                Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6])),
-                Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14])),
-            ])),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+        Tile::tuple(vec![
+            Tile::Scalar(ColumnValue::Variants(vec![make_collection(&[
+                (Value::UInt(1), Value::Int(1)),
+                (Value::UInt(2), Value::Int(3)),
+                (Value::UInt(3), Value::Int(6)),
+            ])])),
+            Tile::Scalar(ColumnValue::Variants(vec![make_collection(&[
+                (Value::UInt(1), Value::Int(1)),
+                (Value::UInt(2), Value::Int(5)),
+                (Value::UInt(3), Value::Int(14)),
+            ])])),
+        ]),
     );
 }
 

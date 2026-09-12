@@ -1069,6 +1069,13 @@ a tuple (`(1, 2)`), a comma-list of `name=value` fields is a record
 Both are projected with `.` (§3.9), keyed by position for a tuple (`t.0`)
 and by name for a record (`r.x`); neither is subscripted.
 
+**A component may be a collection.** `(cash=10, lines=[1, 2, 3])` is one value
+with two fields, and `r.lines` is the collection it holds. Components keep their
+own domains, so `(a=[1, 2], b=[4, 5, 6])` holds a two-element collection beside a
+three-element one. A product of collections and a collection of products are
+different types — `{a: [0, 2] ⤇ Int, b: [0, 2] ⤇ Int}` is two collections, and
+`[0, 2] ⤇ {a: Int, b: Int}` is one collection whose elements are records.
+
 **Records are not braces.** `{...}` is type syntax (§6.1) — a record *type*
 `{name: T}` or a tuple type `{T, U}`. A `{...}` in value position is a
 lowering error. Finite maps are a collection literal `[k -> v, …]`, not a brace
@@ -3275,8 +3282,10 @@ checked is that a value was about to be dropped and the source did not say so.
 ## 9. Sinks
 
 Sinks can be declared anywhere in the program, but all external side
-effects are lifted to the boundary of the program.  The program returns
-a Record of collections that need to be bound to each sink.
+effects are lifted to the boundary of the program. A program that binds a sink
+ends in an **output list**: one named output per sink, each its own collection.
+An output list is not a record value — a record's fields are one value's, while
+each output is a separate stream bound to its own sink.
 
 Sinks may observe the indices of collections passed to them if needed.
 

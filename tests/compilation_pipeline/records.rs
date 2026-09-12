@@ -299,3 +299,100 @@ fn test_datasource_named_record_join() {
 fn test_conditional_arms_at_different_record_widths(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
+
+// ---------------------------------------------------------------------------
+// Products holding a collection
+// ---------------------------------------------------------------------------
+
+/// A product is one value, so a collection-valued component is a value it holds:
+/// op-conversion materializes the component (`Materialize`) and the product
+/// tiles as a record of scalars. Projecting the component takes it back out as
+/// the stream every consumer of a collection reads.
+///
+/// The components' domains are unrelated, which is what separates a product of
+/// collections from a collection of products: assembling one as the other needs
+/// them to agree.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("r = (cash=10, lines=[1, 2, 3]); r.lines", &[1, 2, 3])]
+#[case("r = (cash=10, lines=[1, 2, 3]); [x * 2 for x in r.lines]", &[2, 4, 6])]
+#[case("t = (10, [4, 5, 6]); t.1", &[4, 5, 6])]
+#[case("r = (a=[1, 2], b=[4, 5, 6]); r.a", &[1, 2])]
+#[case("r = (a=[1, 2], b=[4, 5, 6]); r.b", &[4, 5, 6])]
+#[case("xs = [7, 8]; r = (n=1, held=xs); r.held", &[7, 8])]
+#[case("r = (n=1, inner=(k=2, deep=[7, 8])); r.inner.deep", &[7, 8])]
+fn test_collection_component_of_a_product(#[case] code: &str, #[case] expected: &[i64]) {
+    check_tile(code, make_int_list(expected));
+}
+
+/// The scalar components of such a product are untouched, and an aggregate over
+/// a projected collection component reads it as any other collection.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("r = (cash=10, lines=[1, 2, 3]); r.cash", Value::Int(10))]
+#[case("t = (10, [4, 5, 6]); t.0", Value::Int(10))]
+#[case("r = (cash=10, lines=[1, 2, 3]); sum(r.lines)", Value::Int(6))]
+#[case("t = (10, [4, 5, 6]); sum(t.1)", Value::Int(15))]
+#[case(
+    "r = (n=1, inner=(k=2, deep=[7, 8])); sum(r.inner.deep)",
+    Value::Int(15)
+)]
+fn test_scalar_component_beside_a_collection(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The whole product value: each collection component is one cell carrying its
+/// table, and the components keep their own domains — `a` holds two elements
+/// where `b` holds three.
+#[test]
+fn test_product_of_collections_is_a_record_of_tables() {
+    check_collection_tile(
+        "r = (a=[1, 2], b=[4, 5, 6]); r",
+        Tile::Record(
+            [
+                (
+                    "a".to_string(),
+                    Tile::Scalar(ColumnValue::Variants(vec![make_int_collection(&[1, 2])])),
+                ),
+                (
+                    "b".to_string(),
+                    Tile::Scalar(ColumnValue::Variants(vec![make_int_collection(&[4, 5, 6])])),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+}
+
+/// A record with a collection field is a constant, so a list of them is one too:
+/// `expr_to_value` reaches the nested list and builds its table.
+///
+/// A list literal's elements are whole `Value`s, so the record rides one column
+/// boxed (`Scalar(Records)`) rather than as the struct-of-arrays a record
+/// literal compiles to, and each `b` cell carries its own table.
+#[test]
+fn test_list_of_records_holding_collections() {
+    check_tile(
+        "xs = [(a=1, b=[1, 2]), (a=3, b=[4, 5])]; xs",
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Records(
+                [
+                    ("a".to_string(), ColumnValue::Ints(vec![1, 3])),
+                    (
+                        "b".to_string(),
+                        ColumnValue::Variants(vec![
+                            make_int_collection(&[1, 2]),
+                            make_int_collection(&[4, 5]),
+                        ]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}

@@ -37,7 +37,8 @@ use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    ColumnValue, Consumer, Predicate, Tile, Value, sort_sealed_function_by_domain, tuple_field,
+    ColumnValue, Consumer, FuncBinding, Predicate, Tile, Value, sort_sealed_function_by_domain,
+    tuple_field,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,17 @@ pub(crate) fn check_tile(code: &str, expected: Tile) {
     );
 }
 
+/// [`check_tile`] for a result holding materialized collections: normalizes each
+/// table's binding order before comparing, since [`Value::Function`] compares
+/// positionally and a collection's order is unspecified.
+pub(crate) fn check_collection_tile(code: &str, expected: Tile) {
+    assert_eq!(
+        sort_tile_collections(run_pipeline(code)),
+        sort_tile_collections(expected),
+        "pipeline path"
+    );
+}
+
 /// Scalar variant of [`check_tile`]: unwraps the result via
 /// [`cambra::interpreter::ColumnValue::as_single`] before comparing.
 pub(crate) fn check_scalar(code: &str, expected: Value) {
@@ -157,6 +169,75 @@ pub(crate) fn make_int_list(v: &[i64]) -> Tile {
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
         domain_predicate: Predicate::True,
         deleted: BitSet::new(),
+    }
+}
+
+/// A **materialized** collection value: the whole `key ↦ value` table in one
+/// cell, which is how a product value holds a collection-valued component.
+pub(crate) fn make_collection(bindings: &[(Value, Value)]) -> Value {
+    Value::Function(
+        bindings
+            .iter()
+            .map(|(input, output)| FuncBinding {
+                input: input.clone(),
+                output: output.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// A materialized collection over the positions `0..v.len()`, the shape a list
+/// literal in a product component compiles to.
+pub(crate) fn make_int_collection(v: &[i64]) -> Value {
+    make_collection(
+        &v.iter()
+            .enumerate()
+            .map(|(i, n)| (Value::UInt(i), Value::Int(*n)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Order a materialized collection's bindings by key, so two tables holding the
+/// same collection compare equal.
+///
+/// [`Value::Function`] compares its binding list positionally while a
+/// collection's iteration order is unspecified ([`docs/chl-spec.md`](../../docs/chl-spec.md),
+/// "3. Expressions"), so a comparison of two tables normalizes first. Keys that
+/// no total order covers keep their delivery order.
+pub(crate) fn sort_collection_bindings(value: Value) -> Value {
+    match value {
+        Value::Function(mut bindings) => {
+            bindings.sort_by(|a, b| match (&a.input, &b.input) {
+                (Value::UInt(x), Value::UInt(y)) => x.cmp(y),
+                (Value::Int(x), Value::Int(y)) => x.cmp(y),
+                (Value::String(x), Value::String(y)) => x.cmp(y),
+                _ => std::cmp::Ordering::Equal,
+            });
+            Value::Function(bindings)
+        }
+        Value::Record(fields) => Value::Record(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, sort_collection_bindings(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// [`sort_collection_bindings`] over every scalar cell of a tile.
+pub(crate) fn sort_tile_collections(tile: Tile) -> Tile {
+    match tile {
+        Tile::Scalar(ColumnValue::Variants(vs)) => Tile::Scalar(ColumnValue::Variants(
+            vs.into_iter().map(sort_collection_bindings).collect(),
+        )),
+        Tile::Record(fields) => Tile::Record(
+            fields
+                .into_iter()
+                .map(|(k, t)| (k, sort_tile_collections(t)))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
