@@ -451,7 +451,7 @@ impl Subst {
 
     /// Equality up to the terms' *type slots* — same binders, and each pair
     /// of replacement terms equal by the codebase's type-blind structural
-    /// comparison (`eq_refinement_predicate`, the equality that backs
+    /// comparison (`eq_term_modulo_ty_slots`, the equality that backs
     /// [`crate::ccl::Refinement`]'s `PartialEq`).
     ///
     /// Why this exists: a discharge captures its argument expression **at emit
@@ -479,7 +479,7 @@ impl Subst {
                         && match (va, vb) {
                             (Mapping::Rename(a), Mapping::Rename(b)) => a == b,
                             (Mapping::Discharge(a), Mapping::Discharge(b)) => {
-                                crate::ccl::eq_refinement_predicate(a, b)
+                                crate::ccl::eq_term_modulo_ty_slots(a, b)
                             }
                             _ => false,
                         }

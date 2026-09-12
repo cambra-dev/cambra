@@ -1910,6 +1910,10 @@ struct Entry<C> {
 impl<C> MemoStore<C> {
     /// Point `refinement` at `to`, counting it when the `Rc` actually changes.
     fn point_at(&mut self, refinement: &mut Refinement, to: Rc<Expr>) {
+        // The rewrite half of the boundary `Refinement::born` guards: a pass that
+        // substitutes into a predicate can put a whole function body there, and this
+        // is where such a term would be installed.
+        crate::ccl::ty::debug_assert_predicate_shape(&to);
         if !Rc::ptr_eq(&refinement.predicate, &to) {
             self.revision += 1;
         }

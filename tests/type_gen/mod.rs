@@ -124,7 +124,7 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
             Rc::new(TypedExpr::lambda(name, Type::Base(BaseType::Int), body))
         }
         // A cast whose target refines its domain — the embedded-collection shape
-        // whose target predicates `eq_refinement_predicate` compares.
+        // whose target predicates `eq_term_modulo_ty_slots` compares.
         9 => {
             let target = ccl_utils::refined_data_fun(
                 Type::Base(BaseType::Int),
