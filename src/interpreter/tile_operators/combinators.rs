@@ -926,6 +926,211 @@ impl TileProducer for RestrictProducer {
     }
 }
 
+/// A column of **materialized** collection values, read as a collection per row.
+///
+/// A collection reaches an operator in one of two shapes, and the runtime already names
+/// both: a **streamed** one carries its keys in a domain column, and a **materialized** one
+/// is a single map value — `Value::Function`, a binding list carrying its own keys — which
+/// is how a transactional collection's store key holds it ([`Lookup`]). Lookup reads either;
+/// every consumer that wants to *iterate* a collection reads the streamed shape only. This
+/// is the adapter between them: `SealedFunction { domain: 𝐷, codomain: Scalar(𝐾 ⇒ 𝑉) }`
+/// becomes `CurriedFunction { domain1: 𝐷, domain2: 𝐾, codomain: 𝑉 }`, each row's bindings
+/// becoming that row's group.
+///
+/// **A row whose collection is empty contributes no group**, because a curried-function
+/// tile cannot hold one: its offsets are strictly ascending, so every group has at least
+/// one entry (`validate_tile`). A consumer therefore sees that row as absent rather than as
+/// an empty collection, which for an aggregate is the difference between no answer and the
+/// identity.
+pub struct StreamMaterialized {
+    /// Output tiling: `CurriedFunction { domain1: input.domain, domain2: 𝐾, codomain: 𝑉 }`.
+    base: OperatorBase,
+    /// The column of collection values.
+    input: Box<dyn TileOperator>,
+}
+
+impl StreamMaterialized {
+    /// Whether `tiling` is a column of materialized collection values — the one shape this
+    /// operator adapts, and the question a consumer asks before inserting one.
+    pub fn adapts(tiling: &Tiling) -> bool {
+        matches!(
+            tiling,
+            Tiling::SealedFunction { codomain, .. }
+                if matches!(codomain.as_ref(), Tiling::Scalar(Extent::Function { .. }))
+        )
+    }
+
+    /// Create a `StreamMaterialized` over a column of collection values.
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
+        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
+            panic!(
+                "StreamMaterialized expected SealedFunction, got {:?}",
+                input.tiling()
+            )
+        };
+        let Tiling::Scalar(Extent::Function {
+            domain: key,
+            codomain: value,
+        }) = codomain.as_ref()
+        else {
+            panic!(
+                "StreamMaterialized expected a column of collection values, got {:?}",
+                codomain
+            )
+        };
+        let tiling = Tiling::CurriedFunction {
+            domain1: domain.clone(),
+            domain2: (**key).clone(),
+            codomain: (**value).clone(),
+        };
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+        }
+    }
+}
+
+impl TileOperator for StreamMaterialized {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe_impl(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let (key, value) = match self.tiling() {
+            Tiling::CurriedFunction {
+                domain2, codomain, ..
+            } => (domain2.clone(), codomain.clone()),
+            other => unreachable!("StreamMaterialized tiles as a curried function, got {other:?}"),
+        };
+        Box::new(StreamMaterializedProducer {
+            base: ProducerBase::new(StreamMaterializedProducer::alloc_id(), self.tiling()),
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            key,
+            value,
+        })
+    }
+}
+
+/// Producer for [`StreamMaterialized`].
+struct StreamMaterializedProducer {
+    base: ProducerBase,
+    /// The upstream producer of collection values.
+    input: Box<dyn TileProducer>,
+    /// The key extent, for building each group's domain column.
+    key: Extent,
+    /// The value extent, for building each group's codomain column.
+    value: Extent,
+}
+
+impl TileProducer for StreamMaterializedProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        let Tile::SealedFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            deleted,
+        } = input_tile
+        else {
+            panic!("StreamMaterialized expected a SealedFunction tile, got {input_tile:?}")
+        };
+        let Tile::Scalar(values) = *codomain else {
+            panic!("StreamMaterialized expected a scalar codomain column")
+        };
+        // One group per row whose collection has an entry, in row order. A row is kept by
+        // index so `domain1` and the offsets stay parallel after the empty ones drop.
+        let mut kept: Vec<usize> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut keys: Vec<Value> = Vec::new();
+        let mut outputs: Vec<Value> = Vec::new();
+        for row in 0..values.len() {
+            let Value::Function(bindings) = values.index_at(row) else {
+                panic!("StreamMaterialized: a collection value is a binding list")
+            };
+            if bindings.is_empty() {
+                continue;
+            }
+            kept.push(row);
+            offsets.push(keys.len());
+            for b in bindings {
+                keys.push(b.input);
+                outputs.push(b.output);
+            }
+        }
+        let deleted = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| deleted.contains(**row))
+            .map(|(group, _)| group)
+            .collect();
+        let group_count = kept.len();
+        let domain1 = domain.select_indices(kept.into_iter(), group_count);
+        // **Every row delivered here is final**, which is what this operator knows and its
+        // input does not. A `domain_predicate` names the region of `domain1` that will see
+        // no new elements, *together with its whole list* — and a materialized map value
+        // carries its own keys, so it is complete wherever it is present ([`Lookup`]). The
+        // input's own region is unioned in rather than replaced: whether further rows
+        // arrive is its claim, not this one's, and without the union an aggregate over a
+        // live store would never reach a terminal answer for the rows it already has.
+        let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain1));
+        let mut tile = Tile::curried_function(
+            domain1,
+            ColumnValue::UInts(offsets),
+            ColumnValue::from_values(keys, &self.key),
+            ColumnValue::from_values(outputs, &self.value),
+            domain_predicate,
+            deleted,
+        );
+        // **What this producer released, it drops here**, because it cannot drop it
+        // upstream: a released key is one binding of a materialized map, and the map is a
+        // single cell the input keeps whole. Rebuilding from that cell would hand the
+        // consumer the binding a second time, which an accumulating consumer adds twice.
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile
+    }
+
+    /// A row releases upstream; a **key within a row** releases nothing.
+    ///
+    /// The output's outer domain is the input's, so a guard on it passes through. Its inner
+    /// domain is the key set of one materialized map, and that map is a single cell of the
+    /// input — nothing upstream holds a binding of it separately, so there is nothing to
+    /// release. The row's own release is what frees it.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        match obsolete_guard {
+            g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
+            g if g.is_empty() => self.input.release(self.input.tiling().empty_guard()),
+            TileGuard::Function(FunctionGuard::Domain(p)) => self
+                .input
+                .release(TileGuard::Function(FunctionGuard::Domain(p))),
+            TileGuard::Function(FunctionGuard::Codomain(_)) => {}
+            // A consumer that has taken a whole row names both halves — the keys it
+            // folded and the row they came from — so the arms are applied in turn and the
+            // row half is the one that reaches the input.
+            TileGuard::Or(arms) => {
+                for arm in arms {
+                    self.release_impl(arm);
+                }
+            }
+            g => todo!("StreamMaterialized cannot honor the release guard {g:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

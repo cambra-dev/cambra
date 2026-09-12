@@ -419,12 +419,12 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
 /// A compound key `(a, t)` is taken apart now, by the binder or by the program's
 /// own `k.0`
 /// ([`crate::compilation_pipeline`]'s `an_entry_binder_takes_a_compound_key_apart`),
-/// and an entry binder over a transactional map types — `map_domain` takes a
-/// consumer's collection, which a `Mut` wrapping one satisfies. What remains is
-/// **reading a transactional collection as a collection**: the entry binder
-/// meets `lambda_elim`, whose curried body does not carry the Σ binder its
-/// domain names, and a plain value binder meets the `Mut` wrapper at the
-/// comprehension's source annotation before that.
+/// and a transactional collection is read as a collection by its **values**,
+/// materialized per commit and opened into a collection per transaction. What
+/// remains is sweeping one by its **entries**: `lambda_elim` curries the
+/// comprehension's body over the transaction's reads, and the curried type does
+/// not carry the Σ binder its domain names — which op-conversion meets as a
+/// `curry` it cannot compile.
 ///
 /// The same run reports the three routes as undeclared, because
 /// [`expect_compile_error`] compiles against a bare context with no host

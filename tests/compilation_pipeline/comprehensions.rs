@@ -462,24 +462,36 @@ fn a_filtered_comprehension_over_a_map_is_not_reachable(#[case] comprehension: &
     );
 }
 
-/// A transactional map read through a **value** binder. The comprehension's source
-/// annotation names a data function, and a `Mut(…)` does not deref to the collection
-/// inside it there, so the generator meets the wrapper rather than the map. Reading a
-/// transactional collection *as* a collection is the missing piece, and
-/// `src/ccl/design/mutability.md` is where that work lands.
+/// A transactional collection read **as a collection**, once per transaction.
+///
+/// Two things meet here. The source is a mutable variable at a function position, which is
+/// a value position, so the mention reads through to the map inside the handle. And the
+/// store holds that map *materialized* — one map value per commit, which is the shape a
+/// keyed read already uses — while an aggregate iterates, so op-conversion opens it into a
+/// collection per row (`src/interpreter/design-operators.md`, "Reading a collection held
+/// per row").
+///
+/// One transaction and several are both pinned: a per-row collection is complete as soon
+/// as its row arrives, and it is that per-row finality — not the domain closing — that
+/// lets each transaction's aggregate settle while the store stays live.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_value_binder_over_a_transactional_map_is_not_reachable() {
-    check_compile_error(
-        indoc! {r#"
-            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
-            n: Mut(Int, Txn) := 0
-            for r in [1]:
-                with begin():
-                    n := n + sum([v for v in m])
-            await_final(n)
-        "#},
-        "Annotation mismatch",
+#[case::one_transaction("[1]", 3)]
+#[case::three_transactions("[1, 2, 3]", 9)]
+fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+                n: Mut(Int, Txn) := 0
+                for r in {}:
+                    with begin():
+                        n := n + sum([v for v in m])
+                await_final(n)
+            "#},
+            rows
+        ),
+        Value::Int(total),
     );
 }
 

@@ -250,13 +250,13 @@ binder*, which lowers identically in all of them:
 - **A filter** (`for k -> v in m if …`). Not entry iteration at all — the same comprehension
   with a name binder fails identically, because the restrict chain planning builds for the
   filter also tries to compile the domain's carried `collection_contains`.
-- **A transactional map's snapshot**, the shape every storefront/demo entry-iteration site
-  takes. The entry binder types — `map_domain` takes a consumer's collection, which a `Mut`
-  wrapping one satisfies — and meets `lambda_elim`: the curried body does not carry the Σ
-  binder its domain names, so the witness is free at the pass boundary. The **name**-binder
-  case does not get that far: a `Mut(…)` never derefs to the collection inside it at the
-  comprehension's source annotation. Reading a transactional collection as a collection is
-  unbuilt; `src/ccl/design/mutability.md` is where that work lands.
+- **A transactional map's snapshot** through an **entry** binder, the shape every
+  storefront/demo entry-iteration site takes. It types — `map_domain` takes a consumer's
+  collection, which a `Mut` wrapping one satisfies — and meets `lambda_elim`: the curried body
+  does not carry the Σ binder its domain names, so the witness is free at the pass boundary,
+  and op-conversion has no `curry` of an arbitrary morphism behind it. The **name**-binder case
+  reads the snapshot today, materialized per commit and opened into a collection per row
+  (`src/interpreter/design-operators.md`, "Reading a collection held per row").
 
 ## `groupby`'s exact type
 

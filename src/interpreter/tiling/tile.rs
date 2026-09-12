@@ -649,7 +649,8 @@ impl Tile {
     /// For Scalar: universal if the scalar is known and empty otherwise
     /// For Aggregation: universal if terminal and empty otherwise
     /// For SealedFunction: Domain predicate for all domain values
-    /// For CurriedFunction, Codomain(Domain(predicate)) for all domain2 values (TODO for now we assume unique domain2)
+    /// For CurriedFunction, `Domain` over the groups the predicate calls whole, plus
+    /// `Codomain(Domain(...))` over the keys of the groups it does not
     ///
     /// Important note around logical deletes: we don't release eagerly when logically deleting rows via the
     /// deleted bitsets, so `to_guard` includes logically-deleted rows when constructing the guards.
@@ -678,16 +679,36 @@ impl Tile {
                     ))
                 }
             }
+            // **A key is released by its group where the group is whole.** A codomain guard
+            // names keys and says nothing about which group they sit in, so releasing one
+            // releases it in *every* group — sound only while no key repeats across groups,
+            // which a curried-function tile permits (`validate_tile` asks for uniqueness
+            // within a group and no more) and a collection held per row routinely does. The
+            // `domain_predicate` is what separates the two cases: it names the groups that
+            // will see no new elements, each together with its whole list, so `Domain` over
+            // that region releases those groups outright and their keys need no naming. A
+            // group outside it may still grow, so its keys are named the only way the
+            // vocabulary allows.
             Tile::CurriedFunction {
+                domain1,
+                offsets,
                 domain2,
                 domain_predicate,
                 ..
-            } => TileGuard::flatten_or(vec![
-                TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
-                    FunctionGuard::Domain(Predicate::from_column_value(domain2)),
-                )))),
-                TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            ]),
+            } => {
+                let open_keys = Predicate::from_column_value(&keys_of_open_groups(
+                    domain1,
+                    offsets,
+                    domain2,
+                    domain_predicate,
+                ));
+                TileGuard::flatten_or(vec![
+                    TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                        FunctionGuard::Domain(open_keys),
+                    )))),
+                    TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+                ])
+            }
             // The store's guard is over its commit-time domain (the change
             // ticks), like a `SealedFunction` — consumers release a prefix of it.
             Tile::Store {
@@ -731,6 +752,36 @@ impl Tile {
         );
         result
     }
+}
+
+/// The keys of the groups `domain_predicate` does **not** call whole.
+///
+/// A group inside the predicate is released by its own `domain1` value, so naming its keys
+/// would release them in every other group too ([`Tile::to_guard`]).
+fn keys_of_open_groups(
+    domain1: &ColumnValue,
+    offsets: &ColumnValue,
+    domain2: &ColumnValue,
+    domain_predicate: &Predicate,
+) -> ColumnValue {
+    if domain_predicate.is_false() {
+        return domain2.clone();
+    }
+    let groups = domain1.len();
+    let open: Vec<usize> = (0..groups)
+        .filter(|&i| !domain_predicate.contains(&domain1.index_at(i)))
+        .flat_map(|i| {
+            let start = offsets.index_at(i).as_uint();
+            let end = if i + 1 < groups {
+                offsets.index_at(i + 1).as_uint()
+            } else {
+                domain2.len()
+            };
+            start..end
+        })
+        .collect();
+    let kept = open.len();
+    domain2.select_indices(open.into_iter(), kept)
 }
 
 pub fn validate_tile(tile: &Tile) -> bool {
@@ -1064,27 +1115,62 @@ mod tests {
         assert!(!pred.contains(&Value::UInt(99)));
     }
 
+    /// A group the predicate calls whole is released by its own key; only the groups it
+    /// leaves open contribute a codomain arm. Keys repeat across groups here, which is what
+    /// makes the distinction observable: naming a whole group's keys would release them in
+    /// the open group too.
     #[test]
-    fn to_guard_curried_function_nonempty_domain_predicate_produces_or() {
-        // When domain_predicate is non-False it should appear as a second arm of an Or
-        // alongside the domain2-derived codomain guard.
-        let pred = Predicate::LessThanEq(Value::UInt(0));
-        let tile = cf_uint_int(vec![0], vec![0], vec![10, 11], vec![100, 110], pred.clone());
-        let guard = tile.to_guard();
-        // Expect Or([Codomain(Domain(domain2_pred)), Domain(pred)])
-        let TileGuard::Or(arms) = guard else {
-            panic!("expected Or guard when domain_predicate is non-False, got {guard:?}");
-        };
-        assert_eq!(arms.len(), 2);
-        // One arm covers domain1 (the released-region predicate).
-        assert!(
-            arms.iter()
-                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_))))
+    fn to_guard_curried_function_names_only_the_open_groups_keys() {
+        // Groups 0 and 1, both keyed 10 and 11; the predicate calls group 0 whole.
+        let tile = cf_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 10, 11],
+            vec![100, 110, 200, 210],
+            Predicate::LessThanEq(Value::UInt(0)),
         );
-        // One arm covers domain2 (the codomain inner guard).
+        let TileGuard::Or(arms) = tile.to_guard() else {
+            panic!("expected an Or over the two halves")
+        };
+        let codomain = arms
+            .iter()
+            .find_map(|a| match a {
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => Some(inner.as_ref()),
+                _ => None,
+            })
+            .expect("the open group contributes a codomain arm");
+        let TileGuard::Function(FunctionGuard::Domain(keys)) = codomain else {
+            panic!("a codomain arm guards the inner domain, got {codomain:?}")
+        };
+        // Group 1's keys, named once each rather than twice.
+        assert!(keys.contains(&Value::UInt(10)));
+        assert!(keys.contains(&Value::UInt(11)));
         assert!(
             arms.iter()
-                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Codomain(_))))
+                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_)))),
+            "the whole group is released by its own key"
+        );
+    }
+
+    /// With every group whole there is nothing left for a codomain arm to name, so the
+    /// guard is the domain half alone — which is what lets a consumer recognise it as
+    /// universal where the predicate is.
+    #[test]
+    fn to_guard_curried_function_whole_groups_name_no_keys() {
+        let tile = cf_uint_int(
+            vec![0],
+            vec![0],
+            vec![10, 11],
+            vec![100, 110],
+            Predicate::True,
+        );
+        let guard = tile.to_guard();
+        assert!(
+            matches!(
+                guard,
+                TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+            ),
+            "expected the domain half alone, got {guard:?}"
         );
     }
 

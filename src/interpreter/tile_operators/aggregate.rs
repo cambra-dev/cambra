@@ -520,20 +520,40 @@ impl TileProducer for MapAggregateProducer {
         self.input.release(upstream_guard);
 
         // Build the output tile from all known per-key accumulators.
-        // TODO apply the domain predicate to each domain value.
-        let is_terminal = domain_predicate.as_bool().unwrap_or(false);
-        let n = self.accumulators.len();
-        let (domain_values, accumulator_values): (Vec<Value>, Vec<Value>) = self
+        //
+        // **Terminal per key, which is what the predicate says.** A `domain_predicate` names
+        // the region of `domain1` that will see no new elements, each key together with its
+        // whole list ([`Tile::CurriedFunction`]) — so a key inside it has a complete group
+        // and its accumulator is the answer, whatever the rest of the domain is still doing.
+        // Reading the predicate as one bool answers "not yet" for every key whenever any
+        // part of the domain is open, which is never right for a live source: a collection
+        // held per row is complete as soon as its row arrives, and an aggregate over one
+        // would otherwise never settle.
+        let (domain_values, accumulator_values, terminal): (Vec<Value>, Vec<Value>, BitVec) = self
             .accumulators
             .iter()
-            .map(|(key, acc)| (key.clone(), acc.as_single().unwrap()))
-            .unzip();
+            .map(|(key, acc)| {
+                (
+                    key.clone(),
+                    acc.as_single().unwrap(),
+                    domain_predicate.contains(key),
+                )
+            })
+            .fold(
+                (Vec::new(), Vec::new(), BitVec::new()),
+                |(mut keys, mut accs, mut term), (key, acc, is_terminal)| {
+                    keys.push(key);
+                    accs.push(acc);
+                    term.push(is_terminal);
+                    (keys, accs, term)
+                },
+            );
         Tile::SealedFunction {
             domain: ColumnValue::from_values(domain_values, &domain_extent),
             codomain: Box::new(Tile::Aggregation {
                 kind: self.kind,
                 accumulator: ColumnValue::from_values(accumulator_values, &output_extent),
-                terminal: ColumnValue::Bools(BitVec::from_elem(n, is_terminal)),
+                terminal: ColumnValue::Bools(terminal),
             }),
             domain_predicate,
             deleted: BitSet::new(),
@@ -682,8 +702,15 @@ mod tests {
         )));
         producer.release(key_one.clone());
 
+        // The input must have seen key 1 released. A tile that declares itself final is
+        // released whole on the first pull ([`Tile::to_guard`]), so what covers the key
+        // here is that universal release rather than a second, per-key one — which is why
+        // this asks whether the key was covered rather than which release covered it.
         assert!(
-            released.borrow().contains(&key_one),
+            released
+                .borrow()
+                .iter()
+                .any(|g| g.is_universal() || *g == key_one),
             "the per-key release must reach the input, got {:?}",
             released.borrow()
         );

@@ -151,6 +151,43 @@ A product value is where the materialized form is required. A record or tuple is
 
 The two conversions are asymmetric. Materializing is the [`Materialize`] operator, because collecting a stream needs state. Streaming a table back is a composition — `MapResult` of the table over an iteration of its own domain — which is what op-conversion's `List` arm already builds for a list literal, and what `stream_collection` builds at a projection out of a product. A collection therefore leaves a product streamed, so every consumer downstream of a projection sees the one form it reads.
 
+### Reading a collection held per row
+
+A **column** of materialized collections is the third form, and it is what a transactional
+collection reads as: the store holds the whole map at one commit key, so an as-of read is one
+map value per commit. A keyed read takes it as it is — `Lookup` searches the bindings of the
+row's own value — while every consumer that *iterates* a collection reads the streamed shape,
+and one stream cannot carry several rows' collections because their keys collide.
+
+`Tiling::CurriedFunction` is that shape: a collection per row, `domain1` naming the rows.
+[`StreamMaterialized`] is the adapter, opening each row's bindings into that row's group, and
+op-conversion inserts one where an aggregate's input arrives as a column of collection values.
+It is the per-row sibling of `stream_collection`, which streams a **single** materialized table
+and can do it by composition (an iteration of the table's own domain, mapped through it); no
+composition serves the per-row case, because the key set to iterate differs per row and only
+the row's own value names it.
+
+Two facts about a per-row collection make it work, and neither holds of a streamed one.
+
+**It is complete as soon as its row arrives.** A map value carries its own keys, so nothing
+waits on a domain closing to know the group is whole. `StreamMaterialized` says so by naming
+the rows it delivers in its `domain_predicate`, which is the region of `domain1` that will see
+no new elements, each row together with its whole list. Without it an aggregate over a live
+store would hold every row open forever: `MapAggregate` marks each accumulator terminal exactly
+where the predicate names its key, rather than reading the predicate as one bool for the whole
+domain.
+
+**Its keys repeat across rows.** Two commits of one map carry the same keys, which a curried
+tile permits — `validate_tile` asks for uniqueness within a group and no more. A codomain guard
+names keys and not the group they sit in, so releasing one would release it in every other row;
+`Tile::to_guard` therefore names keys only for the groups its predicate leaves open, and
+releases the whole ones by their own `domain1` value instead.
+
+A row whose collection is **empty** contributes no group, because a curried tile's offsets are
+strictly ascending and so every group holds at least one entry. Its consumer sees the row as
+absent rather than as an empty collection, which for an aggregate is the difference between no
+answer and the identity.
+
 ---
 
 ## The release contract

@@ -345,6 +345,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             .user_annotation
             .clone()
             .expect("user_annotation is present");
+        // **An annotation names the value at this position unless it is itself a handle.**
+        // A mutable variable mention under one therefore reads, which is the same rule
+        // [`emit_let`] applies before it matches its annotation forms, and for the same
+        // reason: a `Hole` inside the annotation then completes from the value rather than
+        // from the history, so `_` needs no case of its own. What reaches here is a
+        // generator source — lowering stamps one `data_fun(_, _)` — and rule 1 keeps a
+        // `Mut`-typed value a bare `Var`, so a node carrying both a handle type and a
+        // non-handle annotation is that position and no other.
+        if annotation.mut_value_type().is_none() {
+            ty = read_through(&ty);
+        }
         // A **concrete** function kind on the annotation is a *provenance stamp*:
         // lowering marks a data collection (a comprehension / `groupby`) with a
         // `data_fun(_, _)` annotation, and here we set that kind concretely on the
@@ -943,7 +954,12 @@ pub(super) fn emit_apply<C: Typing>(
         return emit_lookup(form, function, &collection, &key, &key_ty, ctx);
     }
     let raw_arg_ty = ctx.subexpr(argument)?;
-    let fn_ty = ctx.subexpr(function)?;
+    // **A function position is a value position**, so a mutable variable mention there
+    // reads. Applying a collection is what puts one here — a comprehension's generator
+    // source is its own function, applied at each position — and a handle is not a
+    // function: the relation relates a mutable variable only to another, so an
+    // undereffed one meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch.
+    let fn_ty = read_through(&ctx.subexpr(function)?);
     // **The one position where a mutable variable's handle survives.** If the parameter is a
     // mutable variable the argument is passed *by reference* and the handle must reach the
     // parameter, so the invariance rule relates the two value types directly — that is

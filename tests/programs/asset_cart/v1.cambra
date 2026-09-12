@@ -11,21 +11,21 @@
 #      Only the checkout's drain needs it, and it could be written another way.
 #      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
 #
-#   2. Reading a transactional collection as a collection.  Every read of the
-#      whole `cart` or `holdings` — the due total and both view lists — is one.
-#      The entry binder types: `map_domain` takes a consumer's collection, which
-#      a `Mut` wrapping one satisfies, so the source is the map's key domain and
-#      the value comes back through the proven lookup. It meets `lambda_elim`,
-#      whose curried body does not carry the Σ binder its domain names. A plain
-#      value binder does not get that far — a `Mut(...)` never derefs to the map
-#      inside it at the comprehension's source annotation.
+#   2. Sweeping a transactional collection by its **entries**.  The due total
+#      and both view lists bind the key, and that is what is left: the source
+#      types and the value comes back through the proven lookup, but
+#      `lambda_elim` curries the comprehension's body over the transaction's
+#      reads and the curried type does not carry the Σ binder its domain names,
+#      which op-conversion meets as a `curry` it cannot compile.
 #      Pinned: `an_entry_binder_over_a_transactional_map_is_not_reachable`.
 #
 # What does work, and is worth knowing before rewriting anything: writing a key
-# (`cart[(a, t)] := q`) and reading one key are both fine, and so is a compound
-# key, taken apart by the binder or by the program's own `k.0`. It is only
-# reading a whole collection that is blocked — which is why `PATCH /cart` is
-# expressible today and the cart view is not.
+# (`cart[(a, t)] := q`) and reading one key are both fine; so is a compound key,
+# taken apart by the binder or by the program's own `k.0`; and so is reading a
+# whole transactional collection by its **values** (`sum([q for q in cart])`),
+# which is the store's map opened into a collection per transaction. It is the
+# key binder that is blocked — which is why `PATCH /cart` is expressible today
+# and the cart view is not.
 #
 # `mod.rs` carries the same list beside the test that pins it.
 
