@@ -435,6 +435,14 @@ pub(super) fn lower_final_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_standalone_transaction(last, unit, &scope, ctx)
         }
+        // `pass` contributes no statement, and this block's value is its last one
+        // (`docs/chl-spec.md`, "4.7 `pass`"). A function body reaches here too, which
+        // is why `def todo(x): pass` is rejected rather than returning unit.
+        ChlStmt::Pass => Err(LoweringError::unsupported(
+            last.span,
+            "`pass` cannot end a block whose value is used; \
+             it holds a place only where no value is expected",
+        )),
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
         _ => Err(LoweringError::unsupported(
@@ -927,6 +935,9 @@ pub(super) fn lower_middle_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_standalone_transaction(stmt, body, &scope, ctx)
         }
+        // `pass` contributes no statement, so the continuation is the whole block
+        // (`docs/chl-spec.md`, "4.7 `pass`").
+        ChlStmt::Pass => Ok(body),
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(body),
