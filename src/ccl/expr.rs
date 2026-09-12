@@ -570,18 +570,20 @@ pub enum TypedExprNode {
     /// Field access `r.field` lowers to `Apply(r, Proj(ProjKey::Field("field")))`.
     Record(Vec<(String, TypedExpr)>),
 
-    /// The program's **output list**: one named output per entry.
+    /// The program's output list: one named output per entry.
     ///
-    /// Minted by [`lower_stmts`](crate::ccl::lower) at the tail of the root
-    /// `Let*` chain when the program binds any sink, so each entry's expression
-    /// is in scope of the bindings above it. Each output is its own stream,
-    /// compiled to its own operator by
-    /// [`convert_record_fields_to_operators`](crate::interpreter::operator_conversion::convert_record_fields_to_operators)
-    /// — the node never becomes a value, which is what separates it from a
-    /// [`Record`](Self::Record) whose fields are a single value's.
+    /// Lowering mints it at the tail of the root `Let*` chain when the program
+    /// binds a sink, so each entry's expression is in scope of the bindings
+    /// above it. Each entry compiles to its own operator and its own stream, and
+    /// the node never becomes a value — unlike a [`Record`](Self::Record), whose
+    /// fields are one value's.
     ///
-    /// The distinction is not recoverable from shape: a program whose trailing
-    /// expression is a record literal has the same `Let*`-then-fields form.
+    /// Shape does not recover the distinction: a program whose trailing
+    /// expression is a record literal has the same `Let*`-then-named-fields
+    /// form. Every pass that treats the two differently matches on the node.
+    ///
+    /// See `src/ccl/design/ir.md`, "`Outputs` — the program's output list, not a
+    /// record".
     Outputs(Vec<(String, TypedExpr)>),
 
     /// A reference to an externally-registered data source, identified by name.

@@ -154,24 +154,14 @@ fn run_program(
         debug!("Main calling get");
         let tile = producer.get(producer.tiling().universal_guard());
 
-        let release_guard = match &tile {
-            Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
-            Tile::SealedFunction {
-                domain_predicate, ..
-            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            other => panic!("Unexpected top-level tile shape: {other:?}"),
-        };
+        let release_guard = release_guard_for(&tile);
         debug!("Main releasing with {release_guard:?}");
         let done = release_guard.is_universal();
         producer.release(release_guard);
         snapshot(&live, inspector.as_ref(), tick);
         tick += 1;
         // Producers can return empty tiles, but still have more data.
-        let is_empty = match &tile {
-            Tile::Scalar(cv) => cv.is_empty(),
-            Tile::SealedFunction { domain, .. } => domain.is_empty(),
-            _ => false,
-        };
+        let is_empty = tile_is_empty(&tile);
         if !is_empty || done {
             println!("Got value: {tile:#?}");
         }
@@ -205,6 +195,38 @@ fn run_program(
     }
 
     Ok(())
+}
+
+/// What the driver has taken delivery of in `tile`, to release back.
+///
+/// A record value's fields are tiled independently — a scalar field alongside a
+/// materialized collection field — so the guard is built per field rather than
+/// from the record as a whole.
+fn release_guard_for(tile: &Tile) -> TileGuard {
+    match tile {
+        Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
+        Tile::SealedFunction {
+            domain_predicate, ..
+        } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+        Tile::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(k, t)| (k.clone(), release_guard_for(t)))
+                .collect(),
+        ),
+        other => panic!("Unexpected top-level tile shape: {other:?}"),
+    }
+}
+
+/// Whether `tile` carries nothing yet. A producer may answer empty and still
+/// have more to deliver, which is what separates this from being done.
+fn tile_is_empty(tile: &Tile) -> bool {
+    match tile {
+        Tile::Scalar(cv) => cv.is_empty(),
+        Tile::SealedFunction { domain, .. } => domain.is_empty(),
+        Tile::Record(fields) => fields.values().all(tile_is_empty),
+        _ => false,
+    }
 }
 
 /// The default port for every inspector surface. `Run` and `InspectOnly` are
