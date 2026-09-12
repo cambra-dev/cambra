@@ -733,15 +733,21 @@ fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
 #[test]
 fn a_refined_map_key_no_key_satisfies() {
     check_compile_error(
-        "m: Map({String where _ != \"\"}, Int) = map([(\"a\", 1), (\"z\", 2)])\nm\n",
-        "Annotation mismatch: annotated as \u{3a3} (\u{3c3} : SubtypesOf({String | __elem != \"\"}))",
+        r#"
+m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
+m
+"#,
+        r#"Annotation mismatch: annotated as Σ (σ : SubtypesOf({String | __elem != ""}))"#,
     )
 }
 
 #[test]
 fn a_refined_map_key_in_a_mut_annotation_reaches_the_boundary() {
     check_compile_error(
-        "m: Mut(Map({String where _ != \"\"}, Int)) := box(map([(\"a\", 1), (\"z\", 2)]))\nm\n",
+        r#"
+m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
+m
+"#,
         "produced an invalid tree: [Type mismatch for collection domain",
     )
 }
