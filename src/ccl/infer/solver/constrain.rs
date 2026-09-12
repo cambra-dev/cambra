@@ -1708,6 +1708,14 @@ fn constrain_go_impl(
                 .filter(|r| !lrefs_in_ambient.contains(&sr.force_refinement(r)))
                 .cloned()
                 .collect();
+            // Transported, unlike `deficit`'s members: `smt_sub` reads both
+            // sides' predicates as terms of one formula, so a name has to mean
+            // the same thing on both. It is also what makes the entailment
+            // decidable at all here — an untransported lhs predicate mentions
+            // the `let` binder a discharge edge on `sl` replaces with the bound
+            // term.
+            let rrefs_in_ambient: Vec<Refinement> =
+                rrefs.iter().map(|r| sr.force_refinement(r)).collect();
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
@@ -1715,40 +1723,45 @@ fn constrain_go_impl(
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
                 // resolves to a concrete base lacking those refinements.
-                let demanded = Type::refined(rbase.clone(), deficit);
-                constrain_go(lbase, &demanded, sl, sr, cache, scope)
+                //
+                // Ask the entailment first, where lhs states something of its own
+                // over a scalar demand. What the flow is *for* is a variable
+                // acquiring a refinement it lacks, and a value already entailing the
+                // demand lacks nothing; flowing the deficit down to the variable's
+                // lower bounds instead asks each of them to establish alone what
+                // they establish together — `Case` arms, whose disjunction no single
+                // arm carries. Anything the query leaves undecided falls through to
+                // the flow, which is the answer with no query at all.
+                if !scope.is_skip_smt()
+                    && !lrefs_in_ambient.is_empty()
+                    && matches!(rbase, Type::Base(_))
+                    && super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
+                        .unwrap_or(false)
+                {
+                    constrain_go(lbase, rbase, sl, sr, cache, scope)
+                } else {
+                    let demanded = Type::refined(rbase.clone(), deficit);
+                    constrain_go(lbase, &demanded, sl, sr, cache, scope)
+                }
             } else if scope.is_skip_smt() {
                 Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
                 })
-            } else if super::smt::smt_sub(
-                lbase,
-                &lrefs_in_ambient,
-                // Transported, unlike `deficit`'s members: `smt_sub` reads both
-                // sides' predicates as terms of one formula, so a name has to mean
-                // the same thing on both. It is also what makes the entailment
-                // decidable at all here — an untransported lhs predicate mentions
-                // the `let` binder a discharge edge on `sl` replaces with the bound
-                // term.
-                &rrefs
-                    .iter()
-                    .map(|r| sr.force_refinement(r))
-                    .collect::<Vec<_>>(),
-                scope,
-            )
-            .or_else(|error| match error {
-                // A predicate the encoder cannot read leaves the deficit undecided,
-                // and undecided is the answer structural matching already gave:
-                // a mismatch. Reporting the encoder's limit instead would turn an
-                // ill-typed program's diagnostic into a note about this module.
-                SmtError::Encoding { .. } => Ok(false),
-                error => Err(ConstrainError::SmtError {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                    error: Box::new(error),
-                }),
-            })? {
+            } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
+                .or_else(|error| match error {
+                    // A predicate the encoder cannot read leaves the deficit undecided,
+                    // and undecided is the answer structural matching already gave:
+                    // a mismatch. Reporting the encoder's limit instead would turn an
+                    // ill-typed program's diagnostic into a note about this module.
+                    SmtError::Encoding { .. } => Ok(false),
+                    error => Err(ConstrainError::SmtError {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        error: Box::new(error),
+                    }),
+                })?
+            {
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
                 Err(ConstrainError::Mismatch {

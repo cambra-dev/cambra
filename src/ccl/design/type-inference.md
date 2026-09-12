@@ -923,7 +923,7 @@ What this changed is instructive, because refinements were rare enough before th
 
   Inheriting is not the same as **computing**, and only the first is ruled out. `{Int | __elem == 2} + {Int | __elem == 3}` genuinely *is* `{Int | __elem == 5}`, and a trait instance is where such a rule would live, since it determines the output type rather than forcing it to be a position the operands already occupy. Today every instance computes a base and stops — a property of the table, not of the mechanism. Two things would have to change to lift it: an instance would need the operands' *types* rather than their bases, and the deposit would have to move to a point where those types are final. Eager deposit is sound for a base because a base never weakens, while a refinement set only shrinks as further lower bounds arrive — so a refinement computed from a partial view is too strong. A rule computing from resolved operands then meets recurrences (`x := x + 1` resolves its operand through its own output), where it must already be sound at the cut; and anything beyond constant folding and interval arithmetic needs predicate *implication*, which the lattice deliberately does not have (refinements match structurally — see this file's module-level note in `src/ccl/infer/solver/mod.rs`).
 * **A mutable variable takes no refinement** from its initializer or from any single write. A mutable variable is not one value but the sequence its writes produce, so its value type is the join over all of them; taking one contribution's refinement would assert it never changes, which is what declaring it mutable denies. The rule holds at every place a mutable variable's value type is *built*, not just at the `:=`/`+=` rule: the `Transact` carrier's keys (where the seed is the value type's only lower bound, so an unstripped seed would resolve the mutable variable — and every read of it — to the seed's singleton), the recognition that builds that carrier, and the phase that reads the value type back off the seed binding.
-* **Every merge point joins** — a list's elements, a `Case`'s arms, a mutable variable's seed and writes, a channel's contributions. This is the one rule the singleton made load-bearing, and the one place it is easy to get wrong, because a merge that simply *adopts one input's type* looks right until the inputs carry different refinements. The law: a refinement is a fact about **a value**, and a merge point is not one value — it is whichever input the runtime supplies — so a refinement survives the merge only if *every* input establishes it. Two arms depositing different singletons intersect to none (`1 if 𝑐 else 2` is an `Int`); two arms depositing the same restriction keep it (identical filtered comprehensions stay filtered, `5 if 𝑐 else 5` is still `Int@5`). Where the merge is a fresh variable every input flows into, the solver's join *is* the rule and nothing has to strip; where a pass builds the merged type by hand (`channelize`'s channel union, the `Transact` carrier's key seeds) it must intersect the refinements explicitly.
+* **Every merge point joins** — a list's elements, a `Case`'s arms, a mutable variable's seed and writes, a channel's contributions. This is the one rule the singleton made load-bearing, and the one place it is easy to get wrong, because a merge that simply *adopts one input's type* looks right until the inputs carry different refinements. The law: a refinement is a fact about **a value**, and a merge point is not one value — it is whichever input the runtime supplies — so a refinement survives the merge only if *every* input establishes it. Two arms depositing different singletons intersect to none (`1 if 𝑐 else 2` joins to `Int`, and carries what the arms establish between them on top of that join — [What the arms establish](#what-the-arms-establish)); two arms depositing the same restriction keep it (identical filtered comprehensions stay filtered, `5 if 𝑐 else 5` is still `Int@5`). Where the merge is a fresh variable every input flows into, the solver's join *is* the rule and nothing has to strip; where a pass builds the merged type by hand (`channelize`'s channel union, the `Transact` carrier's key seeds) it must intersect the refinements explicitly.
 
   **Stripping is not the join.** It over-approximates in the safe direction (a refinement every input establishes is thrown away) and it is not variance-stable: for a *collection* input, whose extent rides the contravariant `Fun` domain, relating a refined input to a stripped sibling demands `𝐷 <: {𝐷 | 𝑝}` and rejects two arms that are literally the same expression. `𝐷 <: {𝐷 | 𝑝}` is never a real obligation in this language — acquiring a refinement is an explicit `cast` — so seeing one means an erasure manufactured it. Inputs whose extents genuinely differ meet on the domain (both refinements accumulate — the extent both admit), since that is where a function type's join puts them.
 * **A `Mut` input derefs into the join**, exactly as a mutable read derefs into a tuple element, so a `Case` over two mutable variables types as their *value*. The second-class discipline's rule 1 therefore has no `Mut` on the selection to reject; what it protects — a selected mutable variable reaching a position that writes through it — is its argument clause, which reads the argument *node*. See [No aliasing: `Mut` values are second-class (downward-only)](mutability.md#no-aliasing-mut-values-are-second-class-downward-only).
@@ -966,6 +966,27 @@ structural matching had already reached, so falling back to it is incomplete and
 The remaining errors — a solver that will not start, one that breaks mid-query, an `unknown` —
 reach `map_constrain_err`, which aborts on each. `TODO(smt-undecided)` there records the policy
 those want instead.
+
+`smt::reads` answers the same question about a *term*, without a solver: whether the encoder
+translates it. A caller minting a predicate out of program terms asks it first, because a predicate
+built into a type is carried by every pass that type reaches, and one the encoder stops at takes
+down the whole query it rides in. The two walks are one fragment, and
+`a_readable_term_is_what_the_encoder_translates` holds them to it by running the encoder rather
+than by restating its arms.
+
+##### A variable base asks before it absorbs
+
+A deficit over a base that is still a **variable** flows onto it (`b₁ <: {b₂ | S₂ \ S₁}`) rather
+than being rejected, which is what lets a variable acquire a refinement it lacks. A variable whose
+value already entails the demand lacks nothing, so the entailment is asked first, wherever `S₁` is
+non-empty and `b₂` is a scalar. The subject is declared at `b₂`'s sort: the same edge requires
+`b₁ <: b₂`, so every value of `b₁` is one of `b₂`, and a wider subject only weakens the antecedent.
+
+Flowing it unasked is not merely imprecise. The deficit reaches the variable's lower bounds one at
+a time, which asks each of them to establish alone what they establish together — the arms of a
+`Case`, whose disjunction no single arm carries ([What the arms
+establish](#what-the-arms-establish)). Anything the query leaves undecided falls through to the
+flow, which is the answer with no query at all.
 
 ##### A product is reached through its fields
 
@@ -1038,6 +1059,15 @@ Two environments implement the lookup, and a third suppresses the query:
 Dropping is the discipline throughout: a path with no sort, a predicate body outside the
 fragment, a name two binders disagree about. An assumption left out weakens the antecedent and
 cannot make an invalid entailment provable.
+
+A **sort** is not an assumption, and is found by two further readings where the scope settles
+nothing. A slot that is an inference variable resolves demands included, unlike `value_type` above:
+the sort says the leaf is an integer, which is what the edge demanding that established, so reading
+a demand cannot let an entailment prove itself. Failing that, the leaf takes the sort its
+*position* gives it — an operator's operands share one, so `x <= 5` declares `x` at `Int` however
+little the slot on `x` has resolved to. Without either, a query raised mid-emission over an
+unannotated parameter is unaskable: the parameter's type is settled by its uses, and its uses are
+what the query is about.
 
 ##### The set is the representation, not just the reading
 
@@ -2762,7 +2792,52 @@ The bottom two rows are ordinary schemes, because their operand types are fixed.
 
 ### `Case` inference
 
-For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join**. Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `Copair` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join** — refined by [what the arms establish](#what-the-arms-establish). Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `Copair` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+
+#### What the arms establish
+
+The join states what the arms have in common. An `if`/`elif`/`else` establishes more: exactly one
+arm runs, its guard held, every earlier guard failed, and the node's value is what that arm's body
+computes. `ArmFacts` in `src/ccl/infer/emit.rs` collects one predicate per arm,
+
+    𝑝ᵢ = 𝜋̂ᵢ ∧ __elem == 𝑏ᵢ
+
+where `𝜋̂ᵢ` is the first-match predicate `𝑔ᵢ ∧ ¬𝑔₁ ∧ … ∧ ¬𝑔ᵢ₋₁` that every conditional fan-out in
+the pipeline partitions with (`ccl_utils::synthesize_arm_predicate`), and refines the join by their
+disjunction `𝑝₁ ∨ … ∨ 𝑝ₙ`. `def foo(x) => {Int where _ <= 6}: x ^+ 1
+if x <= 5 else 0` is the case that needs it: the demand holds of each disjunct and of neither arm's
+own type, whose singleton `{Int | __elem == x ^+ 1}` exceeds 6 for a large enough `x`.
+
+A demand on the disjunction decomposes back over the arms — `(𝑝₁ ∨ 𝑝₂) ⊨ 𝑞` iff `𝑝₁ ⊨ 𝑞` and
+`𝑝₂ ⊨ 𝑞` — so nothing is lost by stating it as one predicate rather than as a case split. Stating
+it at all is what survives the join: [refinements on the lattice](#refinements-on-the-lattice)
+merge by intersecting the sets, and arms establishing different things intersect to none.
+
+The facts are read off the arms' **terms** and never their types. The same rules run again at the
+post-inference check over resolved types ([The post-inference check (shared rules)](#the-post-inference-check-shared-rules)),
+where a binder that was a variable has since acquired its singleton; a fact read off a type is a
+different fact at each of the two walls, while the terms are the same terms and refinement equality
+is type-blind. `Refinement::sharing` is not what the arms get — each predicate is minted here, so
+`Refinement::born` is.
+
+Four conditions gate the disjunction, and each is decided from syntax for the same reason:
+
+- **Every guard and body is a term the encoder reads** (`smt::reads`, the syntactic half of
+  [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback)). A fact no query can
+  read decides nothing and takes down the query it rides in, since the encoder stops at the first
+  body it cannot translate.
+- **No guard or body reads a history.** A mutable variable denotes a recurrence rather than a
+  value, and nothing discharges the binder into a predicate: the mutability-elimination phases
+  rewrite it away, and a type mentioning it outside its scope is the open bound
+  [The invariant](#the-invariant) rejects.
+- **Some arm is not a bare access path.** An operator term or a literal is a scalar by
+  construction; a name is whatever it is bound to, and a refinement on a data function says its
+  *elements* are filtered rather than anything about the arm. The arms join, so one arm settles the
+  node's kind for all of them. `def f(a, b, d): b if a else d` states nothing, which is what lets
+  its collection instantiations remain [a Σ](#the-domain-join-needs-box).
+- **Some arm carries a guard of its own.** A structural `match` selects by tag, which no predicate
+  over the scope states, and lowering gives every pattern arm — and every `else` arm — the literal
+  `true`.
 
 #### An unobservable arm payload is pinned to what its uses require
 
