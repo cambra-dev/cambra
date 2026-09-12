@@ -2121,7 +2121,7 @@ fn compact_go(
             // *structured* domain whose untouched positions are variables no
             // edge ever reaches, which is a `Proj`'s dense-prefix requirement
             // and nothing else — is recovered separately by `coalesce_node`'s
-            // `specialize_projection_domain`. Both Apply edges are one-way (no
+            // `specialize_projection`. Both Apply edges are one-way (no
             // emit-time reverse whose eager cross-component propagation would
             // cover these halves); see `design/type-inference.md` ("Apply is
             // one-way" and "Closing the single-sided blind spots (no separate

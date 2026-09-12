@@ -454,7 +454,10 @@ fn asset_cart_v1_currently_blocked_on_entry_iteration() {
     // would go green the moment an earlier one moved, and this test's whole job
     // is to fail loudly when the blocker changes — which is how it caught that
     // entry iteration and `for`-in-a-block had landed.
-    expect_compile_error(include_str!("v1.cambra"), "found ':', expected binary operator");
+    expect_compile_error(
+        include_str!("v1.cambra"),
+        "found ':', expected binary operator",
+    );
 }
 
 /// v1's wiring, beside it: three routes and the price feed.

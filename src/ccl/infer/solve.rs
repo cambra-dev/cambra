@@ -1326,7 +1326,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(function, level, ctx);
             coalesce_node(argument, level, ctx);
             // A projection applied to a resolved argument: monomorphize its domain
-            // to the argument flowing in (see `specialize_projection_domain`). A
+            // to the argument flowing in (see `specialize_projection`). A
             // projection is polymorphic in its input's width, so this supplies the
             // one width the use site needs rather than repairing anything the graph
             // lost. The cast-target / join-filter predicate case is reached the same
@@ -1340,7 +1340,30 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // (`src/ccl/design/type-inference.md`, "The collapse happens at the
             // position"). Only a projection's domain is unreassemblable from the graph,
             // because its untouched positions are variables nothing constrains.
-            specialize_projection_domain(function, &argument.ty);
+            //
+            // A recovered codomain lands on the application's **variable**, not on its
+            // type slot, because the variable is what the rest of the program holds: an
+            // unannotated `let` binds its name at the initializer's type object
+            // (`emit_let`), so the binder slot and every reference to the name share this
+            // variable and each resolves it from the graph. `let a = k.0 in a + b` is the
+            // case — writing the slot alone types the projection and leaves every use of
+            // `a` unresolved.
+            //
+            // A bare lower bound rather than `constrain_subtype`, because there is no
+            // second reading to reconcile. The variable is unresolved exactly when the
+            // recovery fires (`specialize_projection` returns `Some` only then), so the
+            // join is this bound alone; and the recovered field is written in the
+            // argument's scope, which a constraint would carry into the variable's own
+            // upper bounds and compare witness references across (the two scopes are
+            // related by a correspondence nothing here holds).
+            if let Some(cod) = specialize_projection(function, &argument.ty)
+                && let Type::Infer(v) = &expr.ty
+            {
+                v.bounds
+                    .borrow_mut()
+                    .lower_mut()
+                    .push(crate::ccl::Bound::conc(cod));
+            }
         }
         // **A cast's predicates are read once, below, after its two slots converge.** The
         // `target` is a type slot the `expr.ty` walk does not reach, so it needs its own
@@ -1466,7 +1489,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     continue;
                 };
                 let prev_cod = prev_cod.as_ref().clone();
-                specialize_projection_domain(&mut elts[i], &prev_cod);
+                specialize_projection(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
                 && let (
@@ -1643,7 +1666,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // an untagged sum when read bare.
     //
     // The read still *happens*, because it is load-bearing elsewhere: a parent's structural
-    // recovery of a contravariant domain (`specialize_projection_domain`) reads it, so a
+    // recovery of a contravariant domain (`specialize_projection`) reads it, so a
     // record-typed parameter's uses are how a projection's domain is recovered at all. So
     // the binder takes over only for the failure that *is* the collision above: a
     // positive-polarity `IncompatibleBounds`, which is what an untagged join of
@@ -1679,7 +1702,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // end-of-pass re-resolution sees every bound a later
             // specialization added — and must still yield `ty`. (Parent arms
             // may overwrite `expr.ty` afterwards via *structural* recovery
-            // — `specialize_projection_domain`, let-closing — which is not a
+            // — `specialize_projection`, let-closing — which is not a
             // graph read and so is not what this guards.)
             ctx.record_read(&expr.ty, &ty, || label.clone());
             expr.ty = ty;
@@ -2363,7 +2386,7 @@ fn typecheck_discarded_definition(def: &mut Expr, level: Level, ctx: &mut Coales
     }
 }
 
-/// The type [`specialize_projection_domain`] writes, given the value `input`
+/// The domain [`specialize_projection`] writes, given the value `input`
 /// flowing in.
 ///
 /// The overwrite reads the argument **node**, and a node's recorded type is the
@@ -2390,37 +2413,66 @@ fn recovered_input(input: &Type) -> Type {
 /// to emit a field access, and the use site is the only thing that has it.
 ///
 /// The solver never generalizes `.i` (it is a builtin, not a `let`), so there is
-/// no scheme to instantiate and overwriting the coalesced domain with `input` *is*
+/// no scheme to instantiate and overwriting the coalesced type with `input` *is*
 /// the instantiation — what [`specialize_use`] does for a generalized `let`, and
 /// what `compact_go`'s opposite-polarity collapse does for a bare contravariant
 /// domain var. The realizations differ only because the relationship differs: a
 /// `let`'s use type relates to its definition by arbitrary subtyping (so it needs
-/// freshen + pin + re-coalesce), whereas a projection's domain *equals* its input
-/// (`domain = ρ`), so it collapses to a single overwrite — no clone, constraint,
-/// or re-coalesce. The codomain (the field extracted) is preserved.
+/// freshen + pin + re-coalesce), whereas a projection's type is determined by its
+/// input (`domain = ρ`, `codomain = ρ.i`), so it collapses to a single overwrite —
+/// no clone, constraint, or re-coalesce.
 ///
-/// Where the argument's own type is already concrete when `arg <: domain` is
-/// drawn, the width reaches the domain variable as a lower bound and the negative
-/// reading meets it, so this is a no-op. What it is for is the argument that is
-/// still a variable at that point, whose width arrives only as its coalesced node
-/// type.
+/// **The codomain too, where the graph settled none.** The graph settles it only where
+/// the argument's own type was concrete when `arg <: domain` was drawn: the width then
+/// reaches the domain variable as a lower bound and the requirement
+/// `domain <: {i: codomain}` carries the field out of it. An argument still a variable
+/// at that point — a binder over a collection whose element type resolves later, which
+/// is every key of an entry-iterating generator — leaves the codomain with no bound at
+/// all, and a demand from above is then the only thing that can resolve it. That makes
+/// `k.0 + k.1` fail where `k.0 + v` succeeds, which is a report about the other operand
+/// rather than about the projection. `ρ.i` answers it at the position that has `ρ`.
+///
+/// A **settled** codomain stands. It is the same field of the same product, so nothing
+/// separates the two but identity — and identity is what a settled one has: a predicate
+/// on it is the `Rc` [`PredMemo`] shares across every occurrence, which planning
+/// compiles once. A structurally equal copy read off `ρ` is a second `Rc` for one
+/// predicate (`tests/predicate_sharing.rs`).
 ///
 /// `input` is supplied by the use site: the argument at an `Apply`, or the
 /// preceding morphism's codomain inside a `Compose`. No-op unless `morphism` is a
 /// `Proj` whose coalesced type is a function.
+///
+/// A recovered codomain comes back so the `Apply` arm can put it where the application
+/// resolves from. A `Compose` link needs nothing back: the next morphism reads its
+/// predecessor's rebuilt type directly.
 ///
 /// Invoked from `coalesce_node`'s `Apply`/`Compose` arms, which run bottom-up so
 /// `input` is already resolved. The cast-target / join-filter predicate case is
 /// reached the same way: `coalesce_type_predicates` runs `coalesce_node` over each
 /// refinement predicate, so its projections monomorphize through the `Apply` arm
 /// too.
-pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
-    if matches!(morphism.node, TypedExprNode::Proj(_))
-        && let Some(cod) = morphism.ty.codomain()
-    {
-        // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
-        morphism.ty = Type::fun(recovered_input(input), cod);
+pub(super) fn specialize_projection(morphism: &mut Expr, input: &Type) -> Option<Type> {
+    let TypedExprNode::Proj(key) = &morphism.node else {
+        return None;
+    };
+    let cod = morphism.ty.codomain()?;
+    let domain = recovered_input(input);
+    // A `ρ` that is no product — still a variable, or a sum whose witness stands where
+    // the product will be — names no field, and there the coalesced codomain is all
+    // there is.
+    let recovered = matches!(cod, Type::Infer(_))
+        .then(|| domain.field(key))
+        .flatten();
+    // EXPERIMENT: deposit on the codomain variable.
+    if let (Type::Infer(v), Some(field)) = (&cod, &recovered) {
+        v.bounds
+            .borrow_mut()
+            .lower_mut()
+            .push(crate::ccl::Bound::conc(field.clone()));
     }
+    // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
+    morphism.ty = Type::fun(domain, recovered.clone().unwrap_or(cod));
+    recovered
 }
 
 /// Fill a lambda's `param.ty` binder slot from its coalesced function type's

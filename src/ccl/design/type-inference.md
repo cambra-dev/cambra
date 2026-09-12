@@ -264,9 +264,9 @@ join-filter / cast-target case) are reached the same way since `coalesce_type_pr
 `coalesce_node` over them (see
 [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)).
 This is the **closed-form case of use-site specialization** — the same operation `specialize_use`
-performs for a generalized `let` (specialize to the resolved use type), except the morphism's domain
-*equals* its input, so it collapses to a single overwrite instead of clone+pin+coalesce. See
-`infer::specialize_projection_domain`. `proj_requirement` still spells the demand as a dense prefix,
+performs for a generalized `let` (specialize to the resolved use type), except the morphism's type
+is determined by its input, so it collapses to a single overwrite instead of clone+pin+coalesce. See
+`infer::specialize_projection`. `proj_requirement` still spells the demand as a dense prefix,
 `Tuple([fresh × 𝑘] ++ [field])`, because `Type::Tuple` cannot say "index 𝑘 at 𝑇, arity at least
 𝑘+1"; the fillers are placeholders for positions the projection has no opinion about, and the
 monomorphization overwrites them before any later phase reads one.
@@ -308,24 +308,44 @@ like any shape, and what lands it is
 **Morphism domains (projections and lambdas) — rebuilt during the coalesce walk (`Apply` and `Compose`).** A morphism's domain appears only at a negative position, and the one-way constraints emitted around it (`fn_ty <: domain ⇒ codomain` and `arg <: domain` at an `Apply`; the adjacency `prev_cod <: next_dom` in a `Compose`) deliver the concrete value flowing in only as a *lower* bound, while the uppers carry just what the morphism's own body demands — so negative-polarity coalesce materializes the narrow body-demand shape. A `Proj`'s domain coalesces field-narrow (e.g. `.0` of a multi-accumulator loop's `step` tuple coalesces to a 1-tuple `(T)` instead of the full `(T, U)`); a lambda's record param narrows to the fields its body touches (`{label}` instead of `{id, label}`), with untouched params left `Infer`.
 
 `coalesce_node` rebuilds it **structurally, after coalescing the children**, via
-`specialize_projection_domain`: the `Apply` arm replaces a projection's domain with the resolved
+`specialize_projection`: the `Apply` arm replaces a projection's domain with the resolved
 argument, the `Compose` arm with the preceding morphism's already-resolved codomain (and the chain's
 own type with `Fun(first.domain, last.codomain)`), and refinement predicates recover the same way
 through `coalesce_type_predicates`. A lambda needs no counterpart here — its binder is the domain
 variable, so its `param.ty` slot is derived from the coalesced domain (`refresh_lambda_param_slot`)
 and the body-usage refinements it carries are already in that reading. This is **use-site
 specialization** — the closed-form sibling of `specialize_use`'s per-`let` specialization (the
-morphism's domain *equals* its input, so it is one overwrite rather than clone+pin+coalesce; see
-§2). Doing it post-coalesce — rather than recording a reverse bound at emit time — is what keeps it
-robust: an emit-time bound is recorded against a specific inference variable, and let-polymorphism's
-monomorphization re-mints those variables (splicing freshened definitions at use sites), so the
-bound would not follow to the variable the node's recorded type ends up carrying. Reading the
-resolved shapes directly sidesteps that entirely.
+morphism's type is determined by its input, so it is one overwrite rather than
+clone+pin+coalesce; see §2). Doing it post-coalesce — rather than recording a reverse bound at
+emit time — is what keeps it robust: an emit-time bound is recorded against a specific inference
+variable, and let-polymorphism's monomorphization re-mints those variables (splicing freshened
+definitions at use sites), so the bound would not follow to the variable the node's recorded type
+ends up carrying. Reading the resolved shapes directly sidesteps that entirely.
+
+**A projection's codomain is recovered too, where the graph settled none.** The requirement
+`domain <: {𝑖: codomain}` carries the field out of the domain's lower bound, so the codomain is
+settled wherever the argument's type was concrete when `arg <: domain` was drawn. An argument
+still a variable at that point leaves it unbounded, and a demand from above is then the only
+thing that resolves it — which is what makes `k.0 + k.1` fail where `k.0 + v` succeeds. Every
+key of an entry-iterating generator is such an argument: its type is the collection's present-key
+domain, which resolves when the collection does. `𝜌.i` answers it at the position that has
+`𝜌`. A codomain the graph *did* settle stands: it is the same field of the same product, and a
+settled one carries the predicate `Rc` `PredMemo` shares across occurrences, which a structurally
+equal copy would split in two.
+
+The recovered codomain lands on the application's **variable** rather than on its type slot,
+because the variable is what the rest of the program holds: an unannotated `let` binds its name
+at the initializer's type object, so the binder slot and every reference to the name resolve that
+same variable from the graph. It goes in as a bare lower bound rather than through
+`constrain_subtype`, and the two reasons are the same fact — the variable is unresolved exactly
+when the recovery fires, so there is no second reading to reconcile, and the recovered field is
+written in the argument's scope, which a constraint would carry into the variable's upper bounds
+and compare witness references across.
 
 #### The collapse happens at the position
 
 The *bare* under-determined variable — a domain variable that receives only `arg` and nothing else —
-is the half `specialize_projection_domain` cannot reassemble, and `compact_go` handles it in place:
+is the half `specialize_projection` cannot reassemble, and `compact_go` handles it in place:
 where a variable's polarity-correct bounds yield no shape, the opposite side supplies one. The
 principal type of such a variable is `∀α ⊒ 𝐿. …`, and with no `Type::ForAll` and concrete code to
 emit, the quantifier collapses to its bound. That elimination is how a structurally-typed position
@@ -2539,7 +2559,7 @@ from](#where-the-candidates-come-from)).
 
   Two constraints shape the fix, and both are load-bearing. The standalone read must still
   *happen*, because a parent's structural recovery of a contravariant domain
-  (`specialize_projection_domain`) reads it — a record-typed parameter's uses are how a
+  (`specialize_projection`) reads it — a record-typed parameter's uses are how a
   projection's domain is recovered at all. And the parameter slot
   must only fill uses the read *left* unresolved, because a use whose read succeeded is at
   least as precise as the slot and often more so: a monomorphized parameter's use carries the

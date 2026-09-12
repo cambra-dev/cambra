@@ -995,7 +995,7 @@ pub(super) fn emit_apply<C: Typing>(
     // `fn_ty <: (x: domain) ⇒ codomain` and the argument edge `arg <: domain`.
     // A projection's contravariant domain, left under-determined by the one-way
     // edges, is recovered structurally at coalesce
-    // (`specialize_projection_domain`).
+    // (`specialize_projection`).
     let declared = function
         .user_annotation
         .as_ref()

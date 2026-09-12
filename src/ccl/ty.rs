@@ -2740,6 +2740,24 @@ impl Type {
         }
     }
 
+    /// The type at `key` of the product this type denotes, or `None` where it denotes no
+    /// product carrying that key.
+    ///
+    /// A refinement layer states a fact about the product as a whole and addresses no
+    /// field, so the walk peels through it. The field's own refinements are kept: they
+    /// describe the value the projection yields, which is what a caller asking for a
+    /// field's type is asking about.
+    pub fn field(&self, key: &ProjKey) -> Option<Type> {
+        match (self.peel_refinements(), key) {
+            (Type::Record(fields), ProjKey::Field(name)) => fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, ty)| ty.clone()),
+            (Type::Tuple(elems), ProjKey::Index(i)) => elems.get(*i).cloned(),
+            _ => None,
+        }
+    }
+
     /// Whether the function this type denotes is indexed by a **witness** rather than by a
     /// written domain — the closed and open spellings of one collection, answered together.
     ///

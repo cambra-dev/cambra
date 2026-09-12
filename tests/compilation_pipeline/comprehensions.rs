@@ -299,6 +299,26 @@ sum([v for k -> v in m])"#,
     );
 }
 
+/// A **compound key**, taken apart — which the storefront's cart
+/// (`Map({AccountId, Ticker}, Int)`) and every other product-keyed collection
+/// need. The key a generator binds is the collection's own present-key domain, a
+/// refined product whose component types the constraint graph learns only once the
+/// collection resolves, so each projection's codomain is monomorphized from the key
+/// flowing in (`src/ccl/design/type-inference.md`, "Apply is one-way"). Both
+/// spellings are one program below the binder — lowering writes `k.0` for the
+/// pattern — and both are pinned so a divergence fails rather than going unnoticed.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::pattern("sum([a + b + v for (a, b) -> v in m])")]
+#[case::written_out("sum([k.0 + k.1 + v for k -> v in m])")]
+fn an_entry_binder_takes_a_compound_key_apart(#[case] comprehension: &str) {
+    check_scalar(
+        &format!("m = map([((1, 2), 5), ((3, 4), 7)])\n{comprehension}"),
+        // (1+2+5) + (3+4+7).
+        Value::Int(22),
+    );
+}
+
 /// A `Set(𝐾)` is `Map(𝐾, unit)`, so its entry is `(𝐾, unit)` and the projection
 /// to the key is lossless — which is the whole reason entry iteration can be
 /// uniform across collection types while `Set` and `Map` remain the one pair the
@@ -419,24 +439,6 @@ fn an_entry_binder_beside_a_second_generator_is_not_reachable() {
     check_scalar(
         "m = map([(1, 10)])\nsum([k * v * x for k -> v in m for x in [1, 2]])",
         Value::Int(30),
-    );
-}
-
-/// A **compound key**, which the storefront's cart (`Map({AccountId, Ticker},
-/// Int)`) and every other product-keyed collection need. Projecting a key whose
-/// type is a present-key domain over a tuple leaves the component types
-/// undetermined — and it does so whether lowering writes the projection for a
-/// `(a, t) -> q` binder or the program writes `k.0` itself, so this is the
-/// projection rule and not the binder.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case::pattern("sum([a + b + v for (a, b) -> v in m])")]
-#[case::written_out("sum([k.0 + k.1 + v for k -> v in m])")]
-#[should_panic(expected = "Unresolved inference variable")]
-fn an_entry_binder_over_a_compound_key_is_not_reachable(#[case] comprehension: &str) {
-    check_scalar(
-        &format!("m = map([((1, 2), 5), ((3, 4), 7)])\n{comprehension}"),
-        Value::Int(22),
     );
 }
 

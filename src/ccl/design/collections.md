@@ -224,9 +224,11 @@ accordingly gained an [`OperatorSchemes`] entry — `∀δ ε. (δ ⤇ ε) ⇒ (
 *consumer's* collection so a sum satisfies it — where before it was minted only by join
 planning, which stamps its own type.
 
-**What works today**: a `map(…)` or `set(…)` source, with a scalar key, read or unread, in
-comprehension position — including inside a `with begin():` block over a collection the block
-does not own. Pinned in `tests/compilation_pipeline/comprehensions.rs`. **Statement position**
+**What works today**: a `map(…)` or `set(…)` source, with a scalar or compound key, read or
+unread, in comprehension position — including inside a `with begin():` block over a collection
+the block does not own. A compound key is taken apart by the binder (`for (a, t) -> q in cart`)
+or by the program (`k.0`), which are one program below the binder. Pinned in
+`tests/compilation_pipeline/comprehensions.rs`. **Statement position**
 (`for k -> v in m:`) lowers through the same binder and then meets the wall a *name* binder
 meets there: a `for` with an accumulator is an induction loop, whose source must be indexed by
 iteration position, and a keyed collection's positions are its keys.
@@ -234,9 +236,6 @@ iteration position, and a keyed collection's positions are its keys.
 **What does not, and why** — each pinned in the same file, and each blocked *upstream of the
 binder*, which lowers identically in all of them:
 
-- **A compound key** (`for (a, t) -> q in cart`). Projecting a key whose type is a
-  present-key domain over a tuple leaves the component types undetermined. Not the binder:
-  a hand-written `k.0` fails the same way.
 - **An annotated `Map(𝐾, 𝑉)`**, i.e. a sum. The keys of a sum are the keys of whichever
   candidate the witness picked, so the key binder lands on the witness and collides with the
   `𝐾` the annotation names. This is consuming a sum at its witness, open with the sum rules.
