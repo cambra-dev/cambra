@@ -78,6 +78,30 @@ fn lists_and_comprehensions() {
 }
 
 #[test]
+fn map_literals_and_entry_pairs() {
+    for src in &[
+        r#"["a" -> 1, "b" -> 2]"#,
+        "[k -> k * 10 for k in [1, 2]]",
+        "map([1 -> 10, 2 -> 20])",
+        "[k -> v for k in ks for v in vs if k == v]",
+        "counts << word -> 1",
+    ] {
+        let _ = must_parse_expr(src);
+    }
+}
+
+#[test]
+fn entry_pair_rollup_from_the_storefront() {
+    // The north-star `/stats` rollup: a map comprehension over a `groupby`,
+    // iterated by entry, spread over two lines inside its brackets.
+    must_parse_module(indoc! {r#"
+        revenue = [key -> sum([o.price for o in g])
+            for key -> g in groupby(paid, \o -> o.sku)]
+        revenue
+    "#});
+}
+
+#[test]
 fn joined_comprehension_from_survey() {
     // Multi-`for` + `if` — the parser must produce two `CompClause::For`s
     // followed by a `CompClause::If` in source order.

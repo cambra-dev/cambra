@@ -52,12 +52,9 @@
 //!
 //! ### Current limitations (what this test depends on)
 //!
-//! **Blocked today**: the `` ` `` prefix on the `` `some ``/`` `none `` variant
-//! tags is not lexed (the `\` lambda — the filter predicates — already
-//! lexes).  Behind the tag, the `match` expression on the catalog lookup is
-//! still not a keyword and derails the layout pass (an inconsistent-
-//! indentation lex error).  The full dependency list, each isolated by a
-//! smaller gallery program where one exists:
+//! **Blocked today** at the front end, on the membership `in` of `SKU`'s
+//! predicate (see the pinned blocker below).  The full dependency list, each
+//! isolated by a smaller gallery program where one exists:
 //!
 //! - `static assert` lifted to a codomain refinement — `discount_contract`
 //!   pins the boundary-assert ancestor of this shape.
@@ -92,29 +89,25 @@
 //! - Serving two versions at once across a branch point — no isolating program
 //!   yet (deferred with the still-open versioning surface).
 //!
-//! The variant tags and the refinement braces parse now (`docs/chl-spec.md`,
-//! "3.15 Variant constructors" and "6.4 Refinement syntax"), so what each file
-//! pins is the blocker behind them:
+//! The variant tags, the refinement braces and the `->` entry pairs of the
+//! `catalog` and `inventory` literals all parse now (`docs/chl-spec.md`,
+//! "3.15 Variant constructors", "6.4 Refinement syntax" and "2.4 Atoms"), so both
+//! files pin the same blocker behind them: `SKU`'s predicate
+//! `_ in catalog.keys()` parses only as far as `in`, which is no expression
+//! operator.  The parser recovers past each statement, so the same run also
+//! reports the other unshipped surfaces listed above — `import`, `static assert`,
+//! `requires`, `with begin():` in value position, and the bare annotation
+//! `orders: Feed(…)`.
 //!
-//! - **v0 — map-literal entries are unparsed.**  The first blocker is the `->`
-//!   entry pair in the `catalog` literal.  The parser recovers past each
-//!   statement, so the same run also reports the other unshipped surfaces listed
-//!   above (`static assert`, `requires`, `<<`) and one the refinements exposed:
-//!   `SKU`'s predicate `_ in catalog.keys()` parses only as far as `in`, which is
-//!   no expression operator.
-//! - **v1 — a layout failure, which lexing hits first.**  `quote` writes a
-//!   multi-line `if`/`else` **expression** whose `else:` sits at a shallower
-//!   indent than the then-branch body it follows.  The off-side rule dedents to a
-//!   level that was never opened and the lexer reports inconsistent indentation.
-//!   What is missing is a continuation rule for a bracket-less multi-line
-//!   expression: `docs/chl-spec.md`, "1.4 Implicit line continuation" covers only
-//!   bracketed forms.  Behind it, v0's map-literal entries and everything else
-//!   listed above.
+//! `/stats`'s map comprehension over `groupby` parses in both files.  What it
+//! still needs is entry iteration: `for key -> g in groupby(…)` binds a pair only
+//! once a keyed collection iterates entries (`src/ccl/design/collections.md`,
+//! "Telling `Set` and `Map` apart [Open]").
 
 use super::common::expect_compile_error;
 
 #[test]
 fn storefront_currently_blocked_in_the_front_end() {
-    expect_compile_error(include_str!("v0.cambra"), "found '->'");
-    expect_compile_error(include_str!("v1.cambra"), "found '->'");
+    expect_compile_error(include_str!("v0.cambra"), "_ in catalog.keys()");
+    expect_compile_error(include_str!("v1.cambra"), "_ in catalog.keys()");
 }

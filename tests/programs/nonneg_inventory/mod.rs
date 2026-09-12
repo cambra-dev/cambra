@@ -9,11 +9,12 @@
 //! This isolates the storefront's oversell invariant: same store type, same
 //! guard shape, no HTTP.
 //!
-//! **Currently blocked at parsing.**  The store type's refinement brace parses
-//! now (`docs/chl-spec.md`, "6.4 Refinement syntax"), so the first unsupported
-//! construct is the `->` map-entry pair in the store literal.  Behind it:
-//! `Map(…)` as an annotation form, map lookup, `requires Transaction`, `with
-//! begin():`, and record terms.  This pins the map-entry parse failure.
+//! **Currently blocked at parsing.**  The store type's refinement brace and the
+//! store literal's `->` entry pair both parse now (`docs/chl-spec.md`,
+//! "6.4 Refinement syntax" and "2.4 Atoms"), so the first unsupported construct
+//! is `reserve`'s `requires Transaction` clause.  Behind it: `Map(…)` as an
+//! annotation form, map lookup, `with begin():`, and record terms.  This pins the
+//! `requires` parse failure.
 //!
 //! Expected output once fully unblocked: `` `some(1) `` (5 − 2 − 2, third
 //! reservation refused).
@@ -22,5 +23,5 @@ use super::common::expect_compile_error;
 
 #[test]
 fn nonneg_inventory_currently_blocked_at_parsing() {
-    expect_compile_error(include_str!("program.cambra"), "found '->'");
+    expect_compile_error(include_str!("program.cambra"), "requires Transaction");
 }
