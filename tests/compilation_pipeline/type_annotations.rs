@@ -827,3 +827,22 @@ fn transaction3() {
         "Scope violation (compiler bug, design §6.2): type {Int | __elem == pool ^+ 1} at pool ^+ 1 references out-of-scope binder(s) [\"pool\"]",
     );
 }
+
+#[test]
+fn transaction4() {
+    check_compile_error(
+        indoc! {r#"
+            x: Mut({Int where _ >= 0}, Txn) := 10
+            y: Mut({Int where _ >= 0}, Txn) := 5
+            with begin():
+                x := x ^+ 1
+                x := x ^+ y
+                y := y ^+ y
+                y := 2
+                z = y
+                y := y ^+ z
+            await_final(y)
+        "#},
+        "post-inference produced an invalid tree",
+    );
+}
