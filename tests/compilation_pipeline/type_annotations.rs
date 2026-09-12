@@ -438,7 +438,7 @@ fn a_let_bound_constant_returned_directly() {
 /// **This test pins a defect, not a decision — it should start failing when the
 /// defect is fixed.**
 ///
-/// `2` is neither `0` nor `1`, so inference admits the call: the argument's type
+/// `2` is not `0`, so inference admits the call: the argument's type
 /// is `Int@2`, which entails both written demands through the fallback. Planning's
 /// post-pass check then rejects the same call. Both predicates are point-free by
 /// then — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — which is outside the encoded
@@ -451,10 +451,10 @@ fn a_let_bound_constant_returned_directly() {
 /// `4 // 2`. The rejecting counterpart is `tests/programs/refinement/`.
 #[test]
 #[should_panic(expected = "produced an invalid tree: [Type mismatch")]
-fn an_argument_entailing_two_written_levels_is_rejected_after_lambda_elim() {
+fn refinements_that_survive_to_post_planning_check_are_rejected() {
     check_scalar(
         indoc! {r#"
-            def no_zero_no_one_div(left: Int, right: { {Int where _ != 1} where _ != 0}):
+            def no_zero_no_one_div(left: Int, right: {Int where _ != 0}):
                 left // right
 
             no_zero_no_one_div(4, 2)

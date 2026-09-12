@@ -287,13 +287,13 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc || failed="${failed} doc"
-  # Before `ci_test`, so the oracle binary exists by the time the suite runs:
-  # the differential tests skip themselves without it, and a skip in the middle
-  # of the gate is the failure mode this step exists to remove.
   # Before `ci_test`, for the reason `ci_solver`'s own comment gives.
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_solver || failed="${failed} solver"
+  # Before `ci_test`, so the oracle binary exists by the time the suite runs:
+  # the differential tests skip themselves without it, and a skip in the middle
+  # of the gate is the failure mode this step exists to remove.
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_formal || failed="${failed} formal"
