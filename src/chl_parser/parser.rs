@@ -700,10 +700,14 @@ where
             )
             .boxed();
 
-        // ---- Unary minus --------------------------------------------
-        let unary = recursive(|u| {
-            just(Token::Minus)
-                .ignore_then(u.clone())
+        // ---- Unary minus and `**` -----------------------------------
+        // One layer, because the two interleave: `**` binds tighter than the
+        // minus on its *left* (`-2 ** 2` is `-(2 ** 2)`) and looser than the
+        // minus on its *right* (`2 ** -1` needs no parens), so the exponent is
+        // the whole layer and the base is only a `postfix`.
+        let unary = recursive(|factor| {
+            let neg = just(Token::Minus)
+                .ignore_then(factor.clone())
                 .map_with(|operand, e| {
                     Spanned::new(
                         e.span(),
@@ -712,8 +716,24 @@ where
                             operand: Box::new(operand),
                         },
                     )
-                })
-                .or(postfix.clone())
+                });
+            // Right-associative: the exponent recurses through this layer, so
+            // `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+            let power = postfix
+                .clone()
+                .then(just(Token::StarStar).ignore_then(factor.clone()).or_not())
+                .map_with(|(base, exponent), e| match exponent {
+                    None => base,
+                    Some(exponent) => Spanned::new(
+                        e.span(),
+                        Expr::BinOp {
+                            left: Box::new(base),
+                            op: BinOp::Pow,
+                            right: Box::new(exponent),
+                        },
+                    ),
+                });
+            neg.or(power)
         })
         .boxed();
 
@@ -1714,6 +1734,63 @@ mod tests {
             }
             other => panic!("expected Add, got {other:?}"),
         }
+    }
+
+    /// `**` binds tighter than `*` and groups to the right, and its two
+    /// neighbours on the unary-minus layer land on opposite sides: the minus on
+    /// its left is the outer node, the one on its right the exponent
+    /// (`docs/chl-spec.md`, "2.3 Expression precedence").
+    #[test]
+    fn power_precedence_and_associativity() {
+        // Tighter than `*`: the exponentiation is the product's right operand.
+        let Expr::BinOp {
+            op: BinOp::Mul,
+            right,
+            ..
+        } = parse_e("2 * 3 ** 2").node
+        else {
+            panic!("expected Mul, got {:?}", parse_e("2 * 3 ** 2").node);
+        };
+        assert!(matches!(right.node, Expr::BinOp { op: BinOp::Pow, .. }));
+
+        // Right-associative: `2 ** (3 ** 2)`, not `(2 ** 3) ** 2`.
+        let Expr::BinOp {
+            op: BinOp::Pow,
+            left,
+            right,
+        } = parse_e("2 ** 3 ** 2").node
+        else {
+            panic!("expected Pow, got {:?}", parse_e("2 ** 3 ** 2").node);
+        };
+        assert_eq!(left.node, Expr::Lit(Lit::Int(2)));
+        assert!(matches!(right.node, Expr::BinOp { op: BinOp::Pow, .. }));
+
+        // `-2 ** 2` is `-(2 ** 2)`.
+        let Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand,
+        } = parse_e("-2 ** 2").node
+        else {
+            panic!("expected Neg, got {:?}", parse_e("-2 ** 2").node);
+        };
+        assert!(matches!(operand.node, Expr::BinOp { op: BinOp::Pow, .. }));
+
+        // `2 ** -1` needs no parentheses around the exponent.
+        let Expr::BinOp {
+            op: BinOp::Pow,
+            right,
+            ..
+        } = parse_e("2 ** -1").node
+        else {
+            panic!("expected Pow, got {:?}", parse_e("2 ** -1").node);
+        };
+        assert!(matches!(
+            right.node,
+            Expr::UnaryOp {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
     }
 
     #[test]

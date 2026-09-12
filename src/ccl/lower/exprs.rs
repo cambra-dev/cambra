@@ -572,7 +572,7 @@ pub(super) fn lower_binop(
 /// Map a CHL [`ChlBinOp`] to its CCL [`BinOpKind`] counterpart.
 ///
 /// The mapping mirrors the variant set on `chl_ast::BinOp`, which only
-/// enumerates the operators CHL accepts (`/`, `%`, `**`, `>>`, `~` are
+/// enumerates the operators CHL accepts (`/`, `%`, `>>`, `~` are
 /// rejected at parse time and never appear here). `LogicalAnd/Or/Xor` map
 /// to CCL boolean logic — CHL reuses the `&`/`|`/`^` tokens for logical
 /// (not bitwise) operations. `Copair` is excluded: it lowers
@@ -585,6 +585,7 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
         ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
         ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
+        ChlBinOp::Pow => BinOpKind::Arithmetic(ArithmeticKind::Pow),
         ChlBinOp::LogicalAnd => BinOpKind::BoolLogic(LogicKind::And),
         ChlBinOp::LogicalOr => BinOpKind::BoolLogic(LogicKind::Or),
         ChlBinOp::LogicalXor => BinOpKind::BoolLogic(LogicKind::Xor),

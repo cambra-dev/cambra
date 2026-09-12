@@ -205,6 +205,7 @@ fn test_literal(#[case] code: &str, #[case] expected: Type) {
 #[case::compare("2 > 1", BaseType::Bool)]
 #[case::bool_and("True and False", BaseType::Bool)]
 #[case::concat_strings(r#""a" + "b""#, BaseType::String)]
+#[case::pow_int("10 ** 8", BaseType::Int)]
 fn test_binary_op(#[case] code: &str, #[case] expected: BaseType) {
     assert_eq!(infer_program(code), Type::Base(expected));
 }
@@ -297,6 +298,20 @@ fn negation_rejects_an_operand_with_no_instance() {
             |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Negatable")
         ),
         "expected NoTraitInstance for Negatable, got {errs:?}"
+    );
+}
+
+/// `**` states `Exponentiable`, whose rows are the numeric ones. A `String` base is a
+/// missing instance, the same rejection `-` gives a `String` operand — the operator has
+/// no hardcoded domain to mismatch against.
+#[test]
+fn exponentiation_rejects_an_operand_with_no_instance() {
+    let errs = infer_program_err(r#""a" ** 2"#);
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Exponentiable")
+        ),
+        "expected NoTraitInstance for Exponentiable, got {errs:?}"
     );
 }
 

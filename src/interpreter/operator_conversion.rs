@@ -4348,6 +4348,7 @@ fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
         B::Arithmetic(A::Sub) => InterpreterBinOp::Arithmetic(ArithmeticKind::Sub),
         B::Arithmetic(A::Mul) => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
         B::Arithmetic(A::FloorDiv) => InterpreterBinOp::Arithmetic(ArithmeticKind::FloorDiv),
+        B::Arithmetic(A::Pow) => InterpreterBinOp::Arithmetic(ArithmeticKind::Pow),
         B::Concat => InterpreterBinOp::Concat,
         B::Compare(C::Equals) => InterpreterBinOp::Compare(CompareKind::Equals),
         B::Compare(C::NotEquals) => InterpreterBinOp::Compare(CompareKind::NotEquals),
