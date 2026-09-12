@@ -2196,23 +2196,31 @@ fn compact_go(
                     && history_slot.is_none()
                     && !var_is_shape
             };
-            // A negative position reads the opposite side whether or not the shape
-            // needed recovering, because both sides narrow it: the requirement side
-            // records what the uses demand, the value side what actually arrives (see
-            // `src/ccl/design/type-inference.md`, "The collapse happens at the
-            // position").
+            // The two rules that read the opposite side, and they are not the same rule.
             //
-            // **Inside an invariant position it reads both sides however the walk
-            // arrived**, where elsewhere it reads them only at a position. A data
-            // domain reached along a bound chain is the same domain as one entered
+            // The **shape collapse** is a choice, so it fires only at the position the
+            // walk entered, and only where the polarity-correct walk found no shape for
+            // it to overwrite.
+            //
+            // The **merge** is a narrowing: both sides narrow a negative position — the
+            // requirement side records what the uses demand, the value side what
+            // actually arrives — so it fires there whether or not the shape needed
+            // recovering (`src/ccl/design/type-inference.md`, "The collapse happens at
+            // the position"). Inside an invariant position it fires however the walk
+            // arrived, where elsewhere it fires only at a position: a data domain
+            // reached along a bound chain is the same domain as one entered
             // structurally, and invariance leaves no variance to tell the two readings
-            // apart — so gating this one on `allow_fallback` gives one variable two
-            // answers at one polarity, which the invariance check then rejects against
-            // itself (`src/ccl/design/type-inference.md`, "An invariant position reads
-            // both sides however the walk reached it"). `allow_fallback` still gates
-            // the shape collapse, which is a choice rather than a narrowing.
-            let read_opposite =
-                (allow_fallback && no_concrete) || (!pol && (allow_fallback || pos.invariant));
+            // apart, so gating this one on `allow_fallback` gives one variable two
+            // answers at one polarity and the invariance check rejects the position
+            // against itself (`src/ccl/design/type-inference.md`, "An invariant position
+            // reads both sides however the walk reached it").
+            //
+            // Both stay under `st.collapse`, which suppresses the opposite side
+            // walk-wide for [`compact_type_polarity_only`] — a caller whose question is
+            // what reached the position, for which a demand is not an answer.
+            let collapse = allow_fallback && no_concrete;
+            let merge = !pol && (allow_fallback || (st.collapse && pos.invariant));
+            let read_opposite = collapse || merge;
             let mut recovered: Option<CompactType> = None;
             if read_opposite {
                 for b in opposite_bounds.iter() {
