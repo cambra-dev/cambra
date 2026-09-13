@@ -3722,11 +3722,7 @@ mod tests {
         // without asking whether a `let` happens to carry a `Mut` annotation.
         let mut tree = Expr::mut_decl(
             pool.clone(),
-            Type::History {
-                value: Box::new(Type::Base(BaseType::Int)),
-                domain: Box::new(Type::Txn),
-                history_kind: HistoryKind::Overwrite,
-            },
+            Type::mutable(Type::Txn, Type::Base(BaseType::Int)),
             init,
             stmt,
         );
