@@ -146,7 +146,7 @@ pub fn run(expr: Expr) -> Expr {
     let mut out = rewrite(expr);
     // The rewrite turns every mutable read/write into an ordinary recurrence
     // read/commit at the mutable variable's *value* type, but the transient history
-    // `Type::History { history_kind: Overwrite }` wrappers that rode the accumulator's
+    // `Type::History { history_kind: Overwrite, .. }` wrappers that rode the accumulator's
     // binding and any surviving reference (e.g. a trailing read the recurrence
     // re-points to the extracted final value) are stale afterward. Erase them
     // so no history reaches the strict `typecheck` (mirroring how

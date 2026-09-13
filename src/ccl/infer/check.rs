@@ -368,6 +368,7 @@ impl Typing for CheckCtx {
                 domain,
                 value,
                 history_kind: crate::ccl::HistoryKind::Append,
+                ..
             } => Ok(((**domain).clone(), (**value).clone())),
             _ => {
                 let located = self.raise(InferError::ExpectedFunction {
