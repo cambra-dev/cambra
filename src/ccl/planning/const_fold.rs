@@ -29,8 +29,9 @@
 //! **A compound constant**, including a `Let` of a tuple, a record or a variant.
 //! Substituting one copies nodes, and a copy needs minted [`NodeId`]s and a recording
 //! (`src/ccl/design/provenance.md`, "Where to open a recording"). Replacing `expr.node`
-//! with a `Lit` mints nothing and duplicates no id, which is why this pass opens no
-//! recording.
+//! with a `Lit` mints nothing and duplicates no id, so the term walk opens no recording of
+//! its own. The predicate rebuild below does — [`PredMemo`] opens one per predicate it
+//! copies — which is why it is entered only for a type that has something to fold.
 //!
 //! **A `//` whose two definitions disagree.** `docs/chl-spec.md`, "3.3 Arithmetic and
 //! logical operators" calls it floor division, and the runtime truncates toward zero. The
@@ -41,12 +42,27 @@
 //! arithmetic case goes through a guard or a `checked_*`, and declining leaves the
 //! application in place for the runtime to evaluate as it would have.
 //!
-//! **Types.** A refinement predicate is a shared `Rc` whose structural identity is what
-//! matches a producer's contract against its consumer's
+//! # Predicates fold too, and that is a patch over a deeper problem
+//!
+//! A refinement built by `^+` **embeds a copy of its operand's term**, so rewriting the
+//! term and not the copy leaves two spellings of one fact. The post-planning wall compares
+//! them structurally — a point-free predicate is outside the SMT encoding's fragment
+//! (`refinements_that_survive_to_post_planning_check_are_rejected` pins that deficit) — so
+//! the disagreement is reported as a type mismatch on a well-typed program.
+//!
+//! So this pass folds the predicates its type slots carry, through a pass-scoped
+//! [`PredMemo`] that keeps every occurrence of one predicate pointing at one term
 //! (`src/ccl/design/type-inference.md`, "Sharing is an invariant, not an optimization
-//! detail"), so folding one occurrence of a predicate and not another would break the
-//! match. The folded node keeps its recorded type, which Check mode verifies by base
-//! (`src/ccl/infer/check.rs`).
+//! detail"). A predicate folds with an **empty** environment: only the shapes that depend
+//! on nothing outside the term itself, so one predicate has one answer wherever it is
+//! shared, and no substitution crosses a scope the predicate is not in.
+//!
+//! **The head application does not fold.** Everything below it is a term the tree also
+//! holds, and the wall rebuilds the head fresh from the node's own operator — so folding it
+//! would answer a question the wall asks differently. That rule is about the wall rather
+//! than about terms, which is the tell: the real fix is for a refinement to compose over its
+//! operand's *type* instead of copying its term, and then nothing downstream has to know
+//! which terms predicates hold. This pass keeps the two spellings in step until that lands.
 //!
 //! # Agreement with the runtime
 //!
@@ -61,11 +77,13 @@ use std::cmp::Ordering;
 
 use super::*;
 use crate::ccl::ArithmeticKind;
+use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 
 /// Replace every closed scalar computation in `expr` with its value.
 pub(super) fn fold_constants(expr: &mut Expr) {
-    fold(expr, &mut Consts::default());
+    let predicates = crate::ccl::ccl_utils::PredMemo::default();
+    fold(expr, &mut Consts::default(), Some(&predicates));
 }
 
 /// The literals in scope, innermost last.
@@ -86,8 +104,14 @@ impl Consts {
     }
 }
 
-fn fold(expr: &mut Expr, consts: &mut Consts) {
+/// Fold `expr`, reporting whether anything changed.
+///
+/// `predicates` is `Some` for the term walk and `None` inside a predicate: a predicate's
+/// own type slots are not a second place for the tree's terms to live, and re-entering
+/// would fold a predicate under the memo that is rebuilding it.
+fn fold(expr: &mut Expr, consts: &mut Consts, predicates: Option<&PredMemo<()>>) -> bool {
     let base = consts.0.len();
+    let mut changed = false;
     if matches!(expr.node, TypedExprNode::Let { .. }) {
         let TypedExprNode::Let {
             binding,
@@ -100,13 +124,13 @@ fn fold(expr: &mut Expr, consts: &mut Consts) {
         // CCL's `let` is non-recursive: the binding scopes over `body` and not over
         // `bound_expr` (`scope::for_each_scoped_item` states every such rule). The bound
         // expression therefore folds in the enclosing environment.
-        fold(bound_expr, consts);
+        changed |= fold(bound_expr, consts, predicates);
         let lit = match &bound_expr.node {
             TypedExprNode::Lit(lit) => Some(lit.clone()),
             _ => None,
         };
         consts.push(binding.name.clone(), lit);
-        fold(body, consts);
+        changed |= fold(body, consts, predicates);
     } else {
         // A scope's children are consecutive and a scope is entered once, an invariant
         // `for_each_scoped_item_mut` documents, so each `Scope` item rebuilds the frame
@@ -118,14 +142,82 @@ fn fold(expr: &mut Expr, consts: &mut Consts) {
                     consts.push(name.clone(), None);
                 }
             }
-            ScopedItemMut::Child(child) => fold(child, consts),
+            ScopedItemMut::Child(child) => changed |= fold(child, consts, predicates),
             ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
         });
     }
     consts.0.truncate(base);
+    if let Some(memo) = predicates {
+        changed |= fold_predicates(expr, memo);
+    }
     if let Some(lit) = value_of(expr, consts) {
         expr.node = TypedExprNode::Lit(lit);
+        changed = true;
     }
+    changed
+}
+
+/// Fold the terms the predicates on `expr`'s type slots embed.
+///
+/// The **operands** of each predicate's head application, never the head: see the module
+/// docs, "Predicates fold too, and that is a patch over a deeper problem".
+fn fold_predicates(expr: &mut Expr, memo: &PredMemo<()>) -> bool {
+    let mut changed = false;
+    expr.walk_type_slots_mut(|ty| {
+        // **Scanned before the rebuild walk is entered, not inside it.**
+        // [`PredMemo::rebuild`] clones a predicate before its callback can report that
+        // there was nothing to do, and a clone advances the process-global
+        // [`NodeId`](crate::ccl::provenance::NodeId) mint — which renumbers every later id
+        // in the program and rewrites the whole golden corpus (`web/CLAUDE.md`, "The
+        // golden fixtures"). A type carrying no foldable predicate is left untouched, so a
+        // program with no constant inside a refinement keeps its ids exactly.
+        if !has_foldable_predicate(ty) {
+            return;
+        }
+        changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, _| fold_operands(pred));
+    });
+    changed
+}
+
+/// Whether any predicate in `ty` has an operand the fold would rewrite.
+fn has_foldable_predicate(ty: &Type) -> bool {
+    let mut found = false;
+    let mut visited = std::collections::HashSet::new();
+    walk_refined_predicates(ty, &mut visited, &mut |pred, _| {
+        found |= folds_anything(pred);
+    });
+    found
+}
+
+/// Whether folding `pred`'s operands would change anything — a read-only scan.
+fn folds_anything(pred: &Expr) -> bool {
+    fn go(e: &Expr) -> bool {
+        // An empty environment, matching the fold itself: only the shapes that depend on
+        // nothing outside the term. One foldable subterm is enough to enter — the fold is
+        // bottom-up from there and may reach more.
+        if value_of(e, &Consts::default()).is_some() {
+            return true;
+        }
+        let mut any = false;
+        e.walk_children(|c| any |= go(c));
+        any
+    }
+    let mut any = false;
+    pred.walk_children(|c| any |= go(c));
+    any
+}
+
+/// Fold every proper subterm of `pred`, leaving `pred`'s own root alone.
+fn fold_operands(pred: &mut Expr) -> bool {
+    let mut changed = false;
+    for_each_scoped_item_mut(pred, &mut |item| {
+        if let ScopedItemMut::Child(child) = item {
+            // An empty environment: a predicate folds only by the shapes that depend on
+            // nothing outside it, so one predicate has one answer wherever it is shared.
+            changed |= fold(child, &mut Consts::default(), None);
+        }
+    });
+    changed
 }
 
 /// The value `expr` computes, when its children are already folded and it is one of the
