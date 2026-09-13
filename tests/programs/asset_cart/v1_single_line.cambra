@@ -1,0 +1,104 @@
+# The map-based cart with **one line per account**, which is what makes it run.
+#
+# `v1.cambra` is the same app with a cart keyed by `{AccountId, Ticker}`, so an
+# account holds any number of lines and every read of the cart is an iteration
+# over the entries belonging to one account. That iteration is what v1's header
+# lists four obstructions to. Holding one line per account replaces each of those
+# reads with a keyed lookup, and the program compiles and runs today.
+#
+# What the simplification costs, and what it keeps:
+#
+#   - **Costs**: an account has one pending line, so the cart cannot hold a
+#     basket. A second `PATCH /cart` replaces the line rather than adding to it,
+#     which is what `cart[c.account] := …` says.
+#   - **Keeps**: the keyed collections, the three routes, the live price feed,
+#     and the atomicity claim — the debit, the credit and the clear commit
+#     together or not at all, under one `if` inside one block.
+#
+# Two further differences from v1, neither of them about the cart:
+#
+#   - The price feed is the declared source `price_updates`, as in `v0.cambra`,
+#     because `wasm_socket_subscribe` is not built. The rows are the same shape
+#     the socket would deliver.
+#   - `Balance` carries no refinement, and the initializer is not the reason.
+#     Seeding with a literal satisfies `{Microcents where _ > 0}` — a literal
+#     carries its own singleton, which discharges the predicate — and the debit
+#     is what does not: `accts[r.account] := cash - due` is a computed `Int`
+#     carrying no predicate, and a refinement is discharged by **matching** one
+#     the value already holds rather than by proving it from the guard. So the
+#     write is rejected whatever the predicate says; `_ >= 0`, which is the
+#     honest invariant here because `cash >= due` permits spending to exactly
+#     zero, is rejected the same way. A refined balance needs a refinement
+#     proved from a guard, which is a feature and not a spelling.
+#
+# `holdings` keeps its compound key: it is only ever written and read at one key,
+# never swept, and a compound key is fine for both (`v1.cambra`'s header records
+# which of those work).
+#
+# Every collection is seeded rather than started empty, because `m[k]` is the
+# proven lookup and faults on an absent key. An account's line seeds at qty 0.
+
+one_btc = 10**8
+one_dollar = 10**8
+
+AccountId = Int
+Microcents = Int
+Ticker = String
+
+accts: Mut(Map(AccountId, Microcents), Txn) := box(map([
+    (1, 500 * one_dollar),
+    (2, 250 * one_dollar),
+]))
+
+holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([
+    ((1, "BTC"), 2 * one_btc),
+    ((2, "ETH"), 5 * one_btc),
+]))
+
+cart: Mut(Map(AccountId, {ticker: Ticker, qty: Int}), Txn) := box(map([
+    (1, (ticker="BTC", qty=0)),
+    (2, (ticker="ETH", qty=0)),
+]))
+
+prices: Mut(Map(Ticker, Microcents), Txn) := box(map([
+    ("BTC", 0),
+    ("ETH", 0),
+]))
+
+cart_changes,  cart_change_acks = wasm_serve("PATCH", "/cart")
+checkout_reqs, checkout_acks    = wasm_serve("PUT",   "/checkout")
+view_requests, view_replies     = wasm_serve("GET",   "/cart")
+
+for c in cart_changes:
+    with begin():
+        if c.qty >= 0:
+            cart[c.account] := (ticker=c.ticker, qty=c.qty)
+        cart_change_acks << (ok=(c.qty >= 0), ticker=c.ticker, qty=c.qty)
+
+for r in checkout_reqs:
+    with begin():
+        cash = accts[r.account]
+        line = cart[r.account]
+        due = line.qty * prices[line.ticker] // one_btc
+        if cash >= due:
+            accts[r.account] := cash - due
+            holdings[(r.account, line.ticker)] := holdings[(r.account, line.ticker)] + line.qty
+            cart[r.account] := (ticker=line.ticker, qty=0)
+        remaining = accts[r.account]
+        checkout_acks << (ok=(cash >= due), due=due, cash=remaining)
+
+for v in view_requests:
+    with begin():
+        line = cart[v.account]
+        view_replies << (
+            cash = accts[v.account],
+            ticker = line.ticker,
+            qty = line.qty,
+            price = prices[line.ticker],
+            total = line.qty * prices[line.ticker] // one_btc,
+            held = holdings[(v.account, line.ticker)],
+        )
+
+for u in price_updates():
+    with begin():
+        prices[u.ticker] := u.price
