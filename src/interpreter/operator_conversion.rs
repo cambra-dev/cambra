@@ -1201,7 +1201,11 @@ in it has a correspondent",
     /// Read off the planned tree before anything is torn down, so `/diff` answers
     /// it as well as `/reload`.
     pub fn unreadable_inputs(&self, previous: &Expr, planned: &Expr) -> Vec<UnreadablePrefix> {
-        let correspondence = Correspondence::of(&crate::ccl::diff::diff(previous, planned));
+        // Diffing two planned trees costs more than the rest of this put together, and
+        // only a variable this version adds to a loop that already carries one needs the
+        // answer. A reload whose state all carries forward asks for none, so the
+        // correspondence is built on the first source that reads it.
+        let correspondence = std::cell::OnceCell::new();
         let unrecomputable = unrecomputable_nodes(planned);
         let carried = self.live_state();
         let sources = writer_sources(planned);
@@ -1233,6 +1237,7 @@ in it has a correspondent",
                 // release is read from this version's own ledger, which is still
                 // `minted` here: `retire_version` has not run.
                 let kept = correspondence
+                    .get_or_init(|| Correspondence::of(&crate::ccl::diff::diff(previous, planned)))
                     .previous(source.node_id())
                     .and_then(|prev| self.minted.entries.get(&prev))
                     .and_then(|entry| entry.fan().released_position());
