@@ -56,12 +56,17 @@
 //! takes `v1_read_sites.cambra` and meets what the three sites reading the cart
 //! report once nothing stops lowering before them. The file is here so the shape
 //! is reviewable while those constructs are built.
+//!
+//! `v1_single_line.cambra` is that ladder with one cart line per account, which
+//! replaces every entry iteration with a keyed lookup — and it runs, routes and
+//! all ([`asset_cart_single_line_serves_its_routes`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::channels::{ChannelFile, ChannelKind};
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
+use cambra::embed::Host;
 use cambra::interpreter::{Consumer, HostSink, HostSource, Value};
 
 use super::common::expect_compile_error;
@@ -595,31 +600,129 @@ fn asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension() {
 // v1_single_line — the map-based cart with one line per account
 // ---------------------------------------------------------------------------
 
-/// `v1_single_line.cambra` compiles, which `v1.cambra` does not.
+/// `v1_single_line.cambra` runs, which `v1.cambra` does not compile.
 ///
 /// One line per account turns every read of the cart from an iteration over one account's
 /// entries into a keyed lookup, and that is the whole difference: the four obstructions
 /// v1's header lists are all obstructions to the iteration. What remains here is the same
 /// app — keyed collections, three routes, a live feed, and the atomicity claim.
 ///
-/// **Compiling is as far as this goes today.** Driven through `cambra::embed::Host` — push a
-/// quote, `PATCH /cart`, `GET /cart` — a tick does not return, so the program does not
-/// converge when it is run. That is the next thing to find, and it is not about the cart's
-/// shape: it compiles clean, with no diagnostics.
+/// Driven the way a host drives, one route at a time: a quote, then `PATCH /cart`,
+/// `GET /cart` and `PUT /checkout`. Each reply arrives in the tick after the call, and the
+/// checkout's three writes — the debit, the credit and the clear — land together.
+///
+/// The quantities are small next to the cart's 10⁸ scale because `qty * price` is an `Int`
+/// product: one whole BTC at a five-figure price overflows `i64` before the `// one_btc`
+/// divides it back down.
 #[test]
-fn asset_cart_single_line_compiles() {
+fn asset_cart_single_line_serves_its_routes() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
     let program = std::path::Path::new(dir).join("v1_single_line.cambra");
     let declared = ChannelFile::beside(&program)
         .expect("the channel file parses")
         .expect("the program has a channel file");
-    let mut ctx = GlobalContext::default();
-    ctx.register_channels(&declared.channels)
-        .expect("its declarations are well formed");
-
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let source = include_str!("v1_single_line.cambra");
-    compile_program(&mut ctx, source, consumer)
-        .map(|_| ())
-        .unwrap_or_render("v1_single_line.cambra", source);
+    let mut host = Host::compile("v1_single_line.cambra", source, &declared.channels)
+        .expect("the program embeds");
+
+    // Settle the price feed first, so the reads below have a quote to price against.
+    host.push(
+        "price_updates",
+        [record(&[
+            ("ticker", Value::String("BTC".into())),
+            ("price", Value::Int(1_000 * SCALE)),
+        ])],
+    )
+    .expect("`price_updates` is a declared source");
+    tick_until_quiet(&mut host);
+
+    // 0.001 BTC into account 1's cart.
+    let qty = SCALE / 1_000;
+    assert_eq!(
+        call(
+            &mut host,
+            "PATCH",
+            "/cart",
+            &[
+                ("account", Value::Int(1)),
+                ("ticker", Value::String("BTC".into())),
+                ("qty", Value::Int(qty)),
+            ],
+        ),
+        vec![record(&[
+            ("ok", Value::Bool(true)),
+            ("ticker", Value::String("BTC".into())),
+            ("qty", Value::Int(qty)),
+        ])],
+    );
+
+    // The view prices that line against the quote the feed delivered.
+    let due = qty * 1_000 * SCALE / SCALE;
+    assert_eq!(
+        call(&mut host, "GET", "/cart", &[("account", Value::Int(1))]),
+        vec![record(&[
+            ("cash", Value::Int(500 * SCALE)),
+            ("ticker", Value::String("BTC".into())),
+            ("qty", Value::Int(qty)),
+            ("price", Value::Int(1_000 * SCALE)),
+            ("total", Value::Int(due)),
+            ("held", Value::Int(2 * SCALE)),
+        ])],
+    );
+
+    // Checkout debits the cash the line is worth, and says what is left.
+    assert_eq!(
+        call(&mut host, "PUT", "/checkout", &[("account", Value::Int(1))]),
+        vec![record(&[
+            ("ok", Value::Bool(true)),
+            ("due", Value::Int(due)),
+            ("cash", Value::Int(500 * SCALE - due)),
+        ])],
+    );
+
+    // The credit and the clear committed with that debit: the holding grew by the
+    // line's quantity and the cart is back to zero.
+    assert_eq!(
+        call(&mut host, "GET", "/cart", &[("account", Value::Int(1))]),
+        vec![record(&[
+            ("cash", Value::Int(500 * SCALE - due)),
+            ("ticker", Value::String("BTC".into())),
+            ("qty", Value::Int(0)),
+            ("price", Value::Int(1_000 * SCALE)),
+            ("total", Value::Int(0)),
+            ("held", Value::Int(2 * SCALE + qty)),
+        ])],
+    );
 }
+
+/// A record value from `(field, value)` pairs.
+fn record(fields: &[(&str, Value)]) -> Value {
+    Value::Record(
+        fields
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect(),
+    )
+}
+
+/// Tick until a tick produces nothing — the host's "let it settle" step.
+fn tick_until_quiet(host: &mut Host) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for _ in 0..TICKS_TO_SETTLE {
+        let result = host.tick();
+        rows.extend(result.outputs.into_iter().flat_map(|(_, rows)| rows));
+    }
+    rows
+}
+
+/// Call `method path` with one row and return what the route replied.
+fn call(host: &mut Host, method: &str, path: &str, fields: &[(&str, Value)]) -> Vec<Value> {
+    host.request(method, path, [record(fields)])
+        .unwrap_or_else(|e| panic!("{method} {path} is a declared route: {e:?}"));
+    tick_until_quiet(host)
+}
+
+/// Ticks allowed for one call to settle. A transaction commits over a few delivery
+/// rounds, and this is far above what any route here takes, so exceeding it would be a
+/// stall rather than a slow answer.
+const TICKS_TO_SETTLE: usize = 32;
