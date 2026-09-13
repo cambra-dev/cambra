@@ -32,6 +32,7 @@ use std::rc::Rc;
 
 use crate::ccl::channels::{ChannelDecl, ChannelError, Channels};
 use crate::ccl::context::{CompileError, GlobalContext};
+use crate::ccl::lower::SocketSubscription;
 use crate::ccl::provenance::NodeId;
 use crate::inspector_model::{render_frame, snapshot_json};
 use crate::interpreter::operator_graph::source_nodes;
@@ -199,6 +200,23 @@ impl Host {
     /// The channels this program was compiled against.
     pub fn channels(&self) -> &Channels {
         &self.channels
+    }
+
+    /// What this program subscribes to, for the host to connect on its behalf.
+    ///
+    /// A `wasm_socket_subscribe` binds a declared source and says where its
+    /// rows come from; the host owns the socket — the browser's `WebSocket` in
+    /// a page, `tungstenite` in a native driver, a recorded slice replayed
+    /// offline — and pushes what it decodes into the named source through
+    /// [`push`](Self::push), exactly as it pushes any other source. Nothing in
+    /// here connects, which is what lets the construct exist in a module with
+    /// no sockets at all.
+    ///
+    /// Read after a [`compile`](Self::compile) or a [`reload`](Self::reload):
+    /// the list is the running version's, so a version that stops reading a
+    /// feed drops it and the host closes the socket it was holding.
+    pub fn socket_subscriptions(&self) -> &[SocketSubscription] {
+        self.ctx.socket_subscriptions()
     }
 
     /// Append `rows` to the source named `source`.

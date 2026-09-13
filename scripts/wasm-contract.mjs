@@ -81,6 +81,46 @@ try {
 }
 check("a row missing a declared field is rejected", rejected);
 
+// The socket feed. The page owns the WebSocket, so what crosses the boundary is
+// the subscription rather than the socket: the module says where to connect
+// and the page pushes what it decodes back into the named source, like any other
+// source. Its own program, because `v0.cambra` predates the construct and is
+// handed its prices by the caller.
+const feedSource = `ticker_updates = wasm_socket_subscribe(
+    "wss://ws-feed.exchange.coinbase.com",
+    "ticker_batch",
+    ["BTC-USD", "ETH-USD"],
+)
+
+for u in ticker_updates:
+    quotes << (ticker=u.ticker, price=u.price)
+`;
+const feedProgram = Program.compile("feed.cambra", feedSource, [
+  { name: "ticker_updates", kind: "source", type: "{ticker: String, price: Int}" },
+  { name: "quotes", kind: "sink", type: "{ticker: String, price: Int}" },
+]);
+const subscriptions = JSON.parse(feedProgram.subscriptions());
+check(
+  "the page reads back what to connect to",
+  subscriptions.length === 1 &&
+    subscriptions[0].source === "ticker_updates" &&
+    subscriptions[0].endpoint === "wss://ws-feed.exchange.coinbase.com" &&
+    subscriptions[0].feed === "ticker_batch" &&
+    JSON.stringify(subscriptions[0].products) === '["BTC-USD","ETH-USD"]',
+  JSON.stringify(subscriptions),
+);
+
+// The bare ticker, not the product id: the page decodes a quote into the row
+// type the declaration gives it, which is why nothing in the program parses one.
+feedProgram.push("ticker_updates", [{ ticker: "BTC", price: 81_692 * SCALE }]);
+let quoted = [];
+for (let i = 0; i < 8 && quoted.length === 0; i += 1) quoted = feedProgram.tick().outputs;
+check(
+  "a decoded quote reaches the program",
+  quoted[0]?.sink === "quotes" && quoted[0]?.rows[0]?.ticker === "BTC" && quoted[0]?.rows[0]?.price === 81_692 * SCALE,
+  JSON.stringify(quoted),
+);
+
 // Throughput against the recorded feed's 2.33 rows/s — a row has ~430 ms.
 const feed = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"];
 const ROWS = 40;

@@ -10,6 +10,7 @@ use std::{cell::RefCell, rc::Rc};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ccl::lower::LoweredRoute;
+use crate::ccl::lower::SocketSubscription;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::interpreter::http_server::SharedHttpServer;
 
@@ -414,6 +415,17 @@ pub struct SourceSinkRegistry {
     /// because a route sink is bound by the program's `wasm_serve` statement
     /// rather than by a `Defer` lowering wraps around the whole program.
     route_sinks: HashMap<String, Rc<dyn DataSink>>,
+    /// The subscription behind every source the running version fills from a
+    /// socket, in the order the program writes them.
+    ///
+    /// The one piece of registry state a version replaces rather than adds to.
+    /// A source, a listener and a declared sink outlive the version that named
+    /// them, which is what a program keeping its state across a reload means. A
+    /// subscription is a claim the running version makes about where its rows
+    /// come from, so a version that drops the feed has stopped making it, and a
+    /// host reading a stale one holds a socket open for a source nothing
+    /// reads.
+    socket_subscriptions: Vec<SocketSubscription>,
 }
 
 impl SourceSinkRegistry {
@@ -454,6 +466,12 @@ impl SourceSinkRegistry {
                 },
             );
         }
+        self.socket_subscriptions = lowering.take_socket_subscriptions();
+    }
+
+    /// The subscription behind every socket-filled source this version holds.
+    pub fn socket_subscriptions(&self) -> &[SocketSubscription] {
+        &self.socket_subscriptions
     }
 
     /// Stop serving every route `still_bound` does not name.
@@ -691,6 +709,17 @@ impl GlobalContext {
     /// installs a version and so opens what the version adds.
     pub fn sources_and_sinks_mut(&mut self) -> &mut SourceSinkRegistry {
         &mut self.sources_and_sinks
+    }
+
+    /// What the running version subscribes to, for a host to connect on its
+    /// behalf.
+    ///
+    /// The compiler makes no connection: a `wasm_socket_subscribe` binds a
+    /// declared source and records what fills it. A host reads this once per
+    /// version, after compiling and before the first tick, and pushes the rows
+    /// it decodes into the source each entry names.
+    pub fn socket_subscriptions(&self) -> &[SocketSubscription] {
+        self.sources_and_sinks.socket_subscriptions()
     }
 
     /// Retire the running version's conversion context and carry its operators

@@ -81,6 +81,24 @@ impl Program {
         self.host.snapshot().to_string()
     }
 
+    /// What the program subscribes to, as
+    /// `[{source, endpoint, feed, products}]`.
+    ///
+    /// The page owns the WebSocket. A `wasm_socket_subscribe` in the program
+    /// binds a declared source and says what fills it; this is how the page
+    /// learns what to connect to, so the endpoint and the products live in the
+    /// program rather than in two places that have to agree. What comes back
+    /// off the socket is decoded by the page and pushed into `source` through
+    /// [`push`](Self::push), like any other source — there is no socket in the
+    /// module, and on `wasm32` there could not be one.
+    ///
+    /// Read after `compile`; a `reload` may change it, and a feed that leaves
+    /// the list is a socket the page should close.
+    pub fn subscriptions(&self) -> Result<String, JsValue> {
+        serde_json::to_string(self.host.socket_subscriptions())
+            .map_err(|e| JsValue::from_str(&format!("subscriptions: {e}")))
+    }
+
     /// Append `rows` to the source named `source`.
     ///
     /// `rows` is a JSON array of objects matching the source's declared row

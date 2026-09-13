@@ -1,5 +1,6 @@
 //! Statement-block lowering: `Let` chains, `if`/`else`, the `http_serve` and
-//! `wasm_serve` tuple-assign wiring, and mutation-loop dispatch.
+//! `wasm_serve` tuple-assign wiring, the `wasm_socket_subscribe` source wiring,
+//! and mutation-loop dispatch.
 
 use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
@@ -761,6 +762,85 @@ pub(super) fn lower_middle_stmt(
                 "lower.wasm_serve",
             );
             let let_expr = Expr::let_bind(req_name, requests_expr, inner_let);
+            Ok(ctx.tag_image(let_expr, stmt.span))
+        }
+        // Special case: `updates = wasm_socket_subscribe(endpoint, feed, [products])`.
+        //
+        // Lowers to the source half of what `wasm_serve` lowers to:
+        //   let <updates> = Source("<updates>") in
+        //   <body>
+        // TODO the multi-return note on the `http_serve` arm applies here too:
+        // TODO neither construct should need a special case.
+        //
+        // A source and not a pair, so this is not the serve shape with an
+        // argument dropped: a feed has nothing to reply to. What it borrows from
+        // `wasm_serve` is the property that matters on `wasm32`: it creates
+        // nothing. The socket is the embedding page's (the browser's own
+        // `WebSocket`, or `tungstenite` in a native host); the page connects,
+        // sends the subscription, decodes each message and pushes one typed row
+        // per quote, so nothing in Cambra parses JSON or splits a string and
+        // nothing in the module owns a transport. That is why the arm is not
+        // `cfg`-gated the way `http_serve`'s is.
+        //
+        // The source is looked up rather than created for the same reason a
+        // route's halves are: its rows arrive as the record type the host's
+        // declaration gives it, and a name no declaration covers is a feed
+        // nothing can fill. Where the two constructs differ is what the address
+        // is. A route's is its method and path, so `wasm_serve` reads it out of
+        // the call; a feed's is the name the host declared the source under, so
+        // this reads it off the target — and the three arguments are then not a
+        // key at all but the subscription the host makes, recorded for it to
+        // read back (`SocketSubscription`).
+        ChlStmt::Assign { target, value } if is_socket_subscribe_assign(value) => {
+            if !is_top_level {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "wasm_socket_subscribe is only supported at the top level of a \
+                     program, not inside an if/else branch or function body",
+                ));
+            }
+            let source = extract_socket_source_name(target)?;
+            let (endpoint, feed, products) = extract_socket_subscribe_args(value)?;
+            if !ctx.sources.contains_key(&source) {
+                return Err(LoweringError::unsupported(
+                    target.span,
+                    format!(
+                        "no host channel declares the source '{source}': a host declares \
+                         a `source` named '{source}' before compiling, and \
+                         wasm_socket_subscribe says what fills it"
+                    ),
+                ));
+            }
+            // One source, one subscription. Two of them on one name would be two
+            // connections pushing into one buffer, with nothing saying which
+            // rows the program is reading — and, since the source is bound by
+            // the statement, the second binding would shadow the first while
+            // its socket stayed connected.
+            if ctx
+                .socket_subscriptions
+                .iter()
+                .any(|existing| existing.source == source)
+            {
+                return Err(LoweringError::unsupported(
+                    value.span,
+                    format!("duplicate wasm_socket_subscribe registration: source={source}"),
+                ));
+            }
+            ctx.socket_subscriptions.push(SocketSubscription {
+                source: source.clone(),
+                endpoint,
+                feed,
+                products,
+            });
+            // The `Source` node is manufactured plumbing of the expansion; the
+            // `Let` images the assignment statement, which is the construct the
+            // user wrote.
+            let rows_expr = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Source(source.clone())),
+                stmt.span,
+                "lower.wasm_socket_subscribe",
+            );
+            let let_expr = Expr::let_bind(source, rows_expr, body);
             Ok(ctx.tag_image(let_expr, stmt.span))
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a

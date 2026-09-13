@@ -65,13 +65,15 @@
 //! the historical `crate::ccl::lower::…` paths continue to resolve:
 //!
 //! - [`stmts`] — statement-block lowering (`Let` chains, `if`/`else`, the
-//!   `http_serve` / `wasm_serve` tuple-assign wiring, mutation-loop dispatch).
+//!   `http_serve` / `wasm_serve` tuple-assign wiring, the
+//!   `wasm_socket_subscribe` source wiring, mutation-loop dispatch).
 //! - [`exprs`] — per-[`ChlExpr`] expression lowering (binops, comparisons,
 //!   boolean ops, calls, unary ops, feeds, defines, constants).
 //! - [`functions`] — lambda / `def` / parameter lowering (uncurrying).
 //! - [`loops`] — `for`-loop, generator, and mutation-accumulation-loop lowering.
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
 //! - [`serve`] — `http_serve` / `wasm_serve` recognition predicates.
+//! - [`socket`] — `wasm_socket_subscribe` recognition predicates.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -83,6 +85,8 @@ use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
 };
+
+use serde::Serialize;
 
 use crate::{
     ccl::{
@@ -102,6 +106,7 @@ mod exprs;
 mod functions;
 mod loops;
 mod serve;
+mod socket;
 mod stmts;
 
 pub use stmts::lower_type_expr;
@@ -123,6 +128,7 @@ use exprs::*;
 use functions::*;
 use loops::*;
 use serve::*;
+use socket::*;
 use stmts::*;
 use transactions::*;
 
@@ -297,6 +303,39 @@ pub struct LoweredRoute {
     pub(super) path: String,
 }
 
+/// One `wasm_socket_subscribe` feed as lowering knows it: the source the host
+/// fills, and the subscription it makes to fill it.
+///
+/// The arguments are not a lookup key, which is where this parts company with
+/// [`LoweredRoute`]. A route is found by the address its call names; a
+/// subscription's source is found by the name the statement binds, so these
+/// three would be checked and thrown away if nothing carried them. They are the
+/// subscription itself — connect here, ask for this feed, name these products —
+/// and a host reads them back off the compiled program
+/// ([`GlobalContext::socket_subscriptions`](crate::ccl::context::GlobalContext::socket_subscriptions))
+/// before it has ticked it once. That read-back is what makes the connection
+/// the program's statement rather than a constant the embedding page has to
+/// keep in step with it by hand.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SocketSubscription {
+    /// The host-declared source the decoded rows are pushed into: the name the
+    /// `wasm_socket_subscribe` statement binds, and the name the program reads
+    /// them by.
+    pub source: String,
+    /// The socket to connect to.
+    pub endpoint: String,
+    /// The feed to ask that socket for, in whatever vocabulary it speaks
+    /// (`"ticker_batch"` on Coinbase's). Opaque here: the host sends the
+    /// subscription, so the compiler has no protocol to check it against.
+    pub feed: String,
+    /// The products the subscription names, in the endpoint's own spelling
+    /// (`"BTC-USD"`). What the rows carry afterwards is the source's declared
+    /// row type, and nothing requires the two to agree — the demo's feed quotes
+    /// `BTC-USD` and pushes `BTC`, because the ticker is a key in the program
+    /// and a product id is an address at the exchange.
+    pub products: Vec<String>,
+}
+
 /// Context for CHL → CCL lowering that carries registered data sources and sinks.
 ///
 /// Zero-argument function calls whose name appears in `sources` are lowered to
@@ -394,6 +433,24 @@ pub struct LoweringContext {
     /// [`route_sinks`](Self::route_sinks), which holds the declarations and is
     /// the same in every version.
     pub(super) wasm_routes_this_pass: HashSet<String>,
+
+    /// Every `wasm_socket_subscribe` in this pass, in the order the program
+    /// writes them.
+    ///
+    /// A `Vec` rather than a map keyed by source name, for two reasons. The
+    /// duplicate check this needs is "has this source already been subscribed
+    /// in this pass", which the list answers directly over the handful of feeds
+    /// a program has; and the order is part of what the host reads back —
+    /// a `HashMap` would hand it a different connection order on every run, the
+    /// way it would for [`host_sinks`](Self::host_sinks).
+    ///
+    /// Unlike [`route_sinks`](Self::route_sinks) nothing seeds this from the
+    /// registry: a subscription is derived from the statement that writes it,
+    /// so a version that drops the feed has no subscription rather than an
+    /// inherited one.
+    ///
+    /// `pub(super)` so the statement submodule's wiring can append to it.
+    pub(super) socket_subscriptions: Vec<SocketSubscription>,
 
     /// What this pass may do with an `http_serve` naming a route the registry does
     /// not already hold.
@@ -535,6 +592,17 @@ impl LoweringContext {
     /// stopped serving.
     pub fn routes_bound_this_pass(&self) -> &HashSet<String> {
         &self.http_routes_this_pass
+    }
+
+    /// Hand over every subscription this pass bound, leaving this context with
+    /// none.
+    ///
+    /// Drained rather than copied so the registry it is folded into holds
+    /// exactly the version's subscriptions: a copy left here would be carried
+    /// into the next pass by nothing, but leaving one behind invites the
+    /// accumulate-rather-than-replace reading that a retired feed makes wrong.
+    pub fn take_socket_subscriptions(&mut self) -> Vec<SocketSubscription> {
+        std::mem::take(&mut self.socket_subscriptions)
     }
 
     /// Hand over every bound TCP port's listener, leaving this context with none.

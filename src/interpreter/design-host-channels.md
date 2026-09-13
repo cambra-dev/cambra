@@ -123,6 +123,68 @@ Correlation is arrival order, as it is for every host sink. A program that feeds
 path answers that call with nothing, and the host sees a call with no row rather than a wrong row;
 that is a property of the program's shape, not of the route.
 
+## Sockets
+
+`wasm_socket_subscribe(endpoint, feed, products)` binds a host source whose rows arrive off a
+socket, and records the subscription that fills it.
+
+```python
+ticker_updates = wasm_socket_subscribe(
+    "wss://ws-feed.exchange.coinbase.com",
+    "ticker_batch",
+    ["BTC-USD", "ETH-USD", "SOL-USD"],
+)
+
+for u in ticker_updates:
+    with begin():
+        prices[u.ticker] := u.price
+```
+
+The source is declared like any other, and the statement binds it by the name it declares:
+
+```json
+{ "name": "ticker_updates", "kind": "source", "type": "{ticker: String, price: Int}" }
+```
+
+**No transport is in it**, for the reason [Routes](#routes) gives. The host owns the socket: the
+browser's own `WebSocket` in a page, `tungstenite` in a native driver, a recorded slice replayed
+offline. It connects, sends the subscription, decodes each message and pushes one typed row per
+quote through `Host::push`. The rows cross as the record type the declaration gives them, so
+**nothing in Cambra parses JSON or splits a string**. That is what lets the construct exist on
+`wasm32`, where `tungstenite` cannot be built.
+
+**It binds one name, not a pair.** A route binds the calls and the channel their replies leave by,
+and destructures a 2-tuple to do it; a feed has nothing to reply to, so this is a plain `=` over a
+single name. The recognition is the call rather than the target shape, so a tuple target is
+answered by the rule it broke rather than by "the name is unbound".
+
+**The arguments are not a lookup key.** A route is found by the address its call names; a
+subscription's source is found by the name the statement binds, so its arguments would be checked
+and thrown away if nothing carried them. They are the subscription: connect here, ask for this
+feed, name these products. Lowering records them as a `SocketSubscription` the host reads back
+through `Host::socket_subscriptions` — `Program.subscriptions()` in the WebAssembly wrapper —
+before the first tick, which puts the endpoint in the program rather than in a page that has to be
+kept in step with it.
+
+They are compile-time constants for that reason rather than the one an address has. A host reads
+them off the compiled program before it has ever ticked it, at which point no value in the program
+exists to have computed one; a program that computed a subscription could not be connected until it
+was already running, which is the wrong order for the only thing that fills it. The products are
+therefore a list literal, since a comprehension over a constant list would have to be run during
+lowering. An empty one is refused where it is written: a subscription that asks for nothing binds a
+source the host can never fill, and every read of it waits forever on a feed behaving exactly as
+written.
+
+A product id is not a ticker. `"BTC-USD"` is an address at the exchange and `"BTC"` is a key in the
+program, and the host decodes one into the other; the source's declared row type is the only thing
+that says what arrives, and nothing requires the two vocabularies to agree.
+
+The subscriptions are the one piece of registry state a version replaces rather than adds to. A
+source, a listener and a declared sink outlive the version that named them, which is what carrying
+state across a reload means. A subscription is a claim the running version makes about where its
+rows come from, so a version that drops the feed has stopped making it, and the host closes the
+socket it was holding.
+
 ## Row types
 
 `ChannelDecl.row_type` is a CHL type expression, written the way a program would write it in an
