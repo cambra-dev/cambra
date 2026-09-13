@@ -36,6 +36,13 @@
 #      over `v1_no_drain.cambra` — this program cannot report 2 or 3 itself,
 #      because the drain stops lowering before its read sites type.
 #
+#   4. `wasm_socket_subscribe` is not built.  The price feed is declared in
+#      `v1.channels.json` as the source `ticker_updates`, and the program assigns
+#      the constructor's result to it — but the constructor appears only in
+#      `demo_code_syntax.md` and here, where `wasm_serve` appears in three source
+#      files. Reported only in a release build, because 3 is a debug assertion
+#      and a release build proceeds past it.
+#
 # Behind those, and unobserved until they move: an entry binder over a
 # *transactional* map, where the witness escapes the sum that binds it; and a key
 # filter whose refinement reaches op-conversion as a `collection_contains` term,

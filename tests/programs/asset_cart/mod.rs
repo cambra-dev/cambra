@@ -547,6 +547,14 @@ fn asset_cart_v1_declares_the_routes_it_serves() {
 /// [`asset_cart_v1_currently_blocked_on_entry_iteration`]: it is the *first* thing these
 /// sites meet, so the test goes red when the obstruction changes rather than staying green
 /// over a different one.
+///
+/// **The needle is a debug assertion**, and this test therefore reports what a debug build
+/// sees. The closure check is `#[cfg(debug_assertions)]`, so a release build records the
+/// open bound and proceeds — reaching `wasm_socket_subscribe`, which v1's header lists as
+/// its fourth obstruction. That is the design's own framing rather than a gap in the check:
+/// an open bound is a reference some pass failed to rewrite
+/// (`src/ccl/design/type-inference.md`, "The invariant"), which is a compiler defect and
+/// not something a program can be at fault for.
 #[test]
 fn asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
