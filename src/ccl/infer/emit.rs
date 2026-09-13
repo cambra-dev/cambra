@@ -1551,11 +1551,8 @@ fn feed_contribution<C: Typing>(value_ty: &Type, ctx: &mut C) -> Type {
             // Names the node being typed: the element term's mints hang off it, and the
             // copy of the loop's source sits beside them — the duplication-as-part-of-a-
             // rewrite case `provenance::copy_frame` declines.
-            let _frame = crate::ccl::provenance::enter(
-                node,
-                "infer.feed_position",
-                crate::ccl::provenance::Nature::Machinery,
-            );
+            let _frame =
+                provenance::enter(node, "infer.feed_position", provenance::Nature::Machinery);
             let element = iter.element_at(&position, &domain);
             crate::ccl::subst::Subst::discharge(iter.binder.clone(), element).apply_type(value_ty)
         }

@@ -332,20 +332,6 @@ fn reads_op(op: BinOpKind, left: &TypedExpr, right: &TypedExpr) -> bool {
     }
 }
 
-/// The type at `key` of a product, or `None` when `ty` is not a product carrying
-/// it. A refinement layer states a fact about the product as a whole and addresses
-/// no field, so the walk peels through it.
-fn field_type(ty: &Type, key: &ProjKey) -> Option<Type> {
-    match (ty.peel_refinements(), key) {
-        (Type::Record(fields), ProjKey::Field(name)) => fields
-            .iter()
-            .find(|(field, _)| field == name)
-            .map(|(_, ty)| ty.clone()),
-        (Type::Tuple(elems), ProjKey::Index(i)) => elems.get(*i).cloned(),
-        _ => None,
-    }
-}
-
 /// Whether every value of `base` satisfying all of `lhs` satisfies all of `rhs`.
 ///
 /// [`REFINEMENT_BINDER`] is declared once at `base`'s sort and shared by both
