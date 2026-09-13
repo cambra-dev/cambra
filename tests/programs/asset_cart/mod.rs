@@ -49,9 +49,13 @@
 //! (subtotal included), and three `wasm_serve` routes replace the three sources
 //! and the sink per ticker — so the page calls `PATCH /cart`, `PUT /checkout`
 //! and `GET /cart` instead of pushing rows at named channels. It does not
-//! compile; [`asset_cart_v1_currently_blocked_on_entry_iteration`] is what it
-//! waits on, and the file is here so the shape is reviewable while those
-//! constructs are built.
+//! compile, and two tests report why:
+//! [`asset_cart_v1_currently_blocked_on_entry_iteration`] takes the whole program
+//! and meets the checkout's drain, while
+//! [`asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request`] takes
+//! `v1_no_drain.cambra` and meets what the three sites reading the cart report
+//! once the drain no longer stops lowering before them. The file is here so the
+//! shape is reviewable while those constructs are built.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -516,4 +520,69 @@ fn asset_cart_v1_declares_the_routes_it_serves() {
             "'{route}' resolves to both of its halves"
         );
     }
+}
+
+/// What the sites that read the cart report, which `v1.cambra` itself cannot show.
+///
+/// The drain stops lowering, and stops it before `due`, `lines` and `positions` ever
+/// type, so the read half of v1 is unobserved while the drain is present.
+/// `v1_no_drain.cambra` elides it — and `Balance`'s refinement, for an unrelated reason
+/// its own header gives — so those three sites report for the first time.
+///
+/// **A filter that names the request row cannot leave the loop that binds it.** All three
+/// read `… if a == v.account`, which refines the comprehension's key domain with a
+/// predicate mentioning `v`. The refinement rides the collection's type, the collection is
+/// a field of the reply record, and the reply crosses a channel — so the predicate arrives
+/// at a position `v` does not reach, and inference reports the bound as having left its
+/// binder's scope with nothing to discharge it (`src/ccl/design/type-inference.md`, "The
+/// invariant").
+///
+/// This is one face of the obstruction; `due` is the other. There the same correlated
+/// filter degenerates instead: `lambda_elim` writes `const` applied to the inner
+/// aggregate's scalar result with `v` free inside it, so the site carries no binder and no
+/// key domain at all. Both say a correlated filter has no representation that survives the
+/// scope it is written in.
+///
+/// The needle is that scope report rather than a later one, on the same rule as
+/// [`asset_cart_v1_currently_blocked_on_entry_iteration`]: it is the *first* thing these
+/// sites meet, so the test goes red when the obstruction changes rather than staying green
+/// over a different one.
+#[test]
+fn asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
+    // The wiring is v1's and the elisions are inside the program, so this reads v1's
+    // channel file. A duplicate would be a second thing to keep in step for no gain.
+    let declared = ChannelFile::beside(&std::path::Path::new(dir).join("v1.cambra"))
+        .expect("the channel file parses")
+        .expect("the program has a channel file");
+    let mut ctx = GlobalContext::default();
+    ctx.register_channels(&declared.channels)
+        .expect("v1's declarations are well formed");
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let source = include_str!("v1_no_drain.cambra");
+    // `CompiledProgram` is not `Debug`, so the success arm is discarded rather than
+    // unwrapped through `expect_err`.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compile_program(&mut ctx, source, consumer).map(|_| ())
+    }));
+    let payload = match outcome {
+        Ok(other) => panic!("the read sites do not compile yet; got: {other:?}"),
+        Err(payload) => payload,
+    };
+
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&'static str>()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    let needle = "the bound left its binder's scope without a mediating discharge";
+    assert!(
+        message.contains(needle),
+        "expected the read sites to report {needle:?}; got: {message}"
+    );
 }

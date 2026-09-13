@@ -1,54 +1,20 @@
-# The map-based cart. One `Map` per collection instead of a slot per ticker,
-# and three routes the embedding page calls instead of three sources and a sink
-# per ticker. `v0.cambra` is the rung below.
+# `v1.cambra` with the checkout's drain elided, so the sites that read the cart
+# reach inference. `v1.cambra` is the program of record; this file exists to pin
+# what those sites report, which nothing else can observe.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
-# them, and the tests named below are what report each — so the messages here are
-# what you will actually see rather than a description of them.
+# The drain is `for (a, t) -> q in cart if a == r.account:` over a source whose
+# length is a runtime fact, inside `with begin():`. Lowering rejects it, and
+# rejects it before the three comprehensions below ever type — so the whole read
+# half of the program is unobserved while it is present.
 #
-#   1. The checkout's drain.  `for (a, t) -> q in cart if a == r.account:`
-#      inside `with begin():` binds a pattern over a source whose length is a
-#      runtime fact. `lower_tx_for` takes a name target over a list literal, and
-#      reports the target first; the source restriction sits behind it. A block
-#      denotes one decision over one snapshot, so the loop is expanded into it at
-#      compile time, and a runtime-sized source instead wants a bulk keyed
-#      update — `merge(snapshot, the loop's contribution)` — of which neither
-#      half exists (`src/ccl/design/mutability.md`, "A `for` inside a block (over
-#      a list literal)").
-#      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
+# `Balance`'s refinement is elided too, for an unrelated reason: `500 *
+# one_dollar` computes, and computing drops a refinement, so `{Microcents where
+# _ > 0}` meets a bare `Int` at the initializer. That is a fact about arithmetic
+# and refinements rather than about the cart, and it would be the first thing
+# reported here instead of the obstruction this file is for.
 #
-#   2. `Balance`'s refinement.  `500 * one_dollar` computes, and computing drops
-#      a refinement, so `{Microcents where _ > 0}` meets a bare `Int` at the
-#      initializer. Unrelated to the cart, and the first thing reported once the
-#      drain is out of the way.
-#
-#   3. A filter that names the request row.  `due`, `lines` and `positions` all
-#      read `… if a == v.account`, which refines the comprehension's key domain
-#      with a predicate mentioning `v`. The refinement rides the collection's
-#      type, the collection is a field of the reply record, and the reply crosses
-#      a channel — so the predicate arrives where `v` does not reach, and
-#      inference reports a bound that left its binder's scope with nothing to
-#      discharge it. `due` shows the same defect degenerating rather than
-#      escaping: `lambda_elim` writes `const` applied to the inner aggregate's
-#      scalar result with `v` free inside it, so that site carries no binder and
-#      no key domain at all.
-#      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request`,
-#      over `v1_no_drain.cambra` — this program cannot report 2 or 3 itself,
-#      because the drain stops lowering before its read sites type.
-#
-# Behind those, and unobserved until they move: an entry binder over a
-# *transactional* map, where the witness escapes the sum that binds it; and a key
-# filter whose refinement reaches op-conversion as a `collection_contains` term,
-# which is carried and never executed.
-#
-# What does work, and is worth knowing before rewriting anything: writing a key
-# (`cart[(a, t)] := q`) and reading one key are both fine; so is a compound key,
-# taken apart by the binder or by the program's own `k.0`; so is reading a whole
-# transactional collection by its values (`sum([q for q in cart])`), entry
-# iteration over a map outside a transaction, and a comprehension whose body
-# reads the row of the loop around it.
-#
-# `mod.rs` carries the same list beside the test that pins it.
+# Everything else is `v1.cambra` verbatim, wiring included: the test beside this
+# reads `v1.channels.json` rather than duplicating it.
 
 one_btc = 10**8
 one_dollar = 10**8        # microcents; matches the feed's existing 10^8 scale
@@ -56,7 +22,7 @@ one_dollar = 10**8        # microcents; matches the feed's existing 10^8 scale
 # TODO alias types, refinement predicates
 AccountId = Int
 Microcents = Int
-Balance = {Microcents where  _ > 0}
+Balance = Microcents
 Ticker = String
 
 # Two accounts, not one: `map([(k, v)])` with a single entry panics in
@@ -128,9 +94,6 @@ for r in checkout_reqs:
         # drain commit together or not at all. This is the atomicity claim.
         if cash >= due:
             accts[r.account] := cash - due
-            for (a, t) -> q in cart if a == r.account:
-                holdings[(a, t)] := holdings[(a, t)] + q
-                cart[(a, t)] := 0
         # Read-your-writes: the debited balance on the committing path, the
         # untouched one on the denied path.
         remaining = accts[r.account]
