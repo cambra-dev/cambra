@@ -2,7 +2,7 @@
 # and three routes the embedding page calls instead of three sources and a sink
 # per ticker. `v0.cambra` is the rung below.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Four things stop it, in the order it meets
+# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
 # them, and the tests named below are what report each — so the messages here are
 # what you will actually see rather than a description of them.
 #
@@ -22,13 +22,7 @@
 #      initializer. Unrelated to the cart, and the first thing reported once the
 #      drain is out of the way.
 #
-#   3. `wasm_socket_subscribe` is not built.  The price feed is declared in
-#      `v1.channels.json` as the source `ticker_updates`, and the program assigns
-#      the constructor's result to it — but the constructor appears only in
-#      `demo_code_syntax.md` and here, where `wasm_serve` appears in three source
-#      files.
-#
-#   4. A **compound** key on a transactional map.  `cart` and `holdings` are keyed
+#   3. A **compound** key on a transactional map.  `cart` and `holdings` are keyed
 #      by `{AccountId, Ticker}`, and a filtered entry comprehension over one
 #      collides on its upper bounds: the map's keys are a witness domain `σ` and
 #      the key tuple arrives beside it. A *scalar* key does not — the witness's
@@ -41,10 +35,10 @@
 #      `a_filtered_entry_comprehension_over_a_compound_key_is_not_reachable` is the
 #      same collision in five lines, with no request row, no reply and no feed.
 #      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension`,
-#      over `v1_read_sites.cambra` — this program cannot report 4 itself, because
-#      1, 2 and 3 each stop it first.
+#      over `v1_read_sites.cambra` — this program cannot report 3 itself, because
+#      1 and 2 each stop it first.
 #
-# Behind 4, reachable with a scalar key today: the comprehension types, and the
+# Behind 3, reachable with a scalar key today: the comprehension types, and the
 # predicate it carries names the map — which a reply then hands to a channel the
 # mutable variable does not reach
 # (`a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`).
@@ -53,6 +47,19 @@
 # where the witness escapes the sum that binds it at `lambda_elim`; and a key
 # filter whose refinement reaches op-conversion as a `collection_contains` term,
 # which is carried and never executed.
+#
+# The price feed stops nothing. `wasm_socket_subscribe` binds the
+# `ticker_updates` source `v1.channels.json` declares — the name on the left is
+# the declaration it names, where a route's address is its method and path — and
+# records the subscription behind it: the endpoint, the feed to ask for and the
+# products to name in the ask, read back by the host before the first tick. It
+# creates nothing, which is what lets it exist in a module with no sockets: the
+# page owns the WebSocket and pushes decoded rows into the source, so the loop at
+# the foot of this file is an ordinary read of an ordinary host source
+# (`src/interpreter/design-host-channels.md`, "Sockets"). Pinned:
+# `tests/wasm_socket_subscribe.rs`, whose
+# `a_subscribed_feed_writes_a_transactional_store` is this file's feed and price
+# store in miniature.
 #
 # What does work, and is worth knowing before rewriting anything: writing a key
 # (`cart[(a, t)] := q`) and reading one key are both fine; so is a compound key,

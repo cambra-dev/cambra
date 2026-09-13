@@ -48,7 +48,9 @@
 //! in cart` collapses the three readers into one that serves the whole cart
 //! (subtotal included), and three `wasm_serve` routes replace the three sources
 //! and the sink per ticker — so the page calls `PATCH /cart`, `PUT /checkout`
-//! and `GET /cart` instead of pushing rows at named channels. It does not
+//! and `GET /cart` instead of pushing rows at named channels. The one source
+//! that survives is the price feed, which `wasm_socket_subscribe` binds and
+//! names the subscription behind (`tests/wasm_socket_subscribe.rs`). It does not
 //! compile, and two tests report why:
 //! [`asset_cart_v1_currently_blocked_on_entry_iteration`] takes the whole program
 //! and meets the checkout's drain, while
@@ -441,9 +443,11 @@ fn asset_cart_runs_as_a_subprocess_driven_by_json_lines() {
 /// `c = map([(1, 10), (2, 20)])` and summing `[q for a -> q in c if a == 1]`
 /// produces it.
 ///
-/// The same run reports the three routes as undeclared, because
-/// [`expect_compile_error`] compiles against a bare context with no host
-/// channels registered. That is what every program with host channels looks
+/// The same run reports the three routes and the price feed as undeclared,
+/// because [`expect_compile_error`] compiles against a bare context with no host
+/// channels registered — the feed among them since `wasm_socket_subscribe` binds
+/// a source the host declared rather than opening one, so with nothing declared
+/// there is nothing for it to bind. That is what every program with host channels looks
 /// like there, and [`asset_cart_needs_the_channels_declared_beside_it`] pins the
 /// same fact for `v0.cambra`; [`asset_cart_v1_declares_the_routes_it_serves`] is
 /// the test that reads v1's own declarations.
