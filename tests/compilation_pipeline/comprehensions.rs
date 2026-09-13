@@ -592,6 +592,43 @@ fn an_entry_binder_over_a_transactional_map_is_not_reachable() {
     );
 }
 
+/// A **filtered** entry comprehension over a transactional map. The filter's predicate and
+/// the map's key domain land on one variable: `σ` is what the `Mut` wraps, `Int` is what
+/// the predicate types its element at, and structural inference will not join the two.
+///
+/// Neither half of the entry binder escapes it — filtering on the key and filtering on the
+/// value report the same collision — so what the filter meets is the entry comprehension
+/// itself rather than which of its two binders the predicate names.
+///
+/// Three neighbours place it. Dropping the filter types
+/// ([`an_entry_binder_over_a_transactional_map_is_not_reachable`] gets as far as
+/// `lambda_elim`); dropping the entry binder fails elsewhere, on a scope violation naming
+/// the map; and the same filtered comprehension over a **plain** map types and reaches
+/// op-conversion ([`a_filtered_comprehension_over_a_map_is_not_reachable`]).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::on_the_key("sum([q for a -> q in m if a == 1])")]
+#[case::on_the_value("sum([q for a -> q in m if q > 10])")]
+#[should_panic(expected = "Conflicting Types: Int | σ")]
+fn a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable(
+    #[case] comprehension: &str,
+) {
+    check_scalar(
+        &format!(
+            indoc! {r"
+                m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+                n: Mut(Int, Txn) := 0
+                for r in [1]:
+                    with begin():
+                        n := n + {}
+                await_final(n)
+            "},
+            comprehension
+        ),
+        Value::Int(20),
+    );
+}
+
 /// Entry iteration in **statement** position. The binder is read off the target
 /// and the body opened exactly as a comprehension's is
 /// (`src/ccl/lower/entries.rs`), so the two positions agree by construction

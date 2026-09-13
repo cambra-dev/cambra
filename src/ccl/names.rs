@@ -112,6 +112,12 @@ pub enum SyntheticKind {
     /// The fresh binder the solver mints for a dependent application's
     /// expected Pi type (`(__arg: d) ⇒ result`), discharged to the argument.
     SolverArg,
+    /// A feed channel's **position binder** — the `p` of `feed((p: domain) ⤇ value)`,
+    /// minted where a `let d = Defer` binding takes its rigid channel identity.
+    /// A contribution made inside a loop names the position it is made at, so the
+    /// loop's binder resolves as `p ▷ source` rather than escaping to whatever holds
+    /// the channel.
+    Position,
 }
 
 impl SyntheticKind {
@@ -124,6 +130,7 @@ impl SyntheticKind {
             SyntheticKind::Mono(_) => "__mono",
             SyntheticKind::FloatedDefer => "__floated",
             SyntheticKind::SolverArg => "__arg",
+            SyntheticKind::Position => "__pos",
         }
     }
 }
@@ -293,6 +300,11 @@ impl Name {
     /// (`(__arg: d) ⇒ result`, discharged to the argument).
     pub fn solver_arg() -> Self {
         Self::synthetic(SyntheticKind::SolverArg)
+    }
+
+    /// A feed channel's position binder (`feed((__pos: domain) ⤇ value)`).
+    pub fn position() -> Self {
+        Self::synthetic(SyntheticKind::Position)
     }
 
     /// The display spelling. Total over every variant; never use it for an

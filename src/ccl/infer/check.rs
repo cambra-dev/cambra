@@ -68,6 +68,9 @@ pub(super) struct CheckCtx {
     /// reason [`Typing::raise`] attributes at the raise site.
     errors: Vec<LocatedInferError>,
     pred_memo: TermMemo,
+    /// The loop bodies this re-derivation is inside, innermost last — the same record
+    /// emission keeps, so a feed site derives the same contribution here.
+    iterations: Vec<crate::ccl::infer::typing::Iteration>,
     /// **Γ — what the witnesses in scope range over** at the current position
     /// (`src/ccl/design/type-inference.md`, "The witness context").
     ///
@@ -99,6 +102,7 @@ impl CheckCtx {
             schemes: OperatorSchemes::new(),
             level: 0,
             errors: Vec::new(),
+            iterations: Vec::new(),
             pred_memo: Default::default(),
             witness_ctx: Default::default(),
             current_node: root,
@@ -269,6 +273,33 @@ impl Typing for CheckCtx {
             self.errors.push(located);
         }
         Ok(())
+    }
+
+    fn scoped_iteration<R>(
+        &mut self,
+        name: &Name,
+        ty: &Type,
+        source: &Expr,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        // Duplicating the source is the whole of this copy — nothing is being rewritten —
+        // so it is recorded as one (`src/ccl/CLAUDE.md`, "Node identity and provenance").
+        let source = {
+            let _frame = provenance::copy_frame("infer.iteration_source");
+            source.clone()
+        };
+        self.iterations.push(crate::ccl::infer::typing::Iteration {
+            binder: name.clone(),
+            binder_ty: ty.clone(),
+            source,
+        });
+        let out = self.scoped(name, ty, f);
+        self.iterations.pop();
+        out
+    }
+
+    fn iteration(&self) -> Option<&crate::ccl::infer::typing::Iteration> {
+        self.iterations.last()
     }
 
     fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {

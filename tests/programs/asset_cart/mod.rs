@@ -52,10 +52,10 @@
 //! compile, and two tests report why:
 //! [`asset_cart_v1_currently_blocked_on_entry_iteration`] takes the whole program
 //! and meets the checkout's drain, while
-//! [`asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request`] takes
-//! `v1_no_drain.cambra` and meets what the three sites reading the cart report
-//! once the drain no longer stops lowering before them. The file is here so the
-//! shape is reviewable while those constructs are built.
+//! [`asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension`]
+//! takes `v1_read_sites.cambra` and meets what the three sites reading the cart
+//! report once nothing stops lowering before them. The file is here so the shape
+//! is reviewable while those constructs are built.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -524,39 +524,29 @@ fn asset_cart_v1_declares_the_routes_it_serves() {
 
 /// What the sites that read the cart report, which `v1.cambra` itself cannot show.
 ///
-/// The drain stops lowering, and stops it before `due`, `lines` and `positions` ever
-/// type, so the read half of v1 is unobserved while the drain is present.
-/// `v1_no_drain.cambra` elides it — and `Balance`'s refinement, for an unrelated reason
-/// its own header gives — so those three sites report for the first time.
+/// Three separate things are reported ahead of `due`, `lines` and `positions`, so the read
+/// half of v1 is unobserved in the program of record. `v1_read_sites.cambra` elides all
+/// three — the drain, `Balance`'s refinement, and the unbuilt price feed, each for a reason
+/// its own header gives — and those sites then report on their own.
 ///
-/// **A filter that names the request row cannot leave the loop that binds it.** All three
-/// read `… if a == v.account`, which refines the comprehension's key domain with a
-/// predicate mentioning `v`. The refinement rides the collection's type, the collection is
-/// a field of the reply record, and the reply crosses a channel — so the predicate arrives
-/// at a position `v` does not reach, and inference reports the bound as having left its
-/// binder's scope with nothing to discharge it (`src/ccl/design/type-inference.md`, "The
-/// invariant").
+/// **A filter that names the request row is no longer what stops them.** All three read
+/// `… if a == v.account`, and the contribution a `<<` makes abstracts over the channel's
+/// position, so `v` resolves there to the request at that position rather than escaping to
+/// the top-level feed that holds the reply (`feed_contribution` in
+/// `src/ccl/infer/emit.rs`).
 ///
-/// This is one face of the obstruction; `due` is the other. There the same correlated
-/// filter degenerates instead: `lambda_elim` writes `const` applied to the inner
-/// aggregate's scalar result with `v` free inside it, so the site carries no binder and no
-/// key domain at all. Both say a correlated filter has no representation that survives the
-/// scope it is written in.
+/// What they meet instead is the filtered entry comprehension underneath, which needs no
+/// reply and no correlation to fail: `cart`'s keys are a witness domain `σ`, the predicate
+/// types its element at the key's tuple, and structural inference will not join the two.
+/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`
+/// (`tests/compilation_pipeline/comprehensions.rs`) pins the same collision on four lines.
 ///
-/// The needle is that scope report rather than a later one, on the same rule as
+/// The needle is that collision rather than a later one, on the same rule as
 /// [`asset_cart_v1_currently_blocked_on_entry_iteration`]: it is the *first* thing these
 /// sites meet, so the test goes red when the obstruction changes rather than staying green
 /// over a different one.
-///
-/// **The needle is a debug assertion**, and this test therefore reports what a debug build
-/// sees. The closure check is `#[cfg(debug_assertions)]`, so a release build records the
-/// open bound and proceeds — reaching `wasm_socket_subscribe`, which v1's header lists as
-/// its fourth obstruction. That is the design's own framing rather than a gap in the check:
-/// an open bound is a reference some pass failed to rewrite
-/// (`src/ccl/design/type-inference.md`, "The invariant"), which is a compiler defect and
-/// not something a program can be at fault for.
 #[test]
-fn asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request() {
+fn asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
     // The wiring is v1's and the elisions are inside the program, so this reads v1's
     // channel file. A duplicate would be a second thing to keep in step for no gain.
@@ -568,14 +558,18 @@ fn asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request() {
         .expect("v1's declarations are well formed");
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let source = include_str!("v1_no_drain.cambra");
-    // `CompiledProgram` is not `Debug`, so the success arm is discarded rather than
-    // unwrapped through `expect_err`.
+    let source = include_str!("v1_read_sites.cambra");
+    // `unwrap_or_render` so a returned diagnostic and an internal panic arrive the same
+    // way: the obstruction has been both as it moved, and a test that reads only one of
+    // them goes green when it changes species. `CompiledProgram` is not `Debug`, so the
+    // success arm is discarded rather than reported.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compile_program(&mut ctx, source, consumer).map(|_| ())
+        compile_program(&mut ctx, source, consumer)
+            .map(|_| ())
+            .unwrap_or_render("v1_read_sites.cambra", source)
     }));
     let payload = match outcome {
-        Ok(other) => panic!("the read sites do not compile yet; got: {other:?}"),
+        Ok(()) => panic!("the read sites do not compile yet"),
         Err(payload) => payload,
     };
 
@@ -588,7 +582,7 @@ fn asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request() {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| "<non-string panic payload>".to_string());
-    let needle = "the bound left its binder's scope without a mediating discharge";
+    let needle = "Conflicting Types: σ | (Int, String)";
     assert!(
         message.contains(needle),
         "expected the read sites to report {needle:?}; got: {message}"

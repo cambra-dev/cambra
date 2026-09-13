@@ -2,7 +2,7 @@
 # and three routes the embedding page calls instead of three sources and a sink
 # per ticker. `v0.cambra` is the rung below.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
+# THIS PROGRAM DOES NOT COMPILE YET. Four things stop it, in the order it meets
 # them, and the tests named below are what report each — so the messages here are
 # what you will actually see rather than a description of them.
 #
@@ -22,26 +22,25 @@
 #      initializer. Unrelated to the cart, and the first thing reported once the
 #      drain is out of the way.
 #
-#   3. A filter that names the request row.  `due`, `lines` and `positions` all
-#      read `… if a == v.account`, which refines the comprehension's key domain
-#      with a predicate mentioning `v`. The refinement rides the collection's
-#      type, the collection is a field of the reply record, and the reply crosses
-#      a channel — so the predicate arrives where `v` does not reach, and
-#      inference reports a bound that left its binder's scope with nothing to
-#      discharge it. `due` shows the same defect degenerating rather than
-#      escaping: `lambda_elim` writes `const` applied to the inner aggregate's
-#      scalar result with `v` free inside it, so that site carries no binder and
-#      no key domain at all.
-#      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filter_naming_the_request`,
-#      over `v1_no_drain.cambra` — this program cannot report 2 or 3 itself,
-#      because the drain stops lowering before its read sites type.
-#
-#   4. `wasm_socket_subscribe` is not built.  The price feed is declared in
+#   3. `wasm_socket_subscribe` is not built.  The price feed is declared in
 #      `v1.channels.json` as the source `ticker_updates`, and the program assigns
 #      the constructor's result to it — but the constructor appears only in
 #      `demo_code_syntax.md` and here, where `wasm_serve` appears in three source
-#      files. Reported only in a release build, because 3 is a debug assertion
-#      and a release build proceeds past it.
+#      files.
+#
+#   4. A filtered entry comprehension over a transactional map.  `due`, `lines`
+#      and `positions` all read `… if a == v.account` over a `Mut(Map(…), Txn)`.
+#      The map's keys are a witness domain `σ`, the predicate types its element
+#      at the key's tuple, and structural inference will not join the two.
+#      Naming the request row costs nothing here: a `<<` inside a loop
+#      contributes at the channel's position, so `v` resolves to the request at
+#      that position. `if a == 1` collides identically, with no request row, no
+#      reply and no feed —
+#      `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`
+#      is that program.
+#      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension`,
+#      over `v1_read_sites.cambra` — this program cannot report 4 itself, because
+#      1, 2 and 3 each stop it first.
 #
 # Behind those, and unobserved until they move: an entry binder over a
 # *transactional* map, where the witness escapes the sum that binds it; and a key

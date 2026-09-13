@@ -9,6 +9,43 @@ use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Name, Type};
 
+/// The iteration a contribution is made under — a loop's binder and the source it draws
+/// from, in scope for the loop's body.
+///
+/// A feed outlives the iteration that writes it, so a contribution naming the loop's binder
+/// is quantified over the positions rather than resolved at one, and the abstraction has to
+/// relate the two: the binder is the source's *element*, while a collection's domain is its
+/// *positions*. Both halves are needed to write that down, and only the loop holds them —
+/// which is why this rides the emission rather than being recovered at the feed site.
+/// `channelize` reconstructs the same pairing later, as `source ≫ (λ binder → body)`.
+pub(super) struct Iteration {
+    /// The loop target — bound to the source's element over the body.
+    pub binder: Name,
+    /// The loop target's type — the source's element type, and so the type of
+    /// [`Iteration::element_at`].
+    pub binder_ty: Type,
+    /// The collection the loop draws from, as a term, so a contribution can name a
+    /// position's element as `position ▷ source`.
+    pub source: Expr,
+}
+
+impl Iteration {
+    /// The source's element at `position` — the term `position ▷ source`, which is what
+    /// this iteration's binder denotes at a contribution made under it.
+    ///
+    /// The copy of the source is a sibling: the loop keeps the original, and this one
+    /// reaches the tree inside a refinement predicate, so it freshens rather than
+    /// preserving ids. The caller's recording names the node being typed, and the mints
+    /// here hang off it.
+    pub fn element_at(&self, position: &Name, position_ty: &Type) -> Expr {
+        Expr::apply(
+            Expr::var(position.clone()).with_ty(position_ty.clone()),
+            self.source.clone(),
+        )
+        .with_ty(self.binder_ty.clone())
+    }
+}
+
 /// The operations a typing rule needs from its surrounding pass.
 ///
 /// Each per-node rule (`emit_apply`, `emit_let`, …) is written once against
@@ -121,6 +158,26 @@ pub(super) trait Typing {
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized;
+
+    /// [`Typing::scoped`] for a **loop target**, recording the iteration its body runs
+    /// under so a contribution made inside can abstract over it ([`Iteration`]).
+    fn scoped_iteration<R>(
+        &mut self,
+        name: &Name,
+        ty: &Type,
+        source: &Expr,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized;
+
+    /// The innermost iteration this emission is inside, if any.
+    ///
+    /// Borrowed rather than cloned: the source is a tree the loop still holds, and a
+    /// copy of it is a duplication that has to be recorded — which is the reading site's
+    /// to open, since only there is there a node for the mints to hang off
+    /// ([`Iteration::element_at`]).
+    fn iteration(&self) -> Option<&Iteration>;
 
     /// Emit/check a `let` RHS. Emit bumps the polymorphism level so RHS-local
     /// variables become generalizable at the binding site; Check (which trusts

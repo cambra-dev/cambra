@@ -117,6 +117,10 @@ pub(super) struct InferCtx {
     /// each use site can splice a freshened, use-specialized copy (see
     /// `scoped_let` and the `Var` arm of `emit_node`).
     pub(super) scopes: ScopeStack<Name, Binding>,
+    /// The loop bodies this emission is inside, innermost last. Pushed by
+    /// [`Typing::scoped_iteration`] and read by a feed site that must abstract over the
+    /// binder it is under (see [`crate::ccl::infer::typing::Iteration`]).
+    pub(super) iterations: Vec<crate::ccl::infer::typing::Iteration>,
     /// Externally-registered data sources (set by
     /// `TypeInferenceContext::register_source_type`).
     pub(super) sources: HashMap<String, Type>,
@@ -183,6 +187,7 @@ impl InferCtx {
     pub(super) fn new(sources: HashMap<String, Type>, root: NodeId) -> Self {
         Self {
             scopes: ScopeStack::default(),
+            iterations: Vec::new(),
             sources,
             cache: ConstrainCache::new(),
             schemes: OperatorSchemes::new(),
@@ -482,6 +487,33 @@ impl Typing for InferCtx {
     ) -> Result<(), LocatedInferError> {
         constrain_subtype_in(sub, sup, &mut self.cache, &self.scopes)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
+    }
+
+    fn scoped_iteration<R>(
+        &mut self,
+        name: &Name,
+        ty: &Type,
+        source: &Expr,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        // Duplicating the source is the whole of this copy — nothing is being rewritten —
+        // so it is recorded as one (`src/ccl/CLAUDE.md`, "Node identity and provenance").
+        let source = {
+            let _frame = crate::ccl::provenance::copy_frame("infer.iteration_source");
+            source.clone()
+        };
+        self.iterations.push(crate::ccl::infer::typing::Iteration {
+            binder: name.clone(),
+            binder_ty: ty.clone(),
+            source,
+        });
+        let out = self.scoped(name, ty, f);
+        self.iterations.pop();
+        out
+    }
+
+    fn iteration(&self) -> Option<&crate::ccl::infer::typing::Iteration> {
+        self.iterations.last()
     }
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {

@@ -1484,8 +1484,8 @@ fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, Located
 /// statement-positioned — channelize extracts the value into a channel and
 /// leaves `Unit` residue).
 ///
-/// The contribution is `Fun(fresh δ, value_ty)`, constrained into the target
-/// handle whose domain is the rigid `ChanDom(d)` — so `δ` pins to that name
+/// The contribution is [`feed_contribution`]'s `(p: δ) ⤇ value_ty`, constrained into
+/// the target handle whose domain is the rigid `ChanDom(d)` — so `δ` pins to that name
 /// rather than a free `Infer`, and `channelize` erases `ChanDom(d)` to the
 /// concrete channel domain (a source domain, or a `Variant` union of feed
 /// sites) by substitution.
@@ -1505,10 +1505,48 @@ pub(super) fn emit_feed<C: Typing>(
     // is no demand for a handle to be reconciled against — an undereferenced
     // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
     let value_ty = emit_value_read(value, ctx)?;
-    // A **data** function: the contribution is one row of the channel's collection,
-    // and the channel it flows into is that collection (`constrain_into_feed`).
-    let contribution = Type::data_fun(ctx.fresh(), value_ty);
+    let contribution = feed_contribution(&value_ty, ctx);
     constrain_into_feed(target_ty, &contribution, label, ctx)
+}
+
+/// The collection one `<<` contributes: `(p: δ) ⤇ value`, over a fresh domain `δ` the
+/// contribution's edge pins to the channel's rigid `ChanDom`.
+///
+/// A **data** function, because the contribution is one row of the channel's collection
+/// and the channel it flows into is that collection (`constrain_into_feed`).
+///
+/// A contribution made inside a loop is made once **per position**, so a value naming the
+/// loop's binder denotes a different value at each. Abstracting over the position is what
+/// keeps that binder inside a scope: left free it is recorded on whatever variable holds
+/// the channel, whose telescope predates the loop
+/// (`src/ccl/design/type-inference.md`, "The invariant"). The channel's positions and the
+/// loop's are the same positions — `channelize` assembles the channel as
+/// `source ≫ (λ binder → body)` — which is what lets the binder resolve to the source's
+/// element there, `p ▷ source` ([`Iteration::element_at`]).
+///
+/// The abstraction is every feed site's rule rather than a dependent site's case: outside a
+/// loop there is no binder to substitute, and inside one whose binder the value does not
+/// name the substitution is vacuous, so both come out as a `p` the codomain ignores.
+fn feed_contribution<C: Typing>(value_ty: &Type, ctx: &mut C) -> Type {
+    let domain = ctx.fresh();
+    let position = Name::position();
+    let node = ctx.current_node();
+    let value = match ctx.iteration() {
+        Some(iter) => {
+            // Names the node being typed: the element term's mints hang off it, and the
+            // copy of the loop's source sits beside them — the duplication-as-part-of-a-
+            // rewrite case `provenance::copy_frame` declines.
+            let _frame = crate::ccl::provenance::enter(
+                node,
+                "infer.feed_position",
+                crate::ccl::provenance::Nature::Machinery,
+            );
+            let element = iter.element_at(&position, &domain);
+            crate::ccl::subst::Subst::discharge(iter.binder.clone(), element).apply_type(value_ty)
+        }
+        None => value_ty.clone(),
+    };
+    Type::pi_kinded(position, domain, value, FunKind::Data(None))
 }
 
 /// Type a `Define { name, value }`: the defined value *is* the handle's
@@ -1542,34 +1580,35 @@ fn constrain_into_feed<C: Typing>(
     label: &str,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    match target_ty.as_feed() {
-        Some((domain, value)) => {
-            // The channel is the history's `domain ⤇ value` stream; the
-            // contribution flows into it (`Fun(δ, elem)` for a feed, the whole
-            // collection for a define). A **data** function, matching the read view
-            // `constrain_go` reconstructs for an `Append` history — the stream
-            // *is* the accumulated collection, and the kinds are incomparable,
-            // so a `Compute` channel here would reject every collection fed into
-            // it.
-            let rho = Type::data_fun(domain.clone(), value.clone());
-            ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
-        }
+    // The channel is the history's stream; the contribution flows into it (a positioned
+    // collection for a feed, the whole collection for a define). A **data** function,
+    // matching the read view `constrain_go` reconstructs for an `Append` history — the
+    // stream *is* the accumulated collection, and the kinds are incomparable, so a
+    // `Compute` channel here would reject every collection fed into it.
+    let rho = match target_ty.feed_stream() {
+        Some(rho) => rho,
         None => {
             // Opaque target (a lambda parameter receiving the handle —
             // ParamAsTarget): *demand* it be a feed channel, then constrain the
             // contribution into that requirement's channel. The call-site
             // argument edge meets the demand, and the invariant history/history
             // rule carries the contribution back to the caller's channel.
-            let rho_value = ctx.fresh();
-            let rho_domain = ctx.fresh();
-            let required = Type::feed(rho_domain.clone(), rho_value.clone());
+            //
+            // The demand binds no position. A history/history edge relates value and
+            // domain under identity substitutions, so a position binder minted here
+            // would reach the caller's channel with nothing corresponding it to the
+            // binder that channel provides — which is the same reason a binder-dependent
+            // refinement does not cross a handle today (`ccl/channelize.rs` module docs).
+            let required = Type::feed(ctx.fresh(), ctx.fresh());
             ctx.require_sub(target_ty, &required, &|| {
                 format!("feed target of {label} must be a feed handle")
             })?;
-            let rho = Type::data_fun(rho_domain, rho_value);
-            ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
+            required
+                .feed_stream()
+                .expect("the demand just built is a feed channel")
         }
-    }
+    };
+    ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
     Ok(prim(BaseType::Unit))
 }
 
@@ -1747,9 +1786,16 @@ pub(super) fn emit_let<C: Typing>(
         } = &bound_ty
         && let Type::Infer(dv) = domain.as_ref()
     {
-        let handle = Type::feed(
+        // The channel names its **positions** as well as its domain: a contribution
+        // made inside a loop is one per position, so the value it accumulates is a
+        // value at a position (`emit_feed`). Minting the binder here rather than at
+        // `Defer` is what makes it the channel's — the same rebuild that gives the
+        // channel its rigid identity gives it the binder its stream is written over.
+        let handle = Type::history_pi(
+            Name::position(),
             Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level)),
             (**value).clone(),
+            crate::ccl::HistoryKind::Append,
         );
         bound_expr.ty = handle.clone();
         handle
@@ -1980,7 +2026,7 @@ pub(super) fn emit_for<C: Typing>(
         ctx.bind_annotation(&target_simple, &ann)?;
     }
 
-    ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
+    ctx.scoped_iteration(&target.name, &target_simple, iter, |ctx| ctx.subexpr(body))?;
     Ok(Type::Base(BaseType::Unit))
 }
 

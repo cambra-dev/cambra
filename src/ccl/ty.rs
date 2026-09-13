@@ -2262,8 +2262,9 @@ impl Type {
     /// A **feed channel**'s type — the append-law history over `domain`, rendered
     /// `feed(domain ⤇ value)`.
     ///
-    /// Argument order is `as_feed`'s return order, so a round trip reads the same way in
-    /// both directions.
+    /// Argument order is `domain` then `value`, matching [`Type::history`] and
+    /// [`Type::mutable`], so no two history constructors disagree about which slot comes
+    /// first.
     pub fn feed(domain: Self, value: Self) -> Self {
         Self::history(domain, value, HistoryKind::Append)
     }
@@ -2271,8 +2272,8 @@ impl Type {
     /// A **mutable variable**'s type — the overwrite-law history, rendered
     /// `Mut(value, domain)`.
     ///
-    /// Argument order matches [`Type::feed`] and [`Type::as_feed`] rather than the
-    /// rendering, so the two constructors do not disagree about which slot comes first.
+    /// Argument order matches [`Type::feed`] rather than the rendering, so the two
+    /// constructors do not disagree about which slot comes first.
     pub fn mutable(domain: Self, value: Self) -> Self {
         Self::history(domain, value, HistoryKind::Overwrite)
     }
@@ -2314,6 +2315,27 @@ impl Type {
             value: Box::new(value),
             domain: Box::new(domain),
             history_kind,
+        }
+    }
+
+    /// The arrow a history denotes, as the [`Type::Fun`] that spells it —
+    /// `(name: domain) ⤇ value`, or `domain ⤇ value` where the history binds no
+    /// position.
+    ///
+    /// **The one place a history's stream is reassembled.** A history spells one data
+    /// arrow across three fields, and every read of a channel and every contribution
+    /// into one needs that arrow: the solver's transparent-read arms, the cast
+    /// rebuild, and the feed sites each built it by hand, and each dropped the
+    /// position binder in doing so. Taking `name` as an argument rather than reading
+    /// it off a `Type` serves the rebuild sites, whose domain and value are the ones
+    /// being computed rather than the exemplar's.
+    ///
+    /// Closing is [`Type::pi_kinded`]'s, so a `value` extracted from a history comes
+    /// through with its index untouched and one recomputed from node types closes here.
+    pub fn history_stream(name: Option<&crate::ccl::Name>, domain: Self, value: Self) -> Self {
+        match name {
+            Some(p) => Type::pi_kinded(p.clone(), domain, value, FunKind::Data(None)),
+            None => Type::data_fun(domain, value),
         }
     }
 
@@ -2439,9 +2461,10 @@ impl Type {
                 }
             }
             Type::History {
+                name,
                 history_kind: HistoryKind::Append,
                 ..
-            } => Type::data_fun(domain, codomain),
+            } => Type::history_stream(name.as_ref(), domain, codomain),
             _ => Type::fun(domain, codomain),
         }
     }
@@ -2613,7 +2636,7 @@ impl Type {
     ///
     /// A mutable variable is a [`HistoryKind::Overwrite`] history `Mut(𝑉, 𝐷)`, and
     /// this is `𝑉` — what one read of it yields. A feed channel is deliberately
-    /// *not* one ([`Type::as_feed`]): it reads as its whole stream, so the two are
+    /// *not* one ([`Type::feed_stream`]): it reads as its whole stream, so the two are
     /// never interchangeable at a read.
     pub fn mut_value_type(&self) -> Option<&Type> {
         match self.peel_refinements() {
@@ -2626,20 +2649,25 @@ impl Type {
         }
     }
 
-    /// The `(domain, value)` of the feed channel this denotes, or `None` if it is
-    /// not one.
+    /// The **stream** of the feed channel this denotes ([`Type::history_stream`]), or
+    /// `None` if it is not one.
     ///
-    /// A channel is a [`HistoryKind::Append`] history, and what a read of it yields
-    /// is the whole stream `domain ⇒ value` — hence the pair, where
-    /// [`Type::mut_value_type`] returns a single value type.
-    pub fn as_feed(&self) -> Option<(&Type, &Type)> {
+    /// A channel is a [`HistoryKind::Append`] history, and what a read of it yields is
+    /// the whole arrow `(p: domain) ⤇ value` rather than a value at a position — which
+    /// is why this returns a constructed type where [`Type::mut_value_type`] borrows a
+    /// stored one.
+    pub fn feed_stream(&self) -> Option<Type> {
         match self.peel_refinements() {
             Type::History {
+                name,
                 domain,
                 value,
                 history_kind: HistoryKind::Append,
-                ..
-            } => Some((domain, value)),
+            } => Some(Type::history_stream(
+                name.as_ref(),
+                (**domain).clone(),
+                (**value).clone(),
+            )),
             _ => None,
         }
     }
@@ -5028,15 +5056,15 @@ mod tests {
 
         assert_eq!(refine(mut_var.clone()).mut_value_type(), Some(&int));
         assert_eq!(
-            refine(channel.clone()).as_feed(),
-            Some((&Type::UIntRange(3), &int))
+            refine(channel.clone()).feed_stream(),
+            Some(Type::data_fun(Type::UIntRange(3), int.clone()))
         );
         assert!(refine(mut_var).is_handle() && refine(channel.clone()).is_handle());
 
         // The two kinds are not interchangeable: a channel reads as its whole
         // stream, a mutable variable as one value, so neither accessor answers for the other.
         assert_eq!(channel.mut_value_type(), None);
-        assert_eq!(Type::mutable(Type::Txn, int.clone()).as_feed(), None);
+        assert_eq!(Type::mutable(Type::Txn, int.clone()).feed_stream(), None);
 
         // A refined *non*-handle peels to a non-handle, which is the case every
         // caller of these accessors actually hits (`x = 0; x += 1`).

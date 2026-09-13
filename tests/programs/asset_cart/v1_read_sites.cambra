@@ -1,17 +1,22 @@
-# `v1.cambra` with the checkout's drain elided, so the sites that read the cart
-# reach inference. `v1.cambra` is the program of record; this file exists to pin
-# what those sites report, which nothing else can observe.
+# `v1.cambra` reduced to the three sites that read the cart, so what those sites
+# report is observable. `v1.cambra` is the program of record; this file exists
+# because each of the three elisions below is reported ahead of them, and nothing
+# else can see past all three.
 #
-# The drain is `for (a, t) -> q in cart if a == r.account:` over a source whose
-# length is a runtime fact, inside `with begin():`. Lowering rejects it, and
-# rejects it before the three comprehensions below ever type — so the whole read
-# half of the program is unobserved while it is present.
+# The **drain** is `for (a, t) -> q in cart if a == r.account:` over a source
+# whose length is a runtime fact, inside `with begin():`. Lowering rejects it,
+# and rejects it before the three comprehensions ever type.
 #
-# `Balance`'s refinement is elided too, for an unrelated reason: `500 *
-# one_dollar` computes, and computing drops a refinement, so `{Microcents where
-# _ > 0}` meets a bare `Int` at the initializer. That is a fact about arithmetic
-# and refinements rather than about the cart, and it would be the first thing
-# reported here instead of the obstruction this file is for.
+# **`Balance`'s refinement**: `500 * one_dollar` computes, and computing drops a
+# refinement, so `{Microcents where _ > 0}` meets a bare `Int` at the
+# initializer. A fact about arithmetic and refinements rather than about the
+# cart.
+#
+# The **price feed**: `wasm_socket_subscribe` appears in `demo_code_syntax.md`
+# and in `v1.cambra`, and is built nowhere, so the name does not resolve. Name
+# resolution precedes inference, so it reports ahead of everything typed here.
+# `prices` keeps its seed and loses its writer, which the read sites do not
+# distinguish — they read it either way.
 #
 # Everything else is `v1.cambra` verbatim, wiring included: the test beside this
 # reads `v1.channels.json` rather than duplicating it.
@@ -115,23 +120,3 @@ for v in view_requests:
             positions = [(ticker=t, qty=q)
                          for (a, t) -> q in holdings if a == v.account],
         )
-
-# --- feed ------------------------------------------------------------------
-
-# The host's websocket, in the same shape as a host source: it connects, sends
-# the subscription, decodes each message and pushes one typed row per quote —
-# so no JSON parsing or string splitting happens in Cambra. Native builds do
-# this with `tungstenite`; the page uses the browser's own WebSocket, and the
-# recorded slice replays into the same channel offline. Arguments are
-# compile-time constants, as `wasm_serve`'s are. Rows carry the bare ticker
-# ("BTC"), not the product id.
-#   -> {ticker: String, price: Microcents}
-ticker_updates = wasm_socket_subscribe(
-    "wss://ws-feed.exchange.coinbase.com",
-    "ticker_batch",
-    ["BTC-USD", "ETH-USD", "SOL-USD"],
-)
-
-for u in ticker_updates:
-    with begin():
-        prices[u.ticker] := u.price

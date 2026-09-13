@@ -4159,24 +4159,21 @@ fn a_reply_carrying_a_collection_is_not_reachable() {
 /// A reply whose comprehension **filters on the request row**, which is `v1.cambra`'s cart
 /// view in six lines.
 ///
-/// The filter refines the comprehension's key domain with a predicate naming `v`. That
-/// refinement rides the collection's type, the collection is what the reply carries, and
-/// the feed is bound at the top level — so the predicate is recorded as a bound on a
-/// variable whose telescope predates `v`, and inference reports the reference as having
-/// left its binder's scope (`src/ccl/design/type-inference.md`, "The invariant").
+/// The filter refines the comprehension's key domain with a predicate naming `v`, and the
+/// reply carries that refined collection into a feed bound at the top level. The
+/// contribution abstracts over the channel's position, so `v` resolves there to
+/// `__pos ▷ [1, 2]` and reaches the feed inside a binder rather than free
+/// (`feed_contribution` in `src/ccl/infer/emit.rs`).
 ///
-/// The dependence is representable one phase later and not here. After `channelize` the
-/// feed is `[0, 1] ⤇ Int` — a collection over the loop's own domain, written
-/// `[1, 2] ≫ (λ v → …)`, where `v` is an ordinary binder over the body. During inference
-/// the same feed is `feed(chan(out) ⤇ V)`: one element type over an opaque channel domain,
-/// with nowhere for a `V` that varies by position to live.
-///
-/// Aggregating instead of replying the collection fails differently — the key binder meets
-/// a concrete `Int` and the witness collides — so the escape here is not the same defect
-/// seen twice.
+/// What stops it is the filtered entry comprehension underneath. `m`'s keys are a witness
+/// domain `σ`, the predicate types its element at `Int`, and structural inference will not
+/// join the two — the collision
+/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable` pins with no
+/// reply, no feed and no correlation, on a filter comparing against a literal. So this
+/// program is now blocked on a defect that is not about correlation.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
+#[should_panic(expected = "Conflicting Types: Int | σ")]
 fn a_reply_filtered_by_the_request_is_not_reachable() {
     check_scalar(
         indoc! {r"

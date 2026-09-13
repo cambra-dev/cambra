@@ -1590,6 +1590,7 @@ fn constrain_go_impl(
         // `value` above), a feed reads as the reconstructed channel function.
         (
             Type::History {
+                name,
                 value,
                 domain,
                 history_kind: HistoryKind::Append,
@@ -1597,13 +1598,9 @@ fn constrain_go_impl(
             },
             _,
         ) => {
-            let chan = Type::Fun {
-                name: None,
-                // A feed's read view is a collection stream: a data function.
-                fun_kind: FunKind::Data(None),
-                domain: domain.clone(),
-                codomain: value.clone(),
-            };
+            // A feed's read view is its stream — a data collection, carrying the
+            // channel's position binder where the value depends on it.
+            let chan = Type::history_stream(name.as_ref(), (**domain).clone(), (**value).clone());
             constrain_go(&chan, rhs, sl, sr, cache, scope)
         }
         // A *channel-shaped* lhs meeting a feed requirement is the read view of
@@ -1615,19 +1612,14 @@ fn constrain_go_impl(
         (
             Type::Fun { .. },
             Type::History {
+                name,
                 value,
                 domain,
                 history_kind: HistoryKind::Append,
                 ..
             },
         ) => {
-            let chan = Type::Fun {
-                name: None,
-                // A feed's read view is a collection stream: a data function.
-                fun_kind: FunKind::Data(None),
-                domain: domain.clone(),
-                codomain: value.clone(),
-            };
+            let chan = Type::history_stream(name.as_ref(), (**domain).clone(), (**value).clone());
             constrain_go(lhs, &chan, sl, sr, cache, scope)
         }
         // Any other plain value can never satisfy a feed requirement: reading is

@@ -1136,11 +1136,34 @@ For the reconcile to hold, the passes that *introduce* refined types post-infere
 
 #### Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)
 
-A feed handle is `Type::History { value: 𝑇, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed `feed(𝐷 ⤇ 𝑉)`) — a collection `𝐷 ⤇ 𝑇` carried as two children plus a two-valued `history_kind` marker. It **shares the `Type::History` variant with a mutable variable** (`history_kind: Overwrite`, displayed `Mut(𝑉, 𝐷)`); the two were unified from the former `Type::Feed(ρ)` / `Type::Mut{…}` pair (see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type)). `let 𝑑 = Defer in body` gives `𝑑` an `Append`-kind history whose channel `𝐷 ⤇ 𝑇` is the *post-channelize result type* of the binding (a `𝐷 ⤇ 𝑇` channel for fed defers, the defined value's type for `<<=`-defined defers). Like `Hole` and `Infer` the `Append` kind is **transient**, scoped to inference: `channelize` (which runs after inference) eliminates every defer construct along with its feed histories, and no pass downstream of it may observe one. (This is the feed-handle type of [`Feed` is a CCL type](mutability.md#feed-is-a-ccl-type) — what a defer-mediating UDF parameter carries.)
+A feed handle is `Type::History { name: Some(𝑝), value: 𝑇, domain: 𝐷, history_kind:
+HistoryKind::Append }` (displayed `feed(𝐷 ⤇ 𝑉)`) — the data arrow `(𝑝: 𝐷) ⤇ 𝑇` carried as three
+children plus a two-valued `history_kind` marker. `name` is the channel's **position binder**,
+bound in `value` exactly as `Type::Fun`'s is bound in its codomain; `Type::history_pi` is the only
+constructor that sets it and `Type::history_stream` the only place the arrow is reassembled, so
+neither a read of the channel nor a contribution into one can drop it. A mutable variable's `name`
+is `None`: its value is one cell, not a value per position. It **shares the `Type::History` variant with a mutable variable** (`history_kind: Overwrite`, displayed `Mut(𝑉, 𝐷)`); the two were unified from the former `Type::Feed(ρ)` / `Type::Mut{…}` pair (see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type)). `let 𝑑 = Defer in body` gives `𝑑` an `Append`-kind history whose channel `𝐷 ⤇ 𝑇` is the *post-channelize result type* of the binding (a `𝐷 ⤇ 𝑇` channel for fed defers, the defined value's type for `<<=`-defined defers). Like `Hole` and `Infer` the `Append` kind is **transient**, scoped to inference: `channelize` (which runs after inference) eliminates every defer construct along with its feed histories, and no pass downstream of it may observe one. (This is the feed-handle type of [`Feed` is a CCL type](mutability.md#feed-is-a-ccl-type) — what a defer-mediating UDF parameter carries.)
 
 Below, **`Feed(ρ)`** abbreviates a `kind: Feed` history whose reconstructed channel is `ρ = 𝐷 ⇒ 𝑇`; the `value`/`domain` children are the two halves of `ρ`. An `Overwrite` history reaches the relation as a handle — a read has already dereffed at the rule that emitted it — so the four invariance rules below are specifically the `Feed`-kind behavior.
 
-The typing rules (`infer_simple_sub::emit_defer` / `emit_feed` / `emit_define`): `Defer` emits `Feed(fresh ρ)`; `Feed{name, value}` and `Define{name, value}` type as `Unit`, resolve `name` from the scope like a `Var` use, and constrain their contribution into the target's payload (`Fun(fresh δ, value_ty)` for a feed — the channel *domain* is a channelize artifact, so `δ` stays unconstrained and coalesces to `Infer`; the bare `value_ty` for a define). A target that isn't structurally a feed handle (a lambda parameter — ParamAsTarget) is demanded to be one via the upper bound `target <: Feed(ρf)`; the call-site argument edge meets it there and invariance carries the contribution back to the caller's channel. A bare `Defer` RHS is never generalized (`should_generalize` wants a lambda RHS), so feeds and reads of one defer share one `ρ`; a defer minted inside a generalized function instantiates fresh per call site.
+The typing rules (`infer_simple_sub::emit_defer` / `emit_feed` / `emit_define`): `Defer` emits `Feed(fresh ρ)`; `Feed{name, value}` and `Define{name, value}` type as `Unit`, resolve `name` from the scope like a `Var` use, and constrain their contribution into the target's stream (`(𝑝: fresh δ) ⤇ value_ty` for a feed — the channel *domain* is a channelize artifact, so `δ` stays unconstrained and coalesces to `Infer`; the bare `value_ty` for a define). A target that isn't structurally a feed handle (a lambda parameter — ParamAsTarget) is demanded to be one via the upper bound `target <: Feed(ρf)`; the call-site argument edge meets it there and invariance carries the contribution back to the caller's channel. A bare `Defer` RHS is never generalized (`should_generalize` wants a lambda RHS), so feeds and reads of one defer share one `ρ`; a defer minted inside a generalized function instantiates fresh per call site.
+
+**A contribution is made at a position** (`feed_contribution`). A `<<` inside a loop contributes
+once per iteration, so a fed value naming the loop's binder denotes a different value at each, and
+the contribution abstracts the binder over the channel's position rather than leaving it free. The
+loop's positions and the channel's are the same positions — `channelize` assembles the channel as
+`source ≫ (λ binder → body)` — so the binder resolves at the position to the source's element there,
+`𝑝 ▷ source`. Left free it would be recorded as a bound on the variable holding the channel, whose
+telescope predates the loop; that is the record-time closure invariant's error, and a reply built
+inside a request loop is the program that reaches it. The abstraction is every feed site's rule
+rather than a dependent site's case: outside a loop there is no binder to substitute, and inside one
+whose binder the value does not name the substitution is vacuous, so both come out as a `𝑝` the
+codomain ignores.
+
+The demand a ParamAsTarget site raises binds no position. Rule 1 below relates the two histories'
+values under identity morphisms, so a binder minted for the demand would reach the caller's channel
+with nothing corresponding it to the binder that channel provides — the same reason that rule does
+not discharge a binder-dependent refinement across a handle.
 
 `History` is the lattice's only **invariant** constructor. Feeding is a contravariant capability (a feed contributes an element *into* the channel) while reading is covariant, so a feed handle flowing through a function parameter must propagate feed contributions *backwards* to the caller's channel — a one-way `arg <: param` edge would strand the callee's contribution on the parameter variable. Four constraint rules (`constrain_go`), where `Feed(a)`/`Feed(b)` are same-`kind` (`Feed`) histories:
 
