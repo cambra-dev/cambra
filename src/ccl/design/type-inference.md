@@ -185,8 +185,8 @@ def identity(x):
 * **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. Does not block today's coverage; a natural next step.
 * **SMT-backed refinements outside linear integer arithmetic, and after `lambda_elim`.**
   [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) discharges an
-  `Int`/`Bool` predicate in linear integer arithmetic to Z3 when structural matching leaves a
-  deficit. A deficit the encoder cannot read is decided structurally, as it was before the
+  `Int`/`Bool` predicate in linear integer arithmetic to the SMT solver when structural matching
+  leaves a deficit. A deficit the encoder cannot read is decided structurally, as it was before the
   fallback existed. The encoded fragment is over surface-syntax predicate shapes, and
   `lambda_elim` rewrites every predicate point-free, so no check at or after that pass reaches
   the fallback at all — the reach is inference and `inline`.
@@ -973,7 +973,12 @@ A deficit `S₂ \ S₁` over a concrete `b₁` asks `smt_sub`
 mismatch. `{Int | __elem == 1 ^+ 3 ^+ 2} <: {Int | __elem == 1 ^+ 5}` holds by that route and
 not by structural matching.
 
-The query is `∀ __elem. ⋀Γ ∧ ⋀S₁ ⇒ ⋀S₂`, decided by asking Z3 for unsatisfiability of
+The solver is `oxiz`, a pure-Rust library linked into the compiler: a query is a term built
+against its term manager rather than a script written to a subprocess. No parser stands between
+the encoder and the decision procedure, so the encoder checks sorts itself, and an ill-sorted
+predicate is an encoding failure — which the deficit rule decides as a mismatch.
+
+The query is `∀ __elem. ⋀Γ ∧ ⋀S₁ ⇒ ⋀S₂`, decided by asking the solver for unsatisfiability of
 `⋀Γ ∧ ⋀S₁ ∧ ¬⋀S₂`. `__elem` is declared once at `b₁`'s sort and shared by both sides, or, where
 `b₁` is a product, read through its fields
 ([A product is reached through its fields](#a-product-is-reached-through-its-fields)). Both

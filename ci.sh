@@ -70,22 +70,6 @@ ci_formal() {
   # everything: the test line reports neither.
   cargo test -q --test differential_oracle -- --nocapture
 }
-# Refinement subtyping decides a structural deficit by asking `z3`
-# (`src/ccl/infer/solver/smt.rs`), spawned as a subprocess. Without the binary
-# every query fails and the thread's solver slot poisons, which shows up as
-# dozens of unrelated test failures reporting an OS error that never names z3 —
-# so this gate says it once, up front, instead. The `lake` precedent skips;
-# this one cannot, because a missing solver does not make a gate a no-op, it
-# makes the suite red.
-ci_solver() {
-  if ! command -v z3 >/dev/null 2>&1; then
-    echo "ci_solver: no \`z3\` on PATH — refinement subtyping runs queries against it," >&2
-    echo "  so the test suite fails with Process { message: \"No such file or directory\" }." >&2
-    echo "  Install it from https://github.com/Z3Prover/z3/releases and put it on PATH;" >&2
-    echo "  .github/workflows/ci.yml pins the release CI installs." >&2
-    return 1
-  fi
-}
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc -p cambra --no-deps
@@ -183,14 +167,24 @@ ci_fixtures() {
 # `wasm-bindgen`, which is not a dependency of this repo — so what it gates is
 # that nothing has re-entered the wasm build through an unguarded `use`.
 #
-# Skipped (not failed) when the target is not installed, so the Rust-only local
-# path still works; install it with `rustup target add wasm32-unknown-unknown`.
+# Nothing in the suite runs on that target and no host build notices when it
+# stops compiling, which is the same rot argument as `ci_clippy_lib`. Refinement
+# subtyping is what makes it load-bearing: the solver is linked in rather than
+# spawned (`src/ccl/infer/solver/smt.rs`) so that a refinement can be discharged
+# in a browser, and a dependency that reached for a subprocess again would
+# otherwise land unremarked.
+#
+# Fails rather than skips without the target installed: a missing target does
+# not make this gate a no-op, it makes it unrun. `.github/workflows/ci.yml`
+# installs it alongside rustfmt and clippy; locally,
+# `rustup target add wasm32-unknown-unknown`.
 ci_wasm() {
   if ! rustup target list --installed 2> /dev/null | grep -qx wasm32-unknown-unknown; then
-    echo "ci_wasm: wasm32-unknown-unknown not installed; skipping" >&2
-    return 0
+    echo "ci_wasm: wasm32-unknown-unknown is not installed, so this gate did not run." >&2
+    echo "  Add it with \`rustup target add wasm32-unknown-unknown\`." >&2
+    return 1
   fi
-  cargo check -p cambra --target wasm32-unknown-unknown --lib
+  cargo check -p cambra --target wasm32-unknown-unknown --lib || return 1
   # The module itself, when the matching `wasm-bindgen` CLI is around. The check
   # above is the gate; this is the contract, and it needs a tool the repo does
   # not depend on.
@@ -256,8 +250,8 @@ ci_shared_state() {
 # Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
 # and test. Deliberately skips the phases whose cost is compile-bound and rarely
 # relevant mid-iteration — the *release* clippy pass (~2x the debug one; only
-# catches `cfg(debug_assertions)`-gated breakage), the doc build, shellcheck, and
-# the doc-ref check — and drops clippy's `--all-targets` (see `ci_clippy`: it
+# catches `cfg(debug_assertions)`-gated breakage), the `wasm32` build, the doc
+# build, shellcheck, and the doc-ref check — and drops clippy's `--all-targets` (see `ci_clippy`: it
 # doubles the debug clippy time to check test targets `cargo test` then rebuilds
 # anyway). Roughly a third of a full `./ci.sh` after a one-file edit. Run the
 # full `./ci.sh` before pushing — CI gates on everything, and the release clippy
@@ -270,10 +264,6 @@ ci_fast() {
   # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
   # shellcheck disable=SC2310
   { cargo clippy -p cambra -- -D warnings; } || failed=1
-  # Before `ci_test`, so a missing solver reads as one line rather than as the
-  # suite's failures.
-  # shellcheck disable=SC2310
-  ci_solver || failed=1
   # shellcheck disable=SC2310
   ci_test || failed=1
   exit "${failed}"
@@ -309,10 +299,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc || failed="${failed} doc"
-  # Before `ci_test`, for the reason `ci_solver`'s own comment gives.
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_solver || failed="${failed} solver"
+  ci_wasm || failed="${failed} wasm"
   # Before `ci_test`, so the oracle binary exists by the time the suite runs:
   # the differential tests skip themselves without it, and a skip in the middle
   # of the gate is the failure mode this step exists to remove.

@@ -19,20 +19,25 @@
 //! The reach of the fallback is therefore inference and [`crate::ccl::inline`], not
 //! the whole pipeline.
 //!
+//! The solver is [`oxiz`], linked in rather than run as a subprocess, so a query
+//! is a term built against a [`TermManager`] and handed to a [`Solver`]. Building
+//! a term goes through no parser, and nothing between this module and the
+//! decision procedure reads sorts, so the encoder checks them itself
+//! ([`Encode::check_operands`]).
+//!
 //! `smt_sub` answers `false` for one reason: the solver found a model of
 //! `⋀lhs ∧ ¬⋀rhs`, a value of the base satisfying every lhs predicate and
 //! violating an rhs one. Every other outcome is an [`SmtError`] naming what
 //! happened — a query outside the fragment (a base that is neither a scalar nor a
 //! product, floor division, a product of two unknowns, a predicate mentioning an
-//! application that is not a projection), a solver that will not start or breaks
-//! mid-query, an `unknown`. An `Err` is not a mismatch: nothing decided the
-//! entailment.
+//! application that is not a projection, an ill-sorted operator), or an
+//! `unknown`. An `Err` is not a mismatch: nothing decided the entailment.
 
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::rc::Rc;
 
-use easy_smt::{Context, ContextBuilder, Response, SExpr};
+use oxiz::core::smtlib::Printer;
+use oxiz::{Solver, SolverResult, SortId, TermId, TermManager};
 
 use crate::ccl::infer::solve::resolve_var_type;
 use crate::ccl::symbolic::symbolic;
@@ -41,42 +46,23 @@ use crate::ccl::{
     Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
 
-/// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
-/// [`SmtError`] report, so a machine without it on PATH is told what is missing.
-pub const SOLVER_BINARY: &str = "z3";
-
 #[derive(Debug, Clone)]
 pub enum SmtError {
-    /// A type or term outside the encoded fragment. Translation stops at the
-    /// first body it cannot read, so a second such body is not reported.
+    /// A type or term outside the encoded fragment, an ill-sorted operator
+    /// included. Translation stops at the first body it cannot read, so a second
+    /// such body is not reported.
     Encoding {
         /// The refinement whose predicate has no encoding.
         body: Refinement,
         /// Description of the encoding failure.
         message: String,
     },
-    /// The solver process could not be spawned, or the pipe to it failed.
-    Process {
-        /// A stringified [`io::Error`].
-        message: String,
-    },
     /// The solver answered `unknown`, which is neither an entailment proof nor a
     /// counterexample.
     SolverReportedUnknown,
-    /// The solver's reply to a command was not one this module expects: an
-    /// `(error …)` reply, which is a misencoding on this side, or no parsable
-    /// reply, which is a solver that stopped answering. `easy_smt` reports both
-    /// as [`io::ErrorKind::Other`], which is the only signal separating them from
-    /// a broken pipe.
-    SolverError {
-        /// A stringified [`io::Error`], carrying the solver's reply.
-        message: String,
-    },
 }
 
-/// The report a caller prints for a query that went unasked or unanswered. The
-/// [`SmtError::Process`] wording carries the install step, because a machine
-/// without a solver sees that variant and no other.
+/// The report a caller prints for a query that went unasked or unanswered.
 impl std::fmt::Display for SmtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -85,17 +71,8 @@ impl std::fmt::Display for SmtError {
                 "the refinement predicate {} is outside the supported SMT encoding ({message})",
                 symbolic(&body.predicate)
             ),
-            SmtError::Process { message } => write!(
-                f,
-                "refinement subtyping runs queries against `{SOLVER_BINARY}`, which could not be \
-                 started: {message}. Install it and put it on PATH — `./ci.sh solver` checks for \
-                 it, and `.github/workflows/ci.yml` pins the release CI installs."
-            ),
             SmtError::SolverReportedUnknown => {
-                write!(f, "`{SOLVER_BINARY}` answered `unknown`")
-            }
-            SmtError::SolverError { message } => {
-                write!(f, "`{SOLVER_BINARY}` reported an error: {message}")
+                write!(f, "the solver answered `unknown`")
             }
         }
     }
@@ -104,7 +81,7 @@ impl std::fmt::Display for SmtError {
 /// SMT representations of Cambra types. If a refinement base type is
 /// encountered that cannot be represented by `Sort`, the check fails
 /// fast.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
     Bool,
     Int,
@@ -112,42 +89,46 @@ pub enum Sort {
     UInt,
     /// Represented as `Int` where `_ >= 0 && _ < n`.
     UIntRange(usize),
-    /// A sort reached by the solver's own spelling for it, carrying no constraint
-    /// of its own. `String` is the case: z3's built-in string sort, used here as a
-    /// sort name. This reaches a built-in sort and not an uninterpreted one,
-    /// which would need a `declare-sort` command that nothing here emits.
-    Named(String),
+    /// The solver's built-in string sort, carrying no constraint of its own. No
+    /// operator in the fragment is on strings, so a leaf at this sort is declared
+    /// and then only ever compared for equality with another one.
+    Str,
 }
 
 impl Sort {
-    /// Declare a constant of the given sort, and assert any relevant
-    /// constraint (such as that the constant is `>= 0`, for a
-    /// `UInt`).
-    fn declare(self, sym: String, ctx: &mut Context) -> Result<(), SmtError> {
-        let sym_atom = ctx.atom(sym.clone());
-        let zero = || ctx.numeral(0);
-        let non_neg = |x: SExpr| ctx.gte(x, zero());
-        let lt = |x: SExpr, y: usize| ctx.lt(x, ctx.numeral(y));
-        let (sort_atom, constraint) = match self {
-            Self::Bool => (ctx.bool_sort(), None),
-            Self::Int => (ctx.int_sort(), None),
-            Self::UInt => {
-                let c = non_neg(sym_atom);
-                (ctx.int_sort(), Some(c))
-            }
-            Self::UIntRange(n) => {
-                let c = ctx.and(non_neg(sym_atom), lt(sym_atom, n));
-                (ctx.int_sort(), Some(c))
-            }
-            Self::Named(s) => (ctx.atom(s), None),
+    /// Mint a constant at this sort, with the constraint pinning it to the Cambra
+    /// type the sort represents: non-negativity for a `UInt`, non-negativity and
+    /// the upper bound for a `UIntRange`, and nothing where the SMT sort denotes
+    /// that type already.
+    ///
+    /// The constraint is returned rather than asserted, because a query is one
+    /// term and its caller is what conjoins the parts ([`Encode::query`]).
+    fn declare(self, sym: &str, tm: &mut TermManager) -> (TermId, Option<TermId>) {
+        let sort_id = match self {
+            Self::Bool => tm.sorts.bool_sort,
+            Self::Int | Self::UInt | Self::UIntRange(_) => tm.sorts.int_sort,
+            Self::Str => tm.sorts.string_sort(),
         };
-        ctx.declare_const(sym, sort_atom)
-            .map_err(exchange_failure)?;
-        if let Some(c) = constraint {
-            ctx.assert(c).map_err(exchange_failure)?;
-        }
-        Ok(())
+        let var = tm.mk_var(sym, sort_id);
+        let constraint = match self {
+            Self::Bool | Self::Int | Self::Str => None,
+            Self::UInt => Some(non_negative(tm, var)),
+            Self::UIntRange(n) => {
+                let low = non_negative(tm, var);
+                let bound = tm.mk_int(n);
+                let high = tm.mk_lt(var, bound);
+                Some(tm.mk_and([low, high]))
+            }
+        };
+        (var, constraint)
     }
+}
+
+/// `x >= 0` — the constraint an unsigned Cambra type puts on the `Int` that
+/// represents it.
+fn non_negative(tm: &mut TermManager, x: TermId) -> TermId {
+    let zero = tm.mk_int(0);
+    tm.mk_ge(x, zero)
 }
 
 /// The lexical scope a solver query runs in — the `Γ` of `Γ ⊢ ⋀lhs ⇒ ⋀rhs`.
@@ -384,75 +365,34 @@ pub fn smt_sub(
     if rhs.is_empty() {
         return Ok(true);
     }
-    with_solver(|ctx| check(ctx, base, lhs, rhs, scope))
-}
+    let _guard = QueryGuard::enter();
+    // A manager and a solver per query, so the constants one query declares and
+    // the formula it asserts leave no trace for the next. Both are ordinary
+    // allocations: the solver is linked in, so there is no process to keep warm
+    // and no assertion stack to unwind.
+    let mut tm = TermManager::new();
+    // Encoding is pure and can bail; a bail drops the terms it built, which the
+    // solver has not seen.
+    let formula = Encode::new(&mut tm, scope, base).query(lhs, rhs)?;
+    log::debug!("check {}", Printer::new(&tm).print_term(formula));
 
-/// One query: build it, then run it inside a `push`/`pop` scope so the constants
-/// it declares and the formula it asserts leave no trace for the next query.
-fn check(
-    ctx: &mut Context,
-    base: &Type,
-    lhs: &[Refinement],
-    rhs: &[Refinement],
-    scope: &dyn ScopeEnv,
-) -> Result<bool, SmtError> {
-    // Encoding is pure and can bail; bailing before the `push` leaves no scope to
-    // unwind.
-    let mut enc = Encode::new(ctx, scope, base);
-    let formula = enc.query(lhs, rhs)?;
-    let decls = enc.decls;
-
-    ctx.push().map_err(exchange_failure)?;
-    // A failed exchange poisons the slot and drops the context, so the `pop`
-    // balancing this `push` only has to happen on the paths that leave the solver
-    // usable — every path that got an answer, `Unknown` included.
-    let response = run(ctx, decls, formula)?;
-    ctx.pop().map_err(exchange_failure)?;
-
-    match response {
-        Response::Unsat => Ok(true),
-        Response::Sat => Ok(false),
-        Response::Unknown => Err(SmtError::SolverReportedUnknown),
+    let mut solver = Solver::new();
+    solver.assert(formula, &mut tm);
+    match solver.check(&mut tm) {
+        SolverResult::Unsat => Ok(true),
+        SolverResult::Sat => Ok(false),
+        SolverResult::Unknown => Err(SmtError::SolverReportedUnknown),
     }
 }
 
-/// The whole exchange: declare the query's constants, assert it, ask.
-fn run(
-    ctx: &mut Context,
-    decls: Vec<(String, Sort)>,
-    formula: SExpr,
-) -> Result<Response, SmtError> {
-    for (sym, sort) in decls {
-        log::debug!("declare {sym} at {sort:?}");
-        sort.declare(sym, ctx)?;
-    }
-    log::debug!("check {}", ctx.display(formula));
-    ctx.assert(formula).map_err(exchange_failure)?;
-    ctx.check().map_err(exchange_failure)
-}
-
-/// Classify a failed exchange with a solver that had started.
+/// Translation from a refinement predicate to a solver term, plus what the
+/// constants it declares are assumed to satisfy.
 ///
-/// `easy_smt` reports every reply it cannot use as [`io::ErrorKind::Other`] and
-/// leaves a pipe failure the kind the OS gave it, so the kind is what separates a
-/// solver answering something unusable from a solver that is not there.
-fn exchange_failure(err: io::Error) -> SmtError {
-    let message = err.to_string();
-    if err.kind() == io::ErrorKind::Other {
-        SmtError::SolverError { message }
-    } else {
-        SmtError::Process { message }
-    }
-}
-
-/// Translation from a refinement predicate to an s-expression, plus the constant
-/// declarations the result depends on.
-///
-/// `Context` is borrowed immutably: building s-expressions is pure, and deferring
-/// the `declare-const` commands to [`run`] keeps a translation that bails from
-/// having sent anything.
+/// The manager is borrowed mutably because it interns every term built through
+/// it. Nothing reaches the solver from here: [`smt_sub`] asserts the one term
+/// this produces, so a translation that bails has sent nothing.
 struct Encode<'a> {
-    ctx: &'a Context,
+    tm: &'a mut TermManager,
     /// The scope consulted for each free name met while translating.
     scope: &'a dyn ScopeEnv,
     /// The type the query's subject is refined at. What
@@ -465,50 +405,59 @@ struct Encode<'a> {
     /// is that value.
     subject: Option<Path>,
     /// Leaves encoded so far, keyed by [`Path`] so that one leaf is one SMT
-    /// constant across both sides of the query.
-    vars: HashMap<Path, SExpr>,
+    /// constant across both sides of the query. Its length is the next constant's
+    /// number, since [`Encode::declare`] inserts exactly one entry per constant.
+    vars: HashMap<Path, TermId>,
     /// The paths whose types have already been read for assumptions. Separate
     /// from `vars` because a path with no constant of its own still carries
     /// refinements — a product's own predicate reads its fields — and because a
     /// refinement mentioning the value it rides must not send the walk back
     /// through it.
     assumed: HashSet<Path>,
-    /// `(symbol, sort)` per entry of `vars`, in declaration order.
-    decls: Vec<(String, Sort)>,
+    /// The constraint each declared constant's sort puts on it
+    /// ([`Sort::declare`]), in declaration order. Part of the antecedent, and not
+    /// part of `Γ`: it pins a representation, where `Γ` states what the scope
+    /// knows.
+    sort_facts: Vec<TermId>,
     /// `Γ`: what the scope claims about the leaves met so far, in the order they
     /// were met. Collected as translation goes rather than up front, because a
     /// leaf is only known to be part of the query once a predicate reads it.
-    assumptions: Vec<SExpr>,
+    assumptions: Vec<TermId>,
 }
 
 impl<'a> Encode<'a> {
-    fn new(ctx: &'a Context, scope: &'a dyn ScopeEnv, base: &'a Type) -> Self {
+    fn new(tm: &'a mut TermManager, scope: &'a dyn ScopeEnv, base: &'a Type) -> Self {
         Encode {
-            ctx,
+            tm,
             scope,
             base,
             subject: None,
             vars: HashMap::new(),
             assumed: HashSet::new(),
-            decls: Vec::new(),
+            sort_facts: Vec::new(),
             assumptions: Vec::new(),
         }
     }
 
     /// `⋀Γ ∧ ⋀lhs ∧ ¬⋀rhs` — unsatisfiable exactly when the entailment holds.
-    fn query(&mut self, lhs: &[Refinement], rhs: &[Refinement]) -> Result<SExpr, SmtError> {
+    fn query(&mut self, lhs: &[Refinement], rhs: &[Refinement]) -> Result<TermId, SmtError> {
         self.declare_subject(lhs, rhs)?;
         let mut conjuncts = self.conjuncts(lhs)?;
         let goals = self.conjuncts(rhs)?;
-        let goal = self.ctx.not(self.ctx.and_many(goals));
+        let demanded = self.tm.mk_and(goals);
+        let goal = self.tm.mk_not(demanded);
         // Before `Γ` is drained: translating a condition reads leaves of its own,
         // and what the scope claims about those belongs in the antecedent too.
-        conjuncts.append(&mut self.conditions());
+        let mut conditions = self.conditions();
+        conjuncts.append(&mut conditions);
         // Gathered after both sides are translated: `Γ` covers a binder first met
         // in the goal as much as one the antecedent mentions.
         conjuncts.append(&mut self.assumptions);
+        // Last for the same reason: a leaf first declared while translating the
+        // goal is pinned to its sort as much as one the antecedent declared.
+        conjuncts.append(&mut self.sort_facts);
         conjuncts.push(goal);
-        Ok(self.ctx.and_many(conjuncts))
+        Ok(self.tm.mk_and(conjuncts))
     }
 
     /// The scope's conditions, translated, with the ones outside the fragment
@@ -518,12 +467,12 @@ impl<'a> Encode<'a> {
     /// condition is an antecedent, so leaving one out only weakens the query, and a
     /// query the encoding can otherwise translate must not fail because of what a
     /// guard somewhere above it happens to say.
-    fn conditions(&mut self) -> Vec<SExpr> {
+    fn conditions(&mut self) -> Vec<TermId> {
         // Collected before the translation, which needs `self` mutably.
         let conditions = self.scope.conditions();
         conditions
             .iter()
-            .filter_map(|c| self.expr(c, Some(Sort::Bool)).ok())
+            .filter_map(|c| self.proposition(c).ok())
             .collect()
     }
 
@@ -601,25 +550,46 @@ impl<'a> Encode<'a> {
     fn assume_refinements(&mut self, path: &Path, ty: &Type) {
         let enclosing = self.subject.replace(path.clone());
         for r in ty.refinements() {
-            if let Ok(e) = self.expr(&r.predicate, Some(Sort::Bool)) {
+            if let Ok(e) = self.proposition(&r.predicate) {
                 self.assumptions.push(e);
             }
         }
         self.subject = enclosing;
     }
 
-    /// One s-expression per refinement. [`Encode::expr`] reports the part it
-    /// could not translate; this is where the body carrying it is known.
-    fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<SExpr>, SmtError> {
+    /// One term per refinement. [`Encode::expr`] reports the part it could not
+    /// translate; this is where the body carrying it is known.
+    fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<TermId>, SmtError> {
         refs.iter()
             .map(|r| {
-                self.expr(&r.predicate, Some(Sort::Bool))
+                self.proposition(&r.predicate)
                     .map_err(|message| SmtError::Encoding {
                         body: r.clone(),
                         message,
                     })
             })
             .collect()
+    }
+
+    /// A predicate as a `Bool` term.
+    ///
+    /// Every position this module conjoins a translation into demands a
+    /// proposition, and nothing upstream establishes that a [`Refinement`]'s
+    /// predicate is one: `{String | __elem}` is a well-formed refinement. The
+    /// check sits at every body that becomes a conjunct, and not only at the
+    /// operators inside one, because a conjunct at another sort lands in the
+    /// antecedent, and an antecedent nothing satisfies proves every entailment.
+    fn proposition(&mut self, e: &TypedExpr) -> Result<TermId, String> {
+        let term = self.expr(e, Some(Sort::Bool))?;
+        let sort = self.smt_sort(term);
+        if sort != self.tm.sorts.bool_sort {
+            return Err(format!(
+                "the predicate {} is a {}, not a proposition",
+                symbolic(e),
+                self.sort_name(sort)
+            ));
+        }
+        Ok(term)
     }
 
     /// The SMT sort a Cambra type is encoded at, or `None` outside the fragment.
@@ -637,17 +607,17 @@ impl<'a> Encode<'a> {
     /// *assumed* about a leaf still comes from the positive reading alone
     /// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
     ///
-    /// The resolution runs inside [`with_solver`]'s borrow, so it must raise no
-    /// query of its own: the compact → simplify → coalesce pipeline records no
-    /// constraints, and a path from it back to [`smt_sub`] would panic on the
-    /// re-entrant borrow rather than corrupt the query in flight.
+    /// The resolution must raise no query of its own: the compact → simplify →
+    /// coalesce pipeline records no constraints, and a path from it back to
+    /// [`smt_sub`] would decide an entailment from the demand it was asked to
+    /// show. [`QueryGuard`] checks it.
     fn sort(&self, ty: &Type) -> Option<Sort> {
         match ty.peel_refinements() {
             Type::Base(BaseType::Int) => Some(Sort::Int),
             Type::Base(BaseType::UInt) => Some(Sort::UInt),
             Type::UIntRange(n) => Some(Sort::UIntRange(*n)),
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
-            Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
+            Type::Base(BaseType::String) => Some(Sort::Str),
             Type::History { value, .. } => self.sort(value),
             Type::Infer(_) => match resolve_var_type(ty) {
                 // A variable resolving to itself has nothing further to read.
@@ -666,14 +636,10 @@ impl<'a> Encode<'a> {
     /// ([`Encode::leaf`]). An operator's operands share a sort, so the one whose
     /// type has a sort supplies it for the other — `x <= 5` declares `x` at `Int`
     /// however little the slot on `x` has resolved to.
-    fn expr(&mut self, e: &TypedExpr, expected: Option<Sort>) -> Result<SExpr, String> {
+    fn expr(&mut self, e: &TypedExpr, expected: Option<Sort>) -> Result<TermId, String> {
         match &e.node {
-            TypedExprNode::Lit(Lit::Int(n)) => Ok(self.numeral(*n)),
-            TypedExprNode::Lit(Lit::Bool(b)) => Ok(if *b {
-                self.ctx.true_()
-            } else {
-                self.ctx.false_()
-            }),
+            TypedExprNode::Lit(Lit::Int(n)) => Ok(self.tm.mk_int(*n)),
+            TypedExprNode::Lit(Lit::Bool(b)) => Ok(self.tm.mk_bool(*b)),
             // A name, or a field read through one: both address a leaf of the value
             // the root denotes, and the path is what names that leaf. An `Apply`
             // that is not a projection chain addresses no leaf and falls through.
@@ -696,9 +662,17 @@ impl<'a> Encode<'a> {
                     UnaryOpKind::Not => Some(Sort::Bool),
                 };
                 let operand = self.expr(operand, inner)?;
+                let want = match op {
+                    UnaryOpKind::Neg => self.tm.sorts.int_sort,
+                    UnaryOpKind::Not => self.tm.sorts.bool_sort,
+                };
+                let found = self.smt_sort(operand);
+                if found != want {
+                    return Err(self.ill_sorted(e, &[found]));
+                }
                 Ok(match op {
-                    UnaryOpKind::Neg => self.ctx.negate(operand),
-                    UnaryOpKind::Not => self.ctx.not(operand),
+                    UnaryOpKind::Neg => self.tm.mk_neg(operand),
+                    UnaryOpKind::Not => self.tm.mk_not(operand),
                 })
             }
             TypedExprNode::BinOp { left, op, right } => {
@@ -706,13 +680,14 @@ impl<'a> Encode<'a> {
                     // Arithmetic is closed over its operands' sort, so the position's
                     // own expectation reaches them; a comparison's does not — it is
                     // `Bool` and its operands are not.
-                    BinOpKind::Arithmetic(_) => self.operand_sort(left, right).or(expected.clone()),
+                    BinOpKind::Arithmetic(_) => self.operand_sort(left, right).or(expected),
                     BinOpKind::Compare(_) => self.operand_sort(left, right),
                     BinOpKind::BoolLogic(_) => Some(Sort::Bool),
                     BinOpKind::Concat => None,
                 };
-                let l = self.expr(left, operands.clone())?;
+                let l = self.expr(left, operands)?;
                 let r = self.expr(right, operands)?;
+                self.check_operands(e, *op, l, r)?;
                 self.binop(*op, left, right, l, r)
             }
             _ => Err(unencodable(e)),
@@ -727,38 +702,52 @@ impl<'a> Encode<'a> {
     }
 
     fn binop(
-        &self,
+        &mut self,
         op: BinOpKind,
         left: &TypedExpr,
         right: &TypedExpr,
-        l: SExpr,
-        r: SExpr,
-    ) -> Result<SExpr, String> {
-        let c = self.ctx;
+        l: TermId,
+        r: TermId,
+    ) -> Result<TermId, String> {
+        let tm = &mut *self.tm;
         Ok(match op {
             // A refining operator computes what its plain counterpart computes and
             // differs only in the trait it states (`src/ccl/ops.rs`), so each pair is
             // one SMT operation.
-            BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => c.plus(l, r),
-            BinOpKind::Arithmetic(ArithmeticKind::Sub | ArithmeticKind::SubRefined) => c.sub(l, r),
+            BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => {
+                tm.mk_add([l, r])
+            }
+            BinOpKind::Arithmetic(ArithmeticKind::Sub | ArithmeticKind::SubRefined) => {
+                tm.mk_sub(l, r)
+            }
             // A product stays linear when one factor is a constant.
             BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::MulRefined)
                 if is_int_literal(left) || is_int_literal(right) =>
             {
-                c.times(l, r)
+                tm.mk_mul([l, r])
             }
-            BinOpKind::Compare(CompareKind::Equals) => c.eq(l, r),
-            BinOpKind::Compare(CompareKind::NotEquals) => c.not(c.eq(l, r)),
-            BinOpKind::Compare(CompareKind::Less) => c.lt(l, r),
-            BinOpKind::Compare(CompareKind::LessOrEq) => c.lte(l, r),
-            BinOpKind::Compare(CompareKind::Greater) => c.gt(l, r),
-            BinOpKind::Compare(CompareKind::GreaterOrEq) => c.gte(l, r),
-            BinOpKind::BoolLogic(LogicKind::And) => c.and(l, r),
-            BinOpKind::BoolLogic(LogicKind::Or) => c.or(l, r),
-            BinOpKind::BoolLogic(LogicKind::Xor) => c.xor(l, r),
-            BinOpKind::BoolLogic(LogicKind::Nand) => c.not(c.and(l, r)),
-            BinOpKind::BoolLogic(LogicKind::Nor) => c.not(c.or(l, r)),
-            BinOpKind::BoolLogic(LogicKind::Xnor) => c.eq(l, r),
+            BinOpKind::Compare(CompareKind::Equals) => tm.mk_eq(l, r),
+            BinOpKind::Compare(CompareKind::NotEquals) => {
+                let eq = tm.mk_eq(l, r);
+                tm.mk_not(eq)
+            }
+            BinOpKind::Compare(CompareKind::Less) => tm.mk_lt(l, r),
+            BinOpKind::Compare(CompareKind::LessOrEq) => tm.mk_le(l, r),
+            BinOpKind::Compare(CompareKind::Greater) => tm.mk_gt(l, r),
+            BinOpKind::Compare(CompareKind::GreaterOrEq) => tm.mk_ge(l, r),
+            BinOpKind::BoolLogic(LogicKind::And) => tm.mk_and([l, r]),
+            BinOpKind::BoolLogic(LogicKind::Or) => tm.mk_or([l, r]),
+            BinOpKind::BoolLogic(LogicKind::Xor) => tm.mk_xor(l, r),
+            BinOpKind::BoolLogic(LogicKind::Nand) => {
+                let and = tm.mk_and([l, r]);
+                tm.mk_not(and)
+            }
+            BinOpKind::BoolLogic(LogicKind::Nor) => {
+                let or = tm.mk_or([l, r]);
+                tm.mk_not(or)
+            }
+            // Equality on `Bool` is `iff`, which is what `xnor` computes.
+            BinOpKind::BoolLogic(LogicKind::Xnor) => tm.mk_eq(l, r),
             // Outside the fragment: a product of two unknowns is nonlinear, and
             // SMT-LIB's `div` is Euclidean rather than floor division, so `//`
             // would encode as something else at a negative divisor. `**` is a
@@ -782,15 +771,77 @@ impl<'a> Encode<'a> {
         })
     }
 
-    /// SMT-LIB numerals are non-negative, so a negative literal encodes as a
-    /// negation applied to its magnitude.
-    fn numeral(&self, n: i64) -> SExpr {
-        let magnitude = self.ctx.numeral(n.unsigned_abs());
-        if n < 0 {
-            self.ctx.negate(magnitude)
-        } else {
-            magnitude
+    /// The sort the manager gave a term it built.
+    ///
+    /// Read back rather than tracked beside the term: the manager assigns it, and
+    /// a second copy is a second thing to keep right.
+    fn smt_sort(&self, term: TermId) -> SortId {
+        self.tm
+            .get(term)
+            .expect("a term the manager built is interned in it")
+            .sort
+    }
+
+    /// The solver's name for a sort. Its own spelling, because nothing in Cambra
+    /// names an SMT sort.
+    fn sort_name(&self, sort: SortId) -> &'static str {
+        use oxiz::core::sort::SortKind;
+        match self.tm.sorts.get(sort).map(|s| &s.kind) {
+            Some(SortKind::Bool) => "Bool",
+            Some(SortKind::Int) => "Int",
+            Some(SortKind::Real) => "Real",
+            Some(SortKind::String) => "String",
+            _ => "sort outside the encoded fragment",
         }
+    }
+
+    /// Whether an operator's operands are at the sorts it takes.
+    ///
+    /// This term reaches the solver built rather than parsed, so nothing between
+    /// here and the decision procedure reads sorts, and an ill-sorted operator
+    /// would come back as a verdict about a question nobody asked.
+    /// Nothing upstream rules one out either: `{String | __elem == 1}` is a
+    /// well-formed [`Refinement`].
+    fn check_operands(
+        &self,
+        e: &TypedExpr,
+        op: BinOpKind,
+        l: TermId,
+        r: TermId,
+    ) -> Result<(), String> {
+        let (left, right) = (self.smt_sort(l), self.smt_sort(r));
+        // Equality relates two values of one sort, whichever it is. Every other
+        // operator in the fragment fixes both operands; `++` has no encoding at
+        // all, and `Encode::binop` is what reports that.
+        let ok = match op {
+            BinOpKind::Arithmetic(_) => {
+                left == self.tm.sorts.int_sort && right == self.tm.sorts.int_sort
+            }
+            BinOpKind::BoolLogic(_) => {
+                left == self.tm.sorts.bool_sort && right == self.tm.sorts.bool_sort
+            }
+            BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals)
+            | BinOpKind::Concat => left == right,
+            BinOpKind::Compare(_) => {
+                left == self.tm.sorts.int_sort && right == self.tm.sorts.int_sort
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(self.ill_sorted(e, &[left, right]))
+        }
+    }
+
+    /// The report for a term whose operands are not at the sorts its operator
+    /// takes.
+    fn ill_sorted(&self, e: &TypedExpr, found: &[SortId]) -> String {
+        let operands: Vec<&str> = found.iter().map(|s| self.sort_name(*s)).collect();
+        format!(
+            "the term {} is ill-sorted: its operands are {}",
+            symbolic(e),
+            operands.join(", ")
+        )
     }
 
     /// The constant a leaf denotes, minting it on first read.
@@ -803,7 +854,7 @@ impl<'a> Encode<'a> {
     /// back to the slot and assumes nothing, on the same footing as a path nothing
     /// settles: declaring the leaf is what the surrounding predicate needs, and the
     /// assumption is the part that can be dropped.
-    fn leaf(&mut self, path: Path, ty: &Type, expected: Option<Sort>) -> Result<SExpr, String> {
+    fn leaf(&mut self, path: Path, ty: &Type, expected: Option<Sort>) -> Result<TermId, String> {
         let path = self.reroot(path);
         if let Some(e) = self.vars.get(&path) {
             return Ok(*e);
@@ -882,12 +933,15 @@ impl<'a> Encode<'a> {
     /// The symbol is positional rather than the path's spelling: a [`Name`]'s
     /// identity is not its spelling (two `Unique`s share a `base`), and a spelling
     /// need not be a legal SMT-LIB symbol.
-    fn declare(&mut self, path: Path, sort: Sort) -> SExpr {
-        let sym = format!("v!{}", self.decls.len());
-        let e = self.ctx.atom(sym.as_str());
-        self.decls.push((sym, sort));
-        self.vars.insert(path, e);
-        e
+    fn declare(&mut self, path: Path, sort: Sort) -> TermId {
+        let sym = format!("v!{}", self.vars.len());
+        log::debug!("declare {sym} at {sort:?}");
+        let (var, constraint) = sort.declare(&sym, self.tm);
+        if let Some(fact) = constraint {
+            self.sort_facts.push(fact);
+        }
+        self.vars.insert(path, var);
+        var
     }
 }
 
@@ -984,53 +1038,35 @@ fn is_int_literal(e: &TypedExpr) -> bool {
     }
 }
 
-/// The per-thread solver subprocess.
-enum Slot {
-    /// No query has run on this thread yet.
-    Unstarted,
-    /// Boxed because a `Context` is ~1KB, dwarfing the other variants.
-    Ready(Box<Context>),
-    /// The failure that broke this thread's solver, returned again by every later
-    /// query. Poisoning is permanent: a solver that broke mid-query has an
-    /// assertion stack nothing here can account for, and starting a replacement
-    /// would hide a misencoding behind a retry.
-    Poisoned(SmtError),
-}
-
 thread_local! {
-    static SOLVER: std::cell::RefCell<Slot> = const { std::cell::RefCell::new(Slot::Unstarted) };
+    /// Whether a query is in flight on this thread — see [`QueryGuard`].
+    static IN_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Run `f` against this thread's solver, starting it on first use.
+/// Asserts that no query raises another.
 ///
-/// A solver that will not start, and an exchange that fails inside `f`, poison the
-/// slot: the failure comes back from here and from every later query on the
-/// thread.
-fn with_solver<T>(f: impl FnOnce(&mut Context) -> Result<T, SmtError>) -> Result<T, SmtError> {
-    SOLVER.with_borrow_mut(|slot| {
-        if matches!(slot, Slot::Unstarted) {
-            *slot = match ContextBuilder::new().with_z3_defaults().build() {
-                Ok(ctx) => Slot::Ready(Box::new(ctx)),
-                Err(err) => Slot::Poisoned(SmtError::Process {
-                    message: err.to_string(),
-                }),
-            };
-        }
-        let ctx = match slot {
-            Slot::Ready(ctx) => ctx,
-            Slot::Poisoned(cause) => return Err(cause.clone()),
-            Slot::Unstarted => unreachable!("the block above replaces Unstarted"),
-        };
-        match f(ctx) {
-            // Only a broken exchange poisons: an encoding failure sent nothing,
-            // and an `unknown` came back with the query's scope already popped.
-            Err(cause @ (SmtError::Process { .. } | SmtError::SolverError { .. })) => {
-                *slot = Slot::Poisoned(cause.clone());
-                Err(cause)
-            }
-            result => result,
-        }
-    })
+/// Encoding resolves an inference variable for its shape ([`Encode::sort`]), and
+/// that resolution must record no constraint and raise no query: a query decided
+/// from the demand it was asked to show proves itself. Nothing in the type system
+/// enforces that, and a linked-in solver answers a re-entrant query quietly rather
+/// than failing on a borrow, so the check is a `debug_assert` and the guard is
+/// inert in release.
+struct QueryGuard;
+
+impl QueryGuard {
+    fn enter() -> Self {
+        debug_assert!(
+            !IN_QUERY.replace(true),
+            "an SMT query raised another SMT query"
+        );
+        QueryGuard
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        IN_QUERY.set(false);
+    }
 }
 
 #[cfg(test)]
@@ -1152,18 +1188,17 @@ mod tests {
         );
     }
 
-    /// The encoder does not typecheck what it sends, so a `String` base under an
-    /// integer comparison reaches the solver and comes back as a reply the
-    /// exchange cannot use. The claim is the variant — a misencoding on this side
-    /// rather than a verdict — and not the solver's wording, which is z3's to
-    /// change.
+    /// Nothing typechecks a predicate before the encoder reads it, so a `String`
+    /// base under an integer comparison reaches the operator arms. The sorts are
+    /// checked there, because the solver builds the term rather than parsing it
+    /// and would otherwise answer a question nobody asked.
     #[test]
-    fn the_solver_will_error_on_type_errors() {
+    fn an_ill_sorted_query_is_not_an_answer() {
         let refs = [elem_cmp(CompareKind::Equals, lit(5))];
         let err = smt_sub(&Type::Base(BaseType::String), &refs, &refs, &NoScope).unwrap_err();
         assert!(
-            matches!(&err, SmtError::SolverError { .. }),
-            "expected a SolverError, got: {err:?}"
+            matches!(&err, SmtError::Encoding { message, .. } if message.contains("ill-sorted")),
+            "expected the sorts reported: {err:?}"
         );
     }
 
@@ -1251,10 +1286,10 @@ mod tests {
         }
     }
 
-    /// An encoding failure sends nothing, so it leaves the thread's solver usable
-    /// for the next query.
+    /// A query that bails leaves nothing behind for the next one: the terms it
+    /// built went to a manager it owned, and the solver never saw them.
     #[test]
-    fn an_encoding_failure_does_not_poison_the_solver() {
+    fn an_encoding_failure_leaves_the_next_query_answerable() {
         let opaque = TypedExpr::lit(Lit::String("s".into())).with_ty(Type::Base(BaseType::String));
         let unencodable = [elem_cmp(CompareKind::Equals, opaque)];
         assert!(smt_sub(&int(), &unencodable, &unencodable, &NoScope).is_err());
@@ -1459,6 +1494,58 @@ mod tests {
             codomain: Box::new(int()),
         };
         assert!(smt_sub(&int(), &lhs, &rhs, &scoped("f", opaque)).unwrap());
+    }
+
+    /// An **ill-sorted** assumption is dropped on the same terms as an unencodable
+    /// one, and dropping it leaves the sound assumptions beside it standing.
+    ///
+    /// The risk this pins is the antecedent's: a conjunct the solver reads as it
+    /// likes can make `⋀Γ ∧ ⋀lhs` contradictory, which proves every entailment.
+    #[test]
+    fn an_ill_sorted_scope_predicate_is_dropped() {
+        // `x : {{a: Int@2, b: String} | __elem.b == 0}` — the refinement compares a
+        // `String` field with an integer, so it has no encoding, while the
+        // refinement on `a` does.
+        let rec = Type::Record(vec![
+            ("a".to_string(), singleton(2)),
+            ("b".to_string(), Type::Base(BaseType::String)),
+        ]);
+        let scope = scoped(
+            "x",
+            Type::refined(
+                rec,
+                Refinement::born(Rc::new(
+                    TypedExpr::binop(
+                        subject_field("b"),
+                        BinOpKind::Compare(CompareKind::Equals),
+                        lit(0),
+                    )
+                    .with_ty(Type::Base(BaseType::Bool)),
+                ))
+                .into(),
+            ),
+        );
+        let lhs = [elem_cmp(CompareKind::Equals, field("x", "a"))];
+        // What `a`'s own refinement gives.
+        assert!(
+            smt_sub(
+                &int(),
+                &lhs,
+                &[elem_cmp(CompareKind::GreaterOrEq, lit(2))],
+                &scope
+            )
+            .unwrap()
+        );
+        // And no more: the dropped conjunct neither helped nor poisoned.
+        assert!(
+            !smt_sub(
+                &int(),
+                &lhs,
+                &[elem_cmp(CompareKind::GreaterOrEq, lit(3))],
+                &scope
+            )
+            .unwrap()
+        );
     }
 
     /// A binder whose predicate is outside the fragment contributes its constant
