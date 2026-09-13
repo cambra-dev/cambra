@@ -82,7 +82,8 @@ for r in checkout_reqs:
         due = line.qty * prices[line.ticker] // one_btc
         if cash >= due:
             accts[r.account] := cash - due
-            holdings[(r.account, line.ticker)] := holdings[(r.account, line.ticker)] + line.qty
+            held = holdings[(r.account, line.ticker)]
+            holdings[(r.account, line.ticker)] := held + line.qty
             cart[r.account] := (ticker=line.ticker, qty=0)
         remaining = accts[r.account]
         checkout_acks << (ok=(cash >= due), due=due, cash=remaining)
@@ -90,12 +91,13 @@ for r in checkout_reqs:
 for v in view_requests:
     with begin():
         line = cart[v.account]
+        px = prices[line.ticker]
         view_replies << (
             cash = accts[v.account],
             ticker = line.ticker,
             qty = line.qty,
-            price = prices[line.ticker],
-            total = line.qty * prices[line.ticker] // one_btc,
+            price = px,
+            total = line.qty * px // one_btc,
             held = holdings[(v.account, line.ticker)],
         )
 
