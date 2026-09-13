@@ -1134,11 +1134,17 @@ positional, and so rests on emission visiting a body in evaluation order, which 
 chain gives it. The write rule retires after raising its own obligation, which the condition does
 still cover.
 
-**The post-inference check assumes no condition**, as it assumes no binder type: it re-derives every
-obligation from the recorded types alone. So a demand met only under a guard passes inference and is
-reported at that wall. Closing that gap means the accepted node carrying the conditioned fact in its
-own type, the way `let`-closing makes a body's refinement self-contained; until then the guard
-reaches inference and stops there.
+**The post-inference check threads the same conditions**, though it assumes no binder type. The two
+are not the same kind of fact: a binder's type is something the walk would have to resolve a name to
+recover, and the check resolves none, whereas an arm's guard is a property of the term being checked
+— the body is reached only where the guard held. So `Typing::under_condition` does the same work in
+both contexts, and a write retires a condition reading it in both.
+
+One shape still escapes it. `lambda_elim` turns a conditional into `filter_values(p) ≫ body`, whose
+domain the filter refines by `p`; from there the guard is in the *type* rather than in a node the arm
+rule visits, and relating the body's codomain does not read the domain's refinement as an assumption
+about what the body was handed. `tests/compilation_pipeline/type_annotations.rs`, `transaction5` is
+the program.
 
 ##### The set is the representation, not just the reading
 
@@ -2967,6 +2973,42 @@ mechanism: `^+`, `^-` and `^*` have one, and `//` and `**` do not. Adding one is
 row records is one the solver drops. `//` and `**` are the two that would need the encoding
 first: SMT-LIB's `div` is Euclidean rather than floor division, and it states no integer
 exponentiation at all.
+
+#### A refinement on a mutable variable is its invariant
+
+A `Mut(V, D)` whose `V` is refined states a **standing obligation on every write and a
+guarantee to every read**, not a claim about the value some one commit holds. That the
+variable changes is not an argument against the refinement: it is what the refinement
+quantifies over. So the declaration survives the mutability and planning phases rather
+than being peeled off at the stamp, each write is checked against it, and a read of the
+variable is entitled to it — which is what admits `pool := pool ^+ 1` at
+`pool: Mut({Int where _ >= 0}, Txn)`, where the sum is non-negative only because what it
+reads is.
+
+The join over a variable's observed contributions is a different quantity, and a narrower
+one: a variable seeded at two keys and written at a third has a seed narrower than what it
+holds. Reading the invariant off that join is what a mutable variable's value type must
+*not* do, and that is unrelated to whether the declared type may carry one.
+
+`tests/compilation_pipeline/transactions.rs`, `a_refined_mutable_variable_commits` runs the
+three shapes; `a_refined_balance_is_debited_under_a_guard` is the keyed one under a guard.
+
+#### The encoded fragment is stated over the pointful syntax
+
+`lambda_elim` rewrites a refinement's predicate along with the rest of the tree, so after
+it `__elem >= 0` is `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ ge)`. `Encode::expr` reads that form
+by applying the morphism — each combinator's defining equation, `id(x)` is `x` and
+`zip(f, g)(x)` is `(f(x), g(x))` — and encoding the pointful term that falls out. Without
+it one predicate has two spellings and only the earlier decides, so what a check can prove
+depends on which pass it runs after. The reading is built and discarded, never installed,
+so it mints no node identity.
+
+What the check may assume about a read is the other half. A leaf whose path the environment
+settles nothing about is declared at the sort its **slot** gives it, and whether that slot's
+refinements join the antecedent is `ScopeEnv::assumes_slot_types`: false during emission,
+where a slot carries what the position *demanded* and assuming a demand would let an
+entailment prove itself; true for the post-inference check, whose contract is that the
+recorded types are what inference decided.
 
 #### A collection literal joins its elements, refinements included
 

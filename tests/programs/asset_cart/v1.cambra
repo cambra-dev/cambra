@@ -2,7 +2,7 @@
 # and three routes the embedding page calls instead of three sources and a sink
 # per ticker. `v0.cambra` is the rung below.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
+# THIS PROGRAM DOES NOT COMPILE YET. Two things stop it, in the order it meets
 # them, and the tests named below are what report each — so the messages here are
 # what you will actually see rather than a description of them.
 #
@@ -17,20 +17,7 @@
 #      a list literal)").
 #      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
 #
-#   2. `Balance` on a transactional store.  The typing works: `^*` carries the
-#      refinement through the seed's scaling, `^-` records the checkout's
-#      difference, and the guard above the debit is assumable inside its own arm,
-#      so a weaker guard makes the write ill-typed and this one does not
-#      (`tests/type_check.rs`, `a_guarded_debit_of_a_refined_balance` and
-#      `a_scaled_seed_meets_a_refined_store`). What stops the program is later: the
-#      declared refinement rides the recurrence carrier into planning, where
-#      `letrec` recognition asserts a mutable variable's joined value type carries
-#      none — a refinement is a fact about one value, and a history holds a
-#      different value at each commit (`src/ccl/planning/loops.rs`). Erasing it at
-#      the stamp, once inference has used it, is the change that unblocks this.
-#      Pinned: `type_annotations.rs`, `transaction2` through `transaction5`.
-#
-#   3. A **compound** key on a transactional map.  `cart` and `holdings` are keyed
+#   2. A **compound** key on a transactional map.  `cart` and `holdings` are keyed
 #      by `{AccountId, Ticker}`, and a filtered entry comprehension over one
 #      collides on its upper bounds: the map's keys are a witness domain `σ` and
 #      the key tuple arrives beside it. A *scalar* key does not — the witness's
@@ -43,10 +30,19 @@
 #      `a_filtered_entry_comprehension_over_a_compound_key_is_not_reachable` is the
 #      same collision in five lines, with no request row, no reply and no feed.
 #      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension`,
-#      over `v1_read_sites.cambra` — this program cannot report 3 itself, because
-#      1 and 2 each stop it first.
+#      over `v1_read_sites.cambra` — this program cannot report 2 itself, because
+#      1 stops it first.
 #
-# Behind 3, reachable with a scalar key today: the comprehension types, and the
+# `Balance`'s refinement stops nothing, and is the one item this list has lost.
+# `^*` carries it through the seed's scaling, `^-` records the checkout's
+# difference, the guard above the debit is assumable inside its own arm, and the
+# invariant rides the store's recurrence carrier, so a read of a balance is
+# entitled to it. A weaker guard makes the debit ill-typed and this one does not
+# (`tests/type_check.rs`, `a_guarded_debit_of_a_refined_balance`), and
+# `tests/compilation_pipeline/transactions.rs`'s
+# `a_refined_balance_is_debited_under_a_guard` runs the same body.
+#
+# Behind 2, reachable with a scalar key today: the comprehension types, and the
 # predicate it carries names the map — which a reply then hands to a channel the
 # mutable variable does not reach
 # (`a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`).

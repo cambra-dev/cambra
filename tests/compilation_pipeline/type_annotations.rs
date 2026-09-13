@@ -890,52 +890,44 @@ fn transaction1() {
     );
 }
 
-// A transaction body over a **refined** mutable variable. Inference accepts every program
-// below, and the write rule reports an unmet demand wherever there is one
-// (`transaction6`). What stops them is later, in two places, and each pin names the one
-// it reaches so that a pin failing says the wall moved.
+// A transaction body over a **refined** mutable variable. The declared refinement is the
+// variable's invariant: every write answers to it, and every read is entitled to it, which
+// is what makes `pool := pool ^+ 1` admissible where `pool` is declared non-negative.
+// `transaction2` through `transaction4` run; `transaction6` is the rejection, and
+// `transactions.rs`'s `a_refined_mutable_variable_commits` carries the same shapes with
+// their values.
 //
-// `transaction2` gets as far as planning, where `letrec` recognition asserts that a
-// mutable variable's joined value type carries no refinement: a refinement is a fact about
-// one value, and a history holds a different value at each commit
-// (`src/ccl/planning/loops.rs`). The declared refinement rides the carrier there, so the
-// assertion fires. Fixing that means erasing the refinement at the stamp once inference
-// has used it, at every carrier it reaches.
-//
-// `transaction3`, `4` and `5` stop before planning, at the transact phase's own check. It
-// re-derives each writer's obligation from the recorded types alone and with no scope, so
-// `__elem == __txp.0 ^+ 1` no longer has `__txp.0`'s own refinement to lean on. That is the
-// wall the conditions section below describes, reached through a binder's type rather than
-// through a guard.
+// `transaction5` is the one refined-mutable shape that does not compile, and its own
+// comment says what stops it.
 #[test]
 fn transaction2() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             pool: Mut({Int where _ >= 0}, Txn) := 100
             with begin():
                 pool := 1
             await_final(pool)
         "#},
-        "letrec recognition: a mutable variable's joined value type carries no refinement",
+        Value::Int(1),
     );
 }
 
 #[test]
 fn transaction3() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             pool: Mut({Int where _ >= 0}, Txn) := 100
             with begin():
                 pool := pool ^+ 1
             await_final(pool)
         "#},
-        "expected {Int | __elem >= 0}, found {Int | __elem == __txp.0 ^+ 1}",
+        Value::Int(101),
     );
 }
 
 #[test]
 fn transaction4() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             x: Mut({Int where _ >= 0}, Txn) := 10
             y: Mut({Int where _ >= 0}, Txn) := 5
@@ -948,10 +940,21 @@ fn transaction4() {
                 y := y ^+ z
             await_final(y)
         "#},
-        "expected {Int | __elem >= 0}, found {Int | __elem == __txp.0 ^+ 1 ^+ __txp.1}",
+        Value::Int(4),
     );
 }
 
+/// A **scalar** refined variable written under a guard, which is the one refined-mutable
+/// shape that does not compile.
+///
+/// Lambda elimination turns the conditional into `filter_values(p) ≫ writer`, and the
+/// filter refines that composition's domain by `p` — the guard is in the type, not only in
+/// the term. What the check does not do is read a domain refinement as an assumption about
+/// the value the writer was handed, so `__elem == __txp.0 ^- 30` is related to
+/// `__elem >= 0` with nothing in the antecedent to close the gap.
+///
+/// The keyed shape is unaffected (`transactions.rs`,
+/// `a_refined_balance_is_debited_under_a_guard`), which is why the demo's checkout runs.
 #[test]
 fn transaction5() {
     check_compile_error(

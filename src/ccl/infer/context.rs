@@ -3,9 +3,9 @@
 // ---------------------------------------------------------------------------
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::ccl::ccl_utils::{TermMemo, free_names};
+use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
@@ -21,7 +21,7 @@ use crate::util::ScopeStack;
 use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
 use super::solve::value_type;
-use super::typing::Typing;
+use super::typing::{Condition, Typing};
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
 
@@ -82,11 +82,7 @@ impl ScopeEnv for QueryEnv<'_> {
         false
     }
     fn conditions(&self) -> Vec<Rc<TypedExpr>> {
-        self.conditions
-            .iter()
-            .filter(|c| c.live)
-            .map(|c| Rc::clone(&c.term))
-            .collect()
+        Condition::live_terms(self.conditions)
     }
 }
 
@@ -215,24 +211,6 @@ pub(super) struct InferCtx {
     /// ends, and entries are retired in place rather than removed
     /// ([`Condition::live`]) so that restoring stays a truncation.
     conditions: Vec<Condition>,
-}
-
-/// One condition in force: a predicate every path to the current position
-/// satisfies.
-///
-/// Pushed by [`Typing::under_condition`] around an arm's body and dropped when
-/// that arm ends. What a condition is *about* is the values its names hold where
-/// it was tested, which is why a write retires it rather than leaving it to be
-/// read against a later value ([`InferCtx::retire_conditions`]).
-struct Condition {
-    /// The predicate assumed.
-    term: Rc<TypedExpr>,
-    /// The names the term reads. A write to one of them retires this condition.
-    names: HashSet<Name>,
-    /// Cleared by a write to one of [`names`](Self::names). A retired condition is
-    /// kept in place so the enclosing arm's restore is still a truncation, and is
-    /// filtered out of every query from then on.
-    live: bool,
 }
 
 impl InferCtx {
@@ -581,11 +559,7 @@ impl Typing for InferCtx {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let depth = self.conditions.len();
-        self.conditions.push(Condition {
-            names: free_names(&condition),
-            term: condition,
-            live: true,
-        });
+        self.conditions.push(Condition::new(condition));
         let r = f(self);
         // A truncation, which is why a retirement clears a flag rather than
         // removing an entry: an inner arm's restore must not renumber what an
@@ -595,9 +569,7 @@ impl Typing for InferCtx {
     }
 
     fn retire_conditions(&mut self, name: &Name) {
-        for c in &mut self.conditions {
-            c.live &= !c.names.contains(name);
-        }
+        Condition::retire_reading(&mut self.conditions, name);
     }
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {

@@ -481,19 +481,12 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 let value_ty =
                     b.ty.codomain()
                         .expect("letrec recognition: history binding is a stream");
-                // The join is unrefined, so nothing is peeled here. A refinement is a fact
-                // about one value and a mutable variable holds a different value at each commit, so
-                // the join over its contributions carries none — the reason reading the seed
-                // needed a `strip_refinements` and reading the binding does not. Stated
-                // rather than re-normalized: a refinement surviving to here would ride into
-                // `TransactKey`'s value type and the extents built off it, which is a
-                // mis-stamped history to fix at the stamp.
-                assert!(
-                    value_ty.refinements().is_empty(),
-                    "letrec recognition: a mutable variable's joined value type carries no \
-                     refinement, got {value_ty} for `{}`",
-                    b.name
-                );
+                // A refinement on the join is carried, not peeled. It is the mutable
+                // variable's **invariant** — a standing obligation on every write and a
+                // guarantee to every read — rather than a claim about the one value some
+                // commit happens to hold, so a variable that changes still satisfies it at
+                // every commit. Peeling it here would drop the declaration that the writes
+                // were checked against and leave the reads with nothing to rely on.
                 key_ty.push((b.name.clone(), value_ty));
                 keys.push(TransactKey { name: b.name, init });
             }

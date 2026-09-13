@@ -37,8 +37,8 @@ use easy_smt::{Context, ContextBuilder, Response, SExpr};
 use crate::ccl::infer::solve::resolve_var_type;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, LogicKind, Name, ProjKey, Refinement,
-    Type, TypedExpr, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Lit, LogicKind, Name, ProjKey,
+    Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
 
 /// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
@@ -183,6 +183,20 @@ pub trait ScopeEnv {
     /// `Option<&dyn ScopeEnv>`, where `None` is "do not ask" — which collapses
     /// the two empty scopes this flag forces apart.
     fn is_skip_smt(&self) -> bool;
+
+    /// Whether the **slot** a read carries may be assumed about it, when this
+    /// environment settles nothing about the path itself.
+    ///
+    /// A slot says what the position the read appears in demanded, and mid-emission a
+    /// demand is exactly what must not be assumed: an entailment would prove itself from
+    /// what it was asked to establish. After inference the same slot says something else —
+    /// the type the node was *resolved to* — and the post-inference check's whole contract
+    /// is to trust those. So this is false for every environment emission supplies and
+    /// true for the check's, which is why it rides the trait beside
+    /// [`is_skip_smt`](ScopeEnv::is_skip_smt) rather than being read off the type.
+    fn assumes_slot_types(&self) -> bool {
+        false
+    }
 
     /// The **conditions** in force where the query is raised: predicates that hold
     /// on every path reaching that point, each a bare `Bool` term over the names
@@ -665,7 +679,15 @@ impl<'a> Encode<'a> {
             // that is not a projection chain addresses no leaf and falls through.
             TypedExprNode::Var(_) | TypedExprNode::Apply { .. } => match Path::of(e) {
                 Some(path) => self.leaf(path, &e.ty, expected),
-                None => Err(unencodable(e)),
+                // Not a leaf address. A predicate that has been through
+                // `lambda_elim` is the other shape an `Apply` takes here: the same
+                // term point-free, `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ ge)` for
+                // `__elem >= 0`. Applying the morphism recovers the pointful term
+                // this arm already reads ([`applied_pointfree`]).
+                None => match applied_pointfree(e) {
+                    Some(pointful) => self.expr(&pointful, expected),
+                    None => Err(unencodable(e)),
+                },
             },
             TypedExprNode::UnaryOp(op, operand) => {
                 let inner = match op {
@@ -800,7 +822,11 @@ impl<'a> Encode<'a> {
                     .sort(ty)
                     .or(expected)
                     .ok_or_else(|| format!("{path} is typed {ty}, which has no SMT sort"))?;
-                Ok(self.declare(path, sort))
+                let leaf = self.declare(path.clone(), sort);
+                if self.scope.assumes_slot_types() && self.assumed.insert(path.clone()) {
+                    self.assume_refinements(&path, ty);
+                }
+                Ok(leaf)
             }
         }
     }
@@ -866,6 +892,86 @@ impl<'a> Encode<'a> {
 }
 
 /// The report for a term the encoding does not cover.
+/// The pointful reading of `e`, when `e` applies a point-free morphism to an argument.
+///
+/// `lambda_elim` rewrites a refinement's predicate along with the rest of the tree, so a
+/// predicate that survives it is the same term in combinator form: `__elem >= 0` becomes
+/// `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ ge)`. The encoded fragment is stated over the
+/// pointful syntax, so without this the two spellings of one predicate encode differently
+/// — the pre-elimination one decides, and the post-elimination one is dropped as
+/// unreadable, which makes what a check can prove depend on which pass it runs after.
+///
+/// A **reading**, not a rewrite: the term built here is encoded and discarded, never
+/// installed in a tree, so it mints no node identity and answers to no provenance row.
+/// That is what lets it be built out of `TypedExpr::binop` and friends at a site that is
+/// otherwise pure inspection.
+///
+/// The vocabulary is what `lambda_elim` emits for a scalar predicate — `id`, `const`,
+/// `zip`, `compose`, the operator builtins, and projection through [`Path`]. Anything
+/// else yields `None` and reaches the caller as the unreadable term it is; widening this
+/// is widening the fragment, which is a decision about what refinement subtyping can
+/// prove and not a detail of this function.
+fn applied_pointfree(e: &TypedExpr) -> Option<TypedExpr> {
+    let TypedExprNode::Apply { argument, function } = &e.node else {
+        return None;
+    };
+    beta(function, argument)
+}
+
+/// Apply a point-free morphism to an argument, symbolically.
+///
+/// Every arm is one combinator's defining equation, so the result denotes what the
+/// application denotes: `id(x)` is `x`, `const(k)(x)` is `k`, `zip(f, g)(x)` is
+/// `(f(x), g(x))`, and `(f ≫ g)(x)` is `g(f(x))`.
+fn beta(function: &TypedExpr, arg: &TypedExpr) -> Option<TypedExpr> {
+    match &function.node {
+        TypedExprNode::Builtin(Builtin::Id) => Some(arg.clone()),
+        // An operator builtin consumes the pair `zip` built, so its operands are that
+        // tuple's components rather than anything this level can project: a `Tuple` node
+        // is what the previous arm produced, and a term that merely *has* a product type
+        // carries no components to read.
+        TypedExprNode::Builtin(Builtin::BinOp(op)) => match &arg.node {
+            TypedExprNode::Tuple(operands) => match operands.as_slice() {
+                [l, r] => Some(
+                    TypedExpr::binop(l.clone(), *op, r.clone())
+                        .with_ty(function.ty.codomain()?.clone()),
+                ),
+                _ => None,
+            },
+            _ => None,
+        },
+        TypedExprNode::Builtin(Builtin::Neg) => {
+            Some(TypedExpr::unary(UnaryOpKind::Neg, arg.clone()).with_ty(arg.ty.clone()))
+        }
+        TypedExprNode::Builtin(Builtin::NotFn) => Some(
+            TypedExpr::unary(UnaryOpKind::Not, arg.clone()).with_ty(Type::Base(BaseType::Bool)),
+        ),
+        TypedExprNode::Compose(morphisms) => morphisms
+            .iter()
+            .try_fold(arg.clone(), |acc, m| beta(m, &acc)),
+        TypedExprNode::Apply {
+            argument: inner,
+            function: applied,
+        } => match &applied.node {
+            // `k ▷ const` ignores what it is applied to.
+            TypedExprNode::Builtin(Builtin::Const) => Some((**inner).clone()),
+            // `(f, g) ▷ zip` fans the argument out to both.
+            TypedExprNode::Builtin(Builtin::Zip) => {
+                let TypedExprNode::Tuple(components) = &inner.node else {
+                    return None;
+                };
+                let applied: Option<Vec<TypedExpr>> =
+                    components.iter().map(|m| beta(m, arg)).collect();
+                // The product's type is the *zip application's* codomain. `inner` is the
+                // tuple of morphisms, whose own type is a tuple of functions.
+                Some(TypedExpr::tuple(applied?).with_ty(function.ty.codomain()?.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn unencodable(e: &TypedExpr) -> String {
     format!("the term {} has no SMT encoding", symbolic(e))
 }

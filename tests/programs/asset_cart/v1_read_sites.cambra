@@ -7,11 +7,9 @@
 # whose length is a runtime fact, inside `with begin():`. Lowering rejects it,
 # and rejects it before the three comprehensions ever type.
 #
-# **`Balance`'s refinement**: `v1.cambra` declares `accts` at a refined `Balance`,
-# which types and then rides the recurrence carrier into planning, where a mutable
-# variable's joined value type is asserted to carry none. A fact about histories
-# and refinements rather than about the cart; `Balance` is the bare alias here so
-# that the read sites report on their own.
+# **`Balance`'s refinement**: `v1.cambra` declares `accts` at a refined `Balance`
+# and that compiles now, so the bare alias here buys a shorter header and nothing
+# else. Left as it is because these sites are about the cart's reads.
 #
 # The **price feed**: `wasm_socket_subscribe` appears in `demo_code_syntax.md`
 # and in `v1.cambra`, and is built nowhere, so the name does not resolve. Name

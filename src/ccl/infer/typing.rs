@@ -2,6 +2,7 @@
 // Typing: the structural typing-rule interface
 // ---------------------------------------------------------------------------
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::TermMemo;
@@ -45,6 +46,56 @@ impl Iteration {
             self.source.clone(),
         )
         .with_ty(self.binder_ty.clone())
+    }
+}
+
+/// One condition in force: a predicate every path to the current position satisfies.
+///
+/// Pushed by [`Typing::under_condition`] around an arm's body and dropped when that arm
+/// ends. What a condition is *about* is the values its names hold where it was tested,
+/// which is why a write retires it rather than leaving it to be read against a later
+/// value ([`Typing::retire_conditions`]).
+///
+/// Held by both contexts. An arm's guard is a fact about the **term** rather than about
+/// the scope — the body is reached only where the guard held — so it is as available to a
+/// walk that re-derives obligations from a finished tree as to the one that emitted them.
+pub(super) struct Condition {
+    /// The predicate assumed.
+    pub(super) term: Rc<TypedExpr>,
+    /// The names the term reads. A write to one of them retires this condition.
+    pub(super) names: HashSet<Name>,
+    /// Cleared by a write to one of [`names`](Self::names). A retired condition is kept in
+    /// place so the enclosing arm's restore is still a truncation, and is filtered out of
+    /// every query from then on.
+    pub(super) live: bool,
+}
+
+impl Condition {
+    /// The condition `term` states, live and with its free names read off it.
+    pub(super) fn new(term: Rc<TypedExpr>) -> Self {
+        Self {
+            names: crate::ccl::ccl_utils::free_names(&term),
+            term,
+            live: true,
+        }
+    }
+
+    /// The live conditions' terms, which is what a [`ScopeEnv`] hands the solver.
+    ///
+    /// [`ScopeEnv`]: crate::ccl::infer::solver::smt::ScopeEnv
+    pub(super) fn live_terms(conditions: &[Condition]) -> Vec<Rc<TypedExpr>> {
+        conditions
+            .iter()
+            .filter(|c| c.live)
+            .map(|c| Rc::clone(&c.term))
+            .collect()
+    }
+
+    /// Retire every condition in `conditions` that reads `name`.
+    pub(super) fn retire_reading(conditions: &mut [Condition], name: &Name) {
+        for c in conditions {
+            c.live &= !c.names.contains(name);
+        }
     }
 }
 

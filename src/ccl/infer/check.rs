@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
-use crate::ccl::infer::solver::smt::NoScope;
+use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme, constrain_subtype_in, fresh_var, prim,
 };
@@ -26,7 +26,7 @@ use super::emit::{
     emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::Typing;
+use super::typing::{Condition, Typing};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 
@@ -74,6 +74,11 @@ pub(super) struct CheckCtx {
     /// The loop bodies this re-derivation is inside, innermost last — the same record
     /// emission keeps, so a feed site derives the same contribution here.
     iterations: Vec<crate::ccl::infer::typing::Iteration>,
+    /// The conditions in force at the current position, innermost last — the same record
+    /// emission keeps, for the reason [`Typing::under_condition`]'s implementation here
+    /// gives: an arm's guard is a fact about the term, so re-deriving an obligation
+    /// raised inside that arm may assume it.
+    conditions: Vec<Condition>,
     /// **Γ — what the witnesses in scope range over** at the current position
     /// (`src/ccl/design/type-inference.md`, "The witness context").
     ///
@@ -106,6 +111,7 @@ impl CheckCtx {
             level: 0,
             errors: Vec::new(),
             iterations: Vec::new(),
+            conditions: Vec::new(),
             pred_memo: Default::default(),
             witness_ctx: Default::default(),
             current_node: root,
@@ -280,7 +286,10 @@ impl Typing for CheckCtx {
         // binders its refinements reference are held by the context it was cut from).
         let mut cache = ConstrainCache::for_derivation(self.derivation);
         cache.seed_context(&self.witness_ctx);
-        if let Err(e) = constrain_subtype_in(sub, sup, &mut cache, &NoScope) {
+        let scope = CheckScope {
+            conditions: &self.conditions,
+        };
+        if let Err(e) = constrain_subtype_in(sub, sup, &mut cache, &scope) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
@@ -316,17 +325,24 @@ impl Typing for CheckCtx {
 
     fn under_condition<R>(
         &mut self,
-        _condition: Rc<TypedExpr>,
+        condition: Rc<TypedExpr>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        // Check assumes nothing about the scope — its `require_sub` passes no
-        // environment at all — so it assumes no condition either. A demand that
-        // held only under a guard is one this wall reports, for the reason
-        // [`Typing::under_condition`] gives.
-        f(self)
+        // Threaded here as it is in emission. A guard is a fact about the **term**, not
+        // about the scope: the arm's body is reached only where its guard held and no
+        // earlier one did, which is as true of the finished tree this walk re-derives
+        // from as of the one emission walked. Dropping it would make this wall reject a
+        // write whose own conditional is what licenses it.
+        let depth = self.conditions.len();
+        self.conditions.push(Condition::new(condition));
+        let r = f(self);
+        self.conditions.truncate(depth);
+        r
     }
 
-    fn retire_conditions(&mut self, _name: &Name) {}
+    fn retire_conditions(&mut self, name: &Name) {
+        Condition::retire_reading(&mut self.conditions, name);
+    }
 
     fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         // Check trusts each `Var`/binder node's recorded `Type` rather than
@@ -901,6 +917,33 @@ pub fn check(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>>
         // recorded per error, so surfacing them is a signature change away when
         // a caller wants an underlined report.
         Err(ctx.errors.into_iter().map(|e| e.error).collect())
+    }
+}
+
+/// The environment the post-inference check raises its queries in: no name is bound,
+/// and the type recorded on a read is assumed about it.
+///
+/// Both halves follow from what the check is. It resolves no names, so it has no binder
+/// types to answer with ([`NoScope`] is the same in that respect). What it does hold is a
+/// tree every node of which inference already resolved, so a read's slot is the type that
+/// read *has* rather than a demand standing where one will be — which is the distinction
+/// [`ScopeEnv::assumes_slot_types`] names.
+struct CheckScope<'a> {
+    conditions: &'a [Condition],
+}
+
+impl ScopeEnv for CheckScope<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        NoScope.binder_type(name)
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
+    fn assumes_slot_types(&self) -> bool {
+        true
+    }
+    fn conditions(&self) -> Vec<Rc<TypedExpr>> {
+        Condition::live_terms(self.conditions)
     }
 }
 

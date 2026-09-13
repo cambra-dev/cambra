@@ -85,20 +85,9 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     40
 )]
-// TODO(refined-txn-body): a transaction body writing a *refined* mutable variable
-// (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, and the reason is no longer
-// about typing it. Inference accepts such a write, reports an unmet one against the
-// declared refinement, and reads an enclosing guard as an assumption while doing it —
-// `tests/type_check.rs`, `a_keyed_write_of_a_refined_product_is_accepted` and the
-// rejections beside it, and `type_annotations.rs`'s `transaction6`.
-//
-// What stops it is that the declared refinement rides the recurrence carrier into
-// planning, where `letrec` recognition asserts it cannot: a refinement is a fact about
-// one value, and a history holds a different value at each commit
-// (`src/ccl/planning/loops.rs`). Erasing it at the stamp, once inference has used it, is
-// the change that unblocks this; the phases between re-derive each writer's obligation
-// with no scope and reject the same programs until they too read a bare carrier.
-// `type_annotations.rs`'s `transaction2` through `transaction5` pin both walls.
+// A *refined* mutable variable has its own cases below, in
+// `a_refined_mutable_variable_commits`: the cases here are the unrefined shapes, where
+// what a write has to meet is a base type.
 
 // Two writers over one mutable variable: the operator serializes + retries, conserving the
 // total: 100 − 30 − 40 = 30.
@@ -268,6 +257,90 @@ fn check_compile_error(code: &str, needle: &str) {
 )]
 fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+// ---------------------------------------------------------------------------
+// A refined mutable variable
+//
+// A refinement on a mutable variable is its **invariant**: a standing obligation on every
+// write and a guarantee to every read. It rides the recurrence carrier rather than being
+// peeled off it, which is what entitles a read of the variable to it — `pool := pool ^+ 1`
+// is admitted because `pool >= 0` is what the carrier says about the value it reads. The
+// rejections are `tests/type_check.rs`'s `a_guarded_debit_of_a_refined_balance` and
+// `type_annotations.rs`'s `transaction6`.
+//
+// One shape is still blocked, and `type_annotations.rs`'s `transaction5` pins it: a
+// **scalar** variable written under a guard. Lambda elimination turns the conditional into
+// `filter_values(p) ≫ writer`, whose domain the filter refines by `p`, and the check
+// relates the writer's codomain to the declared type without reading that domain
+// refinement as an assumption about the value the writer was handed. The keyed shape is
+// unaffected, which is why the checkout below runs.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// The seed alone, with no write: the declaration has to survive on its own.
+#[case::seed_only(
+    indoc! {r#"
+        pool: Mut({Int where _ >= 0}, Txn) := 100
+        await_final(pool)
+    "#},
+    100
+)]
+// A literal write, admitted by proving `1 >= 0`.
+#[case::literal_write(
+    indoc! {r#"
+        pool: Mut({Int where _ >= 0}, Txn) := 100
+        with begin():
+            pool := 1
+        await_final(pool)
+    "#},
+    1
+)]
+// A write computed from the variable's own previous value: `^+` records the sum, and the
+// invariant on what it reads is what makes that sum non-negative.
+#[case::computed_from_itself(
+    indoc! {r#"
+        pool: Mut({Int where _ >= 0}, Txn) := 100
+        with begin():
+            pool := pool ^+ 1
+        await_final(pool)
+    "#},
+    101
+)]
+fn a_refined_mutable_variable_commits(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// The demo's checkout: a balance read out of a transactional map at the key the block
+/// writes, a guard, and a debit written back under it.
+///
+/// Every value here is a runtime one, and the write answers to `Balance`'s own
+/// declaration. `tests/type_check.rs`'s `a_guarded_debit_of_a_refined_balance` is this
+/// body with the guard weakened, where the same write is ill-typed.
+///
+/// `seen` accumulates the balance *after* the debit at each key, which is read-your-writes
+/// inside the block: both accounts start at 100 and spend 30, so it totals 140. Summing
+/// the map itself is what an observer would rather write, and `await_final` over a keyed
+/// variable does not yet compose with an aggregate.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_refined_balance_is_debited_under_a_guard() {
+    check_scalar(
+        indoc! {r#"
+            accts: Mut(Map(Int, {Int where _ >= 0}), Txn) := box(map([(1, 100), (2, 100)]))
+            seen: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                with begin():
+                    cash = accts[r]
+                    due = 30
+                    if cash >= due:
+                        accts[r] := cash ^- due
+                    seen := seen + accts[r]
+            await_final(seen)
+        "#},
+        Value::Int(140),
+    );
 }
 
 // ---------------------------------------------------------------------------
