@@ -1356,11 +1356,13 @@ fn constrain_go_impl(
                 value: v0,
                 domain: d0,
                 history_kind: k0,
+                ..
             },
             Type::History {
                 value: v1,
                 domain: d1,
                 history_kind: k1,
+                ..
             },
         ) if k0 == k1 => {
             constrain_go(v0, v1, &Subst::id(), &Subst::id(), cache, scope)?;
@@ -1547,6 +1549,7 @@ fn constrain_go_impl(
                 value,
                 domain,
                 history_kind: HistoryKind::Append,
+                ..
             },
             _,
         ) => {
@@ -1571,6 +1574,7 @@ fn constrain_go_impl(
                 value,
                 domain,
                 history_kind: HistoryKind::Append,
+                ..
             },
         ) => {
             let chan = Type::Fun {
@@ -1842,6 +1846,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             value,
             domain,
             history_kind,
+            ..
         } => Type::history(
             extrude_invariant(domain, target_level, cache),
             extrude_invariant(value, target_level, cache),
@@ -2671,7 +2676,7 @@ mod tests {
             .expect_err("[A, B] must not flow into v whose upper is [A]");
     }
 
-    // --- Feed handles (`Type::History { kind: Feed }`) ---
+    // --- Feed handles (`Type::History { kind: Feed, .. }`) ---
 
     /// A feed history over `domain ⤇ value`. Its read view is the whole
     /// collection `Fun { domain, value }` (unlike an `Overwrite`, which derefs to the
@@ -2881,7 +2886,7 @@ mod tests {
         );
     }
 
-    // --- Mutable handles (`Type::History { kind: Overwrite }`) ---
+    // --- Mutable handles (`Type::History { kind: Overwrite, .. }`) ---
 
     fn mut_ty(value: Type, domain: Type) -> Type {
         Type::mutable(domain, value)
