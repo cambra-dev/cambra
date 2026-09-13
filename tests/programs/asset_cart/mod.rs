@@ -61,7 +61,9 @@
 //!
 //! `v1_single_line.cambra` is that ladder with one cart line per account, which
 //! replaces every entry iteration with a keyed lookup — and it runs, routes and
-//! all ([`asset_cart_single_line_serves_its_routes`]).
+//! all ([`asset_cart_single_line_serves_its_routes`]). It carries v1's refined
+//! `Balance`, which the checkout's guard discharges
+//! ([`asset_cart_single_line_rejects_a_weakened_checkout_guard`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -730,3 +732,35 @@ fn call(host: &mut Host, method: &str, path: &str, fields: &[(&str, Value)]) -> 
 /// rounds, and this is far above what any route here takes, so exceeding it would be a
 /// stall rather than a slow answer.
 const TICKS_TO_SETTLE: usize = 32;
+
+/// Weakening the checkout's guard makes the debit ill-typed — the claim the refined
+/// `Balance` exists to make.
+///
+/// `^-` types the debit `{Microcents | __elem == cash ^- due}`, and `Balance` demands
+/// `__elem >= 0`; the `cash >= due` guard is what closes the gap, assumable inside its own
+/// arm. A guard that does not imply it leaves the write unproved. Without this, a program
+/// that kept the declaration and lost the check would still pass every other test here.
+#[test]
+fn asset_cart_single_line_rejects_a_weakened_checkout_guard() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
+    let program = std::path::Path::new(dir).join("v1_single_line.cambra");
+    let declared = ChannelFile::beside(&program)
+        .expect("the channel file parses")
+        .expect("the program has a channel file");
+    let source = include_str!("v1_single_line.cambra");
+    let weakened = source.replace("if cash >= due:", "if cash >= 0:");
+    assert_ne!(
+        weakened, source,
+        "the guard this weakens is spelled `if cash >= due:`"
+    );
+    match Host::compile("v1_single_line.cambra", &weakened, &declared.channels) {
+        Ok(_) => panic!("a weakened guard leaves the debit unproved, so it must not compile"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("expected {Int | __elem >= 0}"),
+                "the rejection names the balance's invariant; got: {msg}"
+            );
+        }
+    }
+}

@@ -12,24 +12,13 @@
 #     basket. A second `PATCH /cart` replaces the line rather than adding to it,
 #     which is what `cart[c.account] := …` says.
 #   - **Keeps**: the keyed collections, the three routes, the live price feed,
-#     and the atomicity claim — the debit, the credit and the clear commit
-#     together or not at all, under one `if` inside one block.
+#     the refined `Balance`, and the atomicity claim — the debit, the credit and
+#     the clear commit together or not at all, under one `if` inside one block.
 #
-# Two further differences from v1, neither of them about the cart:
-#
-#   - The price feed is the declared source `price_updates`, as in `v0.cambra`,
-#     because `wasm_socket_subscribe` is not built. The rows are the same shape
-#     the socket would deliver.
-#   - `Balance` carries no refinement, and the initializer is not the reason.
-#     Seeding with a literal satisfies `{Microcents where _ > 0}` — a literal
-#     carries its own singleton, which discharges the predicate — and the debit
-#     is what does not: `accts[r.account] := cash - due` is a computed `Int`
-#     carrying no predicate, and a refinement is discharged by **matching** one
-#     the value already holds rather than by proving it from the guard. So the
-#     write is rejected whatever the predicate says; `_ >= 0`, which is the
-#     honest invariant here because `cash >= due` permits spending to exactly
-#     zero, is rejected the same way. A refined balance needs a refinement
-#     proved from a guard, which is a feature and not a spelling.
+# One further difference from v1, and it is not about the cart: the price feed is
+# the declared source `price_updates`, as in `v0.cambra`, because
+# `wasm_socket_subscribe` is not built. The rows are the same shape the socket
+# would deliver.
 #
 # `holdings` keeps its compound key: it is only ever written and read at one key,
 # never swept, and a compound key is fine for both (`v1.cambra`'s header records
@@ -43,11 +32,21 @@ one_dollar = 10**8
 
 AccountId = Int
 Microcents = Int
+# `>= 0`, not `> 0`: a zero balance is a balance, and `cash >= due` permits spending
+# to exactly zero. What the program may not do is write a negative one.
+Balance = {Microcents where  _ >= 0}
 Ticker = String
 
-accts: Mut(Map(AccountId, Microcents), Txn) := box(map([
-    (1, 500 * one_dollar),
-    (2, 250 * one_dollar),
+# Both accounts open at the same balance, and it is written as a literal. A map
+# literal's codomain is the join over its entries, so two entries carrying different
+# equations join to a bare `Microcents` and the declaration can no longer be met. The
+# equation also has to reduce to a sign on its own: `500 ^* one_dollar` is rejected,
+# because the product it carries names `one_dollar`.
+opening_balance = 50000000000  # 500 dollars, at `one_dollar`
+
+accts: Mut(Map(AccountId, Balance), Txn) := box(map([
+    (1, opening_balance),
+    (2, opening_balance),
 ]))
 
 holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([
@@ -80,8 +79,13 @@ for r in checkout_reqs:
         cash = accts[r.account]
         line = cart[r.account]
         due = line.qty * prices[line.ticker] // one_btc
+        # `^-` records the difference, so the debit is typed
+        # `{Microcents | __elem == cash ^- due}` rather than a bare `Microcents`, and the
+        # guard is assumable inside its own arm. `Balance` demands `__elem >= 0`, which
+        # follows from the two. Weaken the guard and the write is ill-typed
+        # (`asset_cart_single_line_rejects_a_weakened_checkout_guard`).
         if cash >= due:
-            accts[r.account] := cash - due
+            accts[r.account] := cash ^- due
             held = holdings[(r.account, line.ticker)]
             holdings[(r.account, line.ticker)] := held + line.qty
             cart[r.account] := (ticker=line.ticker, qty=0)
