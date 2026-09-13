@@ -121,6 +121,58 @@ check(
   JSON.stringify(quoted),
 );
 
+// Hot reload. The page has no control port to POST `/reload` to, so this is the
+// whole of what a live edit costs it: hand `reload` the edited source and read
+// back what the new version kept. The cart above is holding 2 BTC at a price the
+// page pushed, and neither is pushed again below — a swap that re-derived state
+// by replaying rows would serve a cart of nothing.
+const doubled = source.replace("total=btc_qty * btc_px", "total=btc_qty * btc_px * 2");
+const tally = JSON.parse(program.reload(doubled));
+check(
+  "a reload reports what it kept",
+  tally.generation === 1 && tally.kept > 0 && tally.kept < tally.bound,
+  JSON.stringify(tally),
+);
+check(
+  "the payload describes the version now running",
+  JSON.parse(program.snapshot()).meta.generation === 1,
+);
+
+const reloaded = push("view_requests", [true]).outputs.find((o) => o.sink === "btc_line")?.rows[0];
+check(
+  "the cart survives the swap and the edited rule governs",
+  reloaded?.qty === 2 && reloaded?.price === 81_692 * SCALE && reloaded?.total === 2 * 2 * 81_692 * SCALE,
+  JSON.stringify(reloaded),
+);
+
+// A version that does not compile. The one failure the page cannot afford to
+// handle by restarting: a typo mid-demo has to leave the program answering.
+let diagnostics = "";
+try {
+  program.reload(doubled.replace("btc_qty * btc_px * 2", "btc_qty * btc_pxx * 2"));
+} catch (e) {
+  diagnostics = String(e);
+}
+check("a version that does not compile is rejected", diagnostics.includes("btc_pxx"), diagnostics.split("\n")[0]);
+check("the running version is still the one the page holds", JSON.parse(program.snapshot()).meta.generation === 1);
+const survived = push("view_requests", [true]).outputs.find((o) => o.sink === "btc_line")?.rows[0];
+check(
+  "the rejected version cost the running one nothing",
+  survived?.qty === 2 && survived?.total === 2 * 2 * 81_692 * SCALE,
+  JSON.stringify(survived),
+);
+
+// What the page is connected to is the running version's claim, so a reload
+// answers it again: this one asks for a product the first version did not, and
+// the page opens a socket for it.
+feedProgram.reload(feedSource.replace('"BTC-USD", "ETH-USD"', '"BTC-USD", "ETH-USD", "SOL-USD"'));
+const resubscribed = JSON.parse(feedProgram.subscriptions());
+check(
+  "a reload replaces what the page subscribes to",
+  JSON.stringify(resubscribed[0]?.products) === '["BTC-USD","ETH-USD","SOL-USD"]',
+  JSON.stringify(resubscribed),
+);
+
 // Throughput against the recorded feed's 2.33 rows/s — a row has ~430 ms.
 const feed = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"];
 const ROWS = 40;

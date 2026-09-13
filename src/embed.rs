@@ -40,7 +40,7 @@ use crate::interpreter::value_recorder::{
     DEFAULT_ROWS_PER_RECORDING, SourceWindow, ValueRecorder, render_source_window,
 };
 use crate::interpreter::{Consumer, Value};
-use crate::live_program::LiveProgram;
+use crate::live_program::{LiveProgram, ReloadReport};
 
 /// Why a program could not be embedded.
 #[derive(Debug)]
@@ -88,6 +88,14 @@ pub struct Host {
     ctx: GlobalContext,
     live: LiveProgram,
     channels: Channels,
+
+    /// The program's name, for the payload every version renders.
+    ///
+    /// Held here rather than passed to [`reload`](Self::reload), because a
+    /// version is another source for the same program: a name given again per
+    /// reload is a name that can differ, and the panes would then name a program
+    /// the host never compiled.
+    name: String,
 
     /// Which version is running, counting from `0`. Shipped on the payload and
     /// on every frame so a reader can tell the two apart across a reload.
@@ -155,6 +163,7 @@ impl Host {
         Ok(Self {
             ctx,
             live,
+            name: name.to_string(),
             generation: Cell::new(0),
             channels,
             snapshot,
@@ -167,29 +176,52 @@ impl Host {
         })
     }
 
-    /// Replace the running program with a new version of its source.
+    /// Replace the running program with a new version of its source, and report
+    /// what the version kept.
     ///
     /// The same operation the binary's `/reload` performs, so an embedding host
     /// carries state across a version the way the runtime does rather than by
     /// replaying what it pushed: every operator whose computation is unchanged
     /// keeps running and every mutable variable resumes from the value it held.
+    /// [`ReloadReport::reuse`] counts the first of those, which is the evidence
+    /// that the state survived in place rather than being rebuilt from a journal.
+    ///
+    /// On `Err` the running program is untouched and still answering: the
+    /// version is compiled and checked against the state this one holds before
+    /// anything is torn down ([`LiveProgram::reload`]). A page that reloads on
+    /// every keystroke keeps ticking the version it has.
     ///
     /// The recorder session is held across it because the replacement rebuilds
     /// the operators it could not keep, and a producer takes its handle when it
-    /// is built. The payload and the source-node map are re-rendered from the
-    /// version that is now running, since a rebuilt operator is a new `NodeId`.
-    pub fn reload(&mut self, name: &str, code: &str) -> Result<(), Box<EmbedError>> {
+    /// is built. Everything named by `NodeId` is re-derived from the version now
+    /// running, since a rebuilt operator is a new `NodeId`: the payload, the
+    /// source-node map, and the nodes the channels record under — the channels
+    /// outlive a version while the ids naming them do not.
+    pub fn reload(&mut self, code: &str) -> Result<ReloadReport, Box<EmbedError>> {
         let main_consumer = || -> Box<dyn Consumer> { Box::new(|| {}) };
-        {
+        let report = {
             let _session = crate::interpreter::value_recorder::install(self.recorder.clone());
             self.live
                 .reload(&mut self.ctx, code, &main_consumer)
-                .map_err(|errors| Box::new(EmbedError::Compile(errors)))?;
-        }
+                .map_err(|errors| Box::new(EmbedError::Compile(errors)))?
+        };
         self.generation.set(self.generation.get() + 1);
-        self.snapshot = snapshot_json(self.live.program(), name, self.generation.get());
+        self.snapshot = snapshot_json(self.live.program(), &self.name, self.generation.get());
         self.source_nodes = source_nodes(&self.live.program().operator_graph);
-        Ok(())
+        self.channels
+            .observe(&self.recorder, &self.live.program().operator_graph);
+        Ok(report)
+    }
+
+    /// Which version is running, counting from `0` and incremented by each
+    /// accepted [`reload`](Self::reload).
+    ///
+    /// The same number the payload's `meta.generation` and every frame's
+    /// `generation` carry. A reader holds one payload and a stream of frames,
+    /// and comparing this is how it tells a frame about the version it holds
+    /// from a frame naming nodes it has never seen.
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
     }
 
     /// The `/api/snapshot` payload for this program.
