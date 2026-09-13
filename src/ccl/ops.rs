@@ -92,6 +92,13 @@ pub enum ArithmeticKind {
     Sub,
     /// Integer multiplication (`*`).
     Mul,
+    /// Integer multiplication whose result type records the product (`^*`).
+    ///
+    /// [`AddRefined`](Self::AddRefined)'s counterpart for `*`: the same arithmetic
+    /// as [`Mul`](Self::Mul), stating `MultipliableRefined` instead of
+    /// `Multipliable`, whose one row accepts `Int` operands and refines the result
+    /// by `__elem == a₁ * a₂`.
+    MulRefined,
     /// Floor division (`//`).
     FloorDiv,
     /// Exponentiation (`**`).
@@ -162,6 +169,7 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::AddRefined) => "^+",
             Self::Arithmetic(ArithmeticKind::Sub) => "-",
             Self::Arithmetic(ArithmeticKind::Mul) => "*",
+            Self::Arithmetic(ArithmeticKind::MulRefined) => "^*",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "//",
             Self::Arithmetic(ArithmeticKind::Pow) => "**",
             Self::Concat => "++",
@@ -193,6 +201,7 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::AddRefined) => "add_refined",
             Self::Arithmetic(ArithmeticKind::Sub) => "sub",
             Self::Arithmetic(ArithmeticKind::Mul) => "mul",
+            Self::Arithmetic(ArithmeticKind::MulRefined) => "mul_refined",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",
             Self::Arithmetic(ArithmeticKind::Pow) => "pow",
             Self::Concat => "concat",

@@ -86,7 +86,19 @@ fn check_compile_error(code: &str, needle: &str) {
     40
 )]
 // TODO(refined-txn-body): a transaction body writing a *refined* mutable variable
-// (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, blocked twice over.
+// (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, blocked three times over.
+// Inference itself accepts such a write and reports an unmet one against the declared
+// refinement (`tests/type_check.rs`, `a_keyed_write_of_a_refined_product_is_accepted`
+// and the two rejections beside it); every blocker below is a later phase.
+//
+// The *seed* is the first, and it stops a program that never writes. Emit decides
+// `Int@100 <: {Int | __elem >= 0}` through the solver's semantic fallback, which is
+// what the mutable-variable introduction rule raises. The post-inference check
+// re-raises the same obligation through `Typing::require_sub`, which supplies
+// `SkipSmtScope` and so decides the deficit structurally
+// (`src/ccl/design/type-inference.md`, "The scope a query runs in"). The two
+// disagree, and a program inference accepted panics at the boundary as an invalid
+// tree — `a_refined_scalar_mut_seed_reaches_the_boundary` pins it.
 //
 // A `^+` write records its sum, so `pool := pool ^+ 1` types the written value
 // `{Int | __elem == pool ^+ 1}` — a predicate naming the mutable binder.
@@ -94,7 +106,7 @@ fn check_compile_error(code: &str, needle: &str) {
 // history denotes no value to substitute), so nothing eliminates the name and
 // `check_scope_valid` reports a `ScopeViolation` on a well-typed program.
 //
-// A plain `-` write is the second: `pool := pool - r` under `if pool - r >= 0`
+// A plain `-` write is the third: `pool := pool - r` under `if pool - r >= 0`
 // types the written value `Int`, which does not entail `__elem >= 0`. Reading the
 // guard as a refinement on its branch is path sensitivity, which the type system
 // does not do.

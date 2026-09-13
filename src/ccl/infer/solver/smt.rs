@@ -575,11 +575,12 @@ impl<'a> Encode<'a> {
         let c = self.ctx;
         Ok(match op {
             // `^+` computes what `+` computes and differs only in the trait it
-            // states (`src/ccl/ops.rs`), so both are SMT's `+`.
+            // states (`src/ccl/ops.rs`), so both are SMT's `+`; `^*` and `*` are one
+            // operation for the same reason.
             BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => c.plus(l, r),
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => c.sub(l, r),
             // A product stays linear when one factor is a constant.
-            BinOpKind::Arithmetic(ArithmeticKind::Mul)
+            BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::MulRefined)
                 if is_int_literal(left) || is_int_literal(right) =>
             {
                 c.times(l, r)
@@ -603,7 +604,10 @@ impl<'a> Encode<'a> {
             // no integer exponentiation to state it with. `++` is on strings,
             // which have no sort here.
             BinOpKind::Arithmetic(
-                ArithmeticKind::Mul | ArithmeticKind::FloorDiv | ArithmeticKind::Pow,
+                ArithmeticKind::Mul
+                | ArithmeticKind::MulRefined
+                | ArithmeticKind::FloorDiv
+                | ArithmeticKind::Pow,
             )
             | BinOpKind::Concat => {
                 return Err(format!(

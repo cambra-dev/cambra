@@ -4615,11 +4615,12 @@ fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
         return None;
     };
     Some(match op {
-        // `^+` and `+` compute the same sum, so they share one runtime operation;
-        // the refinement `^+` carries is spent by the time op-conversion runs.
+        // `^+` and `+` compute the same sum, as `^*` and `*` do the same product, so
+        // each pair shares one runtime operation; the refinement the refining operator
+        // carries is spent by the time op-conversion runs.
         B::Arithmetic(A::Add | A::AddRefined) => InterpreterBinOp::Arithmetic(ArithmeticKind::Add),
         B::Arithmetic(A::Sub) => InterpreterBinOp::Arithmetic(ArithmeticKind::Sub),
-        B::Arithmetic(A::Mul) => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
+        B::Arithmetic(A::Mul | A::MulRefined) => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
         B::Arithmetic(A::FloorDiv) => InterpreterBinOp::Arithmetic(ArithmeticKind::FloorDiv),
         B::Arithmetic(A::Pow) => InterpreterBinOp::Arithmetic(ArithmeticKind::Pow),
         B::Concat => InterpreterBinOp::Concat,

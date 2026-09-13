@@ -348,6 +348,50 @@ fn refined_add() {
     check_scalar("z: {Int where _ == 1 ^+ 3} = 1 ^+ 3\n()", Value::Unit)
 }
 
+#[test]
+fn refined_mul() {
+    check_scalar("z: {Int where _ == 2 ^* 3} = 2 ^* 3\n()", Value::Unit)
+}
+
+/// `^*`'s refinement is an equation the solver reads rather than a term the
+/// annotation has to match: `2 ^* 3` entails `_ == 6`, and `_ == 7` is refused.
+#[test]
+fn a_product_entails_its_value() {
+    check_scalar("z: {Int where _ == 6} = 2 ^* 3\n()", Value::Unit)
+}
+
+#[test]
+fn a_product_does_not_entail_another_value() {
+    check_compile_error("z: {Int where _ == 7} = 2 ^* 3\n()", "Annotation mismatch")
+}
+
+/// The demand the demo's balances state, on the scaling that produces one: an amount
+/// and a positive scale factor make a positive product, and `*` — whose `Output` is a
+/// bare `Int` — cannot say so.
+#[test]
+fn a_scaled_positive_amount_stays_positive() {
+    check_scalar(
+        indoc! {r#"
+            one_dollar = 100000000
+            z: {Int where _ > 0} = 500 ^* one_dollar
+            ()
+        "#},
+        Value::Unit,
+    )
+}
+
+#[test]
+fn a_scaled_positive_amount_needs_the_refining_product() {
+    check_compile_error(
+        indoc! {r#"
+            one_dollar = 100000000
+            z: {Int where _ > 0} = 500 * one_dollar
+            ()
+        "#},
+        "Annotation mismatch: annotated as {Int | __elem > 0}, but inferred as Int",
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Semantic entailment of a refinement
 //
@@ -746,6 +790,29 @@ m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
 m
 "#,
         r#"Annotation mismatch: annotated as Σ (σ : SubtypesOf({String | __elem != ""}))"#,
+    )
+}
+
+/// A refined **scalar** mutable variable, stopped by its seed rather than by any
+/// write. Emit admits `Int@100 <: {Int | __elem > 0}` semantically; the post-inference
+/// check re-raises that obligation through `Typing::require_sub`, which supplies
+/// `SkipSmtScope` and decides the deficit structurally, so the two passes disagree and
+/// the boundary reads a compiler bug for a program inference accepted
+/// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
+///
+/// Pinned so the day the seed passes, the pin says so — and `transactions.rs`'s
+/// `TODO(refined-txn-body)` carries the two blockers behind this one.
+#[test]
+fn a_refined_scalar_mut_seed_reaches_the_boundary() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut({Int where _ > 0}, Txn) := 100
+            with begin():
+                pool := 5 ^* 100
+            await_final(pool)
+        "#},
+        "produced an invalid tree: [Type mismatch for initializer of mutable `pool`: \
+         expected {Int | __elem > 0}, found Int@100]",
     )
 }
 

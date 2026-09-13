@@ -763,6 +763,7 @@ where
             .foldl_with(
                 choice((
                     just(Token::Star).to(BinOp::Mul),
+                    just(Token::CaretStar).to(BinOp::MulRefined),
                     just(Token::DoubleSlash).to(BinOp::FloorDiv),
                 ))
                 .then(unary.clone())

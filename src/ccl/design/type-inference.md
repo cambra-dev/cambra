@@ -2866,7 +2866,7 @@ Obligations ride variables through `freshen_above`, so a generalized function ca
 
 | Op kind | Operand constraint | Result type |
 |---|---|---|
-| `Arithmetic` | a trait obligation over two *unrelated* variables — `Addable`, `Subtractable`, `Multipliable`, `Divisible` | the trait's `Output` |
+| `Arithmetic` | a trait obligation over two *unrelated* variables — `Addable`, `Subtractable`, `Multipliable`, `Divisible`, `Exponentiable`, `AddableRefined`, `MultipliableRefined` | the trait's `Output` |
 | `Compare` | a trait obligation — `Equatable` (`==`, `!=`) or `Orderable` (`<`, `<=`, `>`, `>=`), which associate nothing | `Bool`, fixed by the operator |
 | `Concat` | both operands constrained to `String` | `String` |
 | `BoolLogic` | both operands constrained to `Bool` | `Bool` |
@@ -2874,6 +2874,25 @@ Obligations ride variables through `freshen_above`, so a generalized function ca
 The bottom two rows are ordinary schemes, because their operand types are fixed. The top two are not, and could not be: see [Traits](#traits).
 
 **Note**: String + String → `Concat` rewriting is performed at **compile time** (in `simplify.rs`), not at inference time. Inference accepts `(String, String) ⇝ String` as an `Addable` instance and returns `String`.
+
+#### A refining operator records its own result
+
+`^+` and `^*` compute what `+` and `*` compute, and differ in the trait each states.
+`AddableRefined` and `MultipliableRefined` hold one row each — `Int` operands, an `Int`
+`Output` — and the row refines that `Output` by an equation over the operand *terms*:
+`{Int | __elem == 𝑎₁ ^+ 𝑎₂}` and `{Int | __elem == 𝑎₁ ^* 𝑎₂}`. The row builds it through a
+`RefinementTemplate`, a `fn` the instance holds that receives the operand expressions
+(`src/ccl/infer/solver/traits.rs`).
+
+The equation is the instance's, so an operand's own refinement still does not reach the result
+(`tests/type_check.rs`, `an_operator_result_carries_no_operand_refinement`). What the equation
+gives the solver is a term to read back through: `{Int | __elem == cash ^* 2}` entails
+`__elem > 0` under `cash`'s own `{Int | __elem > 0}`, which is how a refined value survives the
+arithmetic that produces the next one.
+
+Which operators have a refining counterpart is the table's content rather than a property of the
+mechanism: `^+` and `^*` have one, and `-`, `//` and `**` do not. Adding one is a row, an
+`ArithmeticKind`, and a token.
 
 ### UnaryOp type rules
 

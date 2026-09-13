@@ -762,6 +762,9 @@ pub enum BinOp {
     AddRefined,
     Sub,
     Mul,
+    /// `^*` — multiplication whose result type records the product. Same arithmetic
+    /// as [`Mul`](Self::Mul), a different trait (`src/ccl/ops.rs`, `ArithmeticKind`).
+    MulRefined,
     FloorDiv,
     /// `**` — exponentiation. Right-associative, and tighter than the unary minus
     /// on its left, so `-2 ** 2` is `-(2 ** 2)` (`docs/chl-spec.md`,

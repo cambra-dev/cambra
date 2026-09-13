@@ -85,6 +85,7 @@ export const OPERATORS: readonly (readonly [string, string])[] = [
   ["-=", "operator"],
   ["*=", "operator"],
   ["^+", "operator"],
+  ["^*", "operator"],
   ["//", "operator"],
   ["=", "channelOp"],
   ["+", "operator"],

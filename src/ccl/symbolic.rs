@@ -712,7 +712,9 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
             ArithmeticKind::Add | ArithmeticKind::AddRefined | ArithmeticKind::Sub,
         )
         | BinOpKind::Concat => Precedence::Add,
-        BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
+        BinOpKind::Arithmetic(
+            ArithmeticKind::Mul | ArithmeticKind::MulRefined | ArithmeticKind::FloorDiv,
+        ) => Precedence::Mul,
         BinOpKind::Arithmetic(ArithmeticKind::Pow) => Precedence::Pow,
     }
 }
@@ -739,6 +741,7 @@ fn binop_assoc(op: &BinOpKind) -> Associativity {
             | ArithmeticKind::AddRefined
             | ArithmeticKind::Sub
             | ArithmeticKind::Mul
+            | ArithmeticKind::MulRefined
             | ArithmeticKind::FloorDiv,
         )
         | BinOpKind::Concat

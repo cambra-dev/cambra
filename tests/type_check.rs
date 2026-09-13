@@ -266,6 +266,37 @@ fn refining_addition_is_int_only() {
     );
 }
 
+/// `^*` records the product, as `^+` records the sum: one row over `Int`, and a
+/// result refined by the operand terms.
+#[rstest]
+#[case::literals("2 ^* 3", "{Int | __elem == 2 ^* 3}")]
+#[case::parameters(
+    indoc! {r#"
+        def f(a: Int, b: Int):
+            a ^* b
+
+        f
+    "#},
+    "((__arg_tuple_0: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_0.0 ^* __arg_tuple_0.1})"
+)]
+fn refining_multiplication_records_the_product(#[case] code: &str, #[case] expected: &str) {
+    assert_eq!(format!("{}", infer_program(code)), expected);
+}
+
+/// `^*` accepts `Int` and nothing else, as `^+` does. `Multipliable` has no `String`
+/// row either, so what a `String` operand meets here is the refining trait's own
+/// missing instance rather than the plain one's.
+#[test]
+fn refining_multiplication_is_int_only() {
+    let errs = infer_program_err(r#""a" ^* "b""#);
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|m| m.contains("No MultipliableRefined instance")),
+        "expected a missing-instance diagnostic for MultipliableRefined, got {errs:?}",
+    );
+}
+
 /// The three shapes a trait can take are each exercised by a real program, which is
 /// what keeps the machinery from being fitted to one of them.
 ///
@@ -5812,6 +5843,72 @@ fn a_keyed_write_checks_key_and_value_separately(#[case] write: &str, #[case] ex
         format!("{errs:?}").contains(expected),
         "expected `{expected}` in {errs:?}"
     );
+}
+
+/// A **refined** codomain is checked at the write, and the write is the position the
+/// refinement has to survive to: `accts` holds balances the program has declared
+/// positive, so a write that cannot be shown positive is ill-typed.
+///
+/// `cash` is a runtime value — the balance read out of the transactional map at the
+/// key this same block writes — so the verdict rests on the refinement that read
+/// carries and on the equation `^*` records over it, not on any constant the program
+/// spells. `{Int | __elem == cash ^* 2}` meets `{Int | __elem > 0}` because `cash > 0`
+/// is what the codomain of `accts` says about the value `cash` names.
+#[rstest]
+#[case::value_first("cash ^* 2")]
+#[case::literal_first("2 ^* cash")]
+fn a_keyed_write_of_a_refined_product_is_accepted(#[case] value: &str) {
+    assert_eq!(
+        infer_program(&refined_balance_write(value)).to_string(),
+        "Int@0"
+    );
+}
+
+/// The same write with `*` in place of `^*`. Plain arithmetic associates an
+/// unrefined `Output`, so the written value is a bare `Int` and the codomain's
+/// demand is unmet — which is what makes `^*` the operator carrying the refinement
+/// rather than the operands doing it on their own.
+#[test]
+fn a_keyed_write_of_a_plain_product_is_rejected() {
+    let errs = infer_program_err(&refined_balance_write("cash * 2"));
+    assert!(
+        format!("{errs:?}").contains(
+            "keyed write to mutable variable `accts`: expected {Int | __elem > 0}, found Int"
+        ),
+        "expected the codomain demand to be reported unmet, got {errs:?}"
+    );
+}
+
+/// Two products `^*` records that the codomain refuses. `cash ^* 0` is zero at every
+/// balance, and `r ^* 2` scales the *key*, which carries no refinement — so neither
+/// entails `__elem > 0`, and the equation the operator records is what the solver
+/// reads to say so.
+#[rstest]
+#[case::zero("cash ^* 0", "__elem == cash ^* 0")]
+#[case::unrefined_operand("r ^* 2", "__elem == r ^* 2")]
+fn a_keyed_write_of_a_product_that_is_not_positive_is_rejected(
+    #[case] value: &str,
+    #[case] recorded: &str,
+) {
+    let errs = infer_program_err(&refined_balance_write(value));
+    let expected = format!(
+        "keyed write to mutable variable `accts`: expected {{Int | __elem > 0}}, \
+         found {{Int | {recorded}}}"
+    );
+    assert!(
+        format!("{errs:?}").contains(&expected),
+        "expected `{expected}` in {errs:?}"
+    );
+}
+
+/// The transaction body every case above writes: a balance read out of `accts` at the
+/// key the block is about, and one keyed write of `value` back to it.
+fn refined_balance_write(value: &str) -> String {
+    format!(
+        "accts: Mut(Map(Int, {{Int where _ > 0}}), Txn) := box(map([(1, 100), (2, 200)]))\n\
+         for r in [1, 2]:\n    with begin():\n        cash = accts[r]\n        \
+         accts[r] := {value}\n0\n"
+    )
 }
 
 /// Writing a key of something that is not a `Map` needs the target's type,

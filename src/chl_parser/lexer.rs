@@ -117,6 +117,14 @@ pub enum Token {
     /// Experimental, and so absent from `docs/chl-spec.md`.
     #[token("^+")]
     CaretPlus,
+    /// Refining multiplication `^*` — multiplication whose result type records the
+    /// product (`ArithmeticKind::MulRefined`, in `src/ccl/ops.rs`). Two chars, so
+    /// maximal munch takes it over `Caret` then `Star`; CHL has no unary `*`, so
+    /// `a ^ *b` is not a competing parse.
+    ///
+    /// Experimental, and so absent from `docs/chl-spec.md`.
+    #[token("^*")]
+    CaretStar,
     #[token("-=")]
     MinusEq,
     /// Lambda body arrow `->`. Also the planned pair / map-entry arrow — `a -> b`
@@ -271,6 +279,7 @@ impl fmt::Display for Token {
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",
             Token::CaretPlus => "^+",
+            Token::CaretStar => "^*",
             Token::MinusEq => "-=",
             Token::Arrow => "->",
             Token::DoubleArrow => "=>",
@@ -664,7 +673,7 @@ mod tests {
     #[test]
     fn multi_char_operators() {
         assert_eq!(
-            tokens("<< <<= == != <= >= // //= += -= *= ** ^+"),
+            tokens("<< <<= == != <= >= // //= += -= *= ** ^+ ^*"),
             vec![
                 Token::LShift,
                 Token::LShiftEq,
@@ -679,6 +688,7 @@ mod tests {
                 Token::StarEq,
                 Token::StarStar,
                 Token::CaretPlus,
+                Token::CaretStar,
                 Token::Newline,
             ]
         );

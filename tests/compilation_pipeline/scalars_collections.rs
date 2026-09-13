@@ -351,6 +351,10 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // maps both to the one runtime addition.
 #[case("2 ^+ 3", Value::Int(5))]
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
+// `^*` stands in the same relation to `*`, and binds as tightly, so the sum is the
+// operand of the product and not the other way round.
+#[case("2 ^* 3", Value::Int(6))]
+#[case("1 + 2 ^* 3 - 4", Value::Int(3))]
 // `**` scales a constant without spelling out the zeroes.
 #[case("10 ** 8", Value::Int(100_000_000))]
 // Right-associative: `2 ** (3 ** 2)` is 512, where a left fold would be 64.

@@ -261,12 +261,13 @@ fn value_of(expr: &Expr, consts: &Consts) -> Option<Lit> {
 
 fn eval_binop(op: BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
     match (op, left, right) {
-        // `^+` computes the sum `+` computes; they differ in the type the result takes,
-        // and the node keeps its recorded type through the fold.
+        // A refining operator computes what its plain counterpart computes; the two differ
+        // in the type the result takes, and the node keeps its recorded type through the
+        // fold.
         (BinOpKind::Arithmetic(op), Lit::Int(l), Lit::Int(r)) => Some(Lit::Int(match op {
             ArithmeticKind::Add | ArithmeticKind::AddRefined => l.checked_add(*r)?,
             ArithmeticKind::Sub => l.checked_sub(*r)?,
-            ArithmeticKind::Mul => l.checked_mul(*r)?,
+            ArithmeticKind::Mul | ArithmeticKind::MulRefined => l.checked_mul(*r)?,
             // Only where floor division and truncation coincide — see the module
             // docs. The bound also excludes a zero divisor.
             ArithmeticKind::FloorDiv if *l >= 0 && *r > 0 => l / r,
