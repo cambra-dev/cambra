@@ -1280,7 +1280,7 @@ in it has a correspondent",
     pub(crate) fn live_state(&self) -> HashMap<VarPath, Value> {
         let mut out: HashMap<VarPath, Value> = HashMap::new();
         for info in self.minted.stores() {
-            let Some(tile) = info.fan.cached_tile() else {
+            let Some(tile) = info.fan.latest_tile() else {
                 debug_assert!(
                     false,
                     "a store's fan is cyclic, so it has a cached tile: {:?}",

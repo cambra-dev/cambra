@@ -233,6 +233,36 @@ answer and the identity.
 
 ---
 
+## The read contract
+
+`get(𝑅)` is a **read, not a step**. Two `get`s for the same region, in one delivery round and with
+no release in between, describe the same state and answer the same tile. `TileProducer::get` asserts
+it in debug builds, comparing the round, the region asked for, and the accumulated obsolete guard
+against what the previous `get` answered.
+
+A producer that advances *because* it was pulled breaks it, and the breakage is not local. With a
+fan-out above it, the branch that pulls first takes the new state and its siblings see a different
+tile; nothing downstream can cache a pull whose answer depends on how often it was asked, so every
+consumer re-walks the graph.
+
+A **delivery round** is the span between two `Scheduler::check_for_notifications` calls — equally,
+a span with no `get` in flight on the thread, which is why the counter behind `current_round` is
+per-thread rather than per-scheduler. The driver alternates: open the round, pull, open the next.
+Three things advance state at that boundary rather than inside a pull, each holding what it renders
+in a `RoundCache`: the commit store draining its writers' proposals, the induction store consuming
+its body's decisions, and `Aggregate` folding its input (it releases each delivery as it folds it,
+so a second fold in one round would count the same rows twice). A `FanOut` pulls its input once per
+round and serves every branch that tile, which is what a fan-out is for — an input that takes
+delivery would otherwise hand the rows to whichever branch pulled first.
+
+A **cyclic** `FanOut` is the recurrence's delay element. Its recurrence branch sits inside its own
+input chain, so it reads the fan while the round's pull is in flight: it is served the round before,
+which is also what makes the recurrence causal — a lap consults the state an earlier lap decided.
+Reader branches are served the round's own pull. A round in which the inner producer answers
+something the recurrence has not read leaves a lap outstanding, so the fan asks the scheduler for
+the round that runs it; nothing else would, because a writer re-arms off its own source, which says
+nothing about whether the state it reads has moved.
+
 ## The release contract
 
 `release(𝑅)` says the data in 𝑅 is **never requested again, and never returned again** — the same promise from each end of the wire. It holds at every granularity: a consumed prefix, one arm of a union, a record field, or the whole tiling (the *universal* release, after which the only conforming tile is the empty one). This is what makes bounded execution possible — a producer may reclaim 𝑅, and every tile it emits afterwards lies outside its accumulated obsolete guard.
@@ -350,7 +380,7 @@ TODOs for implementing hash joins:
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
 - **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
-- **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
+- **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per round so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 
@@ -379,9 +409,9 @@ A single-writer induction store is the degenerate no-conflict case of this same 
 
 A writer body returns one **decision variant** per transaction, `` {`commit{𝑃} | `abort} `` (`ccl_utils::wrap_decision_variant`). `` `commit `` carries the payload record 𝑃 = `{writes, __to_<defer>*}` — the proposed new values keyed by the variable each is for, plus one field per reply tap — and `` `abort `` is the nullary whole-transaction deny: carry, no proposal. Making the grant/deny the *tag* rather than a `commit` field leaves "denied yet real writes" unrepresentable. `body_decision_at` decodes the tag by name, so the two ends agree without a canonical arm position. A tap's value is `` {`fired{𝑉} | `idle} `` — the fed value on the positions its own control-flow path admits, `` `idle `` on the rest (see [mutability.md](../ccl/design/mutability.md#general-in-transaction-conditionals-and-conditional-writes), "General in-transaction conditionals (and conditional writes)"). The grant path omits an `` `idle `` tap from the commit delta, so a routed reply fires only on its own route. A tap whose path *is* the commit — a single-guard or spine feed — wraps unconditionally. Carrying the gate as the value's tag is what lets a fed value be domain-restricted: a value beside a separate `Bool` gate would have to answer wherever the record commits.
 
-### Convergence: the writer re-arms, one step per pull
+### Convergence: the writer re-arms, one step per round
 
-A writer processes **one source item per pull** and re-arms itself on the scheduler's deferred-wakeup queue whenever an item remains, returning non-terminal — the same one-step-per-pull idiom the induction and commit stores share. That single re-arm covers every continuation uniformly: a **commit** (the commit-ack `release` advances it, so the next pull takes the next item), a **deny** (it advances locally with no commit — invisible in the store frontier, which a frontier-growth signal alone would miss), and a **not-ready** decision (it does not advance, and reuses the pending body-input row). It is the *writer's* re-arm, not any reader's, that converges the store: the wakeup fans through the cyclic `FanOut` to re-pull the `AsOf` / `StoreValueStream` readers as commits land, so no reader drives a store to fixpoint. A writer **drained but live** does not re-arm, so an idle live server does not busy-poll — a future arrival wakes it through its source-forwarding consumer.
+A writer processes **one source item per delivery round** and re-arms itself on the scheduler's deferred-wakeup queue whenever an item remains, returning non-terminal — the same one-step-per-round idiom the induction and commit stores share (see [the read contract](#the-read-contract)). That single re-arm covers every continuation uniformly: a **commit** (the commit-ack `release` advances it, so the next round takes the next item), a **deny** (it advances locally with no commit — invisible in the store frontier, which a frontier-growth signal alone would miss), and a **not-ready** decision (it does not advance, and reuses the pending body-input row). It is the *writer's* re-arm, not any reader's, that converges the store: the wakeup fans through the cyclic `FanOut` to re-pull the `AsOf` / `StoreValueStream` readers as commits land, so no reader drives a store to fixpoint. A writer **drained but live** does not re-arm, so an idle live server does not busy-poll — a future arrival wakes it through its source-forwarding consumer.
 
 ### Every fed-out mutable variable read is an as-of sample
 

@@ -76,12 +76,14 @@ struct AggregateProducer {
     input: Box<dyn TileProducer>,
     /// The aggregation operation.
     kind: AggregateKind,
-    /// Running accumulation state; updated in place on each `get`.
+    /// Running accumulation state; updated in place once per delivery round.
     accumulator: Tile,
     /// Set once the consumer has released this output universally, after which
     /// the accumulator must never be handed back — it *is* the whole output, so
     /// re-emitting it returns released data.
     released: bool,
+    /// One fold per delivery round — see [`RoundCache`].
+    round: RoundCache,
 }
 
 impl AggregateProducer {
@@ -107,6 +109,7 @@ impl AggregateProducer {
             kind,
             accumulator,
             released: false,
+            round: RoundCache::default(),
         }
     }
 }
@@ -121,6 +124,12 @@ impl TileProducer for AggregateProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         if self.released {
             return self.tiling().empty_tile();
+        }
+        // One fold per delivery round. This producer consumes: it releases each
+        // delivery as it folds it in, so folding again on a second pull of the
+        // same round would count the same rows twice.
+        if let Some(acc) = self.round.hit() {
+            return acc;
         }
         let i_tiling = self.input.tiling().clone();
         let mut input_result = self.input.get(i_tiling.universal_guard());
@@ -147,7 +156,8 @@ impl TileProducer for AggregateProducer {
         };
         self.kind.accumulate(accumulator, &values, 0, values.len());
         terminal.set(0, is_terminal);
-        self.accumulator.clone()
+        let acc = self.accumulator.clone();
+        self.round.fill(acc)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

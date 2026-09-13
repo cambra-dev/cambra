@@ -27,7 +27,7 @@ use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec, InputTarget},
     interpreter::value_recorder::{self, SharedRecorder},
-    interpreter::{Consumer, Extent, Scheduler, validate_tile},
+    interpreter::{Consumer, Extent, Scheduler, current_round, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -329,11 +329,18 @@ pub struct ProducerBase {
     pub tiling: Tiling,
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
+    /// The round of the previous [`TileProducer::get`], what it was asked for,
+    /// what had been released by then, and what it answered — the idempotence
+    /// check there. Debug builds only: it retains a tile per producer.
+    #[cfg(debug_assertions)]
+    pub(crate) last_get: Option<(u64, TileGuard, TileGuard, Tile)>,
 }
 
 impl ProducerBase {
     pub(crate) fn new(id: usize, tiling: &Tiling) -> Self {
         Self {
+            #[cfg(debug_assertions)]
+            last_get: None,
             id,
             node_id: SUBSCRIBING.with(Cell::get),
             recorder: value_recorder::installed(),
@@ -368,6 +375,46 @@ impl Drop for ProducerBase {
                  recordings outlive it",
             ),
         }
+    }
+}
+
+/// One state advance per **delivery round**, for a producer that advances with
+/// nothing external to trigger it.
+///
+/// [`TileProducer::get`] is a read, not a step: two pulls for the same region
+/// with no release in between describe the same state, so they answer the same
+/// tile. A store that drains its writers' proposals, or a driver that emits the
+/// next attempt, has more to compute with no arrival and no release to hang it
+/// on — and doing that work inside `get` makes the answer depend on how many
+/// times it was asked. The consequence is not local: with a fan-out above it,
+/// whichever branch pulls first takes the new state and the others see a
+/// different tile, and nothing downstream can cache a pull whose answer moves
+/// under it.
+///
+/// The boundary is the one the scheduler already draws: a producer advances on
+/// the round's first pull and hands back the same tile for the rest of the round.
+/// [`Scheduler::check_for_notifications`] opens the next one, which is where the
+/// deferred wakeup driving a cyclic recurrence is delivered anyway, so a cycle
+/// converges at one lap per round instead of one per pull.
+#[derive(Default)]
+pub struct RoundCache {
+    rendered: Option<(u64, Tile)>,
+}
+
+impl RoundCache {
+    /// This round's answer, or `None` on its first pull — the caller then
+    /// advances and [`fill`](Self::fill)s.
+    pub fn hit(&self) -> Option<Tile> {
+        match &self.rendered {
+            Some((round, tile)) if *round == current_round() => Some(tile.clone()),
+            _ => None,
+        }
+    }
+
+    /// Freeze `tile` as this round's answer, returning it.
+    pub fn fill(&mut self, tile: Tile) -> Tile {
+        self.rendered = Some((current_round(), tile.clone()));
+        tile
     }
 }
 
@@ -459,7 +506,37 @@ pub trait TileProducer {
 
     /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
+        #[cfg(debug_assertions)]
+        let asked_for = projection_guard.clone();
         let result = self.get_impl(projection_guard);
+        // **A `get` is a read, not a step.** Two of them for the same region in one
+        // delivery round with no release in between describe the same state, so they
+        // answer the same tile. A producer that advances *because* it was pulled
+        // breaks this, and the breakage is not local: nothing downstream can cache a
+        // pull whose answer depends on how many times it was asked, so every consumer
+        // re-walks the graph instead. State advances instead at the round boundary
+        // (`current_round`, held by [`RoundCache`]), and `obsolete_guard` is the
+        // release record — the two together are what make "no release, same round"
+        // checkable here.
+        #[cfg(debug_assertions)]
+        {
+            let (round, released) = (current_round(), self.base().obsolete_guard.clone());
+            if let Some((prev_round, prev_asked, prev_released, prev_tile)) =
+                self.base().last_get.clone()
+            {
+                assert!(
+                    prev_round != round
+                        || prev_asked != asked_for
+                        || prev_released != released
+                        || prev_tile == result,
+                    "{} answered two `get`s for {asked_for:?} differently within one \
+                     delivery round with no release between them: first {prev_tile:?}, \
+                     then {result:?}",
+                    self.name(),
+                );
+            }
+            self.base_mut().last_get = Some((round, asked_for, released, result.clone()));
+        }
         // A release says that data is never requested and never returned again.
         // Being pulled afterwards is fine — the answer is whatever lies outside
         // the released region, which after a universal release is nothing at all

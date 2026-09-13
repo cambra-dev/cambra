@@ -35,7 +35,7 @@ use std::rc::Rc;
 use bit_set::BitSet;
 use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
-use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
+use cambra::interpreter::tile_operators::{TileProducer, scalar_tile_to_column_value};
 use cambra::interpreter::{
     ColumnValue, Consumer, FuncBinding, Predicate, Tile, Value, sort_sealed_function_by_domain,
     tuple_field,
@@ -44,6 +44,18 @@ use cambra::interpreter::{
 // ---------------------------------------------------------------------------
 // Helpers — CCL pipeline path
 // ---------------------------------------------------------------------------
+
+/// One pull, with its delivery round opened first — the
+/// `check_for_notifications` / `get` alternation `src/main.rs` runs.
+///
+/// A `get` is a read, so nothing advances by being pulled: a store's recurrence
+/// decides one more position per round, and a fan-out pulls its input once per
+/// round and serves every branch the same tile. A test that pulls twice in a row
+/// without this observes one round twice.
+pub(crate) fn pull(ctx: &mut GlobalContext, producer: &mut dyn TileProducer) -> Tile {
+    ctx.scheduler().check_for_notifications();
+    producer.get(producer.tiling().universal_guard())
+}
 
 /// Lower `code` through the CCL pipeline (parse → `ccl::lower` → `ccl::infer`
 /// → `compile_ccl` → subscribe → get) and return the resulting [`Tile`].
@@ -65,10 +77,10 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
         .main_mut()
         .and_then(|o| o.producer.as_mut())
         .expect("pipeline test expects a `main` output");
-    // A single `get` is not always enough to fully drain a producer.  Some
-    // tile operators advance their internal state by one step per pull
-    // (notably a mutation loop's store/drive cycle, where each pull decides one
-    // more position of the recurrence).
+    // A single `get` is not always enough to fully drain a producer. A mutation
+    // loop's store/drive cycle decides one more position of the recurrence per
+    // delivery round, and a round is opened by `check_for_notifications` — a
+    // `get` is a read, so pulling alone advances nothing.
     // Loop until the producer reports a terminal tile, with a generous
     // iteration cap to catch the regression where the cycle stops making
     // progress without converging.
@@ -81,7 +93,7 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
             iterations < 1024,
             "pipeline path: producer did not converge within 1024 iterations"
         );
-        result = producer.get(universal.clone());
+        result = pull(ctx, &mut **producer);
     }
     result.compact();
     // Release everything, then pull once more: a released region must never come
