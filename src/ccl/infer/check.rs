@@ -453,6 +453,13 @@ impl Typing for CheckCtx {
         function: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
+        // **A feed handle reads as its whole stream**, and the stream is the function being
+        // applied ([`Type::feed_stream`]). [`Typing::as_function`] performs that read one
+        // line above this in [`Typing::apply`], so without it here the two disagree about
+        // whether a channel is a function and the assertion below reports a caller error
+        // for a program that reads its own defer.
+        let stream = function.feed_stream();
+        let function = stream.as_ref().unwrap_or(function);
         // Sound one-way only: a refined argument may flow into an unrefined
         // parameter (dropping a restriction is admissible). Emit's reverse
         // direction (domain coalescing) is not the sound subtyping rule and so

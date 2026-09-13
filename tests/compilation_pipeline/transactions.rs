@@ -4126,21 +4126,22 @@ fn a_reply_aggregates_a_transactional_maps_entries() {
     );
 }
 
-/// A reply that carries a **collection** rather than a scalar.
+/// A reply that carries a **collection** rather than a scalar, which is the shape
+/// `v1.cambra`'s cart view replies — a record whose `lines` and `positions` are lists.
 ///
-/// `out << [q for a -> q in m]` hands the feed one collection per request, which is the
-/// shape `v1.cambra`'s cart view replies — a record whose `lines` and `positions` are
-/// lists. The feed's element type is a collection, and constraining the fed value against
-/// it reaches `constrain_argument` with the feed handle itself rather than the function it
-/// applies.
+/// `out << [q for a -> q in m]` hands the feed one collection per request. It types now:
+/// reading the channel yields its stream, so the aggregate over it applies a function
+/// rather than a handle. What it meets is op-conversion, where `max([sum(x) for x in out])`
+/// aggregates over a channel whose every position carries a collection — `MapAggregate`
+/// wants that input curried, one group per position, and the channel arrives sealed.
 ///
 /// No filter, so this is not the correlation defect
 /// [`a_reply_filtered_by_the_request_is_not_reachable`] pins: a reply carrying a collection
-/// is already unreachable with nothing correlated about it, and the two want separating
-/// before either is read as the other's cause.
+/// is unreachable with nothing correlated about it, and the two want separating before
+/// either is read as the other's cause.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "constrain_argument takes the applied function")]
+#[should_panic(expected = "MapAggregate requires CurriedFunction input")]
 fn a_reply_carrying_a_collection_is_not_reachable() {
     check_scalar(
         indoc! {r"
