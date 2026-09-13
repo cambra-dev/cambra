@@ -4102,3 +4102,92 @@ fn a_narrow_read_is_cheap_however_many_stores_exist() {
          a narrow read should not pay for stores it does not name"
     );
 }
+
+/// A reply carrying an **aggregate** of a transactional map's entries, which works.
+///
+/// This is the nearest working neighbour to the two pins below, and it is what makes the
+/// filter and the collection the identified variables rather than the entry binder or the
+/// transactional source: sweeping `m` by its entries inside a read-only block and replying
+/// the total is reachable today.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_reply_aggregates_a_transactional_maps_entries() {
+    check_scalar(
+        indoc! {r"
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+            out = defer()
+            for v in [1, 2]:
+                with begin():
+                    out << sum([q for a -> q in m])
+            max(out)
+        "},
+        // Every request sums the whole map.
+        Value::Int(30),
+    );
+}
+
+/// A reply that carries a **collection** rather than a scalar.
+///
+/// `out << [q for a -> q in m]` hands the feed one collection per request, which is the
+/// shape `v1.cambra`'s cart view replies — a record whose `lines` and `positions` are
+/// lists. The feed's element type is a collection, and constraining the fed value against
+/// it reaches `constrain_argument` with the feed handle itself rather than the function it
+/// applies.
+///
+/// No filter, so this is not the correlation defect
+/// [`a_reply_filtered_by_the_request_is_not_reachable`] pins: a reply carrying a collection
+/// is already unreachable with nothing correlated about it, and the two want separating
+/// before either is read as the other's cause.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "constrain_argument takes the applied function")]
+fn a_reply_carrying_a_collection_is_not_reachable() {
+    check_scalar(
+        indoc! {r"
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+            out = defer()
+            for v in [1, 2]:
+                with begin():
+                    out << [q for a -> q in m]
+            max([sum(x) for x in out])
+        "},
+        // Every request sees the whole map, so both replies sum to 30.
+        Value::Int(30),
+    );
+}
+
+/// A reply whose comprehension **filters on the request row**, which is `v1.cambra`'s cart
+/// view in six lines.
+///
+/// The filter refines the comprehension's key domain with a predicate naming `v`. That
+/// refinement rides the collection's type, the collection is what the reply carries, and
+/// the feed is bound at the top level — so the predicate is recorded as a bound on a
+/// variable whose telescope predates `v`, and inference reports the reference as having
+/// left its binder's scope (`src/ccl/design/type-inference.md`, "The invariant").
+///
+/// The dependence is representable one phase later and not here. After `channelize` the
+/// feed is `[0, 1] ⤇ Int` — a collection over the loop's own domain, written
+/// `[1, 2] ≫ (λ v → …)`, where `v` is an ordinary binder over the body. During inference
+/// the same feed is `feed(chan(out) ⤇ V)`: one element type over an opaque channel domain,
+/// with nowhere for a `V` that varies by position to live.
+///
+/// Aggregating instead of replying the collection fails differently — the key binder meets
+/// a concrete `Int` and the witness collides — so the escape here is not the same defect
+/// seen twice.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
+fn a_reply_filtered_by_the_request_is_not_reachable() {
+    check_scalar(
+        indoc! {r"
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+            out = defer()
+            for v in [1, 2]:
+                with begin():
+                    out << [q for a -> q in m if a == v]
+            max([sum(x) for x in out])
+        "},
+        // Request 1 replies {1 ↦ 10} and request 2 replies {2 ↦ 20}.
+        Value::Int(20),
+    );
+}
