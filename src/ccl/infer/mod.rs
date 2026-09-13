@@ -335,26 +335,19 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             domains: domains.iter().map(coalesce_for_error).collect(),
             origin: ctx_label.to_string(),
         },
-        // TODO(smt-undecided): every arm below aborts the compiler, which is a
+        // TODO(smt-undecided): the `unknown` arm aborts the compiler, which is a
         // prototype tripwire rather than the policy. The policy this wants is the
         // one `constrain`'s deficit rule already applies to a predicate the
         // encoder cannot read — an undecided query is a structural mismatch —
-        // extended to `unknown`, which z3 answers for reasons outside this
-        // encoder's control, and to `SolverError`, which the variant's own doc
-        // calls a misencoding on this side and which
-        // `smt::tests::the_solver_will_error_on_type_errors` reaches from a
-        // well-formed query. A solver that will not start stays a hard failure
-        // under any policy: it is a fact about the machine, not about the program.
+        // extended to `unknown`, which the solver answers for reasons outside this
+        // encoder's control.
         ConstrainError::SmtError { lhs, rhs, error } => match error.as_ref() {
             // `constrain` decides an unreadable predicate as a mismatch, so the
             // variant reaches no caller.
             SmtError::Encoding { .. } => {
                 unreachable!("an Encoding failure is decided at the deficit rule: {error}")
             }
-            // Names no types: which comparison raised the query says nothing about
-            // a solver that is not there.
-            SmtError::Process { .. } => panic!("{error}"),
-            SmtError::SolverReportedUnknown | SmtError::SolverError { .. } => {
+            SmtError::SolverReportedUnknown => {
                 panic!("could not compare {lhs} <: {rhs}: {error}")
             }
         },

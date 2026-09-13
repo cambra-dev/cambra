@@ -51,7 +51,6 @@ test-log = "0.2.19"
 chumsky = "1.0.0-alpha.8"
 logos = "0.14"
 ariadne = "0.4"
-easy-smt = "0.3.2"
 indoc = "1.0"
 log = "0.4.29"
 env_logger = "0.11.9"
@@ -61,6 +60,13 @@ bit-vec = "0.8.0"
 intervalsets = "0.1.0-alpha.2"
 # Pinned to the version `intervalsets` already pulls in, so the tree builds one copy.
 itertools = "0.13"
+# The SMT solver that refinement subtyping discharges its queries to
+# (`src/ccl/infer/solver/smt.rs`). Pure Rust and linked in, so a query costs no
+# subprocess and the crate builds for `wasm32-unknown-unknown`. Default features
+# are off to keep `nlsat` (nonlinear real arithmetic) and `scripting` (an embedded
+# Rhai interpreter) out of the tree: the encoded fragment is linear integer
+# arithmetic, and the encoder builds terms rather than parsing scripts.
+oxiz = { version = "0.3.3", default-features = false, features = ["std"] }
 smol_str = "0.3.6"
 stacker = "0.1"
 # The inspector wire types (`src/inspector_model`) derive `Serialize`; the
@@ -70,6 +76,14 @@ stacker = "0.1"
 # in wall-clock, while the gate cost a standing clippy configuration.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# `oxiz`'s hash tables seed themselves from `getrandom`, whose
+# `wasm32-unknown-unknown` backend is opt-in: the target has no OS entropy source,
+# so the crate refuses to pick one and names the browser's as a feature. Declared
+# here because a feature is selected for the whole graph, not by the dependency
+# that needs it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [profile.release]
 debug = "line-tables-only"

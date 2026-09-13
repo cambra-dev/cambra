@@ -65,10 +65,10 @@ Ordered for a newcomer; each layer is precise about what is implemented versus d
 ## Building from source
 
 Requires a recent Rust toolchain (pinned in [rust-toolchain.toml](rust-toolchain.toml)) and
-[z3](https://github.com/Z3Prover/z3/releases) on `PATH`. The type checker decides a refinement
-subtyping question structural matching leaves open by running a query against z3 as a subprocess,
-so without it the test suite fails. `./ci.sh solver` reports whether it is there; CI installs the
-release pinned in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+nothing else. The type checker decides a refinement subtyping question structural matching leaves
+open by running an SMT query against [oxiz](https://crates.io/crates/oxiz), a pure-Rust solver
+linked into the compiler: there is no solver binary to install, and the library builds for
+`wasm32-unknown-unknown`. `./ci.sh wasm` is the gate on that target.
 
 ```bash
 cargo build          # build

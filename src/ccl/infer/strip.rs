@@ -23,7 +23,7 @@
 //! Nothing here memoizes across compiles. [`compiled_refinements`] is a `Vec`
 //! searched by `contains` on every insert and every query, over
 //! [`Refinement`]'s structural equality across whole predicate terms, and the
-//! solver path behind it re-asks z3 per deficit with no memo on
+//! solver path behind it re-asks the solver per deficit with no memo on
 //! `(base, lhs, rhs)`. Unmeasured.
 //!
 //! Two kinds of interior type survive.
