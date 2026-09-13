@@ -1351,7 +1351,8 @@ binders and `let` binders, interleaved in scope order. Emission already holds th
 A bound recorded on a variable **closes against the holder's telescope**: every free term variable
 of the bound's type is in the telescope or in the edge's substitution domain. The check runs when
 the bound is recorded, and it is a lookup, since uniquify gives every binding site one uid. A
-violation names the variable and the reference and fails.
+violation names the variable and the reference and fails. Every build enforces it: a release
+compile rejects what a debug compile rejects.
 
 Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
 and the pass-boundary re-derivations that check what a pass produced. A re-derivation walks a tree

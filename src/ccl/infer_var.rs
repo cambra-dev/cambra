@@ -12,9 +12,6 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-// Both users are debug-only — the record-time closure check and its gap set — so a
-// release build has none and an ungated import is an unused one there.
-#[cfg(any(debug_assertions, test))]
 use std::collections::BTreeSet;
 
 use crate::ccl::{Name, Type, subst};
@@ -452,7 +449,6 @@ pub(crate) trait TelescopeWalk {
 /// an error. A program source is never one: a source reference is a
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
-#[cfg(any(debug_assertions, test))]
 pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
     subst::scope_gaps(&bound.ty, |n| {
         telescope.contains(n)
@@ -469,29 +465,27 @@ pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet
 /// inference time; it allocates only for a bound whose type carries a refinement,
 /// since an empty `BTreeSet` does not allocate. Narrowing it to a pass boundary is
 /// what `check_scope_valid` already does, and what this check exists to precede.
+///
+/// Enforced in every build, at the cost measured above. Holding only under
+/// `debug_assertions` would make two compilers: a release build would accept a tree a
+/// debug build rejects, and the trees it accepted would be exactly the ones carrying a
+/// reference some pass failed to rewrite.
 pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: &Bound) {
-    #[cfg(debug_assertions)]
-    {
-        // The record-time closure invariant, as an internal error (see
-        // `src/ccl/design/type-inference.md`, "The invariant"). Every gap is an
-        // error: a bound's free term variables are the telescope's entries and
-        // the edge substitutions' domains, and a program source is not among them
-        // because a source reference is a [`crate::ccl::TypedExprNode::Source`]
-        // node rather than a variable.
-        let gaps = bound_scope_gaps(&holder.telescope, bound);
-        if let Some(open) = gaps.iter().next() {
-            panic!(
-                "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
-                 `{}` but is neither in the holder's telescope {:?} nor discharged by \
-                 the edge's substitutions — the bound left its binder's scope \
-                 without a mediating discharge (see type-inference.md, \"The invariant\")",
-                holder.uid, bound.ty, holder.telescope,
-            );
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (holder, side, bound);
+    // The record-time closure invariant, as an internal error (see
+    // `src/ccl/design/type-inference.md`, "The invariant"). Every gap is an
+    // error: a bound's free term variables are the telescope's entries and
+    // the edge substitutions' domains, and a program source is not among them
+    // because a source reference is a [`crate::ccl::TypedExprNode::Source`]
+    // node rather than a variable.
+    let gaps = bound_scope_gaps(&holder.telescope, bound);
+    if let Some(open) = gaps.iter().next() {
+        panic!(
+            "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
+             `{}` but is neither in the holder's telescope {:?} nor discharged by \
+             the edge's substitutions — the bound left its binder's scope \
+             without a mediating discharge (see type-inference.md, \"The invariant\")",
+            holder.uid, bound.ty, holder.telescope,
+        );
     }
 }
 
@@ -782,10 +776,8 @@ mod tests {
     /// The record-time closure invariant is an internal error on the live
     /// solve: recording a bound whose free reference is a *uniquified* name
     /// covered by neither the holder's telescope nor the edge's substitutions
-    /// panics. Debug builds only — the check rides `debug_assertions`, like
-    /// `check_scope_valid`.
+    /// panics.
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "open bound recorded")]
     fn recording_an_open_bound_is_an_internal_error() {
         use crate::ccl::{Name, Refinement, TypedExpr};
@@ -804,7 +796,6 @@ mod tests {
     /// raw gap is a reference some pass failed to rewrite — the dangling refinement
     /// this check exists to catch.
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "open bound recorded")]
     fn a_raw_gap_is_an_internal_error() {
         use crate::ccl::{Name, Refinement, TypedExpr};
