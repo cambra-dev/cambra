@@ -64,6 +64,11 @@
 //! all ([`asset_cart_single_line_serves_its_routes`]). It carries v1's refined
 //! `Balance`, which the checkout's guard discharges
 //! ([`asset_cart_single_line_rejects_a_weakened_checkout_guard`]).
+//!
+//! `v2_single_line.cambra` is its reload target, unwinding the fixed-scale
+//! assumption into a divisor per asset. The two share a wiring, and swapping one
+//! for the other over a running cart is the demo's reload
+//! ([`asset_cart_single_line_reloads_to_per_asset_scales`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -763,4 +768,100 @@ fn asset_cart_single_line_rejects_a_weakened_checkout_guard() {
             );
         }
     }
+}
+
+/// The demo's reload: `v1_single_line.cambra` running, `v2_single_line.cambra` swapped in
+/// over it, and the cart it had built still there.
+///
+/// v1 divides every line by `one_btc`; v2 reads a divisor per asset out of `scales`. The
+/// swap is visible on ETH, whose scale is gwei rather than satoshis, and invisible on BTC,
+/// whose is unchanged — so the run separates "the new code took effect" from "the old state
+/// survived" instead of conflating them.
+#[test]
+fn asset_cart_single_line_reloads_to_per_asset_scales() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
+    let v1 = std::path::Path::new(dir).join("v1_single_line.cambra");
+    let declared = ChannelFile::beside(&v1)
+        .expect("the channel file parses")
+        .expect("the program has a channel file");
+    // A reload changes the program and not the channels, so the two versions' wirings are
+    // one wiring. They are separate files because either program can be booted alone.
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(dir).join("v1_single_line.channels.json"))
+            .expect("v1's wiring is readable"),
+        std::fs::read_to_string(std::path::Path::new(dir).join("v2_single_line.channels.json"))
+            .expect("v2's wiring is readable"),
+        "the versions a reload swaps between share one wiring",
+    );
+
+    let mut host = Host::compile(
+        "v1_single_line.cambra",
+        include_str!("v1_single_line.cambra"),
+        &declared.channels,
+    )
+    .expect("v1 embeds");
+
+    // A quote for each asset, then a line in each account's cart.
+    for (ticker, dollars) in [("BTC", 1_000), ("ETH", 2_000)] {
+        host.push(
+            "price_updates",
+            [record(&[
+                ("ticker", Value::String(ticker.into())),
+                ("price", Value::Int(dollars * SCALE)),
+            ])],
+        )
+        .expect("`price_updates` is a declared source");
+        tick_until_quiet(&mut host);
+    }
+    let qty = SCALE / 1_000;
+    for (account, ticker) in [(1i64, "BTC"), (2, "ETH")] {
+        call(
+            &mut host,
+            "PATCH",
+            "/cart",
+            &[
+                ("account", Value::Int(account)),
+                ("ticker", Value::String(ticker.into())),
+                ("qty", Value::Int(qty)),
+            ],
+        );
+    }
+
+    let view = |host: &mut Host, account: i64| -> Value {
+        let mut rows = call(host, "GET", "/cart", &[("account", Value::Int(account))]);
+        assert_eq!(rows.len(), 1, "one request serves one line");
+        rows.remove(0)
+    };
+    let (btc_before, eth_before) = (view(&mut host, 1), view(&mut host, 2));
+
+    host.reload(include_str!("v2_single_line.cambra"))
+        .expect("v2 declares the same state v1 holds, so the swap is accepted");
+
+    let (btc_after, eth_after) = (view(&mut host, 1), view(&mut host, 2));
+
+    // BTC's scale is satoshis in both versions, so its line is untouched — every field of
+    // it, which is the state that had to survive the swap.
+    assert_eq!(btc_after, btc_before, "BTC's line is unchanged by the swap");
+
+    // ETH's divisor becomes gwei, so its total falls by the ratio of the two scales and
+    // nothing else about it moves.
+    let field = |row: &Value, name: &str| match row {
+        Value::Record(fields) => fields.get(name).cloned().expect("the field is present"),
+        other => panic!("a line is a record, got {other:?}"),
+    };
+    for name in ["cash", "ticker", "qty", "price", "held"] {
+        assert_eq!(
+            field(&eth_after, name),
+            field(&eth_before, name),
+            "the swap keeps ETH's {name}",
+        );
+    }
+    let Value::Int(before) = field(&eth_before, "total") else {
+        panic!("a total is an Int");
+    };
+    assert_eq!(
+        field(&eth_after, "total"),
+        Value::Int(before / 10),
+        "ETH prices at gwei after the swap, a tenth of what satoshis gave",
+    );
 }

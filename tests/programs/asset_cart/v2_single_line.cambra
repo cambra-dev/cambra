@@ -1,37 +1,28 @@
-# The map-based cart with **one line per account**, which is what makes it run.
+# The single-line cart with **one divisor per asset**, which is what
+# `v1_single_line.cambra` assumes away.
 #
-# `v1.cambra` is the same app with a cart keyed by `{AccountId, Ticker}`, so an
-# account holds any number of lines and every read of the cart is an iteration
-# over the entries belonging to one account. That iteration is what v1's header
-# lists four obstructions to. Holding one line per account replaces each of those
-# reads with a keyed lookup, and the program compiles and runs today.
+# v1 prices every line by dividing through `one_btc`, so every asset is taken to hold
+# 10^8 base units. Here each asset names its own: `scales` carries satoshis for BTC and
+# gwei for ETH, and the checkout and the view both read the divisor out of it.
 #
-# What the simplification costs, and what it keeps:
+# This is the reload target for `v1_single_line.cambra`: the demo swaps one for the other
+# over a running cart. They share one wiring — `v2_single_line.channels.json` repeats
+# `v1_single_line.channels.json` — because a reload changes the program and not the
+# channels: the same routes, the same feed, the same ports.
 #
-#   - **Costs**: an account has one pending line, so the cart cannot hold a
-#     basket. A second `PATCH /cart` replaces the line rather than adding to it,
-#     which is what `cart[c.account] := …` says.
-#   - **Keeps**: the keyed collections, the three routes, the live price feed,
-#     the refined `Balance`, and the atomicity claim — the debit, the credit and
-#     the clear commit together or not at all, under one `if` inside one block.
+# A reload keeps what the running version holds, so the cart lines, the balances, the
+# holdings and the latest quotes all carry across and only the arithmetic over them
+# differs — visibly for an asset whose scale is not 10^8.
 #
-# One further difference from v1, and it is not about the cart: the price feed is
-# the declared source `price_updates`, as in `v0.cambra`, because
-# `wasm_socket_subscribe` is not built. The rows are the same shape the socket
-# would deliver.
-#
-# `v2_single_line.cambra` is the reload target: the same cart with one divisor per asset
-# instead of this file's single `one_btc`. The two share a wiring and are what the demo
-# reloads between.
-#
-# `holdings` keeps its compound key: it is only ever written and read at one key,
-# never swept, and a compound key is fine for both (`v1.cambra`'s header records
-# which of those work).
-#
-# Every collection is seeded rather than started empty, because `m[k]` is the
-# proven lookup and faults on an absent key. An account's line seeds at qty 0.
+# Everything else is `v1_single_line.cambra`'s, the refined `Balance` and the atomicity
+# claim included; that file's header carries the shape and what the simplification costs.
 
-one_btc = 10**8
+# Each asset's base unit, and they differ — which is the whole of v2. `one_dollar` is
+# the price scale and is shared, so it stays one constant.
+satoshi = 10**8
+gwei = 10**9
+scales = map([("BTC", satoshi), ("ETH", gwei)])
+
 one_dollar = 10**8
 
 AccountId = Int
@@ -54,8 +45,8 @@ accts: Mut(Map(AccountId, Balance), Txn) := box(map([
 ]))
 
 holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([
-    ((1, "BTC"), 2 * one_btc),
-    ((2, "ETH"), 5 * one_btc),
+    ((1, "BTC"), 2 * satoshi),
+    ((2, "ETH"), 5 * gwei),
 ]))
 
 cart: Mut(Map(AccountId, {ticker: Ticker, qty: Int}), Txn) := box(map([
@@ -82,7 +73,7 @@ for r in checkout_reqs:
     with begin():
         cash = accts[r.account]
         line = cart[r.account]
-        due = line.qty * prices[line.ticker] // one_btc
+        due = line.qty * prices[line.ticker] // scales[line.ticker]
         # `^-` records the difference, so the debit is typed
         # `{Microcents | __elem == cash ^- due}` rather than a bare `Microcents`, and the
         # guard is assumable inside its own arm. `Balance` demands `__elem >= 0`, which
@@ -105,7 +96,7 @@ for v in view_requests:
             ticker = line.ticker,
             qty = line.qty,
             price = px,
-            total = line.qty * px // one_btc,
+            total = line.qty * px // scales[line.ticker],
             held = holdings[(v.account, line.ticker)],
         )
 
