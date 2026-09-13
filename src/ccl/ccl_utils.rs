@@ -1089,11 +1089,11 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             value,
             domain,
             history_kind,
-        } => Type::History {
-            value: Box::new(strip_refinements(value)),
-            domain: Box::new(strip_refinements(domain)),
-            history_kind: *history_kind,
-        },
+        } => Type::history(
+            strip_refinements(domain),
+            strip_refinements(value),
+            *history_kind,
+        ),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole

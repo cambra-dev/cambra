@@ -2785,11 +2785,7 @@ mod tests {
         let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
-                ty: Type::History {
-                    value: Box::new(Type::Base(BaseType::Int)),
-                    domain: Box::new(Type::Hole),
-                    history_kind: HistoryKind::Overwrite,
-                },
+                ty: Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
                 user_annotation: None,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),

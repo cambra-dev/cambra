@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
 use crate::ccl::{
-    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, HistoryKind, Level,
-    Type, UnaryOpKind,
+    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Level, Type,
+    UnaryOpKind,
 };
 use crate::ccl::{FieldKey, FunKind};
 
@@ -395,17 +395,8 @@ impl OperatorSchemes {
         // **handle**, not a value, and its sequencing domain is the concrete `Txn`
         // rather than a quantified one — see the field's doc for what that pins.
         let nu = fresh_var(BODY_LEVEL);
-        let await_final = PolyScheme::poly(
-            SCHEME_LEVEL,
-            fun(
-                Type::History {
-                    value: Box::new(nu.clone()),
-                    domain: Box::new(Type::Txn),
-                    history_kind: HistoryKind::Overwrite,
-                },
-                nu,
-            ),
-        );
+        let await_final =
+            PolyScheme::poly(SCHEME_LEVEL, fun(Type::mutable(Type::Txn, nu.clone()), nu));
 
         Self {
             box_intro,

@@ -895,11 +895,7 @@ mod tests {
     /// key alike, or a clone pinned to one would serve a use of the other.
     #[test]
     fn history_kind_is_part_of_the_key() {
-        let history = |history_kind| Type::History {
-            value: Box::new(int()),
-            domain: Box::new(Type::Txn),
-            history_kind,
-        };
+        let history = |history_kind| Type::history(Type::Txn, int(), history_kind);
         assert_ne!(
             spec_key(&history(HistoryKind::Overwrite)),
             spec_key(&history(HistoryKind::Append))

@@ -481,11 +481,11 @@ fn coalesce_compact_go(
         // Both children materialize at the same polarity (invariant — both
         // directions were resolved at constraint time). The `kind` rides through
         // from compaction so a feed rebuilds as a feed, a mutable variable as a mutable variable.
-        shapes.push(Type::History {
-            value: Box::new(coalesce_compact_go(value, polarity, scope)?),
-            domain: Box::new(coalesce_compact_go(domain, polarity, scope)?),
-            history_kind: *history_kind,
-        });
+        shapes.push(Type::history(
+            coalesce_compact_go(domain, polarity, scope)?,
+            coalesce_compact_go(value, polarity, scope)?,
+            *history_kind,
+        ));
     }
     let mut all = Vec::new();
     all.append(&mut atoms);

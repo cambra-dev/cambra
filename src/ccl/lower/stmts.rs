@@ -937,11 +937,7 @@ pub(super) fn lower_middle_stmt(
             } else {
                 Type::Hole
             };
-            let mut_ty = Type::History {
-                value: Box::new(value_ty),
-                domain: Box::new(domain),
-                history_kind: crate::ccl::HistoryKind::Overwrite,
-            };
+            let mut_ty = Type::mutable(domain, value_ty);
             Ok(ctx.tag_image(Expr::mut_decl(name, mut_ty, val, body), stmt.span))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the

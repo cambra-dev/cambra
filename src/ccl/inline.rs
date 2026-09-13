@@ -630,7 +630,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
 mod tests {
     use super::*;
     use crate::ccl::ty::FunKind;
-    use crate::ccl::{BaseType, HistoryKind, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::ccl::{BaseType, Lit, Type, TypedExpr, TypedExprNode};
 
     // -----------------------------------------------------------------------
     // should_inline predicate
@@ -1142,11 +1142,7 @@ mod tests {
     fn refined_outer_param_discharged_by_mut_var_argument() {
         let int = Type::Base(BaseType::Int);
         let singleton = crate::ccl::infer::lit_singleton(&Lit::Int(5));
-        let handle = Type::History {
-            value: Box::new(singleton.clone()),
-            domain: Box::new(Type::Txn),
-            history_kind: HistoryKind::Overwrite,
-        };
+        let handle = Type::mutable(Type::Txn, singleton.clone());
         let udf_ty = fn_ty(singleton.clone(), int.clone());
 
         let lambda = TypedExpr::lambda("v", singleton, TypedExpr::var("v").with_ty(int.clone()))
@@ -1165,11 +1161,7 @@ mod tests {
     fn mut_var_argument_with_other_refinement_still_asserts() {
         let int = Type::Base(BaseType::Int);
         let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
-        let handle = Type::History {
-            value: Box::new(crate::ccl::infer::lit_singleton(&Lit::Int(7))),
-            domain: Box::new(Type::Txn),
-            history_kind: HistoryKind::Overwrite,
-        };
+        let handle = Type::mutable(Type::Txn, crate::ccl::infer::lit_singleton(&Lit::Int(7)));
         let udf_ty = fn_ty(demanded.clone(), int.clone());
 
         let lambda = TypedExpr::lambda("v", demanded, TypedExpr::var("v").with_ty(int.clone()))

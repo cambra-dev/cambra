@@ -574,11 +574,7 @@ mod tests {
             TypedExpr::let_bind("l", var("bound"), var("l")),
             TypedExpr::mut_decl(
                 "md",
-                Type::History {
-                    value: Box::new(Type::Hole),
-                    domain: Box::new(Type::Hole),
-                    history_kind: crate::ccl::HistoryKind::Overwrite,
-                },
+                Type::mutable(Type::Hole, Type::Hole),
                 var("seed"),
                 var("md"),
             ),

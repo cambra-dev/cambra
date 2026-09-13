@@ -397,11 +397,11 @@ pub fn freshen_above(
             value,
             domain,
             history_kind,
-        } => Type::History {
-            value: Box::new(freshen_above(lim, value, target, cache)),
-            domain: Box::new(freshen_above(lim, domain, target, cache)),
-            history_kind: *history_kind,
-        },
+        } => Type::history(
+            freshen_above(lim, domain, target, cache),
+            freshen_above(lim, value, target, cache),
+            *history_kind,
+        ),
         // A witness reference names a binder, not a variable, so what freshening owes it
         // is the α-conversion its binder got. A written sum's binder is re-minted by
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
