@@ -2037,6 +2037,7 @@ fn compact_go(
             value,
             domain,
             history_kind,
+            ..
         } => {
             let value = compact_go(value, pol, subst_acc, Position::default(), st);
             let domain = compact_go(domain, pol, subst_acc, Position::default(), st);

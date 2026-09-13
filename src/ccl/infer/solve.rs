@@ -511,6 +511,7 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
                 value,
                 domain,
                 history_kind,
+                ..
             },
             other,
         )
@@ -520,6 +521,7 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
                 value,
                 domain,
                 history_kind,
+                ..
             },
         ) => (value, domain, history_kind, other),
         _ => unreachable!("called only when at least one side peels to a History"),

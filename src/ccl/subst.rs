@@ -1452,6 +1452,7 @@ impl Subst {
                 value,
                 domain,
                 history_kind,
+                ..
             } => Type::history(
                 self.apply_type(domain),
                 self.apply_type(value),

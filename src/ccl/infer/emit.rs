@@ -689,6 +689,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
                 value: av,
                 domain: ad,
                 history_kind,
+                ..
             },
             Type::History {
                 value: iv,
@@ -1742,17 +1743,14 @@ pub(super) fn emit_let<C: Typing>(
             value,
             domain,
             history_kind: crate::ccl::HistoryKind::Append,
+            ..
         } = &bound_ty
         && let Type::Infer(dv) = domain.as_ref()
     {
-        let handle = Type::History {
-            value: value.clone(),
-            domain: Box::new(Type::ChanDom(
-                binding.name.clone(),
-                crate::ccl::ChanLevel(dv.level),
-            )),
-            history_kind: crate::ccl::HistoryKind::Append,
-        };
+        let handle = Type::feed(
+            Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level)),
+            (**value).clone(),
+        );
         bound_expr.ty = handle.clone();
         handle
     } else {

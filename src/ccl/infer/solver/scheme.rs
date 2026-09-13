@@ -397,6 +397,7 @@ pub fn freshen_above(
             value,
             domain,
             history_kind,
+            ..
         } => Type::history(
             freshen_above(lim, domain, target, cache),
             freshen_above(lim, value, target, cache),

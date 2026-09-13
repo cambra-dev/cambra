@@ -1239,7 +1239,18 @@ pub enum Type {
     /// written directly: a history denotes the arrow `domain ⤇ value`, and an arrow's
     /// binding discipline needs one owner (see [`Type::history`]).
     History {
-        /// The type of the history's value (a position's cell / element). Read
+        /// The **position binder**, if this history's value is dependent. Bound in
+        /// `value`, exactly as [`Type::Fun`]'s `name` is bound in `codomain`.
+        ///
+        /// A history denotes the arrow `domain ⤇ value`, and a feed whose contribution
+        /// varies by position needs that arrow to bind it — a reply built inside
+        /// `for v in src:` has a type that mentions `v`, and with nowhere to bind it the
+        /// reference escapes to whatever holds the feed. `Type::history_pi` is the only
+        /// constructor that sets it, and it closes `value` the way [`Type::pi_kinded`]
+        /// closes a codomain.
+        name: Option<crate::ccl::Name>,
+        /// The type of the history's value (a position's cell / element). May reference
+        /// `name`. Read
         /// through by the deref coercion for a [`HistoryKind::Overwrite`] reference.
         value: Box<Type>,
         /// The index the history's positions are tracked over (loop index,
@@ -2064,6 +2075,7 @@ fn fmt_type(
             value,
             domain,
             history_kind,
+            ..
         } => {
             let (value, domain) = (at(value, binders), at(domain, binders));
             if *history_kind == HistoryKind::Overwrite {
@@ -2277,6 +2289,28 @@ impl Type {
     /// construction through here gives the discipline one owner to move to.
     pub fn history(domain: Self, value: Self, history_kind: HistoryKind) -> Self {
         Type::History {
+            name: None,
+            value: Box::new(value),
+            domain: Box::new(domain),
+            history_kind,
+        }
+    }
+
+    /// A history whose **value depends on its position** — `feed((name: domain) ⤇ value)`.
+    ///
+    /// Closes `value` over `name` exactly as [`Type::pi_kinded`] closes a codomain, so a
+    /// history built here cannot carry a free name for the binder it provides. This is the
+    /// only constructor that sets [`Type::History`]'s `name`.
+    pub fn history_pi(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        value: Self,
+        history_kind: HistoryKind,
+    ) -> Self {
+        let name = name.into();
+        let value = crate::ccl::subst::close_pi_binder(&name, &value);
+        Type::History {
+            name: Some(name),
             value: Box::new(value),
             domain: Box::new(domain),
             history_kind,
@@ -2604,6 +2638,7 @@ impl Type {
                 domain,
                 value,
                 history_kind: HistoryKind::Append,
+                ..
             } => Some((domain, value)),
             _ => None,
         }
@@ -2988,6 +3023,7 @@ impl Type {
                 value,
                 domain,
                 history_kind,
+                ..
             } => Type::history(
                 domain.without_pi_names(),
                 value.without_pi_names(),

@@ -345,6 +345,7 @@ impl InferCtx {
                 value,
                 domain,
                 history_kind,
+                ..
             } => Type::history(
                 self.normalize_annotation_in(domain, telescope),
                 self.normalize_annotation_in(value, telescope),

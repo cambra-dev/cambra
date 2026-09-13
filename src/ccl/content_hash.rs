@@ -412,6 +412,7 @@ fn hash_type_in<'a>(
             value,
             domain,
             history_kind,
+            ..
         } => {
             history_kind.hash(state);
             hash_type_in(value, env, wenv, free, state);

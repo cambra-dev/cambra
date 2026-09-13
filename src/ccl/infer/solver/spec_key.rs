@@ -563,6 +563,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             value,
             domain,
             history_kind,
+            ..
         } => {
             let value = key_go(value, pol, subst_acc, ctx);
             let domain = key_go(domain, pol, subst_acc, ctx);
