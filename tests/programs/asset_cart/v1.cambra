@@ -28,22 +28,29 @@
 #      `demo_code_syntax.md` and here, where `wasm_serve` appears in three source
 #      files.
 #
-#   4. A filtered entry comprehension over a transactional map.  `due`, `lines`
-#      and `positions` all read `… if a == v.account` over a `Mut(Map(…), Txn)`.
-#      The map's keys are a witness domain `σ`, the predicate types its element
-#      at the key's tuple, and structural inference will not join the two.
-#      Naming the request row costs nothing here: a `<<` inside a loop
-#      contributes at the channel's position, so `v` resolves to the request at
-#      that position. `if a == 1` collides identically, with no request row, no
-#      reply and no feed —
-#      `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`
-#      is that program.
+#   4. A **compound** key on a transactional map.  `cart` and `holdings` are keyed
+#      by `{AccountId, Ticker}`, and a filtered entry comprehension over one
+#      collides on its upper bounds: the map's keys are a witness domain `σ` and
+#      the key tuple arrives beside it. A *scalar* key does not — the witness's
+#      kind bounds it by the key type, so the two are one contribution — which is
+#      what makes this about the key and not about the filter, the entry binder or
+#      the transaction. How the program spells the key makes no difference either:
+#      `k.0` and `(a, t)` report identically.
+#      Naming the request row costs nothing here: a `<<` inside a loop contributes
+#      at the channel's position, so `v` resolves to the request at that position.
+#      `a_filtered_entry_comprehension_over_a_compound_key_is_not_reachable` is the
+#      same collision in five lines, with no request row, no reply and no feed.
 #      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension`,
 #      over `v1_read_sites.cambra` — this program cannot report 4 itself, because
 #      1, 2 and 3 each stop it first.
 #
-# Behind those, and unobserved until they move: an entry binder over a
-# *transactional* map, where the witness escapes the sum that binds it; and a key
+# Behind 4, reachable with a scalar key today: the comprehension types, and the
+# predicate it carries names the map — which a reply then hands to a channel the
+# mutable variable does not reach
+# (`a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`).
+#
+# Behind those: an entry binder over a *transactional* map with no filter at all,
+# where the witness escapes the sum that binds it at `lambda_elim`; and a key
 # filter whose refinement reaches op-conversion as a `collection_contains` term,
 # which is carried and never executed.
 #

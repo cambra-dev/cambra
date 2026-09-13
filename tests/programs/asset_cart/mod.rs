@@ -535,11 +535,13 @@ fn asset_cart_v1_declares_the_routes_it_serves() {
 /// the top-level feed that holds the reply (`feed_contribution` in
 /// `src/ccl/infer/emit.rs`).
 ///
-/// What they meet instead is the filtered entry comprehension underneath, which needs no
-/// reply and no correlation to fail: `cart`'s keys are a witness domain `σ`, the predicate
-/// types its element at the key's tuple, and structural inference will not join the two.
-/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`
-/// (`tests/compilation_pipeline/comprehensions.rs`) pins the same collision on four lines.
+/// What they meet instead is the **compound key**, which needs no reply and no correlation
+/// to fail: `cart` and `holdings` are keyed by `{AccountId, Ticker}`, and a filtered entry
+/// comprehension over one collides on its upper bounds — the key tuple arrives beside the
+/// witness domain the map's keys are. A scalar key does not collide, so this is about the
+/// key rather than the filter or the transaction.
+/// `a_filtered_entry_comprehension_over_a_compound_key_is_not_reachable`
+/// (`tests/compilation_pipeline/comprehensions.rs`) pins it in five lines.
 ///
 /// The needle is that collision rather than a later one, on the same rule as
 /// [`asset_cart_v1_currently_blocked_on_entry_iteration`]: it is the *first* thing these

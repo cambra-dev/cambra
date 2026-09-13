@@ -4165,15 +4165,15 @@ fn a_reply_carrying_a_collection_is_not_reachable() {
 /// `__pos ▷ [1, 2]` and reaches the feed inside a binder rather than free
 /// (`feed_contribution` in `src/ccl/infer/emit.rs`).
 ///
-/// What stops it is the filtered entry comprehension underneath. `m`'s keys are a witness
-/// domain `σ`, the predicate types its element at `Int`, and structural inference will not
-/// join the two — the collision
-/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable` pins with no
-/// reply, no feed and no correlation, on a filter comparing against a literal. So this
-/// program is now blocked on a defect that is not about correlation.
+/// What stops it is the filtered entry comprehension underneath. The site types —
+/// `Σ (σ : SubtypesOf(Int)). ({σ | …} ⤇ Int)` — and the predicate it carries names `m`,
+/// which the reply then hands to a channel the mutable variable does not reach.
+/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable` reports the
+/// same violation with no reply, no feed and no correlation, on a filter comparing against
+/// a literal. So this program is now blocked on a defect that is not about correlation.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "Conflicting Types: Int | σ")]
+#[should_panic(expected = "references out-of-scope binder(s) [\"m\"]")]
 fn a_reply_filtered_by_the_request_is_not_reachable() {
     check_scalar(
         indoc! {r"

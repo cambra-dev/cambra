@@ -592,24 +592,26 @@ fn an_entry_binder_over_a_transactional_map_is_not_reachable() {
     );
 }
 
-/// A **filtered** entry comprehension over a transactional map. The filter's predicate and
-/// the map's key domain land on one variable: `σ` is what the `Mut` wraps, `Int` is what
-/// the predicate types its element at, and structural inference will not join the two.
+/// A **filtered** entry comprehension over a transactional map. It types — the site is
+/// `Σ (σ : SubtypesOf(Int)). ({σ | …} ⤇ Int)`, the witness bound and the entry binder at the
+/// key type its kind bounds it by — and the predicate it carries names `m`, which is where
+/// it stops: the type is stored at a node the mutable variable does not reach.
 ///
 /// Neither half of the entry binder escapes it — filtering on the key and filtering on the
-/// value report the same collision — so what the filter meets is the entry comprehension
-/// itself rather than which of its two binders the predicate names.
+/// value report the same thing — so what the filter meets is the predicate naming its
+/// source rather than which of the two binders the predicate reads.
 ///
-/// Three neighbours place it. Dropping the filter types
-/// ([`an_entry_binder_over_a_transactional_map_is_not_reachable`] gets as far as
-/// `lambda_elim`); dropping the entry binder fails elsewhere, on a scope violation naming
-/// the map; and the same filtered comprehension over a **plain** map types and reaches
-/// op-conversion ([`a_filtered_comprehension_over_a_map_is_not_reachable`]).
+/// Three neighbours place it. Dropping the filter leaves no predicate to carry the name and
+/// fails later instead ([`an_entry_binder_over_a_transactional_map_is_not_reachable`], at
+/// `lambda_elim`); dropping the entry binder reports this same violation; and the same
+/// filtered comprehension over a **plain** map types and reaches op-conversion
+/// ([`a_filtered_comprehension_over_a_map_is_not_reachable`]), because a let-bound
+/// collection is in scope where the predicate lands.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::on_the_key("sum([q for a -> q in m if a == 1])")]
 #[case::on_the_value("sum([q for a -> q in m if q > 10])")]
-#[should_panic(expected = "Conflicting Types: Int | σ")]
+#[should_panic(expected = "references out-of-scope binder(s) [\"m\"]")]
 fn a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable(
     #[case] comprehension: &str,
 ) {
@@ -626,6 +628,67 @@ fn a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable(
             comprehension
         ),
         Value::Int(20),
+    );
+}
+
+/// The same filter over a map whose key is a **tuple**, which does not get as far.
+///
+/// A scalar key absorbs: the witness's kind bounds it by `Int`, so the key type is a
+/// consequence of the kind rather than a second contribution
+/// ([`a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable`] reaches the
+/// predicate's own wall instead). A compound key does not, and it collides on the *upper*
+/// bounds rather than the lower ones — so the position is not the element read the scalar
+/// case resolves through.
+///
+/// How the program spells the key makes no difference: a single binder taking it apart with
+/// `k.0` and a tuple pattern binding `(a, t)` report identically, so what this pins is the
+/// key type and not the binder form. `v1.cambra`'s cart is keyed this way, which is why its
+/// read sites stop here.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::single_binder("sum([q for k -> q in m if k.0 == 1])")]
+#[case::tuple_pattern("sum([q for (a, t) -> q in m if a == 1])")]
+#[should_panic(expected = "Conflicting Types: \u{3c3} | (Int, String)")]
+fn a_filtered_entry_comprehension_over_a_compound_key_is_not_reachable(
+    #[case] comprehension: &str,
+) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map({{Int, String}}, Int), Txn) := box(map([((1, "a"), 10), ((2, "b"), 20)]))
+                n: Mut(Int, Txn) := 0
+                for r in [1]:
+                    with begin():
+                        n := n + {}
+                await_final(n)
+            "#},
+            comprehension
+        ),
+        Value::Int(10),
+    );
+}
+
+/// A key filter comparing against the **wrong type**, which still reports.
+///
+/// An element read inside a predicate defers a positive-polarity collision to the base that
+/// owns its answer (`src/ccl/infer/solve.rs`), and that deferral is only sound while a
+/// genuine mismatch still surfaces somewhere. It does, and from the operator rather than
+/// from the element: the witness's kind bounds the key by `Int`, `"x"` is a `String`, and
+/// the equality reports which operand it can never accept.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "Equatable accepts only String as its operand 1")]
+fn a_filtered_entry_comprehension_reports_a_key_compared_against_the_wrong_type() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+            n: Mut(Int, Txn) := 0
+            for r in [1]:
+                with begin():
+                    n := n + sum([q for a -> q in m if a == "x"])
+            await_final(n)
+        "#},
+        Value::Int(0),
     );
 }
 

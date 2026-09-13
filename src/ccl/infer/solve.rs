@@ -1681,14 +1681,26 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // what reaches this — its index binder's domain is the map's witness, and a bare read
     // of it meets the key type the witness's kind bounds it by.
     //
+    // **A refinement's element read has the same owner, and it is the base.** `__elem`
+    // ranges over the base, so a read of it carries no information of its own, and
+    // [`type_element_reads_from_base`](crate::ccl::ccl_utils::type_element_reads_from_base)
+    // installs the base's answer over whatever this walk produced — its doc calls the
+    // walk's a second answer to a question the base has already answered. A predicate over
+    // a `Map(K, V)`'s witness domain is where the two differ: the base materializes inside
+    // the Σ, so its witness absorbs the key type its kind bounds it by
+    // (`coalesce_compact_go`), while this walk resolves the shared variable with no binder
+    // in scope and sees the witness and that key type as a collision. Reporting it would
+    // report an answer that is about to be discarded.
+    //
     // Any *other* coalesce failure here is reported as usual — the narrow condition is
     // what keeps this from swallowing unrelated errors. Note that yielding to the binder
     // is not itself a claim that the type resolves: where the collision is genuine (arms
     // whose *element* types disagree), the parameter slot fails too and the error surfaces
     // from there instead. Deferring says which position owns the answer, not that there is
-    // one.
+    // one — and for an element read the base's own resolution is where a genuine one
+    // surfaces.
     if let TypedExprNode::Var(name) = &expr.node
-        && ctx.is_lambda_param(name)
+        && (ctx.is_lambda_param(name) || (ctx.in_predicate && name.is_elem()))
         && matches!(
             resolve_var_type(&expr.ty),
             Err(CoalesceError::IncompatibleBounds { polarity: true, .. })
