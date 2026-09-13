@@ -1156,9 +1156,14 @@ loop's positions and the channel's are the same positions — `channelize` assem
 `𝑝 ▷ source`. Left free it would be recorded as a bound on the variable holding the channel, whose
 telescope predates the loop; that is the record-time closure invariant's error, and a reply built
 inside a request loop is the program that reaches it. The abstraction is every feed site's rule
-rather than a dependent site's case: outside a loop there is no binder to substitute, and inside one
-whose binder the value does not name the substitution is vacuous, so both come out as a `𝑝` the
-codomain ignores.
+rather than a dependent site's case: with no iteration in scope there is no binder to substitute, and
+under one whose binder the value does not name the substitution is vacuous, so both come out as a `𝑝`
+the codomain ignores.
+
+Only a `TypedExprNode::For` puts an iteration in scope, and a `for` statement becomes one when it
+writes a mutable variable or contains a `with begin():`. A `for` that only feeds lowers to the
+composed encoding `source ≫ (λ 𝑥 → body)`, whose binder reaches the feed site unrecorded — so
+`out << [x for x in xs if x > v]` with no transaction around it still reports the escape.
 
 The demand a ParamAsTarget site raises binds no position. Rule 1 below relates the two histories'
 values under identity morphisms, so a binder minted for the demand would reach the caller's channel

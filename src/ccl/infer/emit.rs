@@ -1524,9 +1524,15 @@ pub(super) fn emit_feed<C: Typing>(
 /// `source ≫ (λ binder → body)` — which is what lets the binder resolve to the source's
 /// element there, `p ▷ source` ([`Iteration::element_at`]).
 ///
-/// The abstraction is every feed site's rule rather than a dependent site's case: outside a
-/// loop there is no binder to substitute, and inside one whose binder the value does not
-/// name the substitution is vacuous, so both come out as a `p` the codomain ignores.
+/// The abstraction is every feed site's rule rather than a dependent site's case: with no
+/// iteration in scope there is no binder to substitute, and under one whose binder the value
+/// does not name the substitution is vacuous, so both come out as a `p` the codomain ignores.
+///
+/// **Only a [`TypedExprNode::For`] puts an iteration in scope**, which a `for` statement
+/// becomes when it writes a mutable variable or contains a `with begin():`
+/// (`src/ccl/lower/loops.rs`, `src/ccl/lower/transactions.rs`). A `for` that only feeds
+/// lowers to the composed encoding `source ≫ (λ x → body)` instead, so its binder reaches a
+/// feed site unrecorded and a refinement naming it still escapes.
 fn feed_contribution<C: Typing>(value_ty: &Type, ctx: &mut C) -> Type {
     let domain = ctx.fresh();
     let position = Name::position();

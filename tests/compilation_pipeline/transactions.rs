@@ -4188,3 +4188,32 @@ fn a_reply_filtered_by_the_request_is_not_reachable() {
         Value::Int(20),
     );
 }
+
+/// The same correlated reply with **no transaction**, which escapes where the one above no
+/// longer does.
+///
+/// The abstraction over the channel's position is fed by the iteration `emit_for` records,
+/// and only a `TypedExprNode::For` carries one. A `for` statement becomes that node when it
+/// writes a mutable variable or contains a `with begin():` (`src/ccl/lower/loops.rs`,
+/// `src/ccl/lower/transactions.rs`); a `for` that only feeds lowers to the composed encoding
+/// `source ≫ (λ v → body)` instead. So `v` reaches the feed site unrecorded here, the
+/// refinement naming it rides the reply's collection into the top-level channel, and the
+/// bound leaves its binder's scope.
+///
+/// Nothing about the source is involved — a list carries no witness and no map does either
+/// — so this is the abstraction not reaching a loop, not a second defect behind it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
+fn a_reply_filtered_by_the_request_outside_a_transaction_is_not_reachable() {
+    check_scalar(
+        indoc! {r"
+            out = defer()
+            for v in [1, 2]:
+                out << [x for x in [1, 2, 3] if x > v]
+            max([sum(x) for x in out])
+        "},
+        // Request 1 replies [2, 3] and request 2 replies [3].
+        Value::Int(5),
+    );
+}
