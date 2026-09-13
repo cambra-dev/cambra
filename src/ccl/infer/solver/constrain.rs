@@ -1869,11 +1869,11 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             value,
             domain,
             history_kind,
-        } => Type::History {
-            value: Box::new(extrude_invariant(value, target_level, cache)),
-            domain: Box::new(extrude_invariant(domain, target_level, cache)),
-            history_kind: *history_kind,
-        },
+        } => Type::history(
+            extrude_invariant(domain, target_level, cache),
+            extrude_invariant(value, target_level, cache),
+            *history_kind,
+        ),
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&(tv.uid, pol)) {
                 return Type::Infer(Rc::clone(existing));
@@ -2743,11 +2743,7 @@ mod tests {
     /// collection `Fun { domain, value }` (unlike an `Overwrite`, which derefs to the
     /// scalar `value`); the invariant `constrain` arms treat it as that `Fun`.
     fn feed_ty(domain: Type, value: Type) -> Type {
-        Type::History {
-            value: Box::new(value),
-            domain: Box::new(domain),
-            history_kind: HistoryKind::Append,
-        }
+        Type::feed(domain, value)
     }
 
     #[test]
@@ -2954,11 +2950,7 @@ mod tests {
     // --- Mutable handles (`Type::History { kind: Overwrite }`) ---
 
     fn mut_ty(value: Type, domain: Type) -> Type {
-        Type::History {
-            value: Box::new(value),
-            domain: Box::new(domain),
-            history_kind: HistoryKind::Overwrite,
-        }
+        Type::mutable(domain, value)
     }
 
     // There is no deref arm to test: a mutable variable mention that denotes its value is

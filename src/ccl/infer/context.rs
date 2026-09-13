@@ -345,11 +345,11 @@ impl InferCtx {
                 value,
                 domain,
                 history_kind,
-            } => Type::History {
-                value: Box::new(self.normalize_annotation_in(value, telescope)),
-                domain: Box::new(self.normalize_annotation_in(domain, telescope)),
-                history_kind: *history_kind,
-            },
+            } => Type::history(
+                self.normalize_annotation_in(domain, telescope),
+                self.normalize_annotation_in(value, telescope),
+                *history_kind,
+            ),
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_)
             | Type::UIntRange(_)
