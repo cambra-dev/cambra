@@ -5,8 +5,9 @@
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
+use crate::ccl::infer::solver::smt::NoScope;
 use crate::ccl::infer::solver::{
-    ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+    ConstrainCache, Derivation, PolyScheme, constrain_subtype_in, fresh_var, prim,
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
@@ -260,17 +261,26 @@ impl Typing for CheckCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        // Delegate to the solver's `constrain_subtype` — the single source of
-        // truth for width/variance and (since refinements ride the lattice as
-        // restriction refinements) refinement subsetting. A failure is recorded (not
-        // propagated) so the walk continues and reports every error.
+        // Delegate to the solver — the single source of truth for width/variance and
+        // (since refinements ride the lattice as restriction refinements) refinement
+        // subsetting. A failure is recorded (not propagated) so the walk continues and
+        // reports every error.
+        //
+        // [`NoScope`], as [`require_sub_under`](Typing::require_sub_under) supplies:
+        // this walk resolves no names, so it holds no binder types for the deficit
+        // rule's semantic fallback to read, but the fallback still runs. Deciding the
+        // deficit structurally instead — what `constrain_subtype`'s `SkipSmtScope`
+        // does — makes this wall reject what emission proved, and an obligation raised
+        // through this method rather than through `require_sub_under` then reads as a
+        // compiler bug on a program inference accepted. A mutable variable's refined
+        // initializer is the shape that reaches it (`emit_mut_decl`).
         //
         // The cache serves this walk's derivation: a whole tree enforces the
         // closure invariant like the live solve, a sub-tree probe cannot (the
         // binders its refinements reference are held by the context it was cut from).
         let mut cache = ConstrainCache::for_derivation(self.derivation);
         cache.seed_context(&self.witness_ctx);
-        if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
+        if let Err(e) = constrain_subtype_in(sub, sup, &mut cache, &NoScope) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }

@@ -5949,6 +5949,77 @@ fn a_keyed_write_of_a_product_that_is_not_positive_is_rejected(
     );
 }
 
+/// The demo's checkout, in the shape that makes its claim: a balance read out of the
+/// transactional map, a guard, and a debit written back under it. Writing a balance that
+/// cannot be shown non-negative is ill-typed, and every value here is a runtime one.
+///
+/// Three things have to hold at once for the accepted case. `^-` records the difference,
+/// so the written value is `{Int | __elem == cash ^- due}` rather than a bare `Int`; the
+/// guard is assumable inside its own arm, which is what supplies `cash >= due`; and the
+/// codomain's demand is `__elem >= 0`, which follows from the two. Drop any one and the
+/// write is rejected — the three cases below drop each in turn.
+#[rstest]
+#[case::guarded("cash >= due", "cash ^- due", true)]
+// The guard admits `cash == due - 5`, at which the difference is negative.
+#[case::guard_too_weak("cash >= due - 5", "cash ^- due", false)]
+// `-` associates an unrefined `Output`, so the written value says nothing the guard can
+// be combined with.
+#[case::plain_difference("cash >= due", "cash - due", false)]
+fn a_guarded_debit_of_a_refined_balance(
+    #[case] guard: &str,
+    #[case] value: &str,
+    #[case] accepted: bool,
+) {
+    let code = refined_balance_checkout(guard, value);
+    if accepted {
+        assert_eq!(infer_program(&code).to_string(), "Int@0");
+    } else {
+        let errs = infer_program_err(&code);
+        assert!(
+            format!("{errs:?}")
+                .contains("keyed write to mutable variable `accts`: expected {Int | __elem >= 0}"),
+            "expected the codomain demand to be reported unmet, got {errs:?}"
+        );
+    }
+}
+
+/// The store the checkout debits, seeded through `^*`. A map literal's codomain is the
+/// join of its entries, so two entries carrying *different* equations join to a bare
+/// `Int` and no refining operator helps; the seeds are equal here, which is what leaves
+/// the join a refinement the declaration can be met by.
+#[rstest]
+#[case::refining("500 ^* one_dollar", true)]
+#[case::plain("500 * one_dollar", false)]
+fn a_scaled_seed_meets_a_refined_store(#[case] amount: &str, #[case] accepted: bool) {
+    let code = format!(
+        "one_dollar = 100000000\n\
+         accts: Mut(Map(Int, {{Int where _ >= 0}}), Txn) := box(map([\n\
+         \x20   (1, {amount}),\n\
+         \x20   (2, {amount}),\n\
+         ]))\n0\n"
+    );
+    if accepted {
+        assert_eq!(infer_program(&code).to_string(), "Int@0");
+    } else {
+        let errs = infer_program_err(&code);
+        assert!(
+            format!("{errs:?}")
+                .contains("initializer of mutable `accts`: expected {Int | __elem >= 0}"),
+            "expected the declared refinement to be reported unmet, got {errs:?}"
+        );
+    }
+}
+
+/// The transaction body [`a_guarded_debit_of_a_refined_balance`] types: a balance read at
+/// the key the block is about, an amount owed, and one guarded keyed write back.
+fn refined_balance_checkout(guard: &str, value: &str) -> String {
+    format!(
+        "accts: Mut(Map(Int, {{Int where _ >= 0}}), Txn) := box(map([(1, 100), (2, 100)]))\n\
+         for r in [1, 2]:\n    with begin():\n        cash = accts[r]\n        due = 30\n\
+         \x20       if {guard}:\n            accts[r] := {value}\n0\n"
+    )
+}
+
 /// The transaction body every case above writes: a balance read out of `accts` at the
 /// key the block is about, and one keyed write of `value` back to it.
 fn refined_balance_write(value: &str) -> String {

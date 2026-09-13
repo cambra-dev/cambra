@@ -86,30 +86,19 @@ fn check_compile_error(code: &str, needle: &str) {
     40
 )]
 // TODO(refined-txn-body): a transaction body writing a *refined* mutable variable
-// (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, blocked three times over.
-// Inference itself accepts such a write and reports an unmet one against the declared
-// refinement (`tests/type_check.rs`, `a_keyed_write_of_a_refined_product_is_accepted`
-// and the two rejections beside it); every blocker below is a later phase.
+// (`pool: Mut({Int where _ >= 0}, Txn)`) has no case here, and the reason is no longer
+// about typing it. Inference accepts such a write, reports an unmet one against the
+// declared refinement, and reads an enclosing guard as an assumption while doing it —
+// `tests/type_check.rs`, `a_keyed_write_of_a_refined_product_is_accepted` and the
+// rejections beside it, and `type_annotations.rs`'s `transaction6`.
 //
-// The *seed* is the first, and it stops a program that never writes. Emit decides
-// `Int@100 <: {Int | __elem >= 0}` through the solver's semantic fallback, which is
-// what the mutable-variable introduction rule raises. The post-inference check
-// re-raises the same obligation through `Typing::require_sub`, which supplies
-// `SkipSmtScope` and so decides the deficit structurally
-// (`src/ccl/design/type-inference.md`, "The scope a query runs in"). The two
-// disagree, and a program inference accepted panics at the boundary as an invalid
-// tree — `a_refined_scalar_mut_seed_reaches_the_boundary` pins it.
-//
-// A `^+` write records its sum, so `pool := pool ^+ 1` types the written value
-// `{Int | __elem == pool ^+ 1}` — a predicate naming the mutable binder.
-// `close_let_type` holds a `:=` definiens back from the closing discharge (a
-// history denotes no value to substitute), so nothing eliminates the name and
-// `check_scope_valid` reports a `ScopeViolation` on a well-typed program.
-//
-// A plain `-` write is the third: `pool := pool - r` under `if pool - r >= 0`
-// types the written value `Int`, which does not entail `__elem >= 0`. Reading the
-// guard as a refinement on its branch is path sensitivity, which the type system
-// does not do.
+// What stops it is that the declared refinement rides the recurrence carrier into
+// planning, where `letrec` recognition asserts it cannot: a refinement is a fact about
+// one value, and a history holds a different value at each commit
+// (`src/ccl/planning/loops.rs`). Erasing it at the stamp, once inference has used it, is
+// the change that unblocks this; the phases between re-derive each writer's obligation
+// with no scope and reject the same programs until they too read a bare carrier.
+// `type_annotations.rs`'s `transaction2` through `transaction5` pin both walls.
 
 // Two writers over one mutable variable: the operator serializes + retries, conserving the
 // total: 100 − 30 − 40 = 30.

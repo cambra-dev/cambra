@@ -2948,12 +2948,12 @@ The bottom two rows are ordinary schemes, because their operand types are fixed.
 
 #### A refining operator records its own result
 
-`^+` and `^*` compute what `+` and `*` compute, and differ in the trait each states.
-`AddableRefined` and `MultipliableRefined` hold one row each — `Int` operands, an `Int`
-`Output` — and the row refines that `Output` by an equation over the operand *terms*:
-`{Int | __elem == 𝑎₁ ^+ 𝑎₂}` and `{Int | __elem == 𝑎₁ ^* 𝑎₂}`. The row builds it through a
-`RefinementTemplate`, a `fn` the instance holds that receives the operand expressions
-(`src/ccl/infer/solver/traits.rs`).
+`^+`, `^-` and `^*` compute what `+`, `-` and `*` compute, and differ in the trait each
+states. `AddableRefined`, `SubtractableRefined` and `MultipliableRefined` hold one row each —
+`Int` operands, an `Int` `Output` — and the row refines that `Output` by an equation over
+the operand *terms*: `{Int | __elem == 𝑎₁ ^+ 𝑎₂}`, and the same shape for the other two.
+The row builds it through a `RefinementTemplate`, a `fn` the instance holds that receives
+the operand expressions (`src/ccl/infer/solver/traits.rs`).
 
 The equation is the instance's, so an operand's own refinement still does not reach the result
 (`tests/type_check.rs`, `an_operator_result_carries_no_operand_refinement`). What the equation
@@ -2962,8 +2962,24 @@ gives the solver is a term to read back through: `{Int | __elem == cash ^* 2}` e
 arithmetic that produces the next one.
 
 Which operators have a refining counterpart is the table's content rather than a property of the
-mechanism: `^+` and `^*` have one, and `-`, `//` and `**` do not. Adding one is a row, an
-`ArithmeticKind`, and a token.
+mechanism: `^+`, `^-` and `^*` have one, and `//` and `**` do not. Adding one is a row, an
+`ArithmeticKind`, and a token — plus an arm in `Encode::binop`, without which the equation the
+row records is one the solver drops. `//` and `**` are the two that would need the encoding
+first: SMT-LIB's `div` is Euclidean rather than floor division, and it states no integer
+exponentiation at all.
+
+#### A collection literal joins its elements, refinements included
+
+A collection literal's codomain is the join over its entries, and a join keeps the refinements
+its operands share. Two entries carrying the *same* predicate keep it —
+`map([(1, 100), (2, 100)])` has codomain `Int@100` — and two carrying different ones join to the
+bare base, because the intersection of their refinement sets is empty.
+
+So no refining operator makes `map([(1, 500 ^* d), (2, 250 ^* d)])` meet a refined codomain:
+the two entries record different equations, the join drops both, and what reaches the
+annotation is `Int`. Writing the entries at one value is what leaves the join a refinement,
+and it is a property of the literal rather than of the arithmetic above it
+(`tests/type_check.rs`, `a_scaled_seed_meets_a_refined_store`).
 
 ### UnaryOp type rules
 

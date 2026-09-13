@@ -496,23 +496,18 @@ fn a_let_bound_constant_returned_directly() {
     )
 }
 
-/// **This test pins a defect, not a decision — it should start failing when the
-/// defect is fixed.**
+/// A refinement that survives to planning's post-pass check. `2` is not `0`, so
+/// inference admits the call through the semantic fallback, and the check re-derives
+/// the same obligation and admits it the same way.
 ///
-/// `2` is not `0`, so inference admits the call: the argument's type
-/// is `Int@2`, which entails both written demands through the fallback. Planning's
-/// post-pass check then rejects the same call. Both predicates are point-free by
-/// then — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — which is outside the encoded
-/// fragment, so the deficit falls back to the structural matching the fallback
-/// exists to get past, and a well-typed program reports an internal invariant
-/// failure.
-///
-/// Widening the encoding past surface syntax retires this pin, as would checking
-/// against the pre-elimination predicate. Once it passes, the program evaluates
-/// `4 // 2`. The rejecting counterpart is `tests/programs/refinement/`.
+/// What used to reject it was the check's own scope: `Typing::require_sub` supplied
+/// `SkipSmtScope`, so the deficit the fallback exists to get past was decided
+/// structurally instead. The predicates are point-free by then —
+/// `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — and structurally unequal, so a
+/// well-typed program reported an internal invariant failure. The rejecting
+/// counterpart is `tests/programs/refinement/`.
 #[test]
-#[should_panic(expected = "produced an invalid tree: [Type mismatch")]
-fn refinements_that_survive_to_post_planning_check_are_rejected() {
+fn a_refinement_surviving_to_the_post_planning_check_is_admitted() {
     check_scalar(
         indoc! {r#"
             def no_zero_no_one_div(left: Int, right: {Int where _ != 0}):
@@ -810,29 +805,6 @@ m
     )
 }
 
-/// A refined **scalar** mutable variable, stopped by its seed rather than by any
-/// write. Emit admits `Int@100 <: {Int | __elem > 0}` semantically; the post-inference
-/// check re-raises that obligation through `Typing::require_sub`, which supplies
-/// `SkipSmtScope` and decides the deficit structurally, so the two passes disagree and
-/// the boundary reads a compiler bug for a program inference accepted
-/// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
-///
-/// Pinned so the day the seed passes, the pin says so — and `transactions.rs`'s
-/// `TODO(refined-txn-body)` carries the two blockers behind this one.
-#[test]
-fn a_refined_scalar_mut_seed_reaches_the_boundary() {
-    check_compile_error(
-        indoc! {r#"
-            pool: Mut({Int where _ > 0}, Txn) := 100
-            with begin():
-                pool := 5 ^* 100
-            await_final(pool)
-        "#},
-        "produced an invalid tree: [Type mismatch for initializer of mutable `pool`: \
-         expected {Int | __elem > 0}, found Int@100]",
-    )
-}
-
 #[test]
 fn a_refined_map_key_in_a_mut_annotation_reaches_the_boundary() {
     check_compile_error(
@@ -918,13 +890,23 @@ fn transaction1() {
     );
 }
 
-// This test passes typechecking, only failing during the
-// post-planning check which cannot use SMT to compare refinements
-// semantically.
+// A transaction body over a **refined** mutable variable. Inference accepts every program
+// below, and the write rule reports an unmet demand wherever there is one
+// (`transaction6`). What stops them is later, in two places, and each pin names the one
+// it reaches so that a pin failing says the wall moved.
 //
-// As long as the post-planning check is in place, "post-inference
-// produced an invalid tree" is the success condition for these
-// refinement typechecking tests.
+// `transaction2` gets as far as planning, where `letrec` recognition asserts that a
+// mutable variable's joined value type carries no refinement: a refinement is a fact about
+// one value, and a history holds a different value at each commit
+// (`src/ccl/planning/loops.rs`). The declared refinement rides the carrier there, so the
+// assertion fires. Fixing that means erasing the refinement at the stamp once inference
+// has used it, at every carrier it reaches.
+//
+// `transaction3`, `4` and `5` stop before planning, at the transact phase's own check. It
+// re-derives each writer's obligation from the recorded types alone and with no scope, so
+// `__elem == __txp.0 ^+ 1` no longer has `__txp.0`'s own refinement to lean on. That is the
+// wall the conditions section below describes, reached through a binder's type rather than
+// through a guard.
 #[test]
 fn transaction2() {
     check_compile_error(
@@ -934,7 +916,7 @@ fn transaction2() {
                 pool := 1
             await_final(pool)
         "#},
-        "post-inference produced an invalid tree: [Type mismatch for initializer of mutable `pool`: expected {Int | __elem >= 0}, found Int@100]",
+        "letrec recognition: a mutable variable's joined value type carries no refinement",
     );
 }
 
@@ -947,7 +929,7 @@ fn transaction3() {
                 pool := pool ^+ 1
             await_final(pool)
         "#},
-        "post-inference produced an invalid tree",
+        "expected {Int | __elem >= 0}, found {Int | __elem == __txp.0 ^+ 1}",
     );
 }
 
@@ -966,7 +948,7 @@ fn transaction4() {
                 y := y ^+ z
             await_final(y)
         "#},
-        "post-inference produced an invalid tree",
+        "expected {Int | __elem >= 0}, found {Int | __elem == __txp.0 ^+ 1 ^+ __txp.1}",
     );
 }
 
@@ -982,7 +964,7 @@ fn transaction5() {
             foo(30)
             await_final(pool)
         "#},
-        "post-inference produced an invalid tree",
+        "expected {Int | __elem >= 0}, found {Int | __elem == __txp.0 ^- 30}",
     );
 }
 

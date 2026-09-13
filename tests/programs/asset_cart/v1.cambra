@@ -17,10 +17,18 @@
 #      a list literal)").
 #      Pinned: `asset_cart_v1_currently_blocked_on_entry_iteration`.
 #
-#   2. `Balance`'s refinement.  `500 * one_dollar` computes, and computing drops
-#      a refinement, so `{Microcents where _ > 0}` meets a bare `Int` at the
-#      initializer. Unrelated to the cart, and the first thing reported once the
-#      drain is out of the way.
+#   2. `Balance` on a transactional store.  The typing works: `^*` carries the
+#      refinement through the seed's scaling, `^-` records the checkout's
+#      difference, and the guard above the debit is assumable inside its own arm,
+#      so a weaker guard makes the write ill-typed and this one does not
+#      (`tests/type_check.rs`, `a_guarded_debit_of_a_refined_balance` and
+#      `a_scaled_seed_meets_a_refined_store`). What stops the program is later: the
+#      declared refinement rides the recurrence carrier into planning, where
+#      `letrec` recognition asserts a mutable variable's joined value type carries
+#      none — a refinement is a fact about one value, and a history holds a
+#      different value at each commit (`src/ccl/planning/loops.rs`). Erasing it at
+#      the stamp, once inference has used it, is the change that unblocks this.
+#      Pinned: `type_annotations.rs`, `transaction2` through `transaction5`.
 #
 #   3. A **compound** key on a transactional map.  `cart` and `holdings` are keyed
 #      by `{AccountId, Ticker}`, and a filtered entry comprehension over one
@@ -71,21 +79,32 @@
 # `mod.rs` carries the same list beside the test that pins it.
 
 one_btc = 10**8
-one_dollar = 10**8        # microcents; matches the feed's existing 10^8 scale
+# Spelled out, where `one_btc` is a power: `one_dollar` scales the balances `Balance`
+# refines, so the solver has to know its value, and `**` has no encoding — SMT-LIB
+# states no integer exponentiation. `one_btc` only divides prices into base units, and
+# no refinement crosses it.
+one_dollar = 100000000    # microcents; matches the feed's existing 10^8 scale
 
 # TODO alias types, refinement predicates
 AccountId = Int
 Microcents = Int
-Balance = {Microcents where  _ > 0}
+# `>= 0`, not `> 0`: a zero balance is a balance. What the program may not do is write a
+# *negative* one, which is what the checkout's guard below is checked against.
+Balance = {Microcents where  _ >= 0}
 Ticker = String
 
 # Two accounts, not one: `map([(k, v)])` with a single entry panics in
 # post-lambda-elim. `box` seeds the store: a bare `map([…])` at a
 # `Mut(Map(…), Txn)` initializer meets a compute function and a data collection
 # with no ordering between the two kinds.
+#
+# Both accounts open at the same balance, and `^*` is what carries `Balance` through the
+# scaling. A map literal's codomain is the join over its entries, so two entries carrying
+# different equations join to a bare `Microcents` and no operator recovers the
+# refinement; equal seeds leave the join one the declaration can be met by.
 accts: Mut(Map(AccountId, Balance), Txn) := box(map([
-    (1, 500 * one_dollar),
-    (2, 250 * one_dollar),
+    (1, 500 ^* one_dollar),
+    (2, 500 ^* one_dollar),
 ]))
 
 # `Txn`, because checkout credits this inside a transaction and an induction
@@ -146,8 +165,14 @@ for r in checkout_reqs:
                    for (a, t) -> q in cart if a == r.account])
         # One guard over three keyed writes: the debit, the credit and the
         # drain commit together or not at all. This is the atomicity claim.
+        #
+        # `^-` records the difference, so the debit is typed
+        # `{Microcents | __elem == cash ^- due}` rather than a bare `Microcents`, and the
+        # guard is assumable inside its own arm. `Balance` demands `__elem >= 0`, which
+        # follows from the two. Weaken the guard and the write is ill-typed — that is the
+        # claim this program exists to make.
         if cash >= due:
-            accts[r.account] := cash - due
+            accts[r.account] := cash ^- due
             for (a, t) -> q in cart if a == r.account:
                 holdings[(a, t)] := holdings[(a, t)] + q
                 cart[(a, t)] := 0

@@ -1975,6 +1975,12 @@ pub(super) fn emit_mut_decl<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx))?;
+    // The declared value type's refinement predicates ride `binding.ty` to the
+    // post-inference wall, as a `let`'s exact annotation's do, so they are typed here —
+    // in the enclosing scope, which is where the names their terms read are bound.
+    // Before `normalize`, which is where `emit_annotation_predicates` has to run to see
+    // a bounded annotation's interior.
+    ctx.type_annotation_predicates(&mut binding.ty)?;
     let history = ctx.normalize(&binding.ty);
     debug_assert!(
         history.mut_value_type().is_some(),
