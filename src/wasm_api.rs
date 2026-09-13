@@ -11,6 +11,8 @@
 //! program.push("price_updates", [{ ticker: "BTC-USD", price: 8169291000000 }]);
 //! const { outputs, produced } = program.tick();
 //! if (produced) inspector.frame(program.frame(false));
+//!
+//! const { generation, kept, bound } = JSON.parse(program.reload(edited));
 //! ```
 //!
 //! There is no run loop in here. The page owns the clock: `tick` does one
@@ -23,7 +25,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::ccl::Type;
 use crate::ccl::channels::{ChannelDecl, row_from_json, row_to_json};
-use crate::embed::Host;
+use crate::ccl::context::{ReuseTally, render_errors};
+use crate::embed::{EmbedError, Host};
 use crate::interpreter::Value;
 
 /// Route a Rust panic to the browser console rather than an opaque trap.
@@ -74,9 +77,64 @@ impl Program {
         Ok(Program { host })
     }
 
-    /// The `/api/snapshot` payload, computed once at compile.
+    /// Replace the running program with the version `source` describes, and
+    /// report what it kept as `{"generation": n, "kept": k, "bound": b}`.
     ///
-    /// What the inspector renders its source and IR panes from.
+    /// The page swaps its edited source in without losing what the program is
+    /// holding: every operator whose computation is unchanged keeps running, and
+    /// every mutable variable resumes from the value it held. `kept` of `bound`
+    /// counts the operators taken from the replaced version rather than built,
+    /// which is the evidence for the rest. Re-deriving the state instead, by
+    /// pushing a journal of rows into a second program, would keep none of them.
+    ///
+    /// `generation` is the version now running, counting from `0`. The same
+    /// number rides `snapshot()`'s `meta.generation` and every `frame()`, which
+    /// is how a reader holding panes from one version recognizes a frame naming
+    /// nodes it has never seen: a rebuilt operator is minted a fresh `NodeId`,
+    /// and re-reading the payload is what resolves it.
+    ///
+    /// A JSON string, as `snapshot()`, `frame()` and `subscriptions()` return,
+    /// because a page hands all four to the one consumer that parses them. An
+    /// object would buy destructuring at the price of the `json_compatible` care
+    /// [`tick`](Self::tick) documents, for a payload read once per edit rather
+    /// than once per pass. The rendered diff and the loops a version adds above
+    /// the start of what they read stay off it: those two are the control port's
+    /// reply to an author at a terminal, and a page re-reads `snapshot()` after
+    /// an accepted reload, whose source and IR panes are the new version.
+    ///
+    /// Throws the rendered diagnostics for a version that does not compile, or
+    /// that cannot take over the state the running program is holding. Such a
+    /// throw leaves the running program answering, at the generation this last
+    /// reported: the version is compiled and checked before anything is torn
+    /// down. A typo is a caught exception and a stale page, not a program that
+    /// stops.
+    pub fn reload(&mut self, source: &str) -> Result<String, JsValue> {
+        let report = self.host.reload(source).map_err(|e| match *e {
+            // The rendered diagnostics rather than the error's `Display`, which
+            // is the compiler errors' `Debug`. The page has the rejected source
+            // in an editor, so a report naming a line and a column lands on
+            // something its reader can see. `<new>` names that source here and
+            // in the control port's `/reload`, neither having a file behind it.
+            EmbedError::Compile(errors) => {
+                JsValue::from_str(&render_errors(&errors, "<new>", source))
+            }
+            other => JsValue::from_str(&other.to_string()),
+        })?;
+        let ReuseTally { kept, bound } = report.reuse;
+        Ok(serde_json::json!({
+            "generation": self.host.generation(),
+            "kept": kept,
+            "bound": bound,
+        })
+        .to_string())
+    }
+
+    /// The `/api/snapshot` payload for the running version.
+    ///
+    /// What the inspector renders its source and IR panes from. Computed at
+    /// compile and re-rendered by an accepted [`reload`](Self::reload), which is
+    /// when a page re-reads it: the version it describes is the one
+    /// `meta.generation` names.
     pub fn snapshot(&self) -> String {
         self.host.snapshot().to_string()
     }
@@ -92,8 +150,10 @@ impl Program {
     /// [`push`](Self::push), like any other source — there is no socket in the
     /// module, and on `wasm32` there could not be one.
     ///
-    /// Read after `compile`; a `reload` may change it, and a feed that leaves
-    /// the list is a socket the page should close.
+    /// Read after `compile` and after an accepted [`reload`](Self::reload),
+    /// which replaces the list rather than adding to it: a feed that leaves it
+    /// is a socket the page should close, and one that arrives or changes its
+    /// products is one it should open.
     pub fn subscriptions(&self) -> Result<String, JsValue> {
         serde_json::to_string(self.host.socket_subscriptions())
             .map_err(|e| JsValue::from_str(&format!("subscriptions: {e}")))

@@ -341,8 +341,7 @@ fn a_reload_keeps_what_the_running_version_was_holding() {
     // The same source: a reload that changes nothing still rebuilds nothing it
     // can keep, so what survives is what the runtime carried rather than what
     // the program recomputed.
-    host.reload("v0.cambra", &code)
-        .expect("the same source reloads");
+    host.reload(&code).expect("the same source reloads");
 
     let after = push_and_settle(&mut host, "view_requests", Value::Bool(true));
     assert_eq!(
