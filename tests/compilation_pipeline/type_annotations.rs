@@ -686,28 +686,36 @@ fn a_field_read_of_the_parameter_and_of_a_record_in_scope() {
     )
 }
 
-/// A record equality in the *body* is rejected before any refinement question is
-/// reached: no composite satisfies `Equatable`
-/// (`tests/type_check.rs`, `a_composite_satisfies_no_trait`).
+/// A record equality in the *body* computes, and computing drops a refinement, so the
+/// declared singleton has nothing to match.
+///
+/// `t == t` is well-typed: `Equatable` reads a product componentwise
+/// (`tests/type_check.rs`, `products_are_equatable_componentwise`), which is what this pair
+/// of tests once pinned the absence of. What they meet now is the discharge rule — a
+/// refinement is discharged by **matching** a predicate the value already carries, not by
+/// proving one — and a computed `Bool` carries none.
 #[test]
-fn a_record_equality_in_the_body_has_no_instance() {
+fn a_record_equality_in_the_body_carries_no_refinement() {
     check_compile_error(
         indoc! {r#"
-            def foo(t: {a:Int, b:Int}) => {Bool where _ == true}:
+            def foo(t: {a:Int, b:Int}) => {Bool where _ == True}:
                 t == t
 
             foo((a=2, b=3))
         "#},
-        "No Equatable instance for BinOp",
+        "annotated as Bool@true, but inferred as Bool",
     )
 }
 
-/// TODO(refined-composite-eq): the same rejection from inside a refinement
-/// *predicate*, where a record equality is the natural way to write "this value"
-/// and the trait table has no row for it. Enabling `==` over an arbitrary type in
-/// a predicate is what flips this.
+/// The same rule with the equality inside the **predicate**, where a record equality is the
+/// natural way to write "this value".
+///
+/// The predicate is well-formed for the same reason as above, and the body is `t` itself —
+/// whose type is the bare record its parameter declares. Nothing states the fact the
+/// annotation declares, so it is rejected rather than proven. Proving it is what a refined
+/// composite equality would need, and this is the program to re-check when that lands.
 #[test]
-fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
+fn a_refinement_naming_the_parameter_is_not_proven() {
     check_compile_error(
         indoc! {r#"
             def foo(t: {a:Int, b:Int}) => {{a:Int, b:Int} where _ == t}:
@@ -715,7 +723,7 @@ fn a_record_equality_in_a_refinement_predicate_has_no_instance() {
 
             foo((a=1, b=2)).a
         "#},
-        "No Equatable instance for BinOp",
+        "annotated as {{a: Int, b: Int} | __elem == t}, but inferred as {a: Int, b: Int}",
     )
 }
 
