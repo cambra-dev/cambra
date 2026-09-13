@@ -25,8 +25,9 @@ use wasm_bindgen::prelude::*;
 
 use crate::ccl::Type;
 use crate::ccl::channels::{ChannelDecl, row_from_json, row_to_json};
-use crate::ccl::context::{ReuseTally, render_errors};
+use crate::ccl::context::{CompileError, ReuseTally, render_errors};
 use crate::embed::{EmbedError, Host};
+use crate::inspector_model::diagnostics_from_compile_errors;
 use crate::interpreter::Value;
 
 /// Route a Rust panic to the browser console rather than an opaque trap.
@@ -68,12 +69,14 @@ impl Program {
     ///
     /// Throws with the rendered diagnostics rather than returning a status, so
     /// a caller that forgets to check gets an exception instead of a program
-    /// that silently does nothing.
+    /// that silently does nothing. See [`rejection`] for what rides the throw.
     pub fn compile(name: &str, source: &str, channels: JsValue) -> Result<Program, JsValue> {
         let declarations: Vec<ChannelDecl> = serde_wasm_bindgen::from_value(channels)
             .map_err(|e| JsValue::from_str(&format!("channel declarations: {e}")))?;
-        let host = Host::compile(name, source, &declarations)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let host = Host::compile(name, source, &declarations).map_err(|e| match *e {
+            EmbedError::Compile(errors) => rejection(&errors, name, source),
+            other => JsValue::from_str(&other.to_string()),
+        })?;
         Ok(Program { host })
     }
 
@@ -115,9 +118,7 @@ impl Program {
             // in an editor, so a report naming a line and a column lands on
             // something its reader can see. `<new>` names that source here and
             // in the control port's `/reload`, neither having a file behind it.
-            EmbedError::Compile(errors) => {
-                JsValue::from_str(&render_errors(&errors, "<new>", source))
-            }
+            EmbedError::Compile(errors) => rejection(&errors, "<new>", source),
             other => JsValue::from_str(&other.to_string()),
         })?;
         let ReuseTally { kept, bound } = report.reuse;
@@ -242,4 +243,26 @@ impl Program {
     pub fn frame(&self, final_frame: bool) -> String {
         self.host.frame(final_frame)
     }
+}
+
+/// A rejected version, as something the page can underline rather than only print.
+///
+/// A `js_sys::Error`, so `String(e)` is still the rendered report a page shows
+/// when it has nowhere better to put it, with the same `Diagnostic`s a snapshot
+/// carries attached under `diagnostics`. The pane the rejected source is sitting
+/// in can then mark the spans they name, which is the difference between a wall
+/// of text over the editor and a squiggle under the line that caused it.
+///
+/// Spans are byte offsets into `source` — the version that was *rejected*, not
+/// the one still running — so a consumer converts them against the text it sent
+/// rather than against the snapshot it is holding.
+///
+/// A `diagnostics` that will not serialize costs the squiggles and keeps the
+/// message, which is where a page without this lands anyway.
+fn rejection(errors: &[CompileError], name: &str, source: &str) -> JsValue {
+    let error = js_sys::Error::new(&render_errors(errors, name, source));
+    if let Ok(value) = serde_wasm_bindgen::to_value(&diagnostics_from_compile_errors(errors)) {
+        let _ = js_sys::Reflect::set(&error, &JsValue::from_str("diagnostics"), &value);
+    }
+    error.into()
 }

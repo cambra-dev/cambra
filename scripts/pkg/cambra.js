@@ -45,7 +45,7 @@ class Program {
      *
      * Throws with the rendered diagnostics rather than returning a status, so
      * a caller that forgets to check gets an exception instead of a program
-     * that silently does nothing.
+     * that silently does nothing. See [`rejection`] for what rides the throw.
      * @param {string} name
      * @param {string} source
      * @param {any} channels
@@ -494,6 +494,10 @@ function __wbg_get_imports() {
             const ret = new Map();
             return addHeapObject(ret);
         },
+        __wbg_new_a32a1ab6c6655abe: function(arg0, arg1) {
+            const ret = new Error(getStringFromWasm0(arg0, arg1));
+            return addHeapObject(ret);
+        },
         __wbg_new_bebc3f4757acf305: function() {
             const ret = new Object();
             return addHeapObject(ret);
@@ -519,6 +523,10 @@ function __wbg_get_imports() {
         __wbg_set_6be42768c690e380: function(arg0, arg1, arg2) {
             getObject(arg0)[takeObject(arg1)] = takeObject(arg2);
         },
+        __wbg_set_a377297433dfea63: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = Reflect.set(getObject(arg0), getObject(arg1), getObject(arg2));
+            return ret;
+        }, arguments); },
         __wbg_set_bf6dde4923b9b059: function(arg0, arg1, arg2) {
             const ret = getObject(arg0).set(getObject(arg1), getObject(arg2));
             return addHeapObject(ret);

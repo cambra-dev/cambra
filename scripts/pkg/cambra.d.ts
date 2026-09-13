@@ -18,7 +18,7 @@ export class Program {
      *
      * Throws with the rendered diagnostics rather than returning a status, so
      * a caller that forgets to check gets an exception instead of a program
-     * that silently does nothing.
+     * that silently does nothing. See [`rejection`] for what rides the throw.
      */
     static compile(name: string, source: string, channels: any): Program;
     /**

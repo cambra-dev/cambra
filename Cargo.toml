@@ -95,6 +95,11 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 serde-wasm-bindgen = "0.6"
+# Building the JS `Error` a rejected version is thrown as (`src/wasm_api.rs`),
+# so the rendered report and the structured diagnostics ride one throw. Already
+# in the tree through `serde-wasm-bindgen`; named here because this crate uses
+# it directly.
+js-sys = "0.3"
 
 # `oxiz`'s hash tables seed themselves from `getrandom`, whose
 # `wasm32-unknown-unknown` backend is opt-in: the target has no OS entropy

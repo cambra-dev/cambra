@@ -439,9 +439,16 @@ export class SourceView {
     // Call on the OffsetMap object: `byteToChar` reads `this.byteAt`, so a
     // destructured `const { byteToChar } = ...` would lose its binding and throw.
     const offsets = this.store.offsets;
+    // Clamped to the document the editor holds now, which is not always the one
+    // the snapshot's spans were measured against: the pane is editable, and a
+    // reader who deletes half the program leaves every resolved span pointing
+    // past the end. CodeMirror throws on a decoration out of range, so an edit
+    // shorter than the compiled source would take the pane down rather than
+    // just leaving the marks stale.
+    const end = this.view.state.doc.length;
     const mark = (from: number, to: number, primary: boolean): HighlightSpan => ({
-      from: offsets.byteToChar(from),
-      to: offsets.byteToChar(to),
+      from: Math.min(offsets.byteToChar(from), end),
+      to: Math.min(offsets.byteToChar(to), end),
       primary,
     });
 
@@ -450,16 +457,23 @@ export class SourceView {
     // the pointed-at bytes sit inside; `flattenHighlights` subtracts the strong
     // region out of them, so the token reads as itself and the statement around
     // it as what it resolved to.
-    const highlights: HighlightSpan[] = [];
-    if (pointedAt !== null) highlights.push(mark(pointedAt.from, pointedAt.to, true));
-    for (const span of spans) highlights.push(mark(span.start, span.end, false));
+    const marks: HighlightSpan[] = [];
+    if (pointedAt !== null) marks.push(mark(pointedAt.from, pointedAt.to, true));
+    for (const span of spans) marks.push(mark(span.start, span.end, false));
+    // A span the edit consumed entirely collapses to nothing; an empty range is
+    // not a highlight, and `flattenHighlights` has no meaning for one.
+    const highlights = marks.filter((h) => h.to > h.from);
+    if (highlights.length === 0) {
+      this.view.dispatch({ effects: setHighlights.of(null) });
+      return;
+    }
 
     // Not when the selection was made here: the caret is already where the
     // reader put it, and scrolling under a drag fights the gesture. A jump —
     // goto-definition, or a click in another pane — carries a different origin
     // and does move the editor.
     const effects: StateEffect<unknown>[] = [setHighlights.of(highlights)];
-    if (resolved.origin !== SOURCE_PANE && highlights.length > 0) {
+    if (resolved.origin !== SOURCE_PANE) {
       const focus = highlights.reduce((a, b) => (b.from < a.from ? b : a));
       effects.push(EditorView.scrollIntoView(focus.from, { y: "start" }));
     }

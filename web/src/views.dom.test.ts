@@ -68,6 +68,28 @@ function mountApp(snap: Snapshot): {
 describe("view integration: cross-pane source<->tree linking", () => {
   beforeAll(stubLayout);
 
+  /**
+   * The pane is editable, and a reader who deletes most of the program leaves
+   * every span in the snapshot pointing past the end of the document. A
+   * decoration out of range throws, which would take the pane down over a
+   * highlight nobody asked to keep.
+   */
+  it("survives a selection resolved against source the editor no longer holds", () => {
+    const { store, sourceView } = mountApp(listMin);
+    const pre = irPaneById(listMin, "pre-inference");
+    const lit = theNode(pre, "Lit(Int(1))");
+
+    // What an edit does: the document is now shorter than the spans the
+    // snapshot carries.
+    const view = (sourceView as unknown as { view: { state: { doc: { length: number } }; dispatch(t: unknown): void } })
+      .view;
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "x" } });
+
+    expect(() =>
+      store.setSelection({ kind: "node", paneId: "pre-inference", nodeId: lit.nodeId }),
+    ).not.toThrow();
+  });
+
   it("a tree-node selection highlights the source span AND the tree rows", () => {
     const { store, source, trees } = mountApp(listMin);
     const pre = irPaneById(listMin, "pre-inference");

@@ -19,6 +19,7 @@
 // the store is the cross-pane link — a click anywhere resolves to a highlight
 // set in every pane via the pane link graph (links.ts).
 
+import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
 
 import "./style.css";
@@ -30,6 +31,7 @@ import {
   loadHiddenPanes,
   saveHiddenPanes,
 } from "./paneVisibility";
+import { OffsetMap } from "./offsets";
 import { Store } from "./store";
 import { SourceView } from "./sourceView";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
@@ -549,6 +551,44 @@ export interface InjectedHost {
    * the chord would be a control that silently did nothing.
    */
   rebuild?: (source: string, options: { keepState: boolean }) => Promise<unknown>;
+  /**
+   * Take a handle to the source editor, once there is one.
+   *
+   * The other half of [`rebuild`](InjectedHost.rebuild). An embedder can get
+   * text *out* of the editable pane — that is what the chord does — and without
+   * this it can never put text *in*, so an embedder with a program of its own to
+   * show has to compile it to get it on screen. A page offering a reader a
+   * choice of programs would then compile on every choice, which is a swap
+   * nobody asked for.
+   *
+   * Called once, after the panes are first built. The handle stays valid across
+   * re-seeds: a rebuild replaces the editor, and the handle finds the live one
+   * each time rather than closing over the one that existed when it was made.
+   * Absent on a read-only pane, where there is no editor to hand over.
+   */
+  onEditor?: (editor: SourceEditor) => void;
+}
+
+/** What an embedder may do to the source pane's editor from outside. */
+export interface SourceEditor {
+  /**
+   * Replace the editor's whole document.
+   *
+   * Nothing is compiled: the text sits in the pane until a chord or the
+   * embedder's own control asks for it. The reader is then looking at a program
+   * the running one is not, which is a state the embedder has to say something
+   * about — the bundle does not mark it, because "unsaved" means different
+   * things to a page with one program and a page with several.
+   *
+   * A read-only pane takes this too. `readOnly` is about what the *reader* may
+   * type, and an embedder writing to the pane is not the reader; an embedder
+   * with no [`rebuild`](InjectedHost.rebuild) behind it is showing a program
+   * nothing can compile, which is its own business to get right. No-ops only
+   * where there is no editor at all.
+   */
+  setSource(text: string): void;
+  /** The editor's document as it stands, or `null` where there is no editor. */
+  source(): string | null;
 }
 
 declare global {
@@ -586,6 +626,27 @@ function sourceEditor(root: HTMLElement): EditorView | null {
 }
 
 /**
+ * A [`SourceEditor`] over whatever editor `root` currently holds.
+ *
+ * Every call re-reads the DOM rather than closing over a view, because a
+ * rebuild re-renders every pane and destroys the editor being typed in. A
+ * handle that captured one would go stale on the first compile, which is the
+ * moment an embedder most wants it.
+ */
+export function sourceEditorHandle(root: HTMLElement): SourceEditor {
+  return {
+    setSource(text: string): void {
+      const view = sourceEditor(root);
+      if (!view) return;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+    },
+    source(): string | null {
+      return sourceEditor(root)?.state.doc.toString() ?? null;
+    },
+  };
+}
+
+/**
  * Put the caret back where the reader left it, and give it the focus.
  *
  * A rebuild re-renders every pane, so the editor being typed in is destroyed
@@ -604,12 +665,71 @@ function restoreCaret(root: HTMLElement, at: number): void {
 }
 
 /**
+ * The diagnostics a rejected version was thrown with, if it carried any.
+ *
+ * An embedder that compiles in-process throws the rendered report — there is no
+ * degraded snapshot to re-seed from, because nothing was torn down — and may
+ * attach the same `Diagnostic`s a snapshot carries beside it. Spans are byte
+ * offsets into the *rejected* source, which is the text still sitting in the
+ * editor, so they are converted against that rather than against the snapshot
+ * the panes are drawn from.
+ */
+export function rejectedDiagnostics(error: unknown): Diagnostic[] | null {
+  const carried = (error as { diagnostics?: unknown } | null)?.diagnostics;
+  if (!Array.isArray(carried)) return null;
+  const diagnostics = carried.filter(
+    (d): d is Diagnostic =>
+      typeof d === "object" && d !== null && "message" in d && "severity" in d,
+  );
+  return diagnostics.length > 0 ? diagnostics : null;
+}
+
+/**
+ * Mark a rejected version's diagnostics in the editor holding it.
+ *
+ * The squiggle goes where the error is, which is the whole point: a report that
+ * names line 58 is a report the reader has to find line 58 for, and the text is
+ * in front of them already. Returns whether anything could be marked — a
+ * diagnostic with no span names the program rather than a place in it, and has
+ * nowhere to go but the banner.
+ */
+export function markRejection(root: HTMLElement, diagnostics: Diagnostic[]): boolean {
+  const view = sourceEditor(root);
+  if (!view) return false;
+  const text = view.state.doc.toString();
+  const offsets = new OffsetMap(text);
+  const marks: CMDiagnostic[] = [];
+  // Clamped to the document. A span is a byte range in the source the embedder
+  // *sent*, and the editor may already hold something else — the reader keeps
+  // typing while a compile is in flight — so a range past the end is a live
+  // possibility rather than a malformed diagnostic. CodeMirror throws on one,
+  // which would take the whole pane down over a stale squiggle.
+  const end = text.length;
+  for (const d of diagnostics) {
+    if (!d.span) continue;
+    const from = Math.min(offsets.byteToChar(d.span.start), end);
+    const to = Math.min(Math.max(offsets.byteToChar(d.span.end), from + 1), end);
+    if (to <= from) continue;
+    marks.push({
+      from,
+      to,
+      severity: d.severity === "warning" ? "warning" : "error",
+      message: `${d.stage}: ${d.message}`,
+    });
+  }
+  if (marks.length === 0) return false;
+  view.dispatch(setDiagnostics(view.state, marks));
+  return true;
+}
+
+/**
  * Say that a rebuild round trip failed, without disturbing what is on screen.
  *
- * A failed *compile* is not this: that comes back as a snapshot with
- * diagnostics and re-seeds normally. This is the embedder not answering at all,
- * where the panes still show a program that is genuinely running, and throwing
- * them away would lose more than it explains.
+ * The fallback for a rejection with nowhere better to go: no editor to mark, or
+ * diagnostics that name the program rather than a place in it. A version the
+ * compiler rejected with spans is marked in the pane instead — see
+ * [`markRejection`] — because a banner covering the source is a banner covering
+ * the thing it is talking about.
  */
 function reportRebuildFault(root: HTMLElement, message: string): void {
   const existing = root.querySelector(".rebuild-fault");
@@ -667,16 +787,25 @@ async function main(): Promise<void> {
             })
             .catch((e: unknown) => {
               // A program that will not compile is an ordinary outcome of
-              // editing, not a fault: the embedder answers with a degraded
-              // snapshot carrying diagnostics, and that re-seeds like any
-              // other. Reaching here means the round trip itself broke, so say
-              // so without tearing down the panes the reader still has.
+              // editing, not a fault. A server-backed embedder answers with a
+              // degraded snapshot carrying diagnostics and that re-seeds like
+              // any other; an in-process one throws, because it tore nothing
+              // down, and attaches the same diagnostics to the throw. Either
+              // way the marks go in the pane holding the rejected text, and the
+              // panes the reader still has are left standing.
+              const diagnostics = rejectedDiagnostics(e);
+              if (diagnostics && markRejection(root, diagnostics)) return;
               reportRebuildFault(root, String(e));
             });
         }
       : undefined;
 
     seed(snap);
+
+    // After the first `seed`, because there is no editor to hand over until the
+    // panes exist. `sourceEditor` re-reads the DOM per call, so this survives
+    // every later re-seed without being handed over again.
+    injected?.onEditor?.(sourceEditorHandle(root));
 
     // Follow a reload. A frame from a later generation describes a version this
     // payload does not — a rebuilt operator answers to a new `NodeId` — so the

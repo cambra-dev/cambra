@@ -18,7 +18,10 @@ import {
   formatSpan,
   lineCol,
   renderApp,
+  markRejection,
+  rejectedDiagnostics,
   serializeDiagnostics,
+  sourceEditorHandle,
 } from "./main";
 import { LiveStore } from "./liveStore";
 import { Store } from "./store";
@@ -353,6 +356,113 @@ describe("an embedder's configuration", () => {
    * for a layout on this page, where the stored set is what some other reader
    * last chose.
    */
+  /**
+   * The other half of the rebuild contract: an embedder with a program of its
+   * own to show can put it in the pane without compiling it. Without this the
+   * only way text reaches the editor is a compile, so a page offering a choice
+   * of programs would swap the running one on every choice.
+   */
+  it("takes a program into the editor without compiling it", () => {
+    const root = document.createElement("div");
+    const store = new Store(fixture(arithmeticJson));
+    const compiles = vi.fn();
+    renderApp(root, store, undefined, { onRebuild: compiles });
+
+    const editor = sourceEditorHandle(root);
+    expect(editor.source()).toBe(store.snapshot.source.text);
+
+    editor.setSource("x = 1\ny = x + 1\n");
+
+    expect(editor.source()).toBe("x = 1\ny = x + 1\n");
+    expect(compiles).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A handle over a root with no panes in it yet — an embedder that asked too
+   * early, or a render that failed. A no-op rather than a throw: the handle is
+   * held across re-seeds, so the window where there is no editor is real.
+   */
+  it("answers for a root with no editor", () => {
+    const editor = sourceEditorHandle(document.createElement("div"));
+
+    expect(editor.source()).toBeNull();
+    expect(() => editor.setSource("x = 1")).not.toThrow();
+  });
+
+  /**
+   * `readOnly` is about what a reader may type. An embedder writing to the pane
+   * is not the reader, and the handle is how it shows a program at all.
+   */
+  it("writes to a read-only pane", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)));
+    const editor = sourceEditorHandle(root);
+
+    editor.setSource("x = 1");
+
+    expect(editor.source()).toBe("x = 1");
+  });
+
+  /**
+   * A rejected version is thrown, not re-seeded: nothing was torn down, so there
+   * is no degraded snapshot to render. The diagnostics ride the throw, and the
+   * squiggle goes where the error is rather than into a banner over it.
+   */
+  it("marks a rejected version's diagnostics in the editor holding it", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)), undefined, { onRebuild: vi.fn() });
+    const editor = sourceEditorHandle(root);
+    editor.setSource("alpha = 1\nbeta = 2\n");
+
+    const thrown = Object.assign(new Error("rendered report"), {
+      diagnostics: [
+        { severity: "error", stage: "infer", message: "no", span: { start: 10, end: 14 } },
+      ],
+    });
+    const carried = rejectedDiagnostics(thrown);
+
+    expect(carried).toHaveLength(1);
+    expect(markRejection(root, carried!)).toBe(true);
+  });
+
+  /**
+   * The reader keeps typing while a compile is in flight, so a span can name a
+   * range the editor no longer has. CodeMirror throws on one, which would take
+   * the pane down over a stale squiggle.
+   */
+  it("clamps a span that runs past the text the editor now holds", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)), undefined, { onRebuild: vi.fn() });
+    const editor = sourceEditorHandle(root);
+    editor.setSource("ab");
+
+    expect(() =>
+      markRejection(root, [
+        { severity: "error", stage: "parse", message: "past the end", span: { start: 40, end: 99 } },
+      ]),
+    ).not.toThrow();
+    expect(editor.source()).toBe("ab");
+  });
+
+  /** A diagnostic naming the program rather than a place in it has nowhere to go. */
+  it("declines to mark a diagnostic with no span", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)), undefined, { onRebuild: vi.fn() });
+
+    expect(
+      markRejection(root, [
+        { severity: "error", stage: "channels", message: "no route", span: null },
+      ]),
+    ).toBe(false);
+  });
+
+  /** An embedder that throws a bare string still gets the banner. */
+  it("finds no diagnostics on a throw that carries none", () => {
+    expect(rejectedDiagnostics(new Error("just a message"))).toBeNull();
+    expect(rejectedDiagnostics("a string")).toBeNull();
+    expect(rejectedDiagnostics(null)).toBeNull();
+  });
+
   it("opens with the panes an embedder hid", () => {
     const root = document.createElement("div");
     const store = new Store(fixture(arithmeticJson));
