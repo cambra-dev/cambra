@@ -4166,15 +4166,22 @@ fn a_reply_carrying_a_collection_is_not_reachable() {
 /// `__pos ▷ [1, 2]` and reaches the feed inside a binder rather than free
 /// (`feed_contribution` in `src/ccl/infer/emit.rs`).
 ///
-/// What stops it is the filtered entry comprehension underneath. The site types —
-/// `Σ (σ : SubtypesOf(Int)). ({σ | …} ⤇ Int)` — and the predicate it carries names `m`,
-/// which the reply then hands to a channel the mutable variable does not reach.
-/// `a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable` reports the
-/// same violation with no reply, no feed and no correlation, on a filter comparing against
-/// a literal. So this program is now blocked on a defect that is not about correlation.
+/// What stops it is the **channel's own position binder**, left free in the type it binds.
+///
+/// The contribution abstracts over the position, so `v` resolves to `__pos ▷ [1, 2]` and the
+/// filter's predicate carries that (`feed_contribution` in `src/ccl/infer/emit.rs`). The
+/// channel binds `__pos`: `emit_let` builds the handle with `Type::history_pi`, which closes
+/// the value over it. But it closes at the *rebuild*, when the value is still a bare
+/// variable with nothing to close — and the variable materializes later, acquiring `__pos`
+/// by **name**. Nothing re-closes it, so the stored type names a binder it also provides and
+/// `check_scope_valid` reports the reference as escaping.
+///
+/// A `Fun` has the same two moments and does not have the problem, because coalesce
+/// materializes a codomain inside the binder it is under. A history's value is materialized
+/// from a variable the binder never scoped, which is the gap this pins.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "references out-of-scope binder(s) [\"m\"]")]
+#[should_panic(expected = "references out-of-scope binder(s) [\"__pos\"]")]
 fn a_reply_filtered_by_the_request_is_not_reachable() {
     check_scalar(
         indoc! {r"

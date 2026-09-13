@@ -594,24 +594,24 @@ fn an_entry_binder_over_a_transactional_map_is_not_reachable() {
 
 /// A **filtered** entry comprehension over a transactional map. It types — the site is
 /// `Σ (σ : SubtypesOf(Int)). ({σ | …} ⤇ Int)`, the witness bound and the entry binder at the
-/// key type its kind bounds it by — and the predicate it carries names `m`, which is where
-/// it stops: the type is stored at a node the mutable variable does not reach.
+/// key type its kind bounds it by — and it stops where the unfiltered one does: the curried
+/// type `lambda_elim` builds binds the witness in its result and leaves it free in its
+/// argument, so the reference escapes at the pass boundary.
 ///
-/// Neither half of the entry binder escapes it — filtering on the key and filtering on the
-/// value report the same thing — so what the filter meets is the predicate naming its
-/// source rather than which of the two binders the predicate reads.
+/// Neither half of the entry binder distinguishes it — filtering on the key and filtering on
+/// the value report the same thing — and neither does the filter, which is the point:
+/// [`an_entry_binder_over_a_transactional_map_is_not_reachable`] reports it with no filter at
+/// all. The predicate the filter adds names the transaction's read tuple rather than the
+/// mutable variable, so it no longer escapes on its own account.
 ///
-/// Three neighbours place it. Dropping the filter leaves no predicate to carry the name and
-/// fails later instead ([`an_entry_binder_over_a_transactional_map_is_not_reachable`], at
-/// `lambda_elim`); dropping the entry binder reports this same violation; and the same
-/// filtered comprehension over a **plain** map types and reaches op-conversion
-/// ([`a_filtered_comprehension_over_a_map_is_not_reachable`]), because a let-bound
-/// collection is in scope where the predicate lands.
+/// The same filtered comprehension over a **plain** map types and reaches op-conversion
+/// instead ([`a_filtered_comprehension_over_a_map_is_not_reachable`]): no witness, so nothing
+/// to leave a binder behind.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::on_the_key("sum([q for a -> q in m if a == 1])")]
 #[case::on_the_value("sum([q for a -> q in m if q > 10])")]
-#[should_panic(expected = "references out-of-scope binder(s) [\"m\"]")]
+#[should_panic(expected = "free witness reference")]
 fn a_filtered_entry_comprehension_over_a_transactional_map_is_not_reachable(
     #[case] comprehension: &str,
 ) {
