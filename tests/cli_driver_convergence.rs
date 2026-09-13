@@ -1,6 +1,6 @@
 //! The CLI driver contract: a notification-gated drive loop (as in
 //! `src/main.rs`) must converge a mutation-loop accumulator, whose store/drive
-//! cycle advances one position per pull and requests its own re-pull through the
+//! cycle advances one position per round and requests its own re-pull through the
 //! scheduler's deferred-wakeup queue.
 //!
 //! Before that mechanism existed, the first `get` returned an empty

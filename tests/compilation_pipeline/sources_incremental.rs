@@ -18,6 +18,8 @@ use cambra::interpreter::{
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
+use super::helpers::pull;
+
 // ---------------------------------------------------------------------------
 // Data-source injection tests
 // ---------------------------------------------------------------------------
@@ -468,7 +470,7 @@ fn test_incremental_global_aggregate() {
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = pull(&mut ctx, &mut *producer);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -479,7 +481,7 @@ fn test_incremental_global_aggregate() {
     test_source
         .borrow_mut()
         .add_data(&[(Value::UInt(2), Value::Int(30))]);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = pull(&mut ctx, &mut *producer);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -490,7 +492,7 @@ fn test_incremental_global_aggregate() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = pull(&mut ctx, &mut *producer);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![60])),
@@ -542,8 +544,8 @@ x";
 
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
     let mut result = empty.clone();
-    for _ in 0..4 {
-        result = producer.get(producer.tiling().universal_guard());
+    for _ in 0..32 {
+        result = pull(&mut ctx, &mut *producer);
         if result != empty {
             break;
         }
@@ -595,7 +597,7 @@ o";
     let mut result = producer.get(producer.tiling().universal_guard());
     for _ in 0..4 {
         if !result.is_terminal() {
-            result = producer.get(producer.tiling().universal_guard());
+            result = pull(&mut ctx, &mut *producer);
         }
     }
     // Compare as a function (position → value), independent of internal ordering.
@@ -676,7 +678,7 @@ x";
         "second batch should fire a notification"
     );
     for _ in 0..3 {
-        let result = producer.get(producer.tiling().universal_guard());
+        let result = pull(&mut ctx, &mut *producer);
         assert_eq!(
             result, empty,
             "after second batch: should produce no output yet"
@@ -741,7 +743,7 @@ fn test_incremental_aggregates() {
         (Value::UInt(1), Value::Int(20)),
     ]);
 
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = pull(&mut ctx, &mut *producer);
     assert_eq!(
         result,
         Tile::SealedFunction {
@@ -756,7 +758,7 @@ fn test_incremental_aggregates() {
         (Value::UInt(2), Value::Int(10)),
         (Value::UInt(3), Value::Int(30)),
     ]);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = pull(&mut ctx, &mut *producer);
     assert_eq!(
         result,
         Tile::SealedFunction {
@@ -771,7 +773,7 @@ fn test_incremental_aggregates() {
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
 
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = pull(&mut ctx, &mut *producer);
     assert_eq!(
         sort_sealed_function_by_domain(result),
         sort_sealed_function_by_domain(Tile::SealedFunction {
