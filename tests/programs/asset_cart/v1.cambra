@@ -2,7 +2,7 @@
 # and three routes the embedding page calls instead of three sources and a sink
 # per ticker. `v0.cambra` is the rung below.
 #
-# THIS PROGRAM DOES NOT COMPILE YET. Two things stop it, in the order it meets
+# THIS PROGRAM DOES NOT COMPILE YET. Three things stop it, in the order it meets
 # them, and the tests named below are what report each — so the messages here are
 # what you will actually see rather than a description of them.
 #
@@ -32,6 +32,17 @@
 #      Pinned by `asset_cart_v1_read_sites_are_blocked_on_a_filtered_entry_comprehension`,
 #      over `v1_read_sites.cambra` — this program cannot report 2 itself, because
 #      1 stops it first.
+#
+#   3. A list literal reaching a sink.  The view's reply carries two, and either
+#      one fails op-conversion with "list literal reached op-conversion without an
+#      input — planning should have inserted `iterate(_)` before any standalone
+#      `List`", for an empty list as much as a populated one. It stands behind 1
+#      and 2 rather than beside them: the same reply with a scalar field in place
+#      of `lines` compiles, and so does a list literal fed to a `defer()` sink
+#      outside a block, so clearing 1 and 2 reveals this rather than removing it.
+#      The channel is not what stands in the way either —
+#      `asset_cart_v1_declares_the_routes_it_serves` registers the reply row.
+#      Pinned by nothing.
 #
 # `Balance`'s refinement stops nothing, and is the one item this list has lost.
 # `^*` carries it through the seed's scaling, `^-` records the checkout's
@@ -89,8 +100,11 @@ Microcents = Int
 Balance = {Microcents where  _ >= 0}
 Ticker = String
 
-# Two accounts, not one: `map([(k, v)])` with a single entry panics in
-# post-lambda-elim. `box` seeds the store: a bare `map([…])` at a
+# Two accounts, and under different ids: a key component that is the same literal in
+# every seed entry refines to a singleton, and an entry binder over the map then
+# rejects it (`expected Int@1, found Int`). A single entry refines both components
+# that way, and two entries under one account refine the account. `box` seeds the
+# store: a bare `map([…])` at a
 # `Mut(Map(…), Txn)` initializer meets a compute function and a data collection
 # with no ordering between the two kinds.
 #

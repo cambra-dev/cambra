@@ -20,13 +20,16 @@
 # `wasm_socket_subscribe` is not built. The rows are the same shape the socket
 # would deliver.
 #
-# `v2_single_line.cambra` is the reload target: the same cart with one divisor per asset
-# instead of this file's single `one_btc`. The two share a wiring and are what the demo
-# reloads between.
+# There are two reload targets, sharing this file's wiring. `v2_single_line.cambra` is
+# the same cart with one divisor per asset instead of this file's single `one_btc`, and
+# inherits every collection under its own name. `v2_migrating_single_line.cambra` also
+# reshapes the cart and the holdings, seeding each from what this version holds through
+# `@LoadFrom`.
 #
 # `holdings` keeps its compound key: it is only ever written and read at one key,
 # never swept, and a compound key is fine for both (`v1.cambra`'s header records
-# which of those work).
+# which of those work). Its value is a record rather than a bare count, for the
+# reason the declaration gives.
 #
 # Every collection is seeded rather than started empty, because `m[k]` is the
 # proven lookup and faults on an absent key. An account's line seeds at qty 0.
@@ -53,9 +56,14 @@ accts: Mut(Map(AccountId, Balance), Txn) := box(map([
     (2, opening_balance),
 ]))
 
-holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([
-    ((1, "BTC"), 2 * one_btc),
-    ((2, "ETH"), 5 * one_btc),
+# The value repeats the ticker the key already carries. A `@LoadFrom` migration
+# binds a carried collection's values and not its keys, so a successor that scales
+# per asset can only reach the ticker from the value
+# (`v2_migrating_single_line.cambra`). Every write site sets the field from the key
+# it writes at; nothing checks that.
+holdings: Mut(Map({AccountId, Ticker}, {ticker: Ticker, qty: Int}), Txn) := box(map([
+    ((1, "BTC"), (ticker="BTC", qty=2 * one_btc)),
+    ((2, "ETH"), (ticker="ETH", qty=5 * one_btc)),
 ]))
 
 cart: Mut(Map(AccountId, {ticker: Ticker, qty: Int}), Txn) := box(map([
@@ -91,7 +99,7 @@ for r in checkout_reqs:
         if cash >= due:
             accts[r.account] := cash ^- due
             held = holdings[(r.account, line.ticker)]
-            holdings[(r.account, line.ticker)] := held + line.qty
+            holdings[(r.account, line.ticker)] := (ticker=line.ticker, qty=held.qty + line.qty)
             cart[r.account] := (ticker=line.ticker, qty=0)
         remaining = accts[r.account]
         checkout_acks << (ok=(cash >= due), due=due, cash=remaining)
@@ -100,13 +108,14 @@ for v in view_requests:
     with begin():
         line = cart[v.account]
         px = prices[line.ticker]
+        pos = holdings[(v.account, line.ticker)]
         view_replies << (
             cash = accts[v.account],
             ticker = line.ticker,
             qty = line.qty,
             price = px,
             total = line.qty * px // one_btc,
-            held = holdings[(v.account, line.ticker)],
+            held = pos.qty,
         )
 
 for u in price_updates():

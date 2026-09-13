@@ -44,9 +44,12 @@ accts: Mut(Map(AccountId, Balance), Txn) := box(map([
     (2, opening_balance),
 ]))
 
-holdings: Mut(Map({AccountId, Ticker}, Int), Txn) := box(map([
-    ((1, "BTC"), 2 * satoshi),
-    ((2, "ETH"), 5 * gwei),
+# Declared as `v1_single_line.cambra` declares it, so a reload inherits what that
+# version holds. The seed below is the cold-start value and is unreached on the reload
+# path.
+holdings: Mut(Map({AccountId, Ticker}, {ticker: Ticker, qty: Int}), Txn) := box(map([
+    ((1, "BTC"), (ticker="BTC", qty=2 * satoshi)),
+    ((2, "ETH"), (ticker="ETH", qty=5 * gwei)),
 ]))
 
 cart: Mut(Map(AccountId, {ticker: Ticker, qty: Int}), Txn) := box(map([
@@ -82,7 +85,7 @@ for r in checkout_reqs:
         if cash >= due:
             accts[r.account] := cash ^- due
             held = holdings[(r.account, line.ticker)]
-            holdings[(r.account, line.ticker)] := held + line.qty
+            holdings[(r.account, line.ticker)] := (ticker=line.ticker, qty=held.qty + line.qty)
             cart[r.account] := (ticker=line.ticker, qty=0)
         remaining = accts[r.account]
         checkout_acks << (ok=(cash >= due), due=due, cash=remaining)
@@ -91,13 +94,14 @@ for v in view_requests:
     with begin():
         line = cart[v.account]
         px = prices[line.ticker]
+        pos = holdings[(v.account, line.ticker)]
         view_replies << (
             cash = accts[v.account],
             ticker = line.ticker,
             qty = line.qty,
             price = px,
             total = line.qty * px // scales[line.ticker],
-            held = holdings[(v.account, line.ticker)],
+            held = pos.qty,
         )
 
 for u in price_updates():

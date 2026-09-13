@@ -65,10 +65,18 @@
 //! `Balance`, which the checkout's guard discharges
 //! ([`asset_cart_single_line_rejects_a_weakened_checkout_guard`]).
 //!
-//! `v2_single_line.cambra` is its reload target, unwinding the fixed-scale
-//! assumption into a divisor per asset. The two share a wiring, and swapping one
-//! for the other over a running cart is the demo's reload
-//! ([`asset_cart_single_line_reloads_to_per_asset_scales`]).
+//! Two files unwind its fixed-scale assumption into a divisor per asset, and
+//! each is a reload target over the same wiring
+//! ([`asset_cart_single_line_versions_share_one_wiring`]).
+//! `v2_single_line.cambra` changes the arithmetic alone, so every collection
+//! keeps the name and shape v1 gave it and the swap inherits each value where it
+//! stands ([`asset_cart_single_line_reloads_to_per_asset_scales`]).
+//! `v2_migrating_single_line.cambra` also reshapes `cart` and `holdings` to carry
+//! a `scale` per entry, so each is declared under a new name and seeded from what
+//! v1 held through `@LoadFrom`
+//! ([`asset_cart_single_line_migrates_its_state_to_per_asset_scales`]). The
+//! second is the demo's upgrade; `scripts/asset-cart-upgrade.sh` drives it
+//! against the real binary over the control port.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -770,30 +778,37 @@ fn asset_cart_single_line_rejects_a_weakened_checkout_guard() {
     }
 }
 
-/// The demo's reload: `v1_single_line.cambra` running, `v2_single_line.cambra` swapped in
-/// over it, and the cart it had built still there.
+/// One `GET /cart` for `account`, which serves exactly one line.
+fn view(host: &mut Host, account: i64) -> Value {
+    let mut rows = call(host, "GET", "/cart", &[("account", Value::Int(account))]);
+    assert_eq!(rows.len(), 1, "one request serves one line");
+    rows.remove(0)
+}
+
+/// One field of a reply row.
+fn field(row: &Value, name: &str) -> Value {
+    match row {
+        Value::Record(fields) => fields.get(name).cloned().expect("the field is present"),
+        other => panic!("a reply row is a record, got {other:?}"),
+    }
+}
+
+/// The quantity `PATCH /cart` puts in each account's line: a thousandth of a whole unit at
+/// v1's fixed scale.
+const CART_QTY: i64 = SCALE / 1_000;
+
+/// `v1_single_line.cambra` running, one quote per asset, and a cart line per account — the
+/// state both reload tests swap a new version in over.
 ///
-/// v1 divides every line by `one_btc`; v2 reads a divisor per asset out of `scales`. The
-/// swap is visible on ETH, whose scale is gwei rather than satoshis, and invisible on BTC,
-/// whose is unchanged — so the run separates "the new code took effect" from "the old state
-/// survived" instead of conflating them.
-#[test]
-fn asset_cart_single_line_reloads_to_per_asset_scales() {
+/// Account 1 holds BTC and account 2 ETH, because the two scales separate the two claims a
+/// reload makes: BTC's divisor is satoshis in every version, so its line proves the old
+/// state survived, and ETH's becomes gwei, so its line proves the new code took effect.
+fn a_cart_ready_to_reload() -> (Host, Value, Value) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/programs/asset_cart");
     let v1 = std::path::Path::new(dir).join("v1_single_line.cambra");
     let declared = ChannelFile::beside(&v1)
         .expect("the channel file parses")
         .expect("the program has a channel file");
-    // A reload changes the program and not the channels, so the two versions' wirings are
-    // one wiring. They are separate files because either program can be booted alone.
-    assert_eq!(
-        std::fs::read_to_string(std::path::Path::new(dir).join("v1_single_line.channels.json"))
-            .expect("v1's wiring is readable"),
-        std::fs::read_to_string(std::path::Path::new(dir).join("v2_single_line.channels.json"))
-            .expect("v2's wiring is readable"),
-        "the versions a reload swaps between share one wiring",
-    );
-
     let mut host = Host::compile(
         "v1_single_line.cambra",
         include_str!("v1_single_line.cambra"),
@@ -801,7 +816,6 @@ fn asset_cart_single_line_reloads_to_per_asset_scales() {
     )
     .expect("v1 embeds");
 
-    // A quote for each asset, then a line in each account's cart.
     for (ticker, dollars) in [("BTC", 1_000), ("ETH", 2_000)] {
         host.push(
             "price_updates",
@@ -813,7 +827,6 @@ fn asset_cart_single_line_reloads_to_per_asset_scales() {
         .expect("`price_updates` is a declared source");
         tick_until_quiet(&mut host);
     }
-    let qty = SCALE / 1_000;
     for (account, ticker) in [(1i64, "BTC"), (2, "ETH")] {
         call(
             &mut host,
@@ -822,46 +835,142 @@ fn asset_cart_single_line_reloads_to_per_asset_scales() {
             &[
                 ("account", Value::Int(account)),
                 ("ticker", Value::String(ticker.into())),
-                ("qty", Value::Int(qty)),
+                ("qty", Value::Int(CART_QTY)),
             ],
         );
     }
 
-    let view = |host: &mut Host, account: i64| -> Value {
-        let mut rows = call(host, "GET", "/cart", &[("account", Value::Int(account))]);
-        assert_eq!(rows.len(), 1, "one request serves one line");
-        rows.remove(0)
+    let (btc, eth) = (view(&mut host, 1), view(&mut host, 2));
+    (host, btc, eth)
+}
+
+/// Every field of BTC's line survives a swap, and ETH's differs in its total alone, by the
+/// ratio of the two scales.
+///
+/// Both reload targets owe this, whether they inherit the cart or migrate it: a reload
+/// keeps what the running version holds, and the divisor is the only thing that moves.
+fn assert_the_swap_repriced_eth_alone(
+    btc_before: &Value,
+    eth_before: &Value,
+    btc_after: &Value,
+    eth_after: &Value,
+) {
+    assert_eq!(btc_after, btc_before, "BTC's line is unchanged by the swap");
+    for name in ["cash", "ticker", "qty", "price", "held"] {
+        assert_eq!(
+            field(eth_after, name),
+            field(eth_before, name),
+            "the swap keeps ETH's {name}",
+        );
+    }
+    let Value::Int(before) = field(eth_before, "total") else {
+        panic!("a total is an Int");
     };
-    let (btc_before, eth_before) = (view(&mut host, 1), view(&mut host, 2));
+    assert_eq!(
+        field(eth_after, "total"),
+        Value::Int(before / 10),
+        "ETH prices at gwei after the swap, a tenth of what satoshis gave",
+    );
+}
+
+/// The wiring is one wiring across every version a reload swaps between.
+///
+/// A reload changes the program and not the channels. The files are separate because any
+/// of these programs can be booted alone, and identical because none of them may move a
+/// route.
+#[test]
+fn asset_cart_single_line_versions_share_one_wiring() {
+    let dir = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/programs/asset_cart"
+    ));
+    let wiring = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|e| panic!("{name} is readable: {e}"))
+    };
+    let v1 = wiring("v1_single_line.channels.json");
+    for target in [
+        "v2_single_line.channels.json",
+        "v2_migrating_single_line.channels.json",
+    ] {
+        assert_eq!(
+            wiring(target),
+            v1,
+            "{target} repeats v1's wiring, because a reload may not move a route",
+        );
+    }
+}
+
+/// The demo's reload: `v1_single_line.cambra` running, `v2_single_line.cambra` swapped in
+/// over it, and the cart it had built still there.
+///
+/// v1 divides every line by `one_btc`; v2 reads a divisor per asset out of `scales`. Every
+/// collection keeps the name and the shape v1 gave it, so the swap inherits each value
+/// where it stands and nothing is named at the boundary.
+#[test]
+fn asset_cart_single_line_reloads_to_per_asset_scales() {
+    let (mut host, btc_before, eth_before) = a_cart_ready_to_reload();
 
     host.reload(include_str!("v2_single_line.cambra"))
         .expect("v2 declares the same state v1 holds, so the swap is accepted");
 
     let (btc_after, eth_after) = (view(&mut host, 1), view(&mut host, 2));
+    assert_the_swap_repriced_eth_alone(&btc_before, &eth_before, &btc_after, &eth_after);
+}
 
-    // BTC's scale is satoshis in both versions, so its line is untouched — every field of
-    // it, which is the state that had to survive the swap.
-    assert_eq!(btc_after, btc_before, "BTC's line is unchanged by the swap");
+/// The same reload with the state migrated rather than inherited: `cart` and `holdings`
+/// change shape, so `v2_migrating_single_line.cambra` declares each under a new name and
+/// seeds it from what v1 held through `@LoadFrom`.
+///
+/// The reshaped collections are live and not merely readable, which is what the checkout
+/// at the end of this shows: it prices account 2's line at the `scale` the migration
+/// stamped on it, debits under the refined `Balance`, credits the migrated holdings and
+/// clears the migrated cart, all inside one block.
+#[test]
+fn asset_cart_single_line_migrates_its_state_to_per_asset_scales() {
+    let (mut host, btc_before, eth_before) = a_cart_ready_to_reload();
 
-    // ETH's divisor becomes gwei, so its total falls by the ratio of the two scales and
-    // nothing else about it moves.
-    let field = |row: &Value, name: &str| match row {
-        Value::Record(fields) => fields.get(name).cloned().expect("the field is present"),
-        other => panic!("a line is a record, got {other:?}"),
-    };
-    for name in ["cash", "ticker", "qty", "price", "held"] {
-        assert_eq!(
-            field(&eth_after, name),
-            field(&eth_before, name),
-            "the swap keeps ETH's {name}",
-        );
-    }
-    let Value::Int(before) = field(&eth_before, "total") else {
+    host.reload(include_str!("v2_migrating_single_line.cambra"))
+        .expect("`@LoadFrom` names the two collections this version reshapes");
+
+    let (btc_after, eth_after) = (view(&mut host, 1), view(&mut host, 2));
+    assert_the_swap_repriced_eth_alone(&btc_before, &eth_before, &btc_after, &eth_after);
+
+    // What the migration carried, priced at the divisor it stamped on the line.
+    let Value::Int(due) = field(&eth_after, "total") else {
         panic!("a total is an Int");
     };
+    let Value::Int(cash_before) = field(&eth_after, "cash") else {
+        panic!("a balance is an Int");
+    };
+    let Value::Int(held_before) = field(&eth_after, "held") else {
+        panic!("a holding is an Int");
+    };
+
+    let mut acks = call(&mut host, "PUT", "/checkout", &[("account", Value::Int(2))]);
+    assert_eq!(acks.len(), 1, "one request is answered once");
+    let ack = acks.remove(0);
     assert_eq!(
-        field(&eth_after, "total"),
-        Value::Int(before / 10),
-        "ETH prices at gwei after the swap, a tenth of what satoshis gave",
+        ack,
+        record(&[
+            ("cash", Value::Int(cash_before - due)),
+            ("due", Value::Int(due)),
+            ("ok", Value::Bool(true)),
+        ]),
+        "the checkout prices the migrated line and reads its own debit back",
+    );
+
+    // The credit and the clear landed on the migrated collections, not on what v1 held.
+    let settled = view(&mut host, 2);
+    assert_eq!(field(&settled, "qty"), Value::Int(0), "the line is cleared");
+    assert_eq!(
+        field(&settled, "held"),
+        Value::Int(held_before + CART_QTY),
+        "the holding gains the line's quantity, in the asset's own base units",
+    );
+    assert_eq!(
+        field(&settled, "cash"),
+        Value::Int(cash_before - due),
+        "the debit stands after the block commits",
     );
 }

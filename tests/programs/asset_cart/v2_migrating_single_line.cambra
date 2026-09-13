@@ -1,0 +1,144 @@
+# The single-line cart with one divisor per asset, seeded from the version it replaces.
+#
+# `v2_single_line.cambra` is the other reload target for `v1_single_line.cambra`. That one
+# changes the arithmetic and declares every collection under the name v1 gave it, so a
+# reload inherits each value where it stands. This one changes the shape of two of them,
+# so neither can be inherited under its own name: `cart` and `holdings` are declared under
+# new names and seeded from what the retired version held, through `@LoadFrom`.
+#
+# The shape change is where the divisor lives. v1 holds one divisor for every asset as the
+# program constant `one_btc`; here it rides each entry as a `scale` field, which is what
+# lets an account hold satoshis and gwei at once.
+#
+# The migration carries each stored quantity unchanged. A quantity is a count of the
+# asset's base units and always was; v1 divided every one of them by 10^8 and so read an
+# ETH position as ten times what it is. The upgrade corrects the divisor, not the record —
+# which is why account 2's line is worth a tenth afterwards and account 1's is untouched.
+#
+# `accts` and `prices` keep their v1 shapes and are declared here exactly as v1 declares
+# them. A variable the new version declares under the same identity takes the value it held
+# whether or not anything names it (`src/ccl/design/hot-reload.md`, "Seeding a variable
+# from the value the predecessor held"), so their seeds below are cold-start values that
+# the reload path does not reach.
+#
+# `v1_single_line.cambra`'s header carries the cart's shape, the refined `Balance` and the
+# atomicity claim; all three are unchanged here.
+#
+# TODO: `holdings`'s value repeats the ticker its key already carries, and the field's only
+# readers are the two lines of the migration below. A `@LoadFrom` migration cannot bind a
+# carried collection's keys — `for (a, t) -> q in holdings_held` is refused at inference
+# with "proven lookup `c[k]` needs the collection's type at this point, but `?N` is not
+# resolved yet", because the bounded annotation leaves the domain to be inferred and the
+# keyed-iteration desugaring needs it resolved. The same comprehension over an `=`-bound
+# map compiles. Resolve the carried binding's domain from its annotation and this file
+# loads `Map({AccountId, Ticker}, Int)` directly, with the field deleted from both versions.
+
+# Each asset's base unit, and they differ — which is the whole of v2. `one_dollar` is the
+# price scale and is shared, so it stays one constant.
+satoshi = 10**8
+gwei = 10**9
+scales = map([("BTC", satoshi), ("ETH", gwei)])
+
+one_dollar = 10**8
+
+AccountId = Int
+Microcents = Int
+# `>= 0`, not `> 0`: a zero balance is a balance, and `cash >= due` permits spending
+# to exactly zero. What the program may not do is write a negative one.
+Balance = {Microcents where  _ >= 0}
+Ticker = String
+ScaledQuantity = {ticker: Ticker, qty: Int, scale: Int}
+
+# Both accounts open at the same balance, and it is written as a literal. A map
+# literal's codomain is the join over its entries, so two entries carrying different
+# equations join to a bare `Microcents` and the declaration can no longer be met. The
+# equation also has to reduce to a sign on its own: `500 ^* one_dollar` is rejected,
+# because the product it carries names `one_dollar`.
+opening_balance = 50000000000  # 500 dollars, at `one_dollar`
+
+accts: Mut(Map(AccountId, Balance), Txn) := box(map([
+    (1, opening_balance),
+    (2, opening_balance),
+]))
+
+prices: Mut(Map(Ticker, Microcents), Txn) := box(map([
+    ("BTC", 0),
+    ("ETH", 0),
+]))
+
+# --- the migration ---------------------------------------------------------
+
+# `@LoadFrom(x)` binds a declaration to the value the replaced version held for `x`, read
+# once at the swap. The bounded form (`<:`) states the shape that value is read at and
+# leaves the collection's domain to be inferred, which is what a comprehension over the
+# binding needs; an exact `:` pins the domain and rejects one (`docs/chl-spec.md`,
+# "8.8 `@LoadFrom`").
+
+@LoadFrom(cart)
+cart_held <: Map(AccountId, {ticker: Ticker, qty: Int})
+
+cart_rescaled: Mut(Map(AccountId, ScaledQuantity), Txn) := [
+    (ticker=line.ticker, qty=line.qty, scale=scales[line.ticker])
+    for line in cart_held
+]
+
+@LoadFrom(holdings)
+holdings_held <: Map({AccountId, Ticker}, {ticker: Ticker, qty: Int})
+
+holdings_rescaled: Mut(Map({AccountId, Ticker}, ScaledQuantity), Txn) := [
+    (ticker=h.ticker, qty=h.qty, scale=scales[h.ticker])
+    for h in holdings_held
+]
+
+# --- endpoints -------------------------------------------------------------
+
+# The same three routes and the same row types v1 serves, so the wiring beside this file
+# repeats `v1_single_line.channels.json` and a reload moves the program alone.
+cart_changes,  cart_change_acks = wasm_serve("PATCH", "/cart")
+checkout_reqs, checkout_acks    = wasm_serve("PUT",   "/checkout")
+view_requests, view_replies     = wasm_serve("GET",   "/cart")
+
+for c in cart_changes:
+    with begin():
+        if c.qty >= 0:
+            cart_rescaled[c.account] := (ticker=c.ticker, qty=c.qty, scale=scales[c.ticker])
+        cart_change_acks << (ok=(c.qty >= 0), ticker=c.ticker, qty=c.qty)
+
+for r in checkout_reqs:
+    with begin():
+        cash = accts[r.account]
+        line = cart_rescaled[r.account]
+        # The divisor comes off the line, where v1 spelled `one_btc`.
+        due = line.qty * prices[line.ticker] // line.scale
+        # `^-` records the difference, so the debit is typed
+        # `{Microcents | __elem == cash ^- due}` rather than a bare `Microcents`, and the
+        # guard is assumable inside its own arm. `Balance` demands `__elem >= 0`, which
+        # follows from the two. Weaken the guard and the write is ill-typed
+        # (`asset_cart_single_line_rejects_a_weakened_checkout_guard`).
+        if cash >= due:
+            accts[r.account] := cash ^- due
+            held = holdings_rescaled[(r.account, line.ticker)]
+            holdings_rescaled[(r.account, line.ticker)] := (
+                ticker=line.ticker, qty=held.qty + line.qty, scale=line.scale
+            )
+            cart_rescaled[r.account] := (ticker=line.ticker, qty=0, scale=line.scale)
+        remaining = accts[r.account]
+        checkout_acks << (ok=(cash >= due), due=due, cash=remaining)
+
+for v in view_requests:
+    with begin():
+        line = cart_rescaled[v.account]
+        px = prices[line.ticker]
+        pos = holdings_rescaled[(v.account, line.ticker)]
+        view_replies << (
+            cash = accts[v.account],
+            ticker = line.ticker,
+            qty = line.qty,
+            price = px,
+            total = line.qty * px // line.scale,
+            held = pos.qty,
+        )
+
+for u in price_updates():
+    with begin():
+        prices[u.ticker] := u.price
