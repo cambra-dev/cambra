@@ -1,0 +1,11 @@
+{
+  "channels": [
+    { "name": "PATCH /cart", "kind": "request", "type": "{account: Int, ticker: String, qty: Int}" },
+    { "name": "PATCH /cart", "kind": "response", "type": "{ok: Bool, ticker: String, qty: Int}" },
+    { "name": "PUT /checkout", "kind": "request", "type": "{account: Int}" },
+    { "name": "PUT /checkout", "kind": "response", "type": "{ok: Bool, due: Int, cash: Int}" },
+    { "name": "GET /cart", "kind": "request", "type": "{account: Int}" },
+    { "name": "GET /cart", "kind": "response", "type": "{cash: Int, ticker: String, qty: Int, price: Int, total: Int, held: Int}" },
+    { "name": "price_updates", "kind": "source", "type": "{ticker: String, price: Int}" }
+  ]
+}
