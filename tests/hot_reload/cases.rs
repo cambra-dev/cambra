@@ -3114,13 +3114,17 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || tx.send(vec![http_post(port, "/read", "x")]).unwrap());
-    // Let the request arrive, then advance the fold with one poll — which both
-    // takes the source's report of new data and leaves the fold unfinished.
+    // Let the request arrive, then advance the fold a few rounds — enough that the
+    // retired version decides a prefix, far short of the twenty it would need to
+    // finish. The first round only takes the source's report of new data; the
+    // fold's own laps run in the rounds after it.
     thread::sleep(Duration::from_millis(400));
-    ctx.scheduler().check_for_notifications();
+    for _ in 0..4 {
+        ctx.scheduler().check_for_notifications();
+    }
     assert!(
         rx.try_recv().is_err(),
-        "twenty elements outlast the round that starts them, so the reply is still pending",
+        "twenty elements outlast the rounds that start them, so the reply is still pending",
     );
 
     live.reload(

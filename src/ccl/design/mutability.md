@@ -861,7 +861,7 @@ causal matcher (`letrec::check_letrec_causal`).
   value forward); the driver reads that changelog back to produce the body's `(prev…, item)`
   input, taking the next position from the decided frontier and the prev-accumulator from the
   value at it. The accumulator therefore crosses between them as a tile, like every other
-  operator-to-operator value, at one position per pull. `StoreDenseRead` then folds the
+  operator-to-operator value, at one position per round. `StoreDenseRead` then folds the
   changelog over the loop domain to the dense `𝐷 ⇀ 𝑉` stream (serving both a scalar-final
   `ExtractFinal` and a co-iterated `fan_in`). A single always-commit or commit-gated writer over a
   finite *or* async domain.

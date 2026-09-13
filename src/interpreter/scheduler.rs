@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
 };
@@ -10,7 +10,7 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 ///
 /// The notification model is push-from-source: a source announces new data via
 /// [`Scheduler::check_for_notifications`], which the driver calls *between*
-/// pulls. But an operator that advances its own state one pull at a time — a
+/// pulls. But an operator that advances its own state one round at a time — a
 /// store recurrence closed through a cyclic feedback `FanOut` — has
 /// more to compute after a partial pull with **no external trigger pending**,
 /// and it cannot simply `notify()` from inside `get`: the notify graph is cyclic
@@ -57,13 +57,46 @@ impl WakeupQueue {
         self.0.borrow_mut().push(consumer);
     }
 
-    /// Take the currently-queued wakeups, leaving the queue empty. A wakeup
-    /// fired during the drain may enqueue a fresh request (a still-converging
-    /// producer re-arming); that lands in the now-empty queue and is delivered
-    /// by the next drain, not this one.
+    /// Take the currently-queued wakeups, leaving the queue empty. A request
+    /// enqueued after this — by a source notification's synchronous pull, or by a
+    /// still-converging producer re-arming during the drain — lands in the
+    /// now-empty queue and is delivered by the next drain, which is the round it
+    /// is asking for.
     fn take(&self) -> Vec<SharedConsumer> {
         std::mem::take(&mut *self.0.borrow_mut())
     }
+}
+
+// shared-state-ok: a counter, and what crosses it is a clock reading rather than
+// a value — nothing in the graph reads data through it. A *round* is a span with
+// no `get` in flight on this thread, which is a property of the thread and not of
+// any one scheduler: two programs driven from the same loop share the points
+// between their pulls.
+thread_local! {
+    // shared-state-ok: the counter itself, for the reason on the block above.
+    static ROUND: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Begin the next **delivery round**: the span between two
+/// [`Scheduler::check_for_notifications`] calls, over which the graph holds one
+/// consistent set of tiles.
+///
+/// A `get` is a read, not a step — two of them for the same region with no
+/// release in between answer the same tile, which
+/// [`TileProducer::get`](crate::interpreter::tile_operators::TileProducer::get)
+/// asserts. A producer whose state advances with nothing external to trigger it
+/// (a store draining its writers' proposals, a driver emitting the next attempt)
+/// advances on this boundary rather than on whichever pull reached it first, and
+/// answers the round's frozen tile for the rest of it.
+/// [`RoundCache`](crate::interpreter::tile_operators::RoundCache) holds that
+/// answer.
+pub(crate) fn open_round() {
+    ROUND.with(|r| r.set(r.get() + 1));
+}
+
+/// The delivery round in progress. See [`open_round`].
+pub(crate) fn current_round() -> u64 {
+    ROUND.with(Cell::get)
 }
 
 /// Basic scheduler implementation.
@@ -147,6 +180,15 @@ other's subscribers",
     }
 
     pub fn check_for_notifications(&mut self) {
+        // Open the round first: a source arrival and a deferred wakeup are both
+        // state changes the graph may not observe mid-round, so everything this
+        // call delivers belongs to the round it begins.
+        open_round();
+        // Take the queue before polling. A source's notification pulls
+        // synchronously, and a producer re-arming during that pull is asking for
+        // the *next* round — delivering it in this one would re-pull a graph that
+        // has already answered for the round, spending the request on nothing.
+        let deferred = self.wakeups.take();
         self.source_handles
             .values_mut()
             .for_each(|(source, consumers)| {
@@ -159,10 +201,10 @@ other's subscribers",
                     }
                 }
             });
-        // Deliver deferred wakeups now — outside any `get`, so a notification
+        // Deliver the deferred wakeups now — outside any `get`, so a notification
         // that fans through the cyclic operator graph does not re-enter an
         // operator mid-borrow (see [`WakeupQueue`]).
-        for consumer in self.wakeups.take() {
+        for consumer in deferred {
             consumer.borrow_mut().notify();
         }
     }

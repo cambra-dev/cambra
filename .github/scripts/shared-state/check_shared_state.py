@@ -91,6 +91,14 @@ EXPECTED_EXCEPTIONS = [
     # crosses the cell is graph structure, never a tile.
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
+    # The delivery-round clock, twice: the `thread_local!` and the cell inside it
+    # each match the ambient-state shape. What crosses it is a clock reading, not
+    # a value — a *round* is a span with no `get` in flight on the thread, so the
+    # counter belongs to the thread rather than to any one scheduler, and the
+    # `TileProducer::get` check that enforces the round's read contract runs where
+    # no scheduler is in reach.
+    ("src/interpreter/scheduler.rs", "ambient mutable state"),
+    ("src/interpreter/scheduler.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),

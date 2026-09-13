@@ -2213,6 +2213,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     ctx.scheduler().check_for_notifications();
     let mut result = producer.get(ug.clone());
     for _ in 0..64 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(ug.clone());
     }
 
@@ -2277,6 +2278,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     ctx.scheduler().check_for_notifications();
     let mut result = producer.get(ug.clone());
     for _ in 0..64 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(ug.clone());
     }
 
@@ -2337,6 +2339,7 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     ctx.scheduler().check_for_notifications();
     let mut result = producer.get(ug.clone());
     for _ in 0..64 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(ug.clone());
     }
     assert_eq!(
@@ -2480,7 +2483,7 @@ fn live_reply_combines_request_and_store() {
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // Drain the commit store first, with no request present: the reader pulls the
-    // store on every `get`, and the writer's self-re-arm steps one commit per pull.
+    // store on every `get`, and the writer's self-re-arm steps one commit per round.
     for _ in 0..16 {
         producer.get(producer.tiling().universal_guard());
         ctx.scheduler().check_for_notifications();
@@ -2496,6 +2499,7 @@ fn live_reply_combines_request_and_store() {
     let mut result = producer.get(producer.tiling().universal_guard());
     let mut n = 0;
     while !result.is_terminal() && n < 64 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(producer.tiling().universal_guard());
         n += 1;
     }
@@ -3254,6 +3258,7 @@ fn live_read_progresses_past_deny() {
     src.borrow_mut().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     for _ in 0..32 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(ug.clone());
     }
     result.compact();

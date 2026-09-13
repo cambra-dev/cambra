@@ -49,7 +49,7 @@ use crate::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, FunctionGuard, Predicate, Scheduler, SharedConsumer,
     Tile, TileGuard, Tiling, Value, WakeupQueue, forwarding_consumer, shared_consumer,
     tile_operators::{
-        CycleSlot, CyclicSequencingProducer, ProducerBase, TileOperator, TileProducer,
+        CycleSlot, CyclicSequencingProducer, ProducerBase, RoundCache, TileOperator, TileProducer,
     },
     tuple_field,
 };
@@ -327,17 +327,25 @@ enum InitDrainFailure {
 }
 
 /// Drain a scalar-valued producer to its single value — the tick-0 store value
-/// for a computed init. The producer is acyclic (it never reads the store), so a
-/// non-empty scalar appears on the first pull; the [`MAX_INIT_PULLS`] bound is a
-/// belt-and-braces guard against a producer that never yields. On failure,
-/// distinguishes a genuinely [`InitDrainFailure::Empty`] init (a scalar tile was
-/// produced but stayed empty) from a [`InitDrainFailure::Diverged`] one (no
-/// scalar tile settled within the bound).
+/// for a computed init. The producer never reads the store being seeded, so the
+/// drain cannot deadlock on it; a seed taken from *another* store's final value
+/// does read one, and settles one lap of that store's recurrence per round, which
+/// is what the [`MAX_INIT_PULLS`] bound covers. On failure, distinguishes a
+/// genuinely [`InitDrainFailure::Empty`] init (a scalar tile was produced but
+/// stayed empty) from a [`InitDrainFailure::Diverged`] one (no scalar tile
+/// settled within the bound).
 fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDrainFailure> {
     use crate::interpreter::tile_operators::scalar_tile_to_column_value;
     let guard = producer.tiling().universal_guard();
     let mut saw_empty_scalar = false;
     for _ in 0..MAX_INIT_PULLS {
+        // A drive loop of its own, so it opens its own delivery rounds: a `get`
+        // is a read, and an init that awaits another store's final value settles
+        // one lap of that store's recurrence per round. Nothing is mid-pull here
+        // — a subscribe is not inside a `get` — so this is a round boundary in
+        // the same sense `check_for_notifications` is, without delivering the
+        // wakeups that belong to the driver's loop.
+        crate::interpreter::scheduler::open_round();
         // A compound (tuple/record) accumulator's init is struct-of-arrays
         // (`Tile::Record`); box it into a single scalar record value so it seeds
         // like any scalar. A plain scalar init passes straight through.
@@ -395,9 +403,11 @@ fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDra
     })
 }
 
-/// Pull bound for [`read_initial_scalar`]: an acyclic scalar init resolves on the
-/// first pull, so a small margin is ample; exceeding it means the input isn't
-/// converging (the doc's "a couple of pulls" claim).
+/// Round bound for [`read_initial_scalar`]: an init computed from constants
+/// resolves on the first round, and one awaiting another store's final value takes
+/// a round per lap of that store's recurrence. Exceeding this means the input is
+/// not converging — or that it awaits a recurrence longer than the bound, which no
+/// seed in the corpus is.
 const MAX_INIT_PULLS: usize = 8;
 
 /// The watermark of a store tile's `frontier` predicate (the decode behind
@@ -895,8 +905,8 @@ impl TileOperator for CommitOperator {
                 ),
                 InitDrainFailure::Diverged => panic!(
                     "CommitOperator: computed init op for key {key:?} never settled to a scalar \
-                     within {MAX_INIT_PULLS} pulls (an acyclic init should resolve on the first \
-                     pull)"
+                     within {MAX_INIT_PULLS} delivery rounds (an init over constants resolves \
+                     in the first)"
                 ),
             });
             init.insert(key, value);
@@ -927,6 +937,7 @@ impl TileOperator for CommitOperator {
             engine: CommitEngine::new(init),
             output_tiling: self.tiling().clone(),
             drain_start: 0,
+            round: RoundCache::default(),
         })
     }
 }
@@ -956,6 +967,10 @@ struct CommitProducer {
     /// changes only *which* transaction wins a race between conflicting writers,
     /// never correctness (conservation/non-negativity hold under any order).
     drain_start: usize,
+    /// One drain per delivery round. The drain is a state advance with no arrival
+    /// and no release behind it, so it happens on the round boundary rather than
+    /// on whichever of the store's readers pulled first.
+    round: RoundCache,
 }
 
 /// A proposal-stream record field, as its scalar column. The proposal codomain
@@ -1002,6 +1017,9 @@ impl TileProducer for CommitProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         self.debug_assert_position_invariant();
+        if let Some(store) = self.round.hit() {
+            return store;
+        }
         // Drain each writer's new proposals. Within a pull the drain order is the
         // serialization order (an earlier-drained writer's commit can make a
         // later one's same-pull proposal stale), and the **start index rotates**
@@ -1138,7 +1156,7 @@ impl TileProducer for CommitProducer {
             store.check_from(&self.output_tiling),
             "rendered store tile does not match the full-store tiling"
         );
-        store
+        self.round.fill(store)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1318,7 +1336,8 @@ impl TileOperator for InductionStore {
                 ),
                 InitDrainFailure::Diverged => panic!(
                     "InductionStore: init op for accumulator {key:?} never settled to a scalar \
-                     within {MAX_INIT_PULLS} pulls (an acyclic init resolves on the first pull)"
+                     within {MAX_INIT_PULLS} delivery rounds (an init over constants resolves \
+                     in the first)"
                 ),
             });
             inits.insert(key, value);
@@ -1346,6 +1365,7 @@ impl TileOperator for InductionStore {
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
             output_tiling: self.tiling().clone(),
+            round: RoundCache::default(),
         })
     }
 }
@@ -1359,6 +1379,10 @@ struct InductionStoreProducer {
     /// The full-store output tiling — for a debug-time shape check on the rendered
     /// store tile.
     output_tiling: Tiling,
+    /// One step per delivery round, for the reason [`CommitProducer::round`] has
+    /// one: consuming the body's decisions advances the recurrence, and a pull
+    /// must not be what advances it.
+    round: RoundCache,
 }
 
 impl InductionStoreProducer {
@@ -1395,6 +1419,9 @@ impl TileProducer for InductionStoreProducer {
     impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        if let Some(store) = self.round.hit() {
+            return store;
+        }
         let body_tile = self
             .body_producer
             .get(self.body_producer.tiling().universal_guard());
@@ -1406,7 +1433,7 @@ impl TileProducer for InductionStoreProducer {
         // source skips the extent positions its filter excluded, and those ticks are
         // never occupied. The decision gates commit (append the change) vs carry
         // (`step(_, None)` — the value inherits from tick 0 / the latest earlier
-        // change). The driver emits one position per pull, so this normally steps
+        // change). The driver emits one position per round, so this normally steps
         // once; consuming a run costs nothing extra and keeps the store's rule
         // independent of that rate.
         let started_at = self.processed();
@@ -1495,7 +1522,8 @@ impl TileProducer for InductionStoreProducer {
             next_decided_position(&body_tile, self.processed()),
             self.processed()
         );
-        self.render_store(done)
+        let store = self.render_store(done);
+        self.round.fill(store)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1647,7 +1675,7 @@ impl TileProducer for StoreValueStreamProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         // Sample the store's current tile once and re-fold the whole changelog
         // (consumer-driven; no producer-side drive-to-fixpoint). The store's writer
-        // steps one commit per pull and re-arms itself on the wakeup queue, which
+        // steps one commit per round and re-arms itself on the wakeup queue, which
         // fans through the cyclic `FanOut` to re-pull this stream as commits land;
         // terminality flows through the store's closure flags below.
         let sg = self.store_producer.tiling().universal_guard();
@@ -2021,7 +2049,7 @@ impl TileProducer for StoreDenseReadProducer {
         };
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint),
         // then fold `key` at each *decided* position. The cycle advances one
-        // position per pull, so a batch source converges over several pulls rather than in
+        // position per round, so a batch source converges over several rounds rather than in
         // one sample — the read grows across pulls, and the decidedness filter below is
         // what keeps each emission final. Later arrivals and later positions re-pull
         // us through the store's source-forwarding consumer. Iterations occupy ticks 1.. (tick 0 is the
@@ -2052,7 +2080,7 @@ impl TileProducer for StoreDenseReadProducer {
         // *undecided* position would resolve it to the carried earlier value and
         // then contradict that value once the position really commits — a changed
         // value at a known position, which the tile contract forbids. The store
-        // advances one position per pull, so mid-loop this filter is doing real
+        // advances one position per round, so mid-loop this filter is doing real
         // work: without it a `Memo` above this read latches the seed for every
         // position on the first pull, releases them so they are never re-emitted,
         // and publishes that stale cache as complete when the store closes.
@@ -2452,7 +2480,7 @@ impl TileProducer for AsOfProducer {
         // observes the store as of *this* pull's watermark — an arbitrary as-of
         // position, which the unordered transactional model permits. We do not
         // drive the store to a fixpoint here; the store's own writer steps one
-        // commit per pull and re-arms itself on the wakeup queue, and that wakeup
+        // commit per round and re-arms itself on the wakeup queue, and that wakeup
         // fans through the cyclic `FanOut` to re-pull this reader as commits land.
         // A trigger position latched this pull freezes to the watermark it sees;
         // a later position, re-pulled after further commits, latches a later value.
@@ -2526,7 +2554,7 @@ impl TileProducer for AsOfProducer {
                     Predicate::LessThanEq(Value::UInt(f - 1)),
                 )));
         }
-        // Terminality gate. This reader samples one watermark per pull — it does not
+        // Terminality gate. This reader samples one watermark per round — it does not
         // drive the store to a fixpoint itself — and relies on being re-pulled (via the
         // writer's wakeup fanning through the cyclic `FanOut`) to converge. So it must stay
         // **non-terminal** until the store itself is terminal, or it could report "done"
@@ -2963,7 +2991,7 @@ impl TileProducer for InductionDriverProducer {
             .get(self.store_producer.tiling().universal_guard());
 
         // Emit the next iterated position, if the source has delivered it. At most
-        // one position per pull: the cyclic `FanOut` serves this store tile from
+        // one position per round: the cyclic `FanOut` serves this store tile from
         // a snapshot taken before the traversal began, so a position decided
         // *during* this pull is not visible until the next one. That is the
         // one-step-per-pull cycle driver every cyclic operator here runs on.
@@ -3231,7 +3259,7 @@ struct TransactDriverProducer {
 /// decided, plus at most one newer row emitted since it decided.
 ///
 /// This bound *is* the O(1) claim the writer's supersession release exists for,
-/// and it holds only because of it. Rows are added at most one per pull and only
+/// and it holds only because of it. Rows are added at most one per round and only
 /// for `current`; they leave on the release intersection. The writer contributes
 /// two releases — everything below the position it decides (supersession) and
 /// `≤ attempt` when the item finishes (the ack) — and it is the first that caps
@@ -4474,32 +4502,64 @@ mod tests {
         (fan, acc)
     }
 
-    /// Pull until the tile goes terminal. The cycle advances one iteration
-    /// position per pull, so a converging read needs one pull per position (plus
-    /// the closing one); the bound is generous and failing it means divergence.
-    fn pull_to_terminal(producer: &mut Box<dyn TileProducer>) -> Tile {
-        let mut tile = producer.get(producer.tiling().universal_guard());
-        for _ in 0..MAX_CYCLE_PULLS {
-            if tile.is_terminal() {
-                return tile;
+    /// A subscribed producer together with the scheduler that drives it.
+    ///
+    /// A `get` is a read, so a cycle does not advance by being pulled: it
+    /// advances when `check_for_notifications` opens the next delivery round and
+    /// delivers the wakeup the recurrence re-armed (see
+    /// [`RoundCache`](crate::interpreter::tile_operators::RoundCache)). Pulling
+    /// alone leaves a store answering whatever it rendered in the round its
+    /// subscribe opened, so every cycle here is driven through this pair — the
+    /// same `pull` / `check_for_notifications` alternation `src/main.rs` runs.
+    struct Driven {
+        scheduler: Scheduler,
+        producer: Box<dyn TileProducer>,
+    }
+
+    impl Driven {
+        fn new(mut op: Box<dyn TileOperator>) -> Self {
+            let mut scheduler = Scheduler::new();
+            let guard = op.tiling().universal_guard();
+            let producer = op.subscribe(guard, Box::new(|| {}), &mut scheduler);
+            Self {
+                scheduler,
+                producer,
             }
-            tile = producer.get(producer.tiling().universal_guard());
         }
-        panic!("induction cycle did not converge within {MAX_CYCLE_PULLS} pulls");
+
+        /// Open the next round, then read it — one lap of the cycle.
+        fn pull(&mut self) -> Tile {
+            self.scheduler.check_for_notifications();
+            self.producer.get(self.producer.tiling().universal_guard())
+        }
+
+        fn release(&mut self, guard: TileGuard) {
+            self.producer.release(guard);
+        }
+
+        /// Pull until the tile goes terminal. A cycle advances one position per
+        /// round, so a converging read needs one round per position plus the
+        /// closing one; the bound is generous and failing it means divergence.
+        fn pull_to_terminal(&mut self) -> Tile {
+            for _ in 0..MAX_CYCLE_ROUNDS {
+                let tile = self.pull();
+                if tile.is_terminal() {
+                    return tile;
+                }
+            }
+            panic!("cycle did not converge within {MAX_CYCLE_ROUNDS} rounds");
+        }
     }
 
     /// Convergence bound for the test cycles here — far above any test's
     /// iteration count, so exceeding it means the cycle stalled.
-    const MAX_CYCLE_PULLS: usize = 64;
+    const MAX_CYCLE_ROUNDS: usize = 64;
 
     /// Drive an `InductionStore` for a single-accumulator loop end-to-end through
     /// the tile protocol and return the converged store tile.
     fn drive_induction(items: &[i64], threshold: i64, init: i64) -> Tile {
         let (fan, _acc) = induction_cycle(items, threshold, init);
-        let mut op = fan.branch();
-        let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        pull_to_terminal(&mut producer)
+        Driven::new(fan.branch()).pull_to_terminal()
     }
 
     /// `acc := 0; for i in [1,2,3,4]: if i > 2: acc += i` driven through the whole
@@ -4557,11 +4617,9 @@ mod tests {
     #[test]
     fn induction_store_release_bounds_changelog_keeping_latest() {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 10); // unconditional
-        let mut op = fan.branch();
-        let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(fan.branch());
 
-        let full = pull_to_terminal(&mut producer);
+        let full = driven.pull_to_terminal();
         let Tile::Store { changes, .. } = &full else {
             panic!("induction store output is a Store");
         };
@@ -4572,11 +4630,15 @@ mod tests {
         );
 
         // A reader consumed loop positions ≤ 1 → store ticks ≤ 2.
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
+        driven.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::LessThanEq(Value::UInt(2)),
         )));
 
-        let bounded = producer.get(producer.tiling().universal_guard());
+        // Two rounds to observe the GC: the store re-renders on the next round's
+        // inner pull, and the cyclic fan serves that render the round after (it
+        // is the recurrence's delay element).
+        driven.pull();
+        let bounded = driven.pull();
         assert!(validate_tile(&bounded));
         assert_eq!(
             store_current(&bounded, &acc).map(|(_, v)| v),
@@ -4599,13 +4661,11 @@ mod tests {
     fn dense_read(items: &[i64], threshold: i64, init: i64) -> Vec<i64> {
         let (fan, acc) = induction_cycle(items, threshold, init);
         let trigger = IterateExtent::new(Extent::uint_range(items.len()));
-        let mut reader =
+        let reader =
             StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
-        let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        // The cycle advances one position per pull, so the dense read converges
-        // over several pulls rather than one.
-        let tile = pull_to_terminal(&mut producer);
+        // The cycle advances one position per round, so the dense read converges
+        // over several rounds rather than one.
+        let tile = Driven::new(Box::new(reader)).pull_to_terminal();
         assert!(validate_tile(&tile));
         let Tile::SealedFunction { codomain, .. } = tile else {
             panic!("dense read is a SealedFunction");
@@ -4688,16 +4748,15 @@ mod tests {
         // Writes iff `item > 3`: over [5, 1, 1, 9] that fires at positions 0 and 3.
         let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
         let trigger = IterateExtent::new(Extent::uint_range(4));
-        let mut reader =
+        let reader =
             StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
-        let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(Box::new(reader));
 
-        let read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(usize, i64)> {
-            // The cycle advances one position per pull, so the first full read
-            // converges over several pulls; a later re-read is already terminal
+        let read_values = |d: &mut Driven| -> Vec<(usize, i64)> {
+            // The cycle advances one position per round, so the first full read
+            // converges over several rounds; a later re-read is already terminal
             // and returns immediately.
-            let tile = pull_to_terminal(p);
+            let tile = d.pull_to_terminal();
             let Tile::SealedFunction {
                 domain, codomain, ..
             } = tile
@@ -4717,15 +4776,15 @@ mod tests {
 
         // Full read: acc = 5 (pos 0), 5, 5 (carries), 14 (pos 3).
         assert_eq!(
-            read_values(&mut producer),
+            read_values(&mut driven),
             vec![(0, 5), (1, 5), (2, 5), (3, 14)]
         );
         // Release the leading position, then re-read. The carry source (tick 1)
         // must survive so positions 1, 2 still fold to 5 — not the seed 0.
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
+        driven.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::LessThanEq(Value::UInt(0)),
         )));
-        let after = read_values(&mut producer);
+        let after = read_values(&mut driven);
         for (p, v) in [(1usize, 5i64), (2, 5), (3, 14)] {
             assert!(
                 after.contains(&(p, v)),
@@ -4802,21 +4861,20 @@ mod tests {
             releases: releases.clone(),
         };
         let trigger = IterateExtent::new(Extent::uint_range(4));
-        let mut reader = StoreDenseRead::new(
+        let reader = StoreDenseRead::new(
             Box::new(trigger),
             Box::new(recorder),
             acc,
             value_extent(),
             true,
         );
-        let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(Box::new(reader));
 
         // Drive the fold to convergence so the reader caches which ticks wrote
-        // `acc` — the cycle advances one position per pull.
-        let _ = pull_to_terminal(&mut producer);
+        // `acc` — the cycle advances one position per round.
+        let _ = driven.pull_to_terminal();
 
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
+        driven.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::LessThanEq(Value::UInt(0)),
         )));
         assert_eq!(
@@ -4825,8 +4883,8 @@ mod tests {
             "releasing dense pos 0 must forward store release ≤ 0 (carry source tick 1 survives)"
         );
 
-        let _ = producer.get(producer.tiling().universal_guard());
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
+        let _ = driven.pull();
+        driven.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::LessThanEq(Value::UInt(2)),
         )));
         assert_eq!(
@@ -5220,15 +5278,11 @@ mod tests {
 
     /// Wire `input` as the operator's single writer and subscribe, returning the
     /// store producer.
-    fn subscribe_commit(
-        input: Box<dyn TileOperator>,
-        init: HashMap<Value, Value>,
-    ) -> Box<dyn TileProducer> {
+    fn subscribe_commit(input: Box<dyn TileOperator>, init: HashMap<Value, Value>) -> Driven {
         let writes = all_writers_write(&init, 1);
-        let mut op = CommitOperator::new(init, key_extent(), value_extent(), writes);
+        let op = CommitOperator::new(init, key_extent(), value_extent(), writes);
         (op.writer_input_setter(0))(input);
-        let guard = op.tiling().universal_guard();
-        op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
+        Driven::new(Box::new(op))
     }
 
     /// A test source operator that emits a fixed proposal stream as one
@@ -5294,9 +5348,9 @@ mod tests {
             (0, balances(&[("pool", 100)]), balances(&[("pool", 30)])),
             (0, balances(&[("pool", 100)]), balances(&[("pool", 50)])),
         ]);
-        let mut producer = subscribe_commit(Box::new(source), balances(&[("pool", 100)]));
+        let mut driven = subscribe_commit(Box::new(source), balances(&[("pool", 100)]));
 
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = driven.pull();
         assert!(validate_tile(&tile));
         let Tile::Store {
             changes,
@@ -5322,9 +5376,9 @@ mod tests {
             (0, balances(&[("pool", 100)]), balances(&[("pool", 30)])),
             (1, balances(&[("pool", 30)]), balances(&[("pool", 20)])),
         ]);
-        let mut producer = subscribe_commit(Box::new(source), balances(&[("pool", 100)]));
+        let mut driven = subscribe_commit(Box::new(source), balances(&[("pool", 100)]));
 
-        let tile = producer.get(producer.tiling().universal_guard());
+        let tile = driven.pull();
         let Tile::Store {
             changes,
             frontier,
@@ -5348,7 +5402,7 @@ mod tests {
     /// A test writer body that models a single-writer counter loop on one store
     /// `key`: each pull it folds the store to read `key`'s value and proposes
     /// `value + 1`, reporting the frontier it observed as its snapshot. Appends
-    /// one proposal per pull, up to `n` steps. It reads the store through its
+    /// one proposal per round, up to `n` steps. It reads the store through its
     /// `store_op` input — which, in the cycle, is a branch of the commit
     /// operator's own output.
     struct CounterBody {
@@ -5449,14 +5503,12 @@ mod tests {
         let body = CounterBody::new(store_fan.branch(), acct("n"), 3);
         set_writer(Box::new(body));
 
-        let mut external = store_fan.branch();
-        let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(store_fan.branch());
 
-        // Drive the cycle: bootstrap + 3 commits + a fixpoint pull, with margin.
-        let mut latest = producer.get(producer.tiling().universal_guard());
+        // Drive the cycle: bootstrap + 3 commits + a fixpoint round, with margin.
+        let mut latest = driven.pull();
         for _ in 0..6 {
-            latest = producer.get(producer.tiling().universal_guard());
+            latest = driven.pull();
         }
         // Store: init 0 @0, then 1@1, 2@2, 3@3 — the counter reached 3.
         assert_eq!(store_at(&latest, &acct("n")), Some((3, 3)));
@@ -5595,7 +5647,7 @@ mod tests {
     /// **A contended item costs a flat window, not one row per retry.**
     ///
     /// Six writers each draw 1 from a pool of 100, all through the same key, so
-    /// every attempt conflicts: one writer commits per pull and the other five go
+    /// every attempt conflicts: one writer commits per round and the other five go
     /// stale and re-attempt at the advanced frontier. A writer therefore re-poses
     /// its single item several times before winning — which is the condition the
     /// end-to-end suite never reaches, because two alternating writers make the
@@ -5617,12 +5669,10 @@ mod tests {
         let draws: Vec<&[i64]> = vec![&[-1]; WRITERS];
         let (store_fan, seen) = contending_writer_cycle(100, &draws);
 
-        let mut external = store_fan.branch();
-        let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        let mut latest = producer.get(producer.tiling().universal_guard());
-        for _ in 0..MAX_CYCLE_PULLS {
-            latest = producer.get(producer.tiling().universal_guard());
+        let mut driven = Driven::new(store_fan.branch());
+        let mut latest = driven.pull();
+        for _ in 0..MAX_CYCLE_ROUNDS {
+            latest = driven.pull();
         }
 
         // Every draw committed exactly once: the pool conserves.
@@ -5870,13 +5920,11 @@ mod tests {
             vec![50],
         )));
 
-        let mut external = store_fan.branch();
-        let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(store_fan.branch());
 
-        let mut latest = producer.get(producer.tiling().universal_guard());
+        let mut latest = driven.pull();
         for _ in 0..6 {
-            latest = producer.get(producer.tiling().universal_guard());
+            latest = driven.pull();
         }
         // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
         // whichever commits first, the other denies. The round-robin drain picks
@@ -5920,13 +5968,11 @@ mod tests {
             vec![50, 30],
         )));
 
-        let mut external = store_fan.branch();
-        let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(store_fan.branch());
 
-        let mut latest = producer.get(producer.tiling().universal_guard());
+        let mut latest = driven.pull();
         for _ in 0..10 {
-            latest = producer.get(producer.tiling().universal_guard());
+            latest = driven.pull();
         }
         // Which draws fit (and in what order) is schedule-dependent under the
         // round-robin drain, but the token-pool safety invariant holds under every
@@ -6038,15 +6084,14 @@ mod tests {
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_writer(Box::new(CounterBody::new(store_fan.branch(), acct("n"), 3)));
 
-        let mut reader = StoreReadAsOf::new(store_fan.branch(), acct("n"), 2);
-        let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let reader = StoreReadAsOf::new(store_fan.branch(), acct("n"), 2);
+        let mut driven = Driven::new(Box::new(reader));
 
-        // Pulling the reader drives the cycle. Before the watermark reaches 2 the
+        // Each round drives the cycle one lap. Before the watermark reaches 2 the
         // read is ⊥ (empty); once it does, it resolves to the value at tick 2.
         let mut latest = Tile::Scalar(ColumnValue::from_ints(vec![]));
         for _ in 0..8 {
-            latest = producer.get(producer.tiling().universal_guard());
+            latest = driven.pull();
         }
         let Tile::Scalar(cv) = &latest else { panic!() };
         assert_eq!(cv.as_single(), Some(int(2)));
@@ -6170,13 +6215,11 @@ mod tests {
         set_a(Box::new(BankWriter::new(store_fan.branch(), a)));
         set_b(Box::new(BankWriter::new(store_fan.branch(), b)));
 
-        let mut external = store_fan.branch();
-        let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut driven = Driven::new(store_fan.branch());
 
-        let mut latest = producer.get(producer.tiling().universal_guard());
+        let mut latest = driven.pull();
         for _ in 0..pulls {
-            latest = producer.get(producer.tiling().universal_guard());
+            latest = driven.pull();
         }
         latest
     }
@@ -6710,17 +6753,15 @@ mod tests {
     /// emitted undecided positions, the very first pull would hand over every
     /// position folded to the seed, the `Memo` would latch those, and the store
     /// going terminal later would publish the stale cache as complete. The store
-    /// advances one position per pull, so nothing else prevents that.
+    /// advances one position per round, so nothing else prevents that.
     #[test]
     fn a_memo_over_a_live_dense_read_caches_only_decided_positions() {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 0); // unconditional
         let trigger = IterateExtent::new(Extent::uint_range(3));
         let reader =
             StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
-        let mut memo = Memo::new(Box::new(reader));
-        let guard = memo.tiling().universal_guard();
-        let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        let tile = pull_to_terminal(&mut producer);
+        let memo = Memo::new(Box::new(reader));
+        let tile = Driven::new(Box::new(memo)).pull_to_terminal();
         let Tile::SealedFunction { codomain, .. } = &tile else {
             panic!("dense read is a SealedFunction");
         };

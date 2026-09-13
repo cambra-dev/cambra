@@ -5,6 +5,7 @@ use std::{
 };
 
 use super::*;
+use crate::interpreter::WakeupQueue;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{Consumer, Scheduler},
@@ -26,13 +27,26 @@ use crate::{
 /// that and serves from the cache instead of recursively re-entering the
 /// inner producer.
 struct FanOutReentrancy {
-    /// Cache of the most-recently-returned tile from the inner producer,
-    /// used to serve re-entrant `FanOutProducer::get_impl` calls.
+    /// What a [`FanHold::Recurrence`] branch reads: the inner producer's answer
+    /// from the round before the one in progress.
+    ///
+    /// The recurrence branch is the cycle's delay element. It sits inside the
+    /// fan-out's own input chain, so it reads this fan while the inner pull is in
+    /// flight — there is no current answer yet, and re-entering the inner
+    /// producer would alias `&mut`. Reading the previous round's answer is also
+    /// what makes the recurrence causal: a lap consults the state an earlier lap
+    /// decided.
+    serving: Tile,
+    /// What a reader branch reads: the inner producer's answer for the round in
+    /// progress.
     ///
     /// **Replace, not merge**: typical inner producers ([`Memo`] in
-    /// particular) already return cumulative tiles, so each non-reentrant
-    /// pull supplants the previous cache rather than appending to it.
-    cached_tile: Tile,
+    /// particular) already return cumulative tiles, so each pull supplants the
+    /// previous answer rather than appending to it.
+    pending: Tile,
+    /// The round whose inner pull has happened, so it happens once however many
+    /// readers this fan-out has.
+    pulled_round: Option<u64>,
     /// Re-entrancy guard for the inner subscribe path.  `FanOutBranch::subscribe`
     /// of one branch can transitively trigger `subscribe` on a sibling
     /// (e.g. an induction loop's drive subscribes to its store branch while
@@ -113,6 +127,21 @@ struct FanOutShared {
     /// fan-outs (the overwhelming majority); `Some` only when constructed
     /// via [`FanOut::new_cyclic`].
     reentrancy: Option<FanOutReentrancy>,
+    /// The scheduler's deferred-wakeup queue, where a cyclic fan-out asks for the
+    /// round that runs the recurrence's next lap. Installed at subscribe, since a
+    /// fan-out is built before there is a scheduler to ask.
+    wakeups: WakeupQueue,
+    /// One inner pull per delivery round, shared by every branch — the
+    /// non-cyclic fan-out's whole reason to exist. Pulling per branch instead
+    /// makes the answer depend on which branch asked first: an input that takes
+    /// delivery (a source draining, a `Memo` releasing what it merged) hands the
+    /// rows to that branch and the empty remainder to its siblings.
+    ///
+    /// A sibling's release does not clear it. The inner producer drops what the
+    /// release intersection covers, and a branch that has not released it still
+    /// has it coming; serving this round's tile is what keeps that branch's own
+    /// answer stable. Each branch still subtracts its own released region below.
+    round: RoundCache,
 }
 
 impl FanOutShared {
@@ -123,6 +152,21 @@ impl FanOutShared {
             .enumerate()
             .filter(|(_, s)| s.strong_count() > 0)
             .map(|(i, _)| i)
+    }
+
+    /// Ask for the next delivery round, waking every live branch's consumer.
+    ///
+    /// A cyclic fan-out calls this while its recurrence branch is a round behind
+    /// what the inner producer holds — the next lap has an input it has not read.
+    /// Nothing else asks for that round: the recurrence re-arms off its own
+    /// source, which says nothing about whether the state it reads has moved.
+    fn request_next_round(&self) {
+        for i in self.live_indices() {
+            let consumer = self.consumers[i].clone();
+            self.wakeups.request(Rc::new(RefCell::new(move || {
+                consumer.borrow_mut().notify()
+            })));
+        }
     }
 
     /// Drop every slot whose subscriber is gone, renumbering the survivors.
@@ -239,21 +283,24 @@ impl FanOut {
     }
 
     /// Construct a cyclic [`FanOut`].  Sets up the re-entrancy bookkeeping
-    /// (a cached tile snapshot + a subscribe-in-progress flag) needed when
-    /// a branch of this fan-out transitively feeds back into its own input.
+    /// (the two tile snapshots a delay element holds + a subscribe-in-progress
+    /// flag) needed when a branch of this fan-out transitively feeds back into
+    /// its own input.
     ///
-    /// The cost relative to [`FanOut::new`] is one `Tile` clone per pull
+    /// The cost relative to [`FanOut::new`] is one `Tile` clone per round
     /// (to refresh the cache), so non-cyclic users should stick with `new`.
     /// Called for the stores a recurrence is built around — the commit store and
     /// the induction store. The branch that closes the cycle is a
     /// [`recurrence_branch`](Self::recurrence_branch), not a
     /// [`branch`](Self::branch).
     pub fn new_cyclic(input: Box<dyn TileOperator>) -> Self {
-        let cached_tile = input.tiling().empty_tile();
+        let empty = input.tiling().empty_tile();
         Self::new_with_reentrancy(
             input,
             Some(FanOutReentrancy {
-                cached_tile,
+                serving: empty.clone(),
+                pending: empty,
+                pulled_round: None,
                 subscribing_inner: false,
             }),
         )
@@ -273,6 +320,8 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
+            wakeups: WakeupQueue::default(),
+            round: RoundCache::default(),
         }));
         Self {
             input: Rc::new(RefCell::new(input)),
@@ -332,20 +381,21 @@ impl FanOut {
         f(&**self.input.borrow())
     }
 
-    /// The tile this fan-out most recently served, for a cyclic fan-out;
-    /// `None` for an ordinary one, which keeps no memo.
+    /// The inner producer's latest answer, for a cyclic fan-out; `None` for an
+    /// ordinary one, which keeps no memo. Named for what it holds rather than for
+    /// what a branch is served, which depends on the branch: a reader gets this,
+    /// and the recurrence branch the round before it.
     ///
     /// Reads the cyclic-mode memo rather than pulling the input, so it is safe
-    /// wherever the graph is not mid-traversal and observes exactly what the
-    /// fan's consumers last saw. A store's value is carried on its fan, so this
-    /// is how a version replacing this program reads what its variables hold
-    /// without a second channel out of the operator.
-    pub fn cached_tile(&self) -> Option<Tile> {
+    /// wherever the graph is not mid-traversal. A store's value is carried on its
+    /// fan, so this is how a version replacing this program reads what its
+    /// variables hold without a second channel out of the operator.
+    pub fn latest_tile(&self) -> Option<Tile> {
         self.shared
             .borrow()
             .reentrancy
             .as_ref()
-            .map(|r| r.cached_tile.clone())
+            .map(|r| r.pending.clone())
     }
 
     /// Whether every subscriber has released everything this fan-out could
@@ -527,6 +577,7 @@ impl TileOperator for FanOutBranch {
         let shared_rc = self.shared();
         {
             let mut shared = shared_rc.borrow_mut();
+            shared.wakeups = scheduler.wakeup_queue();
             slot.set(shared.consumers.len());
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
             let carried = shared.released.clone();
@@ -670,53 +721,79 @@ impl TileProducer for FanOutProducer {
         let shared_rc = self.shared();
         let cyclic = shared_rc.borrow().reentrancy.is_some();
         let mut result = if cyclic {
-            let producer_opt = shared_rc.borrow_mut().producer.take();
-            if let Some(producer) = producer_opt {
-                // RAII: put the producer back into `shared` on any exit
-                // path (success or panic).  Without this guard, a panic
-                // from `producer.get(...)` would leave `shared.producer
-                // = None` forever, silently breaking every subsequent
-                // pull on this fan-out.
-                let mut guard = TakenProducerGuard {
-                    shared: &shared_rc,
-                    producer: Some(producer),
-                };
-                let tile = guard.producer.as_mut().unwrap().get(projection_guard);
-                trace!("{} received {tile:?}", self.name());
-                // Refresh the re-entrancy cache before the guard drops.
-                // We replace (not merge) — inner producers like `Memo`
-                // already return cumulative tiles, so each pull
-                // supplants the previous cached snapshot.
-                shared_rc
-                    .borrow_mut()
-                    .reentrancy
-                    .as_mut()
-                    .unwrap()
-                    .cached_tile = tile.clone();
-                tile
-                // `guard` drops here, restoring `shared.producer`.
-            } else {
-                // Re-entrant pull: another branch's outer `get_impl` is
-                // currently holding the producer.  Serve the latest known
-                // emission instead of re-entering the inner producer (which
-                // would alias `&mut`).
-                let cached = shared_rc
+            // The recurrence branch neither claims the round nor pulls: it reads
+            // this fan-out from inside the pull it would be making.
+            if matches!(self.hold, FanHold::Recurrence { .. }) {
+                let serving = shared_rc
                     .borrow()
                     .reentrancy
                     .as_ref()
                     .unwrap()
-                    .cached_tile
+                    .serving
                     .clone();
-                trace!("{} serving cached (re-entrant): {cached:?}", self.name());
-                cached
+                trace!("{} serving the previous round: {serving:?}", self.name());
+                serving
+            } else {
+                // One inner pull per round, however many readers ask. Claiming the
+                // round *before* the pull retires the previous answer to `serving`,
+                // where the recurrence branch reads it during the pull.
+                let due = {
+                    let mut shared = shared_rc.borrow_mut();
+                    let re = shared.reentrancy.as_mut().unwrap();
+                    let due = re.pulled_round != Some(current_round());
+                    if due {
+                        re.pulled_round = Some(current_round());
+                        re.serving = re.pending.clone();
+                    }
+                    due
+                };
+                // The take is its own statement: a `let`-chain would hold the
+                // `borrow_mut` for the whole body, across the inner pull.
+                let producer_opt = due
+                    .then(|| shared_rc.borrow_mut().producer.take())
+                    .flatten();
+                if let Some(producer) = producer_opt {
+                    let tile = {
+                        // RAII: put the producer back into `shared` on any exit
+                        // path (success or panic).  Without this guard, a panic
+                        // from `producer.get(...)` would leave `shared.producer =
+                        // None` forever, silently breaking every subsequent pull
+                        // on this fan-out.
+                        let mut guard = TakenProducerGuard {
+                            shared: &shared_rc,
+                            producer: Some(producer),
+                        };
+                        guard.producer.as_mut().unwrap().get(projection_guard)
+                    };
+                    trace!("{} received {tile:?}", self.name());
+                    let mut shared = shared_rc.borrow_mut();
+                    let re = shared.reentrancy.as_mut().unwrap();
+                    let lap_pending = tile != re.serving;
+                    re.pending = tile;
+                    if lap_pending {
+                        shared.request_next_round();
+                    }
+                }
+                shared_rc
+                    .borrow()
+                    .reentrancy
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .clone()
             }
         } else {
-            shared_rc
-                .borrow_mut()
-                .producer
-                .as_mut()
-                .unwrap()
-                .get(projection_guard)
+            let mut shared = shared_rc.borrow_mut();
+            match shared.round.hit() {
+                Some(tile) => tile,
+                None => {
+                    // The borrow is held across the inner pull, as it has always
+                    // been here: a non-cyclic fan-out has no branch that can
+                    // re-enter it.
+                    let tile = shared.producer.as_mut().unwrap().get(projection_guard);
+                    shared.round.fill(tile)
+                }
+            }
         };
 
         // Filter by the stored obsolete guard. Because upstream retains data according to the
@@ -764,6 +841,15 @@ impl TileProducer for FanOutProducer {
             && let Some(position) = pred.max_released_position()
         {
             shared.released_position = shared.released_position.max(Some(position));
+        }
+        // An advancing intersection ends this round's cached pull: the input
+        // drops what it covers, so the cached tile stops describing it and a
+        // sibling path re-pulled afterwards answers from the smaller input.
+        // Sound against the idempotence rule because the intersection is what
+        // *every* branch has released — a branch that reaches the fresh pull has
+        // released that region itself, so its own answer was going to change.
+        if intersection != shared.released {
+            shared.round = RoundCache::default();
         }
         shared.released = intersection.clone();
         // In cyclic mode the inner producer can be temporarily taken out
