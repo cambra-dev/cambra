@@ -653,6 +653,75 @@ impl TileProducer for FilterProducer {
                 output.retain(mask);
                 output
             }
+            // A **collection per row**, filtered within each row. The predicate is the same
+            // shape because it compiled over the same pairs, so its flat codomain is one
+            // boolean per entry, in entry order — the mask `retain` takes, which re-offsets
+            // the groups a filter shortens.
+            (
+                Tile::CurriedFunction {
+                    domain2: pred_keys,
+                    codomain: pred_outputs,
+                    ..
+                },
+                Tile::CurriedFunction {
+                    domain1,
+                    offsets,
+                    domain2,
+                    codomain,
+                    domain_predicate,
+                    deleted,
+                },
+            ) => {
+                // **The mask is positional**, as in the sealed case above, so it applies
+                // only while the two sides are in step. An input with nothing in it is
+                // already filtered — the predicate keeps answering for entries whose rows
+                // have been handed on.
+                if domain2.is_empty() {
+                    return Tile::CurriedFunction {
+                        domain1,
+                        offsets,
+                        domain2,
+                        codomain,
+                        domain_predicate,
+                        deleted,
+                    };
+                }
+                // Anything else out of step is a shape this does not serve, and it says so
+                // rather than reading a mask across the misalignment (which drops the wrong
+                // entries, silently) or answering empty (which waits for an alignment that
+                // is not coming). Each side is pulled from its own branch of the pairs, and
+                // a source delivering its rows one at a time — a transaction's — lets the
+                // predicate reach entries the input has not.
+                assert_eq!(
+                    pred_keys.len(),
+                    domain2.len(),
+                    "a correlated filter needs its predicate and its rows in step; the \
+                     predicate has answered for a different number of entries than the rows \
+                     carry. A source that delivers rows one at a time is the case this does \
+                     not serve yet.",
+                );
+                // Equal counts are what a positional mask needs stated on every pull, and
+                // equal keys are what makes it the right mask. The second walks both
+                // columns, so it is checked where checks cost nothing.
+                debug_assert!(
+                    pred_keys == domain2,
+                    "a correlated filter's predicate and rows agree in count but not in \
+                     keys, so the mask is positional over two different orders",
+                );
+                let mask = pred_outputs
+                    .as_bitvec()
+                    .unwrap_or_else(|| panic!("Expected bools"));
+                let mut output = Tile::CurriedFunction {
+                    domain1,
+                    offsets,
+                    domain2,
+                    codomain,
+                    domain_predicate,
+                    deleted,
+                };
+                output.retain(mask);
+                output
+            }
             _ => panic!("Invalid Filter input tiles"),
         }
     }

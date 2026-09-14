@@ -268,6 +268,18 @@ fn test_refiltered_let_bound_comprehension() {
     "c = map([(\"a\", 1), (\"b\", 2)])\nsum([sum([v * r for v in c]) for r in [1, 2]])",
     9
 )]
+// A correlated **filter** beside a correlated body, the filter riding the pair it filters
+// (`src/ccl/planning/correlated.rs`): 1*(2+3) + 2*3.
+#[case::correlated_filter("sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])", 11)]
+// A filter reading only the element, beside a body that reads the outer binder. It rides
+// the same pair: the refinement is on the pair domain either way, so leaving it there
+// applies it nowhere — which answered 18 rather than 15. 1*(2+3) + 2*(2+3).
+#[case::uncorrelated_filter("sum([sum([v * r for v in [1, 2, 3] if v > 1]) for r in [1, 2]])", 15)]
+// Both together, the correlated one narrowing further: 1*(2+3) + 2*3.
+#[case::both_filters(
+    "sum([sum([v * r for v in [1, 2, 3] if v > 1 if v > r]) for r in [1, 2]])",
+    11
+)]
 // (1+2+3) twice, the inner sum shared.
 #[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
 // The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
@@ -449,5 +461,79 @@ fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i
             rows
         ),
         Value::Int(total),
+    );
+}
+
+/// A correlated filter **inside a transaction**, where the rows arrive one at a time. The
+/// predicate and the input are pulled from separate branches of the pairs, so the predicate
+/// answers for entries whose rows the input has not delivered, and `Filter` reads its mask
+/// positionally. It refuses rather than reading the mask across the misalignment, which
+/// drops the wrong entries silently, or answering empty, which waits for an alignment that
+/// is not coming.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "needs its predicate and its rows in step")]
+fn a_correlated_filter_inside_a_transaction_does_not_compile() {
+    check_scalar(
+        indoc! {r"
+            n: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                with begin():
+                    n := n + sum([v * r for v in [1, 2, 3] if v > r])
+            await_final(n)
+        "},
+        // 1*(2+3) + 2*3.
+        Value::Int(11),
+    );
+}
+
+/// A correlated filter whose **body reads nothing outer**. The outer binder appears in the
+/// filter alone, so it is free only in the type: lambda elimination takes the Pi-const arm
+/// and the site never becomes the pair the re-basing rewrite reads. The rewrite for this is
+/// a sibling of that one rather than an extension of it.
+/// A correlated filter with **no aggregate over it** does not compile, where the same filter
+/// under a `sum` does (`a_correlated_inner_comprehension_runs_per_outer_row`,
+/// `correlated_filter`). Lambda elimination leaves two spellings of the one predicate — one
+/// naming `r`, one the iteration record it was closed over — and the post-pass tree check
+/// rejects the pair before planning re-bases either.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
+fn a_correlated_filter_without_an_aggregate_does_not_compile() {
+    check_tile(
+        "[[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]",
+        // `[[1, 2], [2, 4, 6]]` if it compiled.
+        make_int_list(&[]),
+    );
+}
+
+/// A correlated filter whose **body** reads nothing outer never forms a pair, so the
+/// re-basing above has nothing to re-base.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "unrecognised Var")]
+fn a_correlated_filter_over_an_uncorrelated_body_does_not_compile() {
+    check_scalar(
+        "sum([sum([v for v in [1, 2, 3] if v > r]) for r in [1, 2]])",
+        // (2+3) + 3.
+        Value::Int(8),
+    );
+}
+
+/// A correlated filter over a **collection** source. This one is not about correlation: a
+/// filtered comprehension over a collection does not compile with a name binder and no
+/// outer row either, because the restrict chain planning builds for the filter also tries
+/// to compile the domain's carried `collection_contains`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "an iteration site is a collection")]
+fn a_correlated_filter_over_a_collection_does_not_compile() {
+    check_scalar(
+        indoc! {r"
+            c = map([(1, 10), (2, 20)])
+            sum([sum([v * r for v in c if v > r]) for r in [1, 2]])
+        "},
+        // 1*(10+20) + 2*(10+20).
+        Value::Int(90),
     );
 }
