@@ -138,8 +138,8 @@ where
 ```
 
 `where` is the refinement predicate separator (§6.4). It is lexed so the name is
-**reserved** — refinements are not parsed yet, so every use is a parse error
-today.
+**reserved**: a bare `where` is a keyword rather than an identifier. The refinement
+syntax itself is parsed, in every annotation position that takes a type (§6.4).
 
 `with` is a keyword: it introduces a transaction block, `with begin():`
 (§8.2). It does **not** carry Python's general context-manager meaning.
@@ -978,10 +978,11 @@ n-arg call.
 
 Parameters are bare identifiers today. Because `->` (not `:`) terminates
 the binder list, `:` is free for a per-parameter annotation `\x: T -> body`
-(**[Planned]** — not yet parsed); refinement annotations are likewise not
-writable, though some built-ins (e.g. `groupby`, §7.2) produce refined
-lambdas internally. `\x -> x -> 1` (a lambda returning a pair, §2.4) is
-unusual but unambiguous — the first `->` closes the binder, the rest is
+(**[Planned]** — not yet parsed), which is also what makes a refinement
+unwritable on a *lambda* parameter; one parses on a `def` parameter, on a
+`def` result, and in a binding's annotation (§6.4). Some built-ins (e.g.
+`groupby`, §7.2) produce refined lambdas internally. `\x -> x -> 1` (a lambda
+returning a pair, §2.4) is unusual but unambiguous — the first `->` closes the binder, the rest is
 body.
 
 ### 3.11 List, tuple, record literals

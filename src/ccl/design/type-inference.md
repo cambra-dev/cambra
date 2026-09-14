@@ -365,29 +365,9 @@ and the marker then claims the remainder is exhaustive. No program observes the 
 a default arm being compiled from the `Case` (`test_default_arm_under_a_record_field`); the
 reading itself is pinned by `a_settled_negative_position_closes_an_open_child_demand`.
 
-**The merge is gated as if it were the collapse, and one variable therefore has two readings
-at one polarity.** `fallback_allowed` answers both, so a variable entered as a position reads
-the merge while the same variable reached through another variable's bound chain reads the
-demand side alone. Only the collapse needs that gate: a choice does not propagate along
-subtyping edges, and a narrowing does. What the difference leaves open is a mutable `Map`
-seeded with a one-entry literal — `box`'s instantiated domain reaches the key variable
-through a chain and keeps the bare reading, which invariance then rejects against the
-singleton the seed establishes (`a_one_entry_seed_does_not_reach_a_mutable_map`).
-
-Ungating the merge closes that shape and costs two things it does not pay for. Reading the
-opposite side at every negative variable compacts it in full there, so the walk doubles per
-level of type nesting — `def by_key(c, f): groupby(c, f)` applied at two types goes from 1.4s
-to 10s. And where a discharge is suspended on the chain, two data domains meet whose
-refinement sets differ only in the spelling of the discharged binder: `{[0, 2] | 𝑥 == 0}`
-against `{[0, 2] | 𝑥 == __arg}`. [`data_domains_disagree`] compares those sets structurally,
-so it reads one domain reached twice as two domains that disagree, and the position has no
-common answer — which `higher_order_dependent_application_discharges_the_binder` reports.
-Forcing the discharge on both contributions before they meet is the prerequisite for letting
-the merge follow a chain.
-
 **The gated merge pays a doubling of its own.** The gate confines the merge to the entered
-position, and a structural child *is* an entered position — `compact_go` resets `parents` to
-`None` at every one — so the merge re-opens one nesting level down and the walk doubles per
+position, and a structural child *is* an entered position — `compact_go` takes a fresh
+`Position` at every one — so the merge re-opens one nesting level down and the walk doubles per
 contravariant flip. Measured in debug, median of three runs at equal test counts: the whole
 of `tests/type_check.rs` goes from 0.83s to 1.29s, and `test_groupby_key_relation_is_per_occurrence`
 — `def by_key(c, f): groupby(c, f)` at two types, the same program as above — from 0.56s to
@@ -402,11 +382,41 @@ contribution keys on what was produced instead, and sidesteps that.
 
 **Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
 
-**Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no*
-scope lookup: it shares its binder's inference variable — a monomorphic `let` binds verbatim
-(`instantiate` freshens nothing) so every use coalesces to exactly what the binder coalesces to, and
-a *generalized* `let`'s uses are rewritten by the walk itself to reference per-type specializations
-(which does carry a scope — the walk's stack of specialization frames and shadow markers; see §3.1).
+##### An invariant position reads both sides however the walk reached it
+
+Elsewhere the merge fires only at a position, which `fallback_allowed` answers. That gate
+belongs to the collapse: a collapse is a choice, and a choice does not propagate along
+subtyping edges. Applying it to the merge as well gives one variable **two readings at one
+polarity** — the merge where the walk entered it structurally, the demand side alone where it
+arrived along another variable's bound chain — and inside an invariant position there is no
+variance left to tell those readings apart, so the invariance check rejects the position
+against itself.
+
+A mutable `Map` seeded with a one-entry literal is the shape that reaches it. The seed's key
+type is that key's own singleton, and `box`'s scheme shares one variable between its domain
+and the sum's single candidate, so the key domain arrives at that variable through a chain:
+entered as a position it reads the singleton, reached along the chain it reads the bare
+present-key domain, and the two are the collection the program wrote and a wider one.
+`a_one_entry_seed_reads_as_a_map` and its two keyed-write siblings are the three uses.
+
+**Scoped to an invariant position, not ungated.** Reading the opposite side at *every*
+negative variable compacts it in full there, so the walk doubles per level of type nesting —
+`def by_key(c, f): groupby(c, f)` applied at two types goes from 1.4s to 10s, where the
+scoped read costs 1.5s. It also reaches a function-typed **parameter**, which is a compute
+domain: there a suspended discharge puts two data domains together whose refinement sets
+differ only in the discharged binder's spelling, `{[0, 2] | 𝑥 == 0}` against
+`{[0, 2] | 𝑥 == __arg}`, and `data_domains_disagree` compares those sets structurally, so one
+domain reached twice reads as two that disagree
+(`higher_order_dependent_application_discharges_the_binder`). Identifying those two spellings
+is what letting the merge follow *every* chain would need first.
+
+#### Binder slots — filled during the coalesce walk (no lexical scope needed)
+
+A `Var` use needs *no* scope lookup: it shares its binder's inference variable — a monomorphic
+`let` binds verbatim (`instantiate` freshens nothing) so every use coalesces to exactly what the
+binder coalesces to, and a *generalized* `let`'s uses are rewritten by the walk itself to
+reference per-type specializations (which does carry a scope — the walk's stack of specialization
+frames and shadow markers; see §3.1).
 
 What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `For`'s target slot. Each is resolved explicitly in `coalesce_node`, mirroring its definition (inference runs before the mutability/transaction phases, so the recurrence carriers `LetRec`/`Transact` never reach coalesce):
 
