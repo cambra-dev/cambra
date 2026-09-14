@@ -28,7 +28,8 @@ import {
 } from "@codemirror/view";
 import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lint";
 
-import { forceParsing } from "@codemirror/language";
+import { history, historyKeymap, indentLess, indentMore } from "@codemirror/commands";
+import { forceParsing, indentUnit } from "@codemirror/language";
 
 import { cambraLanguage } from "./cambraLang";
 import type { Indices } from "./indices";
@@ -364,6 +365,32 @@ export class SourceView {
         EditorView.editable.of(onRebuild !== undefined),
         ...(onRebuild
           ? [
+              // Two spaces, which is what the programs in the gallery are
+              // written at and what an off-side-rule language makes structural
+              // rather than cosmetic: a block moved by the wrong amount is a
+              // different program.
+              indentUnit.of("  "),
+              // Undo, because the pane is edited in front of an audience and
+              // the alternative to `Mod-z` is retyping a line while a room
+              // watches. `historyKeymap` is `Mod-z` / `Mod-y` / `Mod-Shift-z`
+              // and collides with neither chord below.
+              history(),
+              keymap.of(historyKeymap),
+              // Block indent over a selection. `Tab` is the binding every
+              // editor has and the one a reader reaches for; `Mod-]` and
+              // `Mod-[` are the other convention, kept because `Tab` in a frame
+              // on a slide is also how a keyboard leaves the editor, and taking
+              // it away should leave something behind.
+              //
+              // `indentMore`/`indentLess` work over whole lines, so a selection
+              // spanning several moves all of them and a bare caret moves the
+              // line it sits on.
+              keymap.of([
+                { key: "Tab", preventDefault: true, run: indentMore },
+                { key: "Shift-Tab", preventDefault: true, run: indentLess },
+                { key: "Mod-]", preventDefault: true, run: indentMore },
+                { key: "Mod-[", preventDefault: true, run: indentLess },
+              ]),
               // Two chords, because the difference between them is the whole
               // point: state is either carried across the edit or it is not.
               // `Mod-Enter` is the one a demo repeats — keep the cart, change
