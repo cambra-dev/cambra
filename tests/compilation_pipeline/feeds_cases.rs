@@ -441,26 +441,33 @@ fn a_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i6
     );
 }
 
-/// A **filtered** comprehension over a channel, which the argument check admits and
-/// `channelize` then stops. The filter refines the comprehension's source domain and that
-/// domain is the channel's, so a `ChanDom` sits inside the refinement's predicate — where
-/// channelize's erasure never reaches, because `Type::walk_children_mut` visits a
-/// `Type::Refinement`'s base and not its predicate. The post-channelize check then reports
-/// the residue at `__elem`.
+/// A **filtered** comprehension over a channel. The filter refines the comprehension's
+/// source domain and that domain is the channel's, so a `ChanDom` sits inside the
+/// refinement's predicate — which `Type::walk_children_mut` does not reach, visiting a
+/// `Type::Refinement`'s base and not its predicate. `erase_chan_domains_in_predicates`
+/// reaches it, gated on a read-only scan so a program with nothing to erase keeps its
+/// node ids.
 ///
-/// The unfiltered reads beside it place it: what the filter meets is the channel domain
-/// surviving into a predicate, not anything about applying a channel.
-#[test]
-fn a_filtered_comprehension_over_a_feed_channel_fails_at_channelize() {
-    check_compile_error(
-        indoc! {r"
-            out = defer()
-            for v in [1, 2]:
-                with begin():
-                    out << v
-            sum([x for x in out if x > 1])
-        "},
-        "channel domain chan(out) survived channelize at `__elem`",
+/// Both halves are pinned: filtering on a value the channel carries, and filtering with a
+/// predicate that names a `let` bound outside the loop, which the erasure has to close
+/// over the same way the main tree's substitution does.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::literal("sum([x for x in out if x > 1])", 2)]
+#[case::names_an_outer_let("n = 1\nsum([x for x in out if x > n])", 2)]
+fn a_filtered_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r"
+                out = defer()
+                for v in [1, 2]:
+                    with begin():
+                        out << v
+                {}
+            "},
+            read
+        ),
+        Value::Int(expected),
     );
 }
 
