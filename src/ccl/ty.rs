@@ -2570,6 +2570,18 @@ impl Type {
         }
     }
 
+    /// The **read view** of the feed channel this denotes — the data function
+    /// `domain ⤇ value` — or `None` if it is not one.
+    ///
+    /// A read view is kind-specific: a feed channel reads as the whole collection it has
+    /// accumulated, where [`Type::mut_value_type`] derefs a mutable variable to one value.
+    /// So this is the function a read of a channel applies. [`Type::as_feed`] answers the
+    /// same question as the two halves, for a caller that needs them apart.
+    pub fn feed_read_view(&self) -> Option<Type> {
+        self.as_feed()
+            .map(|(domain, value)| Type::data_fun(domain.clone(), value.clone()))
+    }
+
     /// Whether this denotes a **handle** to state introduced elsewhere — a mutable
     /// variable or a feed channel, either [`HistoryKind`].
     ///

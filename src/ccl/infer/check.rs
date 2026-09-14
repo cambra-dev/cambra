@@ -421,6 +421,14 @@ impl Typing for CheckCtx {
         function: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
+        // **A feed handle's read view is the function being applied**
+        // ([`Type::feed_read_view`]). [`Typing::as_function`] takes that view one line
+        // above this in [`Typing::apply`], so a handle arriving here unpeeled leaves the
+        // two disagreeing about whether a channel is a function: the domain lookup below
+        // finds none, and the assertion reports a caller that passed a domain. A
+        // comprehension over a channel is the program that reaches it.
+        let view = function.feed_read_view();
+        let function = view.as_ref().unwrap_or(function);
         // Sound one-way only: a refined argument may flow into an unrefined
         // parameter (dropping a restriction is admissible). Emit's reverse
         // direction (domain coalescing) is not the sound subtyping rule and so
