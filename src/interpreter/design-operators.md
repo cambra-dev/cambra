@@ -462,6 +462,50 @@ In all three cases planning has ensured every iteration site has an explicit
 `iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
 what to emit based only on its own AST shape and the input flowing in.
 
+### A correlated inner comprehension
+
+An inner comprehension whose body reads the **outer** binder runs once per outer row, over its
+own copy of the inner domain. `lambda_elim` writes that as `curry(𝑔)` composed onto the outer
+stream, where `𝑔` takes the pair of the outer value and the inner element. The pair is what
+carries the correlation: an uncorrelated body never forms one, leaving a `const` that is
+computed once and broadcast.
+
+Compiling it is the pairing. [`Product`] gives each outer row a group holding the whole inner
+domain, which is `Tiling::CurriedFunction` — a collection per row — and `𝑔` then compiles over
+that like any other morphism over a stream, its result inheriting the grouping.
+The inner source does not mention the outer binder, so every row iterates the same domain and
+the pairing is a cartesian product. A source that differs per row is the same output shape
+from a different builder ([Reading a collection held per row](#reading-a-collection-held-per-row)),
+where the per-row collection arrives as a value rather than being selected by the binder.
+
+Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
+comprehension is aggregated, and a comprehension that yields a collection per row leaves the
+curried tile as the answer.
+
+**Where the inner domain comes from is what the term has to say.** A list literal's is an
+index range, which the type gives directly. A map's is its present-key refinement, which
+`extent_of` strips to answer the unbounded key type — `IterateExtent` refuses that, and the
+refinement that would have narrowed it is carried and never executed. So planning names the
+source (`src/ccl/planning/correlated.rs`) and the site becomes [`Builtin::CurryOver`], whose
+first operand compiles as its own iteration.
+
+Reading the domain off the type is the other route, not a fallback: a body that reads the
+outer binder but never applies the inner source gives planning no source to name, and
+op-conversion compiles the site from its type instead. That serves a list literal, whose type
+gives an index range. It does not serve a map, whose collection sits inside the refinement
+`extent_of` strips — though a map read that way fails without an enclosing comprehension too,
+so that gap is older than these two routes.
+
+Two operators gain a second reading from this, each one a consumer now meeting a per-row
+stream. `map_domain` with an input is **applied** at the incoming value rather than iterated,
+the two readings `Converse` already had — a key drawn from a collection's own domain comes back
+as itself. And [`CheckedLookup`] answers a group of keys per row, keeping the grouping: one
+answer per key, where its key sits. A tile that cannot answer every key answers none, since an
+undecided key would have to re-offset the groups it left.
+
+A correlated **filter** is the shape still not compiled: it leaves its predicate naming the
+pair binder, which `planning/predicates.rs` refuses.
+
 ### Reading a collection held per row
 
 A collection reaches an operator in one of two shapes. A **streamed** one carries its keys in

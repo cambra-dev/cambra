@@ -1146,6 +1146,236 @@ impl TileProducer for IterateRowCollectionProducer {
     }
 }
 
+/// Each row of one stream paired with every element of another's domain — the cartesian
+/// product that makes a correlated inner comprehension compilable.
+///
+/// `lambda_elim` turns `[… f(r, v) … for v in xs]` written inside a `for r in …` into a
+/// curried morphism over the outer stream, taking the pair `(r, v)`. Compiling that means
+/// running the morphism once per pair and grouping the results by the outer row, which is
+/// [`Tiling::CurriedFunction`] — a collection per row. This builds the pairs; the morphism
+/// then compiles over them like any other morphism over a stream, and the grouping is
+/// already there because this operator emits it.
+///
+/// **The inner side is a stream, not an extent**, and that is what lets one builder serve
+/// both sources a comprehension can have. A list literal's domain is an index range, so the
+/// inner stream is an `IterateExtent` over it. A map's is its present-key refinement, which
+/// `extent_of` strips to answer the unbounded key type, so the inner stream is `MapDomain`
+/// of the collection instead. Both carry that domain in their codomain, which is all this
+/// reads.
+///
+/// The codomain is the pair the morphism reads: `_0` the row's value, `_1` the element.
+pub struct Product {
+    /// Output tiling: `CurriedFunction { domain1: outer.domain, domain2: inner domain,
+    /// codomain: {_0: outer codomain, _1: inner domain} }`.
+    base: OperatorBase,
+    /// The outer stream, one group per row.
+    outer: Box<dyn TileOperator>,
+    /// The inner stream, whose codomain is the domain every group holds.
+    inner: Box<dyn TileOperator>,
+}
+
+impl Product {
+    /// Pair every row of `outer` with every element of the domain `inner` carries.
+    pub fn new(outer: Box<dyn TileOperator>, inner: Box<dyn TileOperator>) -> Self {
+        let Tiling::SealedFunction { domain, codomain } = outer.tiling() else {
+            panic!(
+                "Product expected a SealedFunction outer stream, got {:?}",
+                outer.tiling()
+            )
+        };
+        let Tiling::SealedFunction {
+            codomain: inner_domain,
+            ..
+        } = inner.tiling()
+        else {
+            panic!(
+                "Product reads the inner domain off a stream's codomain, got {:?}",
+                inner.tiling()
+            )
+        };
+        let inner_domain = inner_domain.extent();
+        // The row's value as one extent, however many columns carry it: a product row
+        // spreads over a column per field, and the pair this builds holds it whole.
+        let tiling = Tiling::CurriedFunction {
+            domain1: domain.clone(),
+            domain2: inner_domain.clone(),
+            codomain: Extent::Record(HashMap::from([
+                (tuple_field(0), codomain.extent()),
+                (tuple_field(1), inner_domain),
+            ])),
+        };
+        Self {
+            base: OperatorBase::new(tiling),
+            outer,
+            inner,
+        }
+    }
+}
+
+impl TileOperator for Product {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("outer", &*self.outer));
+        visit(value("inner", &*self.inner));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let shared = shared_consumer(consumer);
+        Box::new(ProductProducer {
+            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling()),
+            outer: self.outer.subscribe(
+                self.outer.tiling().universal_guard(),
+                forwarding_consumer(&shared),
+                scheduler,
+            ),
+            inner: self.inner.subscribe(
+                self.inner.tiling().universal_guard(),
+                forwarding_consumer(&shared),
+                scheduler,
+            ),
+            inner_domain: None,
+        })
+    }
+}
+
+/// Producer for [`Product`].
+struct ProductProducer {
+    base: ProducerBase,
+    /// The outer stream.
+    outer: Box<dyn TileProducer>,
+    /// The inner stream, read once for its domain.
+    inner: Box<dyn TileProducer>,
+    /// The inner domain, kept after the inner stream has delivered all of it.
+    ///
+    /// **Every group holds the whole domain**, so a row cannot be emitted until the inner
+    /// side is complete — a group built from a prefix would claim a row finished with
+    /// elements still to come. The inner side of a correlated comprehension is closed over
+    /// the outer binder, so it is the same stream for every row and reading it once is all
+    /// this needs.
+    inner_domain: Option<ColumnValue>,
+}
+
+impl TileProducer for ProductProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("outer", self.outer.inspect(opts))
+            .child("inner", self.inner.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        if self.inner_domain.is_none() {
+            let inner_tile = self.inner.get(self.inner.tiling().universal_guard());
+            if inner_tile.is_terminal() {
+                let Tile::SealedFunction { codomain, .. } = inner_tile else {
+                    panic!("Product expected a SealedFunction inner tile")
+                };
+                self.inner_domain = Some(scalar_tile_to_column_value(*codomain));
+            }
+        }
+        let outer_tile = self.outer.get(self.outer.tiling().universal_guard());
+        let Tile::SealedFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            deleted,
+        } = outer_tile
+        else {
+            panic!("Product expected a SealedFunction outer tile")
+        };
+        let outer = scalar_tile_to_column_value(*codomain);
+        let empty = |inner_domain: ColumnValue| {
+            Tile::curried_function(
+                domain.select_indices(iter::empty(), 0),
+                ColumnValue::UInts(Vec::new()),
+                inner_domain.select_indices(iter::empty(), 0),
+                ColumnValue::Records(HashMap::from([
+                    (tuple_field(0), outer.select_indices(iter::empty(), 0)),
+                    (
+                        tuple_field(1),
+                        inner_domain.select_indices(iter::empty(), 0),
+                    ),
+                ])),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        // Nothing to pair against yet, or nothing to pair: an empty inner side gives every
+        // row an empty group, which a curried tile cannot hold — its offsets are strictly
+        // ascending — so there is no group to emit.
+        let Some(inner_domain) = self.inner_domain.clone() else {
+            return empty(ColumnValue::UInts(Vec::new()));
+        };
+        let (rows, width) = (domain.len(), inner_domain.len());
+        if width == 0 || rows == 0 {
+            return empty(inner_domain);
+        }
+        let total = rows * width;
+        // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the row's value
+        // repeats across its own group and the inner domain repeats across rows.
+        let outer_column = outer.select_indices((0..total).map(|i| i / width), total);
+        let domain_column = inner_domain.select_indices((0..total).map(|i| i % width), total);
+        // **Every row's group is the whole domain**, so a row is complete as soon as it
+        // arrives — the same statement [`IterateRowCollection`] makes about a map value
+        // carrying its own keys, and what lets an aggregate over one settle per row while
+        // the outer side stays open.
+        let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain));
+        // A curried tile's `deleted` indexes its **flat innermost** entries
+        // ([`Tile::CurriedFunction`]), and pairing turns each outer row into a group of
+        // `width` of them. A deleted row is therefore a deleted group: its whole run is
+        // marked, where carrying the row's own index through marks one entry of whichever
+        // group covers that flat position.
+        let deleted: BitSet = deleted
+            .iter()
+            .flat_map(|row| (row * width)..((row + 1) * width))
+            .collect();
+        let mut tile = Tile::curried_function(
+            domain,
+            ColumnValue::UInts((0..rows).map(|r| r * width).collect()),
+            domain_column.clone(),
+            ColumnValue::Records(HashMap::from([
+                (tuple_field(0), outer_column),
+                (tuple_field(1), domain_column),
+            ])),
+            domain_predicate,
+            deleted,
+        );
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile
+    }
+
+    /// A row releases to the **outer** stream; an element within a row releases nothing.
+    ///
+    /// The domain is the inner stream's whole content, held here because every group
+    /// holds all of them, so one group being done says nothing about them. The inner side
+    /// is released when everything is.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        match obsolete_guard {
+            g if g.is_universal() => {
+                self.outer.release(self.outer.tiling().universal_guard());
+                self.inner.release(self.inner.tiling().universal_guard());
+            }
+            g if g.is_empty() => self.outer.release(self.outer.tiling().empty_guard()),
+            TileGuard::Function(FunctionGuard::Domain(p)) => self
+                .outer
+                .release(TileGuard::Function(FunctionGuard::Domain(p))),
+            TileGuard::Function(FunctionGuard::Codomain(_)) => {}
+            TileGuard::Or(arms) => {
+                for arm in arms {
+                    self.release_impl(arm);
+                }
+            }
+            g => todo!("Product cannot honor the release guard {g:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1685,6 +1915,68 @@ mod tests {
         assert_eq!(
             deleted, expected,
             "row 0 opened flat entries 0..2, so both are deleted"
+        );
+    }
+
+    /// Pairing turns a deleted outer row into a deleted **group**, and a curried tile's
+    /// `deleted` indexes flat innermost entries ([`Tile::CurriedFunction`]). Carrying the
+    /// row index through marks one entry of whichever group covers that flat position, which
+    /// [`Tile::retain`] then drops in place of the row.
+    #[test]
+    fn product_deletes_an_outer_row_as_its_whole_group() {
+        let stream = |values: Vec<i64>, deleted: BitSet| Tile::SealedFunction {
+            domain: ColumnValue::from_uints((0..values.len()).collect()),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            domain_predicate: Predicate::True,
+            deleted,
+        };
+        let stream_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let mut deleted = BitSet::new();
+        deleted.insert(0);
+        let out_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::Int),
+            codomain: Extent::Record(HashMap::from([
+                (tuple_field(0), Extent::Base(BaseType::Int)),
+                (tuple_field(1), Extent::Base(BaseType::Int)),
+            ])),
+        };
+        let mut producer = ProductProducer {
+            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            outer: Box::new(TestTileProducer::new(
+                stream(vec![100, 200], deleted),
+                stream_tiling.clone(),
+            )),
+            inner: Box::new(TestTileProducer::new(
+                stream(vec![7, 8], BitSet::new()),
+                stream_tiling,
+            )),
+            inner_domain: None,
+        };
+        let Tile::CurriedFunction {
+            offsets,
+            domain2,
+            deleted,
+            ..
+        } = producer.get(out_tiling.universal_guard())
+        else {
+            panic!("Product tiles as a curried function")
+        };
+        assert_eq!(
+            offsets,
+            ColumnValue::from_uints(vec![0, 2]),
+            "each row pairs with both inner elements"
+        );
+        assert_eq!(domain2.len(), 4, "four flat pairs");
+        let mut expected = BitSet::new();
+        expected.insert(0);
+        expected.insert(1);
+        assert_eq!(
+            deleted, expected,
+            "outer row 0 opened flat entries 0..2, so both are deleted"
         );
     }
 }
