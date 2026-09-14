@@ -110,7 +110,9 @@ use std::fmt;
 
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::make_cast;
+use crate::ccl::ccl_utils::{
+    PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
+};
 use crate::ccl::{
     BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, Refinement, Type, TypedBinding,
     TypedExpr, TypedExprNode,
@@ -755,6 +757,73 @@ fn erase_chan_domains_in_type(
     ty.walk_children_mut(|t| erase_chan_domains_in_type(t, map, kinds));
 }
 
+/// Whether any refinement predicate reachable from `ty` still holds a channel type —
+/// a `ChanDom` or an `Append` history — in one of its own node slots.
+///
+/// Read-only, and the gate on [`erase_chan_domains_in_predicates`]: rebuilding a
+/// predicate reallocates it and mints fresh ids for the copy, so a walk that entered
+/// unconditionally would renumber every later node in programs with nothing to erase.
+fn predicates_hold_channel_types(ty: &Type) -> bool {
+    fn in_type(ty: &Type) -> bool {
+        if matches!(
+            ty,
+            Type::ChanDom(..)
+                | Type::History {
+                    history_kind: HistoryKind::Append,
+                    ..
+                }
+        ) {
+            return true;
+        }
+        let mut found = false;
+        ty.walk_children(|c| found |= in_type(c));
+        found
+    }
+    fn in_expr(e: &Expr) -> bool {
+        let mut found = false;
+        e.walk_type_slots(|t| found |= in_type(t));
+        e.walk_children(|c| found |= in_expr(c));
+        found
+    }
+    let mut found = false;
+    walk_refined_predicates(ty, &mut HashSet::new(), &mut |pred, _| {
+        found |= in_expr(pred);
+    });
+    found
+}
+
+/// Erase channel types inside `ty`'s refinement **predicates**, which
+/// [`erase_chan_domains_in_type`] does not reach: `Type::walk_children_mut` visits a
+/// `Type::Refinement`'s base and not its predicate.
+///
+/// A predicate over a channel-domain source holds that domain in its own node types — a
+/// filtered comprehension over a channel is the program that writes one — and the strict
+/// wall walks predicates, so a residue left here is reported there
+/// (`src/ccl/design/type-inference.md`,
+/// "Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)").
+fn erase_chan_domains_in_predicates(
+    ty: &mut Type,
+    map: &HashMap<Name, Type>,
+    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+) {
+    if !predicates_hold_channel_types(ty) {
+        return;
+    }
+    let memo: PredMemo<()> = PredMemo::default();
+    walk_refined_predicates_mut(ty, &memo, &(), &mut |pred, _| {
+        fn go(
+            e: &mut Expr,
+            map: &HashMap<Name, Type>,
+            kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+        ) {
+            e.walk_type_slots_mut(|t| erase_chan_domains_in_type(t, map, kinds));
+            e.walk_children_mut(|c| go(c, map, kinds));
+        }
+        go(pred, map, kinds);
+        true
+    });
+}
+
 /// whole-tree erasure — node types, user annotations, and
 /// the binder slots `walk_children_mut` does not reach (mirroring
 /// `mut_elim::erase_mut`'s coverage of the strict-wall checker).
@@ -808,8 +877,10 @@ fn erase_chan_domains(
         expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds));
     }
     erase_chan_domains_in_type(&mut expr.ty, map, kinds);
+    erase_chan_domains_in_predicates(&mut expr.ty, map, kinds);
     if let Some(ann) = &mut expr.user_annotation {
         erase_chan_domains_in_type(ann, map, kinds);
+        erase_chan_domains_in_predicates(ann, map, kinds);
     }
 }
 
