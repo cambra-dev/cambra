@@ -625,17 +625,21 @@ fn two_reply_feeds_one_transaction() {
                     outb << b
             (outa, outb)
         "#},
+        // A pair of collections, each keeping its own commit-tick domain — not one
+        // collection of pairs, which is what zipping the two would have made.
         Tile::tuple(vec![
-            Tile::Scalar(ColumnValue::Variants(vec![make_collection(&[
-                (Value::UInt(1), Value::Int(1)),
-                (Value::UInt(2), Value::Int(3)),
-                (Value::UInt(3), Value::Int(6)),
-            ])])),
-            Tile::Scalar(ColumnValue::Variants(vec![make_collection(&[
-                (Value::UInt(1), Value::Int(1)),
-                (Value::UInt(2), Value::Int(5)),
-                (Value::UInt(3), Value::Int(14)),
-            ])])),
+            Tile::SealedFunction {
+                domain: ColumnValue::UInts(vec![1, 2, 3]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6]))),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            },
+            Tile::SealedFunction {
+                domain: ColumnValue::UInts(vec![1, 2, 3]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14]))),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            },
         ]),
     );
 }

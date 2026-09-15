@@ -111,6 +111,15 @@ pub(super) fn insert_iterate_recurse(
     // and an `iterate` chain takes no input — the same shape the `Copair` arm's
     // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each
     // component without firing those arms.
+    // A list literal's elements are **values**: op-conversion evaluates each with
+    // `expr_to_value` and compiles none of them, so nothing inside one is an
+    // iteration site. A collection-valued element is the case that shows it — the
+    // element is a table written down, and a table written down is what a constant
+    // already is. Marking it would leave `iterate ≫ […]` where a value belongs, and
+    // constant evaluation would report a computation it cannot reduce.
+    if matches!(&expr.node, TypedExprNode::List(_)) {
+        return;
+    }
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))
     {
@@ -260,25 +269,18 @@ pub(super) fn insert_iterate_recurse(
     }
 }
 
-/// Mark `component`, a component of a product value, as an iteration site if
-/// producing its value takes an iteration.
+/// Mark `component`, a component of a product value, as an iteration site when it
+/// holds a collection.
 ///
-/// A collection-valued component is **materialized**, not iterated: a product is one
-/// value and the component is a value it holds, which is why
-/// [`convert_component`](crate::interpreter::operator_conversion::convert_component)
-/// collects it rather than compiling it as one. Collecting still needs something to
-/// collect, so the component is an iteration site for the sake of what
-/// [`Materialize`](crate::interpreter::tile_operators::Materialize) consumes, not
-/// because a component is swept.
+/// A collection component compiles exactly as a collection compiles anywhere: the
+/// product holds the tile it produces, keeping its own domain
+/// ([`SelectField`](crate::interpreter::tile_operators::SelectField) is what reads
+/// one back out). So the component needs the iteration every collection needs, and
+/// there is no shape here that a collection elsewhere does not have.
 ///
-/// A list literal is the exception at both ends: it is born materialized, its table
-/// *is* the value, and `compile_list_fn` builds that table with no iteration in between.
-///
-/// Tuples and records differ only in whether a component carries a name, and
-/// op-conversion compiles both through `convert_component`, so the rule is one rule.
-/// The kind test is that function's, down to peeling the refinement a filtered
-/// component carries: a component marked here and not materialized there would be
-/// handed an iteration source nothing reads.
+/// Tuples and records differ only in whether a component carries a name, so the rule
+/// is one rule. The kind test peels the refinement a filtered component carries: a
+/// filtered collection is a collection.
 fn mark_component_source(
     component: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -290,7 +292,7 @@ fn mark_component_source(
             ..
         }
     );
-    if holds_a_collection && !matches!(&component.node, TypedExprNode::List(_)) {
+    if holds_a_collection {
         wrap_with_iterate(component, discharged, "product-component-source");
     }
 }
@@ -1349,10 +1351,11 @@ mod tests {
         );
     }
 
-    /// A record is one value, so a collection-valued field stays a value:
-    /// op-conversion materializes it rather than iterating it.
+    /// A record's collection-valued field is an iteration site, and its scalar
+    /// field is not. The product holds the tile each component produces, so a
+    /// component compiles as the collection it is.
     #[test]
-    fn test_insert_iterate_recurse_leaves_a_record_field_alone() {
+    fn test_insert_iterate_recurse_wraps_a_collection_record_field() {
         let int = int_ty();
         let mut expr = Expr::new(TypedExprNode::Record(vec![
             ("xs".to_string(), list_123()),
@@ -1362,8 +1365,15 @@ mod tests {
             ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
             ("n".to_string(), int),
         ]));
-        let before = symbolic(&expr);
         insert_iterate_recurse(&mut expr, &Default::default());
-        assert_eq!(symbolic(&expr), before);
+        let TypedExprNode::Record(fields) = &expr.node else {
+            panic!("still a record");
+        };
+        assert!(
+            symbolic(&fields[0].1).contains("iterate"),
+            "the collection field is a site: {}",
+            symbolic(&fields[0].1),
+        );
+        assert_eq!(symbolic(&fields[1].1), "0", "the scalar field is untouched",);
     }
 }

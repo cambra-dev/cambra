@@ -143,13 +143,36 @@ Both compiled forms satisfy the same CCL type; which one a specific call site ge
 
 In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; fan-in is handled by [`fan_in`](./tile_operators/fan.rs), which dispatches to [`FanIn`] (function-tiled arms) or [`ScalarFanIn`] (scalar arms) based on what the compiled arms ended up with. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
 
-### Iterated and materialized collections
+### A product value is a record of tiles
 
-A collection has two runtime forms. **Iterated** is a `SealedFunction` tiling, one row per key, which is what every consumer that iterates a collection reads. **Materialized** is a `Scalar` tiling at an `Extent::Function`, the whole bindings table in one cell, which is what a value *holding* a collection carries. `Constant::new` and `Constant::collection` are the same choice for a constant, and the call site states it because the value does not determine it.
+A record or tuple **value** compiles to a `Tiling::Record`, each field keeping the tiling its
+own term produced: a scalar component stays a scalar, a collection component stays the sealed
+function it already was, with the domain it binds. `ScalarFanIn` assembles it and
+[`SelectField`] reads one field back out, handing over that field's sub-tile.
 
-A product value is where the materialized form is required. A record or tuple is one value, so a collection-valued component is a value it holds: `convert_component` materializes it and `fan_in` combines the components with `ScalarFanIn`. Assembling such a product with `FanIn` instead builds the zip — `(D ⤇ A, D ⤇ B)` comes out as `D ⤇ (A, B)`, a collection of products where the node's type is a product of collections. `debug_assert_product_shape` is what refuses that: it compares the operator's extent against the node's type, which nothing else in the tiling relates. Collecting needs something to collect, so a component that is not a list literal is an iteration site even though the component position is not iterated (`planning::iterate`'s `mark_component_source`); a list literal is born materialized and `compile_list_fn` builds its table with no iteration in between. A partition is not a collection of values — every key holds a further collection — so `convert_component` rejects one by name rather than handing `Materialize` a shape with no bindings table.
+Keeping a component a tile is what lets it grow. A `Tile::SealedFunction` merges by appending
+its domain and unioning its domain predicate, which is a collection arriving in pieces; a
+`Tile::Scalar` merges by appending, so a collection boxed into one cell could only be replaced
+and its pieces would read as several tables. The fields also settle independently, and a guard
+says so per field — a settled scalar beside an unsettled collection releases the first and not
+the second, which `ScalarFanInProducer` honors by not re-reading a released field.
 
-Each direction is an operator. [`Materialize`] collects the rows into the table, accumulating rows and answering nothing until the domain is complete, because a partial table is a different collection rather than a smaller one. [`IterateTable`] puts a table back in iterated form, taking its domain from the keys the table binds rather than from the input's domain extent: a filtered collection binds a subset of its extent, only the table knows which keys survived the predicate, and iterating the extent would ask the table for keys it does not bind. `iterate_collection` builds the `IterateTable` at a projection out of a product, so a collection leaves a product iterated and every consumer downstream of a projection sees the one form it reads. Op-conversion's `List` arm converts nothing: a list literal under an iteration is applied to the iteration already flowing, and no table is held in between.
+The other product is a **morphism**: `Tuple([acc, i])` under a binop is a pointwise pairing over
+the ambient iteration, and that is the zip [`FanIn`] assembles. The node's own type tells the two
+apart — a value's extent is a record, a morphism's is a function — and `build_product` reads it
+there. Assembling a value as a zip is what turned `(D ⤇ A, D ⤇ B)` into `D ⤇ (A, B)`, a collection
+of products where the type says a product of collections; `debug_assert_product_shape` compares
+the operator's extent against the node's type, which nothing else in the tiling relates.
+
+A collection component is an iteration site like any other collection (`planning::iterate`'s
+`mark_component_source`), because it compiles as the collection it is. A list literal's
+*elements* are the exception, and not as components: op-conversion evaluates each with
+`expr_to_value` and compiles none of them, so nothing inside one is a site.
+
+Selecting a field is a tile operation, distinct from the value-level `RecordField` application
+that reads a record sitting in a function's codomain one row at a time. That application needs
+every field to be a value in a column, which is what a record holding a collection cannot
+supply.
 
 ---
 
@@ -233,7 +256,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `CurriedFunction`, and `SealedFunction` tilings. When the **data** input is itself a `CurriedFunction`, it maps the function over each codomain list, producing a `CurriedFunction` with the same domain and transformed values. A **`Scalar` data input against a `CurriedFunction` function** is the single-key lookup `groupby(c, k)(v)`: the same walk at one key, yielding that key's group as a `SealedFunction` — one currying level shallower, since the scalar consumes `domain1`. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A `SealedFunction` function draws the same distinction: a row whose key it has not answered yet is withheld — dropped from the output, its domain position subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
 | `MapResultToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant (or zips it in, per its mode), preserving the domain. The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
-| `Materialize` | `SealedFunction(domain → *)` | `Scalar(Function(domain → codomain))` | Collects an iterated collection into one value — the whole bindings table in a single cell, which is the form a product value holds a collection-valued component in. Answers ⊥ until the input's domain is complete: a partial table is a different collection, not a smaller one. Releases each delivery as it takes it, so the source stays bounded; the only release it can take is the universal one. `IterateTable` is the inverse. |
+| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's sub-tile. The eliminator for the product value `ScalarFanIn` builds, and the reason a component keeps its own tiling: a collection field stays a sealed function rather than being boxed into a cell. Guards travel naming that field alone, so reading one field releases only it. |
 | `Converse` | `SealedFunction(domain → Scalar(codomain))` | `CurriedFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `CurriedFunction(A → B → C)` | `SealedFunction(Record(A, B) → Scalar(C))` | Flattens a curried function into a sealed function with a pair domain: transforms the nested lookup structure `A → B → C` into a flat pair-keyed structure `(A, B) → C`. |
 | `MapDomain` | `SealedFunction(A → *)` | `SealedFunction(A → Scalar(A))` | Replaces the codomain of a sealed function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |

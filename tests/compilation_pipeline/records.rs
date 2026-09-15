@@ -304,10 +304,8 @@ fn test_conditional_arms_at_different_record_widths(#[case] code: &str, #[case] 
 // Products holding a collection
 // ---------------------------------------------------------------------------
 
-/// A product is one value, so a collection-valued component is a value it holds:
-/// op-conversion materializes the component (`Materialize`) and the product
-/// tiles as a record of scalars. Projecting the component takes it back out as
-/// the form every consumer of a collection reads.
+/// A product value holds each component as the tile its own term produced, so a
+/// collection component stays a sealed function and `SelectField` hands it back.
 ///
 /// The components' domains are unrelated, which is what separates a product of
 /// collections from a collection of products: assembling one as the other needs
@@ -341,23 +339,18 @@ fn test_scalar_component_beside_a_collection(#[case] code: &str, #[case] expecte
     check_scalar(code, expected);
 }
 
-/// The whole product value: each collection component is one cell carrying its
-/// table, and the components keep their own domains — `a` holds two elements
-/// where `b` holds three.
+/// The whole product value: a record of tiles, each component keeping the tiling
+/// its own term produced. The two collections keep their own domains — `a` holds
+/// two elements where `b` holds three — which is what a product of collections is
+/// and a collection of products cannot be.
 #[test]
 fn test_product_of_collections_is_a_record_of_tables() {
     check_collection_tile(
         "r = (a=[1, 2], b=[4, 5, 6]); r",
         Tile::Record(
             [
-                (
-                    "a".to_string(),
-                    Tile::Scalar(ColumnValue::Variants(vec![make_int_collection(&[1, 2])])),
-                ),
-                (
-                    "b".to_string(),
-                    Tile::Scalar(ColumnValue::Variants(vec![make_int_collection(&[4, 5, 6])])),
-                ),
+                ("a".to_string(), make_int_list(&[1, 2])),
+                ("b".to_string(), make_int_list(&[4, 5, 6])),
             ]
             .into_iter()
             .collect(),
@@ -417,26 +410,32 @@ fn test_computed_collection_component(#[case] code: &str, #[case] expected: Valu
     check_scalar(code, expected);
 }
 
-/// A partition is not a collection of values: every key holds a further
-/// collection, so there is no single table for a product component to hold.
-/// Rejected by name at op-conversion rather than reaching `Materialize`, whose
-/// input tiles as a sealed function. Iterating one is unaffected — `groupby`'s
-/// result compiles wherever it is iterated rather than held.
+/// A partition is a component like any other. Every key of one holds a further
+/// collection, so it tiles as a curried function rather than a sealed one — and a
+/// component keeps the tiling its own term produced, so there is nothing here to
+/// flatten and nothing to reject.
+///
+/// Held rather than read back: reading a partition's entries takes
+/// `for k -> v in g`, which this version does not lower. What is pinned is that
+/// holding one compiles and leaves its siblings readable.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::record_field(r"r = (n=1, g=groupby([1, 1, 2], \x -> x)); 1")]
-#[case::tuple_component(r"t = (groupby([1, 1, 2], \x -> x), 1); 1")]
-fn a_partition_is_not_a_product_component(#[case] code: &str) {
-    check_compile_error(code, "a partition has");
+#[case::record_field(r"r = (n=1, g=groupby([1, 1, 2], \x -> x)); r.n", Value::Int(1))]
+#[case::tuple_component(r"t = (groupby([1, 1, 2], \x -> x), 7); t.1", Value::Int(7))]
+fn a_partition_is_a_product_component_like_any_other(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
-/// A filtered component binds a subset of its extent, and the table it holds is
-/// keyed by the indices that survived — only the table knows which, the predicate
-/// having been decided upstream of the collecting. `IterateTable` reads the domain back
-/// off the table for that reason; iterating the extent would ask for keys 0 and 1,
-/// which this table does not bind.
+/// A filtered component keeps the domain it binds rather than the extent it was
+/// filtered from: index `2` survives `y > 2` and indices `0` and `1` do not, so the
+/// field's tile is keyed by `2` alone.
+///
+/// The component's tiling is its own, so a sparse domain travels as a sparse
+/// domain. Boxed into a cell it would have to be read back out against something,
+/// and the extent is the only thing available to read it against — which would ask
+/// for keys this collection does not bind.
 #[test]
-fn test_a_filtered_component_holds_a_sparse_table() {
+fn test_a_filtered_component_keeps_the_domain_it_binds() {
     check_collection_tile(
         "r = (n=1, xs=[y for y in [1, 2, 3] if y > 2]); r",
         Tile::Record(
@@ -444,10 +443,12 @@ fn test_a_filtered_component_holds_a_sparse_table() {
                 ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
                 (
                     "xs".to_string(),
-                    Tile::Scalar(ColumnValue::Variants(vec![make_collection(&[(
-                        Value::UInt(2),
-                        Value::Int(3),
-                    )])])),
+                    Tile::SealedFunction {
+                        domain: ColumnValue::UInts(vec![2]),
+                        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+                        domain_predicate: Predicate::True,
+                        deleted: BitSet::new(),
+                    },
                 ),
             ]
             .into_iter()

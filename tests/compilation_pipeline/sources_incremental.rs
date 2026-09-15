@@ -771,13 +771,11 @@ fn test_incremental_aggregates() {
 /// A collection component of a product value, read from a **data source** rather
 /// than written out as a literal.
 ///
-/// The component is materialized — one cell carrying the whole bindings table —
-/// and the table is the source's, so a projection out of the product reads what
-/// the source delivered. Covered here rather than beside the literal cases in
-/// `records.rs` because a literal's table is built at compile time and never
-/// exercises the collecting: `Materialize` answers the table once its input has
-/// delivered all of it, which for a source is a fact about the source rather than
-/// about the term.
+/// The component keeps its own tiling, so what the product holds is the source's
+/// own sealed function and a projection reads what the source delivered. Covered
+/// here rather than beside the literal cases in `records.rs` because a literal's
+/// table is built at compile time, so those never exercise a component whose rows
+/// arrive over time.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::projected_and_summed("r = (n=1, xs=source1()); sum(r.xs)", 30)]

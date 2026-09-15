@@ -34,11 +34,11 @@ use crate::{
         operator_graph::{record_kept_operators, record_sink, record_source_read},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, IterateTable, MapAggregate, MapDomain,
+            Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Materialize, Memo, PermuteRecordDomain, Restrict, TileOperator,
-            Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in,
-            fan_in_named,
+            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, ScalarFanIn, SelectField,
+            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
+            fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -2156,13 +2156,7 @@ fn convert_impl_inner(
                 return Ok(Box::new(MapResult::new(input, collection)));
             }
             let arg = convert_impl(argument, None, ctx)?;
-            let applied = convert_impl(function, Some(arg), ctx)?;
-            // Projecting a collection out of a product value takes it out of the
-            // one place it is held as a value, so it leaves in the form every
-            // consumer of a collection reads. `iterate_collection` is the identity
-            // on the product that was itself iterated, whose
-            // projection is already a sealed function over the same domain.
-            Ok(iterate_collection(applied, &expr.ty))
+            convert_impl(function, Some(arg), ctx)
         }
 
         // Standalone projection morphism: project field _n from codomain of input.
@@ -2426,17 +2420,26 @@ fn convert_impl_inner(
 
         // Tuple: compile to a record.
         //
-        // Zipped tuples are handled by the zip rule earlier; this case
-        // fires when a `Tuple` appears as the argument of a non-Zip Apply
-        // (e.g. `Apply(Tuple([acc, i]), Builtin(BinOp(Add)))` after
-        // lambda-elim of `acc + i`).  Each component compiles through
-        // [`convert_component`], which materializes a collection-valued one so
-        // that the product is the value its type says it is.
+        // Zipped tuples are handled by the zip rule earlier; this case fires when a
+        // `Tuple` appears as the argument of a non-Zip Apply (e.g.
+        // `Apply(Tuple([acc, i]), Builtin(BinOp(Add)))` after lambda-elim of
+        // `acc + i`). Each component compiles as the term it is, and
+        // [`build_product`] reads off the node's type whether they are a value's
+        // components or a morphism's.
         TypedExprNode::Tuple(elts) => {
             expect_no_input(input, "tuple literal")?;
-            let ops: Result<Vec<_>, _> =
-                elts.iter().map(|elt| convert_component(elt, ctx)).collect();
-            let product = fan_in(ops?);
+            let ops: Result<Vec<_>, _> = elts
+                .iter()
+                .map(|elt| convert_impl(elt, None, ctx))
+                .collect();
+            let product = build_product(
+                ops?.into_iter()
+                    .enumerate()
+                    .map(|(i, op)| (tuple_field(i), op))
+                    .collect(),
+                expr,
+                ctx,
+            )?;
             debug_assert_product_shape(&*product, expr, ctx);
             Ok(product)
         }
@@ -2445,9 +2448,9 @@ fn convert_impl_inner(
             expect_no_input(input, "record literal")?;
             let ops: Result<Vec<_>, _> = fields
                 .iter()
-                .map(|(name, elt)| Ok((name.clone(), convert_component(elt, ctx)?)))
+                .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
                 .collect();
-            let product = fan_in_named(ops?);
+            let product = build_product(ops?, expr, ctx)?;
             debug_assert_product_shape(&*product, expr, ctx);
             Ok(product)
         }
@@ -2682,11 +2685,6 @@ fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
 /// [`FunKind`] is the whole test: both tile at an [`Extent::Function`], and a `Data`
 /// domain is the one that is swept. A refinement is a fact about the value rather
 /// than a different shape, so it peels first — a filtered collection is a collection.
-///
-/// [`iterate_collection`] and [`convert_component`] are inverses, so they must answer
-/// this the same way: one iterates a held table, the other holds an iterated one, and a
-/// type either side classified alone would be materialized without being collectable
-/// or iterated without being held.
 fn is_collection(ty: &Type) -> bool {
     matches!(
         ty.peel_refinements(),
@@ -2697,81 +2695,34 @@ fn is_collection(ty: &Type) -> bool {
     )
 }
 
-/// Put a collection in the form its consumers read: **iterated**, a sealed
-/// function over its domain.
+/// Assemble a product from its compiled components.
 ///
-/// The inverse of [`Materialize`], and the identity on a collection already
-/// iterated. `ty` is the node's CCL type rather than the operator's extent
-/// because only the type separates a collection from a capability: both tile at
-/// an [`Extent::Function`], and [`FunKind`] is what says the domain is data the
-/// runtime sweeps.
+/// Two different things wear the `Tuple`/`Record` node. A product **value** is one
+/// value with a component per field, and compiles to a record of tiles: each field
+/// keeps the tiling its own term produced, so a scalar component stays a scalar and
+/// a collection component stays the sealed function it already was, with its own
+/// domain. A product in **morphism** position — `Tuple([acc, i])` under a binop, say
+/// — is a pointwise pairing over the ambient iteration, and that is the zip
+/// [`fan_in`] assembles.
 ///
-/// [`IterateTable`] does the work, reading the domain off the table rather than off the
-/// extent: a filtered collection binds a subset of its extent, and applying the table
-/// to an iteration of that extent would ask it for keys it does not bind.
-fn iterate_collection(op: Box<dyn TileOperator>, ty: &Type) -> Box<dyn TileOperator> {
-    if !is_collection(ty) {
-        return op;
-    }
-    if !matches!(op.tiling(), Tiling::Scalar(Extent::Function { .. })) {
-        return op;
-    }
-    Box::new(IterateTable::new(op))
-}
-
-/// Compile one component of a product *value*.
+/// The node's own type tells them apart, and nothing else can: both arrive as the
+/// same node with the same number of operands, and a value whose components happen
+/// to share a domain is still a value. A value's extent is a record; a morphism's is
+/// a function.
 ///
-/// A product is one value, so a collection-valued component is a value that
-/// product holds, and it compiles **materialized** — one cell carrying the whole
-/// bindings table — rather than in the iterated form a collection compiles to where
-/// something iterates it. [`Materialize`] names the two forms; the component's
-/// [`FunKind`] is what says which one this position wants, because a `Data`
-/// domain is one the runtime sweeps and so marks a collection rather than a
-/// morphism awaiting the shared input.
-///
-/// A morphism component keeps its own compilation: `Tuple([acc, i])` under a
-/// binop is a pointwise pairing over the ambient iteration, and `fan_in` routes
-/// those arms to [`FanIn`].
-///
-/// A list literal is *born* materialized — its table is the value, and
-/// [`compile_list_fn`] is what builds it — so it needs no collecting. Every
-/// other collection arrives here already iterated.
-fn convert_component(
-    elt: &Expr,
+/// Assembling a value as a zip is what turned `(𝐷 ⤇ 𝐴, 𝐷 ⤇ 𝐵)` into `𝐷 ⤇ (𝐴, 𝐵)`,
+/// a collection of products where the type says a product of collections —
+/// contradicting the node's own type, which is what
+/// [`debug_assert_product_shape`] now checks.
+fn build_product(
+    components: Vec<(String, Box<dyn TileOperator>)>,
+    expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    if !is_collection(&elt.ty) {
-        return convert_impl(elt, None, ctx);
+    if matches!(ctx.extent_of(&expr.ty)?, Extent::Record(_)) {
+        return Ok(Box::new(ScalarFanIn::new_named(components)));
     }
-    if let TypedExprNode::List(elts) = &elt.node {
-        let Extent::Function { codomain, .. } = ctx.extent_of(&elt.ty)? else {
-            return Err(ConversionError::TypeError(format!(
-                "a list literal's type is a function from its index set to its element \
-                 type, got {}",
-                elt.ty
-            )));
-        };
-        // The table belongs to the list literal that wrote it. `convert_impl` names
-        // each node it converts, and this path does not go through it, so the
-        // recording is opened here — without it the constant is attributed to
-        // whatever enclosing node happens to be open.
-        let _scope = crate::ccl::provenance::converting(elt.node_id());
-        return compile_list_fn(elts, *codomain);
-    }
-    let iterated = convert_impl(elt, None, ctx)?;
-    // [`Materialize`] carries a bindings table, which a `CurriedFunction` does not
-    // have: it is a partition, whose every key holds a further collection. Holding
-    // one as a product component is collecting at each level, and no composition
-    // here does that. Iterating it is unaffected — a `groupby` result compiles
-    // wherever it is iterated rather than held.
-    if !matches!(iterated.tiling(), Tiling::SealedFunction { .. }) {
-        return Err(ConversionError::Unsupported(format!(
-            "a product component holds a collection as one value, and a partition has \
-             no single table to hold; got {}",
-            iterated.tiling()
-        )));
-    }
-    Ok(Box::new(Materialize::new(iterated)))
+    Ok(fan_in_named(components))
 }
 
 /// Evaluate a constant CCL expression to a [`Value`].
@@ -2815,9 +2766,9 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
             inner: Box::new(expr_to_value(payload)?),
         }),
         // A nested collection is constant exactly when its elements are, and its
-        // value is the bindings table — the materialized form a product value
-        // holds ([`Materialize`]), reached here because a list literal is born
-        // in it. Without this arm `[(a=1, b=[1, 2])]` is rejected for holding a
+        // value is the bindings table. A list literal's elements are values, so a
+        // collection among them is a table written down rather than an operator's
+        // output. Without this arm `[(a=1, b=[1, 2])]` is rejected for holding a
         // computation, though nothing in it computes.
         TypedExprNode::List(elts) => Ok(Value::Function(
             elts.iter()
@@ -4357,6 +4308,10 @@ fn proj_field(
     n: usize,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let field_name = tuple_field(n);
+    // A tuple value is a product value; see [`proj_named_field`].
+    if matches!(input.tiling(), Tiling::Record(_)) {
+        return Ok(Box::new(SelectField::new(input, field_name)));
+    }
     let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, &field_name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
@@ -4422,6 +4377,14 @@ fn proj_named_field(
     input: Box<dyn TileOperator>,
     name: &str,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
+    // A product **value** tiles as a record of tiles, so its field is one of those
+    // tiles and selecting it is a tile operation. The application below is the
+    // *other* projection: it reads a record one row at a time, which is what a
+    // record sitting in the codomain of a function needs and what a record holding
+    // a collection cannot supply.
+    if matches!(input.tiling(), Tiling::Record(_)) {
+        return Ok(Box::new(SelectField::new(input, name)));
+    }
     let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(name.to_string()));

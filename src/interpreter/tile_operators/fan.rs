@@ -3,7 +3,7 @@ use log::trace;
 use std::collections::HashMap;
 
 use super::*;
-use crate::interpreter::operator_graph::value_at;
+use crate::interpreter::operator_graph::{value, value_at};
 use crate::{
     interpreter::{
         ColumnValue, Consumer, Extent, Scheduler, forwarding_consumer, shared_consumer, tuple_field,
@@ -530,6 +530,7 @@ impl TileOperator for ScalarFanIn {
                     )
                 })
                 .collect(),
+            released: std::collections::HashSet::new(),
         })
     }
 }
@@ -540,6 +541,16 @@ struct ScalarFanInProducer {
     base: ProducerBase,
     names: Vec<String>,
     inputs: Vec<Box<dyn TileProducer>>,
+    /// Fields the consumer has released, by name.
+    ///
+    /// A consumer releases a record field at a time, and a product whose
+    /// components settle at different moments is released a field at a time as a
+    /// matter of course: `to_guard` reports a settled component as covered and an
+    /// unsettled one as not, so a `Memo` above this derives a guard naming the
+    /// first and not the second. Acting on one of those is what this operator
+    /// cannot do — it re-reads every operand on every pull — but their
+    /// accumulation says what a universal release says, and that it can act on.
+    released: std::collections::HashSet<String>,
 }
 
 impl TileProducer for ScalarFanInProducer {
@@ -553,11 +564,22 @@ impl TileProducer for ScalarFanInProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let field_tilings = match self.tiling() {
+            Tiling::Record(m) => m.clone(),
+            other => unreachable!("a ScalarFanIn tiles as a record, got {other}"),
+        };
         let fields: HashMap<String, Tile> = self
             .names
             .iter()
             .zip(self.inputs.iter_mut())
             .map(|(name, input)| {
+                // A released field is not pulled again. The producer promised not
+                // to re-emit it, and this operator rebuilds the whole record on
+                // every pull, so the promise is kept here rather than by declining
+                // the release.
+                if self.released.contains(name) {
+                    return (name.clone(), field_tilings[name].empty_tile());
+                }
                 let tile = input.get(input.tiling().universal_guard());
                 (name.clone(), tile)
             })
@@ -566,11 +588,178 @@ impl TileProducer for ScalarFanInProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.inputs
-                .iter_mut()
-                .for_each(|i| i.release(i.tiling().universal_guard()));
+        if obsolete_guard.is_empty() {
+            return;
         }
+        if obsolete_guard.is_universal() {
+            self.released.extend(self.names.iter().cloned());
+        } else if let TileGuard::Record(fields) = &obsolete_guard {
+            self.released.extend(
+                fields
+                    .iter()
+                    .filter(|(_, g)| g.is_universal())
+                    .map(|(name, _)| name.clone()),
+            );
+        } else {
+            // Every guard this operator's `Tiling::Record` admits is a `Record` or
+            // one of the two ends. Anything else names a region of a shape this
+            // does not produce.
+            panic!(
+                "{} cannot honor the release guard {obsolete_guard:?}, which does not \
+                 name its fields",
+                self.name()
+            );
+        }
+        // A released field's operand is released with it: `get_impl` stops pulling
+        // that operand, so holding its region upstream would keep the source from
+        // reclaiming something nothing will read again.
+        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+            if self.released.contains(name) {
+                input.release(input.tiling().universal_guard());
+            }
+        }
+    }
+}
+
+/// Pick one field out of a **product value**.
+///
+/// The eliminator for what [`ScalarFanIn`] introduces. A product value tiles as a
+/// `Tiling::Record` whose fields each keep their own tiling: a scalar component
+/// stays a scalar, a collection component stays the sealed function it already
+/// was. Selecting a field is therefore a *tile* operation — hand back that
+/// field's sub-tile — rather than the value-level `RecordField` application
+/// [`crate::interpreter::operator_conversion`] uses elsewhere, which reads a
+/// record one row at a time and so needs every field to be a value in a column.
+///
+/// Keeping the field a tile is what lets a collection component grow: a
+/// `Tile::SealedFunction` merges by appending its domain and unioning its
+/// domain predicate, which is the collection arriving in pieces. Boxed into a
+/// cell it could only be replaced, and `Tile::Scalar` merges by appending, so
+/// the pieces would read as several tables rather than one.
+pub struct SelectField {
+    base: OperatorBase,
+    /// The product whose field this selects.
+    input: Box<dyn TileOperator>,
+    /// The field's name — `_0`, `_1`, … for a tuple.
+    name: String,
+}
+
+impl SelectField {
+    /// Construct a `SelectField` for `name` over a product value.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `input` tiles as a `Tiling::Record` holding `name`.
+    pub fn new(input: Box<dyn TileOperator>, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let Tiling::Record(fields) = input.tiling() else {
+            panic!(
+                "SelectField reads a product value, so its input tiles as a record; got {}",
+                input.tiling()
+            );
+        };
+        let Some(field) = fields.get(&name) else {
+            panic!(
+                "SelectField({name}) over a product with no such field; got {}",
+                input.tiling()
+            );
+        };
+        let tiling = field.clone();
+        Self {
+            base: OperatorBase::new(tiling),
+            input,
+            name,
+        }
+    }
+
+    /// `guard` on this field, and nothing on the product's others.
+    ///
+    /// Every guard travelling to the input names one field, which is what makes a
+    /// consumer reading one field release only that one
+    /// ([`ScalarFanInProducer::release_impl`]).
+    fn at_field(&self, input_tiling: &Tiling, guard: TileGuard) -> TileGuard {
+        let TileGuard::Record(mut fields) = input_tiling.empty_guard() else {
+            unreachable!("the input tiles as a record, checked in `new`")
+        };
+        fields.insert(self.name.clone(), guard);
+        TileGuard::Record(fields)
+    }
+}
+
+impl TileOperator for SelectField {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe(
+        &mut self,
+        intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input_tiling = self.input.tiling().clone();
+        let intent = self.at_field(&input_tiling, intent_guard);
+        let input_producer = self.input.subscribe(intent, consumer, scheduler);
+        Box::new(SelectFieldProducer {
+            base: ProducerBase::new(SelectFieldProducer::alloc_id(), self.tiling()),
+            input: input_producer,
+            name: self.name.clone(),
+            input_tiling,
+        })
+    }
+}
+
+/// Producer for [`SelectField`].
+struct SelectFieldProducer {
+    base: ProducerBase,
+    input: Box<dyn TileProducer>,
+    name: String,
+    /// The product's tiling, for naming this field in a guard travelling upward.
+    input_tiling: Tiling,
+}
+
+impl SelectFieldProducer {
+    fn at_field(&self, guard: TileGuard) -> TileGuard {
+        let TileGuard::Record(mut fields) = self.input_tiling.empty_guard() else {
+            unreachable!("the input tiles as a record, checked in `SelectField::new`")
+        };
+        fields.insert(self.name.clone(), guard);
+        TileGuard::Record(fields)
+    }
+}
+
+impl TileProducer for SelectFieldProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let asked = self.at_field(projection_guard);
+        let tile = self.input.get(asked);
+        let Tile::Record(mut fields) = tile else {
+            panic!(
+                "SelectField({}) expected a record tile, got {tile:?}",
+                self.name
+            );
+        };
+        fields.remove(&self.name).unwrap_or_else(|| {
+            panic!(
+                "SelectField({}) over a record tile with no such field",
+                self.name
+            )
+        })
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // Only this field is released. The product's other fields belong to
+        // whatever else selects them, and a consumer of one says nothing about
+        // the rest.
+        let released = self.at_field(obsolete_guard);
+        self.input.release(released);
     }
 }
 
@@ -602,6 +791,7 @@ mod tests {
             base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
             names: (0..2).map(tuple_field).collect(),
             inputs,
+            released: std::collections::HashSet::new(),
         };
 
         producer.release(out_tiling.universal_guard());
@@ -625,6 +815,7 @@ mod tests {
             base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0)],
             inputs: vec![Box::new(spy)],
+            released: std::collections::HashSet::new(),
         };
 
         producer.release(out_tiling.empty_guard());
@@ -634,13 +825,13 @@ mod tests {
         );
     }
 
-    /// A guard between the two extremes is **rejected, not ignored**. A
-    /// `ScalarFanIn` re-reads every operand on every pull, so it cannot stop
-    /// requesting one released field; silently dropping the guard would leave it
-    /// re-emitting that field, which the producer has already promised not to do.
+    /// A guard between the two extremes names one field, and the field is what is
+    /// released: the operand behind it is released with it and the next pull answers
+    /// that field empty rather than re-reading it. Re-emitting it is what the
+    /// producer has promised not to do, and declining the release would leave a
+    /// consumer reading one field of a product unable to free the other.
     #[test]
-    #[should_panic(expected = "cannot honor the partial release guard")]
-    fn scalar_fan_in_rejects_a_partial_record_release() {
+    fn scalar_fan_in_honors_a_partial_record_release() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
         for _ in 0..2 {
@@ -655,6 +846,7 @@ mod tests {
             base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
             names: names.clone(),
             inputs,
+            released: std::collections::HashSet::new(),
         };
 
         // Field `_0` released, `_1` still live — neither empty nor universal.
@@ -667,6 +859,20 @@ mod tests {
             .collect(),
         );
         producer.release(partial);
+
+        let Tile::Record(fields) = producer.get(out_tiling.universal_guard()) else {
+            panic!("a ScalarFanIn answers a record");
+        };
+        assert!(
+            fields[&names[0]].is_empty(),
+            "the released field is not re-emitted, got {:?}",
+            fields[&names[0]],
+        );
+        assert!(
+            !fields[&names[1]].is_empty(),
+            "the live field still answers, got {:?}",
+            fields[&names[1]],
+        );
     }
 
     // ── FanInProducer: asymmetric per-branch presence ────────────────────────

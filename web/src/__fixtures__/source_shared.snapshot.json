@@ -4370,7 +4370,7 @@
       "nodes": [
         {
           "label": "Source(stdin)",
-          "nodeId": 652,
+          "nodeId": 650,
           "role": "source",
           "tiling": null,
           "spans": [
@@ -4441,7 +4441,7 @@
               },
               "kind": "share",
               "deferred": false,
-              "subscribed": 652
+              "subscribed": 650
             }
           ]
         },
@@ -4612,34 +4612,6 @@
           ]
         },
         {
-          "label": "Materialize",
-          "nodeId": 647,
-          "role": "operator",
-          "tiling": "(Source(stdin) -> String)",
-          "spans": [
-            {
-              "start": 87,
-              "end": 103
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": [
-            {
-              "role": {
-                "kind": "named",
-                "name": "input"
-              },
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 646
-            }
-          ]
-        },
-        {
           "label": "IterateExtent",
           "nodeId": 639,
           "role": "operator",
@@ -4690,7 +4662,7 @@
               },
               "kind": "share",
               "deferred": false,
-              "subscribed": 652
+              "subscribed": 650
             }
           ]
         },
@@ -4834,7 +4806,7 @@
         },
         {
           "label": "FanOutBranch",
-          "nodeId": 648,
+          "nodeId": 647,
           "role": "operator",
           "tiling": "SF(Source(stdin) → String)",
           "spans": [
@@ -4861,38 +4833,10 @@
           ]
         },
         {
-          "label": "Materialize",
-          "nodeId": 649,
-          "role": "operator",
-          "tiling": "(Source(stdin) -> String)",
-          "spans": [
-            {
-              "start": 87,
-              "end": 103
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": [
-            {
-              "role": {
-                "kind": "named",
-                "name": "input"
-              },
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 648
-            }
-          ]
-        },
-        {
           "label": "ScalarFanIn",
-          "nodeId": 650,
+          "nodeId": 648,
           "role": "operator",
-          "tiling": "{(Source(stdin) -> String), (Source(stdin) -> String)}",
+          "tiling": "{SF(Source(stdin) → String), SF(Source(stdin) → String)}",
           "spans": [
             {
               "start": 87,
@@ -4912,7 +4856,7 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 647
+              "subscribed": 646
             },
             {
               "role": {
@@ -4921,13 +4865,13 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 649
+              "subscribed": 647
             }
           ]
         },
         {
           "label": "Sink(main)",
-          "nodeId": 651,
+          "nodeId": 649,
           "role": "sink",
           "tiling": null,
           "spans": [
@@ -4949,7 +4893,7 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 650
+              "subscribed": 648
             }
           ]
         }
@@ -5697,7 +5641,7 @@
         ],
         [
           275,
-          652
+          650
         ],
         [
           303,
@@ -5721,7 +5665,7 @@
         ],
         [
           350,
-          652
+          650
         ],
         [
           378,
@@ -5741,15 +5685,7 @@
         ],
         [
           390,
-          647
-        ],
-        [
-          390,
-          649
-        ],
-        [
-          390,
-          650
+          648
         ],
         [
           391,
@@ -5757,7 +5693,7 @@
         ],
         [
           392,
-          648
+          647
         ],
         [
           393,
@@ -5769,7 +5705,7 @@
         ],
         [
           394,
-          651
+          649
         ],
         [
           513,
