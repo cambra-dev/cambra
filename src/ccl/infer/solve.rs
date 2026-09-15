@@ -820,8 +820,71 @@ fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     true
 }
 
-/// The type to pin an unreachable arm's payload to: the concrete type it is
-/// required to flow into, else one its operator reads accept, else `Unit`. See
+/// Pin an **empty** list literal's element type, so it resolves to *some* type
+/// rather than staying an inference variable.
+///
+/// The empty literal denotes the function with no positions, so nothing can read
+/// its codomain, and the type language has no uninhabited type to name that with
+/// (`docs/chl-spec.md`, "6.6 The empty product is unit"). A type is chosen here on
+/// the rule an unreachable arm's payload takes: whatever the position's uses
+/// require, and `Unit` when they require nothing
+/// (`src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to
+/// what its uses require").
+///
+/// **Emptiness is the premise, not a shortcut for it.** A non-empty literal whose
+/// elements are themselves undetermined — `\x -> [x, x]`, never called — has a
+/// value-free element type too, and there the variable is a type *parameter* the
+/// program left ambiguous. Pinning it would accept a program that has no type
+/// (`test_unexercised_generic_definition_is_an_error_not_a_panic`). What makes the
+/// choice free is that the domain is empty, which only this literal knows.
+///
+/// Recorded **on the variable**, like that pin and for the same reason: the element
+/// type also occurs in the binder slots the literal feeds — a `for` target, a `let`
+/// binding — and those resolve from the variable rather than from this node.
+///
+/// Chosen here rather than in `emit_list` because a type asserted before the
+/// constraints arrive is a bound the literal never had: `Unit` written at emission
+/// meets every annotation naming another element type as a mismatch.
+fn pin_empty_list_element(list_ty: &Type) {
+    // `emit_list` builds a bare `Fun`, so this is an invariant and not a case: a list node
+    // whose type grew a wrapper would stop being pinned, and every unannotated `[]` would
+    // reach the wall as an unresolved variable with nothing pointing here.
+    debug_assert!(
+        matches!(list_ty, Type::Fun { .. }),
+        "an empty list literal's type is the bare function `emit_list` built, got {list_ty}"
+    );
+    let Type::Fun { codomain, .. } = list_ty else {
+        return;
+    };
+    if value_reaches(codomain) {
+        return;
+    }
+    let chosen = payload_pin(codomain);
+    let mut cache = ConstrainCache::new();
+    let pinned = constrain_subtype(&chosen, codomain, &mut cache)
+        .and_then(|()| constrain_subtype(codomain, &chosen, &mut cache));
+    assert!(
+        pinned.is_ok(),
+        "pinning an empty list's element variable cannot fail: its only bounds are what \
+         its uses required, and `{chosen}` is a type they all still accept",
+    );
+}
+
+/// [`pin_empty_list_element`] over every empty list literal in `expr`, in one pass before
+/// coalescing reads anything.
+///
+/// Term nodes only: a refinement predicate rides a *type* slot, which this walk does not
+/// enter, so a predicate's copy keeps its own variables and is answered by whatever the
+/// original resolves to.
+fn pin_empty_list_elements(expr: &Expr) {
+    if matches!(&expr.node, TypedExprNode::List(elts) if elts.is_empty()) {
+        pin_empty_list_element(&expr.ty);
+    }
+    expr.walk_children(pin_empty_list_elements);
+}
+
+/// The type to pin an unobservable position to: the concrete type it is required
+/// to flow into, else one its operator reads accept, else `Unit`. See
 /// [`pin_unobservable_arm_payload`], which is the whole rationale.
 fn payload_pin(payload: &Type) -> Type {
     let Type::Infer(v) = payload else {
@@ -897,6 +960,20 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
+    // **Every empty literal's element is chosen before the walk starts.** The choice is
+    // recorded on the element *variable*, and that variable also stands in the binder slots
+    // the literal feeds — a comprehension's lambda parameter, a `for` target — so a read
+    // that precedes the pin resolves one occurrence against the unpinned graph and leaves
+    // it unresolved at the wall. The walk cannot reach the literal first in general: the
+    // `Apply` arm descends into `function` before `argument` on purpose, so a comprehension
+    // over an inline `[]` reads the lambda's parameter before it ever sees the list.
+    //
+    // Here rather than at emission because a type asserted before the constraints arrive is
+    // a bound the literal never had; here rather than in the walk because by the walk it is
+    // already too late. Emission has finished, so every constraint is in, and no coalesce
+    // read has happened yet. Predicates are reached through type slots rather than this
+    // walk, so a predicate's copy is left alone for the reason the walk left it alone.
+    pin_empty_list_elements(expr);
     coalesce_node(expr, 0, &mut ctx);
     debug_assert!(
         ctx.scope.is_empty(),
