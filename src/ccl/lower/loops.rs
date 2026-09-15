@@ -86,7 +86,7 @@ pub(super) fn for_body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
 /// terminal that reassigns the loop variable (`x += 1`) or a non-mutable is *not*
 /// a bare effect and stays rejected by the generator path. Gates the
 /// final-statement hidden-writer fallback in [`super::stmts::lower_final_stmt`];
-/// mirrors the non-yield/non-feed `ChlStmt::Expr` arm of `lower_for_body_terminal`.
+/// mirrors the non-yield/non-feed `ChlStmt::Expr` arm of [`lower_for_body_stmt`].
 pub(super) fn for_body_terminal_is_bare_effect(stmts: &[Spanned<ChlStmt>]) -> bool {
     matches!(
         stmts.last().map(|s| &s.node),
@@ -236,18 +236,6 @@ fn generator_defer_binding(
     )
 }
 
-/// Lower the body statements of a `for`-loop to a single CCL expression.
-///
-/// Leading statements are lowered to nested [`TypedExprNode::Let`] bindings.
-/// The final statement is lowered by [`lower_for_body_terminal`].
-///
-/// `defer_name` — if `Some`, `yield e` terminals are replaced with
-/// `feed(defer_name, e)`. If `None`, a `yield` is an error.
-///
-/// `mutation_scope` — names that cannot be assigned to (function args,
-/// pre-loop lets, and enclosing for's iteration variables). Assignments to
-/// these produce a mutation error.
-///
 /// Rejection for a write to a name bound *outside* a for-loop body. Inside a
 /// loop a plain `=` cannot carry state across iterations, and `=` is immutable
 /// regardless — it would be a per-iteration shadow that silently discards each
@@ -325,6 +313,22 @@ fn body_scope(
     mutation_scope.union(frame_introduced).cloned().collect()
 }
 
+/// Lower the body statements of a `for`-loop to a single CCL expression.
+///
+/// The last statement is the body's value. A binding above it becomes a
+/// [`TypedExprNode::Let`] around the rest of the body, and a feed becomes an effect
+/// sequenced before the rest with [`TypedExprNode::ExprStmt`]; those two are the whole
+/// of what a non-final statement may be (`docs/chl-spec.md`, "4. Statement semantics").
+/// Every position lowers through [`lower_for_body_stmt`], so a feed lowers by one rule
+/// wherever it sits.
+///
+/// `defer_name` — if `Some`, `yield e` terminals are replaced with
+/// `feed(defer_name, e)`. If `None`, a `yield` is an error.
+///
+/// `mutation_scope` — names that cannot be assigned to (function args,
+/// pre-loop lets, and enclosing for's iteration variables). Assignments to
+/// these produce a mutation error.
+///
 /// `frame_introduced` — names introduced by the current for clause (the
 /// iteration variable) and any let-bindings accumulated so far. These may
 /// be re-bound (shadowed) inside the body without triggering a mutation error.
@@ -367,9 +371,9 @@ fn lower_for_body_stmts_scoped(
         return Ok(ctx.tag_machinery(Expr::lit(Lit::Unit), body_span, "lower.loop_unit"));
     };
 
-    // Each binding carries its statement's span so the `Let` folded around the
-    // terminal below can be tagged as that statement's direct image.
-    let mut bindings: Vec<(String, Expr, Option<Type>, Span)> = Vec::new();
+    // Each item carries its statement's span so the `Let` or `ExprStmt` folded around
+    // the terminal below can be tagged as that statement's direct image.
+    let mut prefix: Vec<PrefixStmt> = Vec::new();
 
     for (_, stmt) in contributing {
         match &stmt.node {
@@ -383,7 +387,12 @@ fn lower_for_body_stmts_scoped(
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
-                bindings.push((name, val, None, stmt.span));
+                prefix.push(PrefixStmt::Bind {
+                    name,
+                    value: val,
+                    annotation: None,
+                    span: stmt.span,
+                });
             }
             ChlStmt::AnnAssign {
                 target,
@@ -401,7 +410,12 @@ fn lower_for_body_stmts_scoped(
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
-                bindings.push((name, val, Some(ann), stmt.span));
+                prefix.push(PrefixStmt::Bind {
+                    name,
+                    value: val,
+                    annotation: Some(ann),
+                    span: stmt.span,
+                });
             }
             ChlStmt::AugAssign { target, .. } => {
                 let name = extract_name_target(target, "augmented assignment")?;
@@ -438,7 +452,12 @@ fn lower_for_body_stmts_scoped(
                 let func_expr =
                     lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
                 frame_introduced.insert(name_str.clone());
-                bindings.push((name_str, func_expr, None, stmt.span));
+                prefix.push(PrefixStmt::Bind {
+                    name: name_str,
+                    value: func_expr,
+                    annotation: None,
+                    span: stmt.span,
+                });
             }
             // A `with begin():` transaction inside a *generator* loop body is a
             // later increment; top-level and simple `for … with begin():` loops
@@ -450,44 +469,114 @@ fn lower_for_body_stmts_scoped(
                      is not yet supported",
                 ));
             }
+            // `x := e` and `x: T := e` introduce a mutable variable inside the body,
+            // the same construct the `Mut(V)`-annotated `=` above rejects, so they earn
+            // the same rejection — the annotation says nothing about which construct it
+            // is ([`in_loop_mut_var_error`]). A subscript target is a keyed write to a
+            // collection rather than an introduction, and falls through below.
+            ChlStmt::MutAssign { target, .. } if name_target_as_name(target).is_some() => {
+                let name = extract_name_target(target, "mutable assignment")?;
+                if mutation_scope.contains(&name) {
+                    return Err(outer_binding_write_error(stmt.span, &name));
+                }
+                return Err(in_loop_mut_var_error(stmt.span, &name));
+            }
+            // A feed is an effect: it contributes to a deferred collection and nothing
+            // to the body's value, so it is lowered by the rule that lowers it last
+            // ([`lower_for_body_stmt`]) and sequenced before what follows. That is what
+            // lets two feeds into one deferred collection stand in a body with no
+            // accumulator, the shape [`lower_loop_body_chain`] already admits when one
+            // is present.
+            //
+            // A binding and a feed are the whole of what a non-final statement may be
+            // (`docs/chl-spec.md`, "4. Statement semantics"). An `if`, a `match` and a
+            // nested `for` are the body's value and stay last: `channelize`'s fan-out
+            // dispatches on a bare `Case` at the lambda body (`try_extract_fanout_feed`),
+            // so one sequenced under an `ExprStmt` is not fanned out at all, and the
+            // generic path it falls to builds a companion channel whose predicate
+            // references the loop binder — which the post-channelize typecheck rejects.
+            ChlStmt::Expr(value)
+                if matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }) =>
+            {
+                let effect =
+                    lower_for_body_stmt(stmt, defer_name, mutation_scope, &frame_introduced, ctx)?;
+                prefix.push(PrefixStmt::Effect {
+                    effect,
+                    span: stmt.span,
+                });
+            }
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
-                    "only assignments and function definitions are supported as \
-                     non-terminal statements in for-loop bodies",
+                    "only assignments, function definitions, `<<` feeds and `yield` \
+                     are supported as non-terminal statements in for-loop bodies",
                 ));
             }
         }
     }
 
-    let terminal =
-        lower_for_body_terminal(last, defer_name, mutation_scope, &frame_introduced, ctx)?;
+    let terminal = lower_for_body_stmt(last, defer_name, mutation_scope, &frame_introduced, ctx)?;
 
-    // Fold let-bindings around the terminal from outermost to innermost; each
-    // `Let` images its binding statement.
-    Ok(bindings
-        .into_iter()
-        .rev()
-        .fold(terminal, |body, (name, val, ann, span)| {
-            let let_expr = match ann {
-                Some(a) => Expr::let_bind_annotated(name, val, body, a),
-                None => Expr::let_bind(name, val, body),
-            };
-            ctx.tag_image(let_expr, span)
-        }))
+    // Fold the prefix around the terminal from outermost to innermost; each wrapper
+    // images the statement it came from.
+    Ok(prefix.into_iter().rev().fold(terminal, |body, item| {
+        let (wrapped, span) = match item {
+            PrefixStmt::Bind {
+                name,
+                value,
+                annotation: Some(a),
+                span,
+            } => (Expr::let_bind_annotated(name, value, body, a), span),
+            PrefixStmt::Bind {
+                name,
+                value,
+                annotation: None,
+                span,
+            } => (Expr::let_bind(name, value, body), span),
+            PrefixStmt::Effect { effect, span } => (Expr::expr_stmt(effect, body), span),
+        };
+        ctx.tag_image(wrapped, span)
+    }))
 }
 
-/// Lower the terminal (last) statement of a for-loop body.
+/// One statement of a for-loop body that is not its last: a binding the rest of the
+/// body reads, or an effect sequenced before it.
+enum PrefixStmt {
+    Bind {
+        name: String,
+        value: Expr,
+        annotation: Option<Type>,
+        span: Span,
+    },
+    Effect {
+        effect: Expr,
+        span: Span,
+    },
+}
+
+/// Lower one statement of a for-loop body.
 ///
-/// Valid terminals:
 /// - `yield e` — `Feed(defer_name, lower(e))` (requires `defer_name` to be set)
 /// - `r << e` — `Feed("r", lower(e))`
 /// - `if cond: body` (no else) — `Case` with `Unit` fallthrough
+/// - `match m: case …` — the same `Case`, dispatching on a tag
 /// - `for j in ys: body` — nested `Compose([ys, Lambda(j, body)])`
+///
+/// A feed reaches here at either position: it is the body's value when it stands last,
+/// and an effect [`lower_for_body_stmts`] sequences before what follows when it does
+/// not. One rule lowers it either way, which is what lets two feeds into one deferred
+/// collection stand in a body with no accumulator.
+///
+/// The other three forms are the body's value and reach here only last. `channelize`'s
+/// fan-out dispatches on a bare `Case` at the lambda body (`try_extract_fanout_feed`),
+/// so one sequenced under an `ExprStmt` is not fanned out at all, and the generic path
+/// it falls to builds a companion channel whose predicate references the loop binder —
+/// which the post-channelize typecheck rejects. [`lower_for_body_stmts`] keeps them out
+/// of a non-final position for that reason.
 ///
 /// `mutation_scope` and `frame_introduced` carry the same semantics as in
 /// [`lower_for_body_stmts`]; they are threaded through for recursive calls.
-fn lower_for_body_terminal(
+fn lower_for_body_stmt(
     stmt: &Spanned<ChlStmt>,
     defer_name: Option<&str>,
     mutation_scope: &HashSet<String>,
