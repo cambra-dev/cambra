@@ -22,6 +22,12 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 /// no `get`-borrow held anywhere — so the driver re-pulls without spinning and
 /// without re-entering the graph mid-borrow.
 ///
+/// The alternation is load-bearing rather than conventional: an operator holding a
+/// cumulative cache answers from it while its input has said nothing
+/// ([`crate::interpreter::tile_operators::Notified`]), so a caller that pulls without
+/// delivering never reaches the operators below it. `pull_laps` is that alternation,
+/// for tests.
+///
 /// A shareable consumer handle: a consumer the queue can hold and deliver later
 /// (and that a producer can clone to re-arm on its next pull).
 pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
@@ -154,6 +160,34 @@ other's subscribers",
             consumer.borrow_mut().notify();
         }
     }
+}
+
+/// Deliver, then pull — `laps` times, stopping as soon as `done` accepts the tile.
+/// Returns the last tile pulled.
+///
+/// The alternation `src/main.rs` runs, and the one a test should write. A lap runs on any
+/// pull that reaches the store, so a loop that only pulls is not stalled by itself; what
+/// it loses is the read. An operator holding a cumulative cache answers from that cache
+/// while its input has said nothing ([`crate::interpreter::tile_operators::Notified`]),
+/// so the pull stops there and never reaches the store at all. Delivering is what
+/// re-enables the read.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn pull_laps(
+    scheduler: &mut Scheduler,
+    producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
+    laps: usize,
+    done: impl Fn(&crate::interpreter::Tile) -> bool,
+) -> crate::interpreter::Tile {
+    let guard = producer.tiling().universal_guard();
+    let mut tile = producer.tiling().empty_tile();
+    for _ in 0..laps {
+        scheduler.check_for_notifications();
+        tile = producer.get(guard.clone());
+        if done(&tile) {
+            break;
+        }
+    }
+    tile
 }
 
 #[cfg(test)]

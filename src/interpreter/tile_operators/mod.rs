@@ -268,15 +268,11 @@ pub(crate) use impl_operator_base;
 /// last pulled" are the same statement.
 #[derive(Clone)]
 pub enum Notified {
-    /// The input's notification does not reach this producer, so every pull reads. What
-    /// an operator whose `subscribe` installs no flag gets, and what every producer had
-    /// before this existed.
+    /// The input's notification does not reach this producer, so every pull reads —
+    /// what an operator whose `subscribe` installs no flag gets.
     Always,
     /// Set when the input notifies, cleared by a pull.
-    // shared-state-ok: a one-bit wakeup latch, not a dataflow edge. What crosses it is
-    // that the input said something, never what the input said — the value still travels
-    // as a tile through `get`. It is shared with the consumer handle installed on the
-    // input for the reason the type doc gives: the setter exists before the reader does.
+    // shared-state-ok: see the type doc.
     Flag(Rc<Cell<bool>>),
 }
 
@@ -327,7 +323,6 @@ pub struct ProducerBase {
     pub tiling: Tiling,
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
-    /// Whether this producer's input has notified it since it last pulled.
     pub(crate) notified: Notified,
 }
 

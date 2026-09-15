@@ -333,11 +333,25 @@ enum InitDrainFailure {
 /// distinguishes a genuinely [`InitDrainFailure::Empty`] init (a scalar tile was
 /// produced but stayed empty) from a [`InitDrainFailure::Diverged`] one (no
 /// scalar tile settled within the bound).
-fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDrainFailure> {
+///
+/// Each pull past the first is preceded by a delivery, the alternation `src/main.rs`
+/// runs. A pull with nothing delivered between is not a step the runtime takes, and an
+/// operator that answers from a cache while its input has said nothing
+/// ([`crate::interpreter::tile_operators::Notified`]) returns the same tile to every
+/// pull of such a loop — so a bound spent without delivering is a bound spent on
+/// nothing. Delivering here is sound because no `get` is in flight: `subscribe` is the
+/// caller ([`crate::interpreter::Scheduler::check_for_notifications`]).
+fn read_initial_scalar(
+    producer: &mut dyn TileProducer,
+    scheduler: &mut Scheduler,
+) -> Result<Value, InitDrainFailure> {
     use crate::interpreter::tile_operators::scalar_tile_to_column_value;
     let guard = producer.tiling().universal_guard();
     let mut saw_empty_scalar = false;
-    for _ in 0..MAX_INIT_PULLS {
+    for pull in 0..MAX_INIT_PULLS {
+        if pull > 0 {
+            scheduler.check_for_notifications();
+        }
         // A compound (tuple/record) accumulator's init is struct-of-arrays
         // (`Tile::Record`); box it into a single scalar record value so it seeds
         // like any scalar. A plain scalar init passes straight through.
@@ -879,7 +893,7 @@ impl TileOperator for CommitOperator {
         for (key, mut op) in std::mem::take(&mut self.init_ops) {
             let g = op.tiling().universal_guard();
             let mut producer = op.subscribe(g, Box::new(|| {}), scheduler);
-            let value = read_initial_scalar(&mut *producer).unwrap_or_else(|e| match e {
+            let value = read_initial_scalar(&mut *producer, scheduler).unwrap_or_else(|e| match e {
                 InitDrainFailure::Empty => panic!(
                     "CommitOperator: computed init op for key {key:?} produced an empty scalar \
                      (no value to seed the tick-0 store)"
@@ -1302,16 +1316,17 @@ impl TileOperator for InductionStore {
         for (key, mut op) in std::mem::take(&mut self.init_ops) {
             let g = op.tiling().universal_guard();
             let mut producer = op.subscribe(g, Box::new(|| {}), scheduler);
-            let value = read_initial_scalar(&mut *producer).unwrap_or_else(|e| match e {
-                InitDrainFailure::Empty => panic!(
-                    "InductionStore: init op for accumulator {key:?} produced an empty scalar \
+            let value =
+                read_initial_scalar(&mut *producer, scheduler).unwrap_or_else(|e| match e {
+                    InitDrainFailure::Empty => panic!(
+                        "InductionStore: init op for accumulator {key:?} produced an empty scalar \
                      (no value to seed the accumulator)"
-                ),
-                InitDrainFailure::Diverged => panic!(
-                    "InductionStore: init op for accumulator {key:?} never settled to a scalar \
+                    ),
+                    InitDrainFailure::Diverged => panic!(
+                        "InductionStore: init op for accumulator {key:?} never settled to a scalar \
                      within {MAX_INIT_PULLS} pulls (an acyclic init resolves on the first pull)"
-                ),
-            });
+                    ),
+                });
             inits.insert(key, value);
         }
         let mut body_op = self.body_input.take().expect(
@@ -3057,6 +3072,12 @@ impl TileProducer for InductionDriverProducer {
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
             self.source_fully_released = true;
+            // The close is itself news, and it is the one transition the rule above does
+            // not re-arm for. A consumer that pulled earlier in this same pass has
+            // already consumed its notification, and a cache-holding one
+            // (`tile_operators::Notified`) answers from that pre-final cache until
+            // something tells it otherwise. `source_fully_released` makes this fire once.
+            self.wakeups.request(self.consumer.clone());
         }
 
         self.window.render(done)
@@ -4133,8 +4154,10 @@ mod tests {
     // The consumer helpers own shared-cell construction for the operators here; the
     // fixtures below build their own recording cells, hence the direct imports.
     use crate::ccl::{FieldKey, TagMap, V_ABORT, V_COMMIT};
+    use crate::interpreter::scheduler::pull_laps;
     use crate::interpreter::tile_operators::{Constant, FanOut, IterateExtent, Memo};
     use crate::interpreter::validate_tile;
+    use rstest::rstest;
     use std::{cell::RefCell, rc::Rc};
 
     /// A fixture producer's answer with the released region subtracted — the
@@ -4469,17 +4492,12 @@ mod tests {
     /// position per pull, so a converging read needs one pull per position (plus
     /// the closing one); the bound is generous and failing it means divergence.
     fn pull_to_terminal(sched: &mut Scheduler, producer: &mut Box<dyn TileProducer>) -> Tile {
-        let mut tile = producer.get(producer.tiling().universal_guard());
-        for _ in 0..MAX_CYCLE_PULLS {
-            if tile.is_terminal() {
-                return tile;
-            }
-            // Deliver before pulling: the cycle re-arms through the wakeup queue, so a
-            // lap that is not delivered is a lap that does not run.
-            sched.check_for_notifications();
-            tile = producer.get(producer.tiling().universal_guard());
-        }
-        panic!("induction cycle did not converge within {MAX_CYCLE_PULLS} pulls");
+        let tile = pull_laps(sched, &mut **producer, MAX_CYCLE_PULLS, Tile::is_terminal);
+        assert!(
+            tile.is_terminal(),
+            "induction cycle did not converge within {MAX_CYCLE_PULLS} pulls"
+        );
+        tile
     }
 
     /// Convergence bound for the test cycles here — far above any test's
@@ -5454,11 +5472,7 @@ mod tests {
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
         // Drive the cycle: bootstrap + 3 commits + a fixpoint pull, with margin.
-        let mut latest = producer.get(producer.tiling().universal_guard());
-        for _ in 0..6 {
-            sched.check_for_notifications();
-            latest = producer.get(producer.tiling().universal_guard());
-        }
+        let latest = pull_laps(&mut sched, &mut *producer, 7, |_| false);
         // Store: init 0 @0, then 1@1, 2@2, 3@3 — the counter reached 3.
         assert_eq!(store_at(&latest, &acct("n")), Some((3, 3)));
     }
@@ -5622,11 +5636,7 @@ mod tests {
         let guard = external.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
-        let mut latest = producer.get(producer.tiling().universal_guard());
-        for _ in 0..MAX_CYCLE_PULLS {
-            sched.check_for_notifications();
-            latest = producer.get(producer.tiling().universal_guard());
-        }
+        let latest = pull_laps(&mut sched, &mut *producer, MAX_CYCLE_PULLS, |_| false);
 
         // Every draw committed exactly once: the pool conserves.
         assert_eq!(
@@ -5878,11 +5888,7 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let mut latest = producer.get(producer.tiling().universal_guard());
-        for _ in 0..6 {
-            sched.check_for_notifications();
-            latest = producer.get(producer.tiling().universal_guard());
-        }
+        let latest = pull_laps(&mut sched, &mut *producer, 7, |_| false);
         // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
         // whichever commits first, the other denies. The round-robin drain picks
         // the winner, so the resting value is schedule-dependent (30 or 50) but
@@ -5930,11 +5936,7 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let mut latest = producer.get(producer.tiling().universal_guard());
-        for _ in 0..10 {
-            sched.check_for_notifications();
-            latest = producer.get(producer.tiling().universal_guard());
-        }
+        let latest = pull_laps(&mut sched, &mut *producer, 11, |_| false);
         // Which draws fit (and in what order) is schedule-dependent under the
         // round-robin drain, but the token-pool safety invariant holds under every
         // serialization: the pool is never oversold (≥ 0) and never exceeds its
@@ -6052,10 +6054,7 @@ mod tests {
 
         // Pulling the reader drives the cycle. Before the watermark reaches 2 the
         // read is ⊥ (empty); once it does, it resolves to the value at tick 2.
-        let mut latest = Tile::Scalar(ColumnValue::from_ints(vec![]));
-        for _ in 0..8 {
-            latest = producer.get(producer.tiling().universal_guard());
-        }
+        let latest = pull_laps(&mut sched, &mut *producer, 8, |_| false);
         let Tile::Scalar(cv) = &latest else { panic!() };
         assert_eq!(cv.as_single(), Some(int(2)));
     }
@@ -6183,12 +6182,7 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let mut latest = producer.get(producer.tiling().universal_guard());
-        for _ in 0..pulls {
-            sched.check_for_notifications();
-            latest = producer.get(producer.tiling().universal_guard());
-        }
-        latest
+        pull_laps(&mut sched, &mut *producer, pulls + 1, |_| false)
     }
 
     /// Two writers transfer over *disjoint* account pairs — A: alice→bob 30,
@@ -6409,14 +6403,15 @@ mod tests {
     /// that stays empty) from a producer that never yields a scalar.
     #[test]
     fn read_initial_scalar_distinguishes_failure_modes() {
+        let mut sched = Scheduler::new();
         // A non-empty scalar resolves immediately.
         let mut ok = FixedSource {
             tiling: Tiling::Scalar(Extent::Base(BaseType::Int)),
             tile: Tile::Scalar(ColumnValue::from_ints(vec![7])),
         };
         let g = ok.tiling().universal_guard();
-        let mut p = ok.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
-        assert!(matches!(read_initial_scalar(&mut *p), Ok(v) if v == int(7)));
+        let mut p = ok.subscribe(g, Box::new(|| {}), &mut sched);
+        assert!(matches!(read_initial_scalar(&mut *p, &mut sched), Ok(v) if v == int(7)));
 
         // An always-empty scalar → Empty.
         let mut empty = FixedSource {
@@ -6424,9 +6419,9 @@ mod tests {
             tile: Tile::Scalar(ColumnValue::from_ints(vec![])),
         };
         let g = empty.tiling().universal_guard();
-        let mut p = empty.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let mut p = empty.subscribe(g, Box::new(|| {}), &mut sched);
         assert!(matches!(
-            read_initial_scalar(&mut *p),
+            read_initial_scalar(&mut *p, &mut sched),
             Err(InitDrainFailure::Empty)
         ));
 
@@ -6447,9 +6442,9 @@ mod tests {
             },
         };
         let g = nonscalar.tiling().universal_guard();
-        let mut p = nonscalar.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let mut p = nonscalar.subscribe(g, Box::new(|| {}), &mut sched);
         assert!(matches!(
-            read_initial_scalar(&mut *p),
+            read_initial_scalar(&mut *p, &mut sched),
             Err(InitDrainFailure::Diverged)
         ));
     }
@@ -6641,6 +6636,90 @@ mod tests {
             closed_keys: Vec::new(),
         }));
     }
+    /// Two memo'd readers of one cyclic store both end at the final state, in whichever
+    /// order they are pulled.
+    ///
+    /// The recurrence advances on the **pull**, not on the wakeup, so the reader whose
+    /// pull closes the cycle decides what its sibling was holding at that moment. A memo
+    /// whose input has not notified it answers from its cache, so a sibling left with a
+    /// pre-final cache and no further wakeup would answer the stale tile forever. The
+    /// wakeup the driver requests on its `done` transition is what rules that out;
+    /// this pins the property that makes it necessary — the order is not the runtime's
+    /// to choose.
+    #[rstest]
+    #[case::laggard_first(true)]
+    #[case::leader_first(false)]
+    fn both_memo_readers_of_one_cycle_reach_the_final_state(#[case] laggard_first: bool) {
+        let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 0); // unconditional
+        let mut sched = Scheduler::new();
+        let subscribe = |sched: &mut Scheduler| {
+            let trigger = IterateExtent::new(Extent::uint_range(3));
+            let reader = StoreDenseRead::new(
+                Box::new(trigger),
+                fan.branch(),
+                acc.clone(),
+                value_extent(),
+                true,
+            );
+            let mut memo = Memo::new(Box::new(reader));
+            let guard = memo.tiling().universal_guard();
+            memo.subscribe(guard, Box::new(|| {}), sched)
+        };
+        let mut lagging = subscribe(&mut sched);
+        let mut leading = subscribe(&mut sched);
+        let guard = lagging.tiling().universal_guard();
+
+        // Both readers pull each lap, in the order under test, until the one pulled
+        // second closes the cycle.
+        let mut closing = leading.get(guard.clone());
+        for _ in 0..MAX_CYCLE_PULLS {
+            if closing.is_terminal() {
+                break;
+            }
+            sched.check_for_notifications();
+            if laggard_first {
+                let _ = lagging.get(guard.clone());
+                closing = leading.get(guard.clone());
+            } else {
+                closing = leading.get(guard.clone());
+                let _ = lagging.get(guard.clone());
+            }
+        }
+        assert!(closing.is_terminal(), "the closing reader converged");
+
+        // The sibling now gets only what the runtime would deliver — no further pull of
+        // the other reader to drive the cycle on its behalf.
+        let mut lagged = lagging.get(guard.clone());
+        for _ in 0..MAX_CYCLE_PULLS {
+            if lagged.is_terminal() {
+                break;
+            }
+            sched.check_for_notifications();
+            lagged = lagging.get(guard.clone());
+        }
+        assert_eq!(
+            dense_values(&lagged),
+            vec![1, 3, 6],
+            "the sibling answered a pre-final cache the closing pull left it holding"
+        );
+    }
+
+    /// The `Int` codomain of a dense read, in domain order.
+    fn dense_values(tile: &Tile) -> Vec<i64> {
+        let Tile::SealedFunction { codomain, .. } = tile else {
+            panic!("dense read is a SealedFunction");
+        };
+        let Tile::Scalar(col) = codomain.as_ref() else {
+            panic!("dense read codomain is a scalar column");
+        };
+        (0..col.len())
+            .map(|i| match col.index_at(i) {
+                Value::Int(v) => v,
+                other => panic!("unexpected dense value {other:?}"),
+            })
+            .collect()
+    }
+
     /// A `Memo` over a dense read of a *live* store must never cache a value the
     /// store has not decided yet.
     ///
