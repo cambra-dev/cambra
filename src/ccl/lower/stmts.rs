@@ -51,13 +51,22 @@ pub(super) fn lower_stmts_recovering(
     // scans — see [`with_block_type_aliases`] for the constraint.
     errors.extend(pre_declare_type_aliases(stmts, ctx));
     pre_register_txn_decls(stmts, ctx);
-    let (last, rest) = stmts.split_last().unwrap();
+    // This block's value is its last *contributing* statement ([`contributing_stmts`]),
+    // and the statements above that one are its prefix.
+    let terminal = contributing_stmts(stmts).next_back();
+    let rest = &stmts[..terminal.map_or(0, |(ix, _)| ix)];
 
     // Final statement: recover by substituting Expr::error() on failure.
-    let final_expr = match lower_final_stmt(last, rest, &outer_bindings, ctx) {
-        Ok(e) => e,
-        Err(e) => {
-            errors.push(e);
+    let final_expr = match terminal {
+        Some((_, last)) => match lower_final_stmt(last, rest, &outer_bindings, ctx) {
+            Ok(e) => e,
+            Err(e) => {
+                errors.push(e);
+                Expr::error()
+            }
+        },
+        None => {
+            errors.push(block_contributes_nothing(stmts));
             Expr::error()
         }
     };
@@ -78,9 +87,7 @@ pub(super) fn lower_stmts_recovering(
     // remains. The fix is to stop needing a snapshot: have `lower_middle_stmt`
     // borrow, or return the continuation back on the error path, so recovery
     // costs nothing when nothing fails.
-    let body = rest
-        .iter()
-        .enumerate()
+    let body = contributing_stmts(rest)
         .rev()
         .fold(final_expr, |acc, (i, stmt)| {
             let backup = acc.clone_preserving_ids();
@@ -215,6 +222,14 @@ pub(super) fn lower_stmts_inner(
         "lower_stmts_inner: empty nested block (parser invariant violated)"
     );
 
+    // This block's value is its last *contributing* statement ([`contributing_stmts`]),
+    // and the statements above that one are its prefix. Decided before the snapshots
+    // below, so a block that contributes nothing returns with nothing to restore.
+    let Some((last_ix, last)) = contributing_stmts(stmts).next_back() else {
+        return Err(block_contributes_nothing(stmts));
+    };
+    let rest = &stmts[..last_ix];
+
     // A nested block is its own scope: snapshot *both* the transactional
     // registry and the `mut_param_fns` set so declarations local to this block —
     // a `Mut(…, Txn)` mutable variable, or a `Mut`-param `def`'s curried call shape —
@@ -226,7 +241,6 @@ pub(super) fn lower_stmts_inner(
     // Restored on both the success and error paths below.
     let snapshot = ctx.snapshot_transactional();
     let saved_mut_param_fns = ctx.mut_param_fns.clone();
-    let (last, rest) = stmts.split_last().unwrap();
 
     // The final statement must be a bare expression, an if/else block, or
     // a for-loop that contains a yield chain (generator pattern). Wrap the
@@ -236,8 +250,7 @@ pub(super) fn lower_stmts_inner(
     let result = with_block_type_aliases(stmts, ctx, |ctx| {
         pre_register_txn_decls(stmts, ctx);
         lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
-            rest.iter()
-                .enumerate()
+            contributing_stmts(rest)
                 .rev()
                 .try_fold(final_expr, |acc, (i, stmt)| {
                     lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
@@ -1709,6 +1722,43 @@ pub(super) fn pre_declare_type_aliases(
         }
     }
     errors
+}
+
+/// A block's contributing statements, paired with their positions in it.
+///
+/// `pass` contributes no statement (`docs/chl-spec.md`, "4.7 `pass`"), so no statement
+/// grammar has an arm for it: every block walker drops it here. What is left is the one
+/// question a block's own shape answers — what a block that contributes nothing is. A
+/// value block rejects it ([`block_contributes_nothing`]), a `for`-loop body is `unit`,
+/// and a mirror loop body and a `with begin():` block are the manufactured terminal
+/// their chain already starts from, which leaves a transaction with no footprint for
+/// `lower_tx_block`'s must-do-something rule to report.
+///
+/// The position is the statement's index in `stmts`. A walker slices the statements
+/// above one with it, and those slices stay unfiltered, because they carry binder names
+/// ([`collect_stmt_names`]) and a dropped statement binds nothing either way.
+pub(super) fn contributing_stmts(
+    stmts: &[Spanned<ChlStmt>],
+) -> impl DoubleEndedIterator<Item = (usize, &Spanned<ChlStmt>)> + Clone {
+    stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, stmt)| !matches!(stmt.node, ChlStmt::Pass))
+}
+
+/// The rejection a block whose value is used earns when it contributes no statement.
+///
+/// Spanned to the block's last statement, which is a `pass` — every statement in the
+/// block is one, or [`contributing_stmts`] would have yielded another.
+pub(super) fn block_contributes_nothing(stmts: &[Spanned<ChlStmt>]) -> LoweringError {
+    let last = stmts
+        .last()
+        .expect("block_contributes_nothing: a block has at least one statement");
+    LoweringError::unsupported(
+        last.span,
+        "`pass` cannot be all of a block whose value is used; \
+         it holds a place only where no value is expected",
+    )
 }
 
 /// Lower a block with its own type aliases in scope, restoring the enclosing

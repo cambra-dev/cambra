@@ -6,6 +6,7 @@ use std::time::Duration;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::{Tile, Value};
 use cambra::pretty_graph::pretty_tile_operator;
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -116,4 +117,186 @@ fn test_multi_arg_param_in_filter_predicate() {
                 pick = \\lo, hi -> sum([x for x in data if x >= lo])\n\
                 pick(8, 0)";
     check_scalar(code, Value::Int(30));
+}
+
+// ---------------------------------------------------------------------------
+// `pass`
+//
+// A statement that contributes nothing (`docs/chl-spec.md`, "4.7 `pass`"). Every block
+// walker drops it on entry (`contributing_stmts`), so it reaches no statement grammar at
+// any position, and each block is left with the one question its own shape answers: what
+// a block that contributes nothing is. A value block rejects it, a `for`-loop body is
+// `unit`, and a `with begin():` block has no footprint for the transaction rule.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Before a value block's terminal, and before a function body's.
+#[case(
+    indoc! {r#"
+        pass
+        1 + 1
+    "#},
+    Value::Int(2)
+)]
+#[case(
+    indoc! {r#"
+        def f(x):
+            pass
+            x + 1
+        f(1)
+    "#},
+    Value::Int(2)
+)]
+// A loop body with no accumulator: as a `match` arm that does nothing, which is the
+// case an `if` can express by omitting its `else` and a `match` cannot. The feeding arm
+// carries a trailing one, the position that takes the terminal away from the feed if a
+// grammar splits its last statement off before dropping `pass`.
+#[case(
+    indoc! {r#"
+        good = defer()
+        for m in [`a(2), `b(3)]:
+            match m:
+                case `a(n):
+                    good << n
+                    pass
+                case `b(k):
+                    pass
+        sum(good)
+    "#},
+    Value::Int(2)
+)]
+// The same arm in a loop body that carries an accumulator, which is lowered by the
+// other of the two loop-body grammars.
+#[case(
+    indoc! {r#"
+        acc := 0
+        for m in [`a(2), `b(3)]:
+            match m:
+                case `a(n):
+                    acc += n
+                case `b(k):
+                    pass
+        acc
+    "#},
+    Value::Int(2)
+)]
+// As a loop body's whole content: the loop runs, and its body has no effect.
+#[case(
+    indoc! {r#"
+        for i in [1, 2]:
+            pass
+        sum([1, 2])
+    "#},
+    Value::Int(3)
+)]
+// Before an accumulator write, so the drop leaves the write as the body.
+#[case(
+    indoc! {r#"
+        acc := 0
+        for i in [1, 2]:
+            pass
+            acc += i
+        acc
+    "#},
+    Value::Int(3)
+)]
+// After a feed, so the drop leaves the feed as the body.
+#[case(
+    indoc! {r#"
+        g = defer()
+        for i in [1, 2]:
+            g << i
+            pass
+        sum(g)
+    "#},
+    Value::Int(3)
+)]
+// Inside a `with begin():` block, as the arm of a `match` whose other arm writes.
+#[case(
+    indoc! {r#"
+        b: Mut(Int, Txn) := 0
+        for m in [`a(2), `b(3)]:
+            with begin():
+                match m:
+                    case `a(n):
+                        b := b + n
+                    case `b(k):
+                        pass
+        await_final(b)
+    "#},
+    Value::Int(2)
+)]
+// And as the body of an `if` in one, beside a spine write that commits every iteration.
+#[case(
+    indoc! {r#"
+        b: Mut(Int, Txn) := 0
+        for i in [1, 2]:
+            with begin():
+                b := b + i
+                if i > 1:
+                    pass
+        await_final(b)
+    "#},
+    Value::Int(3)
+)]
+fn pass_contributes_no_statement(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A block whose value is used needs a statement to be it, and a block of nothing but
+// `pass` has none — the spec's own example of what is rejected, and a function body
+// reaching the same rule.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("pass")]
+#[case(
+    indoc! {r#"
+        def todo(x):
+            pass
+        todo(1)
+    "#}
+)]
+fn a_block_of_nothing_but_pass_has_no_value(#[case] code: &str) {
+    check_compile_error(code, "`pass` cannot be all of a block whose value is used");
+}
+
+// A trailing `pass` is dropped like any other, so the statement above it is the block's
+// value and answers for itself. An assignment is not a value at that position, and the
+// rejection names the assignment rather than the `pass` below it.
+#[test]
+fn a_trailing_pass_leaves_the_statement_above_it_as_the_value() {
+    check_compile_error(
+        indoc! {r#"
+            x = 1
+            pass
+        "#},
+        "last statement must be a bare expression",
+    );
+}
+
+// A `with begin():` block of nothing but `pass` has no footprint, which the transaction
+// rule reports rather than the statement grammar — as a loop body's transaction, and
+// standing alone.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {r#"
+        b: Mut(Int, Txn) := 0
+        for i in [1, 2]:
+            with begin():
+                pass
+        await_final(b)
+    "#}
+)]
+#[case(
+    indoc! {r#"
+        b: Mut(Int, Txn) := 0
+        with begin():
+            pass
+        await_final(b)
+    "#}
+)]
+fn a_transaction_of_nothing_but_pass_has_no_footprint(#[case] code: &str) {
+    check_compile_error(code, "must do something");
 }

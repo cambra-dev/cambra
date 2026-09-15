@@ -216,7 +216,7 @@ fn lower_tx_block_scoped(
         _ => fallback_span,
     };
     let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
-    for stmt in stmts.iter().rev() {
+    for (_, stmt) in contributing_stmts(stmts).rev() {
         chain = match &stmt.node {
             // `balance := value` — the transactional mutable variable write. `:=` is the
             // sole variable-write operator; `write_or_let` gates it (a write to a

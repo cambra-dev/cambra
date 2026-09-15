@@ -268,3 +268,23 @@ it collects per-statement errors; through `with_block_type_aliases` the first er
 Refusing them at the declaration keeps a name from resolving one way as a bare annotation and
 another as an application: an alias `List = Int` would be read by `x: List` and ignored by
 `x: List(Int)`.
+
+## `pass` statements — dropped at every block entry
+
+`pass` contributes no statement ([chl-spec.md](../../../docs/chl-spec.md), "4.7 `pass`"), so no
+statement grammar has an arm for it. `contributing_stmts` (`ccl/lower/stmts.rs`) drops it, and the
+five block walkers named above iterate what it yields rather than the block's own statements.
+
+What is left is one question, which each walker's shape answers for itself: what a block that
+contributes nothing is. A value block rejects it (`block_contributes_nothing`). A `for`-loop body
+is `unit`, the terminal a guard with no `else` falls through to, so the loop still runs once per
+element of its source. A mirror loop body and a `with begin():` block are the manufactured `Unit`
+their chain already starts from, which leaves the transaction with no footprint for the
+must-do-something rule in `lower_tx_block` to report.
+
+The drop runs before a walker splits its last statement off, so a `pass` standing last is the
+same identity it is anywhere else: a loop body and the same body with a trailing `pass` lower to
+one tree.
+
+A walker slices the statements above one by position, and those slices stay unfiltered. They
+carry binder names (`collect_stmt_names`), and a dropped statement binds nothing either way.
