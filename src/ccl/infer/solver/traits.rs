@@ -199,10 +199,16 @@ fn refinement_for_add(args: &[TypedExpr]) -> TypedExpr {
 }
 
 /// `(Int, Int) ⇝ {Int | __elem == 𝑎₁ ^+ 𝑎₂}` — the one row of `^+`.
-const ADDITION_REFINED: &[TraitInstance] = &[TraitInstance {
-    args: &[BaseType::Int, BaseType::Int],
-    assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_add))],
-}];
+const ADDITION_REFINED: &[TraitInstance] = &[
+    TraitInstance {
+        args: &[BaseType::Int, BaseType::Int],
+        assoc: &[(Assoc::Output, BaseType::Int, Some(refinement_for_add))],
+    },
+    TraitInstance {
+        args: &[BaseType::UInt, BaseType::UInt],
+        assoc: &[(Assoc::Output, BaseType::UInt, Some(refinement_for_add))],
+    },
+];
 
 /// The numeric rows plus `(String, String) ⇝ String`.
 const NUMERIC_OR_STRING: &[TraitInstance] = &[
@@ -376,7 +382,11 @@ pub struct TraitObligation {
     assoc: Vec<AssocPosition>,
     /// The input arguments' actual expressions, to be substituted
     /// into the output type if it has a refinement template.
-    input_exprs: Vec<TypedExpr>,
+    ///
+    /// A `RefCell`, as [`AssocPosition::ty`] is: freshening rewrites these to the
+    /// instantiation's own variables after the clone exists (see
+    /// [`set_input_exprs`](Self::set_input_exprs)).
+    input_exprs: RefCell<Vec<TypedExpr>>,
     /// The ID of the operator node that spawned this obligation, to
     /// be used as provenance for any resulting refinement body.
     operator_node_id: provenance::NodeId,
@@ -416,7 +426,7 @@ impl TraitObligation {
                     deposited: Cell::new(false),
                 })
                 .collect(),
-            input_exprs,
+            input_exprs: RefCell::new(input_exprs),
             operator_node_id,
         })
     }
@@ -451,7 +461,7 @@ impl TraitObligation {
                     deposited: Cell::new(p.deposited.get()),
                 })
                 .collect(),
-            input_exprs: original.input_exprs.clone(),
+            input_exprs: RefCell::new(original.input_exprs.borrow().clone()),
             operator_node_id: original.operator_node_id,
         })
     }
@@ -499,6 +509,19 @@ impl TraitObligation {
         for (position, ty) in self.assoc.iter().zip(tys) {
             *position.ty.borrow_mut() = ty;
         }
+    }
+
+    /// The input expressions, in argument order. Freshening reads these, freshens
+    /// their type slots, and writes them back with
+    /// [`set_input_exprs`](Self::set_input_exprs).
+    pub(super) fn input_exprs(&self) -> Vec<TypedExpr> {
+        self.input_exprs.borrow().clone()
+    }
+
+    /// Rewrite the input expressions. Freshening's second phase; see the
+    /// `input_exprs` field.
+    pub(super) fn set_input_exprs(&self, exprs: Vec<TypedExpr>) {
+        *self.input_exprs.borrow_mut() = exprs;
     }
 
     /// Reject a shape no instance can accept at position `pos`.
@@ -595,7 +618,10 @@ impl TraitObligation {
             let ty = match maybe_refinement {
                 Some(template) => Type::Refinement(
                     Box::new(ty_base),
-                    RefinementSet::one(Refinement::born_from_template(template, &self.input_exprs)),
+                    RefinementSet::one(Refinement::born_from_template(
+                        template,
+                        &self.input_exprs.borrow(),
+                    )),
                 ),
                 None => ty_base,
             };

@@ -751,3 +751,58 @@ m
         "produced an invalid tree: [Type mismatch for collection domain",
     )
 }
+
+/// This and the following two tests exclude a bug in which captured
+/// input expressions that are later used to create a trait instance
+/// refinement are stale at that point. Bug was fixed by freshening
+/// the inputs before creating the refinement.
+#[test]
+fn freshen_refined_add_double_arg1() {
+    check_scalar(
+        indoc! {r#"
+g = 10
+def f(p,q):
+    p ^+ q ^+ g
+f(1,2)
+        "#},
+        Value::Int(13),
+    )
+}
+
+#[test]
+fn freshen_refined_add_double_arg2() {
+    check_scalar(
+        indoc! {r#"
+def f(p,q):
+    p ^+ q
+f(1,2)
+        "#},
+        Value::Int(3),
+    )
+}
+
+#[test]
+fn freshen_refined_add_single_arg() {
+    check_scalar(
+        indoc! {r#"
+def f(p):
+    p ^+ p
+f(1)
+        "#},
+        Value::Int(2),
+    )
+}
+
+/// Test the UInt trait instance of ^+. Currently pins the fact that a
+/// numeric literal can only be inferred as an Int.
+#[test]
+fn refined_add_uint_row() {
+    check_compile_error(
+        indoc! {r#"
+def f(p) => {UInt where _ == p ^+ p}:
+    p ^+ p
+f(1)
+        "#},
+        "Type mismatch for Apply: expected UInt, found Int",
+    )
+}
