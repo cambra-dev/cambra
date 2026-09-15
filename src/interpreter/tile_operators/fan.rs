@@ -526,7 +526,6 @@ impl TileOperator for MakeRecord {
                     )
                 })
                 .collect(),
-            released: std::collections::HashSet::new(),
         })
     }
 }
@@ -537,16 +536,6 @@ struct MakeRecordProducer {
     base: ProducerBase,
     names: Vec<String>,
     inputs: Vec<Box<dyn TileProducer>>,
-    /// Fields the consumer has released, by name.
-    ///
-    /// A consumer releases a record field at a time, and a product whose
-    /// components settle at different moments is released a field at a time as a
-    /// matter of course: `to_guard` reports a settled component as covered and an
-    /// unsettled one as not, so a `Memo` above this derives a guard naming the
-    /// first and not the second. Acting on one of those is what this operator
-    /// cannot do — it re-reads every operand on every pull — but their
-    /// accumulation says what a universal release says, and that it can act on.
-    released: std::collections::HashSet<String>,
 }
 
 impl TileProducer for MakeRecordProducer {
@@ -559,60 +548,56 @@ impl TileProducer for MakeRecordProducer {
         node
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let field_tilings = match self.tiling() {
-            Tiling::Record(m) => m.clone(),
-            other => unreachable!("a MakeRecord tiles as a record, got {other}"),
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        // Each field is asked for its own share of what the consumer wants. A field
+        // withholds what it has already handed over, which is what keeps a record
+        // whose fields settle at different moments from re-delivering the ones that
+        // settled first.
+        let wanted = match &projection_guard {
+            TileGuard::Record(fields) => Some(fields),
+            _ => None,
         };
         let fields: HashMap<String, Tile> = self
             .names
             .iter()
             .zip(self.inputs.iter_mut())
             .map(|(name, input)| {
-                // A released field is not pulled again. The producer promised not
-                // to re-emit it, and this operator rebuilds the whole record on
-                // every pull, so the promise is kept here rather than by declining
-                // the release.
-                if self.released.contains(name) {
-                    return (name.clone(), field_tilings[name].empty_tile());
-                }
-                let tile = input.get(input.tiling().universal_guard());
-                (name.clone(), tile)
+                let guard = wanted
+                    .and_then(|w| w.get(name).cloned())
+                    .unwrap_or_else(|| input.tiling().universal_guard());
+                (name.clone(), input.get(guard))
             })
             .collect();
         Tile::Record(fields)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_empty() {
-            return;
-        }
-        if obsolete_guard.is_universal() {
-            self.released.extend(self.names.iter().cloned());
-        } else if let TileGuard::Record(fields) = &obsolete_guard {
-            self.released.extend(
-                fields
-                    .iter()
-                    .filter(|(_, g)| g.is_universal())
-                    .map(|(name, _)| name.clone()),
-            );
-        } else {
-            // Every guard this operator's `Tiling::Record` admits is a `Record` or
-            // one of the two ends. Anything else names a region of a shape this
-            // does not produce.
-            panic!(
-                "{} cannot honor the release guard {obsolete_guard:?}, which does not \
-                 name its fields",
-                self.name()
-            );
-        }
-        // A released field's operand is released with it: `get_impl` stops pulling
-        // that operand, so holding its region upstream would keep the source from
-        // reclaiming something nothing will read again.
-        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
-            if self.released.contains(name) {
-                input.release(input.tiling().universal_guard());
+        // A record guard names one guard per field, and a field's guard belongs to
+        // that field's operand. Forwarding it is the whole of the release: the
+        // operand then withholds what it handed over, whether that is the field
+        // entire or the rows of it a consumer has finished with.
+        //
+        // Declining a guard between the two ends is what this used to do, on the
+        // grounds that a pull re-reads every operand. It does, and an operand that
+        // has been told keeps the promise itself.
+        match &obsolete_guard {
+            g if g.is_empty() => {}
+            TileGuard::Record(fields) => {
+                for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+                    if let Some(field) = fields.get(name) {
+                        input.release(field.clone());
+                    }
+                }
             }
+            g if g.is_universal() => {
+                for input in self.inputs.iter_mut() {
+                    input.release(input.tiling().universal_guard());
+                }
+            }
+            other => panic!(
+                "{} cannot honor the release guard {other:?}, which does not name its fields",
+                self.name()
+            ),
         }
     }
 }
@@ -787,7 +772,6 @@ mod tests {
             base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
             names: (0..2).map(tuple_field).collect(),
             inputs,
-            released: std::collections::HashSet::new(),
         };
 
         producer.release(out_tiling.universal_guard());
@@ -811,7 +795,6 @@ mod tests {
             base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0)],
             inputs: vec![Box::new(spy)],
-            released: std::collections::HashSet::new(),
         };
 
         producer.release(out_tiling.empty_guard());
@@ -821,18 +804,24 @@ mod tests {
         );
     }
 
-    /// A guard between the two extremes names one field, and the field is what is
-    /// released: the operand behind it is released with it and the next pull answers
-    /// that field empty rather than re-reading it. Re-emitting it is what the
-    /// producer has promised not to do, and declining the release would leave a
-    /// consumer reading one field of a product unable to free the other.
+    /// A guard between the two extremes names one field, and that field's operand is
+    /// what it releases. A product whose components settle at different moments is
+    /// released a field at a time as a matter of course, so this is the ordinary
+    /// case rather than an edge: `to_guard` reports a settled component as covered
+    /// and an unsettled one as not.
+    ///
+    /// The operand is what withholds the released region afterwards — a conforming
+    /// producer answers a released region empty — so what is asserted here is that
+    /// the guard reaches the right one and not its neighbour.
     #[test]
-    fn make_record_honors_a_release_naming_one_field() {
+    fn make_record_releases_the_operand_a_guard_names() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let mut logs = Vec::new();
         let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
         for _ in 0..2 {
-            let (spy, _log) =
+            let (spy, log) =
                 ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+            logs.push(log);
             inputs.push(Box::new(spy));
         }
         let names: Vec<String> = (0..2).map(tuple_field).collect();
@@ -842,7 +831,6 @@ mod tests {
             base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
             names: names.clone(),
             inputs,
-            released: std::collections::HashSet::new(),
         };
 
         // Field `_0` released, `_1` still live — neither empty nor universal.
@@ -856,18 +844,15 @@ mod tests {
         );
         producer.release(partial);
 
-        let Tile::Record(fields) = producer.get(out_tiling.universal_guard()) else {
-            panic!("a MakeRecord answers a record");
-        };
-        assert!(
-            fields[&names[0]].is_empty(),
-            "the released field is not re-emitted, got {:?}",
-            fields[&names[0]],
+        assert_eq!(
+            *logs[0].borrow(),
+            vec![TileGuard::Scalar(true)],
+            "the named field's operand is released",
         );
         assert!(
-            !fields[&names[1]].is_empty(),
-            "the live field still answers, got {:?}",
-            fields[&names[1]],
+            logs[1].borrow().iter().all(TileGuard::is_empty),
+            "the other operand is not, got {:?}",
+            logs[1].borrow(),
         );
     }
 

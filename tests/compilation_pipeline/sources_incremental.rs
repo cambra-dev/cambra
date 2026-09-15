@@ -814,3 +814,75 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
     tile.compact();
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
+
+/// A collection component **grows**: rows reach it as the source delivers them,
+/// and the field settles when the source does.
+///
+/// This is what holding the component as a tile buys. A `Tile::SealedFunction`
+/// merges by appending its domain and unioning its domain predicate, which is a
+/// collection arriving in pieces; boxed into one cell it could only be replaced,
+/// and a scalar merges by appending, so the pieces would read as several tables
+/// rather than one growing one.
+///
+/// The bare source is pulled alongside as the control: a component answers what
+/// the collection answers, at every pull rather than only at the last.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::component("r = (n=1, xs=source1()); r.xs")]
+#[case::bare_source("source1()")]
+fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    let mut pull = |source: &Rc<RefCell<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
+        source.borrow_mut().add_data(
+            &rows
+                .iter()
+                .map(|(k, v)| (Value::UInt(*k as usize), Value::Int(*v)))
+                .collect::<Vec<_>>(),
+        );
+        if done {
+            source.borrow_mut().set_yield_predicate(Predicate::True);
+        }
+        let mut tile = producer.get(producer.tiling().universal_guard());
+        tile.compact();
+        sort_sealed_function_by_domain(tile)
+    };
+
+    let expected = |keys: Vec<usize>, vals: Vec<i64>, done: bool| {
+        sort_sealed_function_by_domain(Tile::SealedFunction {
+            domain: ColumnValue::UInts(keys),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+            domain_predicate: if done {
+                Predicate::True
+            } else {
+                Predicate::False
+            },
+            deleted: BitSet::new(),
+        })
+    };
+
+    assert_eq!(
+        pull(&test_source, &[(0, 10), (1, 20)], false),
+        expected(vec![0, 1], vec![10, 20], false),
+        "the rows delivered so far, and the domain is not settled",
+    );
+    assert_eq!(
+        pull(&test_source, &[(2, 30)], false),
+        expected(vec![0, 1, 2], vec![10, 20, 30], false),
+        "the row added since joins the ones already there",
+    );
+    assert_eq!(
+        pull(&test_source, &[], true),
+        expected(vec![0, 1, 2], vec![10, 20, 30], true),
+        "the source says it is done, and the domain settles with no new rows",
+    );
+}
