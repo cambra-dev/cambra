@@ -1,6 +1,7 @@
 //! The CCL [`Type`] lattice, its [`Refinement`] subset-type carrier, and the
 //! type-blind structural equality / hashing on refinement predicate terms.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -2567,6 +2568,36 @@ impl Type {
                 history_kind: HistoryKind::Append,
             } => Some((domain, value)),
             _ => None,
+        }
+    }
+
+    /// The **read view** of this type: what a reference to it denotes when read, with
+    /// refinement tags looked through and a handle resolved to the state behind it.
+    ///
+    /// The view is kind-specific. A mutable variable reads as one value
+    /// ([`Type::mut_value_type`]); a feed channel reads as the whole collection it has
+    /// accumulated, the data function `domain ⤇ value` ([`Type::as_feed`]). Anything else
+    /// is its own read view, which makes this idempotent. Emit's `read_through` is the
+    /// value deref alone and stops at a channel, where the solver's transparent-read rule
+    /// reads through instead; this is the post-inference counterpart, with no solver left
+    /// to defer to.
+    ///
+    /// **No read view carries a Σ.** [`Type::History`] has no binder slot, so the channel
+    /// case builds its function with [`Type::data_fun`] and a consumer reading binders off
+    /// that view finds none — because a handle holds none, not because the view dropped
+    /// them.
+    pub fn read_view(&self) -> Cow<'_, Type> {
+        let mut peeled = self.peel_refinements();
+        while let Some(value) = peeled.mut_value_type() {
+            peeled = value.peel_refinements();
+        }
+        match peeled {
+            Type::History {
+                domain,
+                value,
+                history_kind: HistoryKind::Append,
+            } => Cow::Owned(Type::data_fun((**domain).clone(), (**value).clone())),
+            other => Cow::Borrowed(other),
         }
     }
 
