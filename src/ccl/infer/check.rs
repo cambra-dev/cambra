@@ -340,18 +340,13 @@ impl Typing for CheckCtx {
         t: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
-        // Destructure the resolved type directly (no inference vars), and —
-        // pre-channelize only — read through a transparent handle to the value it
-        // wraps: a `Mut` history to its value (a `Mut`-typed collection used as a
-        // for-loop source derefs to the collection), a defer's `Feed` to its
-        // channel. Both mirror the solver's transparent-read rule that Emit applies
-        // when it destructures the same position, so Check and Emit agree at the
-        // consistency wall; post-channelize/-erasure trees carry neither type.
-        let mut peeled = t.peel_refinements();
-        while let Some(value) = peeled.mut_value_type() {
-            peeled = value.peel_refinements();
-        }
-        match peeled {
+        // Destructure the resolved type directly (no inference vars), through its read
+        // view ([`Type::read_view`]) — a `Mut`-typed collection used as a for-loop source
+        // reads as the collection, a defer's channel as the collection it accumulates.
+        // That mirrors the solver's transparent-read rule Emit applies when it
+        // destructures the same position, so Check and Emit agree at the consistency
+        // wall; post-channelize/-erasure trees carry neither handle type.
+        match t.read_view().as_ref() {
             // A sum destructures like the function it is: the consumer's domain is a name
             // for whichever domain the witness picked — the sum's own domain, which its
             // slot binds — paired with the shared element type. One arm serves both
@@ -362,13 +357,6 @@ impl Typing for CheckCtx {
                 codomain: c,
                 ..
             } => Ok(((**d).clone(), (**c).clone())),
-            // A `Feed` history reads as its whole read view `domain ⤇ value` — a
-            // defer's channel — so it destructures directly to (domain, value).
-            Type::History {
-                domain,
-                value,
-                history_kind: crate::ccl::HistoryKind::Append,
-            } => Ok(((**domain).clone(), (**value).clone())),
             _ => {
                 let located = self.raise(InferError::ExpectedFunction {
                     found: t.clone(),
@@ -421,14 +409,6 @@ impl Typing for CheckCtx {
         function: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        // **A feed handle's read view is the function being applied**
-        // ([`Type::feed_read_view`]). [`Typing::as_function`] takes that view one line
-        // above this in [`Typing::apply`], so a handle arriving here unpeeled leaves the
-        // two disagreeing about whether a channel is a function: the domain lookup below
-        // finds none, and the assertion reports a caller that passed a domain. A
-        // comprehension over a channel is the program that reaches it.
-        let view = function.feed_read_view();
-        let function = view.as_ref().unwrap_or(function);
         // Sound one-way only: a refined argument may flow into an unrefined
         // parameter (dropping a restriction is admissible). Emit's reverse
         // direction (domain coalescing) is not the sound subtyping rule and so
@@ -466,8 +446,14 @@ impl Typing for CheckCtx {
         _kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {
-        let (_domain, codomain) = self.as_function(fn_ty, at)?;
-        self.constrain_argument(arg_ty, fn_ty, at)?;
+        // **One read view for the whole rule.** An application consumes the function's
+        // shape three times — the shape edge, the argument edge, and the discharge — and a
+        // handle looked through at one and not another leaves them disagreeing about
+        // whether a channel is a function ([`Type::read_view`]). A comprehension over a
+        // channel applies it, so the disagreement is reachable.
+        let function = fn_ty.read_view();
+        let (_domain, codomain) = self.as_function(&function, at)?;
+        self.constrain_argument(arg_ty, &function, at)?;
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
@@ -475,7 +461,7 @@ impl Typing for CheckCtx {
         // usual case — application opens the function at the argument, β) and
         // free names when a name-spelled form survived; both discharge to
         // the same argument term.
-        let result = match fn_ty.peel_refinements() {
+        let result = match function.as_ref() {
             Type::Fun { name: Some(b), .. } => {
                 crate::ccl::subst::discharge_codomain(b, argument, &codomain)
             }
