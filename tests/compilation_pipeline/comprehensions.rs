@@ -258,3 +258,25 @@ fn test_filtered_comprehension_over_a_filtered_literal() {
         Value::Int(2),
     );
 }
+
+/// A transactional collection read **as a collection**, once per transaction.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::one_transaction("[1]", 3)]
+#[case::three_transactions("[1, 2, 3]", 9)]
+fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+                n: Mut(Int, Txn) := 0
+                for r in {}:
+                    with begin():
+                        n := n + sum([v for v in m])
+                await_final(n)
+            "#},
+            rows
+        ),
+        Value::Int(total),
+    );
+}

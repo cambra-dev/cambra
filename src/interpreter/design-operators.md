@@ -67,7 +67,9 @@ equivalent tiles with some data released may.
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
 Tiles representing collections (`SealedFunction` and `CurriedFunction`) support logical deletes by storing a `BitSet` of deleted values.  These are set by filteriing operator like `Restrict` and compacted away by
-stateful operators like `Memo` and aggregation.
+stateful operators like `Memo` and aggregation. A `CurriedFunction`'s bitset indexes its **flat
+innermost** entries, never its groups, so a producer deleting a whole group marks that group's whole
+run of entries — `Tile::retain` reads the bits against the innermost level.
 
 ### TileGuard
 
@@ -459,6 +461,42 @@ The pipeline always bottoms out at one of three consumer shapes:
 In all three cases planning has ensured every iteration site has an explicit
 `iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
 what to emit based only on its own AST shape and the input flowing in.
+
+### Reading a collection held per row
+
+A collection reaches an operator in one of two shapes. A **streamed** one carries its keys in
+a domain column, one row per key, and is what every consumer that iterates a collection reads.
+A **materialized** one is a single map value, a binding list carrying its own keys, and is how
+a transactional collection's store key holds it: the store holds the whole map at one commit
+key, so an as-of read is one map value per commit. A keyed read takes that shape as it is —
+[`CheckedLookup`] searches the bindings of the row's own value — and an iterating consumer
+cannot, because one stream cannot carry several rows' collections when their keys collide.
+
+`Tiling::CurriedFunction` holds them apart: a collection per row, `domain1` naming the rows.
+[`IterateRowCollection`] is the adapter, opening each row's bindings into that row's group, and
+op-conversion inserts one where an aggregate's input arrives as a column of collection values.
+No composition serves this case, because the key set to iterate differs per row and only the
+row's own value names it.
+
+Two facts about a per-row collection make it work, and neither holds of a streamed one.
+
+**It is complete as soon as its row arrives.** A map value carries its own keys, so nothing
+waits on a domain closing to know the group is whole. `IterateRowCollection` says so by naming
+the rows it delivers in its `domain_predicate`, which is the region of `domain1` that will see
+no new elements, each row together with its whole list. `MapAggregate` marks each accumulator
+terminal where the predicate names its key, rather than reading the predicate as one bool for
+the whole domain; without that, an aggregate over a live store holds every row open forever.
+
+**Its keys repeat across rows.** Two commits of one map carry the same keys, which a curried
+tile permits: `validate_tile` asks for uniqueness within a group and no more. A codomain guard
+names keys and not the group they sit in, so releasing one would release it in every other
+row. `Tile::to_guard` therefore names keys only for the groups its predicate leaves open, and
+releases the whole ones by their own `domain1` value.
+
+A row whose collection is **empty** contributes no group, because a curried tile's offsets are
+strictly ascending and so every group holds at least one entry. Its consumer sees that row as
+absent rather than as an empty collection, which for an aggregate is the difference between no
+answer and the identity.
 
 ---
 
