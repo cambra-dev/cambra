@@ -1457,6 +1457,52 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
     );
 }
 
+/// A rebuilt collection needs the bounded annotation, and an exact one is
+/// refused.
+///
+/// The refusal is a limitation, not a rule: `[q for q in held]` denotes `held`,
+/// over the same domain and at the same element type, and carrying `held` whole
+/// under the same exact annotation is accepted
+/// ([`a_map_valued_variable_carries_whole`]). What differs is that a
+/// comprehension hands back a collection at the witness it opened, while the
+/// target's annotation binds a witness of its own, and the two are compared
+/// rather than solved against each other.
+///
+/// Pinned so that repairing it fails here: solving the target's domain binder
+/// against the witness its initializer carries accepts both forms, and this
+/// test is what says so.
+#[test]
+fn an_exact_annotation_on_a_rebuilt_collection_is_refused() {
+    let v1 = indoc! {r#"
+        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        for c in [1]:
+            with begin():
+                qty["sol"] := 3
+        await_final(qty)
+    "#};
+    // The identity comprehension, so the rejection cannot be read as a
+    // disagreement about the value or its type.
+    let v2 = indoc! {r#"
+        @LoadFrom(qty)
+        held: Map(String, Int)
+        qty_units: Mut(Map(String, Int), Txn) := [q for q in held]
+        await_final(qty_units)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let _ = drive_main_map(&mut ctx, &mut live);
+
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("an exact annotation on a rebuilt collection does not compile today");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("initializer of mutable `qty_units`"),
+        "the two domains are compared at the initializer: {rendered}",
+    );
+}
+
 /// A carried collection whose values are records is transformed on its way into
 /// the variable that replaces it.
 ///

@@ -3168,13 +3168,11 @@ declares takes the value it held whether or not anything names it. `@LoadFrom` i
 for the variable it declares under a different name, or retires. Doing both keeps
 the old variable live while seeding a new one from it.
 
-**The annotation states the shape, and its mode matters.** What the running
-program holds has to fit the annotation exactly, so an exact `y: T` is right
-wherever the value is used whole. A collection's domain is its data and is
-invariant, so an exact annotation on one pins the domain too and a comprehension
-over the binding is rejected; the bounded form ([6. Types (informal
-sketch)](#6-types-informal-sketch)) is what leaves the domain to
-be inferred:
+**The annotation states the shape.** The value the running program holds has to fit
+it, and the two forms ([Two annotation forms: exact and
+bounded](#two-annotation-forms-exact-and-bounded)) read here as they do at any other
+binder: `held: T` binds at `T`, and `held <: T` binds at the loaded value's own type
+with `T` as an upper bound.
 
 ```python
 @LoadFrom(qty)
@@ -3195,10 +3193,6 @@ wrong answer.
 the next version. A name a version loads and does not declare is gone after that
 version, which is why recompiling a migrating source unchanged is refused: there
 is no longer anything of that name to load.
-
-What `@LoadFrom` does not do is make units checkable. Both variables above hold
-an `Int`, and nothing checks that ten thousand is the right number; what is
-checked is that a value was about to be dropped and the source did not say so.
 
 ## 9. Sinks
 
