@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use bit_set::BitSet;
 use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
-use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile};
+use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
 use cambra::ccl::TagMap;
 
 use crate::helpers::*;
+use indoc::indoc;
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -413,6 +414,67 @@ o"#;
             ])),
             deleted: BitSet::new(),
         },
+    );
+}
+
+/// A **comprehension over a feed channel**, which applies the channel: the channel's read
+/// view is the data function the comprehension's source position holds.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::bare("sum([x for x in out])", 3)]
+#[case::mapped("sum([x * 2 for x in out])", 6)]
+fn a_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r"
+                out = defer()
+                for v in [1, 2]:
+                    with begin():
+                        out << v
+                {}
+            "},
+            read
+        ),
+        Value::Int(expected),
+    );
+}
+
+/// A **filtered** comprehension over a channel, which the argument check admits and
+/// `channelize` then stops. The filter refines the comprehension's source domain and that
+/// domain is the channel's, so a `ChanDom` sits inside the refinement's predicate — where
+/// channelize's erasure never reaches, because `Type::walk_children_mut` visits a
+/// `Type::Refinement`'s base and not its predicate. The post-channelize check then reports
+/// the residue at `__elem`.
+///
+/// The unfiltered reads beside it place it: what the filter meets is the channel domain
+/// surviving into a predicate, not anything about applying a channel.
+#[test]
+fn a_filtered_comprehension_over_a_feed_channel_fails_at_channelize() {
+    check_compile_error(
+        indoc! {r"
+            out = defer()
+            for v in [1, 2]:
+                with begin():
+                    out << v
+            sum([x for x in out if x > 1])
+        "},
+        "channel domain chan(out) survived channelize at `__elem`",
+    );
+}
+
+/// The same read with **no transaction** around the contribution. `with begin():` decides
+/// how the channel is fed, not how it is read, so the comprehension applies the same read
+/// view either way.
+#[test]
+fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
+    check_scalar(
+        indoc! {r"
+            out = defer()
+            for v in [1, 2]:
+                out << v
+            sum([x for x in out])
+        "},
+        Value::Int(3),
     );
 }
 
