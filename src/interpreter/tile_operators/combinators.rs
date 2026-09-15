@@ -1018,11 +1018,9 @@ impl TileProducer for RestrictProducer {
 /// not carry the same keys, which is what the offsets express and a sealed function cannot
 /// ([`Tiling::CurriedFunction`]).
 ///
-/// **A row whose collection is empty contributes no group**, because a curried-function
-/// tile cannot hold one: its offsets are strictly ascending, so every group has at least
-/// one entry (`validate_tile`). A consumer therefore sees that row as absent rather than as
-/// an empty collection, which for an aggregate is the difference between no answer and the
-/// identity.
+/// A row whose collection is **empty** keeps its group, holding nothing: the offsets are
+/// non-decreasing, so two equal starts say so ([`Tile::CurriedFunction`]). The row reads as
+/// the empty collection it is, and an aggregate over it folds to the aggregate's identity.
 pub struct IterateRowCollection {
     /// Output tiling: `CurriedFunction { domain1: input.domain, domain2: 𝐾, codomain: 𝑉 }`.
     base: OperatorBase,
@@ -1134,20 +1132,15 @@ impl TileProducer for IterateRowCollectionProducer {
         let Tile::Scalar(values) = *codomain else {
             panic!("IterateRowCollection expected a scalar codomain column")
         };
-        // One group per row whose collection has an entry, in row order. A row is kept by
-        // index so `domain1` and the offsets stay parallel after the empty ones drop.
-        let mut kept: Vec<usize> = Vec::new();
-        let mut offsets: Vec<usize> = Vec::new();
+        // One group per row, in row order, holding that row's bindings — none of them
+        // where the row's collection is empty, which two equal starts carry.
+        let mut offsets: Vec<usize> = Vec::with_capacity(values.len());
         let mut keys: Vec<Value> = Vec::new();
         let mut outputs: Vec<Value> = Vec::new();
         for row in 0..values.len() {
             let Value::Function(bindings) = values.index_at(row) else {
                 panic!("IterateRowCollection: a collection value is a binding list")
             };
-            if bindings.is_empty() {
-                continue;
-            }
-            kept.push(row);
             offsets.push(keys.len());
             for b in bindings {
                 keys.push(b.input);
@@ -1159,18 +1152,10 @@ impl TileProducer for IterateRowCollectionProducer {
         // is the run of keys that row opened, not the group's own ordinal. Marking the
         // ordinal deletes whichever key happens to sit at that flat position, which
         // [`Tile::retain`] then drops in place of the row.
-        let deleted: BitSet = kept
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| deleted.contains(**row))
-            .flat_map(|(group, _)| {
-                let start = offsets[group];
-                let end = offsets.get(group + 1).copied().unwrap_or(keys.len());
-                start..end
-            })
-            .collect();
-        let group_count = kept.len();
-        let domain1 = domain.select_indices(kept.into_iter(), group_count);
+        // A released row is marked at its own level, which is what takes its group with
+        // it ([`Tile::compact`]); the rows themselves ride through as they arrived.
+        let deleted = Deleted::at_level(0, deleted);
+        let domain1 = domain;
         // **Every row delivered here is final**, which is what this operator knows and its
         // input does not. A `domain_predicate` names the region of `domain1` that will see
         // no new elements, *together with its whole list* — and a materialized map value
@@ -1184,7 +1169,7 @@ impl TileProducer for IterateRowCollectionProducer {
             vec![ColumnValue::UInts(offsets)],
             Box::new(Tile::Scalar(ColumnValue::from_values(outputs, &self.value))),
             domain_predicate,
-            Deleted::at_level(1, deleted),
+            deleted,
         );
         // **What this producer released, it drops here**, because it cannot drop it
         // upstream: a released key is one binding of a materialized map, and the map is a
@@ -1407,9 +1392,10 @@ impl TileProducer for ProductProducer {
                 Deleted::none(),
             )
         };
-        // Nothing to pair against yet, or nothing to pair: an empty inner side gives every
-        // row an empty group, which a curried tile cannot hold — its offsets are strictly
-        // ascending — so there is no group to emit.
+        // Nothing to pair against **yet** is the one case with no groups to emit: until
+        // the inner side is terminal its domain is unknown, so a group built now could
+        // still grow. An inner side that is terminal and empty is a different fact — every
+        // row pairs with nothing, which the layout below carries as equal starts.
         let Some(inner_domain) = self.inner_domain.clone() else {
             return empty(&ColumnValue::UInts(Vec::new()));
         };
@@ -1418,9 +1404,6 @@ impl TileProducer for ProductProducer {
             .expect("the outer tile has at least one level")
             .len();
         let width = inner_domain.len();
-        if width == 0 || rows == 0 {
-            return empty(&inner_domain);
-        }
         let total = rows * width;
         // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the row's value
         // repeats across its own group and the inner domain repeats across rows.
@@ -1432,20 +1415,8 @@ impl TileProducer for ProductProducer {
         // the outer side stays open.
         let domain_predicate =
             domain_predicate.union(&Predicate::from_column_value(&outer_domains[0]));
-        // The outer's levels are the output's, level for level, so a removal above its
-        // innermost rides through at the level it already names. Its innermost becomes the
-        // run of `width` pairs that element opened, which is the level `compact` reads.
-        let outer_innermost = outer_domains.len() - 1;
-        let mut out_deleted = Deleted::none();
-        for k in 0..outer_innermost {
-            *out_deleted.level_mut(k) = deleted.level(k).clone();
-        }
-        *out_deleted.level_mut(outer_innermost + 1) = deleted
-            .level(outer_innermost)
-            .iter()
-            .flat_map(|row| (row * width)..((row + 1) * width))
-            .collect();
-        let deleted = out_deleted;
+        // The outer's levels are the output's, level for level, and the appended level is
+        // new, so every removal rides through at the level it already names.
         let mut domains = outer_domains;
         domains.push(domain_column.clone());
         let mut offsets = outer_offsets;
@@ -1959,12 +1930,11 @@ mod tests {
         assert_eq!(deleted.level(1), &expected);
     }
 
-    /// A deleted input row is a deleted **group**, and a curried tile's `deleted` indexes
-    /// flat innermost entries ([`Tile::CurriedFunction`]), so the row's whole run of keys is
-    /// marked. Marking the group's ordinal instead deletes whichever key sits at that flat
-    /// position, which [`Tile::retain`] drops in place of the row.
+    /// A removed input row is a removed **group**, marked at the row's own level, which
+    /// `compact` then takes the group with. An empty collection keeps its group instead —
+    /// the two are different facts and the level is what separates them.
     #[test]
-    fn iterate_row_collection_deletes_a_row_as_its_whole_group() {
+    fn iterate_row_collection_removes_a_row_at_its_own_level() {
         use crate::interpreter::FuncBinding;
 
         let coll_extent = Extent::Function {
@@ -2027,20 +1997,18 @@ mod tests {
         assert_eq!(domains[1].len(), 4, "four flat entries");
         let mut expected = BitSet::new();
         expected.insert(0);
-        expected.insert(1);
-        assert_eq!(
-            deleted.level(1),
-            &expected,
-            "row 0 opened flat entries 0..2, so both are deleted"
+        assert_eq!(deleted.level(0), &expected, "row 0 is marked, as a row");
+        assert!(
+            deleted.level(1).is_empty(),
+            "its entries are not; `compact` takes them with it"
         );
     }
 
-    /// Pairing turns a deleted outer row into a deleted **group**, and a curried tile's
-    /// `deleted` indexes flat innermost entries ([`Tile::CurriedFunction`]). Carrying the
-    /// row index through marks one entry of whichever group covers that flat position, which
-    /// [`Tile::retain`] then drops in place of the row.
+    /// Pairing appends a level, so the outer's levels are the output's level for level and
+    /// a removed outer row stays marked where it already was. `compact` takes the group of
+    /// pairs it opened.
     #[test]
-    fn product_deletes_an_outer_row_as_its_whole_group() {
+    fn product_removes_an_outer_row_at_its_own_level() {
         let stream = |values: Vec<i64>, deleted: BitSet| Tile::SealedFunction {
             domain: ColumnValue::from_uints((0..values.len()).collect()),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(values))),
@@ -2089,11 +2057,14 @@ mod tests {
         assert_eq!(domains[1].len(), 4, "four flat pairs");
         let mut expected = BitSet::new();
         expected.insert(0);
-        expected.insert(1);
         assert_eq!(
-            deleted.level(1),
+            deleted.level(0),
             &expected,
-            "outer row 0 opened flat entries 0..2, so both are deleted"
+            "outer row 0 is marked, as a row"
+        );
+        assert!(
+            deleted.level(1).is_empty(),
+            "the pairs it opened are not; `compact` takes them with it"
         );
     }
 }

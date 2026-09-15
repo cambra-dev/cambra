@@ -575,10 +575,15 @@ names keys and not the group they sit in, so releasing one would release it in e
 row. `Tile::to_guard` therefore names keys only for the groups its predicate leaves open, and
 releases the whole ones by their own `domains[0]` value.
 
-A row whose collection is **empty** contributes no group, because a curried tile's offsets are
-strictly ascending and so every group holds at least one entry. Its consumer sees that row as
-absent rather than as an empty collection, which for an aggregate is the difference between no
-answer and the identity.
+A row whose collection is **empty** keeps its group, holding nothing: the offsets are
+non-decreasing, so two equal starts say so. Its consumer reads the row as the empty collection
+it is, and an aggregate over it folds to the aggregate's identity rather than dropping the row.
+
+A group that is empty and a group that is **gone** are therefore different tiles, and the
+difference is what `deleted` records. A filter empties a group and leaves its key
+(`Tile::retain`); a release removes the key, marked at that key's own level and realised by
+`Tile::compact`. Collapsing the two is what upward pruning used to do, and it is why a
+released group and a filtered-empty one could not be told apart.
 
 ---
 
