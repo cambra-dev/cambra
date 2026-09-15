@@ -2781,7 +2781,7 @@ Obligations ride variables through `freshen_above`, so a generalized function ca
 
 | Op kind | Operand constraint | Result type |
 |---|---|---|
-| `Arithmetic` | a trait obligation over two *unrelated* variables — `Addable`, `Subtractable`, `Multipliable`, `Divisible` | the trait's `Output` |
+| `Arithmetic` | a trait obligation over two *unrelated* variables — `Addable`, `Subtractable`, `Multipliable`, `Divisible`, `Exponentiable` | the trait's `Output` |
 | `Compare` | a trait obligation — `Equatable` (`==`, `!=`) or `Orderable` (`<`, `<=`, `>`, `>=`), which associate nothing | `Bool`, fixed by the operator |
 | `Concat` | both operands constrained to `String` | `String` |
 | `BoolLogic` | both operands constrained to `Bool` | `Bool` |
