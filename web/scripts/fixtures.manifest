@@ -22,7 +22,7 @@
 # instead — which is where `txn_multi_read`, `for_accumulator`,
 # `source_accumulator` and `inner_join` live. The first three hold a store, so
 # their bytes would re-bless on every change to how a store is built; a join's
-# payload is ~830KB, six times the largest fixture here.
+# payload is larger than any fixture here.
 #
 # A program added for backend coverage alone needs NO row here: ratchet 5 of
 # tests/inspector_goldens.rs already walks every gallery source through the

@@ -120,6 +120,17 @@ fn kind_for(id: &str) -> &'static str {
     PANE_KINDS[i]
 }
 
+/// The panic-message prefix naming the payload under test: `"<document>: "`,
+/// or empty when the caller validates a single payload and has nothing to
+/// disambiguate.
+fn prefix(document: &str) -> String {
+    if document.is_empty() {
+        String::new()
+    } else {
+        format!("{document}: ")
+    }
+}
+
 /// Assert `v` is a structurally-valid **successful** `/api/snapshot` payload.
 ///
 /// Pins the full pane contract: the retired top-level `ir`/`spanIndex`
@@ -131,35 +142,55 @@ fn kind_for(id: &str) -> &'static str {
 /// Panics naming the offending path otherwise. Does not assert
 /// program-specific content — that is each caller's job.
 pub fn assert_snapshot_shape(v: &Value) {
-    assert_common_shape(v);
+    assert_snapshot_shape_at(v, "");
+}
+
+/// [`assert_snapshot_shape`], with `document` naming the payload under test — a
+/// program path, a fixture name — prefixed onto every path a panic reports.
+///
+/// A sweep drives many payloads through one call site, so a path rooted at the
+/// payload names no document. `""` is the single-payload case.
+pub fn assert_snapshot_shape_at(v: &Value, document: &str) {
+    let doc = prefix(document);
+    assert_common_shape(v, &doc);
 
     // An earlier wire retired the legacy top-level `ir`/`spanIndex` (byte-for-byte
     // duplicates of the post-inference pane). They must be *absent*, not
     // merely null — the client reads the panes, never the top level.
-    assert!(v.get("ir").is_none(), "the wire has no top-level ir");
+    assert!(v.get("ir").is_none(), "{doc}the wire has no top-level ir");
     assert!(
         v.get("spanIndex").is_none(),
-        "the wire has no top-level spanIndex"
+        "{doc}the wire has no top-level spanIndex"
     );
 
     // The panes, in pipeline order, with their kinds.
-    let panes = v["panes"].as_array().expect("panes is an array");
+    let panes = v["panes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc}panes is an array"));
     let ids: Vec<&str> = panes
         .iter()
-        .map(|s| s["id"].as_str().expect("pane id is a string"))
+        .map(|s| {
+            s["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{doc}a pane id is a string"))
+        })
         .collect();
     assert_eq!(
         ids, PANE_IDS,
-        "panes are the pipeline panes in upstream → downstream order"
+        "{doc}panes are the pipeline panes in upstream → downstream order"
     );
     // Each pane carries the kind its id mandates.
     for (i, pane) in panes.iter().enumerate() {
         let id = pane["id"].as_str().expect("pane id is a string");
         let kind = pane["kind"].as_str().expect("pane kind is a string");
-        assert_eq!(kind, kind_for(id), "panes[{i}] ({id}) has the wrong kind");
+        assert_eq!(
+            kind,
+            kind_for(id),
+            "{doc}panes[{i}] ({id}) has the wrong kind"
+        );
     }
     for (i, pane) in panes.iter().enumerate() {
-        let at = format!("panes[{i}]");
+        let at = format!("{doc}panes[{i}]");
         assert!(pane["label"].is_string(), "{at}.label is a string");
         assert_node_table(pane, &at);
         // Every node of a compiled pane is attributed, so the pane resolves
@@ -176,7 +207,7 @@ pub fn assert_snapshot_shape(v: &Value) {
 
     let links = v["paneLinks"]
         .as_array()
-        .expect("paneLinks is present and an array");
+        .unwrap_or_else(|| panic!("{doc}paneLinks is present and an array"));
 
     // The live node-id set per pane, keyed by pane id, for endpoint-liveness
     // checks on the pane links below.
@@ -202,10 +233,10 @@ pub fn assert_snapshot_shape(v: &Value) {
     assert_eq!(
         windows,
         PANE_WINDOWS.to_vec(),
-        "paneLinks are the adjacent pane windows in pipeline order"
+        "{doc}paneLinks are the adjacent pane windows in pipeline order"
     );
     for (i, link) in links.iter().enumerate() {
-        let at = format!("paneLinks[{i}]");
+        let at = format!("{doc}paneLinks[{i}]");
         let (from, to) = windows[i];
         let up_ids = &ids_by_pane[from];
         let down_ids = &ids_by_pane[to];
@@ -242,38 +273,63 @@ pub fn assert_snapshot_shape(v: &Value) {
 /// `payloadKind: "failed"`. `paneLinks` is empty but present: no payload
 /// ever omits the field.
 pub fn assert_degraded_snapshot_shape(v: &Value) {
-    assert_common_shape(v);
-    assert!(v.get("ir").is_none(), "the wire has no top-level ir");
+    assert_degraded_snapshot_shape_at(v, "");
+}
+
+/// [`assert_degraded_snapshot_shape`], with `document` naming the payload under
+/// test — see [`assert_snapshot_shape_at`].
+pub fn assert_degraded_snapshot_shape_at(v: &Value, document: &str) {
+    let doc = prefix(document);
+    assert_common_shape(v, &doc);
+    assert!(v.get("ir").is_none(), "{doc}the wire has no top-level ir");
     assert!(
         v.get("spanIndex").is_none(),
-        "the wire has no top-level spanIndex"
+        "{doc}the wire has no top-level spanIndex"
     );
     assert!(
-        v["panes"].as_array().expect("array").is_empty(),
-        "degraded panes is empty"
+        v["panes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{doc}panes is an array"))
+            .is_empty(),
+        "{doc}degraded panes is empty"
     );
     assert!(
-        v["paneLinks"].as_array().expect("array").is_empty(),
-        "degraded paneLinks is empty"
+        v["paneLinks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{doc}paneLinks is an array"))
+            .is_empty(),
+        "{doc}degraded paneLinks is empty"
     );
-    assert_eq!(v["meta"]["payloadKind"], "failed");
+    assert_eq!(
+        v["meta"]["payloadKind"], "failed",
+        "{doc}a degraded payload is tagged failed"
+    );
 }
 
 /// The keys common to both the success and degraded payloads.
-fn assert_common_shape(v: &Value) {
-    assert!(v["source"]["name"].is_string(), "source.name is a string");
-    assert!(v["source"]["text"].is_string(), "source.text is a string");
-    assert!(v["definitions"].is_array(), "definitions is an array");
-    assert!(v["diagnostics"].is_array(), "diagnostics is an array");
-    assert!(v.get("scopes").is_none(), "the payload ships no scopes");
+fn assert_common_shape(v: &Value, doc: &str) {
+    assert!(
+        v["source"]["name"].is_string(),
+        "{doc}source.name is a string"
+    );
+    assert!(
+        v["source"]["text"].is_string(),
+        "{doc}source.text is a string"
+    );
+    assert!(v["definitions"].is_array(), "{doc}definitions is an array");
+    assert!(v["diagnostics"].is_array(), "{doc}diagnostics is an array");
+    assert!(
+        v.get("scopes").is_none(),
+        "{doc}the payload ships no scopes"
+    );
     let meta = &v["meta"];
-    assert!(meta.get("tick").is_none(), "meta ships no tick");
+    assert!(meta.get("tick").is_none(), "{doc}meta ships no tick");
     let kind = meta["payloadKind"]
         .as_str()
-        .expect("meta.payloadKind is a string");
+        .unwrap_or_else(|| panic!("{doc}meta.payloadKind is a string"));
     assert!(
         ALLOWED_PAYLOAD_KIND.contains(&kind),
-        "meta.payloadKind {kind:?} is outside the pinned vocabulary \
+        "{doc}meta.payloadKind {kind:?} is outside the pinned vocabulary \
          {ALLOWED_PAYLOAD_KIND:?}"
     );
     // A payload kind names what the document is; a pane id names a position
@@ -281,12 +337,12 @@ fn assert_common_shape(v: &Value) {
     // header badge.
     assert!(
         !PANE_IDS.contains(&kind),
-        "meta.payloadKind {kind:?} is also a pane id"
+        "{doc}meta.payloadKind {kind:?} is also a pane id"
     );
     assert_eq!(
         meta["schema"],
         crate::inspector_model::SCHEMA_VERSION,
-        "meta.schema is the supported version"
+        "{doc}meta.schema is the supported version"
     );
 }
 
