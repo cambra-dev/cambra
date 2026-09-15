@@ -229,6 +229,24 @@ pub enum Tile {
     },
 }
 
+/// One domain level of a curried tile, as [`Tile::append_level`] takes it.
+///
+/// The three fields index each other: `starts` is one entry per element of the level above,
+/// `keys` is the flattened groups those starts cut, and `codomain` carries one entry per
+/// key.
+pub struct DomainLevel {
+    /// The start in `keys` of each parent's group, in parent order. **Non-decreasing**: two
+    /// equal starts are a parent whose group holds nothing
+    /// ([`Tile::CurriedFunction::offsets`]).
+    pub starts: Vec<usize>,
+    /// Every group's keys, flattened in parent order. Unique within a group; a key may
+    /// repeat across its siblings' groups.
+    pub keys: ColumnValue,
+    /// The codomain, vectorized one entry per key — the convention every function tile's
+    /// codomain follows.
+    pub codomain: Tile,
+}
+
 impl Tile {
     /// Helper to create a tuple tile, i.e. a Record tile where all fields are from `tuple_field`
     pub fn tuple(tiles: Vec<Tile>) -> Tile {
@@ -841,6 +859,66 @@ impl Tile {
         result
     }
 
+    /// This function tile with a [`DomainLevel`] appended below its innermost level.
+    ///
+    /// `level` builds that level out of the codomain the tile arrives with, which is the
+    /// data the new level is made of: a pairing repeats each row's value across the group
+    /// it opens, and a column of collection values holds each row's own keys. The codomain
+    /// is replaced rather than kept, because the arriving one carries an entry per element
+    /// of what is now the level above and the new one carries an entry per key.
+    ///
+    /// A [`Tile::SealedFunction`] is the one-level case — one domain, no offsets, and its
+    /// removals at level 0 — so appending to one gives two levels and appending to that
+    /// gives three. An operator that appends a level is therefore closed under its own
+    /// output, which is what lets correlated comprehensions nest to any depth.
+    ///
+    /// **Every group the level names is whole.** A parent's keys occupy one contiguous run
+    /// of the level below, so no later tile can add to a group: [`Tile::merge`]
+    /// concatenates levels, which appends whole subtrees under new outermost keys and never
+    /// reaches inside an existing one. A caller holding part of a group has nothing to
+    /// append yet. The `domain_predicate` follows from that: every outermost key present is
+    /// final together with every level beneath it, unioned with the region the arriving
+    /// tile already called final, which is its own claim about whether further keys come.
+    ///
+    /// Removals ride through level for level. A [`Deleted`] indexes by level, the levels
+    /// that arrive keep the elements they name, and the appended level has removed nothing,
+    /// so nothing renumbers.
+    pub fn append_level(self, level: impl FnOnce(Tile) -> DomainLevel) -> Tile {
+        let (mut domains, mut offsets, codomain, domain_predicate, deleted) = match self {
+            Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                deleted,
+            } => (
+                vec![domain],
+                Vec::new(),
+                *codomain,
+                domain_predicate,
+                Deleted::at_level(0, deleted),
+            ),
+            Tile::CurriedFunction {
+                domains,
+                offsets,
+                codomain,
+                domain_predicate,
+                deleted,
+            } => (domains, offsets, *codomain, domain_predicate, deleted),
+            other => panic!("append_level expects a function tile, got {other:?}"),
+        };
+        let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domains[0]));
+        let level = level(codomain);
+        domains.push(level.keys);
+        offsets.push(ColumnValue::UInts(level.starts));
+        Tile::curried_function(
+            domains,
+            offsets,
+            Box::new(level.codomain),
+            domain_predicate,
+            deleted,
+        )
+    }
+
     /// For each element of `level`, the values of its ancestors from the outermost level
     /// down to and including itself.
     ///
@@ -1284,6 +1362,126 @@ mod tests {
             marked,
             Deleted::at_level(1, one),
             "the level is part of the index"
+        );
+    }
+
+    // ── Tile::append_level ────────────────────────────────────────────────────
+
+    /// Two keys per parent, so a level is built without the test restating the layout.
+    fn two_keys_per_parent(codomain: Tile) -> DomainLevel {
+        let Tile::Scalar(values) = codomain else {
+            unreachable!("the test tiles carry scalar codomains")
+        };
+        let rows = values.len();
+        DomainLevel {
+            starts: (0..rows).map(|r| r * 2).collect(),
+            keys: ColumnValue::UInts((0..rows * 2).map(|i| i % 2).collect()),
+            codomain: Tile::Scalar(values.select_indices((0..rows * 2).map(|i| i / 2), rows * 2)),
+        }
+    }
+
+    #[test]
+    fn append_level_reads_a_sealed_function_as_one_level() {
+        let appended =
+            sf_int(vec![7, 8], vec![70, 80], Predicate::False).append_level(two_keys_per_parent);
+        let Tile::CurriedFunction {
+            domains, offsets, ..
+        } = &appended
+        else {
+            panic!("appending a level leaves a curried tile, got {appended:?}")
+        };
+        assert_eq!(domains.len(), 2, "the sealed domain is the level above");
+        assert_eq!(domains[0], ColumnValue::Ints(vec![7, 8]));
+        assert_eq!(offsets[0], ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(domains[1], ColumnValue::UInts(vec![0, 1, 0, 1]));
+    }
+
+    #[test]
+    fn append_level_is_closed_under_its_own_output() {
+        let twice = sf_int(vec![7, 8], vec![70, 80], Predicate::False)
+            .append_level(two_keys_per_parent)
+            .append_level(two_keys_per_parent);
+        let Tile::CurriedFunction {
+            domains, offsets, ..
+        } = &twice
+        else {
+            panic!("appending a level leaves a curried tile, got {twice:?}")
+        };
+        assert_eq!(domains.len(), 3, "each append adds one level");
+        assert_eq!(
+            offsets[0],
+            ColumnValue::UInts(vec![0, 2]),
+            "level 0 is untouched"
+        );
+        assert_eq!(offsets[1], ColumnValue::UInts(vec![0, 2, 4, 6]));
+        assert_eq!(domains[2].len(), 8);
+    }
+
+    #[test]
+    fn append_level_keeps_removals_at_the_level_that_named_them() {
+        let mut row_gone = BitSet::new();
+        row_gone.insert(1);
+        let sealed = Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![7, 8]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![70, 80]))),
+            domain_predicate: Predicate::False,
+            deleted: row_gone.clone(),
+        };
+        let appended = sealed
+            .append_level(two_keys_per_parent)
+            .append_level(two_keys_per_parent);
+        let Tile::CurriedFunction { deleted, .. } = &appended else {
+            panic!("appending a level leaves a curried tile, got {appended:?}")
+        };
+        // The bit names a row, and appending beneath a row does not move it: reading it as
+        // a flat innermost position would delete whichever key landed there instead.
+        assert_eq!(deleted.level(0), &row_gone);
+        assert!(
+            deleted.level(1).is_empty() && deleted.level(2).is_empty(),
+            "an appended level has removed nothing"
+        );
+    }
+
+    #[test]
+    fn append_level_calls_every_key_present_final() {
+        let appended =
+            sf_int(vec![7, 8], vec![70, 80], Predicate::False).append_level(two_keys_per_parent);
+        let Tile::CurriedFunction {
+            domain_predicate, ..
+        } = &appended
+        else {
+            panic!("appending a level leaves a curried tile, got {appended:?}")
+        };
+        // The level is whole for every parent it names, so each key present is done —
+        // whether further keys arrive stays the region the input claimed.
+        assert!(
+            domain_predicate.contains(&Value::Int(7)) && domain_predicate.contains(&Value::Int(8))
+        );
+        assert!(!domain_predicate.contains(&Value::Int(9)));
+    }
+
+    #[test]
+    fn append_level_gives_a_parent_with_no_keys_two_equal_starts() {
+        let empty_middle = |codomain: Tile| {
+            let Tile::Scalar(values) = codomain else {
+                unreachable!("the test tile carries a scalar codomain")
+            };
+            DomainLevel {
+                starts: vec![0, 1, 1],
+                keys: ColumnValue::UInts(vec![0, 0]),
+                codomain: Tile::Scalar(values.select_indices([0, 2].into_iter(), 2)),
+            }
+        };
+        let appended =
+            sf_int(vec![7, 8, 9], vec![70, 80, 90], Predicate::False).append_level(empty_middle);
+        let Tile::CurriedFunction { offsets, .. } = &appended else {
+            panic!("appending a level leaves a curried tile, got {appended:?}")
+        };
+        assert_eq!(offsets[0], ColumnValue::UInts(vec![0, 1, 1]));
+        assert_eq!(
+            appended.len(),
+            2,
+            "the middle key holds nothing, and is present"
         );
     }
 

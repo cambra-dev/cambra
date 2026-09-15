@@ -1,4 +1,4 @@
-use crate::interpreter::Deleted;
+use crate::interpreter::{Deleted, DomainLevel};
 use bit_set::BitSet;
 use log::trace;
 use std::{collections::HashMap, iter};
@@ -1041,26 +1041,20 @@ impl IterateRowCollection {
 
     /// Create an `IterateRowCollection` over a column of collection values.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
-        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
-            panic!(
-                "IterateRowCollection expected SealedFunction, got {:?}",
-                input.tiling()
-            )
+        let input_tiling = input.tiling();
+        let Tiling::SealedFunction { codomain, .. } = &input_tiling else {
+            panic!("IterateRowCollection expected SealedFunction, got {input_tiling:?}")
         };
         let Tiling::Scalar(Extent::Function {
             domain: key,
             codomain: value,
         }) = codomain.as_ref()
         else {
-            panic!(
-                "IterateRowCollection expected a column of collection values, got {:?}",
-                codomain
-            )
+            panic!("IterateRowCollection expected a column of collection values, got {codomain:?}")
         };
-        let tiling = Tiling::CurriedFunction {
-            domains: vec![domain.clone(), (**key).clone()],
-            codomain: Box::new(Tiling::Scalar((**value).clone())),
-        };
+        // The row's keys are the appended level, so the operator tiles one level deeper
+        // than its input — the same level its producer builds.
+        let tiling = input_tiling.append_level((**key).clone(), Tiling::Scalar((**value).clone()));
         Self {
             base: OperatorBase::new(tiling),
             input,
@@ -1120,57 +1114,35 @@ impl TileProducer for IterateRowCollectionProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::SealedFunction {
-            domain,
-            codomain,
-            domain_predicate,
-            deleted,
-        } = input_tile
-        else {
-            panic!("IterateRowCollection expected a SealedFunction tile, got {input_tile:?}")
-        };
-        let Tile::Scalar(values) = *codomain else {
-            panic!("IterateRowCollection expected a scalar codomain column")
-        };
-        // One group per row, in row order, holding that row's bindings — none of them
-        // where the row's collection is empty, which two equal starts carry.
-        let mut offsets: Vec<usize> = Vec::with_capacity(values.len());
-        let mut keys: Vec<Value> = Vec::new();
-        let mut outputs: Vec<Value> = Vec::new();
-        for row in 0..values.len() {
-            let Value::Function(bindings) = values.index_at(row) else {
-                panic!("IterateRowCollection: a collection value is a binding list")
+        // A materialized map value carries its own keys, so a row arrives holding its whole
+        // collection ([`CheckedLookup`]) — which is the group [`Tile::append_level`] needs
+        // whole, and what lets an aggregate over one row settle while further rows are
+        // still to come.
+        let mut tile = input_tile.append_level(|codomain| {
+            let Tile::Scalar(values) = codomain else {
+                panic!("IterateRowCollection expected a scalar codomain column")
             };
-            offsets.push(keys.len());
-            for b in bindings {
-                keys.push(b.input);
-                outputs.push(b.output);
+            // One group per row, in row order, holding that row's bindings — none of them
+            // where the row's collection is empty, which two equal starts carry.
+            let mut starts: Vec<usize> = Vec::with_capacity(values.len());
+            let mut keys: Vec<Value> = Vec::new();
+            let mut outputs: Vec<Value> = Vec::new();
+            for row in 0..values.len() {
+                let Value::Function(bindings) = values.index_at(row) else {
+                    panic!("IterateRowCollection: a collection value is a binding list")
+                };
+                starts.push(keys.len());
+                for b in bindings {
+                    keys.push(b.input);
+                    outputs.push(b.output);
+                }
             }
-        }
-        // A curried tile's `deleted` indexes its **flat innermost** entries
-        // ([`Tile::CurriedFunction`]), so a deleted row is a deleted *group*: what is marked
-        // is the run of keys that row opened, not the group's own ordinal. Marking the
-        // ordinal deletes whichever key happens to sit at that flat position, which
-        // [`Tile::retain`] then drops in place of the row.
-        // A released row is marked at its own level, which is what takes its group with
-        // it ([`Tile::compact`]); the rows themselves ride through as they arrived.
-        let deleted = Deleted::at_level(0, deleted);
-        let domain1 = domain;
-        // **Every row delivered here is final**, which is what this operator knows and its
-        // input does not. A `domain_predicate` names the region of `domain1` that will see
-        // no new elements, *together with its whole list* — and a materialized map value
-        // carries its own keys, so it is complete wherever it is present ([`CheckedLookup`]). The
-        // input's own region is unioned in rather than replaced: whether further rows
-        // arrive is its claim, not this one's, and without the union an aggregate over a
-        // live store would never reach a terminal answer for the rows it already has.
-        let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain1));
-        let mut tile = Tile::curried_function(
-            vec![domain1, ColumnValue::from_values(keys, &self.key)],
-            vec![ColumnValue::UInts(offsets)],
-            Box::new(Tile::Scalar(ColumnValue::from_values(outputs, &self.value))),
-            domain_predicate,
-            deleted,
-        );
+            DomainLevel {
+                starts,
+                keys: ColumnValue::from_values(keys, &self.key),
+                codomain: Tile::Scalar(ColumnValue::from_values(outputs, &self.value)),
+            }
+        });
         // **What this producer released, it drops here**, because it cannot drop it
         // upstream: a released key is one binding of a materialized map, and the map is a
         // single cell the input keeps whole. Rebuilding from that cell would hand the
@@ -1238,13 +1210,13 @@ impl Product {
     /// Pair every row of `outer` with every element of the domain `inner` carries.
     pub fn new(outer: Box<dyn TileOperator>, inner: Box<dyn TileOperator>) -> Self {
         // The outer stream is either a plain stream of rows or a function already grouped
-        // by earlier pairings. Pairing appends a level either way, which is what makes this
-        // operator closed under its own output and correlated nesting unbounded in depth.
-        let (outer_domains, outer_codomain) = match outer.tiling() {
-            Tiling::SealedFunction { domain, codomain } => {
-                (vec![domain.clone()], codomain.extent())
+        // by earlier pairings. Pairing appends a level either way, which is what makes
+        // correlated nesting unbounded in depth ([`Tiling::append_level`]).
+        let outer_tiling = outer.tiling();
+        let outer_codomain = match &outer_tiling {
+            Tiling::SealedFunction { codomain, .. } | Tiling::CurriedFunction { codomain, .. } => {
+                codomain.extent()
             }
-            Tiling::CurriedFunction { domains, codomain } => (domains.clone(), codomain.extent()),
             other => panic!("Product expected a function as its outer stream, got {other:?}"),
         };
         let Tiling::SealedFunction {
@@ -1260,15 +1232,13 @@ impl Product {
         let inner_domain = inner_domain.extent();
         // The row's value as one extent, however many columns carry it: a product row
         // spreads over a column per field, and the pair this builds holds it whole.
-        let mut domains = outer_domains;
-        domains.push(inner_domain.clone());
-        let tiling = Tiling::CurriedFunction {
-            domains,
-            codomain: Box::new(Tiling::Scalar(Extent::Record(HashMap::from([
+        let tiling = outer_tiling.append_level(
+            inner_domain.clone(),
+            Tiling::Scalar(Extent::Record(HashMap::from([
                 (tuple_field(0), outer_codomain),
                 (tuple_field(1), inner_domain),
-            ])))),
-        };
+            ]))),
+        );
         Self {
             base: OperatorBase::new(tiling),
             outer,
@@ -1309,6 +1279,48 @@ impl TileOperator for Product {
     }
 }
 
+/// `outer`'s rows paired against an inner side that has not delivered its domain yet: no
+/// groups at all.
+///
+/// A group is the whole inner domain, so one built before the inner side is terminal could
+/// still gain elements — and a group that can grow is what the layout cannot hold
+/// ([`Tile::append_level`]). Emitting no rows claims nothing about them, which is why the
+/// region is `False` rather than whatever `outer` has decided.
+///
+/// An inner side that is terminal and empty is a different fact: every row is present and
+/// pairs with nothing.
+fn unpaired_rows(outer: &Tile) -> Tile {
+    let (levels, codomain) = match outer {
+        Tile::SealedFunction {
+            domain, codomain, ..
+        } => (std::slice::from_ref(domain), codomain),
+        Tile::CurriedFunction {
+            domains, codomain, ..
+        } => (domains.as_slice(), codomain),
+        other => panic!("Product expected a function as its outer tile, got {other:?}"),
+    };
+    let Tile::Scalar(values) = codomain.as_ref() else {
+        panic!("Product expected a scalar outer codomain, got {codomain:?}")
+    };
+    let mut domains: Vec<ColumnValue> = levels
+        .iter()
+        .map(|d| d.select_indices(iter::empty(), 0))
+        .collect();
+    let keys = ColumnValue::UInts(Vec::new());
+    domains.push(keys.clone());
+    let offsets = vec![ColumnValue::UInts(Vec::new()); domains.len() - 1];
+    Tile::curried_function(
+        domains,
+        offsets,
+        Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
+            (tuple_field(0), values.select_indices(iter::empty(), 0)),
+            (tuple_field(1), keys),
+        ])))),
+        Predicate::False,
+        Deleted::none(),
+    )
+}
+
 /// Producer for [`Product`].
 struct ProductProducer {
     base: ProducerBase,
@@ -1345,92 +1357,32 @@ impl TileProducer for ProductProducer {
             }
         }
         let outer_tile = self.outer.get(self.outer.tiling().universal_guard());
-        // A stream of rows is one level; a function already paired is as many as it has.
-        // Either way the pairing appends one below whatever arrived.
-        let (outer_domains, outer_offsets, outer_codomain, domain_predicate, deleted) =
-            match outer_tile {
-                Tile::SealedFunction {
-                    domain,
-                    codomain,
-                    domain_predicate,
-                    deleted,
-                } => (
-                    vec![domain],
-                    Vec::new(),
-                    *codomain,
-                    domain_predicate,
-                    Deleted::at_level(0, deleted),
-                ),
-                Tile::CurriedFunction {
-                    domains,
-                    offsets,
-                    codomain,
-                    domain_predicate,
-                    deleted,
-                } => (domains, offsets, *codomain, domain_predicate, deleted),
-                other => panic!("Product expected a function as its outer tile, got {other:?}"),
-            };
-        let outer = scalar_tile_to_column_value(outer_codomain);
-        let empty = |inner_domain: &ColumnValue| {
-            let mut domains: Vec<ColumnValue> = outer_domains
-                .iter()
-                .map(|d| d.select_indices(iter::empty(), 0))
-                .collect();
-            domains.push(inner_domain.select_indices(iter::empty(), 0));
-            let offsets = vec![ColumnValue::UInts(Vec::new()); domains.len() - 1];
-            Tile::curried_function(
-                domains,
-                offsets,
-                Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
-                    (tuple_field(0), outer.select_indices(iter::empty(), 0)),
-                    (
-                        tuple_field(1),
-                        inner_domain.select_indices(iter::empty(), 0),
-                    ),
-                ])))),
-                Predicate::False,
-                Deleted::none(),
-            )
-        };
-        // Nothing to pair against **yet** is the one case with no groups to emit: until
-        // the inner side is terminal its domain is unknown, so a group built now could
-        // still grow. An inner side that is terminal and empty is a different fact — every
-        // row pairs with nothing, which the layout below carries as equal starts.
         let Some(inner_domain) = self.inner_domain.clone() else {
-            return empty(&ColumnValue::UInts(Vec::new()));
+            return unpaired_rows(&outer_tile);
         };
-        let rows = outer_domains
-            .last()
-            .expect("the outer tile has at least one level")
-            .len();
         let width = inner_domain.len();
-        let total = rows * width;
-        // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the row's value
-        // repeats across its own group and the inner domain repeats across rows.
-        let outer_column = outer.select_indices((0..total).map(|i| i / width), total);
-        let domain_column = inner_domain.select_indices((0..total).map(|i| i % width), total);
-        // **Every row's group is the whole domain**, so a row is complete as soon as it
-        // arrives — the same statement [`IterateRowCollection`] makes about a map value
-        // carrying its own keys, and what lets an aggregate over one settle per row while
-        // the outer side stays open.
-        let domain_predicate =
-            domain_predicate.union(&Predicate::from_column_value(&outer_domains[0]));
-        // The outer's levels are the output's, level for level, and the appended level is
-        // new, so every removal rides through at the level it already names.
-        let mut domains = outer_domains;
-        domains.push(domain_column.clone());
-        let mut offsets = outer_offsets;
-        offsets.push(ColumnValue::UInts((0..rows).map(|r| r * width).collect()));
-        let mut tile = Tile::curried_function(
-            domains,
-            offsets,
-            Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
-                (tuple_field(0), outer_column),
-                (tuple_field(1), domain_column),
-            ])))),
-            domain_predicate,
-            deleted,
-        );
+        // Every group is the whole inner domain, so a row is complete as soon as it
+        // arrives — the group [`Tile::append_level`] needs whole. An inner domain that is
+        // terminal and empty pairs every row with nothing, which equal starts carry.
+        let mut tile = outer_tile.append_level(|codomain| {
+            let outer = scalar_tile_to_column_value(codomain);
+            let rows = outer.len();
+            let total = rows * width;
+            // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the row's
+            // value repeats across its own group and the inner domain repeats across rows.
+            let keys = inner_domain.select_indices((0..total).map(|i| i % width), total);
+            DomainLevel {
+                starts: (0..rows).map(|r| r * width).collect(),
+                keys: keys.clone(),
+                codomain: Tile::Scalar(ColumnValue::Records(HashMap::from([
+                    (
+                        tuple_field(0),
+                        outer.select_indices((0..total).map(|i| i / width), total),
+                    ),
+                    (tuple_field(1), keys),
+                ]))),
+            }
+        });
         tile.remove_guarded(self.obsolete_guard().clone());
         tile
     }

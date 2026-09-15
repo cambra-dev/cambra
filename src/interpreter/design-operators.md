@@ -66,6 +66,18 @@ equivalent tiles with some data released may.
 
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
+`Tile::append_level` builds a `CurriedFunction` one level deeper than the function tile it is
+given, out of that tile's codomain: `Product` repeats each row's value across the group it
+opens, and `IterateRowCollection` opens the row's own keys. A `SealedFunction` is the one-level
+case, so an operator that appends a level is closed under its own output. `Tiling::append_level`
+is the same step on the static shape.
+
+The appended level is whole for every parent it names. A parent's keys occupy one contiguous run
+of the level below and `merge` concatenates levels rather than reaching inside a group, so no
+later tile adds to a group. The tile therefore calls every key present final together with the
+level just built, and removals ride through level for level — the appended level has removed
+nothing.
+
 Tiles representing collections (`SealedFunction` and `CurriedFunction`) support logical deletes by storing a `BitSet` of deleted values.  These are set by filteriing operator like `Restrict` and compacted away by
 stateful operators like `Memo` and aggregation. A `CurriedFunction` carries **one set per domain
 level**, so a bit names a position in that level's own column and a removed group and a removed
@@ -555,8 +567,9 @@ key, so an as-of read is one map value per commit. A keyed read takes that shape
 cannot, because one stream cannot carry several rows' collections when their keys collide.
 
 `Tiling::CurriedFunction` holds them apart: a collection per row, `domains[0]` naming the rows.
-[`IterateRowCollection`] is the adapter, opening each row's bindings into that row's group, and
-op-conversion inserts one where an aggregate's input arrives as a column of collection values.
+[`IterateRowCollection`] is the adapter, opening each row's bindings into that row's group — the
+same level append the pairing makes, from a different source of keys — and op-conversion inserts
+one where an aggregate's input arrives as a column of collection values.
 No composition serves this case, because the key set to iterate differs per row and only the
 row's own value names it.
 
