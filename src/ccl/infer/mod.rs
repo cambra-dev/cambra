@@ -322,13 +322,10 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // twice, once in source and once in CCL.
         ConstrainError::DataDomainMismatch { lhs, rhs, cause } => {
             let (found, expected) = (coalesce_for_error(&lhs), coalesce_for_error(&rhs));
-            // **An inequality between two types that render alike says nothing.** It shows
-            // one type twice and asserts they differ, and the reader is left to distrust
-            // the rendering rather than read it. What separates them is a binder identity
-            // a domain holds and does not print, and the comparison that exposed the
-            // inequality names that pair — so where the two render alike, that comparison
-            // is the report. Its own two sides then differ structurally, which is what
-            // lets [`identical_rendering_hint`] quote the divergence.
+            // Where the two render alike, the report is the sub-comparison that found
+            // them unequal ([`ConstrainError::DataDomainMismatch`]'s `cause`, whose doc
+            // says why it is carried): its own sides differ structurally, so
+            // [`identical_rendering_hint`] can quote the divergence.
             if found.to_string() == expected.to_string() {
                 return map_constrain_err(*cause, ctx_label);
             }
