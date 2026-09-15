@@ -1354,11 +1354,11 @@ the bound is recorded, and it is a lookup, since uniquify gives every binding si
 violation names the variable and the reference and fails.
 
 Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
-and the pass-boundary re-derivations that check what a pass produced. A
-re-derivation walks a tree where a pass has erased term binders, and the refinements it meets still
-name them. The dependent function's type binds them there, and the chain walk enters its Pi binder
-(see [Where the conversions run](#where-the-conversions-run)). The tree holds every binder its
-refinements reference; a reference to one it does not hold is a bound that left its binder's scope.
+and the pass-boundary re-derivations that check what a pass produced. A re-derivation walks a tree
+where a pass has erased term binders, and the refinements it meets still name them. The dependent
+function's type binds them there, and the chain walk enters its Pi binder (see [Where the
+conversions run](#where-the-conversions-run)). The tree holds every binder its refinements
+reference; a reference to one it does not hold is a bound that left its binder's scope.
 
 `ConstrainCache::for_derivation` names the two cases, and the `Fun`/`Fun` codomain edge reads the
 same value (see [Where the conversions run](#where-the-conversions-run)).
@@ -1506,7 +1506,7 @@ discharge at a variable (`[k ↦ x]`, read as an application), so a bound record
 variable references the binder by name and closes against that variable's telescope.
 Which derivation is running decides whether that edge opens at all. The live solve opens only toward
 a side carrying inference variables, since a dangling index can only land on a bound and only a live
-side records one. Either re-derivation opens unconditionally, because it reconciles two passes'
+side records one. A re-derivation opens unconditionally, because it reconciles two passes'
 spellings of one type.
 
 `normalize_annotation` extends the emission telescope with each Pi binder it descends past, so the

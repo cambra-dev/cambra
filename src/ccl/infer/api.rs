@@ -1639,18 +1639,19 @@ pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// `Feed`/`ChanDom` (and `Overwrite`-history `Infer`-domain) types the pre-channelize check
 /// tolerates.
 ///
-/// The type check matters because a defer-read alias (`Var(x) : feed(_)`)
-/// carries a `Feed` type with no defer node; keying only on defer nodes would
-/// check such a tree strictly and reject the legitimate channel type. `Mut` is
-/// analogous: a mutable reference carries a `Mut` type whose `Infer` domain the
-/// pre-channelize relaxation must tolerate until the unified phase resolves it.
+/// The **binder-slot** clause is the one that decides alone. A dead mutable variable
+/// `let cnt: Mut(Int, _) = 0 in (cnt := 1)` carries `Mut` only on the `Let` binding — the
+/// `MutWrite` target is a bare `Name`, the value is `Int`, the `Let` node's type is
+/// `Unit` — and the tree holds no `Defer`/`Feed`/`Define` node at all. The strict
+/// checker inspects binder types (`check_binder`), so the selector must too, or it
+/// under-detects and drives such a tree to the strict arm.
 ///
-/// The transient type can live on a **binder slot** rather than a node type — a
-/// dead mutable variable `let cnt: Mut(Int, _) = 0 in (cnt := 1)` carries `Mut` only on the
-/// `Let` binding (the `MutWrite` target is a bare `Name`, the value is `Int`,
-/// the `Let` node's type is `Unit`). The strict checker inspects binder types
-/// (`check_binder`), so the selector must too, or it under-detects and drives
-/// such a tree to the strict arm.
+/// The node-type clause never decides alone over a whole tree. A defer-read alias
+/// (`Var(x) : feed(_)`) carries a `Feed` type with no defer node of its own, but the
+/// `Feed`/`Define` node that introduced the channel it reads is in the same tree, where
+/// the node-kind clause answers first. The clause stays because it states what the
+/// relaxation is keyed on — the transient type the check tolerates, rather than the node
+/// that minted it — and the walk reaches the slot either way.
 fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
     fn ty_has_transient(ty: &Type) -> bool {
         if matches!(ty, Type::History { .. }) {

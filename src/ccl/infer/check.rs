@@ -102,6 +102,18 @@ impl CheckCtx {
             telescope: Telescope::empty(),
         }
     }
+
+    /// The constraint cache every Check edge draws against, with both sides' Γ seeded
+    /// from the walk's witness context.
+    ///
+    /// Check re-derives at a pass boundary, reconciling types two passes spelled in
+    /// different forms, so the derivation is always [`Derivation::PostPass`] — the one
+    /// respect in which Check's constraint solving differs from the live solve's.
+    fn cache(&self) -> ConstrainCache {
+        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+        cache.seed_context(&self.witness_ctx);
+        cache
+    }
 }
 
 impl TelescopeWalk for CheckCtx {
@@ -254,13 +266,7 @@ impl Typing for CheckCtx {
         // truth for width/variance and (since refinements ride the lattice as
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
-        //
-        // Check re-derives at a pass boundary, reconciling types two passes
-        // spelled in different forms, so its cache takes `Derivation::PostPass`.
-        // That is the one respect in which Check's constraint solving differs
-        // from the live solve's (see [`Derivation`]).
-        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
-        cache.seed_context(&self.witness_ctx);
+        let mut cache = self.cache();
         if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
@@ -385,8 +391,7 @@ impl Typing for CheckCtx {
         sup_binders: &[crate::ccl::ty::Witness],
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
-        cache.seed_context(&self.witness_ctx);
+        let mut cache = self.cache();
         if let Err(e) = crate::ccl::infer::solver::constrain_subtype_under(
             sub,
             sup,
@@ -785,17 +790,13 @@ fn check_predicates(
 /// record name the caller's real nodes rather than scratch ones nobody can
 /// resolve.
 ///
-/// Cost note: the full-tree clone makes each call O(tree). Every caller
-/// (`typecheck`, `check_pre_channelize`, post-planning validation in
-/// `context.rs`) runs once per pipeline stage.
-///
-/// **TODO(scratch-copy): ripe for refactoring.** The clone is a whole tree per
-/// pass boundary, for a value that is read and dropped. It exists only because
-/// the shared per-node rules
-/// take `&mut Expr` for inference's in-place type writes, while Check needs
-/// nothing but reads. Splitting the rules' slot access — a `&mut` writer in
-/// Infer mode, a reader in Check mode — removes the copy entirely rather than
-/// making it cheaper.
+/// Cost note: the full-tree clone makes each call O(tree), the order of the walk it
+/// feeds, and every caller (`typecheck`, `check_pre_channelize`, post-planning
+/// validation in `context.rs`) runs once per pipeline stage. The clone exists because
+/// the shared per-node rules take `&mut Expr` for inference's in-place type writes
+/// while Check needs nothing but reads; splitting the rules' slot access — a `&mut`
+/// writer in Infer mode, a reader in Check mode — removes it rather than making it
+/// cheaper.
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id());
