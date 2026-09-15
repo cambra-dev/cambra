@@ -1906,7 +1906,7 @@ impl TileProducer for StoreFinalReadProducer {
 /// is indexed by *commit tick* (sparse change events), but an induction
 /// accumulator co-iterated into another store (e.g. `for r in …: cnt += 1; with
 /// begin(): store := store + cnt`) must present a *dense* function over the loop
-/// extent so it aligns (via `fan_in`) with the co-iterated `iter`. Because
+/// extent so it aligns (via `zip_arms`) with the co-iterated `iter`. Because
 /// [`store_value_at`] folds by scanning changes `≤ p` — **independent of the
 /// store's frontier** — this reads every position correctly even across a
 /// trailing run of carries, so it needs neither the frontier watermark nor the
@@ -1920,7 +1920,7 @@ impl TileProducer for StoreFinalReadProducer {
 /// [`fold_changelog_key`]; this reader and [`StoreValueStream`] are the same
 /// changelog projection differing only on *which* ticks they fold (loop positions
 /// at `p + 1` here, commit ticks there) and how they emit (full re-emit here for
-/// `fan_in`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
+/// `zip_arms`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
     /// Output tiling `SealedFunction { domain: D, codomain: Scalar(V) }`.
     base: OperatorBase,
@@ -2032,7 +2032,7 @@ impl TileProducer for StoreDenseReadProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         // The loop-extent positions (the output domain) — the same positions a
-        // co-iterated `iter` presents, so the two `fan_in` cleanly.
+        // co-iterated `iter` presents, so the two `zip_arms` cleanly.
         let trigger = self
             .trigger_producer
             .get(self.trigger_producer.tiling().universal_guard());
@@ -2063,7 +2063,7 @@ impl TileProducer for StoreDenseReadProducer {
         // output domain must be position-ordered: a scalar-final read is
         // `ExtractFinal` over this stream — the *final column* — which is the final
         // accumulator only if the highest loop position is last. (A co-iterated
-        // read aligns by domain *value* via `fan_in`, so ordering is immaterial
+        // read aligns by domain *value* via `zip_arms`, so ordering is immaterial
         // there; sorting is correct for both.)
         let mut sorted: Vec<usize> = (0..positions.len())
             .map(|i| match positions.index_at(i) {

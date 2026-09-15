@@ -176,6 +176,19 @@ Neither is a "union", and the name matters: in type theory a *union type* is **u
 
 Op-conversion accordingly compiles a fed union as a flat merge — a disjoint join — and **rejects** a fed `Copair` rather than compiling it as the operation it is not. Nothing builds one today: `Builtin::Copair` needs a `++` inside a lambda over its parameter, which fails earlier. When something does, it needs a tagged fed form, not the flat merge.
 
+### The program's output list is a `Record`
+
+A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at the tail of the root `Let*` chain so each entry is in scope of the bindings above it. There is no node of its own for it, and none is needed: a program whose trailing expression is a record literal has the same shape, and the two never occupy the same position.
+
+```
+x = 1
+(a=[1, 2, 3], b=[4, 5, 6])
+```
+
+Lowering appends the list as the body of an `ExprStmt` whose effect is the program's own trailing expression, and `channelize` collapses that `ExprStmt` to its body. A sink program's trailing expression is therefore dropped, and the list is what sits at the tail. Which conversion entry point runs is read off the sink registry, the same fact lowering read when it decided to append a list at all.
+
+Each entry is an iteration site exactly when it holds a collection, which is the rule a product value's components already follow (`planning::iterate`'s `mark_component_source`): an output is compiled with no input, and so is a component, and a collection needs the iteration a collection needs. A pure program has a single output and no list — its trailing expression is that output.
+
 ### `Transact` — the domain-parameterized recurrence carrier
 
 CHL mutation-accumulation `for` loops **and** `with begin():` transactions share one carrier node, `Transact`, rather than recursive `Lambda`/`Let` combinations or a dedicated fold node. (For the lowering mechanics and the operator-graph realization, see [lowering.md](lowering.md#mutation-accumulation-loops) and [mutability.md](mutability.md).)

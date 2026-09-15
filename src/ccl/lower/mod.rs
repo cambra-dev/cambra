@@ -40,6 +40,7 @@
 //! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
 //! | Positional access `t.0` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Index`]`)` |
 //! | Collection lookup `c[k]` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
+//! | The output list of a program that binds a sink | a [`TypedExprNode::Record`] at the tail of the root `Let*` chain |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -1146,11 +1147,11 @@ fn lower_expr_inner(
 ///
 /// When sink bindings are registered during lowering (e.g. from `http_serve`),
 /// the final expression is wrapped so the program ends in
-/// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
-/// sink-binding contract; each field is the name that [`crate::ccl::channelize`]
-/// resolves to the computed response morphism.  After `channelize` removes
-/// all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
-/// `Let* Record{…}` shape for `compile_program`.
+/// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The
+/// record is the sink-binding contract; each entry is
+/// the name that [`crate::ccl::channelize`] resolves to the computed response
+/// morphism.  After `channelize` removes all `Feed` nodes, `simplify` drops the
+/// `ExprStmt`, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
     let mut errors: Vec<LoweringError> = Vec::new();
     let value = lower_stmts_recovering(stmts, ctx, &mut errors);
