@@ -2633,8 +2633,34 @@ extensions this shape exists to take: the instances are already *data*
 Every instance in every table accepts **base types only**, and every one is
 homogeneous — `Addable(Int, Int ⇝ Int)`, never `Addable(Int, String ⇝ …)`. Both
 facts are the tables' content, not properties of resolution: nothing in narrowing or
-deposit assumes either. So `Equatable` rejecting a tuple, a record or a variant is
-what these rows happen to be, and not a judgement that such types are incomparable.
+deposit assumes either. So a trait rejecting a variant is what these rows happen to be,
+and not a judgement that such types are incomparable.
+
+### A product is answered off the table
+
+`Equatable` holds of a tuple or record when the two operands are the **same** product and
+each component is equatable. No row states it — a row accepts a base — so `narrow_product`
+answers it structurally instead: the product is recorded on the obligation, stated as an
+**upper** bound on every operand position beside the contributing one, and required of each
+component through an obligation of its own over a fresh variable the component flows into.
+
+Three consequences follow from that shape rather than from a choice:
+
+- **A component still unknown resolves later.** It reaches its own obligation by the
+  ordinary delivery path, so a record key whose field type has not arrived is deferred
+  rather than read early and missed.
+- **The propagation is the base case's write-back, one level up.** It is an upper bound for
+  the reason [What an obligation determines](#what-an-obligation-determines) gives, and
+  every component's refinements are peeled for the reason
+  [Refinements are transparent](#refinements-are-transparent) gives — a product carrying
+  `Int@1` would hold the operand beside it to one literal.
+- **Once answered, the table has nothing left to say.** The candidate set is untouched, so
+  the requirement sweep skips the obligation and a base arriving afterwards contradicts the
+  product rather than narrowing it.
+
+Equality is the only trait with this reading (`Trait::is_structural`). Ordering a product
+needs an order on its components and a record's fields carry none; arithmetic has no product
+reading at all.
 
 ### Refinements are transparent
 
@@ -2654,9 +2680,10 @@ A contribution arriving at a position is one of three things, and each has its o
 |---|---|---|
 | a **base** | `Int` | narrows the candidate set |
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
-| **determined, and not a base** | a tuple, record, variant, function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
+| a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
+| **determined, and neither** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
 
-The third is a rejection and not silence, because "no base here" is true of both it and the second. A tuple that merely failed to narrow would leave `(1, 2) == (3, 4)` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
+The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
 
 A position that stays in the second row for the whole program — nothing ever determines it — is not a rejection either. Its obligation simply never narrows, and the variable is reported as unresolved rather than as a missing instance.
 
