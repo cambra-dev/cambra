@@ -1,4 +1,10 @@
 {
+  "remoteControlAtStartup": true,
+  "attribution": {
+    "commit": "",
+    "sessionUrl": false,
+    "pr": ""
+  },
   "permissions": {
     "allow": [
       "Bash(awk *)",
@@ -44,7 +50,52 @@
       "Bash(grep *)",
       "Bash(sed *)",
       "Bash(tail *)",
-      "WebSearch"
+      "WebSearch",
+
+      "Bash(git check-ignore *)",
+      "Bash(git ls-tree *)",
+
+      "Bash(jj --version)",
+      "Bash(jj log *)",
+      "Bash(jj st *)",
+      "Bash(jj status *)",
+      "Bash(jj diff *)",
+      "Bash(jj show *)",
+      "Bash(jj file *)",
+      "Bash(jj root *)",
+      "Bash(jj next *)",
+      "Bash(jj config *)",
+      "Bash(jj bookmark *)",
+      "Bash(jj describe *)",
+      "Bash(jj workspace *)",
+      "Bash(jj op *)",
+      "Bash(jj git *)",
+
+      "Bash(cargo --version)",
+      "Bash(cargo doc *)",
+      "Bash(cargo tree *)",
+      "Bash(RUSTDOCFLAGS=\"-A warnings -D rustdoc::broken_intra_doc_links\" cargo doc --no-deps -p cambra*)",
+      "Bash(timeout 3000 cargo nextest run --all-features)",
+      "Bash(rustc --version)",
+      "Bash(rust-analyzer --version)",
+      "Bash(rustup show *)",
+      "Bash(rustup component *)",
+
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(timeout 180 npm run typecheck)",
+      "Bash(timeout 180 npm run test)",
+      "Bash(timeout 240 npm run build)",
+
+      "Bash(./target/debug/cambra-inspector *)",
+      "Bash(curl -s http://localhost*/api/snapshot)",
+      "Bash(pkill -f cambra-inspector*)",
+
+      "Bash(.claude/skills/gh-pr-respond/gh_pr_comments.sh *)"
+    ],
+    "deny": [
+      "Bash(npm run dev)",
+      "Bash(jj squash)"
     ]
   },
   "hooks": {
