@@ -1543,6 +1543,7 @@ fn collect_type_errors(
             value,
             domain,
             history_kind,
+            ..
         } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, an `Overwrite`
@@ -1791,6 +1792,7 @@ fn check_no_nested_mut(
             value,
             domain,
             history_kind: HistoryKind::Overwrite,
+            ..
         } => {
             if !allow_mut {
                 errors.push(InferError::MutInCompositeType {
@@ -2778,11 +2780,7 @@ mod tests {
         let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
-                ty: Type::History {
-                    value: Box::new(Type::Base(BaseType::Int)),
-                    domain: Box::new(Type::Hole),
-                    history_kind: HistoryKind::Overwrite,
-                },
+                ty: Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
                 user_annotation: None,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),

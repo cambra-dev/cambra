@@ -1235,8 +1235,22 @@ pub enum Type {
     /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
     /// may observe a `History` (a survivor at the strict `typecheck` is a compiler bug —
     /// see `collect_type_errors`). See src/ccl/design/mutability.md.
+    /// Built by [`Type::feed`], [`Type::mutable`] and [`Type::history`] rather than
+    /// written directly: a history denotes the arrow `domain ⤇ value`, and an arrow's
+    /// binding discipline needs one owner (see [`Type::history`]).
     History {
-        /// The type of the history's value (a position's cell / element). Read
+        /// The **position binder**, if this history's value is dependent. Bound in
+        /// `value`, exactly as [`Type::Fun`]'s `name` is bound in `codomain`.
+        ///
+        /// A history denotes the arrow `domain ⤇ value`, and a feed whose contribution
+        /// varies by position needs that arrow to bind it — a reply built inside
+        /// `for v in src:` has a type that mentions `v`, and with nowhere to bind it the
+        /// reference escapes to whatever holds the feed. `Type::history_pi` is the only
+        /// constructor that sets it, and it closes `value` the way [`Type::pi_kinded`]
+        /// closes a codomain.
+        name: Option<crate::ccl::Name>,
+        /// The type of the history's value (a position's cell / element). May reference
+        /// `name`. Read
         /// through by the deref coercion for a [`HistoryKind::Overwrite`] reference.
         value: Box<Type>,
         /// The index the history's positions are tracked over (loop index,
@@ -2061,6 +2075,7 @@ fn fmt_type(
             value,
             domain,
             history_kind,
+            ..
         } => {
             let (value, domain) = (at(value, binders), at(domain, binders));
             if *history_kind == HistoryKind::Overwrite {
@@ -2241,6 +2256,64 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+        }
+    }
+
+    /// A **feed channel**'s type — the append-law history over `domain`, rendered
+    /// `feed(domain ⤇ value)`.
+    ///
+    /// Argument order is `as_feed`'s return order, so a round trip reads the same way in
+    /// both directions.
+    pub fn feed(domain: Self, value: Self) -> Self {
+        Self::history(domain, value, HistoryKind::Append)
+    }
+
+    /// A **mutable variable**'s type — the overwrite-law history, rendered
+    /// `Mut(value, domain)`.
+    ///
+    /// Argument order matches [`Type::feed`] and [`Type::as_feed`] rather than the
+    /// rendering, so the two constructors do not disagree about which slot comes first.
+    pub fn mutable(domain: Self, value: Self) -> Self {
+        Self::history(domain, value, HistoryKind::Overwrite)
+    }
+
+    /// A history at an explicit [`HistoryKind`], for a rebuild carrying the kind it
+    /// replaces.
+    ///
+    /// **The one place a history is built.** A history denotes the arrow `domain ⤇ value`,
+    /// and an arrow's binding is a discipline: a `Type::Fun` binds its domain over its
+    /// codomain, and [`Type::pi_kinded`] owns that closing so no caller can leave a free
+    /// name for a binder the type itself provides. A history spells the same arrow across
+    /// two independent fields, so nothing holds that discipline for it — which is exactly
+    /// why a feed's value cannot depend on its own position today. Routing every
+    /// construction through here gives the discipline one owner to move to.
+    pub fn history(domain: Self, value: Self, history_kind: HistoryKind) -> Self {
+        Type::History {
+            name: None,
+            value: Box::new(value),
+            domain: Box::new(domain),
+            history_kind,
+        }
+    }
+
+    /// A history whose **value depends on its position** — `feed((name: domain) ⤇ value)`.
+    ///
+    /// Closes `value` over `name` exactly as [`Type::pi_kinded`] closes a codomain, so a
+    /// history built here cannot carry a free name for the binder it provides. This is the
+    /// only constructor that sets [`Type::History`]'s `name`.
+    pub fn history_pi(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        value: Self,
+        history_kind: HistoryKind,
+    ) -> Self {
+        let name = name.into();
+        let value = crate::ccl::subst::close_pi_binder(&name, &value);
+        Type::History {
+            name: Some(name),
+            value: Box::new(value),
+            domain: Box::new(domain),
+            history_kind,
         }
     }
 
@@ -2565,6 +2638,7 @@ impl Type {
                 domain,
                 value,
                 history_kind: HistoryKind::Append,
+                ..
             } => Some((domain, value)),
             _ => None,
         }
@@ -2899,11 +2973,12 @@ impl Type {
                 value,
                 domain,
                 history_kind,
-            } => Type::History {
-                value: Box::new(value.without_pi_names()),
-                domain: Box::new(domain.without_pi_names()),
-                history_kind: *history_kind,
-            },
+                ..
+            } => Type::history(
+                domain.without_pi_names(),
+                value.without_pi_names(),
+                *history_kind,
+            ),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -4571,11 +4646,7 @@ mod tests {
             let (acc, item) = (Name::raw(acc), Name::raw(item));
             TypedExpr::mut_decl(
                 acc.clone(),
-                Type::History {
-                    value: Box::new(Type::Base(BaseType::Int)),
-                    domain: Box::new(Type::Hole),
-                    history_kind: HistoryKind::Overwrite,
-                },
+                Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
                 TypedExpr::lit(Lit::Int(0)),
                 TypedExpr::for_loop(
                     item.clone(),
@@ -4618,11 +4689,11 @@ mod tests {
             let (acc, item) = (Name::raw(acc), Name::raw(item));
             TypedExpr::mut_decl(
                 acc.clone(),
-                Type::History {
-                    value: Box::new(Type::Base(BaseType::Int)),
-                    domain: Box::new(Type::Hole),
-                    history_kind: HistoryKind::Overwrite,
-                },
+                Type::history(
+                    Type::Hole,
+                    Type::Base(BaseType::Int),
+                    HistoryKind::Overwrite,
+                ),
                 TypedExpr::lit(Lit::Int(0)),
                 TypedExpr::begin(TypedExpr::for_loop(
                     item.clone(),
@@ -5037,16 +5108,8 @@ mod tests {
         let refinement = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
         let refine = |t: Type| Type::refined_one(t, refinement.clone());
         let int = Type::Base(BaseType::Int);
-        let mut_var = Type::History {
-            value: Box::new(int.clone()),
-            domain: Box::new(Type::Txn),
-            history_kind: HistoryKind::Overwrite,
-        };
-        let channel = Type::History {
-            value: Box::new(int.clone()),
-            domain: Box::new(Type::UIntRange(3)),
-            history_kind: HistoryKind::Append,
-        };
+        let mut_var = Type::mutable(Type::Txn, int.clone());
+        let channel = Type::feed(Type::UIntRange(3), int.clone());
 
         assert_eq!(refine(mut_var.clone()).mut_value_type(), Some(&int));
         assert_eq!(
@@ -5058,15 +5121,7 @@ mod tests {
         // The two kinds are not interchangeable: a channel reads as its whole
         // collection, a mutable variable as one value, so neither accessor answers for the other.
         assert_eq!(channel.mut_value_type(), None);
-        assert_eq!(
-            Type::History {
-                value: Box::new(int.clone()),
-                domain: Box::new(Type::Txn),
-                history_kind: HistoryKind::Overwrite,
-            }
-            .as_feed(),
-            None
-        );
+        assert_eq!(Type::mutable(Type::Txn, int.clone()).as_feed(), None);
 
         // A refined *non*-handle peels to a non-handle, which is the case every
         // caller of these accessors actually hits (`x = 0; x += 1`).

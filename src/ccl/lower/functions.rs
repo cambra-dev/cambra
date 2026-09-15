@@ -51,11 +51,7 @@ fn mut_param_history_type(
             )))
         }
         Some(Ok((value, is_txn))) => Some(Ok((
-            Type::History {
-                value: Box::new(value),
-                domain: Box::new(if is_txn { Type::Txn } else { Type::Hole }),
-                history_kind: crate::ccl::HistoryKind::Overwrite,
-            },
+            Type::mutable(if is_txn { Type::Txn } else { Type::Hole }, value),
             is_txn,
         ))),
         Some(Err(e)) => Some(Err(e)),
@@ -107,11 +103,7 @@ fn feed_param_history_type(
             "`Feed` takes one type argument: `Feed(T)`",
         )));
     };
-    Some(lower_type_expr(value, ctx).map(|t| Type::History {
-        value: Box::new(t),
-        domain: Box::new(Type::Hole),
-        history_kind: crate::ccl::HistoryKind::Append,
-    }))
+    Some(lower_type_expr(value, ctx).map(|t| Type::feed(Type::Hole, t)))
 }
 
 /// Validate that the function or lambda has at least one parameter.
