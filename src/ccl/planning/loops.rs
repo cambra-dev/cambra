@@ -505,7 +505,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
             }
             TxnBinding::Tap => {
                 // The tap's mutable variable field keeps the binding's own site-domained
-                // stream type (𝐼 ⇒ V): the channel union channelize already
+                // collection type (𝐼 ⤇ 𝑉): the channel union channelize already
                 // assembled references the taps at that type, and the mutable variable
                 // registration resolves the branch regardless of the field's
                 // domain.

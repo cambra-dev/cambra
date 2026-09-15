@@ -607,7 +607,7 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // channel-domain residue to re-derive. Closing the tree is therefore a pure
     // whole-tree type substitution: map each `ChanDom(d)` to its assembled
     // channel's concrete domain, and erase each `Feed`-kind history to its bare
-    // bare `Fun` — the exact feed-side analog of `mut_elim::erase_mut`. The
+    // `Fun` — the exact feed-side analog of `mut_elim::erase_mut`. The
     // strict post-channelize `typecheck` in `compile_program` backstops the
     // invariant.
     let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
@@ -815,9 +815,9 @@ fn erase_chan_domains(
 
 /// The codomain of `ty` viewed as a function, peeling outer refinements.
 ///
-/// a `Feed`-kind history is viewed as the `domain ⤇ value` it states
-/// — with rigid nominal domains an unresolved defer read has
-/// a usable (concrete-modulo-`ChanDom`) function view, so a channel built on
+/// a `Feed`-kind history is viewed as its `domain ⤇ value` — with rigid
+/// nominal domains an unresolved defer read has a usable
+/// (concrete-modulo-`ChanDom`) function view, so a channel built on
 /// a read prefix (a nested generator's inner channel block) types at
 /// construction instead of leaving a `Hole` for a re-derivation pass.
 fn fun_codomain(ty: &Type) -> Option<Type> {
@@ -1542,7 +1542,7 @@ fn channelize_cluster(
 /// rebound by a `Let` on the wrap-to-feed spine — a body binder and a captured
 /// outer variable never share a `uid`, so the emitted `let d = channel` can't
 /// be shadow-captured. (A channel legitimately referencing a body-*internal*
-/// binding — e.g. an accumulator stream — is excluded: such a name is bound in
+/// binding — e.g. an accumulator — is excluded: such a name is bound in
 /// `body`, hence not free in it, so it never lands in the checked set.) A
 /// violation would mean a duplicate binder `uid` reached channelization (e.g. an
 /// un-freshened `inline` duplication); catch it loudly here rather than silently
@@ -1957,7 +1957,7 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
     Expr::copair(feeds).with_ty(ty)
 }
 
-/// The type of an N-ary channel union: `Variant[Index(i) ↦ domainᵢ] ⇒ cod`,
+/// The type of an N-ary channel union: `Variant[Index(i) ↦ domainᵢ] ⤇ cod`,
 /// where each operand contributes its domain as tag `i` and they share a
 /// common element codomain. Returns [`Type::Hole`] when an operand is not a
 /// function-shaped type at all (the untyped-mode pipeline); a defer-read

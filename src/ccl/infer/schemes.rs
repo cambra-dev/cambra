@@ -98,8 +98,8 @@ pub struct OperatorSchemes {
     /// Used by the `map` constructor's group collapse.
     aggregate_sole: PolyScheme,
     /// `∀α β. ((α → β), β) → β` — extract the final value from a
-    /// function-typed stream, falling back to the default scalar when the
-    /// stream's domain is empty. Polymorphic in both the stream domain
+    /// function-typed collection, falling back to the default scalar when the
+    /// collection's domain is empty. Polymorphic in both the collection's domain
     /// (`α`) and the shared codomain/default type (`β`); inline construction
     /// is required because both vars are shared across positions, which
     /// `normalize_annotation` (one fresh var per `Hole`) can't express.

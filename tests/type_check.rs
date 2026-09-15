@@ -3063,7 +3063,7 @@ fn test_defined_defer_reads_through_aggregate() {
 
 #[test]
 fn test_fed_defer_reads_through_aggregate() {
-    // `sum` consumes the feed handle as its read view `(α → γ)`.
+    // `sum` consumes the feed handle as its read view `(α ⤇ γ)`.
     assert_eq!(infer_program("x = defer()\nx << 1\nx << 2\nsum(x)"), int());
 }
 

@@ -461,10 +461,10 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
 /// Otherwise a history reads through transparently (the solver's read-through rule,
 /// mirrored in `provide_function`): a read agrees with the handle's read view, and two
 /// handles agree iff their read views do. The read view is kind-specific — a `Feed`
-/// reads as its whole `domain ⤇ value`, an `Overwrite` derefs to its scalar
-/// `value`. A `Feed` channel domain is the rigid nominal `ChanDom(d)`, which
-/// `channelize` erases to the concrete channel domain by substitution; the `ChanDom`
-/// arm agrees it by name.
+/// reads as its whole channel `domain ⤇ value`, an `Overwrite` derefs to its
+/// scalar `value`. A `Feed` channel domain is the rigid nominal `ChanDom(d)`,
+/// which `channelize` erases to the concrete channel domain by substitution; the
+/// `ChanDom` arm agrees it by name.
 ///
 /// A **handle's own** outer refinements are peeled and not counted, unlike
 /// everywhere else in this comparison. They cannot be: the two sides here are legally a

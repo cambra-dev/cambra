@@ -2576,7 +2576,7 @@ mod tests {
     /// collection stays one. This is the shape `mut_elim` discharges over when a
     /// mutating block binds a comprehension.
     #[test]
-    fn a_data_compose_is_not_downgraded_to_a_compute_arrow() {
+    fn a_data_compose_is_not_downgraded_to_a_compute_function() {
         let int_ty = Type::Base(crate::ccl::BaseType::Int);
         let fun_ty = Type::data_fun(int_ty.clone(), int_ty.clone());
 

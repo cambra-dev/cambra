@@ -2925,10 +2925,10 @@ around `reserve` + `quote` + the feed).
 
 A feed (`<<`, §3.7) is the **same history object** as a mutable variable,
 under the **append-only** merge law: contributions union (`++`), there is
-no carry-forward, and a read yields the whole stream — which is exactly
-why a feed is an unordered bag (§3.7) while a mutable variable derefs to a
-single latest value. `o << e` is surface-impure in the same way `x := e`
-is; the two differ only in that merge law.
+no carry-forward, and a read yields the whole collection — which is
+exactly why a feed is an unordered bag (§3.7) while a mutable variable
+derefs to a single latest value. `o << e` is surface-impure in the same
+way `x := e` is; the two differ only in that merge law.
 
 Two feed shapes interact with transactions, and the difference is
 observable:

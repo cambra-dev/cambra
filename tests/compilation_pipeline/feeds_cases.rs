@@ -418,7 +418,7 @@ o"#;
 
 /// `<<=` sets a channel's read view outright, so its RHS must be a collection
 /// (a `Fun`). A scalar RHS is rejected by typing — the discipline that keeps
-/// every feed history a genuine `domain ⤇ value` (scalar values belong
+/// every feed history a genuine collection `domain ⤇ value` (scalar values belong
 /// in a plain `let` binding or a `:=` mutable variable, not a feed channel).
 #[rstest]
 #[timeout(Duration::from_secs(1))]

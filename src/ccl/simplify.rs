@@ -1964,7 +1964,7 @@ mod tests {
     /// refinement's key. Both arms of the rule are covered — with 𝑓 absent the
     /// `map` node carries the type itself, with 𝑓 present the compose does.
     #[test]
-    fn simplify_exponential_eta_carries_the_curry_arrow() {
+    fn simplify_exponential_eta_carries_the_curry_type() {
         let b_ty = int_ty();
         let c_ty = Type::Base(BaseType::String);
         let c2_ty = Type::Base(BaseType::Bool);

@@ -1566,7 +1566,7 @@ fn constrain_go_impl(
         // filter-feed-through-UDF gaps (see design/mutability.md §4 and the
         // `ccl/channelize.rs` module docs).)
         // Transparent read: a non-mutable consumer of a feed channel consumes its
-        // whole `domain ⤇ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
+        // whole read view `domain ⤇ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
         // feeding one defer from another). Unlike a mutable variable (dereffed to its scalar
         // `value` above), a feed reads as the reconstructed channel function.
         (

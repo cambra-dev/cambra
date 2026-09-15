@@ -952,7 +952,7 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
-/// xs`) is read (dereferenced) to its underlying `D ⇒ V` collection — the
+/// xs`) is read (dereferenced) to its underlying `D ⤇ V` collection — the
 /// mutable variable's value type; `erase_mut` clears the residual `Mut` on the source node
 /// at the end of the phase.
 pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
@@ -960,7 +960,7 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
     loop {
         match t {
             Type::Refinement(inner, _) => t = inner,
-            // Only a mutable collection derefs to its `D ⇒ V` value here;
+            // Only a mutable collection derefs to its `D ⤇ V` value here;
             // a feed reads as its whole collection and never reaches this phase's
             // loop-source destructuring.
             Type::History {

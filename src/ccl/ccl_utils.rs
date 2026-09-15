@@ -307,10 +307,10 @@ pub fn commit_payload_ty(decision_ty: &Type) -> Type {
 }
 
 /// The point-free one-arm eliminator ``variant_project(`commit) : 𝑑 ⇒ 𝑃`` reading a
-/// decision stream's `commit` payload — inserted before a `.writes`/`.__to_<defer>`
+/// decision history's `commit` payload — inserted before a `.writes`/`.__to_<defer>`
 /// read so a `` Fun(D, {`commit{𝑃} | `abort}) `` history projects its committing
 /// payload. (`abort` positions carry no payload and drop out of the eliminated
-/// stream; a read is only meaningful at committing positions.)
+/// collection; a read is only meaningful at committing positions.)
 pub fn commit_project(decision_ty: &Type) -> Expr {
     // The projection names the tag, so a decision variant materialized in any arm
     // order reads the same — there is no position for the runtime decode to agree
@@ -353,14 +353,14 @@ pub(crate) fn statement_tag_cases_to_guards(expr: Expr) -> Expr {
 }
 
 /// The point-free one-arm eliminator ``variant_project(`fired) : {`fired{𝑉} |
-/// `idle} ⇒ 𝑉`` reading a tap stream's fed value — appended after a `.__to_<defer>`
+/// `idle} ⇒ 𝑉`` reading a tap's fed value — appended after a `.__to_<defer>`
 /// read so the channel carries the positions the tap fired at.
 ///
 /// The restriction is the point: a channel assembled from a tap holds what the
 /// program fed and nothing at the positions it fed nothing, which is the same
 /// domain a fanned-out conditional feed produces
 /// ([`crate::ccl::channelize`]). `` `idle `` positions drop out of the eliminated
-/// stream, so the `` `fired `` payload need answer nowhere else.
+/// collection, so the `` `fired `` payload need answer nowhere else.
 pub fn fired_project(value_ty: Type) -> Expr {
     let tap_ty = tap_variant_ty(value_ty.clone());
     Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_FIRED.into())))
@@ -825,14 +825,14 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         domain.clone(),
         Refinement::born(Rc::new(bare_predicate_of_fn(&domain, predicate.clone()))),
     );
-    let refined_stream = Type::fun_like(&upstream_ty, refined_dom, value_ty);
+    let refined_collection = Type::fun_like(&upstream_ty, refined_dom, value_ty);
     // The transformer node `restrict(p) : (D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`.
     let restrict = apply_primitive(
         predicate,
         Builtin::Restrict,
-        Type::fun(upstream_ty, refined_stream.clone()),
+        Type::fun(upstream_ty, refined_collection.clone()),
     );
-    apply_function(upstream, restrict, refined_stream)
+    apply_function(upstream, restrict, refined_collection)
 }
 
 /// Refine a join morphism's **extent** — both sides — with `predicate`, taking

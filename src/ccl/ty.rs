@@ -1181,7 +1181,7 @@ pub enum Type {
     ChanDom(crate::ccl::Name, ChanLevel),
     /// The transaction-commit domain: an anonymous total order of commit times
     /// issued by the runtime (the prototype's `CommitTime`). It is the domain of
-    /// transactional histories (`Txn ⇒ V`), the codomain of the per-site
+    /// transactional histories (`Txn ⤇ V`), the codomain of the per-site
     /// `begin_<site>` oracles, and the type of a transaction handle. Like
     /// `DataSource`, it has no enumerable static domain — its positions exist only
     /// in the tile. See src/ccl/design/mutability.md.
@@ -1189,7 +1189,7 @@ pub enum Type {
     /// The type of a **history** handle: a function `domain ⤇ value` that a
     /// `:=` mutable variable or a `defer`/`<<` channel writes incrementally. One variant
     /// for both — a mutable variable and a feed channel are the same object (an
-    /// invariant, deref-transparent `domain ⇒ value`); they differ only in the
+    /// invariant, deref-transparent `domain ⤇ value`); they differ only in the
     /// [`HistoryKind`]:
     ///
     /// - [`HistoryKind::Overwrite`] — a **mutable variable** (`:=` / `+=`). A reference
@@ -1198,7 +1198,7 @@ pub enum Type {
     ///   (`get_prev_seq` recurrence), and its trailing read is `final_or_default`
     ///   (a scalar). The unified phase materializes it with a carry-forward arm.
     /// - [`HistoryKind::Append`] — a **feed channel** (`defer` / `<<` / `<<=`). A
-    ///   reference reads the whole `domain ⤇ value`, off-path positions
+    ///   reference reads the whole read view `domain ⤇ value`, off-path positions
     ///   are absent (no carry-forward), and `channelize` resolves it to the
     ///   collected channel.
     ///
@@ -1835,7 +1835,7 @@ pub enum HistoryKind {
     /// read, and a carry-forward arm for off-path positions.
     Overwrite,
     /// A feed channel introduced by `defer` and written with `<<` / `<<=` — read
-    /// as the whole `domain ⤇ value`, with off-path positions absent.
+    /// as the whole read view `domain ⤇ value`, with off-path positions absent.
     Append,
 }
 
@@ -2557,7 +2557,7 @@ impl Type {
     /// not one.
     ///
     /// A channel is a [`HistoryKind::Append`] history, and what a read of it yields
-    /// is the whole `domain ⤇ value` — hence the pair, where
+    /// is the whole read view `domain ⤇ value` — hence the pair, where
     /// [`Type::mut_value_type`] returns a single value type.
     pub fn as_feed(&self) -> Option<(&Type, &Type)> {
         match self.peel_refinements() {

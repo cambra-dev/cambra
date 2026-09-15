@@ -351,7 +351,7 @@ pub enum Builtin {
 
     /// `filter_values : (D ⇒ Bool) ⇒ ({d: D | p(d)} ⇒ V)` — a **value-preserving**
     /// mid-chain filter. `Apply(p, FilterValues)` requires `input=Some(_)` (the
-    /// `D ⇒ V` stream to filter) and keeps each surviving element's **codomain
+    /// `D ⇒ V` collection to filter) and keeps each surviving element's **codomain
     /// value** `V` — unlike `Restrict`, which returns the domain identity
     /// `{D | p} ⇒ {D | p}` for a source a downstream map re-indexes. Compiles to
     /// the `Filter` tile operator (input stream + predicate, output = filtered

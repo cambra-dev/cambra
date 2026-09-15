@@ -49,8 +49,8 @@ of the domain, through one of two **causal accessor** builtins:
 - `get_prev_seq(ℎ, 𝑖, 𝑑)` — for an **induction domain** (a loop's iteration index): the value of
   history `ℎ` at the predecessor of `𝑖`, or the default `𝑑` at the first position.
 - `get_prev_txn(𝑤, 𝑡, 𝑑)` — for the **transaction domain** `Txn` (a total order of commit times):
-  the value carried by the latest commit in stream `𝑤` at a time *strictly before* `𝑡`, or the
-  default `𝑑` if there is none.
+  the value carried by the latest commit in collection `𝑤` at a time *strictly before* `𝑡`, or
+  the default `𝑑` if there is none.
 
 Because every cycle in the group crosses a causal accessor, values at any position depend only on
 strictly earlier positions, and the group has a unique (well-founded) solution by induction along
@@ -412,13 +412,14 @@ parameters — deferred to that design.)
 
 ### `Feed` is a CCL type
 
-`Type::History { value: 𝑉, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed `feed(𝐷 ⤇ 𝑉)`) — the
-type of a feed handle: what an `out = defer()` introduces, what `http_serve`'s response half
-returns, what a defer-mediating UDF parameter (`λ out → out << e`) carries. It is the same
-`Type::History` variant a mutable variable uses, under the `Append` kind; unlike an overwrite
-variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. Feed handles are fully first-class — returnable and tuple-packable —
-because feed aliasing is benign (multiple feeders union by `++`). `channelize` eliminates every
-feed-typed term when it resolves channels, so no history type survives to planning.
+`Type::History { value: 𝑉, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed
+`feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out = defer()` introduces, what
+`http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
+carries. It is the same `Type::History` variant a mutable variable uses, under the `Append` kind;
+unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. Feed
+handles are fully first-class — returnable and tuple-packable — because feed aliasing is benign
+(multiple feeders union by `++`). `channelize` eliminates every feed-typed term when it resolves
+channels, so no history type survives to planning.
 
 ### `Txn` is a CCL type
 
