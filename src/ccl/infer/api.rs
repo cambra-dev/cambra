@@ -791,25 +791,9 @@ fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     /// domain stays excluded for the reason it always was — its mismatch already reads as
     /// what it is, and the checked form fails on it identically.
     fn is_present_key_domain(ty: &Type) -> bool {
-        ty.refinements().iter().any(|refinement| {
-            let TypedExprNode::Apply { argument, function } = &refinement.predicate.node else {
-                return false;
-            };
-            if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
-                return false;
-            }
-            let TypedExprNode::Apply {
-                function: characteristic,
-                ..
-            } = &function.node
-            else {
-                return false;
-            };
-            matches!(
-                &characteristic.node,
-                TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
-            )
-        })
+        ty.refinements()
+            .iter()
+            .any(crate::ccl::ty::Refinement::is_collection_membership)
     }
     // Read whichever side is the domain. The two are not in a fixed order here: which one
     // the solver reports as "expected" depends on where the edge was raised, and an

@@ -503,8 +503,34 @@ as itself. And [`CheckedLookup`] answers a group of keys per row, keeping the gr
 answer per key, where its key sits. A tile that cannot answer every key answers none, since an
 undecided key would have to re-offset the groups it left.
 
-A correlated **filter** is the shape still not compiled: it leaves its predicate naming the
-pair binder, which `planning/predicates.rs` refuses.
+A **filter** on the inner source rides the pair it filters. `lambda_elim` leaves it as a
+refinement on the pair domain's second component, and planning re-bases it onto the pair and
+emits it as `filter_values` — a term, which is what applies it. Leaving it on the domain
+applies it nowhere.
+
+Whether the predicate reads the outer value decides only how much rewriting it takes. One
+that does reaches that value through the enclosing binder, naming what no binder binds, so
+re-basing also discharges the reference into the refinement's own binder. One that reads only
+the element needs the re-basing alone. A keyed collection's carried present-key membership
+predicate is the shape planning leaves alone: it is never executed, and an uncorrelated
+predicate beside one is not distinguishable from it here.
+
+[`Filter`] reads the resulting mask **positionally**: the predicate compiled over the same
+pairs, so its flat codomain is one boolean per entry in entry order, which is the mask
+`Tile::retain` takes and re-offsets the shortened groups from. Each side is pulled from its own
+branch of the pairs and they need not have reached the same rows. An input with nothing in it
+is already filtered, which is the ordinary end of a pull; anything else out of step is refused
+with a message that says so, rather than reading the mask across the misalignment, which drops
+the wrong entries silently, or answering empty, which waits for an alignment that is not
+coming. A source delivering its rows one at a time — a transaction's — is what produces that
+misalignment, so a correlated filter inside a transaction is not served yet.
+
+Still not compiled: a correlated filter whose **body reads nothing outer**, whose binder is
+free only in the type, so lambda elimination takes the Pi-const arm and the site never becomes
+a pair at all; and a correlated filter over a **collection** source, which fails in the
+iteration-site walk on the collection's carried `collection_contains`. The second is not about
+correlation — a filter over a collection does not compile with a name binder and no outer row
+either.
 
 ### Reading a collection held per row
 
