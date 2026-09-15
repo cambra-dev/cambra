@@ -3255,7 +3255,7 @@ mod tests {
     }
 
     // `Subst::eq_modulo_ty_slots` (backed by the codebase's type-blind
-    // `eq_refinement_predicate`) — the comparison the bridge relies on:
+    // `eq_term_modulo_ty_slots`) — the comparison the bridge relies on:
     // insensitive to inferred slots (positive), but a genuine structural or
     // name difference must still distinguish (negatives — what keeps the
     // bridge from conflating genuinely different fibers).
