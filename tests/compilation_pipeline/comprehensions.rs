@@ -247,6 +247,147 @@ fn test_refiltered_let_bound_comprehension() {
     );
 }
 
+/// A **correlated** inner comprehension — its body reads the outer binder, so each outer row
+/// gets its own inner pass. `lambda_elim` writes that as `curry(𝑔)` over the outer stream,
+/// where `𝑔` takes the pair of the outer value and the inner element, and op-conversion pairs
+/// them (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
+///
+/// The **uncorrelated** case is beside it because it compiles by a different route and always
+/// did: a body closing over nothing outer leaves a `const`, computed once and broadcast.
+///
+/// One case reaches op-conversion with its `curry` intact, which is the second of the two
+/// routes a correlated site has and the only coverage of it:
+/// `body_ignores_the_inner_element`. Deleting either route drops a program the other does
+/// not serve.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::correlated("sum([sum([v * r for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// A **collection** source, whose domain no extent describes: 1*(1+2) + 2*(1+2).
+#[case::collection_source(
+    "c = map([(\"a\", 1), (\"b\", 2)])\nsum([sum([v * r for v in c]) for r in [1, 2]])",
+    9
+)]
+// (1+2+3) twice, the inner sum shared.
+#[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
+// The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
+#[case::outer_binder_outside("sum([r * sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// A body that reads the outer binder and **never applies the inner source**, so `𝑔` is a
+// projection with no source in it for planning to name. It compiles by the second route —
+// op-conversion reading the domain off the type — which nothing else here covers: 3*(1+2).
+#[case::body_ignores_the_inner_element("sum([sum([r for v in [1, 2, 3]]) for r in [1, 2]])", 9)]
+fn a_correlated_inner_comprehension_runs_per_outer_row(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A correlated inner comprehension with **no aggregate over it**: the pairing is the whole
+/// compilation, and the curried tile is the answer.
+///
+/// Every other case here sums, which hides that `MapAggregate` is a consumer rather than a
+/// requirement — `Product` emits a collection per row, and a comprehension that yields one
+/// keeps it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_inner_comprehension_without_an_aggregate() {
+    // `r` ranges over [1, 2] and `v` over [1, 2], so row `r` holds [r, 2r].
+    check_tile(
+        "[[v * r for v in [1, 2]] for r in [1, 2]]",
+        Tile::curried_function(
+            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 2]),
+            ColumnValue::UInts(vec![0, 1, 0, 1]),
+            ColumnValue::Ints(vec![1, 2, 2, 4]),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    );
+}
+
+/// The same over a **collection** source, whose keys are the inner domain.
+///
+/// Read as a set of `(row, key, value)` triples: a map carries its entries in its own order,
+/// and what the pairing decides is the grouping rather than the order within a group.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_comprehension_without_an_aggregate_over_a_collection() {
+    let tile = run_pipeline(indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        [[v * r for v in c] for r in [1, 2]]
+    "#});
+    let Tile::CurriedFunction {
+        domain1,
+        offsets,
+        domain2,
+        codomain,
+        ..
+    } = tile
+    else {
+        panic!("a comprehension yielding a collection per row tiles as a curried function")
+    };
+    let groups = domain1.len();
+    let mut got: Vec<(usize, Value, Value)> = Vec::new();
+    for g in 0..groups {
+        let start = offsets.index_at(g).as_uint();
+        let end = if g + 1 < groups {
+            offsets.index_at(g + 1).as_uint()
+        } else {
+            domain2.len()
+        };
+        for j in start..end {
+            got.push((g, domain2.index_at(j), codomain.index_at(j)));
+        }
+    }
+    got.sort_by_key(|(g, k, _)| (*g, format!("{k:?}")));
+    assert_eq!(
+        got,
+        vec![
+            (0, Value::String("a".into()), Value::Int(1)),
+            (0, Value::String("b".into()), Value::Int(2)),
+            (1, Value::String("a".into()), Value::Int(2)),
+            (1, Value::String("b".into()), Value::Int(4)),
+        ]
+    );
+}
+
+/// An outer comprehension that yields a collection while its inner one aggregates — the
+/// aggregate is inside, so the answer is a stream rather than a scalar.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_inner_aggregate_under_a_collection_result() {
+    // 1*(1+2) and 2*(1+2).
+    check_tile(
+        "[sum([v * r for v in [1, 2]]) for r in [1, 2]]",
+        make_int_list(&[3, 6]),
+    );
+}
+
+/// A **map comprehension whose body never reads the element** does not compile, with or
+/// without an enclosing comprehension.
+///
+/// Nothing here is about correlation or nesting: this one-line program fails, and so does
+/// the base branch's, which has none of the correlated work. A body that reads the element
+/// applies the collection, which is what puts it in the term
+/// (`sum([v for v in c])` answers 3). A body that does not leaves the collection reachable
+/// only through its domain's carried `collection_contains`, which op-conversion meets as a
+/// non-combinator handed an input.
+///
+/// The correlated form fails too and reports differently — reading the domain off the type
+/// answers the unbounded key type — which is why the message, not just the failure, is
+/// pinned here.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "non-combinator collection_contains")]
+fn a_map_comprehension_that_ignores_the_element_does_not_compile() {
+    check_scalar(
+        indoc! {r#"
+            c = map([("a", 1), ("b", 2)])
+            sum([1 for v in c])
+        "#},
+        // One per entry.
+        Value::Int(2),
+    );
+}
+
 /// The inlined counterpart of the let-bound case above — filtering a filtered comprehension
 /// works when the inner one sits directly in the generator. Pins that the binding, not the
 /// nesting, is what the case above trips over.
@@ -256,6 +397,36 @@ fn test_filtered_comprehension_over_a_filtered_literal() {
     check_scalar(
         "sum([y for y in [z for z in [1, 2, 3] if z > 1] if y < 3])",
         Value::Int(2),
+    );
+}
+
+/// A correlated inner comprehension **inside a transaction**, where the outer binder is the
+/// transaction's own row. Nothing about it is transactional: the same pairing serves it as
+/// serves a bare nested comprehension, which is why a list source works here before a
+/// collection source does anywhere.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::list_source("sum([v * r for v in [1, 2, 3]])", 18)]
+// Over a collection, whose domain comes from the data: 1*(1+2) + 2*(1+2).
+#[case::collection_source("sum([v * r for v in c])", 9)]
+fn a_correlated_comprehension_runs_inside_a_transaction(
+    #[case] comprehension: &str,
+    #[case] total: i64,
+) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                c = map([("a", 1), ("b", 2)])
+                n: Mut(Int, Txn) := 0
+                for r in [1, 2]:
+                    with begin():
+                        n := n + {}
+                await_final(n)
+            "#},
+            comprehension
+        ),
+        Value::Int(total),
     );
 }
 
