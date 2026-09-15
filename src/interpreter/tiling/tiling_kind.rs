@@ -221,6 +221,25 @@ impl Tiling {
         }
     }
 
+    /// This function tiling with a domain level appended below its innermost one — the
+    /// shape [`Tile::append_level`] gives the tiles.
+    ///
+    /// A [`Tiling::SealedFunction`] is the one-level case, so an operator that appends a
+    /// level tiles one deeper than its input whichever of the two arrives, and is closed
+    /// under its own output.
+    pub fn append_level(&self, domain: Extent, codomain: Tiling) -> Tiling {
+        let mut domains = match self {
+            Tiling::SealedFunction { domain, .. } => vec![domain.clone()],
+            Tiling::CurriedFunction { domains, .. } => domains.clone(),
+            other => panic!("append_level expects a function tiling, got {other:?}"),
+        };
+        domains.push(domain);
+        Tiling::CurriedFunction {
+            domains,
+            codomain: Box::new(codomain),
+        }
+    }
+
     /// Helper to create a tuple tiling, i.e. a Record tiling where all fields are from `tuple_field`
     pub fn tuple(tilings: &[Tiling]) -> Tiling {
         Tiling::Record(
@@ -544,6 +563,34 @@ mod tests {
     }
 
     // ── Tiling Display ────────────────────────────────────────────────────────
+
+    // ── Tiling::append_level ──────────────────────────────────────────────────
+
+    #[test]
+    fn append_level_reads_a_sealed_function_as_one_level() {
+        let deeper = sealed(int(), bool_ext()).append_level(range(4), Tiling::Scalar(bool_ext()));
+        assert_eq!(
+            deeper,
+            Tiling::CurriedFunction {
+                domains: vec![int(), range(4)],
+                codomain: Box::new(Tiling::Scalar(bool_ext())),
+            }
+        );
+    }
+
+    #[test]
+    fn append_level_is_closed_under_its_own_output() {
+        let deeper =
+            curried(int(), range(4), bool_ext()).append_level(int(), Tiling::Scalar(int()));
+        let Tiling::CurriedFunction { domains, .. } = deeper else {
+            panic!("appending a level leaves a curried tiling")
+        };
+        assert_eq!(
+            domains,
+            vec![int(), range(4), int()],
+            "the new level is innermost"
+        );
+    }
 
     #[test]
     fn display_scalar() {
