@@ -23,7 +23,7 @@ elsewhere; both break referential transparency). The two forms differ only in th
 - **mutable variable** — *last-write-wins* (overwrite). The value at a position is the latest
   write ≤ it; a read derefs to that scalar. Introduced with `:=` / `+=`.
 - **feed** — *append-only*. Contributions union (`++`); there is no carry-forward, and a read
-  yields the whole stream. Written with `<<`.
+  yields the whole collection. Written with `<<`.
 
 So there is one idea — *surface-impure histories* `𝐷 ⤇ 𝑉`, eliminated into pure dataflow — in
 two merge laws. This distinction is the through-line of the whole document: it is what the
@@ -416,7 +416,7 @@ parameters — deferred to that design.)
 type of a feed handle: what an `out = defer()` introduces, what `http_serve`'s response half
 returns, what a defer-mediating UDF parameter (`λ out → out << e`) carries. It is the same
 `Type::History` variant a mutable variable uses, under the `Append` kind; unlike an overwrite
-variable it reads as its whole stream `𝐷 ⤇ 𝑉`, not a scalar deref. Feed handles are fully first-class — returnable and tuple-packable —
+variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. Feed handles are fully first-class — returnable and tuple-packable —
 because feed aliasing is benign (multiple feeders union by `++`). `channelize` eliminates every
 feed-typed term when it resolves channels, so no history type survives to planning.
 

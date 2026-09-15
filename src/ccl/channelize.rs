@@ -34,7 +34,7 @@
 //! spine) types *concretely* against the rigid name, with no `Infer` residue.
 //! Closing the tree is then the pure whole-tree substitution
 //! [`erase_chan_domains`] — map each `ChanDom(d)` to its assembled channel's
-//! concrete domain and erase each `Feed`-kind history to its stream `Fun` — the
+//! concrete domain and erase each `Feed`-kind history to its bare `Fun` — the
 //! exact feed-side analog of `mut_elim::erase_mut`. There is no re-typing
 //! pass; the strict post-channelization `typecheck` in `compile_program`
 //! backstops the invariant.
@@ -607,7 +607,7 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // channel-domain residue to re-derive. Closing the tree is therefore a pure
     // whole-tree type substitution: map each `ChanDom(d)` to its assembled
     // channel's concrete domain, and erase each `Feed`-kind history to its bare
-    // stream `Fun` — the exact feed-side analog of `mut_elim::erase_mut`. The
+    // bare `Fun` — the exact feed-side analog of `mut_elim::erase_mut`. The
     // strict post-channelize `typecheck` in `compile_program` backstops the
     // invariant.
     let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
@@ -713,7 +713,7 @@ fn subst_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 }
 
 /// erase every `Feed`-kind `Type::History` in `ty` to its
-/// bare stream `Fun(domain, value)` and substitute every `ChanDom` via
+/// bare `Fun(domain, value)` and substitute every `ChanDom` via
 /// [`subst_chan_domains_in_type`] — the feed-side analog of
 /// `mut_elim::erase_mut_in_type`.
 fn erase_chan_domains_in_type(
@@ -728,7 +728,7 @@ fn erase_chan_domains_in_type(
     } = ty
     {
         // The handle names its channel, and the channel's assembled type is what says
-        // whether the stream binds a witness. Read it before the domain is substituted:
+        // whether the read view binds a witness. Read it before the domain is substituted:
         // afterwards the domain is a bare reference, and a reference carries no kind.
         let fun_kind = match domain.peel_refinements() {
             Type::ChanDom(n, _) => kinds.get(n).cloned(),
@@ -738,7 +738,7 @@ fn erase_chan_domains_in_type(
         let value = std::mem::replace(value.as_mut(), Type::Hole);
         *ty = Type::Fun {
             name: None,
-            // A feed channel is a collection stream: erase History → a data function.
+            // A feed channel reads as a collection: erase History → a data function.
             fun_kind: fun_kind.unwrap_or(crate::ccl::ty::FunKind::Data(None)),
             domain: Box::new(domain),
             codomain: Box::new(value),
@@ -815,8 +815,8 @@ fn erase_chan_domains(
 
 /// The codomain of `ty` viewed as a function, peeling outer refinements.
 ///
-/// a `Feed`-kind history is viewed as its stream
-/// `domain ⇒ value` — with rigid nominal domains an unresolved defer read has
+/// a `Feed`-kind history is viewed as the `domain ⤇ value` it states
+/// — with rigid nominal domains an unresolved defer read has
 /// a usable (concrete-modulo-`ChanDom`) function view, so a channel built on
 /// a read prefix (a nested generator's inner channel block) types at
 /// construction instead of leaving a `Hole` for a re-derivation pass.
@@ -833,7 +833,7 @@ fn fun_codomain(ty: &Type) -> Option<Type> {
 }
 
 /// The domain of `ty` viewed as a function, peeling outer refinements.
-/// See [`fun_codomain`] for the feed-history stream view.
+/// See [`fun_codomain`] for the feed-history read view.
 fn fun_domain(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
@@ -1961,7 +1961,7 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
 /// where each operand contributes its domain as tag `i` and they share a
 /// common element codomain. Returns [`Type::Hole`] when an operand is not a
 /// function-shaped type at all (the untyped-mode pipeline); a defer-read
-/// operand is function-shaped via its handle's stream view, so typed-mode
+/// operand is function-shaped via its handle's read view, so typed-mode
 /// unions are concrete-modulo-`ChanDom` at construction.
 fn copair_type(feeds: &[Expr]) -> Type {
     let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
@@ -2035,7 +2035,7 @@ fn join_refinements(a: &Type, b: &Type) -> Type {
 
 /// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`.
 /// With nominal channel domains every element is concrete-modulo-`ChanDom` at
-/// construction (the feed-history stream view of [`fun_domain`] /
+/// construction (the feed-history read view of [`fun_domain`] /
 /// [`fun_codomain`]), so a `Hole` here means a genuinely untyped input (the
 /// untyped-mode pipeline); the debug residue assert and the strict wall
 /// backstop the typed mode.
@@ -2045,7 +2045,7 @@ fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
     // `fun_like`, not `Type::fun`: the chain is the head read through the rest, so it is a
     // collection exactly when the head is. The head here is routinely a feed handle that
     // `erase_chan_domains` has not yet turned into a `Type::Fun`, which `fun_like` reads as
-    // the stream it states.
+    // the read view it states.
     let ty = match (d, c) {
         (Some(d), Some(c)) => Type::fun_like(&elts[0].ty, d, c),
         _ => Type::Hole,

@@ -55,9 +55,9 @@ variable-against-variable arm records that the two kinds are the same unknown, a
 whole constraint set: a pin arriving after the edge crosses it, and so does one two edges away.
 Resolving
 at the edge instead — copying each side's pin onto the other — answers from the pins that happen to
-have arrived and drops the rest, and the two variables then coalesce to different arrows depending
-on which constraint came first. `a_shared_kind_var_resolves_the_same_way_in_every_order` checks
-all 24 orders of the shape that exhibits it. The join is the flat semilattice
+have arrived and drops the rest, and the two variables then coalesce to different function types
+depending on which constraint came first. `a_shared_kind_var_resolves_the_same_way_in_every_order`
+checks all 24 orders of the shape that exhibits it. The join is the flat semilattice
 `Unpinned < {Compute, Data} < Conflict`, whose commutativity, associativity and idempotence are what
 make the fold order-blind: every reader folds the same set, and no fold step reads a value a later
 step can change.
@@ -1118,7 +1118,7 @@ For the reconcile to hold, the passes that *introduce* refined types post-infere
 
 A feed handle is `Type::History { value: 𝑇, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed `feed(𝐷 ⤇ 𝑉)`) — a collection `𝐷 ⤇ 𝑇` carried as two children plus a two-valued `history_kind` marker. It **shares the `Type::History` variant with a mutable variable** (`history_kind: Overwrite`, displayed `Mut(𝑉, 𝐷)`); the two were unified from the former `Type::Feed(ρ)` / `Type::Mut{…}` pair (see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type)). `let 𝑑 = Defer in body` gives `𝑑` an `Append`-kind history whose channel `𝐷 ⤇ 𝑇` is the *post-channelize result type* of the binding (a `𝐷 ⤇ 𝑇` channel for fed defers, the defined value's type for `<<=`-defined defers). Like `Hole` and `Infer` the `Append` kind is **transient**, scoped to inference: `channelize` (which runs after inference) eliminates every defer construct along with its feed histories, and no pass downstream of it may observe one. (This is the feed-handle type of [`Feed` is a CCL type](mutability.md#feed-is-a-ccl-type) — what a defer-mediating UDF parameter carries.)
 
-Below, **`Feed(ρ)`** abbreviates a `kind: Feed` history whose reconstructed channel is `ρ = 𝐷 ⇒ 𝑇`; the `value`/`domain` children are the two halves of `ρ`. An `Overwrite` history reaches the relation as a handle — a read has already dereffed at the rule that emitted it — so the four invariance rules below are specifically the `Feed`-kind behavior.
+Below, **`Feed(ρ)`** abbreviates a `kind: Feed` history whose reconstructed channel is `ρ = 𝐷 ⤇ 𝑇`; the `value`/`domain` children are the two halves of `ρ`. An `Overwrite` history reaches the relation as a handle — a read has already dereffed at the rule that emitted it — so the four invariance rules below are specifically the `Feed`-kind behavior.
 
 The typing rules (`infer_simple_sub::emit_defer` / `emit_feed` / `emit_define`): `Defer` emits `Feed(fresh ρ)`; `Feed{name, value}` and `Define{name, value}` type as `Unit`, resolve `name` from the scope like a `Var` use, and constrain their contribution into the target's payload (`Fun(fresh δ, value_ty)` for a feed — the channel *domain* is a channelize artifact, so `δ` stays unconstrained and coalesces to `Infer`; the bare `value_ty` for a define). A target that isn't structurally a feed handle (a lambda parameter — ParamAsTarget) is demanded to be one via the upper bound `target <: Feed(ρf)`; the call-site argument edge meets it there and invariance carries the contribution back to the caller's channel. A bare `Defer` RHS is never generalized (`should_generalize` wants a lambda RHS), so feeds and reads of one defer share one `ρ`; a defer minted inside a generalized function instantiates fresh per call site.
 

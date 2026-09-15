@@ -1566,7 +1566,7 @@ fn constrain_go_impl(
         // filter-feed-through-UDF gaps (see design/mutability.md §4 and the
         // `ccl/channelize.rs` module docs).)
         // Transparent read: a non-mutable consumer of a feed channel consumes its
-        // whole stream `domain ⇒ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
+        // whole `domain ⤇ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
         // feeding one defer from another). Unlike a mutable variable (dereffed to its scalar
         // `value` above), a feed reads as the reconstructed channel function.
         (
@@ -1579,7 +1579,7 @@ fn constrain_go_impl(
         ) => {
             let chan = Type::Fun {
                 name: None,
-                // A feed's read view is a collection stream: a data function.
+                // A feed's read view is a collection: a data function.
                 fun_kind: FunKind::Data(None),
                 domain: domain.clone(),
                 codomain: value.clone(),
@@ -1602,7 +1602,7 @@ fn constrain_go_impl(
         ) => {
             let chan = Type::Fun {
                 name: None,
-                // A feed's read view is a collection stream: a data function.
+                // A feed's read view is a collection: a data function.
                 fun_kind: FunKind::Data(None),
                 domain: domain.clone(),
                 codomain: value.clone(),
@@ -2739,8 +2739,8 @@ mod tests {
 
     // --- Feed handles (`Type::History { kind: Feed }`) ---
 
-    /// A feed history over `domain ⇒ value`. Its read view is the whole
-    /// stream `Fun { domain, value }` (unlike an `Overwrite`, which derefs to the
+    /// A feed history over `domain ⤇ value`. Its read view is the whole
+    /// collection `Fun { domain, value }` (unlike an `Overwrite`, which derefs to the
     /// scalar `value`); the invariant `constrain` arms treat it as that `Fun`.
     fn feed_ty(domain: Type, value: Type) -> Type {
         Type::History {
@@ -2776,9 +2776,9 @@ mod tests {
     }
 
     #[test]
-    fn feed_reads_transparently_as_stream() {
-        // feed(D, Int) <: (D ⤇ Int) — a non-feed consumer reads the whole
-        // stream, which is the accumulated *collection*…
+    fn feed_reads_transparently_as_a_collection() {
+        // feed(D, Int) <: (D ⤇ Int) — a non-feed consumer reads the read view,
+        // which is the accumulated *collection*…
         let d = Type::UIntRange(3);
         let mut cache = ConstrainCache::new();
         assert!(
@@ -2789,7 +2789,7 @@ mod tests {
             )
             .is_ok()
         );
-        // …but the stream's value still has to match the consumer.
+        // …but the read view's value still has to match the consumer.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
             constrain_subtype(
@@ -2804,8 +2804,8 @@ mod tests {
     #[test]
     fn plain_value_is_not_a_feed() {
         // Int </: feed(D, Int) — reading a feed handle is transparent, but the
-        // write capability cannot be conjured from a plain (non-stream) value.
-        // A `Fun` LHS aligns into the feed (that is how `x << stream` works);
+        // write capability cannot be conjured from a plain, non-function value.
+        // A `Fun` LHS aligns into the feed (that is how a `<<` contribution works);
         // only a scalar hits the `NotAFeed` arm.
         let mut cache = ConstrainCache::new();
         assert!(matches!(

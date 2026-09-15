@@ -181,7 +181,7 @@ struct PointfulSite<'a> {
     /// the match.
     key_fn: Expr,
     /// The key binder the group's predicate closes over, taken from the outer Pi. It
-    /// has to ride the rebuilt arrow as a Pi for that `𝑘` to stay bound.
+    /// has to ride the rebuilt function type as a Pi for that `𝑘` to stay bound.
     key_binder: Option<Name>,
     /// The **extracted** key type — bare `𝐾`. The key morphism `c ≫ key` produces
     /// plain keys: which of them are present is a fact about the partition, not about
@@ -228,7 +228,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
         return None;
     };
     // head.ty = (k: K) ⇒ ({I | pred} ⇒ V) — read the types name-agnostically. The
-    // outer arrow's domain is the key domain `{K | k ▷ (𝑚 ▷ collection_contains)}` when the source
+    // outer function's domain is the key domain `{K | k ▷ (𝑚 ▷ collection_contains)}` when the source
     // came through `reify` (the `groupby` realization).
     // `Converse`'s key-extraction morphism `c ≫ key` produces plain keys, so strip
     // refinements here: the group key type is the bare `K`, the "present" identity

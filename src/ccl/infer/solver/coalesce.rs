@@ -229,7 +229,7 @@ fn coalesce_compact_go(
     // handle alone at a position keeps its constructor; so do two handles
     // meeting (their `history_slot`s merged upstream). This is the
     // join-variable counterpart of `constrain_go`'s direct feed read-through
-    // rule (a feed history `<: T` reads through to its stream `domain ⇒ value`).
+    // rule (a feed history `<: T` reads through to its read view `domain ⤇ value`).
     let ct = &dissolve_read_feeds(ct.clone(), polarity);
     // Count concrete (non-variable) contributions to pick the output
     // type. With multiple distinct contributions, we would need
@@ -566,7 +566,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
             ct.history_slot = Some((value, domain, kind));
             break;
         }
-        // The channel is the `domain ⇒ value` function; reconstruct it as a
+        // The channel is the `domain ⤇ value` function; reconstruct it as a
         // `fun`-slot CompactType (exactly what the old single-payload slot held)
         // and merge it into the read view.
         //
@@ -579,9 +579,9 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
             fun: Some(super::compact::CompactFun {
                 name: None,
                 binders: Vec::new(),
-                // A feed's read view is a collection stream: a data function.
+                // A feed's read view is a collection: a data function.
                 kind: super::compact::KindPin::Data,
-                // A stream is over its channel domain, not over an index of its own.
+                // A read view is over its channel domain, not over an index of its own.
                 domains_disagree: false,
                 domain,
                 combined: None,

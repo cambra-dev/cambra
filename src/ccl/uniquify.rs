@@ -222,7 +222,7 @@ impl Uniquifier {
         // *enclosing* scope — the scope as of this node, before any binder
         // this node introduces.
         //
-        // **A lambda's own arrow is the exception, by the same rule.**
+        // **A lambda's own function type is the exception, by the same rule.**
         // [`crate::ccl::TypedExpr::lambda`] sets the node's type to
         // `param_ty ⇒ body_ty`, so its codomain is a copy of the body's type and belongs
         // to the *binder's* scope rather than this one. Its arm walks the two halves each
@@ -268,7 +268,7 @@ impl Uniquifier {
             TypedExprNode::Lambda { param, body } => {
                 // The domain half is the param's declared type, so it resolves against the
                 // enclosing scope, alongside `binding_tys`. The codomain half is the body's
-                // type and resolves under the binder. Walking the whole arrow before the
+                // type and resolves under the binder. Walking the whole function type before the
                 // mint decides the codomain's names in the wrong scope — and a predicate is
                 // rebuilt **once**, with every occurrence re-pointed at that rebuild, so a
                 // decision made here is the one the copies visited later under the binder

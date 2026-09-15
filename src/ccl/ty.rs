@@ -602,7 +602,7 @@ pub enum KindPin {
     /// Pinned to a sum over this many binders.
     ///
     /// The **arity**, not the binders. Whether a function is over binders and how many are
-    /// facts about its kind — presence is what makes a sum and a plain arrow unrelatable —
+    /// facts about its kind — presence is what makes a sum and a plain function unrelatable —
     /// but *which* binder is not: a variable picks its binder names where its arity becomes
     /// known ([`FunKindVar::binder_ids`]), so naming them here would be a second answer.
     Sum(usize),
@@ -997,7 +997,7 @@ pub fn reset_fun_kind_var_counter() {
 /// | `BoundedHole(𝑇)` | Lowering | "A bounded annotation `𝑥 <: 𝑇`: infer this, subject to `<: 𝑇`" — an obligation, not a shape | Pass 1's `normalize_annotation` (flagged as `UnresolvedBoundedHole` if it survives) |
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreChannelize`) |
 /// | `History` (`history_kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
-/// | `History` (`history_kind: Append`) | Type checker only | "Feed channel `domain ⤇ value`: the defer binding's post-channelize stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
+/// | `History` (`history_kind: Append`) | Type checker only | "Feed channel `domain ⤇ value`: the defer binding's post-channelize collection type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
 ///
 /// A type is **concrete** when none of those variants occurs anywhere in it, nor
@@ -1186,7 +1186,7 @@ pub enum Type {
     /// `DataSource`, it has no enumerable static domain — its positions exist only
     /// in the tile. See src/ccl/design/mutability.md.
     Txn,
-    /// The type of a **history** handle: a function `domain ⇒ value` that a
+    /// The type of a **history** handle: a function `domain ⤇ value` that a
     /// `:=` mutable variable or a `defer`/`<<` channel writes incrementally. One variant
     /// for both — a mutable variable and a feed channel are the same object (an
     /// invariant, deref-transparent `domain ⇒ value`); they differ only in the
@@ -1198,7 +1198,7 @@ pub enum Type {
     ///   (`get_prev_seq` recurrence), and its trailing read is `final_or_default`
     ///   (a scalar). The unified phase materializes it with a carry-forward arm.
     /// - [`HistoryKind::Append`] — a **feed channel** (`defer` / `<<` / `<<=`). A
-    ///   reference reads the whole stream (`domain ⇒ value`), off-path positions
+    ///   reference reads the whole `domain ⤇ value`, off-path positions
     ///   are absent (no carry-forward), and `channelize` resolves it to the
     ///   collected channel.
     ///
@@ -1243,7 +1243,7 @@ pub enum Type {
         /// transaction time, or a feed channel's collection domain).
         domain: Box<Type>,
         /// Whether this is a mutable variable or a feed channel — selects the read
-        /// mode (scalar-final vs whole-stream) and, in the unified phase, whether
+        /// mode (scalar-final vs whole-collection) and, in the unified phase, whether
         /// off-path positions carry forward.
         history_kind: HistoryKind,
     },
@@ -1821,7 +1821,7 @@ impl Witness {
 }
 
 /// Which flavour of [`Type::History`] a handle is — a mutable variable (`:=`) or a
-/// feed channel (`defer` / `<<`). The two are the same object (a `domain ⇒
+/// feed channel (`defer` / `<<`). The two are the same object (a `domain ⤇
 /// value` history) but read and materialize differently; see [`Type::History`].
 ///
 /// `Ord` carries no semantics — the two kinds are unordered alternatives. It
@@ -1835,7 +1835,7 @@ pub enum HistoryKind {
     /// read, and a carry-forward arm for off-path positions.
     Overwrite,
     /// A feed channel introduced by `defer` and written with `<<` / `<<=` — read
-    /// as the whole `domain ⇒ value` stream, with off-path positions absent.
+    /// as the whole `domain ⤇ value`, with off-path positions absent.
     Append,
 }
 
@@ -2223,7 +2223,7 @@ impl Type {
 
     /// [`Type::pi`] at an explicit kind, for a rebuild that carries the `FunKind`
     /// it is replacing: a group-by partition function is a dependent *collection*,
-    /// so its Pi stays `⤇` instead of flattening to the capability arrow.
+    /// so its Pi stays `⤇` instead of flattening to a compute function.
     ///
     /// Closes its codomain exactly as [`Type::pi`] does — the kind is the only
     /// difference, and reaching for a bare [`Type::Fun`] literal to get it is what
@@ -2331,12 +2331,12 @@ impl Type {
     /// the safe default at a site with no function type to copy from.
     ///
     /// **A feed channel is a function too**, before `channelize` has made it one: a
-    /// [`HistoryKind::Append`] history states the stream `domain ⤇ value`, and
+    /// [`HistoryKind::Append`] history states the collection `domain ⤇ value`, and
     /// `channelize::erase_chan_domains_in_type` erases it to exactly that. A pass that
     /// rebuilds around a still-unerased handle — the chain a per-iteration feed becomes —
     /// has a kind to copy, and taking the `Compute` default there declares a collection a
     /// capability. ([`HistoryKind::Overwrite`] is not this case: a mutable variable handle
-    /// erases to its *value*, so it states no arrow to copy.)
+    /// erases to its *value*, so it states no function type to copy.)
     ///
     /// **A sum is a function.** `Σ (𝑤 : 𝐾). (𝑤 ⤇ 𝑉)` is a collection exactly as `𝐷 ⤇ 𝑉`
     /// is; the witness binder only says its domain is whichever candidate was taken. So
@@ -2540,7 +2540,7 @@ impl Type {
     ///
     /// A mutable variable is a [`HistoryKind::Overwrite`] history `Mut(𝑉, 𝐷)`, and
     /// this is `𝑉` — what one read of it yields. A feed channel is deliberately
-    /// *not* one ([`Type::as_feed`]): it reads as its whole stream, so the two are
+    /// *not* one ([`Type::as_feed`]): it reads as its whole collection, so the two are
     /// never interchangeable at a read.
     pub fn mut_value_type(&self) -> Option<&Type> {
         match self.peel_refinements() {
@@ -2557,7 +2557,7 @@ impl Type {
     /// not one.
     ///
     /// A channel is a [`HistoryKind::Append`] history, and what a read of it yields
-    /// is the whole stream `domain ⇒ value` — hence the pair, where
+    /// is the whole `domain ⤇ value` — hence the pair, where
     /// [`Type::mut_value_type`] returns a single value type.
     pub fn as_feed(&self) -> Option<(&Type, &Type)> {
         match self.peel_refinements() {
@@ -2610,7 +2610,7 @@ impl Type {
     /// [`UIntRanges`](TypeKind::UIntRanges) takes no parameter, and a conditional collection,
     /// whose candidates are named.
     ///
-    /// **The witness arrow is a Pi**, for the reason [`full_map_of`](Self::full_map_of)
+    /// **The witness function is a Pi**, for the reason [`full_map_of`](Self::full_map_of)
     /// is one: a map's value may depend on its key, so the type declares the binder that
     /// dependence names. `box` puts the same binder on the same position
     /// (`a_boxed_dependent_collection_declares_its_binder_on_the_witness`), so without it
@@ -4709,7 +4709,7 @@ mod tests {
         assert!(refine(mut_var).is_handle() && refine(channel.clone()).is_handle());
 
         // The two kinds are not interchangeable: a channel reads as its whole
-        // stream, a mutable variable as one value, so neither accessor answers for the other.
+        // collection, a mutable variable as one value, so neither accessor answers for the other.
         assert_eq!(channel.mut_value_type(), None);
         assert_eq!(
             Type::History {

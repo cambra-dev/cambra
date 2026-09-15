@@ -919,7 +919,7 @@ impl Subst {
     /// **ends** recomputed from the rewritten elements (substituting a `Var` whose
     /// type was an unresolved placeholder can concretize the element types; the
     /// `Compose.ty == Fun(first_domain, last_codomain)` invariant must follow) —
-    /// the arrow's `FunKind` and Pi binder are preserved, since those belong to
+    /// the function type's `FunKind` and Pi binder are preserved, since those belong to
     /// the composition and not to its elements.
     pub fn rewrite_expr(&self, e: &mut TypedExpr) {
         if self.is_id() {
@@ -1069,11 +1069,11 @@ impl Subst {
         // `Compose`'s type is derived from its elements, so rewriting them can
         // concretize it (substituting a `Var` whose type was a placeholder).
         //
-        // `fun_like`, not `fun`: only the arrow's *ends* are derived from the
+        // `fun_like`, not `fun`: only the function type's *ends* are derived from the
         // elements. Its `FunKind` and any Pi binder are properties of the
         // composition itself, and `Type::fun` answers `Compute`/`None` for both —
         // so rebuilding with it silently downgrades a data collection `⤇` to a
-        // compute arrow `⇒` and drops a dependent binder, on every `Compose` a
+        // compute function `⇒` and drops a dependent binder, on every `Compose` a
         // live substitution happens to reach
         // (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions").
         if let TypedExprNode::Compose(elts) = &e.node
@@ -2539,7 +2539,7 @@ mod tests {
         crate::ccl::context::assert_unique_node_ids(&out, "discharge_env_in_place");
     }
 
-    /// A `Compose`'s arrow *ends* are derived from its elements, so a
+    /// A `Compose`'s *ends* are derived from its elements, so a
     /// substitution recomputes them — but its `FunKind` and Pi binder are not,
     /// and rebuilding with `Type::fun` would answer `Compute`/`None` for both.
     /// A data collection `⤇` must survive a discharge that reaches it, or
@@ -2547,16 +2547,16 @@ mod tests {
     #[test]
     fn a_compose_keeps_its_fun_kind_and_binder_across_a_discharge() {
         let int_ty = Type::Base(crate::ccl::BaseType::Int);
-        let arrow = Type::data_fun(int_ty.clone(), int_ty.clone());
+        let fun_ty = Type::data_fun(int_ty.clone(), int_ty.clone());
 
         // (f ≫ g) : Int ⤇ Int, with `f` the substituted occurrence.
         let mut compose = TypedExpr::compose(vec![
-            var("f").with_ty(arrow.clone()),
-            var("g").with_ty(arrow.clone()),
+            var("f").with_ty(fun_ty.clone()),
+            var("g").with_ty(fun_ty.clone()),
         ]);
         compose.ty = Type::pi("n", int_ty.clone(), int_ty.clone());
-        // A Pi arrow whose ends the elements will recompute; the binder must stay.
-        let replacement = var("h").with_ty(arrow);
+        // A Pi function type whose ends the elements will recompute; the binder must stay.
+        let replacement = var("h").with_ty(fun_ty);
         let env: HashMap<Name, TypedExpr> = HashMap::from([(Name::raw("f"), replacement)]);
 
         let out = Subst::discharge_env_in_place(compose, &env);
@@ -2567,7 +2567,7 @@ mod tests {
         assert_eq!(
             (name.as_ref().map(Name::base), fun_kind),
             (Some("n"), &crate::ccl::FunKind::Compute),
-            "the arrow's species and binder are the composition's, not its \
+            "the function type's species and binder are the composition's, not its \
              elements' — `Type::fun` would have flattened both"
         );
     }
@@ -2578,15 +2578,15 @@ mod tests {
     #[test]
     fn a_data_compose_is_not_downgraded_to_a_compute_arrow() {
         let int_ty = Type::Base(crate::ccl::BaseType::Int);
-        let arrow = Type::data_fun(int_ty.clone(), int_ty.clone());
+        let fun_ty = Type::data_fun(int_ty.clone(), int_ty.clone());
 
         let mut compose = TypedExpr::compose(vec![
-            var("f").with_ty(arrow.clone()),
-            var("g").with_ty(arrow.clone()),
+            var("f").with_ty(fun_ty.clone()),
+            var("g").with_ty(fun_ty.clone()),
         ]);
-        compose.ty = arrow.clone();
+        compose.ty = fun_ty.clone();
         let env: HashMap<Name, TypedExpr> =
-            HashMap::from([(Name::raw("f"), var("h").with_ty(arrow))]);
+            HashMap::from([(Name::raw("f"), var("h").with_ty(fun_ty))]);
 
         let out = Subst::discharge_env_in_place(compose, &env);
 

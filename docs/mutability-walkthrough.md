@@ -116,7 +116,7 @@ The two differ only in their merge/read law:
 ```
 
 One type carries both: `Type::History { value, domain, kind }`, where `kind` is
-`Overwrite` (displayed `Mut(𝑉, 𝐷)`) or `Append` (displayed `feed(𝐷 ⇒ 𝑉)`). This
+`Overwrite` (displayed `Mut(𝑉, 𝐷)`) or `Append` (displayed `feed(𝐷 ⤇ 𝑉)`). This
 distinction is the through-line of the whole design — it is why the eliminator has two
 halves, and why the two get different aliasing rules (see
 [§5](#5-mutability-is-a-type)).
@@ -532,7 +532,7 @@ a key of the store all the same.
 lifted into the letrec below — which is the clearest single picture of what this phase does:
 
 ```
-let out : feed(chan(out) ⇒ Int) = defer
+let out : feed(chan(out) ⤇ Int) = defer
 in for r in [10, 20, 30] do unit;
    for __txn_item_0 in [unit] do unit;
    letrec

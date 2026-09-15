@@ -461,7 +461,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
 /// Otherwise a history reads through transparently (the solver's read-through rule,
 /// mirrored in `provide_function`): a read agrees with the handle's read view, and two
 /// handles agree iff their read views do. The read view is kind-specific — a `Feed`
-/// reads as its whole stream `domain ⇒ value`, an `Overwrite` derefs to its scalar
+/// reads as its whole `domain ⤇ value`, an `Overwrite` derefs to its scalar
 /// `value`. A `Feed` channel domain is the rigid nominal `ChanDom(d)`, which
 /// `channelize` erases to the concrete channel domain by substitution; the `ChanDom`
 /// arm agrees it by name.
@@ -514,7 +514,7 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
         _ => unreachable!("called only when at least one side peels to a History"),
     };
     match kind {
-        // A feed's read view is a collection stream: a data function.
+        // A feed's read view is a collection: a data function.
         HistoryKind::Append => types_agree_modulo_unread(
             &Type::data_fun((**domain).clone(), (**value).clone()),
             other,

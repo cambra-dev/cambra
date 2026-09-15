@@ -379,8 +379,8 @@ fn lower_groupby(
     );
     let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), span, gb);
 
-    // The arrow is a collection because the `data_fun` annotation says so, which
-    // `emit_node` stamps onto the arrow `emit_lambda` builds — an arrow already carrying
+    // The function is a collection because the `data_fun` annotation says so, which
+    // `emit_node` stamps onto the function type `emit_lambda` builds — one already carrying
     // this binder and its domain.
     let keyed = ctx.tag_machinery(
         Expr::lambda("__gb_k", key_domain.clone(), inner)

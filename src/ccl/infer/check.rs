@@ -362,7 +362,7 @@ impl Typing for CheckCtx {
                 codomain: c,
                 ..
             } => Ok(((**d).clone(), (**c).clone())),
-            // A `Feed` history reads as its whole stream `domain ⇒ value` — a
+            // A `Feed` history reads as its whole `domain ⤇ value` — a
             // defer's channel — so it destructures directly to (domain, value).
             Type::History {
                 domain,
