@@ -9,6 +9,7 @@
 // ancestors so they are visible.
 
 import type { Resolved, Store } from "./store";
+import { el } from "./dom";
 import type { IrNode } from "./types";
 
 // Auto-expand the tree to this depth; deeper nodes start collapsed but usable.
@@ -72,13 +73,6 @@ export function serializeTree(root: number, nodeById: Map<number, IrNode>): stri
   };
   walk(root, null, 0, new Set());
   return lines.join("\n");
-}
-
-function el(tag: string, className?: string, text?: string): HTMLElement {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
 }
 
 // Per-node view handles, so a selection change can drive highlight + expand
