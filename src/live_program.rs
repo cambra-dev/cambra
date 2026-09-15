@@ -314,7 +314,7 @@ impl LiveProgram {
                      bare `f(…)` — and a reload can follow them wherever they move."
                 } else if unseatable
                     .iter()
-                    .any(|c| matches!(c, StateConflict::CarriedAt { .. }))
+                    .any(|c| matches!(c, StateConflict::LoadFromAt { .. }))
                 {
                     // The declaration's annotation is what the value is read
                     // at, so it has to state the whole of what the running

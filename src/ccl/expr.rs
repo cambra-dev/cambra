@@ -601,8 +601,8 @@ pub enum TypedExprNode {
     ///
     /// The name is the source's own spelling. Which variable it addresses is
     /// decided by where the node sits, exactly as a declaration's address is —
-    /// see [`CarriedSite`](crate::interpreter::operator_conversion::CarriedSite).
-    Carried(String),
+    /// see [`LoadFromSite`](crate::interpreter::operator_conversion::LoadFromSite).
+    LoadFrom(String),
 
     /// N-ary point-free function composition: `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁`.
     ///
@@ -756,7 +756,7 @@ impl TypedExprNode {
             TypedExprNode::Proj(_) => "Proj",
             TypedExprNode::Record(_) => "Record",
             TypedExprNode::Source(_) => "Source",
-            TypedExprNode::Carried(_) => "Carried",
+            TypedExprNode::LoadFrom(_) => "LoadFrom",
             TypedExprNode::Compose(_) => "Compose",
             TypedExprNode::Copair(_) => "Copair",
             TypedExprNode::DisjointJoin(_) => "DisjointJoin",
@@ -1111,9 +1111,9 @@ impl TypedExpr {
         Self::new(TypedExprNode::Builtin(b))
     }
 
-    /// Construct a [`TypedExprNode::Carried`] reference to `name`.
-    pub fn carried(name: impl Into<String>) -> Self {
-        Self::new(TypedExprNode::Carried(name.into()))
+    /// Construct a [`TypedExprNode::LoadFrom`] reference to `name`.
+    pub fn load_from(name: impl Into<String>) -> Self {
+        Self::new(TypedExprNode::LoadFrom(name.into()))
     }
 
     /// Construct a list literal expression.
@@ -1521,7 +1521,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Carried(_)
+            | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
@@ -1710,7 +1710,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Carried(_)
+            | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
@@ -1839,7 +1839,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Carried(_)
+            | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
@@ -1889,7 +1889,7 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Carried(_)
+            | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }

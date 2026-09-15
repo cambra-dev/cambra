@@ -57,7 +57,7 @@ impl Constant {
     /// transforms each output and keeps the domain.
     ///
     /// Which of the two a constant is cannot be read off the value, so the call
-    /// site states it — see [`TypedExprNode::Carried`](crate::ccl::TypedExprNode),
+    /// site states it — see [`TypedExprNode::LoadFrom`](crate::ccl::TypedExprNode),
     /// the one site that does.
     ///
     /// # Panics

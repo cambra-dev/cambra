@@ -565,7 +565,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::Carried(_) => expr.ty.clone(),
+        | TypedExprNode::LoadFrom(_) => expr.ty.clone(),
 
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 

@@ -535,7 +535,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
         | N::Builtin(_)
         | N::Proj(_)
         | N::Source(_)
-        | N::Carried(_)
+        | N::LoadFrom(_)
         | N::Defer
         | N::Error => {
             vec![]

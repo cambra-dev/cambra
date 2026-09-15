@@ -1024,7 +1024,7 @@ fn a_retired_variable_seeds_its_replacement() {
 
     let report = live
         .reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
-        .expect("retiring `latest` is accepted where `carried` reads it");
+        .expect("retiring `latest` is accepted where a `@LoadFrom` reads it");
     // The seed summarizes the position the retired variable folded, so the store
     // resumes above it. Answered from variable identity alone, `marked` reads as
     // fresh and the report claims a position that was never lost.
@@ -1046,7 +1046,7 @@ fn a_retired_variable_seeds_its_replacement() {
 /// keeping the old variable live while seeding a new one from it.
 ///
 /// The two share a commit store — one `with begin():` block reads both, so they
-/// fall in one causal group — which is the shape where a `carried` reads a key
+/// fall in one causal group — which is the shape where a `@LoadFrom` reads a key
 /// of the very store its own key is seeded into.
 #[test]
 fn a_loaded_variable_may_stay_declared() {
@@ -1121,7 +1121,7 @@ fn a_reload_may_not_load_a_variable_nothing_holds() {
     let errors = live
         .reload(
             &mut ctx,
-            &source("latest-write-carries-a-stranger", port),
+            &source("latest-write-loads-a-stranger", port),
             &no_main,
         )
         .err()
@@ -1136,7 +1136,7 @@ fn a_reload_may_not_load_a_variable_nothing_holds() {
     assert_eq!(still_serving, vec!["bob"], "state intact");
 }
 
-/// Reading a carried value at a type the running program does not hold it at is
+/// Reading a loaded value at a type the running program does not hold it at is
 /// refused, by the comparison a declaration gets.
 #[test]
 fn a_reload_may_not_load_a_variable_at_another_type() {
@@ -1169,7 +1169,7 @@ fn a_reload_may_not_load_a_variable_at_another_type() {
 /// match — not the shape the variable was declared at.
 ///
 /// A record used one field at a time infers a record of that one field, so the
-/// expression around a `carried` decides what shape is demanded of the
+/// expression around a `@LoadFrom` decides what shape is demanded of the
 /// predecessor. Stating the shape is what makes a partial use compile.
 #[test]
 fn a_loaded_record_is_read_at_the_shape_annotated() {
@@ -1316,7 +1316,7 @@ fn a_version_loading_state_is_not_a_cold_start() {
 /// Built here rather than named because it has no `{PORT}` to substitute: the
 /// program's value is its accumulator, pulled to terminal.
 ///
-/// The regression this pins: before `carried`, a new variable's initialiser
+/// The regression this pins: before `@LoadFrom`, a new variable's initialiser
 /// naming the old one bound the plain `let` the declaration lowers to rather
 /// than the value the store held, so the migration silently read the declared
 /// init — `2` here rather than `8`.
@@ -1341,7 +1341,7 @@ fn an_induction_accumulator_carries_into_its_replacement() {
     assert_eq!(drive_main_int(&mut ctx, &mut live), 8);
 
     live.reload(&mut ctx, v2, &no_main)
-        .expect("retiring `n` is accepted where `carried` reads it");
+        .expect("retiring `n` is accepted where a `@LoadFrom` reads it");
 
     // `80000`, and nothing more: the seed summarizes every position of `[1, 2, 3]`,
     // so `m`'s drive resumes above them rather than folding them a second time.
@@ -1386,7 +1386,7 @@ fn a_map_valued_variable_carries_whole() {
     );
 
     live.reload(&mut ctx, v2, &no_main)
-        .expect("retiring a keyed collection is accepted where `carried` reads it");
+        .expect("retiring a keyed collection is accepted where a `@LoadFrom` reads it");
 
     // The collection carries whole, `sol` included. The writer does not fire
     // again: its one position of `[1]` is committed into the value that was
@@ -1401,12 +1401,12 @@ fn a_map_valued_variable_carries_whole() {
     );
 }
 
-/// A carried collection is transformed on its way into the variable that
+/// A loaded collection is transformed on its way into the variable that
 /// replaces it — the whole of a unit change on persisted state, as a
 /// declaration.
 ///
 /// A comprehension over a map binds each value and keeps the domain, so scaling
-/// every quantity is a value-only transformation over the carried collection.
+/// every quantity is a value-only transformation over the loaded collection.
 /// Both the seed's keys and the one the retired version wrote survive it.
 #[test]
 fn a_loaded_collection_is_transformed_into_its_replacement() {
@@ -1503,7 +1503,7 @@ fn an_exact_annotation_on_a_rebuilt_collection_is_refused() {
     );
 }
 
-/// A carried collection whose values are records is transformed on its way into
+/// A loaded collection whose values are records is transformed on its way into
 /// the variable that replaces it.
 ///
 /// A map's seed reaches the store as a column of values, and a column of records
@@ -1812,7 +1812,7 @@ fn a_load_inside_an_instantiation_reaches_its_own_variable() {
 
     live.reload(&mut ctx, v2, &no_main)
         .expect("the load resolves outward to the variable of its own instantiation");
-    // The carried 6 scaled by ten. `[1, 2]` is not folded again: the value
+    // The loaded 6 scaled by ten. `[1, 2]` is not folded again: the value
     // loaded already summarizes both its positions.
     assert_eq!(drive_main_int(&mut ctx, &mut live), 60);
 }
