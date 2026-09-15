@@ -465,7 +465,7 @@ impl TileProducer for VariantWrapProducer {
 ///   domain `D` is explicit (a variant field of a record stream, `x.f`). The
 ///   projected keys are the **actual `D` keys** at the tagged positions,
 ///   *not* synthetic positions — so the projected payload co-iterates by key
-///   with the outer element `x` under a `zip`/`FanIn` (the outer-binder arm
+///   with the outer element `x` under a `zip`/`Zip` (the outer-binder arm
 ///   `λ (x, wᵢ) → eᵢ`), which inner-joins on shared keys.
 ///
 /// **Restrict and project are one operation here.** A [`ColumnValue::Union`] arm
@@ -1077,8 +1077,8 @@ mod tests {
     /// **Outer-binder alignment.** Over a variant *stream* keyed by an explicit
     /// (non-`0..N`) domain, `VariantProject` keeps the real domain keys, so the
     /// projected payload co-iterates by key with the outer element under a
-    /// `FanIn` (the `⟨id, x.f ≫ variant_project(cᵢ)⟩ ▷ zip` shape). This is the
-    /// mechanism the outer-binder arm `λ (x, wᵢ) → eᵢ` relies on; the `FanIn`
+    /// `Zip` (the `⟨id, x.f ≫ variant_project(cᵢ)⟩ ▷ zip` shape). This is the
+    /// mechanism the outer-binder arm `λ (x, wᵢ) → eᵢ` relies on; the `Zip`
     /// inner-joins on the shared keys, so the outer arm need not be pre-restricted.
     #[test]
     fn variant_project_stream_preserves_keys_and_zips() {
@@ -1130,9 +1130,9 @@ mod tests {
             codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
 
-        // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the FanIn joins
+        // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the Zip joins
         // the full outer stream with the tag-restricted payload on shared keys.
-        let mut fan = FanIn::new(vec![
+        let mut fan = Zip::new(vec![
             Box::new(FixedOp {
                 tile: outer_tile,
                 tiling: outer_tiling,

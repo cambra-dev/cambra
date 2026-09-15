@@ -553,7 +553,7 @@ pub enum TypedExprNode {
 
     /// A tuple constructor: `(e0, e1, ...)`.
     ///
-    /// Compiles to a [`crate::interpreter::tile_operators::FanIn`] record with fields
+    /// Compiles to a [`crate::interpreter::tile_operators::Zip`] record with fields
     /// named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]).
     Tuple(Vec<TypedExpr>),
 

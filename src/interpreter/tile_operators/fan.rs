@@ -17,7 +17,7 @@ use crate::{
 ///
 /// All inputs must have `SealedFunction` tilings with compatible domains.
 /// Output fields are named `_0`, `_1`, … matching the input order.
-pub struct FanIn {
+pub struct Zip {
     /// Output tiling: either a `SealedFunction { domain, codomain: Record { … } }`
     /// or a `CurriedFunction { domain1, domain2, codomain: Record { … } }`,
     /// depending on the input operators.
@@ -28,8 +28,8 @@ pub struct FanIn {
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
-impl FanIn {
-    /// Create a new `FanIn` operator over the given input operators.
+impl Zip {
+    /// Create a new `Zip` operator over the given input operators.
     ///
     /// All inputs must be either all `SealedFunction` tilings with the same domain,
     /// or all `CurriedFunction` tilings with the same domain1, offsets, and domain2.
@@ -44,27 +44,27 @@ impl FanIn {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        assert!(!inputs.is_empty(), "FanIn requires at least one input");
+        assert!(!inputs.is_empty(), "Zip requires at least one input");
         let names = (0..inputs.len()).map(tuple_field).collect();
         Self::new_impl(names, inputs)
     }
 
-    /// Construct a `FanIn` with explicit named fields for record literals.
+    /// Construct a `Zip` with explicit named fields for record literals.
     ///
     /// Like [`Self::new`] but uses caller-supplied field names instead of
     /// the synthetic `_0`, `_1`, … names used for tuples.
     pub fn new_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Self {
-        assert!(!inputs.is_empty(), "FanIn requires at least one input");
+        assert!(!inputs.is_empty(), "Zip requires at least one input");
         let (names, ops) = inputs.into_iter().unzip();
         Self::new_impl(names, ops)
     }
 
     fn new_impl(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>) -> Self {
-        // The [`fan_in`] dispatcher guarantees all inputs are function-typed
-        // (otherwise it routes to [`ScalarFanIn`]).  Inputs may still have
+        // The [`zip_arms`] dispatcher guarantees all inputs are function-typed
+        // (otherwise it routes to [`MakeRecord`]).  Inputs may still have
         // *different* tile-level presence at runtime — e.g. one branch has
         // emitted positions 0..3 while another has only 0..2 — which is
-        // handled by an intersection step in `FanInProducer::get_impl`.
+        // handled by an intersection step in `ZipProducer::get_impl`.
         let first_tiling = ops[0].tiling();
         let tiling = match first_tiling {
             Tiling::SealedFunction { domain, .. } => {
@@ -72,11 +72,11 @@ impl FanIn {
                     if let Tiling::SealedFunction { domain: d, .. } = op.tiling() {
                         assert_eq!(
                             domain, d,
-                            "FanIn: all SealedFunction inputs must have the same domain"
+                            "Zip: all SealedFunction inputs must have the same domain"
                         );
                     } else {
                         panic!(
-                            "FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
+                            "Zip: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
                         );
                     }
                 }
@@ -113,15 +113,15 @@ impl FanIn {
                     {
                         assert_eq!(
                             domain1, d1,
-                            "FanIn: all CurriedFunction inputs must have the same domain1"
+                            "Zip: all CurriedFunction inputs must have the same domain1"
                         );
                         assert_eq!(
                             domain2, d2,
-                            "FanIn: all CurriedFunction inputs must have the same domain2"
+                            "Zip: all CurriedFunction inputs must have the same domain2"
                         );
                     } else {
                         panic!(
-                            "FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
+                            "Zip: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
                         );
                     }
                 }
@@ -144,7 +144,7 @@ impl FanIn {
                 }
             }
             _ => panic!(
-                "FanIn: all inputs must have function tilings (SealedFunction or CurriedFunction)"
+                "Zip: all inputs must have function tilings (SealedFunction or CurriedFunction)"
             ),
         };
         Self {
@@ -155,42 +155,37 @@ impl FanIn {
     }
 }
 
-/// Tile-polymorphic fan-in factory.
+/// Zip N arms of a CCL-level `zip(f₀, …, fₙ₋₁)`, at whichever tiling they compiled to.
 ///
-/// Given N operators representing the arms of a CCL-level `zip(f₀, …, fₙ₋₁)`,
-/// returns the correct tile-level combinator for the arms' runtime tilings:
+/// Function-tiled arms share a domain, and zipping them is [`Zip`]. Arms that all
+/// came out scalar have no domain to share, and their zip is the record of their
+/// values — the degenerate case, which is [`MakeRecord`]. The upstream `input` at
+/// the zip site decides which, so a caller hands over the compiled arms without
+/// knowing; see "CCL types vs. tilings" in
+/// [`design-operators.md`](./design-operators.md).
 ///
-/// - If every arm has a scalar tiling (`Scalar` or a `Record` of scalars),
-///   the fan-in is just a record-of-values and [`ScalarFanIn`] is returned.
-/// - Otherwise the arms carry function tilings and [`FanIn`] is returned,
-///   which fans the shared domain out into a record-codomain sealed/curried
-///   function.
-///
-/// Callers at op-conversion can hand the compiled arms to this factory
-/// without knowing what tiling the arms ended up with — the upstream
-/// `input` at the zip call site determines that, and the factory picks
-/// the right combinator. See the "CCL types vs. tilings" section of
-/// [`design-operators.md`](./design-operators.md) for why the same
-/// CCL-level `zip` compiles to two different tile operators.
-pub fn fan_in(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+/// A product **value** does not come through here. It is a record of tiles whatever
+/// its components tiled as, and `build_product` reads that off the node's own type
+/// rather than off the arms.
+pub fn zip_arms(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
     if inputs.iter().all(|op| op.tiling().is_scalar()) {
-        Box::new(ScalarFanIn::new(inputs))
+        Box::new(MakeRecord::new(inputs))
     } else {
-        Box::new(FanIn::new(inputs))
+        Box::new(Zip::new(inputs))
     }
 }
 
-/// Named-field variant of [`fan_in`]: like [`fan_in`] but uses caller-supplied
+/// Named-field variant of [`zip_arms`]: like [`zip_arms`] but uses caller-supplied
 /// field names instead of the synthetic `_0`, `_1`, … names.
-pub fn fan_in_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn TileOperator> {
+pub fn zip_arms_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn TileOperator> {
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
-        Box::new(ScalarFanIn::new_named(inputs))
+        Box::new(MakeRecord::new_named(inputs))
     } else {
-        Box::new(FanIn::new_named(inputs))
+        Box::new(Zip::new_named(inputs))
     }
 }
 
-impl TileOperator for FanIn {
+impl TileOperator for Zip {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -206,8 +201,8 @@ impl TileOperator for FanIn {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
-        Box::new(FanInProducer {
-            base: ProducerBase::new(FanInProducer::alloc_id(), self.tiling()),
+        Box::new(ZipProducer {
+            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling()),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -224,8 +219,8 @@ impl TileOperator for FanIn {
     }
 }
 
-/// Producer for [`FanIn`]: pulls each input and assembles a record-codomain tile.
-struct FanInProducer {
+/// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
+struct ZipProducer {
     base: ProducerBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
@@ -233,7 +228,7 @@ struct FanInProducer {
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
-impl TileProducer for FanInProducer {
+impl TileProducer for ZipProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -286,7 +281,7 @@ impl TileProducer for FanInProducer {
                         ..
                     } = t
                     else {
-                        panic!("FanIn: cannot mix SealedFunction and other tile types")
+                        panic!("Zip: cannot mix SealedFunction and other tile types")
                     };
                     let p = Predicate::from_column_value(domain);
                     presence = Some(match presence {
@@ -377,19 +372,19 @@ impl TileProducer for FanInProducer {
                             if let Some(ref prev_d1) = domain1 {
                                 assert_eq!(
                                     prev_d1, &d1,
-                                    "FanIn: all inputs must have the same domain1"
+                                    "Zip: all inputs must have the same domain1"
                                 );
                             }
                             if let Some(ref prev_offs) = offsets {
                                 assert_eq!(
                                     prev_offs, &offs,
-                                    "FanIn: all inputs must have the same offsets"
+                                    "Zip: all inputs must have the same offsets"
                                 );
                             }
                             if let Some(ref prev_d2) = domain2 {
                                 assert_eq!(
                                     prev_d2, &d2,
-                                    "FanIn: all inputs must have the same domain2"
+                                    "Zip: all inputs must have the same domain2"
                                 );
                             }
                             if let Some(ref mut prev) = domain_pred {
@@ -402,7 +397,7 @@ impl TileProducer for FanInProducer {
                             domain2 = Some(d2);
                             codomains.push(cod);
                         }
-                        _ => panic!("FanIn: cannot mix CurriedFunction and other tile types"),
+                        _ => panic!("Zip: cannot mix CurriedFunction and other tile types"),
                     }
                 }
 
@@ -423,7 +418,7 @@ impl TileProducer for FanInProducer {
                     deleted: BitSet::new(),
                 }
             }
-            _ => panic!("FanIn: all inputs must be SealedFunction or CurriedFunction tiles"),
+            _ => panic!("Zip: all inputs must be SealedFunction or CurriedFunction tiles"),
         }
     }
 
@@ -438,48 +433,49 @@ impl TileProducer for FanInProducer {
                 TileGuard::Function(FunctionGuard::Codomain(g)) => {
                     TileGuard::Function(FunctionGuard::Codomain(g.clone()))
                 }
-                g => unimplemented!("FanIn cannot honor the release guard {g:?}"),
+                g => unimplemented!("Zip cannot honor the release guard {g:?}"),
             })
         });
     }
 }
 
-/// Pack N scalar inputs into a single scalar [`Tile::Record`] output.
+/// Build a record **value** from N components: a `Tile::Record` whose fields are
+/// `_0`, `_1`, … for a tuple, or the source's own names for a record.
 ///
-/// Analogous to [`FanIn`] for function tiles, but operates entirely on scalars:
-/// each input must produce a `Tile::Scalar` and the output is a
-/// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
-pub struct ScalarFanIn {
+/// Each field keeps the tiling its own component produced, so a scalar component
+/// stays a scalar and a collection component stays the sealed function it already
+/// was, with the domain it binds. Nothing here shares a domain — that is [`Zip`],
+/// which is the other thing a `Tuple`/`Record` node can mean
+/// (`src/interpreter/design-operators.md`, "A product value is a record of tiles").
+///
+/// [`SelectField`] is the eliminator, and the pair is what makes a field's guard
+/// travel on its own: the fields settle independently, so a consumer reading one
+/// releases one.
+pub struct MakeRecord {
     base: OperatorBase,
     /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<String>,
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
-impl ScalarFanIn {
-    /// Construct a `ScalarFanIn` from N scalar input operators.
+impl MakeRecord {
+    /// Construct a `MakeRecord` from N scalar input operators.
     ///
     /// All inputs must have scalar tilings. The output `extent` and `tiling`
     /// are derived: each input's scalar extent becomes a field (`_0`, `_1`, …)
     /// in the output `Extent::Record`.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
-        assert!(
-            !inputs.is_empty(),
-            "ScalarFanIn requires at least one input"
-        );
+        assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let names = (0..inputs.len()).map(tuple_field).collect();
         Self::new_impl(names, inputs)
     }
 
-    /// Construct a `ScalarFanIn` with explicit named fields for record literals.
+    /// Construct a `MakeRecord` with explicit named fields for record literals.
     ///
     /// Like [`Self::new`] but uses the caller-supplied field names instead of
     /// the synthetic `_0`, `_1`, … names used for tuples.
     pub fn new_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Self {
-        assert!(
-            !inputs.is_empty(),
-            "ScalarFanIn requires at least one input"
-        );
+        assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let (names, ops) = inputs.into_iter().unzip();
         Self::new_impl(names, ops)
     }
@@ -500,7 +496,7 @@ impl ScalarFanIn {
     }
 }
 
-impl TileOperator for ScalarFanIn {
+impl TileOperator for MakeRecord {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -516,8 +512,8 @@ impl TileOperator for ScalarFanIn {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
-        Box::new(ScalarFanInProducer {
-            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), self.tiling()),
+        Box::new(MakeRecordProducer {
+            base: ProducerBase::new(MakeRecordProducer::alloc_id(), self.tiling()),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -535,9 +531,9 @@ impl TileOperator for ScalarFanIn {
     }
 }
 
-/// Producer for [`ScalarFanIn`]: pulls each scalar input and combines them into
+/// Producer for [`MakeRecord`]: pulls each scalar input and combines them into
 /// a `Tile::Scalar(ColumnValue::Records)`.
-struct ScalarFanInProducer {
+struct MakeRecordProducer {
     base: ProducerBase,
     names: Vec<String>,
     inputs: Vec<Box<dyn TileProducer>>,
@@ -553,7 +549,7 @@ struct ScalarFanInProducer {
     released: std::collections::HashSet<String>,
 }
 
-impl TileProducer for ScalarFanInProducer {
+impl TileProducer for MakeRecordProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -566,7 +562,7 @@ impl TileProducer for ScalarFanInProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let field_tilings = match self.tiling() {
             Tiling::Record(m) => m.clone(),
-            other => unreachable!("a ScalarFanIn tiles as a record, got {other}"),
+            other => unreachable!("a MakeRecord tiles as a record, got {other}"),
         };
         let fields: HashMap<String, Tile> = self
             .names
@@ -623,7 +619,7 @@ impl TileProducer for ScalarFanInProducer {
 
 /// Pick one field out of a **product value**.
 ///
-/// The eliminator for what [`ScalarFanIn`] introduces. A product value tiles as a
+/// The eliminator for what [`MakeRecord`] introduces. A product value tiles as a
 /// `Tiling::Record` whose fields each keep their own tiling: a scalar component
 /// stays a scalar, a collection component stays the sealed function it already
 /// was. Selecting a field is therefore a *tile* operation — hand back that
@@ -676,7 +672,7 @@ impl SelectField {
     ///
     /// Every guard travelling to the input names one field, which is what makes a
     /// consumer reading one field release only that one
-    /// ([`ScalarFanInProducer::release_impl`]).
+    /// ([`MakeRecordProducer::release_impl`]).
     fn at_field(&self, input_tiling: &Tiling, guard: TileGuard) -> TileGuard {
         let TileGuard::Record(mut fields) = input_tiling.empty_guard() else {
             unreachable!("the input tiles as a record, checked in `new`")
@@ -769,14 +765,14 @@ mod tests {
     use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
     use crate::interpreter::{BaseType, ColumnValue, Extent};
 
-    /// A `ScalarFanIn` re-reads every operand on every pull, so it can only pass a
+    /// A `MakeRecord` re-reads every operand on every pull, so it can only pass a
     /// release on once there will be no next pull — which is exactly what a
     /// universal release from its consumer says. Swallowing it strands every
     /// producer beneath a binop operand or record field, and because [`FanOut`]
     /// forwards the *intersection* of its branches' guards, one branch that never
     /// releases blocks reclamation for all of them.
     #[test]
-    fn scalar_fan_in_forwards_a_universal_release_to_every_operand() {
+    fn make_record_forwards_a_universal_release_to_every_component() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let mut logs = Vec::new();
         let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
@@ -787,8 +783,8 @@ mod tests {
             inputs.push(Box::new(spy));
         }
         let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
-        let mut producer = ScalarFanInProducer {
-            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
+        let mut producer = MakeRecordProducer {
+            base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
             names: (0..2).map(tuple_field).collect(),
             inputs,
             released: std::collections::HashSet::new(),
@@ -807,12 +803,12 @@ mod tests {
     /// Nothing narrower travels: a scalar has no sub-region, so a partial guard
     /// names no operand positions to free — and the operands are still being read.
     #[test]
-    fn scalar_fan_in_does_not_forward_a_narrower_release() {
+    fn make_record_does_not_forward_an_empty_release() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
-        let mut producer = ScalarFanInProducer {
-            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
+        let mut producer = MakeRecordProducer {
+            base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0)],
             inputs: vec![Box::new(spy)],
             released: std::collections::HashSet::new(),
@@ -831,7 +827,7 @@ mod tests {
     /// producer has promised not to do, and declining the release would leave a
     /// consumer reading one field of a product unable to free the other.
     #[test]
-    fn scalar_fan_in_honors_a_partial_record_release() {
+    fn make_record_honors_a_release_naming_one_field() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
         for _ in 0..2 {
@@ -842,8 +838,8 @@ mod tests {
         let names: Vec<String> = (0..2).map(tuple_field).collect();
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
-        let mut producer = ScalarFanInProducer {
-            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
+        let mut producer = MakeRecordProducer {
+            base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
             names: names.clone(),
             inputs,
             released: std::collections::HashSet::new(),
@@ -861,7 +857,7 @@ mod tests {
         producer.release(partial);
 
         let Tile::Record(fields) = producer.get(out_tiling.universal_guard()) else {
-            panic!("a ScalarFanIn answers a record");
+            panic!("a MakeRecord answers a record");
         };
         assert!(
             fields[&names[0]].is_empty(),
@@ -875,10 +871,10 @@ mod tests {
         );
     }
 
-    // ── FanInProducer: asymmetric per-branch presence ────────────────────────
+    // ── ZipProducer: asymmetric per-branch presence ────────────────────────
     //
     // Regression for the per-branch presence-intersection added to
-    // `FanInProducer::get_impl` for cyclic mutation loops, where one branch
+    // `ZipProducer::get_impl` for cyclic mutation loops, where one branch
     // (the body) can have emitted more positions than another (a still-
     // converging `recursive_input`).  Before the intersection step, the
     // output tile carried whichever branch happened to be at index 0 of
@@ -887,14 +883,14 @@ mod tests {
     //
     // We construct two `SealedFunction` test tiles over the same domain
     // type but with *different actual positions present* (branch A has
-    // positions [0, 1, 2]; branch B has only [0, 1]) and a `FanInProducer`
+    // positions [0, 1, 2]; branch B has only [0, 1]) and a `ZipProducer`
     // directly over them, then check that the merged output is restricted
     // to the intersection [0, 1].
 
     /// Two `SealedFunction` inputs with different sets of present positions.
     /// The output should restrict to the intersection of those positions.
     #[test]
-    fn fan_in_producer_intersects_branch_presence() {
+    fn zip_producer_intersects_branch_presence() {
         let input_tiling = Tiling::SealedFunction {
             domain: Extent::Base(BaseType::UInt),
             codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
@@ -927,8 +923,8 @@ mod tests {
                 ),
             ]))),
         };
-        let mut fan_in = FanInProducer {
-            base: ProducerBase::new(FanInProducer::alloc_id(), &output_tiling),
+        let mut zip_arms = ZipProducer {
+            base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
             inputs: vec![
                 Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
@@ -936,7 +932,7 @@ mod tests {
             ],
         };
 
-        let result = fan_in.get(fan_in.tiling().universal_guard());
+        let result = zip_arms.get(zip_arms.tiling().universal_guard());
         let Tile::SealedFunction {
             domain, codomain, ..
         } = result

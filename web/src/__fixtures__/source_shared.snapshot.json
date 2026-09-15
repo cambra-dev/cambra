@@ -4833,7 +4833,7 @@
           ]
         },
         {
-          "label": "ScalarFanIn",
+          "label": "MakeRecord",
           "nodeId": 648,
           "role": "operator",
           "tiling": "{SF(Source(stdin) → String), SF(Source(stdin) → String)}",

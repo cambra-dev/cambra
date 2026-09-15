@@ -34,11 +34,11 @@ use crate::{
         operator_graph::{record_kept_operators, record_sink, record_source_read},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
+            Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, ScalarFanIn, SelectField,
-            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
-            fan_in, fan_in_named,
+            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, SelectField, TileOperator,
+            Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, zip_arms,
+            zip_arms_named,
         },
         tuple_field,
     },
@@ -71,7 +71,7 @@ use std::{
 /// - Let-bindings of the above
 ///  
 /// For converting to operators, scalars and application of functions to scalars are turned into a dag
-/// of Constant, MapResult, and ScalarFanIn operators.  Functions can only be combined via composition
+/// of Constant, MapResult, and MakeRecord operators.  Functions can only be combined via composition
 /// and zip, and every function is lifted over a domain with a Map-style operator (MapResult,
 /// MapResultToConst, or MapResultWithSource). The input to each lifted function is carried through
 /// conversion as the `input` argument.  Iteration is never inserted implicitly here — every
@@ -1608,7 +1608,7 @@ fn convert_impl_inner(
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
-                    // Zip-with-const fast path: avoid the FanOut+FanIn dance
+                    // Zip-with-const fast path: avoid the FanOut+Zip dance
                     // when exactly one arm of a 2-arm zip is a const-lift.
                     if elts.len() == 2
                         && let Some(const_idx) = consts.iter().position(|c| c.is_some())
@@ -1629,7 +1629,7 @@ fn convert_impl_inner(
                     // Generic path: fan_out the input so every branch shares the
                     // same upstream producer.  The arms' runtime tilings depend
                     // on the upstream `input` — scalar upstream produces scalar
-                    // arms, function upstream produces function arms.  `fan_in`
+                    // arms, function upstream produces function arms.  `zip_arms`
                     // picks the matching combinator.
                     //
                     // A **store-read arm** (`__hist.k`) is a *leaf* source over
@@ -1638,7 +1638,7 @@ fn convert_impl_inner(
                     // reject it). This is the cross-domain co-iteration shape: a
                     // commit writer's source `zip((reqs, __cnt.acc))` pairs the
                     // request stream (input-driven) with an induction accumulator
-                    // read (leaf) position-by-position; `fan_in` co-aligns them by
+                    // read (leaf) position-by-position; `zip_arms` co-aligns them by
                     // domain.
                     let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
                     let mut ops = Vec::new();
@@ -1650,7 +1650,7 @@ fn convert_impl_inner(
                         };
                         ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
-                    Ok(fan_in(ops))
+                    Ok(zip_arms(ops))
                 }
                 TypedExprNode::Record(fields) => {
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
@@ -1665,7 +1665,7 @@ fn convert_impl_inner(
                             ))
                         })
                         .collect();
-                    Ok(fan_in_named(ops?))
+                    Ok(zip_arms_named(ops?))
                 }
                 other => Err(ConversionError::Unsupported(format!(
                     "zip expects a Tuple or Record argument, got {:?}",
@@ -2703,7 +2703,7 @@ fn is_collection(ty: &Type) -> bool {
 /// a collection component stays the sealed function it already was, with its own
 /// domain. A product in **morphism** position — `Tuple([acc, i])` under a binop, say
 /// — is a pointwise pairing over the ambient iteration, and that is the zip
-/// [`fan_in`] assembles.
+/// [`zip_arms`] assembles.
 ///
 /// The node's own type tells them apart, and nothing else can: both arrive as the
 /// same node with the same number of operands, and a value whose components happen
@@ -2720,9 +2720,9 @@ fn build_product(
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     if matches!(ctx.extent_of(&expr.ty)?, Extent::Record(_)) {
-        return Ok(Box::new(ScalarFanIn::new_named(components)));
+        return Ok(Box::new(MakeRecord::new_named(components)));
     }
-    Ok(fan_in_named(components))
+    Ok(zip_arms_named(components))
 }
 
 /// Evaluate a constant CCL expression to a [`Value`].
@@ -4628,7 +4628,7 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
 /// Return the value (codomain) [`Extent`] from a tiling.
 ///
 /// For `Scalar(e)` returns `e`; for `Record(fields)` returns `Extent::Record` over
-/// the field extents (arising when a non-constant tuple is compiled via [`ScalarFanIn`]);
+/// the field extents (arising when a non-constant tuple is compiled via [`MakeRecord`]);
 /// for `SealedFunction { codomain, .. }` returns `codomain.extent()`.
 fn result_extent(tiling: &Tiling) -> Extent {
     match tiling {
@@ -4664,7 +4664,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
 /// `__hist.k` or an `as_of((trigger, store))` read — rather than an
 /// iteration-driven morphism. Such an arm is converted with *no* input (it would
-/// reject the fanned iteration input); `fan_in` co-aligns it with the
+/// reject the fanned iteration input); `zip_arms` co-aligns it with the
 /// input-driven arms by domain position. This is the cross-domain co-iteration
 /// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a reply
 /// combining the request with a store read (`zip((trigger, as_of(store)))`).
@@ -5233,7 +5233,7 @@ mod variant_ctor_tests {
     /// lambda_elim compiles it to the zip form `⟨id, .decision ▷
     /// variant_project(0)⟩ ▷ zip ≫ (λ (__c, w) → …)`; we drive that over a
     /// two-row `{time, decision: commit}` stream. The outer element and the
-    /// tag-restricted payload co-iterate by key through the `FanIn`, so each row
+    /// tag-restricted payload co-iterate by key through the `Zip`, so each row
     /// pairs its own `time` with its own commit payload.
     #[test]
     fn variant_elim_outer_binder_zip() {
