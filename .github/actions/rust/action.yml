@@ -1,0 +1,40 @@
+name: Rust toolchain
+description: >-
+  The setup every Rust gate shares: the pinned stable toolchain, the Cargo build
+  cache, and the z3 binary refinement subtyping shells out to.
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
+      with:
+        components: rustfmt, clippy
+
+    # `save-if` keeps the write side on main. Each gate is its own job and
+    # rust-cache keys on the job id, so a branch that saved would store one
+    # ~470MB entry per gate; at eight active branches that alone exceeds the
+    # 10GB repo limit and starts evicting the entries the next run wants. A PR
+    # restores main's entries and saves nothing, so a PR that changes
+    # dependencies recompiles them on each push — the cost of one gate's
+    # rebuild against a cache that stays warm for every other branch.
+    - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    # The refinement-entailment fallback shells out to a `z3` subprocess
+    # (`easy_smt::ContextBuilder::with_z3_defaults` in
+    # `src/ccl/infer/solver/smt.rs`), so without the binary on PATH every query
+    # fails and the solver slot poisons. Pinned by release and verified by hash,
+    # the same discipline as pinning actions by SHA, and for a sharper reason:
+    # z3's answers decide refinement subtyping, so a version floating with the
+    # runner image would move what the type checker accepts without a commit
+    # saying so.
+    - name: Setup Z3
+      shell: bash
+      run: |
+        curl -sSfL -o /tmp/z3.zip \
+          https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip
+        echo "7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e  /tmp/z3.zip" \
+          | sha256sum -c -
+        unzip -q /tmp/z3.zip -d /tmp
+        echo "/tmp/z3-4.16.0-x64-glibc-2.39/bin" >> "$GITHUB_PATH"

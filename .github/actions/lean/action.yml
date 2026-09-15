@@ -1,0 +1,64 @@
+name: Lean model
+description: >-
+  The Lean toolchain and a built `formal/`. Building the model is what
+  elaborates its theorems, and it produces the `subverdict` binary the
+  differential oracle runs.
+
+runs:
+  using: composite
+  steps:
+    # elan is installed every run rather than restored: `~/.elan/toolchains` is
+    # 732MB, and restoring it measured 11.1s against the 17s the download it
+    # replaces takes. Six seconds, on a job that is not the critical path, for
+    # 7% of the repo's 10GB cache budget — and the budget is what the Cargo
+    # caches below compete for. The `.lake` cache is the one that pays: 40MB
+    # standing in for a 30s elaboration.
+    #
+    # elan is pinned by release and verified by hash, the same discipline as
+    # pinning actions by SHA, and it installs the version
+    # `formal/lean-toolchain` names rather than a floating one.
+    - name: Setup Lean
+      shell: bash
+      run: |
+        curl -sSfL -o /tmp/elan.tar.gz \
+          https://github.com/leanprover/elan/releases/download/v4.2.3/elan-x86_64-unknown-linux-gnu.tar.gz
+        echo "df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2  /tmp/elan.tar.gz" \
+          | sha256sum -c -
+        tar xzf /tmp/elan.tar.gz -C /tmp
+        /tmp/elan-init -y --default-toolchain "$(cat formal/lean-toolchain)" >/dev/null
+        echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+    # lake's build directory, which nothing else caches: `Swatinem/rust-cache`
+    # covers Cargo only, and `formal/.lake` is gitignored. Without it every run
+    # re-elaborates all 43 modules from scratch; a warm `lake build` is a tenth
+    # of a second.
+    #
+    # The key covers every input the build has: the toolchain pin, the sources,
+    # the lakefile, and the manifest. That manifest lists no external packages,
+    # so `formal/` is the whole input set, and an exact hit skips an elaboration
+    # that already succeeded on this Lean version for these bytes. The
+    # restore-keys prefix holds the toolchain fixed, so editing one theorem
+    # reuses the other modules through lake's per-module traces and never
+    # restores oleans built by a different Lean.
+    #
+    # Both jobs that use this action restore the same key and may both save it.
+    # The loser of that race logs "Cache already exists" and continues.
+    - name: Cache Lean build
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: formal/.lake
+        key: >-
+          lake-${{ runner.os }}-${{ hashFiles('formal/lean-toolchain') }}-${{
+          hashFiles('formal/**/*.lean', 'formal/lakefile.toml', 'formal/lake-manifest.json') }}
+        restore-keys: |
+          lake-${{ runner.os }}-${{ hashFiles('formal/lean-toolchain') }}-
+
+    # Building the model is what elaborates every theorem and evaluates every
+    # `#guard`; it also produces the `subverdict` oracle binary. Run here rather
+    # than left to the formal gate, because the test job needs that binary and
+    # does not invoke `ci.sh formal`. A restored cache makes this a no-op.
+    - name: Build the Lean model
+      shell: bash
+      # By full path: `GITHUB_PATH` from the install step above is applied
+      # between steps, and this runs inside the same composite action.
+      run: cd formal && "$HOME/.elan/bin/lake" build
