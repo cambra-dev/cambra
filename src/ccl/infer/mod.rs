@@ -320,14 +320,24 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // is rather than reconcile two arms. No `ctx_label` either: the report's span
         // underlines the expression already, so rendering it again says the same thing
         // twice, once in source and once in CCL.
-        ConstrainError::DataDomainMismatch { lhs, rhs } => InferError::TypeMismatch {
-            ctx: "collection domain (a collection's domain is its data, so it is \
-                  invariant — a collection over one domain does not stand in for a \
-                  collection over another)"
-                .to_string(),
-            found: Box::new(coalesce_for_error(&lhs)),
-            expected: Some(Box::new(coalesce_for_error(&rhs))),
-        },
+        ConstrainError::DataDomainMismatch { lhs, rhs, cause } => {
+            let (found, expected) = (coalesce_for_error(&lhs), coalesce_for_error(&rhs));
+            // Where the two render alike, the report is the sub-comparison that found
+            // them unequal ([`ConstrainError::DataDomainMismatch`]'s `cause`, whose doc
+            // says why it is carried): its own sides differ structurally, so
+            // [`identical_rendering_hint`] can quote the divergence.
+            if found.to_string() == expected.to_string() {
+                return map_constrain_err(*cause, ctx_label);
+            }
+            InferError::TypeMismatch {
+                ctx: "collection domain (a collection's domain is its data, so it is \
+                      invariant — a collection over one domain does not stand in for a \
+                      collection over another)"
+                    .to_string(),
+                found: Box::new(found),
+                expected: Some(Box::new(expected)),
+            }
+        }
         // A **join**, and the same fact the coalesce-time face reports. Converted to the
         // same `InferError` so the message follows the situation rather than which phase
         // noticed it.
