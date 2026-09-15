@@ -1776,7 +1776,7 @@ mod tests {
     /// survives without `is_iteration` flagging `restrict` itself.
     #[test]
     fn simplify_preserves_restrict_over_iteration_under_const_reduce() {
-        // `restrict(p)` applied to an iterate source: `{Int | p} ⇒ Int`.
+        // `restrict(p)` applied to an iterate source: `{Int | p} ⤇ Int`.
         let pred = apply_primitive(
             Expr::lit(Lit::Bool(false)).with_ty(Type::Base(BaseType::Bool)),
             Builtin::Const,

@@ -725,11 +725,11 @@ pub fn is_trivially_true_predicate(expr: &Expr) -> bool {
 /// `predicate` must have type `D ⇒ Bool` (a point-free combinator chain
 /// after lambda elimination).
 ///
-/// The result has type `{D | p} ⇒ {D | p}` — `iterate(p)` is the identity
+/// The result has type `{D | p} ⤇ {D | p}` — `iterate(p)` is the identity
 /// on the predicate's refined domain.  As a special case, when `predicate`
 /// is the trivially-true predicate (recognised by
 /// [`is_trivially_true_predicate`]), the output type degenerates to
-/// `D ⇒ D` with no refinement wrapper: the refinement would carry no
+/// `D ⤇ D` with no refinement wrapper: the refinement would carry no
 /// information, and skipping it keeps program dumps and golden tests
 /// free of `{D | true ▷ const}` noise.  The refinement gets a freshly
 /// built predicate term — safe because refinements match by structural
@@ -740,7 +740,7 @@ pub fn is_trivially_true_predicate(expr: &Expr) -> bool {
 /// Iterate arm requires `input=None` — mid-chain filtering is handled by
 /// the separate [`make_restrict`] form.  Refinements are transparent
 /// under [`crate::ccl::infer::typecheck`], so the symmetric
-/// `{D | p} ⇒ {D | p}` shape composes cleanly against either a refined
+/// `{D | p} ⤇ {D | p}` shape composes cleanly against either a refined
 /// or unrefined adjacent edge.
 pub fn make_iterate(predicate: Expr) -> Expr {
     let domain = predicate
@@ -767,10 +767,10 @@ pub fn make_iterate(predicate: Expr) -> Expr {
 /// Restrict))`.
 ///
 /// `restrict` is a *codomain-parametric function transformer*: given a
-/// predicate `p : D ⇒ Bool` it narrows the domain of an upstream
-/// `D ⇒ T`, passing the values `T` through unchanged.  So the transformer
-/// `Apply(p, Restrict)` has type `(D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`, and
-/// applying it to `upstream : D ⇒ T` yields `{d : D | p(d)} ⇒ T` — the
+/// predicate `p : D ⤇ Bool` it narrows the domain of an upstream
+/// `D ⤇ T`, passing the values `T` through unchanged.  So the transformer
+/// `Apply(p, Restrict)` has type `(D ⤇ T) ⇒ ({d : D | p(d)} ⤇ T)`, and
+/// applying it to `upstream : D ⤇ T` yields `{d : D | p(d)} ⤇ T` — the
 /// refinement on the **domain**, the value `T` preserved on the codomain.
 ///
 /// This is application, not composition: `restrict`'s domain is a
@@ -779,7 +779,7 @@ pub fn make_iterate(predicate: Expr) -> Expr {
 /// rejects it).  Modelling it as an applied higher-order function is what
 /// keeps the emitted term well-typed — see [`crate::ccl::planning`].
 ///
-/// `predicate` must have type `D ⇒ Bool` and `upstream` type `D ⇒ T`
+/// `predicate` must have type `D ⤇ Bool` and `upstream` type `D ⤇ T`
 /// (matching domains).  Emitted by [`crate::ccl::planning`] for every
 /// filter step downstream of an iteration source — `JoinPlan::Loop` /
 /// `JoinPlan::Hash` residual predicates and the outer layers of
@@ -799,11 +799,11 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
     let upstream_ty = upstream.ty.clone();
     let value_ty = upstream_ty
         .codomain()
-        .expect("restrict upstream must have a function type D ⇒ T")
+        .expect("restrict upstream must have a function type D ⤇ T")
         .clone();
     let upstream_dom = upstream_ty
         .domain()
-        .expect("restrict upstream must have a function type D ⇒ T");
+        .expect("restrict upstream must have a function type D ⤇ T");
     debug_assert!(
         {
             let (u, d) = (strip_refinements(&upstream_dom), strip_refinements(&domain));
@@ -811,10 +811,10 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         },
         "restrict upstream domain {upstream_dom} must match predicate domain {domain}",
     );
-    // `{d : D | p(d)} ⇒ T` — refinement on the domain, value preserved.
+    // `{d : D | p(d)} ⤇ T` — refinement on the domain, value preserved.
     // Narrowing an extent leaves it an extent, so the kind rides through from
-    // `upstream`: restricting a collection yields a collection, restricting a
-    // capability yields a capability.
+    // `upstream` rather than being declared here: every restrict chain is led by an
+    // iteration source, which `make_iterate` declares `Data`.
     //
     // The refinement is built **without** `refine_with`'s trivially-true
     // degeneracy: the caller emits one `restrict` per refinement the site declared,
@@ -826,7 +826,7 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         Refinement::born(Rc::new(bare_predicate_of_fn(&domain, predicate.clone()))),
     );
     let refined_collection = Type::fun_like(&upstream_ty, refined_dom, value_ty);
-    // The transformer node `restrict(p) : (D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`.
+    // The transformer node `restrict(p) : (D ⤇ T) ⇒ ({d : D | p(d)} ⤇ T)`.
     let restrict = apply_primitive(
         predicate,
         Builtin::Restrict,

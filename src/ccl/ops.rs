@@ -282,14 +282,14 @@ pub enum Builtin {
     Converse,
     /// `uncurry : (A → (B → C)) → ((A, B) → C)`.
     Uncurry,
-    /// `restrict : (D ⇒ Bool) ⇒ (D ⇒ T) ⇒ ({d: D | p(d)} ⇒ T)` —
+    /// `restrict : (D ⤇ Bool) ⇒ (D ⤇ T) ⇒ ({d: D | p(d)} ⤇ T)` —
     /// mid-chain filter step.
     ///
     /// `restrict` is a *codomain-parametric function transformer*: it
-    /// narrows the domain of an upstream value-producer `D ⇒ T` to the
+    /// narrows the domain of an upstream value-producer `D ⤇ T` to the
     /// subset satisfying `p`, passing the values `T` through unchanged.
     /// So the refinement lands on the **domain** and `T` is preserved on
-    /// the codomain — not the unsound `D ⇒ {d: D | p(d)}` (which would
+    /// the codomain — not the unsound `D ⤇ {d: D | p(d)}` (which would
     /// claim every `d : D` satisfies `p`).  The transformer
     /// `Apply(p, Restrict)` is therefore **applied to** its upstream
     /// (`Apply(upstream, Apply(p, Restrict))`), not composed with it —
@@ -306,7 +306,7 @@ pub enum Builtin {
     /// of `JoinPlan::Hash`.  Chain-head iteration is the separate
     /// `Iterate` variant.  See [`crate::ccl::ccl_utils::make_restrict`].
     Restrict,
-    /// `iterate : (D ⇒ Bool) ⇒ ({d: D | p(d)} ⇒ {d: D | p(d)})` —
+    /// `iterate : (D ⇒ Bool) ⇒ ({d: D | p(d)} ⤇ {d: D | p(d)})` —
     /// chain-head iteration source.
     ///
     /// `Apply(p, Iterate)` requires `input=None`; op-conversion compiles
@@ -349,11 +349,11 @@ pub enum Builtin {
     /// `not_fn : Bool → Bool` — boolean negation as a morphism.
     NotFn,
 
-    /// `filter_values : (D ⇒ Bool) ⇒ ({d: D | p(d)} ⇒ V)` — a **value-preserving**
+    /// `filter_values : (D ⤇ Bool) ⇒ ({d: D | p(d)} ⤇ V)` — a **value-preserving**
     /// mid-chain filter. `Apply(p, FilterValues)` requires `input=Some(_)` (the
-    /// `D ⇒ V` collection to filter) and keeps each surviving element's **codomain
+    /// `D ⤇ V` collection to filter) and keeps each surviving element's **codomain
     /// value** `V` — unlike `Restrict`, which returns the domain identity
-    /// `{D | p} ⇒ {D | p}` for a source a downstream map re-indexes. Compiles to
+    /// `{D | p} ⤇ {D | p}` for a source a downstream map re-indexes. Compiles to
     /// the `Filter` tile operator (input stream + predicate, output = filtered
     /// input). Lambda elimination emits it to desugar a value-selecting `Case`
     /// whose gate varies with the element (`λ x → Case{[gᵢ(x) → eᵢ(x)]}`, a writer
