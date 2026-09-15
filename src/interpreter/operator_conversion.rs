@@ -2137,11 +2137,23 @@ fn convert_impl_inner(
         }
 
         TypedExprNode::Apply { argument, function } => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(format!(
-                    "Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator {}",
-                    symbolic(function)
-                )));
+            // An `Apply` that *denotes* a collection is a value, not a combinator, so
+            // an input reaching it is a domain to look the collection up at rather
+            // than a stage to thread through it. That is the rule a free
+            // [`TypedExprNode::Var`] already follows below, and a projection out of a
+            // product is the other term that denotes one: a filter plans as
+            // `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠`, naming its source twice, and the
+            // second occurrence is the composition stage this answers for.
+            if let Some(input) = input {
+                if !is_collection(&expr.ty) {
+                    return Err(ConversionError::Unsupported(format!(
+                        "Only higher-order combinators (map, const, zip) can take an input \
+                         operator; found input for non-combinator {}",
+                        symbolic(function)
+                    )));
+                }
+                let collection = convert_impl_inner(expr, None, ctx)?;
+                return Ok(Box::new(MapResult::new(input, collection)));
             }
             let arg = convert_impl(argument, None, ctx)?;
             let applied = convert_impl(function, Some(arg), ctx)?;

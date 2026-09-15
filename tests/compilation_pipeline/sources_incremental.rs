@@ -767,3 +767,52 @@ fn test_incremental_aggregates() {
         Predicate::True
     );
 }
+
+/// A collection component of a product value, read from a **data source** rather
+/// than written out as a literal.
+///
+/// The component is materialized — one cell carrying the whole bindings table —
+/// and the table is the source's, so a projection out of the product reads what
+/// the source delivered. Covered here rather than beside the literal cases in
+/// `records.rs` because a literal's table is built at compile time and never
+/// exercises the collecting: `Materialize` answers the table once its input has
+/// delivered all of it, which for a source is a fact about the source rather than
+/// about the term.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::projected_and_summed("r = (n=1, xs=source1()); sum(r.xs)", 30)]
+#[case::scalar_component_beside("r = (n=1, xs=source1()); r.n", 1)]
+#[case::mapped("r = (n=1, xs=source1()); sum([z * 2 for z in r.xs])", 60)]
+#[case::filtered("r = (n=1, xs=source1()); sum([z for z in r.xs if z < 15])", 10)]
+#[case::tuple_component("t = (1, source1()); sum([z for z in t.1 if z < 15])", 10)]
+#[case::comprehension_component(
+    "r = (n=1, xs=[s + 1 for s in source1()]); sum([z for z in r.xs if z < 15])",
+    11
+)]
+fn test_source_backed_collection_component(#[case] code: &str, #[case] expected: i64) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    // The table a product holds is the whole table, so the source states that it
+    // has delivered all of it.
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.register_source(test_source.clone());
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+
+    let mut tile = producer.get(producer.tiling().universal_guard());
+    tile.compact();
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}

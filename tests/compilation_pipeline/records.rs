@@ -455,3 +455,48 @@ fn test_a_filtered_component_holds_a_sparse_table() {
         ),
     );
 }
+
+/// A **filter** over a projected collection component, the shape a map over one
+/// does not reach.
+///
+/// A filter plans as `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠`, naming its source twice:
+/// once inside the predicate and once as the composition stage that reads the
+/// surviving domain. That second occurrence puts the projection in function
+/// position with an input, where a map leaves it at the head with none. A
+/// projection denotes a collection rather than transforming one, so it answers an
+/// input the way a free `Var` does — by looking the collection up at each position.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::record(
+    "r = (n=1, xs=[1, 2, 3, 4]); sum([z for z in r.xs if z < 4])",
+    Value::Int(6)
+)]
+#[case::tuple("t = ([1, 2, 3, 4], 1); sum([z for z in t.0 if z < 4])", Value::Int(6))]
+#[case::filtered_component(
+    "r = (n=1, xs=[y for y in [1, 2, 3, 4] if y > 1]); sum([z for z in r.xs if z < 4])",
+    Value::Int(5)
+)]
+#[case::filter_and_map(
+    "r = (n=1, xs=[1, 2, 3, 4]); sum([z * 2 for z in r.xs if z < 4])",
+    Value::Int(12)
+)]
+#[case::nothing_survives(
+    "r = (n=1, xs=[1, 2, 3]); sum([z for z in r.xs if z > 99])",
+    Value::Int(0)
+)]
+#[case::everything_survives(
+    "r = (n=1, xs=[1, 2, 3]); sum([z for z in r.xs if z > 0])",
+    Value::Int(6)
+)]
+#[case::nested_projection(
+    "r = (a=(b=[1, 2, 3, 4])); sum([z for z in r.a.b if z < 3])",
+    Value::Int(3)
+)]
+// Two filters over one component: the projection is read at two different domains.
+#[case::two_filters(
+    "r = (n=1, xs=[1, 2, 3, 4]); sum([z for z in r.xs if z < 4]) + sum([w for w in r.xs if w > 2])",
+    Value::Int(13)
+)]
+fn test_filter_over_a_projected_component(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
