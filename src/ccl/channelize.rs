@@ -1190,7 +1190,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::Carried(_)) => node,
+        | TypedExprNode::LoadFrom(_)) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
         // A tagged-variant value carries no ExprStmt of its own; recurse into
         // the payload so a nested one is dropped.
@@ -1307,7 +1307,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::Carried(_) => Ok(()),
+        | TypedExprNode::LoadFrom(_) => Ok(()),
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::VariantCtor { payload, .. } => assert_no_defer_residue(payload),
     }
@@ -2043,7 +2043,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Carried(_)
+            | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer => {}
             TypedExprNode::Error => crate::unexpected_error_node!(),
             TypedExprNode::VariantCtor { payload, .. } => rec(payload, bound, out),
@@ -2893,7 +2893,7 @@ fn extract_for_defer_impl(
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::Carried(_)
+        | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
