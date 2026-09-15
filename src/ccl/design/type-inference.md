@@ -1410,26 +1410,11 @@ reference it (`subst::codomain_depends_on`) and strips it elsewhere.
 
 A refinement's predicate may contain a term lambda — `λ x → x // 2` in the group-by case — and its
 parameter stays a name. That binder sits inside the refinement rather than outside it, so the
-compared terms carry it
-and the correspondence is local: `eq_term_modulo_ty_slots` threads a pairing and compares a
-reference to it by its binder's position, and `hash_term_modulo_ty_slots` hashes it by position so
+compared terms carry it and the correspondence is local: `eq_term_modulo_ty_slots` threads a
+pairing and compares a reference to it by its binder's position, and `hash_term_modulo_ty_slots`
+hashes it by position so
 the `Eq`/`Hash` contract survives. The name stays the stored form, so the predicate is still a term
 planning can compile.
-
-`eq_term_modulo_ty_slots` answers for terms, not only for predicates. `Refinement`'s `PartialEq`
-asks it about a predicate, where it is the same-restriction relation, and `planning::groupby`'s
-pointful-site match asks it about two collection paths drawn from one. `Subst::eq_modulo_ty_slots`
-asks it about a discharge's captured argument, which is any expression the program wrote, a
-function body included. Its domain is the widest of the three, so every node a program builds has
-an arm — the mutable-variable introduction and the loop among them, each binding over its body the
-way a `let` does.
-
-`LetRec` and `Transact` have no arm. A predicate never acquires one, because the phases that mint
-them do not rewrite inside a predicate, and neither does a discharge's captured argument, which is
-taken during inference before those phases run. That a predicate is a boolean expression over
-`__elem` is asserted where a predicate is installed, at `Refinement::born` and at the rewrite path's
-`point_at` — the same fact read the other way, since a statement shape installed in a predicate is
-one nothing later eliminates.
 
 Closing treats such a parameter as a shadow: inside the lambda, a reference spelled like the
 enclosing function's binder is the lambda's and keeps its name. Uniquification already keeps the two

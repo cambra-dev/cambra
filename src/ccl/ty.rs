@@ -3176,21 +3176,14 @@ pub const REFINEMENT_BINDER: &str = "__elem";
 pub type RefinementTemplate = fn(&[TypedExpr]) -> TypedExpr;
 
 /// A refinement predicate is a **boolean expression over
-/// [`crate::ccl::REFINEMENT_BINDER`]**, so it holds none of the statement shapes a
-/// program body is built from: a mutable variable introduction or write, a loop, a
-/// statement sequence, or a recurrence carrier (`LetRec`, `Transact`).
+/// [`crate::ccl::REFINEMENT_BINDER`]**: it holds no `MutDecl`, `MutWrite`, `For`,
+/// `Begin`, `LetRec` or `Transact`.
 ///
-/// What makes it a restriction rather than a preference: the mutability-elimination
-/// phases do not rewrite inside a predicate. A statement shape installed in one is
-/// therefore never eliminated, and reaches the post-inline wall as a `Mut` that
-/// survived the unified phase. `inline` can install one — substituting a scalar UDF
-/// whose body carries a mutable accumulator into a filter's cast-target predicate is
-/// the way there — so the shape is reachable, and this asserts at the boundary that
-/// installs it rather than leaving the report to a wall two passes later that names
-/// the surviving type instead of the term that carried it.
-///
-/// The walk reaches a cast's target predicate, which is where a nested refinement's
-/// term sits, because [`eq_term_modulo_ty_slots`] compares that slot too.
+/// Asserted at every site that installs a predicate ([`Refinement::born`], and the
+/// rewrite path's `point_at`) rather than at a later wall, because the
+/// mutability-elimination phases do not rewrite inside a predicate: a statement shape
+/// installed in one is never eliminated, and surfaces two passes later as a surviving
+/// type rather than as the term that carried it.
 #[track_caller]
 pub(crate) fn debug_assert_predicate_shape(predicate: &TypedExpr) {
     #[cfg(debug_assertions)]
@@ -3325,7 +3318,6 @@ impl Eq for Refinement {}
 /// not an approximation of a finer one — there is no plan to make it a derived `==`
 /// (which would wrongly compare those slots).
 ///
-/// **Three callers, one relation, and the domain is the widest of the three.**
 /// [`Refinement`]'s `PartialEq` asks it about predicate terms, where it is the
 /// "same restriction" relation, and `planning::groupby`'s pointful-site match asks it
 /// about two collection paths drawn from one.
@@ -3584,7 +3576,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Defer
         | N::Begin { .. }
         | N::Error => true,
-        // The two a term this walk compares never holds; the catch-all says why.
+        // The two shapes a term this walk compares never holds; the catch-all says why.
         N::LetRec { .. } | N::Transact { .. } => false,
     }
 }
@@ -3886,8 +3878,7 @@ fn eq_term_modulo_ty_slots_go(
 ///
 /// The generic walk covers the two shapes `eq` has no arm for, hashing their children
 /// in the enclosing scope. That direction is the safe one: `eq` answering `false` makes
-/// it finer, and a hash coarser than `eq` is what the contract asks for. Neither is
-/// reachable — this hashes predicates only, through [`Refinement`]'s `Hash`.
+/// it finer, and a hash coarser than `eq` is what the contract asks for.
 fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
     e: &TypedExpr,
     state: &mut H,
@@ -4617,12 +4608,12 @@ mod tests {
         assert!(!eq_term_modulo_ty_slots(&a, &build("total", "x", "ys")));
     }
 
-    /// The keyed write and the statement sequence, the two arms
+    /// The keyed write and the `Begin` transaction block, the two arms
     /// [`alpha_variant_terms_compare_and_hash_alike`] does not reach. A keyed write is the
     /// shape `transact_phase` normalizes away, so it exists in exactly the window this walk
     /// runs in, and its key is a term the comparison reads.
     #[test]
-    fn a_keyed_write_under_a_sequence_compares_its_key() {
+    fn a_keyed_write_under_a_transaction_block_compares_its_key() {
         let build = |acc: &str, item: &str, key: i64| {
             let (acc, item) = (Name::raw(acc), Name::raw(item));
             TypedExpr::mut_decl(
