@@ -11,6 +11,7 @@ use std::time::Duration;
 use bit_set::BitSet;
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
+use cambra::interpreter::pull_laps;
 use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
     sort_sealed_function_by_domain, tuple_field,
@@ -541,13 +542,7 @@ x";
     ctx.scheduler().check_for_notifications();
 
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
-    let mut result = empty.clone();
-    for _ in 0..4 {
-        result = producer.get(producer.tiling().universal_guard());
-        if result != empty {
-            break;
-        }
-    }
+    let result = pull_laps(ctx.scheduler(), &mut *producer, 4, |t| *t != empty);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![50])),
@@ -592,12 +587,7 @@ o";
         .set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
-    let mut result = producer.get(producer.tiling().universal_guard());
-    for _ in 0..4 {
-        if !result.is_terminal() {
-            result = producer.get(producer.tiling().universal_guard());
-        }
-    }
+    let result = pull_laps(ctx.scheduler(), &mut *producer, 16, Tile::is_terminal);
     // Compare as a function (position → value), independent of internal ordering.
     assert_eq!(
         sort_sealed_function_by_domain(result),
@@ -657,13 +647,11 @@ x";
     ]);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "first batch should fire a notification");
-    for _ in 0..3 {
-        let result = producer.get(producer.tiling().universal_guard());
-        assert_eq!(
-            result, empty,
-            "after first batch: should produce no output yet"
-        );
-    }
+    assert_eq!(
+        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        empty,
+        "after first batch: should produce no output yet"
+    );
     *notified.borrow_mut() = false;
 
     // Second batch: adds 30; running total 60, still not terminal.
@@ -675,13 +663,11 @@ x";
         *notified.borrow(),
         "second batch should fire a notification"
     );
-    for _ in 0..3 {
-        let result = producer.get(producer.tiling().universal_guard());
-        assert_eq!(
-            result, empty,
-            "after second batch: should produce no output yet"
-        );
-    }
+    assert_eq!(
+        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        empty,
+        "after second batch: should produce no output yet"
+    );
     *notified.borrow_mut() = false;
 
     // Signal that the source is exhausted; the loop's final accumulator
@@ -691,13 +677,7 @@ x";
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
-    let mut result = empty.clone();
-    for _ in 0..3 {
-        result = producer.get(producer.tiling().universal_guard());
-        if result != empty {
-            break;
-        }
-    }
+    let result = pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![60])),

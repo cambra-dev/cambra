@@ -35,6 +35,7 @@ use smol_str::SmolStr;
 use cambra::ccl::TagMap;
 
 use crate::helpers::*;
+use cambra::interpreter::pull_laps;
 use indoc::{formatdoc, indoc};
 
 /// Assert `code` fails to compile with an error whose rendering contains
@@ -1789,17 +1790,13 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     assert_eq!(stores_in(&compiled.ast), vec!["Txn[a]", "Txn[b]"]);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let ug = producer.tiling().universal_guard();
 
     // One request arrives, and the source is left **open** — no
     // terminal yield predicate — so `b`'s writer never drains.
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     ctx.scheduler().check_for_notifications();
-    let mut result = producer.get(ug.clone());
-    for _ in 0..64 {
-        result = producer.get(ug.clone());
-    }
+    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
 
     let Tile::Record(fields) = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -1855,15 +1852,11 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
         "the shared block must put both keys in one store, or this tests nothing"
     );
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let ug = producer.tiling().universal_guard();
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     ctx.scheduler().check_for_notifications();
-    let mut result = producer.get(ug.clone());
-    for _ in 0..64 {
-        result = producer.get(ug.clone());
-    }
+    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
 
     let Tile::Record(fields) = &result else {
         panic!("expected a record of both replies, got {result:?}");
@@ -1915,15 +1908,11 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
         "the read must put both keys in one store, or this tests nothing"
     );
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let ug = producer.tiling().universal_guard();
 
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(5))]);
     ctx.scheduler().check_for_notifications();
-    let mut result = producer.get(ug.clone());
-    for _ in 0..64 {
-        result = producer.get(ug.clone());
-    }
+    let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![100])),
@@ -2078,14 +2067,8 @@ fn live_reply_combines_request_and_store() {
     src.borrow_mut().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
-    let mut result = producer.get(producer.tiling().universal_guard());
-    let mut n = 0;
-    while !result.is_terminal() && n < 64 {
-        result = producer.get(producer.tiling().universal_guard());
-        n += 1;
-    }
+    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
     result.compact();
-    let _ = n;
     assert_eq!(
         sort_sealed_function_by_domain(result),
         sort_sealed_function_by_domain(make_int_list(&[65, 75])),
@@ -2817,30 +2800,20 @@ fn live_read_progresses_past_deny() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let ug = producer.tiling().universal_guard();
 
     // Request 0 (req = 100) arrives first and latches whatever the store has then.
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     src.borrow_mut()
         .set_yield_predicate(Predicate::LessThanEq(Value::from(0usize)));
-    ctx.scheduler().check_for_notifications();
-    let mut result = producer.get(ug.clone());
-
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.
-    for _ in 0..32 {
-        result = producer.get(ug.clone());
-        ctx.scheduler().check_for_notifications();
-    }
+    let _ = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
     src.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(200))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    for _ in 0..32 {
-        result = producer.get(ug.clone());
-    }
+    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
     result.compact();
 
     let result = sort_sealed_function_by_domain(result);

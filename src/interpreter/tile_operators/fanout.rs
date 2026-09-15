@@ -814,9 +814,16 @@ impl TileOperator for Memo {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        let notified = Notified::flag();
         Box::new(MemoProducer {
-            base: ProducerBase::new(MemoProducer::alloc_id(), self.tiling()),
-            input: self.input.subscribe(intent_guard, consumer, scheduler),
+            base: ProducerBase::listening(
+                MemoProducer::alloc_id(),
+                self.tiling(),
+                notified.clone(),
+            ),
+            input: self
+                .input
+                .subscribe(intent_guard, notified.consumer(consumer), scheduler),
             cached_tile: self.tiling().empty_tile(),
             upstream_drained: false,
         })
@@ -865,6 +872,22 @@ impl TileProducer for MemoProducer {
         if self.upstream_drained && !cfg!(debug_assertions) {
             return self.cached_tile.clone();
         }
+        // The cache is cumulative, so when nothing has notified since the last pull it is
+        // already the answer and pulling walks the subtree below to merge nothing. An
+        // empty cache is not an answer yet: a demand read taken outside the delivery loop
+        // — a store's init op reading a seed, a completion read — arrives before anything
+        // has notified, so it pulls. A drained input is left to the rule above rather
+        // than gated here, which is what keeps that rule's debug probe: gating a drained
+        // input would shield it in every build.
+        let notified = self.base.notified.take();
+        if !notified && !self.cached_tile.is_empty() && !self.upstream_drained {
+            debug_assert!(
+                projection_guard.is_universal(),
+                "a memo answers a gated pull from its whole cache, which is the projection \
+                 asked for only while every pull is universal; got {projection_guard:?}"
+            );
+            return self.cached_tile.clone();
+        }
         let mut input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
@@ -900,6 +923,12 @@ impl TileProducer for MemoProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    use bit_set::BitSet;
+
     use crate::interpreter::tile_operators::test_helpers::QuietSpy;
     use crate::interpreter::tile_operators::{Constant, Scheduler};
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
@@ -986,6 +1015,171 @@ mod tests {
             "the late subscriber inherits the release rather than starting at nothing"
         );
         drop(late);
+    }
+
+    /// A `TileOperator` whose producer hands over one scripted tile per pull and
+    /// empties afterwards. It counts pulls, and keeps the consumer its subscriber
+    /// installed so a test can fire a notification the way the scheduler would.
+    struct Scripted {
+        base: OperatorBase,
+        tiles: Rc<RefCell<VecDeque<Tile>>>,
+        pulls: Rc<Cell<usize>>,
+        consumer: Rc<RefCell<Option<Box<dyn Consumer>>>>,
+    }
+
+    struct ScriptedProducer {
+        base: ProducerBase,
+        tiles: Rc<RefCell<VecDeque<Tile>>>,
+        pulls: Rc<Cell<usize>>,
+    }
+
+    impl Scripted {
+        /// The operator, the pull counter, and a handle that fires the consumer the
+        /// memo installs on it.
+        fn new(tiles: Vec<Tile>, tiling: &Tiling) -> (Self, Rc<Cell<usize>>, Notifier) {
+            let pulls = Rc::new(Cell::new(0usize));
+            let consumer: Notifier = Rc::new(RefCell::new(None));
+            (
+                Self {
+                    base: OperatorBase::new(tiling.clone()),
+                    tiles: Rc::new(RefCell::new(tiles.into())),
+                    pulls: pulls.clone(),
+                    consumer: consumer.clone(),
+                },
+                pulls,
+                consumer,
+            )
+        }
+    }
+
+    /// The consumer a [`Scripted`] input was handed, so a test can notify with it.
+    type Notifier = Rc<RefCell<Option<Box<dyn Consumer>>>>;
+
+    fn notify(notifier: &Notifier) {
+        notifier
+            .borrow_mut()
+            .as_mut()
+            .expect("the memo installed a consumer on its input")
+            .notify();
+    }
+
+    impl TileOperator for Scripted {
+        impl_operator_base!();
+
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            *self.consumer.borrow_mut() = Some(consumer);
+            Box::new(ScriptedProducer {
+                base: ProducerBase::new(ScriptedProducer::alloc_id(), self.tiling()),
+                tiles: self.tiles.clone(),
+                pulls: self.pulls.clone(),
+            })
+        }
+    }
+
+    impl TileProducer for ScriptedProducer {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.pulls.set(self.pulls.get() + 1);
+            self.tiles
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| self.tiling().empty_tile())
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A tiling whose tiles can be **incomplete**, so a memo over one never reaches
+    /// `upstream_drained` and the gate is what the test observes.
+    fn partial_tiling() -> Tiling {
+        Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        }
+    }
+
+    /// One row at `key`, under a domain predicate that claims only the prefix up to
+    /// it — so the tile is not the whole function and the input is not drained.
+    fn one_row(key: usize, value: i64) -> Tile {
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![key]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
+            domain_predicate: Predicate::LessThanEq(Value::UInt(key)),
+            deleted: BitSet::new(),
+        }
+    }
+
+    /// A memo whose input has said nothing since its last pull answers from the
+    /// cache without reading the input; a notification re-enables the read.
+    ///
+    /// This is the gate `MemoProducer::get_impl` applies, and it is what makes a
+    /// pull cost the graph's traffic rather than its size.
+    #[test]
+    fn a_memo_reads_its_input_only_after_its_input_notifies() {
+        let tiling = partial_tiling();
+        let (input, pulls, notifier) = Scripted::new(vec![one_row(0, 7)], &tiling);
+        let mut memo = Memo::new(Box::new(input));
+        let mut sched = Scheduler::new();
+        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+
+        let first = producer.get(tiling.universal_guard());
+        assert_eq!(pulls.get(), 1, "the first pull reads its input");
+        assert!(!first.is_empty(), "the first pull fills the cache");
+
+        let gated = producer.get(tiling.universal_guard());
+        assert_eq!(
+            gated, first,
+            "a gated pull answers the tile it just answered"
+        );
+        assert_eq!(pulls.get(), 1, "nothing notified, so the input is not read");
+
+        notify(&notifier);
+        let after = producer.get(tiling.universal_guard());
+        assert_eq!(after, first, "the input had nothing new to add");
+        assert_eq!(pulls.get(), 2, "a notification re-enables the read");
+    }
+
+    /// An **empty** cache is never gated: a demand read taken outside the delivery
+    /// loop arrives before anything has notified, and an empty cache is not yet an
+    /// answer. The input here yields nothing on the first pull and the row on the
+    /// second, so both pulls have to reach it.
+    #[test]
+    fn a_memo_with_an_empty_cache_reads_its_input_unnotified() {
+        let tiling = partial_tiling();
+        let (input, pulls, _notifier) =
+            Scripted::new(vec![tiling.empty_tile(), one_row(0, 7)], &tiling);
+        let mut memo = Memo::new(Box::new(input));
+        let mut sched = Scheduler::new();
+        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+
+        assert!(
+            producer.get(tiling.universal_guard()).is_empty(),
+            "the input had nothing yet"
+        );
+        assert_eq!(pulls.get(), 1);
+
+        let second = producer.get(tiling.universal_guard());
+        assert!(
+            !second.is_empty(),
+            "an empty cache pulls again with nothing notified, and finds the row"
+        );
+        assert_eq!(
+            pulls.get(),
+            2,
+            "the empty cache is not an answer to gate on"
+        );
     }
 
     /// A `Memo` releases its input universally as soon as the input hands over a

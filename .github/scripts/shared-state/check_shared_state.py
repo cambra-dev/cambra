@@ -84,6 +84,8 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "cell of `HashMap<usize, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
+    # `Notified::Flag`, the one-bit input-notified flag; see its type doc.
+    ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what

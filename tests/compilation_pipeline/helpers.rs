@@ -37,7 +37,8 @@ use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    ColumnValue, Consumer, Predicate, Tile, Value, sort_sealed_function_by_domain, tuple_field,
+    ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_sealed_function_by_domain,
+    tuple_field,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,24 +65,16 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
         .main_mut()
         .and_then(|o| o.producer.as_mut())
         .expect("pipeline test expects a `main` output");
-    // A single `get` is not always enough to fully drain a producer.  Some
-    // tile operators advance their internal state by one step per pull
-    // (notably a mutation loop's store/drive cycle, where each pull decides one
-    // more position of the recurrence).
-    // Loop until the producer reports a terminal tile, with a generous
-    // iteration cap to catch the regression where the cycle stops making
-    // progress without converging.
+    // A single `get` is not always enough to drain a producer: a mutation loop's
+    // store/drive cycle decides one more position of the recurrence per pass, and
+    // re-arms by asking the scheduler to wake its consumer. The cap catches a cycle
+    // that stops converging without reaching a terminal tile.
     let universal = producer.tiling().universal_guard();
-    let mut result = producer.get(universal.clone());
-    let mut iterations = 0usize;
-    while !result.is_terminal() {
-        iterations += 1;
-        assert!(
-            iterations < 1024,
-            "pipeline path: producer did not converge within 1024 iterations"
-        );
-        result = producer.get(universal.clone());
-    }
+    let mut result = pull_laps(ctx.scheduler(), &mut **producer, 1024, Tile::is_terminal);
+    assert!(
+        result.is_terminal(),
+        "pipeline path: producer did not converge within 1024 iterations"
+    );
     result.compact();
     // Release everything, then pull once more: a released region must never come
     // back out, so this answers empty or trips the contract assertion.
