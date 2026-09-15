@@ -121,31 +121,46 @@ use crate::ccl::{
     provenance,
 };
 
-/// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
-/// on a node this pass constructed or invalidated, an unresolved `Infer` channel
-/// domain, or a `Feed` history the defer elimination dissolves. Walks type
-/// structure only; refinement *predicates* carry no such residue (their terms are
-/// immutable and kept type-consistent by the substitution engine), so they are
-/// not inspected.
+/// A **channel type**, which this pass is the one that erases: a nominal channel
+/// domain, or the `Feed` history the defer elimination dissolves.
+fn is_channel_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::ChanDom(..)
+            | Type::History {
+                history_kind: HistoryKind::Append,
+                ..
+            }
+    )
+}
+
+/// A type node that must not survive channelization: a channel type, or a `Hole` /
+/// `Infer` stamped on a node this pass constructed or invalidated.
+#[cfg(debug_assertions)]
+fn is_type_residue(ty: &Type) -> bool {
+    matches!(ty, Type::Hole | Type::Infer(_)) || is_channel_type(ty)
+}
+
+/// `true` when `ty` carries channelization-erasable residue anywhere in it.
+///
+/// Refinement **predicates** are walked alongside type structure, because a predicate
+/// holds channel types in its own node slots and [`erase_chan_domains_in_predicates`] is
+/// what erases them. A checker that stopped at the structure would pass a tree its own
+/// eraser is answerable for.
 ///
 /// Debug-only: its sole consumer is the `assert_no_type_residue` invariant
 /// walk (the strict `typecheck` wall is the release-visible enforcement).
 #[cfg(debug_assertions)]
 fn has_type_residue(ty: &Type) -> bool {
-    match ty {
-        Type::Hole
-        | Type::Infer(_)
-        | Type::ChanDom(..)
-        | Type::History {
-            history_kind: HistoryKind::Append,
-            ..
-        } => true,
-        _ => {
-            let mut found = false;
-            ty.walk_children(|t| found = found || has_type_residue(t));
-            found
+    fn in_structure(ty: &Type) -> bool {
+        if is_type_residue(ty) {
+            return true;
         }
+        let mut found = false;
+        ty.walk_children(|t| found = found || in_structure(t));
+        found
     }
+    in_structure(ty) || predicates_hold_type(ty, &is_type_residue)
 }
 
 /// Errors that can arise while channelizing `Defer`/`Feed`/`Define` nodes.
@@ -615,7 +630,10 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
     let kinds: HashMap<Name, crate::ccl::ty::FunKind> =
         std::mem::take(&mut ctx.channel_kinds).into_iter().collect();
-    erase_chan_domains(&mut rewritten, &mut map, &kinds);
+    // One predicate memo for the whole erasure, so occurrences that shared a predicate
+    // term still share one afterwards ([`PredMemo`], "One memo per pass").
+    let predicates: PredMemo<()> = PredMemo::default();
+    erase_chan_domains(&mut rewritten, &mut map, &kinds, &predicates);
     #[cfg(debug_assertions)]
     assert_no_type_residue(&rewritten);
     Ok(rewritten)
@@ -722,7 +740,7 @@ fn erase_chan_domains_in_type(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
     kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
-) {
+) -> bool {
     if let Type::History {
         value,
         domain,
@@ -745,49 +763,54 @@ fn erase_chan_domains_in_type(
             domain: Box::new(domain),
             codomain: Box::new(value),
         };
-        return erase_chan_domains_in_type(ty, map, kinds);
+        erase_chan_domains_in_type(ty, map, kinds);
+        return true;
     }
     if let Type::ChanDom(name, _) = ty {
-        if let Some(dom) = map.get(name) {
-            *ty = dom.clone();
-            erase_chan_domains_in_type(ty, map, kinds);
-        }
-        return;
+        let Some(dom) = map.get(name) else {
+            return false;
+        };
+        *ty = dom.clone();
+        erase_chan_domains_in_type(ty, map, kinds);
+        return true;
     }
-    ty.walk_children_mut(|t| erase_chan_domains_in_type(t, map, kinds));
+    let mut changed = false;
+    ty.walk_children_mut(|t| changed |= erase_chan_domains_in_type(t, map, kinds));
+    changed
 }
 
-/// Whether any refinement predicate reachable from `ty` still holds a channel type —
-/// a `ChanDom` or an `Append` history — in one of its own node slots.
+/// Whether any refinement predicate reachable from `ty` holds a type satisfying `hit` in
+/// one of its own node slots, at any depth of that slot.
 ///
-/// Read-only, and the gate on [`erase_chan_domains_in_predicates`]: rebuilding a
-/// predicate reallocates it and mints fresh ids for the copy, so a walk that entered
-/// unconditionally would renumber every later node in programs with nothing to erase.
-fn predicates_hold_channel_types(ty: &Type) -> bool {
-    fn in_type(ty: &Type) -> bool {
-        if matches!(
-            ty,
-            Type::ChanDom(..)
-                | Type::History {
-                    history_kind: HistoryKind::Append,
-                    ..
-                }
-        ) {
+/// Read-only, and the two things that ask are the eraser and its checker: the gate on
+/// [`erase_chan_domains_in_predicates`] asks for a channel type, and [`has_type_residue`]
+/// asks for anything channelization must have removed.
+///
+/// Gating the eraser on a read-only scan is what keeps node ids stable. Rebuilding a
+/// predicate copies it, and the copy draws fresh ids whether or not the rebuild is kept,
+/// so a walk that entered unconditionally would renumber every later node in programs
+/// with nothing to erase. The scan lives here rather than in
+/// [`walk_refined_predicates_mut`] because that helper clones before it can ask; a probe
+/// that ran on the shared term first belongs there, and every pass with a conditional
+/// predicate rewrite will want it.
+fn predicates_hold_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
+    fn in_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
+        if hit(ty) {
             return true;
         }
         let mut found = false;
-        ty.walk_children(|c| found |= in_type(c));
+        ty.walk_children(|c| found |= in_type(c, hit));
         found
     }
-    fn in_expr(e: &Expr) -> bool {
+    fn in_expr(e: &Expr, hit: &dyn Fn(&Type) -> bool) -> bool {
         let mut found = false;
-        e.walk_type_slots(|t| found |= in_type(t));
-        e.walk_children(|c| found |= in_expr(c));
+        e.walk_type_slots(|t| found |= in_type(t, hit));
+        e.walk_children(|c| found |= in_expr(c, hit));
         found
     }
     let mut found = false;
     walk_refined_predicates(ty, &mut HashSet::new(), &mut |pred, _| {
-        found |= in_expr(pred);
+        found |= in_expr(pred, hit);
     });
     found
 }
@@ -796,32 +819,49 @@ fn predicates_hold_channel_types(ty: &Type) -> bool {
 /// [`erase_chan_domains_in_type`] does not reach: `Type::walk_children_mut` visits a
 /// `Type::Refinement`'s base and not its predicate.
 ///
-/// A predicate over a channel-domain source holds that domain in its own node types — a
-/// filtered comprehension over a channel is the program that writes one — and the strict
-/// wall walks predicates, so a residue left here is reported there
+/// A predicate over a channel-domain source holds that domain in its own node types; a
+/// filtered comprehension over a channel is the program that writes one. The strict wall
+/// walks predicates, so a residue left here is reported there
 /// (`src/ccl/design/type-inference.md`,
 /// "Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)").
+///
+/// `predicates` is the pass's one memo, so occurrences that shared a predicate term leave
+/// sharing it ([`PredMemo`]).
 fn erase_chan_domains_in_predicates(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
     kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    predicates: &PredMemo<()>,
 ) {
-    if !predicates_hold_channel_types(ty) {
+    if !predicates_hold_type(ty, &is_channel_type) {
         return;
     }
-    let memo: PredMemo<()> = PredMemo::default();
-    walk_refined_predicates_mut(ty, &memo, &(), &mut |pred, _| {
+    walk_refined_predicates_mut(ty, predicates, &(), &mut |pred, _| {
         fn go(
             e: &mut Expr,
             map: &HashMap<Name, Type>,
             kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
-        ) {
-            e.walk_type_slots_mut(|t| erase_chan_domains_in_type(t, map, kinds));
-            e.walk_children_mut(|c| go(c, map, kinds));
+        ) -> bool {
+            let mut changed = false;
+            e.walk_type_slots_mut(|t| changed |= erase_chan_domains_in_type(t, map, kinds));
+            e.walk_children_mut(|c| changed |= go(c, map, kinds));
+            changed
         }
-        go(pred, map, kinds);
-        true
+        go(pred, map, kinds)
     });
+}
+
+/// Erase channel types from one type slot: its structure and its refinement predicates
+/// alike. Every slot the pass reaches — a node's type, a user annotation, a binder's
+/// declared type — needs both halves, and the strict wall checks both.
+fn erase_chan_domains_in_slot(
+    ty: &mut Type,
+    map: &HashMap<Name, Type>,
+    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    predicates: &PredMemo<()>,
+) {
+    erase_chan_domains_in_type(ty, map, kinds);
+    erase_chan_domains_in_predicates(ty, map, kinds, predicates);
 }
 
 /// whole-tree erasure — node types, user annotations, and
@@ -840,6 +880,7 @@ fn erase_chan_domains(
     expr: &mut Expr,
     map: &mut HashMap<Name, Type>,
     kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    predicates: &PredMemo<()>,
 ) {
     // Erase this node's binder-declared type slots — both the declared type and
     // the annotation, since a handle can ride either. Deliberately *not*
@@ -852,9 +893,9 @@ fn erase_chan_domains(
     // that child — never in scope at this binder — so erasing binders before the
     // child recursion sees the same substitutions the old inline order did.
     expr.walk_binders_mut(|b| {
-        erase_chan_domains_in_type(&mut b.ty, map, kinds);
+        erase_chan_domains_in_slot(&mut b.ty, map, kinds, predicates);
         if let Some(ann) = &mut b.user_annotation {
-            erase_chan_domains_in_type(ann, map, kinds);
+            erase_chan_domains_in_slot(ann, map, kinds, predicates);
         }
     });
     if let TypedExprNode::Let {
@@ -863,8 +904,8 @@ fn erase_chan_domains(
         body,
     } = &mut expr.node
     {
-        erase_chan_domains(bound_expr, map, kinds);
-        erase_chan_domains(body, map, kinds);
+        erase_chan_domains(bound_expr, map, kinds, predicates);
+        erase_chan_domains(body, map, kinds, predicates);
         // §6.2 Let-closing on the substitution content (see fn docs).
         // A discharge template is not a tree node: it is cloned again at every
         // read, and that read is where the sibling is minted.
@@ -874,13 +915,11 @@ fn erase_chan_domains(
             *dom = discharge.apply_type(dom);
         }
     } else {
-        expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds));
+        expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds, predicates));
     }
-    erase_chan_domains_in_type(&mut expr.ty, map, kinds);
-    erase_chan_domains_in_predicates(&mut expr.ty, map, kinds);
+    erase_chan_domains_in_slot(&mut expr.ty, map, kinds, predicates);
     if let Some(ann) = &mut expr.user_annotation {
-        erase_chan_domains_in_type(ann, map, kinds);
-        erase_chan_domains_in_predicates(ann, map, kinds);
+        erase_chan_domains_in_slot(ann, map, kinds, predicates);
     }
 }
 
