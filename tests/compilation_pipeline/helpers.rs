@@ -64,13 +64,14 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
         .main_mut()
         .and_then(|o| o.producer.as_mut())
         .expect("pipeline test expects a `main` output");
-    // A single `get` is not always enough to fully drain a producer.  Some
-    // tile operators advance their internal state by one step per pull
-    // (notably a mutation loop's store/drive cycle, where each pull decides one
-    // more position of the recurrence).
-    // Loop until the producer reports a terminal tile, with a generous
-    // iteration cap to catch the regression where the cycle stops making
-    // progress without converging.
+    // A single `get` is not always enough to fully drain a producer: a mutation
+    // loop's store/drive cycle decides one more position of the recurrence per
+    // pass, and re-arms by asking the scheduler to wake its consumer.
+    //
+    // Each pass delivers notifications and then pulls, which is the alternation
+    // `src/main.rs` runs. Pulling without delivering is not a loop the runtime
+    // performs, and it stalls a graph whose operators read the notification to
+    // decide whether there is anything to read (`Notified`).
     let universal = producer.tiling().universal_guard();
     let mut result = producer.get(universal.clone());
     let mut iterations = 0usize;
@@ -80,6 +81,7 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
             iterations < 1024,
             "pipeline path: producer did not converge within 1024 iterations"
         );
+        ctx.scheduler().check_for_notifications();
         result = producer.get(universal.clone());
     }
     result.compact();

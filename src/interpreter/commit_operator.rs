@@ -4468,12 +4468,15 @@ mod tests {
     /// Pull until the tile goes terminal. The cycle advances one iteration
     /// position per pull, so a converging read needs one pull per position (plus
     /// the closing one); the bound is generous and failing it means divergence.
-    fn pull_to_terminal(producer: &mut Box<dyn TileProducer>) -> Tile {
+    fn pull_to_terminal(sched: &mut Scheduler, producer: &mut Box<dyn TileProducer>) -> Tile {
         let mut tile = producer.get(producer.tiling().universal_guard());
         for _ in 0..MAX_CYCLE_PULLS {
             if tile.is_terminal() {
                 return tile;
             }
+            // Deliver before pulling: the cycle re-arms through the wakeup queue, so a
+            // lap that is not delivered is a lap that does not run.
+            sched.check_for_notifications();
             tile = producer.get(producer.tiling().universal_guard());
         }
         panic!("induction cycle did not converge within {MAX_CYCLE_PULLS} pulls");
@@ -4489,8 +4492,9 @@ mod tests {
         let (fan, _acc) = induction_cycle(items, threshold, init);
         let mut op = fan.branch();
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        pull_to_terminal(&mut producer)
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        pull_to_terminal(&mut sched, &mut producer)
     }
 
     /// `acc := 0; for i in [1,2,3,4]: if i > 2: acc += i` driven through the whole
@@ -4550,9 +4554,10 @@ mod tests {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 10); // unconditional
         let mut op = fan.branch();
         let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let full = pull_to_terminal(&mut producer);
+        let full = pull_to_terminal(&mut sched, &mut producer);
         let Tile::Store { changes, .. } = &full else {
             panic!("induction store output is a Store");
         };
@@ -4593,10 +4598,11 @@ mod tests {
         let mut reader =
             StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
         // The cycle advances one position per pull, so the dense read converges
         // over several pulls rather than one.
-        let tile = pull_to_terminal(&mut producer);
+        let tile = pull_to_terminal(&mut sched, &mut producer);
         assert!(validate_tile(&tile));
         let Tile::SealedFunction { codomain, .. } = tile else {
             panic!("dense read is a SealedFunction");
@@ -4682,13 +4688,14 @@ mod tests {
         let mut reader =
             StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(usize, i64)> {
+        let mut read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(usize, i64)> {
             // The cycle advances one position per pull, so the first full read
             // converges over several pulls; a later re-read is already terminal
             // and returns immediately.
-            let tile = pull_to_terminal(p);
+            let tile = pull_to_terminal(&mut sched, p);
             let Tile::SealedFunction {
                 domain, codomain, ..
             } = tile
@@ -4801,11 +4808,12 @@ mod tests {
             true,
         );
         let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
 
         // Drive the fold to convergence so the reader caches which ticks wrote
         // `acc` — the cycle advances one position per pull.
-        let _ = pull_to_terminal(&mut producer);
+        let _ = pull_to_terminal(&mut sched, &mut producer);
 
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::LessThanEq(Value::UInt(0)),
@@ -5442,11 +5450,13 @@ mod tests {
 
         let mut external = store_fan.branch();
         let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
         // Drive the cycle: bootstrap + 3 commits + a fixpoint pull, with margin.
         let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..6 {
+            sched.check_for_notifications();
             latest = producer.get(producer.tiling().universal_guard());
         }
         // Store: init 0 @0, then 1@1, 2@2, 3@3 — the counter reached 3.
@@ -5610,9 +5620,11 @@ mod tests {
 
         let mut external = store_fan.branch();
         let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
         let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..MAX_CYCLE_PULLS {
+            sched.check_for_notifications();
             latest = producer.get(producer.tiling().universal_guard());
         }
 
@@ -5863,10 +5875,12 @@ mod tests {
 
         let mut external = store_fan.branch();
         let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
         let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..6 {
+            sched.check_for_notifications();
             latest = producer.get(producer.tiling().universal_guard());
         }
         // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
@@ -5913,10 +5927,12 @@ mod tests {
 
         let mut external = store_fan.branch();
         let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
         let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..10 {
+            sched.check_for_notifications();
             latest = producer.get(producer.tiling().universal_guard());
         }
         // Which draws fit (and in what order) is schedule-dependent under the
@@ -6031,7 +6047,8 @@ mod tests {
 
         let mut reader = StoreReadAsOf::new(store_fan.branch(), acct("n"), 2);
         let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
 
         // Pulling the reader drives the cycle. Before the watermark reaches 2 the
         // read is ⊥ (empty); once it does, it resolves to the value at tick 2.
@@ -6163,10 +6180,12 @@ mod tests {
 
         let mut external = store_fan.branch();
         let guard = external.tiling().universal_guard();
-        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut sched = Scheduler::new();
+        let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
 
         let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..pulls {
+            sched.check_for_notifications();
             latest = producer.get(producer.tiling().universal_guard());
         }
         latest
@@ -6640,8 +6659,9 @@ mod tests {
             StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
         let mut memo = Memo::new(Box::new(reader));
         let guard = memo.tiling().universal_guard();
-        let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        let tile = pull_to_terminal(&mut producer);
+        let mut sched = Scheduler::new();
+        let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut sched);
+        let tile = pull_to_terminal(&mut sched, &mut producer);
         let Tile::SealedFunction { codomain, .. } = &tile else {
             panic!("dense read is a SealedFunction");
         };

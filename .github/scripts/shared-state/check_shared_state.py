@@ -84,6 +84,14 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "cell of `HashMap<usize, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
+    # `Notified`: the one-bit latch a producer reads to decide whether its input has
+    # anything to hand over. Necessary because the consumer handle that sets it is built
+    # before the producer that reads it — `subscribe` must give the input a consumer, and
+    # only then returns the producer. Carrying it any other way means the producer itself
+    # is the consumer, which is a larger shared cell (`Rc<RefCell<dyn Consumer>>`) around
+    # a reference cycle. No tile shape removes it: what crosses is that the input spoke,
+    # never what it said, and the value still travels as a tile through `get`.
+    ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what

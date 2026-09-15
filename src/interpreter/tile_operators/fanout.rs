@@ -814,9 +814,20 @@ impl TileOperator for Memo {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // The notification is installed on *this* operator's input rather than handed
+        // straight down, so arrivals reach the memo instead of running past it to the
+        // sink. Its `get_impl` reads the flag to decide whether the subtree below is
+        // worth walking.
+        let notified = Notified::flag();
         Box::new(MemoProducer {
-            base: ProducerBase::new(MemoProducer::alloc_id(), self.tiling()),
-            input: self.input.subscribe(intent_guard, consumer, scheduler),
+            base: ProducerBase::listening(
+                MemoProducer::alloc_id(),
+                self.tiling(),
+                notified.clone(),
+            ),
+            input: self
+                .input
+                .subscribe(intent_guard, notified.consumer(consumer), scheduler),
             cached_tile: self.tiling().empty_tile(),
             upstream_drained: false,
         })
@@ -863,6 +874,21 @@ impl TileProducer for MemoProducer {
         //
         // `cfg!` rather than `#[cfg]` so both configurations stay compiled.
         if self.upstream_drained && !cfg!(debug_assertions) {
+            return self.cached_tile.clone();
+        }
+        // **Nothing has arrived, so the cache is already the answer.** A memo is
+        // cumulative — it returns what it holds, not what its last pull delivered — so a
+        // pull that finds no notification since the previous one answers the tile it just
+        // answered. Pulling anyway walks the whole subtree below to merge nothing, which
+        // is what makes a graph cost its size rather than its traffic. Unlike the drained
+        // check above, this holds in every build.
+        //
+        // A memo is the one operator that holds the cumulative answer, so it is the one
+        // that can decline to read without losing anything. An **empty** cache is not yet
+        // that answer: a demand read taken outside the delivery loop — a store's init op
+        // reading a seed, a completion read — arrives before anything has notified, and
+        // gating it would answer from a cache that has never been filled.
+        if !self.base.notified.take() && !self.cached_tile.is_empty() {
             return self.cached_tile.clone();
         }
         let mut input = self.input.get(projection_guard);

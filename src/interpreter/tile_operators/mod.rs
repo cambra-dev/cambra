@@ -15,7 +15,9 @@
 //! consumers continue to reach items as `tile_operators::X`.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
+    rc::Rc,
     sync::{Mutex, OnceLock},
 };
 
@@ -248,6 +250,72 @@ macro_rules! impl_operator_base {
 // it to the crate root.
 pub(crate) use impl_operator_base;
 
+/// Whether a producer's input has notified it since the producer last pulled.
+///
+/// A [`Consumer::notify`](crate::interpreter::Consumer) says new data is available and
+/// carries no payload, so it is the only signal a producer can act on without pulling.
+/// The flag is set by the consumer handle an operator installs on its own input
+/// ([`Self::consumer`]) and cleared by a pull, so a producer whose input has said nothing
+/// since it last read knows there is nothing to read.
+///
+/// Held behind an `Rc<Cell<_>>` because the setter and the reader are built at different
+/// times: `subscribe` must hand the input a consumer before it has a producer to put the
+/// flag in.
+///
+/// A producer instance has exactly one consumer — sharing goes through a
+/// [`FanOut`](crate::interpreter::tile_operators::FanOut), whose branches are separate
+/// producers with separate flags — so "since the consumer last pulled" and "since anyone
+/// last pulled" are the same statement.
+#[derive(Clone)]
+pub enum Notified {
+    /// The input's notification does not reach this producer, so every pull reads. What
+    /// an operator whose `subscribe` installs no flag gets, and what every producer had
+    /// before this existed.
+    Always,
+    /// Set when the input notifies, cleared by a pull.
+    // shared-state-ok: a one-bit wakeup latch, not a dataflow edge. What crosses it is
+    // that the input said something, never what the input said — the value still travels
+    // as a tile through `get`. It is shared with the consumer handle installed on the
+    // input for the reason the type doc gives: the setter exists before the reader does.
+    Flag(Rc<Cell<bool>>),
+}
+
+impl Notified {
+    /// A live [`Flag`](Self::Flag), starting set: a producer that has never pulled has
+    /// everything to read.
+    pub fn flag() -> Self {
+        Self::Flag(Rc::new(Cell::new(true)))
+    }
+
+    /// Record that the input has new data.
+    pub fn mark(&self) {
+        if let Self::Flag(c) = self {
+            c.set(true);
+        }
+    }
+
+    /// Read and clear. `Always` reads set and stays set.
+    pub fn take(&self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Flag(c) => c.replace(false),
+        }
+    }
+
+    /// A consumer handle that sets this flag and then passes the notification on.
+    ///
+    /// Installed on a producer's own input so the notification reaches the operator
+    /// rather than running straight from source to sink past it.
+    pub fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
+        let flag = self.clone();
+        let mut downstream = downstream;
+        Box::new(move || {
+            flag.mark();
+            downstream.notify();
+        })
+    }
+}
+
 /// Common identity and tiling state shared by every [`TileProducer`].
 ///
 /// Storing these together avoids repeating the same two fields and their
@@ -259,14 +327,25 @@ pub struct ProducerBase {
     pub tiling: Tiling,
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
+    /// Whether this producer's input has notified it since it last pulled.
+    pub(crate) notified: Notified,
 }
 
 impl ProducerBase {
+    /// A producer whose input notification does not reach it, so every pull reads.
     pub(crate) fn new(id: usize, tiling: &Tiling) -> Self {
+        Self::listening(id, tiling, Notified::Always)
+    }
+
+    /// A producer that reads only when its input has said something since its last
+    /// pull. `notified` is the flag whose [`Notified::consumer`] this producer's
+    /// `subscribe` installed on its input.
+    pub(crate) fn listening(id: usize, tiling: &Tiling, notified: Notified) -> Self {
         Self {
             id,
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
+            notified,
         }
     }
 }

@@ -543,6 +543,7 @@ x";
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
     let mut result = empty.clone();
     for _ in 0..4 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(producer.tiling().universal_guard());
         if result != empty {
             break;
@@ -592,9 +593,12 @@ o";
         .set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
+    // One lap per pass: the tap's cycle re-arms through the wakeup queue, so each
+    // position needs its notification delivered before the pull that decides it.
     let mut result = producer.get(producer.tiling().universal_guard());
-    for _ in 0..4 {
+    for _ in 0..16 {
         if !result.is_terminal() {
+            ctx.scheduler().check_for_notifications();
             result = producer.get(producer.tiling().universal_guard());
         }
     }
@@ -658,6 +662,7 @@ x";
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "first batch should fire a notification");
     for _ in 0..3 {
+        ctx.scheduler().check_for_notifications();
         let result = producer.get(producer.tiling().universal_guard());
         assert_eq!(
             result, empty,
@@ -676,6 +681,7 @@ x";
         "second batch should fire a notification"
     );
     for _ in 0..3 {
+        ctx.scheduler().check_for_notifications();
         let result = producer.get(producer.tiling().universal_guard());
         assert_eq!(
             result, empty,
@@ -693,6 +699,7 @@ x";
     ctx.scheduler().check_for_notifications();
     let mut result = empty.clone();
     for _ in 0..3 {
+        ctx.scheduler().check_for_notifications();
         result = producer.get(producer.tiling().universal_guard());
         if result != empty {
             break;
