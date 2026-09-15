@@ -615,8 +615,9 @@ impl TileProducer for MakeRecordProducer {
 /// Keeping the field a tile is what lets a collection component grow: a
 /// `Tile::SealedFunction` merges by appending its domain and unioning its
 /// domain predicate, which is the collection arriving in pieces. Boxed into a
-/// cell it could only be replaced, and `Tile::Scalar` merges by appending, so
-/// the pieces would read as several tables rather than one.
+/// cell it would merge the way every `Tile::Scalar` does, by appending the
+/// column, so two deliveries would land as two cells — two tables where the
+/// program has one collection.
 pub struct SelectField {
     base: OperatorBase,
     /// The product whose field this selects.

@@ -20,7 +20,7 @@ use super::*;
 /// "Iteration site" means any position where op-conversion would otherwise
 /// compile with `input=None` and the expression is function-typed —
 /// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
-/// sources, program outputs, `Copair` operands,
+/// sources, product components and program outputs, `Copair` operands,
 /// the program's top-level function-valued result, top-level let-bound
 /// function values, and a few other shapes enumerated by
 /// [`insert_iterate_recurse`].  At each site the pass dispatches via
@@ -104,13 +104,6 @@ pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
-    // A zipped product is a product *morphism*, not a product value: op-conversion's
-    // `Zip` arm fans the outer input out to each component, so each is compiled with
-    // `input=Some(fan_out_branch)`. The value-position arms below would mark a
-    // collection-valued component as an iteration site ([`mark_component_source`]),
-    // and an `iterate` chain takes no input — the same shape the `Copair` arm's
-    // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each
-    // component without firing those arms.
     // A list literal's elements are **values**: op-conversion evaluates each with
     // `expr_to_value` and compiles none of them, so nothing inside one is an
     // iteration site. A collection-valued element is the case that shows it — the
@@ -120,6 +113,13 @@ pub(super) fn insert_iterate_recurse(
     if matches!(&expr.node, TypedExprNode::List(_)) {
         return;
     }
+    // A zipped product is a product *morphism*, not a product value: op-conversion's
+    // `Zip` arm fans the outer input out to each component, so each is compiled with
+    // `input=Some(fan_out_branch)`. The value-position arms below would mark a
+    // collection-valued component as an iteration site ([`mark_component_source`]),
+    // and an `iterate` chain takes no input — the same shape the `Copair` arm's
+    // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each
+    // component without firing those arms.
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))
     {

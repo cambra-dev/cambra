@@ -820,9 +820,9 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
 ///
 /// This is what holding the component as a tile buys. A `Tile::SealedFunction`
 /// merges by appending its domain and unioning its domain predicate, which is a
-/// collection arriving in pieces; boxed into one cell it could only be replaced,
-/// and a scalar merges by appending, so the pieces would read as several tables
-/// rather than one growing one.
+/// collection arriving in pieces; boxed into one cell it would merge the way every
+/// `Tile::Scalar` does, by appending the column, so the deliveries below would land
+/// as three cells rather than one growing table.
 ///
 /// The bare source is pulled alongside as the control: a component answers what
 /// the collection answers, at every pull rather than only at the last.
@@ -884,5 +884,69 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         pull(&test_source, &[], true),
         expected(vec![0, 1, 2], vec![10, 20, 30], true),
         "the source says it is done, and the domain settles with no new rows",
+    );
+}
+
+/// Releasing a collection component reaches the source under it, and what was
+/// released does not come back.
+///
+/// A release travels to the product through the [`FanOut`] a `let` binding wraps
+/// it in, which accumulates each subscriber's guard by union. Two releases of one
+/// field are two record guards, and their union is the record guard naming that
+/// field's two regions — a shape the product can forward to the operand that owns
+/// the field. An `Or` of the two would name the field twice and reach nobody, and
+/// the product would reject it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::component("r = (n=1, xs=source1()); r.xs")]
+#[case::bare_source("source1()")]
+fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    let mut pull_and_release = |rows: &[(usize, i64)]| {
+        test_source.borrow_mut().add_data(
+            &rows
+                .iter()
+                .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+                .collect::<Vec<_>>(),
+        );
+        let mut tile = producer.get(producer.tiling().universal_guard());
+        tile.compact();
+        producer.release(tile.to_guard());
+        sort_sealed_function_by_domain(tile)
+    };
+
+    let delivered = |keys: Vec<usize>, vals: Vec<i64>| {
+        sort_sealed_function_by_domain(Tile::SealedFunction {
+            domain: ColumnValue::UInts(keys),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        })
+    };
+
+    assert_eq!(
+        pull_and_release(&[(0, 10), (1, 20)]),
+        delivered(vec![0, 1], vec![10, 20]),
+        "the rows delivered so far",
+    );
+    assert_eq!(
+        pull_and_release(&[(2, 30)]),
+        delivered(vec![2], vec![30]),
+        "only the row added since — the released ones are not re-delivered",
+    );
+    assert_eq!(
+        pull_and_release(&[(3, 40)]),
+        delivered(vec![3], vec![40]),
+        "and the release still lands after the accumulated guard has two regions",
     );
 }

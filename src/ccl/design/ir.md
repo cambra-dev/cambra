@@ -178,16 +178,16 @@ Op-conversion accordingly compiles a fed union as a flat merge — a disjoint jo
 
 ### The program's output list is a `Record`
 
-A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at the tail of the root `Let*` chain so each entry is in scope of the bindings above it. A program whose trailing expression is a record literal has that same shape, and nothing tells them apart:
+A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at the tail of the root `Let*` chain so each entry is in scope of the bindings above it. There is no node of its own for it, and none is needed: a program whose trailing expression is a record literal has the same shape, and the two never occupy the same position.
 
 ```
 x = 1
 (a=[1, 2, 3], b=[4, 5, 6])
 ```
 
-Nothing needs to. `compile_program` reads the sink registry, which is the same fact lowering read when it decided to append the list at all, and dispatches to `convert_outputs_to_operators` for one operator per entry or `convert_to_operators` for a single `main`. A record literal is never in that position, because the appended list goes at the tail and the program's own trailing expression sits inside it.
+Lowering appends the list as the body of an `ExprStmt` whose effect is the program's own trailing expression, and `channelize` collapses that `ExprStmt` to its body. A sink program's trailing expression is therefore dropped, and the list is what sits at the tail. Which conversion entry point runs is read off the sink registry, the same fact lowering read when it decided to append a list at all.
 
-Each entry is an iteration site exactly when it holds a collection, which is the rule a product value's components already follow (`planning::iterate`'s `mark_component_source`): an output is compiled with `input=None`, and so is a component, and a collection needs the iteration a collection needs. A pure program has a single output and no list — its trailing expression *is* that output.
+Each entry is an iteration site exactly when it holds a collection, which is the rule a product value's components already follow (`planning::iterate`'s `mark_component_source`): an output is compiled with no input, and so is a component, and a collection needs the iteration a collection needs. A pure program has a single output and no list — its trailing expression is that output.
 
 ### `Transact` — the domain-parameterized recurrence carrier
 

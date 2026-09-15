@@ -82,12 +82,14 @@ the previous version of the interpreter.
 | `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
 | `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
 | `Function(FunctionGuard)` | Structured interest in a function tile (see below). |
-| `Or(arms)` | Union of multiple guards; produced when two `Record` guards are unioned, because OR cannot be pushed through the AND semantics of a `Record` guard. Arms are always flat (no nested `Or`). |
+| `Or(arms)` | Union of two guards no single variant holds: a curried function's tile is covered partly by inner domain and partly by outer, and `FunctionGuard` has no `Domain`-with-`Codomain` arm. Arms are always flat (no nested `Or`). |
 
-`TileGuard::intersect()` computes the overlap between two guards (conjunction of interest
-regions). `TileGuard::union()` computes the union; for `Record` guards this produces an `Or`
-variant because the field-wise AND semantics prevent distributing OR through the conjunction.
-`is_universal()` and `is_empty()` test the extremes.
+`TileGuard::intersect()` computes the overlap between two guards, and `TileGuard::union()` their
+union; `is_universal()` and `is_empty()` test the extremes. Both run field by field over a
+`Record` guard, which names a region per field rather than a product over them — unlike
+`Predicate::Record`, which admits a value only when every field does and so needs an `Or` of
+its own to union two. A record guard's union is a record guard, which is what lets a product
+forward a consumer's accumulated release to the operand holding the field it names.
 
 TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
 as a `split(guard: &TileGuard)` method on `Tile` in the future.
@@ -145,34 +147,31 @@ In practice this means tile operators need to be **tile-polymorphic in their inp
 
 ### A product value is a record of tiles
 
-A record or tuple **value** compiles to a `Tiling::Record`, each field keeping the tiling its
-own term produced: a scalar component stays a scalar, a collection component stays the sealed
-function it already was, with the domain it binds. `MakeRecord` assembles it and
-[`SelectField`] reads one field back out, handing over that field's sub-tile.
+A record or tuple **value** compiles to a `Tiling::Record`, each field keeping the tiling its own
+term produced: a scalar component stays a scalar, a collection component stays the sealed function
+it already was, with the domain it binds. `MakeRecord` assembles it and [`SelectField`] reads one
+field back out.
 
-Keeping a component a tile is what lets it grow. A `Tile::SealedFunction` merges by appending
-its domain and unioning its domain predicate, which is a collection arriving in pieces; a
-`Tile::Scalar` merges by appending, so a collection boxed into one cell could only be replaced
-and its pieces would read as several tables. The fields also settle independently, and a guard
-says so per field — a settled scalar beside an unsettled collection releases the first and not
-the second, which `MakeRecordProducer` honors by not re-reading a released field.
+Keeping a component a tile is what lets it grow. A `Tile::SealedFunction` merges by appending its
+domain and unioning its domain predicate, which is a collection arriving in pieces. A collection
+boxed into one cell would merge the way every `Tile::Scalar` does, by appending the column, so two
+deliveries would land as two cells — two tables where the program has one collection. The
+components also settle at their own moments, so a guard names one field at a time: a settled
+scalar beside an unsettled collection releases the first alone.
 
-The other product is a **morphism**: `Tuple([acc, i])` under a binop is a pointwise pairing over
-the ambient iteration, and that is the zip [`Zip`] assembles. The node's own type tells the two
-apart — a value's extent is a record, a morphism's is a function — and `build_product` reads it
-there. Assembling a value as a zip is what turned `(D ⤇ A, D ⤇ B)` into `D ⤇ (A, B)`, a collection
-of products where the type says a product of collections; `debug_assert_product_shape` compares
-the operator's extent against the node's type, which nothing else in the tiling relates.
+The other product is a **morphism**: `Tuple([acc, i])` under a binop is a pointwise pairing over the
+ambient iteration, and that is the zip [`Zip`] assembles. A value's extent is a record and a
+morphism's is a function, so the node's own type is what separates them. Assembling a value as a zip
+yields `𝐷 ⤇ (𝐴, 𝐵)`, a collection of products, where the type says a product of collections.
 
 A collection component is an iteration site like any other collection (`planning::iterate`'s
-`mark_component_source`), because it compiles as the collection it is. A list literal's
-*elements* are the exception, and not as components: op-conversion evaluates each with
-`expr_to_value` and compiles none of them, so nothing inside one is a site.
+`mark_component_source`), because it compiles as the collection it is. A list literal's elements are
+the exception: op-conversion evaluates each to a `Value` and compiles none of them, so nothing
+inside one is a site.
 
-Selecting a field is a tile operation, distinct from the value-level `RecordField` application
-that reads a record sitting in a function's codomain one row at a time. That application needs
-every field to be a value in a column, which is what a record holding a collection cannot
-supply.
+Selecting a field is a tile operation, distinct from the value-level `RecordField` application that
+reads a record sitting in a function's codomain one row at a time. That application needs every
+field to be a value in a column, which a record holding a collection cannot supply.
 
 ---
 

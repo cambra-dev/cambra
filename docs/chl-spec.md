@@ -3295,8 +3295,8 @@ is no longer anything of that name to load.
 Sinks can be declared anywhere in the program, but all external side
 effects are lifted to the boundary of the program. A program that binds a sink
 ends in an **output list**: one named output per sink, each its own collection.
-An output list is not a record value — a record's fields are one value's, while
-each output is a separate collection bound to its own sink.
+Those outputs are the whole of what such a program produces — its trailing
+expression runs for effect and is not a result.
 
 Sinks may observe the indices of collections passed to them if needed.
 
