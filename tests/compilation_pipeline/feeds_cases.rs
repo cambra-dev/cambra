@@ -454,20 +454,34 @@ fn a_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i6
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::literal("sum([x for x in out if x > 1])", 2)]
-#[case::names_an_outer_let("n = 1\nsum([x for x in out if x > n])", 2)]
+#[case::names_an_outer_let("sum([x for x in out if x > n])", 2)]
 fn a_filtered_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i64) {
+    let feed = indoc! {r"
+        n = 1
+        out = defer()
+        for v in [1, 2]:
+            with begin():
+                out << v
+    "};
+    check_scalar(&format!("{feed}{read}"), Value::Int(expected));
+}
+
+/// The same filtered read **bound to a name** before it is consumed. The binding's
+/// declared type is a slot `walk_children_mut` does not reach either, so the erasure
+/// covers the binder slots alongside a node's own type and its annotation; without that
+/// the channel domain survives in the binding's predicate and the strict wall reports it.
+#[test]
+fn a_let_bound_filtered_comprehension_reads_a_feed_channel() {
     check_scalar(
-        &format!(
-            indoc! {r"
-                out = defer()
-                for v in [1, 2]:
-                    with begin():
-                        out << v
-                {}
-            "},
-            read
-        ),
-        Value::Int(expected),
+        indoc! {r"
+            out = defer()
+            for v in [1, 2]:
+                with begin():
+                    out << v
+            c = [x for x in out if x > 1]
+            sum(c)
+        "},
+        Value::Int(2),
     );
 }
 
