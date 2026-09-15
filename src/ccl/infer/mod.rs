@@ -320,14 +320,27 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // is rather than reconcile two arms. No `ctx_label` either: the report's span
         // underlines the expression already, so rendering it again says the same thing
         // twice, once in source and once in CCL.
-        ConstrainError::DataDomainMismatch { lhs, rhs } => InferError::TypeMismatch {
-            ctx: "collection domain (a collection's domain is its data, so it is \
-                  invariant — a collection over one domain does not stand in for a \
-                  collection over another)"
-                .to_string(),
-            found: Box::new(coalesce_for_error(&lhs)),
-            expected: Some(Box::new(coalesce_for_error(&rhs))),
-        },
+        ConstrainError::DataDomainMismatch { lhs, rhs, cause } => {
+            let (found, expected) = (coalesce_for_error(&lhs), coalesce_for_error(&rhs));
+            // **An inequality between two types that render alike says nothing.** It shows
+            // one type twice and asserts they differ, and the reader is left to distrust
+            // the rendering rather than read it. What separates them is a binder identity
+            // a domain holds and does not print, and the comparison that exposed the
+            // inequality names that pair — so where the two render alike, that comparison
+            // is the report. Its own two sides then differ structurally, which is what
+            // lets [`identical_rendering_hint`] quote the divergence.
+            if found.to_string() == expected.to_string() {
+                return map_constrain_err(*cause, ctx_label);
+            }
+            InferError::TypeMismatch {
+                ctx: "collection domain (a collection's domain is its data, so it is \
+                      invariant — a collection over one domain does not stand in for a \
+                      collection over another)"
+                    .to_string(),
+                found: Box::new(found),
+                expected: Some(Box::new(expected)),
+            }
+        }
         // A **join**, and the same fact the coalesce-time face reports. Converted to the
         // same `InferError` so the message follows the situation rather than which phase
         // noticed it.
