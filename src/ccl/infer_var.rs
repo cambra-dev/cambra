@@ -12,9 +12,6 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-// Both users are debug-only — the record-time closure check and its gap set — so a
-// release build has none and an ungated import is an unused one there.
-#[cfg(any(debug_assertions, test))]
 use std::collections::BTreeSet;
 
 use crate::ccl::{Name, Type, subst};
@@ -452,7 +449,6 @@ pub(crate) trait TelescopeWalk {
 /// an error. A program source is never one: a source reference is a
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
-#[cfg(any(debug_assertions, test))]
 pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
     subst::scope_gaps(&bound.ty, |n| {
         telescope.contains(n)
@@ -461,14 +457,8 @@ pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet
     })
 }
 
-/// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`
-/// names. Debug builds only, and inert unless the variable is set; one line
-/// per open name, so the file enumerates every open bound the run stored.
-///
-/// A line the enforcement excused reads `OPEN(sub-tree)`: the derivation was a
-/// probe over a sub-tree, whose free references its absent context binds. The
-/// tag is what keeps the log a measurement of escapes rather than a count of
-/// sub-tree checks.
+/// Enforce the record-time closure check at one recorded bound: a free term
+/// variable of the bound's type that the holder does not account for panics.
 ///
 /// Takes the [`Derivation`] rather than a decision about it: which derivations
 /// enforce is one question with one answer
@@ -482,33 +472,27 @@ pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet
 /// since an empty `BTreeSet` does not allocate. Narrowing it to a pass boundary is
 /// what `check_scope_valid` already does, and what this check exists to precede.
 ///
+/// **Enforced in every build**, and the cost above is what that is worth. A check that
+/// held only under `debug_assertions` would make two compilers: a release build would
+/// accept a tree a debug build rejects, and the trees it accepted would be exactly the
+/// ones carrying a reference some pass failed to rewrite.
+///
 /// [`Derivation::enforces_closure`]: crate::ccl::infer::solver::Derivation
-pub(crate) fn observe_bound_scope(
+pub(crate) fn check_bound_scope(
     holder: &InferVar,
     side: &'static str,
     bound: &Bound,
     derivation: crate::ccl::infer::solver::Derivation,
 ) {
-    let enforce = derivation.enforces_closure();
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::OnceLock;
-        static LOG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-        let log_path = LOG.get_or_init(|| std::env::var_os("CAMBRA_TELESCOPE_LOG").map(Into::into));
-        if log_path.is_none() && !enforce {
-            return;
-        }
+    if derivation.enforces_closure() {
         let gaps = bound_scope_gaps(&holder.telescope, bound);
-        if gaps.is_empty() {
-            return;
-        }
         // The record-time closure invariant, as an internal error on the live
         // solve (see `src/ccl/design/type-inference.md`, "The invariant"). Every
         // gap is an error: a bound's free term variables are the telescope's
         // entries and the edge substitutions' domains, and a program source is
         // not among them because a source reference is a
         // [`crate::ccl::TypedExprNode::Source`] node rather than a variable.
-        if enforce && let Some(open) = gaps.iter().next() {
+        if let Some(open) = gaps.iter().next() {
             panic!(
                 "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
                  `{}` but is neither in the holder's telescope {:?} nor discharged by \
@@ -517,34 +501,6 @@ pub(crate) fn observe_bound_scope(
                 holder.uid, bound.ty, holder.telescope,
             );
         }
-        let Some(path) = log_path else {
-            return;
-        };
-        use std::io::Write;
-        let mut out = String::new();
-        for n in &gaps {
-            out.push_str(&format!(
-                "OPEN{} ?{} {side} free={n} telescope={:?} ty={}\n",
-                if enforce { "" } else { "(sub-tree)" },
-                holder.uid,
-                holder.telescope,
-                bound.ty
-            ));
-        }
-        if std::env::var_os("CAMBRA_TELESCOPE_BT").is_some() {
-            out.push_str(&format!("{}\n", std::backtrace::Backtrace::force_capture()));
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = f.write_all(out.as_bytes());
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (holder, side, bound, enforce);
     }
 }
 
@@ -798,8 +754,8 @@ mod tests {
 
     /// The record-time closure check: a bound's free reference is covered by
     /// the holder's telescope or by an edge substitution's domain, and
-    /// anything else is a gap. [`observe_bound_scope`] logs the gap set and,
-    /// on a derivation that enforces, rejects it.
+    /// anything else is a gap. [`check_bound_scope`] rejects one on a
+    /// derivation that enforces.
     #[test]
     fn bound_scope_gaps_sees_telescope_and_edge_domains() {
         use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
@@ -848,7 +804,7 @@ mod tests {
             Refinement::born(StdRc::new(TypedExpr::var(Name::fresh("escaped")))),
         );
         let holder = InferVar::fresh(0);
-        observe_bound_scope(
+        check_bound_scope(
             &holder,
             "lower",
             &Bound::conc(dep),
@@ -872,7 +828,7 @@ mod tests {
             Refinement::born(StdRc::new(TypedExpr::var(Name::raw("a")))),
         );
         let holder = InferVar::fresh(0);
-        observe_bound_scope(
+        check_bound_scope(
             &holder,
             "lower",
             &Bound::conc(dep),

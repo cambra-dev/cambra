@@ -1365,7 +1365,7 @@ per-operation check and nothing else. The context it was cut from holds the bind
 the sub-tree can enter them. Planning's in-place checks of a morphism it has just built are not
 excused, because a morphism carries its own binder. `ConstrainCache::for_derivation` names the three
 cases, and the `Fun`/`Fun` codomain edge reads the same value (see [Where the conversions
-run](#where-the-conversions-run)). `CAMBRA_TELESCOPE_LOG` enables the observation log.
+run](#where-the-conversions-run)).
 
 A program source needs no standing in the telescope, because the check never sees a reference to
 one. A source is referenced by a `TypedExprNode::Source` node rather than by a variable: lowering
