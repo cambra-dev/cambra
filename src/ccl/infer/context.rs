@@ -590,12 +590,7 @@ impl Typing for InferCtx {
             body_ty,
             crate::ccl::subst::Subst::discharge(name.clone(), bound_expr.clone_preserving_ids()),
         );
-        crate::ccl::infer_var::observe_bound_scope(
-            v,
-            "lower",
-            &bound,
-            crate::ccl::infer::solver::Derivation::LiveSolve,
-        );
+        crate::ccl::infer_var::enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         lifted
     }
@@ -856,13 +851,7 @@ impl Typing for InferCtx {
             result,
             crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
         );
-        // The dependent-apply push is emission's, so it is always the live solve.
-        crate::ccl::infer_var::observe_bound_scope(
-            v,
-            "lower",
-            &bound,
-            crate::ccl::infer::solver::Derivation::LiveSolve,
-        );
+        crate::ccl::infer_var::enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
     }

@@ -197,8 +197,8 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
-    /// Which derivation this cache serves. The representation poses two questions
-    /// and they do not have the same answer in all three
+    /// Which derivation this cache serves: the live solve and a pass-boundary
+    /// re-derivation answer `opens_unconditionally` differently
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
     derivation: Derivation,
     /// **Γ for each side of the judgment** — what the witnesses in scope range over
@@ -216,7 +216,7 @@ pub struct ConstrainCache {
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
-/// draws an edge, which is what those questions are answered against.
+/// draws an edge, which is what that question is answered against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Derivation {
     /// Emission and its specialization pins — where a recorded bound becomes
@@ -226,41 +226,9 @@ pub enum Derivation {
     /// passes spelled in different coordinates, but every binder the tree's
     /// refinements reference is a binder the walk itself can enter.
     PostPass,
-    /// A probe over a sub-tree cut from its context: `debug_typecheck`'s
-    /// per-operation check, its one caller. Its refinements reference binders the
-    /// absent context holds, which no walk of the sub-tree can see, so the
-    /// closure invariant is not a record-time error here. Planning's in-place
-    /// checks of a morphism it has just built do not need the excuse: a
-    /// morphism carries its own binder, so they take
-    /// [`PostPass`](Self::PostPass), which enforces.
-    SubTree,
 }
 
 impl Derivation {
-    /// Whether every binder a reference in this derivation's types names is one the walk can
-    /// enter — so a reference Γ does not classify is **free**.
-    ///
-    /// True over a self-contained tree, where free is a malformed type and the escape check
-    /// reports it. A sub-tree probe cannot say it, and a refinement predicate is not the
-    /// case that shows why: a predicate's type does bind the witnesses it names. **A
-    /// Σ-typed lambda's parameter** is the case. Its type is a bare `WitnessRef`, and the
-    /// sum that binds it rides the *lambda's* type rather than the parameter's
-    /// (`crate::ccl::infer::debug_assert_no_free_witness`), so a cut anywhere inside the
-    /// body leaves the index unclassifiable while the enclosing walk classifies it. The
-    /// probe has no verdict to give there and gives none; the whole-tree walls decide. Same
-    /// excuse, and the same reason, as [`enforces_closure`](Self::enforces_closure).
-    pub(crate) fn sees_every_binder(self) -> bool {
-        self != Derivation::SubTree
-    }
-
-    /// Whether bounds recorded through this derivation must close against the
-    /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
-    /// Every derivation over a self-contained tree does. Only a sub-tree probe
-    /// is excused, because its absent context is what carries the binders.
-    pub(crate) fn enforces_closure(self) -> bool {
-        self != Derivation::SubTree
-    }
-
     /// Whether a closed `Fun`/`Fun` codomain opens unconditionally rather than
     /// only toward a side carrying inference variables. A re-derivation is
     /// reconciling two passes' spellings of one type; the live solve is not, and
@@ -1093,9 +1061,8 @@ fn constrain_go_impl(
             // convention). A post-pass re-derivation opens unconditionally: it
             // reconciles types that different passes spelled in different
             // forms (a closed function's codomain against a rebuilt,
-            // discharged one). Which derivation this is
-            // ([`Derivation`]) answers both this and the record sites'
-            // question, so the two read one field rather than two flags.
+            // discharged one). This is the only site that reads [`Derivation`]:
+            // the record sites enforce the closure invariant at every derivation.
             // The pre-scan keeps the common codomain that does not reference
             // this function untouched — the same dependence test descent and
             // application ask everywhere else.
@@ -1271,22 +1238,19 @@ fn constrain_go_impl(
             let (Type::WitnessRef(a), Type::WitnessRef(b)) = (&a, &b) else {
                 unreachable!("a witness renaming maps a reference to a reference")
             };
-            // **Each side's own Γ classifies its own reference.** A reference is a name, so
-            // what it ranges over is read where it is bound.
-            // **Two references are one index when they are one name**, at every derivation.
-            // The comparison runs under the correspondence its caller established — the
-            // Fun/Fun arm's rename between two Σs, [`witness_instantiation`]'s where a value
-            // meets a shape written over binders — so both sides arrive in one spelling and
-            // nothing is left for this to reconcile.
+            // **Two references are one index when they are one name.** The comparison runs
+            // under the correspondence its caller established — the Fun/Fun arm's rename
+            // between two Σs, [`witness_instantiation`]'s where a value meets a shape written
+            // over binders — so both sides arrive in one spelling and nothing is left for this
+            // to reconcile.
             //
-            // A **sub-tree** probe is the one abstention: a binder its refinements reference
-            // may be held by the context the cut removed, so Γ classifies neither reference
-            // and the probe has no verdict to give ([`Derivation::sees_every_binder`]).
-            let same = a == b
-                || (!cache.derivation.sees_every_binder()
-                    && (cache.lctx.type_kind_of(a).is_none()
-                        || cache.rctx.type_kind_of(b).is_none()));
-            if same {
+            // **Neither Γ is read here.** `lctx`/`rctx` serve the concrete-meets-witness arm
+            // below, where a reference has to be classified before it can be constrained; two
+            // references decide by identity. A reference neither Γ classifies compares equal
+            // to itself and passes, so this arm is not the free-reference check — that is
+            // [`crate::ccl::infer_var::enforce_bound_scope`] at the `Infer` arms below and
+            // `crate::ccl::infer::debug_assert_no_free_witness`.
+            if a == b {
                 Ok(())
             } else {
                 Err(ConstrainError::Mismatch {
@@ -1425,7 +1389,7 @@ fn constrain_go_impl(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
-                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.derivation);
+                crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
                 let lows = Rc::clone(s.lower());
@@ -1494,7 +1458,7 @@ fn constrain_go_impl(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
-                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.derivation);
+                crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
                 let ups = Rc::clone(s.upper());
@@ -2104,18 +2068,20 @@ mod tests {
         )
     }
 
-    /// The `Fun`/`Fun` opening does not fire between two concrete sides, so a free
-    /// reference sharing a binder's display spelling cannot capture the reopened
-    /// index.
+    /// **The `Fun`/`Fun` opening is the whole behavioral content of [`Derivation`]**, and
+    /// one pair of types shows both answers.
     ///
     /// `(x: Int) ⇒ {Int | __elem == #0}` and `Int ⇒ {Int | __elem == x}` state
     /// different refinements: one is about the function's own argument, the other about
-    /// whatever binds `x` outside the type. Opening the closed side at its
-    /// display name spells both `__elem == x` and reads them as one. Uniquified
-    /// binders make the collision need the same uid, which is the same binder,
-    /// and the concrete relation must not depend on that convention.
+    /// whatever binds `x` outside the type. The live solve leaves the closed side closed, so
+    /// the index and the free name stay apart and the edge is a mismatch — uniquified binders
+    /// would make the collision need the same uid, which is the same binder, and the concrete
+    /// relation must not depend on that convention. A re-derivation opens at the display name,
+    /// which spells both `__elem == x` and reads them as one: its two sides are two passes'
+    /// spellings of one type rather than two types a program wrote, so a shared spelling there
+    /// is the same binder.
     #[test]
-    fn a_concrete_pair_does_not_open_at_a_shared_spelling() {
+    fn the_derivation_decides_whether_a_concrete_pair_opens() {
         let x = Name::raw("x");
         let refinement = |referenced: &Name| {
             Type::Refinement(
@@ -2141,15 +2107,22 @@ mod tests {
             "a closed refinement about the function's own binder does not satisfy one \
              about a free name that shares its spelling"
         );
+        assert!(
+            constrain_subtype(
+                &closed,
+                &free,
+                &mut ConstrainCache::for_derivation(Derivation::PostPass),
+            )
+            .is_ok(),
+            "a re-derivation opens the closed side at its display name, so the two \
+             refinements arrive in one spelling"
+        );
     }
 
     /// A whole-tree re-derivation enforces the closure invariant, exactly as the
     /// live solve does: the tree it walks holds every binder its refinements name, so
     /// a reference to one it does not is the escape the invariant catches.
     ///
-    /// This is what a `Derivation::SubTree` cache is excused from. The two
-    /// tests together are why that excuse is narrow: a probe over a sub-tree
-    /// has no context to hold the binder, and a walk over the whole tree does.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "open bound recorded")]
@@ -2158,54 +2131,6 @@ mod tests {
         let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
         let v = fresh_var(0);
         let _ = constrain_subtype(&escaped, &v, &mut cache);
-    }
-
-    /// Two references to one index, spelled under different binders, at a cut where Γ
-    /// classifies only one of them.
-    ///
-    /// The shape is a comprehension over a conditional collection: the collection is
-    /// `Σ (σ_coll : 𝐾). (σ_coll ⤇ Int)` and the index reaching it is the enclosing
-    /// Σ-typed lambda's parameter, a bare reference the *lambda's* type binds. A cut inside
-    /// the body classifies the collection's binder and not the parameter's, so a probe that
-    /// read the pair as free rejected every such program — 80 tests, all of them
-    /// well-typed at every whole-tree wall.
-    #[test]
-    fn a_sub_tree_probe_abstains_where_only_one_reference_is_classified() {
-        use crate::ccl::infer_var::fresh_witness_binder_id;
-        use crate::ccl::ty::{TypeKind, Witness, WitnessContext};
-
-        let kind = TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]);
-        let collection = Witness::bound_to(fresh_witness_binder_id(), kind.clone());
-        let parameter = Witness::bound_to(fresh_witness_binder_id(), kind);
-        let (classified, unclassified) = (
-            Type::WitnessRef(*collection.id()),
-            Type::WitnessRef(*parameter.id()),
-        );
-        // Γ holds the collection's binder, the one the cut kept.
-        let gamma = WitnessContext::default().extended(std::slice::from_ref(&collection));
-
-        let mut probe = ConstrainCache::for_derivation(Derivation::SubTree);
-        probe.seed_context(&gamma);
-        constrain_subtype(&unclassified, &classified, &mut probe)
-            .expect("a sub-tree probe gives no verdict on a reference its context binds");
-
-        let mut whole = ConstrainCache::for_derivation(Derivation::PostPass);
-        whole.seed_context(&gamma);
-        constrain_subtype(&unclassified, &classified, &mut whole)
-            .expect_err("over a whole tree an unclassified reference is free");
-    }
-
-    /// A sub-tree probe records the same bound without complaint: its refinements
-    /// reference binders the context it was cut from holds, and no walk of the
-    /// sub-tree can enter them.
-    #[test]
-    #[cfg(debug_assertions)]
-    fn a_sub_tree_probe_admits_a_reference_its_context_binds() {
-        let escaped = escaped_refinement();
-        let mut cache = ConstrainCache::for_derivation(Derivation::SubTree);
-        let v = fresh_var(0);
-        constrain_subtype(&escaped, &v, &mut cache)
-            .expect("a sub-tree's free reference is admitted");
     }
 
     /// The tripwire is armed for the one place the record/variant arms and the
@@ -3383,7 +3308,8 @@ mod tests {
 
     /// **Candidates lie below a kind that admits every one of them.** The premise is set
     /// containment, so it is asked once per candidate and `Type` — which admits all of them
-    /// — is above every kind and below nothing narrower.
+    /// — is above every kind and below nothing narrower. A key bound is a kind like any
+    /// other here: a `Map` lies below `Collection`, and `Collection` below no `Map`.
     #[test]
     fn candidates_lie_below_a_kind_that_admits_them() {
         let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
@@ -3394,6 +3320,7 @@ mod tests {
         ]));
         let filtered = sum(TypeKind::Enumerated(vec![refined(Type::UIntRange(3), 7)]));
         let universe = sum(TypeKind::Type);
+        let key_bound = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
 
         assert!(
             constrain_subtype(&named, &ranges, &mut ConstrainCache::new()).is_ok(),
@@ -3403,16 +3330,18 @@ mod tests {
             constrain_subtype(&filtered, &ranges, &mut ConstrainCache::new()).is_err(),
             "a refined range is not a range, so a filtered collection is not a `List`"
         );
-        for k in [&named, &ranges, &universe] {
+        for k in [&named, &ranges, &universe, &key_bound] {
             assert!(
                 constrain_subtype(k, &universe, &mut ConstrainCache::new()).is_ok(),
                 "{k} <: ⊤"
             );
         }
-        assert!(
-            constrain_subtype(&universe, &ranges, &mut ConstrainCache::new()).is_err(),
-            "⊤ is below nothing narrower"
-        );
+        for narrower in [&ranges, &key_bound] {
+            assert!(
+                constrain_subtype(&universe, narrower, &mut ConstrainCache::new()).is_err(),
+                "⊤ is below nothing narrower, and {narrower} is narrower"
+            );
+        }
     }
 
     /// **An unresolved candidate is not a rejection.** It has no shape to read a property
@@ -3554,64 +3483,6 @@ mod tests {
             ),
             Err(ConstrainError::KindMismatch { .. })
         ));
-    }
-
-    /// **One rule, every derivation.** A check asks what the solve asks, so a rejection is a
-    /// rejection wherever the edge is drawn — the previous version of this test named every
-    /// cache and used one.
-    #[test]
-    fn a_rejection_holds_at_every_derivation() {
-        for derivation in [
-            Derivation::LiveSolve,
-            Derivation::PostPass,
-            Derivation::SubTree,
-        ] {
-            // A capability where a collection is demanded: the fun-kind rejection.
-            assert!(
-                matches!(
-                    constrain_subtype(
-                        &fun(Type::UIntRange(3), prim(BaseType::Int)),
-                        &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
-                        &mut ConstrainCache::for_derivation(derivation),
-                    ),
-                    Err(ConstrainError::KindMismatch { .. })
-                ),
-                "a capability reaching a collection position is caught at {derivation:?}"
-            );
-            // **The Σ kind premise, at every derivation.** The universe is not contained in
-            // a key bound, so a `Collection` where a `Map` is demanded is a
-            // rejection — and it is the only premise that looks at the kinds, the domain edge
-            // being discharged by the binder correspondence.
-            assert!(
-                constrain_subtype(
-                    &Type::collection_of(prim(BaseType::Int)),
-                    &Type::map_of(prim(BaseType::Int), prim(BaseType::Int)),
-                    &mut ConstrainCache::for_derivation(derivation),
-                )
-                .is_err(),
-                "Collection is not below Map at {derivation:?}"
-            );
-            // A candidate dropped is a narrower kind, and narrower is not above.
-            assert!(
-                constrain_subtype(
-                    &conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]),
-                    &conditional(vec![Type::UIntRange(2)]),
-                    &mut ConstrainCache::for_derivation(derivation),
-                )
-                .is_err(),
-                "a sum with an extra candidate is not below one without it at {derivation:?}"
-            );
-            // What must still be accepted: a `Map` is below `Collection`.
-            assert!(
-                constrain_subtype(
-                    &Type::map_of(prim(BaseType::Int), prim(BaseType::Int)),
-                    &Type::collection_of(prim(BaseType::Int)),
-                    &mut ConstrainCache::for_derivation(derivation),
-                )
-                .is_ok(),
-                "Map is below Collection at {derivation:?}"
-            );
-        }
     }
 
     /// A function over a fixed domain and codomain, so a test varies only the
