@@ -2104,7 +2104,7 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
 /// a refinement.
 ///
 /// Feeding a response under a guard restricts the channel's domain, so the output's
-/// type is `{source(…) | __elem ▷ …} ⤇ String` rather than a bare arrow. The output
+/// type is `{source(…) | __elem ▷ …} ⤇ String` rather than an unrefined one. The output
 /// list is an ordinary `Record`, so planning decides each entry by whether it holds a
 /// collection — and a filtered collection is a collection, its predicate riding the
 /// domain. Reading the outer shape instead would answer the same here and differ on a
