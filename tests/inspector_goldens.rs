@@ -141,31 +141,29 @@ fn snapshot_dumps_are_cross_process_deterministic() {
 
 /// Two spawns of one program produce byte-identical dumps.
 fn assert_dumps_agree(example: &str) {
-    {
-        let first = dump(example);
-        let second = dump(example);
-        if first != second {
-            // Preserve both dumps for diffing before panicking.
-            let dir = std::env::temp_dir();
-            let a = dir.join(format!("{example}.dump1.json"));
-            let b = dir.join(format!("{example}.dump2.json"));
-            std::fs::write(&a, &first).expect("writing first dump");
-            std::fs::write(&b, &second).expect("writing second dump");
-            let diff_at = first
-                .iter()
-                .zip(second.iter())
-                .position(|(x, y)| x != y)
-                .unwrap_or_else(|| first.len().min(second.len()));
-            panic!(
-                "--dump-snapshot for {example} is NOT cross-process deterministic \
-                 (first difference at byte {diff_at}; dumps preserved at {} and {}). \
-                 Golden fixtures cannot be blessed until the nondeterminism source \
-                 is fixed — see `snapshot_dumps_are_cross_process_deterministic` \
-                 for the first suspects.",
-                a.display(),
-                b.display()
-            );
-        }
+    let first = dump(example);
+    let second = dump(example);
+    if first != second {
+        // Preserve both dumps for diffing before panicking.
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("{example}.dump1.json"));
+        let b = dir.join(format!("{example}.dump2.json"));
+        std::fs::write(&a, &first).expect("writing first dump");
+        std::fs::write(&b, &second).expect("writing second dump");
+        let diff_at = first
+            .iter()
+            .zip(second.iter())
+            .position(|(x, y)| x != y)
+            .unwrap_or_else(|| first.len().min(second.len()));
+        panic!(
+            "--dump-snapshot for {example} is NOT cross-process deterministic \
+             (first difference at byte {diff_at}; dumps preserved at {} and {}). \
+             Golden fixtures cannot be blessed until the nondeterminism source \
+             is fixed — see `snapshot_dumps_are_cross_process_deterministic` \
+             for the first suspects.",
+            a.display(),
+            b.display()
+        );
     }
 }
 
