@@ -236,20 +236,6 @@ fn generator_defer_binding(
     )
 }
 
-/// Lower the body statements of a `for`-loop to a single CCL expression.
-///
-/// A binding statement becomes a [`TypedExprNode::Let`] around the rest of the body;
-/// every other statement is an effect sequenced before it with
-/// [`TypedExprNode::ExprStmt`]. Both, and the last statement, lower through
-/// [`lower_for_body_stmt`].
-///
-/// `defer_name` — if `Some`, `yield e` terminals are replaced with
-/// `feed(defer_name, e)`. If `None`, a `yield` is an error.
-///
-/// `mutation_scope` — names that cannot be assigned to (function args,
-/// pre-loop lets, and enclosing for's iteration variables). Assignments to
-/// these produce a mutation error.
-///
 /// Rejection for a write to a name bound *outside* a for-loop body. Inside a
 /// loop a plain `=` cannot carry state across iterations, and `=` is immutable
 /// regardless — it would be a per-iteration shadow that silently discards each
@@ -327,6 +313,22 @@ fn body_scope(
     mutation_scope.union(frame_introduced).cloned().collect()
 }
 
+/// Lower the body statements of a `for`-loop to a single CCL expression.
+///
+/// The last statement is the body's value. A binding above it becomes a
+/// [`TypedExprNode::Let`] around the rest of the body, and a feed becomes an effect
+/// sequenced before the rest with [`TypedExprNode::ExprStmt`]; those two are the whole
+/// of what a non-final statement may be (`docs/chl-spec.md`, "4. Statement semantics").
+/// Every position lowers through [`lower_for_body_stmt`], so a feed lowers by one rule
+/// wherever it sits.
+///
+/// `defer_name` — if `Some`, `yield e` terminals are replaced with
+/// `feed(defer_name, e)`. If `None`, a `yield` is an error.
+///
+/// `mutation_scope` — names that cannot be assigned to (function args,
+/// pre-loop lets, and enclosing for's iteration variables). Assignments to
+/// these produce a mutation error.
+///
 /// `frame_introduced` — names introduced by the current for clause (the
 /// iteration variable) and any let-bindings accumulated so far. These may
 /// be re-bound (shadowed) inside the body without triggering a mutation error.
@@ -467,19 +469,48 @@ fn lower_for_body_stmts_scoped(
                      is not yet supported",
                 ));
             }
-            // Everything else is an effect, lowered by the same rule that lowers it
-            // as the body's last statement and sequenced before what follows. The
-            // grammar of a body's statements is therefore one grammar, at whichever
-            // position the statement sits — which is what lets two feeds into one
-            // deferred collection stand in a body with no accumulator, the shape
-            // [`lower_loop_body_chain`] already admits when one is present.
-            _ => {
+            // `x := e` and `x: T := e` introduce a mutable variable inside the body,
+            // the same construct the `Mut(V)`-annotated `=` above rejects, so they earn
+            // the same rejection — the annotation says nothing about which construct it
+            // is ([`in_loop_mut_var_error`]). A subscript target is a keyed write to a
+            // collection rather than an introduction, and falls through below.
+            ChlStmt::MutAssign { target, .. } if name_target_as_name(target).is_some() => {
+                let name = extract_name_target(target, "mutable assignment")?;
+                if mutation_scope.contains(&name) {
+                    return Err(outer_binding_write_error(stmt.span, &name));
+                }
+                return Err(in_loop_mut_var_error(stmt.span, &name));
+            }
+            // A feed is an effect: it contributes to a deferred collection and nothing
+            // to the body's value, so it is lowered by the rule that lowers it last
+            // ([`lower_for_body_stmt`]) and sequenced before what follows. That is what
+            // lets two feeds into one deferred collection stand in a body with no
+            // accumulator, the shape [`lower_loop_body_chain`] already admits when one
+            // is present.
+            //
+            // A binding and a feed are the whole of what a non-final statement may be
+            // (`docs/chl-spec.md`, "4. Statement semantics"). An `if`, a `match` and a
+            // nested `for` are the body's value and stay last: `channelize`'s fan-out
+            // dispatches on a bare `Case` at the lambda body (`try_extract_fanout_feed`),
+            // so one sequenced under an `ExprStmt` is not fanned out at all, and the
+            // generic path it falls to builds a companion channel whose predicate
+            // references the loop binder — which the post-channelize typecheck rejects.
+            ChlStmt::Expr(value)
+                if matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }) =>
+            {
                 let effect =
                     lower_for_body_stmt(stmt, defer_name, mutation_scope, &frame_introduced, ctx)?;
                 prefix.push(PrefixStmt::Effect {
                     effect,
                     span: stmt.span,
                 });
+            }
+            _ => {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "only assignments, function definitions, `<<` feeds and `yield` \
+                     are supported as non-terminal statements in for-loop bodies",
+                ));
             }
         }
     }
@@ -523,18 +554,25 @@ enum PrefixStmt {
     },
 }
 
-/// Lower one effect statement of a for-loop body, at any position in it.
+/// Lower one statement of a for-loop body.
 ///
 /// - `yield e` — `Feed(defer_name, lower(e))` (requires `defer_name` to be set)
 /// - `r << e` — `Feed("r", lower(e))`
 /// - `if cond: body` (no else) — `Case` with `Unit` fallthrough
 /// - `match m: case …` — the same `Case`, dispatching on a tag
 /// - `for j in ys: body` — nested `Compose([ys, Lambda(j, body)])`
-/// - `pass` — `unit`
 ///
-/// The body's **last** statement is its value; [`lower_for_body_stmts`] sequences the
-/// rest before it. Both positions lower through here, so a body's statements have one
-/// grammar rather than one per position.
+/// A feed reaches here at either position: it is the body's value when it stands last,
+/// and an effect [`lower_for_body_stmts`] sequences before what follows when it does
+/// not. One rule lowers it either way, which is what lets two feeds into one deferred
+/// collection stand in a body with no accumulator.
+///
+/// The other three forms are the body's value and reach here only last. `channelize`'s
+/// fan-out dispatches on a bare `Case` at the lambda body (`try_extract_fanout_feed`),
+/// so one sequenced under an `ExprStmt` is not fanned out at all, and the generic path
+/// it falls to builds a companion channel whose predicate references the loop binder —
+/// which the post-channelize typecheck rejects. [`lower_for_body_stmts`] keeps them out
+/// of a non-final position for that reason.
 ///
 /// `mutation_scope` and `frame_introduced` carry the same semantics as in
 /// [`lower_for_body_stmts`]; they are threaded through for recursive calls.

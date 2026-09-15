@@ -282,7 +282,9 @@ y ++ y"#, Tile::SealedFunction {
         ])),
         deleted: BitSet::new(),
     })]
-#[ignore] // TODO this should work, but our filters on supported exprs in loops are too restrictive
+// A feed, a rebind, a second feed: an interleaved body with no accumulator, which
+// only the one grammar admits. `x = i` and `x = x + i` are per-iteration immutable
+// rebinds, so `x` is `i` at the first feed and `2i` at the second.
 #[case(
     r#"
 o = defer()
@@ -297,7 +299,7 @@ o"#,
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
             ]),
-        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 10, 30, 60]))),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))),
         domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     }
@@ -478,37 +480,192 @@ fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
     );
 }
 
-/// Two feeds into **one** deferred collection, in a loop body with no accumulator.
-/// The body's statements have one grammar at every position
-/// ([`lower_for_body_stmt`]), so the first feed is an effect sequenced before the
-/// second rather than a non-terminal statement to reject. The same body with an
-/// accumulator compiled already, through the other loop-body lowering.
+/// A feed, an ordinary statement, a second feed: an interleaved loop body with no
+/// accumulator. Every position lowers through [`lower_for_body_stmt`], so the first
+/// feed is an effect sequenced before the rest rather than a non-terminal statement to
+/// reject. Each program here is a lowering error on the base, in the `<<` spelling and
+/// in the `yield` spelling alike.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// One deferred collection.
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            o << i
+            t = i * 10
+            o << t
+        sum(o)
+    "#},
+    Value::Int(33)
+)]
+// Two, so the statement between the feeds separates a feed to each. The reads are
+// weighted apart, so a fan-out routing an arm's values into the wrong one fails here.
+#[case(
+    indoc! {r#"
+        a = defer()
+        b = defer()
+        for i in [1, 2]:
+            a << i
+            t = i * 10
+            b << t
+        sum(a) * 100 + sum(b)
+    "#},
+    Value::Int(330)
+)]
+// The `yield` spelling of the first, inside a generator function.
+#[case(
+    indoc! {r#"
+        def g(xs):
+            for i in xs:
+                yield i
+                t = i * 10
+                yield t
+        sum(g([1, 2]))
+    "#},
+    Value::Int(33)
+)]
+// Two `yield`s in one iteration with nothing between them.
+#[case(
+    indoc! {r#"
+        def g(xs):
+            for i in xs:
+                yield i
+                yield i * 10
+        sum(g([1, 2]))
+    "#},
+    Value::Int(33)
+)]
+fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// What a for-loop body's non-final position keeps out. A binding and a feed are the
+/// whole of what a non-final statement may be (`docs/chl-spec.md`, "4. Statement
+/// semantics"): an `if`, a `match` and a nested `for` are the body's value and stay
+/// last, and a mutable variable is not introduced inside a body at any spelling.
+///
+/// The three conditional forms compile past lowering without this rejection and fail
+/// deeper — an `if` and a nested `for` on the post-channelize typecheck, a `match` on
+/// `PartialFeedCaseUnsupported`, which names the wrong cause. `channelize`'s fan-out
+/// dispatches on a bare `Case` at the lambda body, and one sequenced under an
+/// `ExprStmt` is not one.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
     indoc! {r#"
         o = defer()
-        for i in [1, 2]:
-            o << i
-            o << i * 10
+        for i in [1, 2, 3]:
+            if i > 1:
+                o << i
+            o << 100
         sum(o)
     "#},
-    Value::Int(33)
+    "only assignments, function definitions, `<<` feeds and `yield`"
 )]
 #[case(
     indoc! {r#"
-        acc := 0
         o = defer()
-        for i in [1, 2]:
-            o << i
-            o << i * 10
-            acc += 1
+        for m in [`a(2), `b(3)]:
+            match m:
+                case `a(n):
+                    o << n
+                case `b(k):
+                    o << k
+            o << 100
         sum(o)
     "#},
-    Value::Int(33)
+    "only assignments, function definitions, `<<` feeds and `yield`"
 )]
-fn two_feeds_into_one_defer_in_a_loop_body(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            for j in [10, 20]:
+                o << i * j
+            o << i
+        sum(o)
+    "#},
+    "only assignments, function definitions, `<<` feeds and `yield`"
+)]
+// A bare call, and a `return`: neither binds nor feeds.
+#[case(
+    indoc! {r#"
+        def bump(x):
+            x + 1
+        o = defer()
+        for i in [1, 2]:
+            bump(i)
+            o << i
+        sum(o)
+    "#},
+    "only assignments, function definitions, `<<` feeds and `yield`"
+)]
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            return i
+            o << i
+        sum(o)
+    "#},
+    "only assignments, function definitions, `<<` feeds and `yield`"
+)]
+// A mutable variable introduced in the body, at all three spellings — one rejection,
+// because whether the introduction carries an annotation says nothing about which
+// construct it is.
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            t := i * 2
+            o << i
+        sum(o)
+    "#},
+    "`t` is a mutable variable introduced inside a for-loop body"
+)]
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            t: Mut(Int) := i * 2
+            o << i
+        sum(o)
+    "#},
+    "`t` is a mutable variable introduced inside a for-loop body"
+)]
+#[case(
+    indoc! {r#"
+        o = defer()
+        for i in [1, 2]:
+            t: Mut(Int) = i * 2
+            o << i
+        sum(o)
+    "#},
+    "`t` is a mutable variable introduced inside a for-loop body"
+)]
+fn a_non_final_loop_body_statement_is_a_binding_or_a_feed(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    check_compile_error(code, needle);
+}
+
+/// The last statement is the body's value, so the forms that are not one are rejected
+/// there by the terminal's own message. Reached only last: a non-final position admits
+/// a narrower set, which the rejection above names.
+#[test]
+fn a_loop_body_ends_in_a_value() {
+    check_compile_error(
+        indoc! {r#"
+            o = defer()
+            for i in [1, 2]:
+                o << i
+                return i
+            sum(o)
+        "#},
+        "for-loop body must end in a yield, `<<` feed, nested for, if-guard, or match",
+    );
 }
 
 /// `<<=` sets a channel's read view outright, so its RHS must be a collection
