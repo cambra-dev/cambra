@@ -35,13 +35,7 @@ import { TreeView, serializeTree } from "./treeView";
 import { validateSnapshot } from "./wireValidate";
 import { isIrPane } from "./types";
 import type { Diagnostic, Snapshot, Span } from "./types";
-
-function el(tag: string, className?: string, text?: string): HTMLElement {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
+import { el } from "./dom";
 
 // Cambra `Span`s are UTF-8 *byte* offsets; for the diagnostics list we show
 // ariadne-style `line:col` positions computed against the encoded byte stream.
