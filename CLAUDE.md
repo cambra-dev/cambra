@@ -303,6 +303,11 @@ Mental model:
 
 - jj **bookmarks** are git branches. Each git-spice branch head appears as a bookmark on the matching commit; `main@origin`, `<name>@origin` are remote-tracking. `@` is the working-copy commit (itself a real, editable commit).
 - Every operation is recorded in the **op log** — `jj op log` — and any prior state is recoverable with `jj op restore <op-id>`. This is your undo; there is no "rebase --abort" because a rebase never leaves you detached.
+- An edit lands in `@` as it is made. There is no staging area, so the commit an edit belongs to is
+  chosen before the edit rather than after: run `jj new` before starting a unit of work, and
+  `jj new --insert-after <head>` followed by `jj bookmark set <name> -r @` when the work belongs to
+  an existing bookmark. `.claude/hooks/jj-published-commit.py` reports the case that rewrites
+  published history — `@` at or below a pushed bookmark — and judges nothing else.
 
 Workflow (validated rebasing the inspector stack onto `dmills/txn-mutability`):
 
