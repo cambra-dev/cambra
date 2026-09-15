@@ -2130,12 +2130,8 @@ fn test_match_arm_write_carries(#[case] code: &str, #[case] expected: Value) {
 ///
 /// An exact annotation on a mutable collection binds a witness of its own, while the
 /// comprehension initializing it hands back a collection at the witness it opened. The
-/// two are compared, they differ, and both print `σ` — a witness's binder identity is
-/// not something `Display` shows. Reported as the inequality, the message reads
-/// `expected σ, found σ`: one type printed twice, asserting that it differs from
-/// itself, which sends a reader looking anywhere but where the disagreement is. The
-/// sub-comparison it rode in on has two sides that differ structurally, so that is the
-/// one the report shows.
+/// two differ, and both print `σ` — a witness's binder identity is not something
+/// `Display` shows.
 #[test]
 fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
     let code = indoc! {r#"

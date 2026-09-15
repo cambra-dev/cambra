@@ -119,9 +119,9 @@ pub enum ConstrainError {
         rhs: Box<Type>,
         /// The comparison that found them unequal.
         ///
-        /// Carried because the two domains can *render alike* — what separates them is a
-        /// binder identity a domain holds and does not print — and an inequality between
-        /// two identical-looking types says nothing. Only the reporting layer knows how
+        /// Carried because the two domains can render alike: what separates them is a
+        /// binder identity a domain holds and does not print, and an inequality between
+        /// two identical-looking types names nothing. Only the reporting layer knows how
         /// the pair will render, so it chooses which of the two to show
         /// ([`crate::ccl::infer::map_constrain_err`]).
         cause: Box<ConstrainError>,
@@ -1173,8 +1173,7 @@ fn constrain_go_impl(
                     // inequality and not the sub-comparison that exposed it — except for
                     // an `SmtError`, which established nothing: relabelling it would claim
                     // a conflict that no comparison decided. See [`super::smt`]. The
-                    // sub-comparison rides along as the inequality's `cause`, for the
-                    // reporting layer to fall back on where the two domains render alike.
+                    // sub-comparison rides along as the inequality's `cause`.
                     if let Err(err) = decided {
                         return match err {
                             ConstrainError::SmtError { .. } => Err(err),
