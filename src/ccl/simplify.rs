@@ -859,11 +859,19 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             // where g: A → B.  Both fall back to Hole if g has no concrete type.
             //
             // Both are minted, and both span `g`'s domain, so they take
-            // `mint_kind` (see `try_pairwise_in_compose`). This is the site that
-            // makes `id`'s kind matter: `zip_pair_ty` reads the *first* operand's
-            // kind, so a bare `Compute` here would propagate out through the zip
-            // to every consumer of the rewritten chain — `id` is the unit of
-            // composition and has no kind of its own to lend.
+            // `mint_kind` (see `try_pairwise_in_compose`). `id` is the unit of
+            // composition and has no kind of its own to lend, and a bare `Compute`
+            // here reaches the tuple type the zip built-in is applied at. The kind
+            // the pair carries is declared rather than read off an operand:
+            // `zip_pair_ty` takes it as an argument, and reads the domain off the
+            // first, the binder off either.
+            //
+            // `mint` drops the binder: a dependent `g` carries its binder reference
+            // in `g_cod`, and `name: None` leaves nothing to open it at — the shape
+            // `subst::open_codomain` rejects. It reaches the zip below because
+            // `.with_ty` overrides the type `zip_pair_ty` computed, which does carry
+            // the binder. `arm_ty` in the zip-distribution rewrite has the same
+            // shape.
             let g_dom = g.ty.domain();
             let g_cod = g.ty.codomain();
             let mint = |d: Type, c: Type| Type::Fun {

@@ -258,3 +258,20 @@ fn test_filtered_comprehension_over_a_filtered_literal() {
         Value::Int(2),
     );
 }
+
+/// A **correlated filter beside a correlated body** is refused for its pair binder.
+///
+/// The inner comprehension's filter and its body both read the outer binder, so eliminating
+/// the lambda zips two morphisms of which the second is the dependent one. Taking the pair's
+/// binder from the first alone left an unnamed function whose codomain referenced a binder,
+/// and the program panicked inside `subst` before reaching any refusal of its own. What
+/// refuses it is planning: a `__pair` uid is minted fresh per elimination, and the
+/// structural producer/consumer refinement match needs the compiled predicate to be a value
+/// function. Closing that turns this into a positive test for `Value::Int(11)`.
+#[test]
+fn a_correlated_filter_beside_a_correlated_body_is_refused_for_its_pair_binder() {
+    check_compile_error(
+        "sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])",
+        "a `__pair` binder survived into a compiled predicate term",
+    );
+}

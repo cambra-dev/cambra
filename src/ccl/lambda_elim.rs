@@ -221,11 +221,8 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
-/// The pair shares its operands' domain, so it is a collection exactly when they
-/// are — the kind rides across from `f` rather than being rebuilt bare.
-///
-/// Returns [`Type::Hole`] if either argument does not have a concrete function
-/// type; inference will fill in the gaps in that case.
+/// Returns [`Type::Hole`] unless both arguments match a bare [`Type::Fun`]; inference
+/// fills in the gap in that case.
 ///
 /// The domain is `f`'s, but the **kind is declared** rather than read off `f`: a zip of
 /// morphism columns denotes what the lambda being eliminated denotes, and its first column
@@ -235,6 +232,24 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// ([`crate::ccl::simplify`]'s pairwise rewrite takes the chain's kind there for the same
 /// reason). Every caller has the kind it is building at: an elimination arm has the
 /// lambda's, a rewrite has the chain's.
+///
+/// **The binder, by contrast, is read off the operands.** A function type names a binder
+/// exactly when its codomain references one, which is the rule [`elim_lambda_impl`] builds
+/// its result type by, and the pair's codomain is the tuple of its operands'. Both operands
+/// are morphisms over the one domain the pair shares, so either may be the dependent one: a
+/// binder the second alone names still has a reference in the pair's codomain and so still
+/// has to ride it. A caller holds a name and not that dependence, so declaring the binder
+/// the way `fun_kind` is declared would make a Pi of every pair an elimination builds,
+/// including the `⟨id, scrut ≫ variant_project(cᵢ)⟩` the outer-binder `Case` arm mints
+/// from [`Type::fun`]. Where both operands name a binder they name the same one, each
+/// being this elimination's own `param`, which the first assertion below states.
+///
+/// Reading the binder off the first operand alone leaves an unnamed function whose codomain
+/// references a binder, and [`crate::ccl::subst::open_codomain`] then has no binder to open
+/// that reference at: it debug-asserts on the shape one line later in the `Apply` arm, and
+/// returns the codomain unresolved where assertions are compiled out. A correlated filter
+/// beside a correlated body produces that shape; the `debug_assert!` below rejects it where
+/// the type is built rather than where it is read.
 pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
     match (&f.ty, &g.ty) {
         (
@@ -244,10 +259,26 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
                 codomain: b,
                 ..
             },
-            Type::Fun { codomain: c, .. },
+            Type::Fun {
+                name: g_name,
+                codomain: c,
+                ..
+            },
         ) => {
+            assert!(
+                !matches!((name, g_name), (Some(x), Some(y)) if x != y),
+                "a zip's operands are morphisms over one domain, so a binder either operand \
+                 names is that domain's binder; these name two: {name:?} and {g_name:?}",
+            );
             let codomain = Type::Tuple(vec![*b.clone(), *c.clone()]);
-            match name {
+            debug_assert!(
+                name.is_some()
+                    || g_name.is_some()
+                    || !crate::ccl::subst::references_enclosing_function(&codomain),
+                "a pair with no binder carries a codomain referencing one: the index has no \
+                 binder to open at, so nothing downstream can resolve it",
+            );
+            match name.as_ref().or(g_name.as_ref()) {
                 Some(n) => Type::pi_kinded(n.clone(), *a.clone(), codomain, fun_kind.clone()),
                 None => Type::Fun {
                     name: None,
@@ -1861,7 +1892,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
 mod tests {
     use super::*;
     use crate::ccl::{
-        ArithmeticKind, BaseType, BinOpKind, CompareKind, Expr, Lit, Type, symbolic::symbolic,
+        ArithmeticKind, BaseType, BinOpKind, CompareKind, Expr, Lit, Name, Refinement,
+        RefinementSet, Type, symbolic::symbolic,
     };
     use test_log::test;
 
@@ -1871,6 +1903,91 @@ mod tests {
 
     fn var(s: &str) -> Expr {
         Expr::var(s)
+    }
+
+    /// `(k: Int) ⇒ {Int | k}` — a morphism whose codomain references its own binder.
+    fn dependent_morphism(binder: &Name) -> Type {
+        let int = Type::Base(BaseType::Int);
+        Type::pi_kinded(
+            binder,
+            int.clone(),
+            Type::refined(
+                int.clone(),
+                RefinementSet::one(Refinement::born(Rc::new(
+                    Expr::var(binder.clone()).with_ty(int),
+                ))),
+            ),
+            FunKind::Compute,
+        )
+    }
+
+    /// `Int ⇒ Int` — a morphism over the same domain, depending on nothing.
+    fn plain_morphism() -> Expr {
+        let int = Type::Base(BaseType::Int);
+        var("f").with_ty(Type::fun(int.clone(), int))
+    }
+
+    /// A zip whose **second** operand is the dependent one keeps the binder.
+    ///
+    /// The pair's codomain holds both operands' codomains, so a reference the second
+    /// carries is in the pair's codomain too, and an unnamed function whose codomain
+    /// references a binder is what `subst::open_codomain` rejects — the `Apply` arm calls it
+    /// on this very type one line after building it.
+    #[test]
+    fn a_zip_takes_its_binder_from_either_operand() {
+        let binder = Name::raw("k");
+        let f = plain_morphism();
+        let g = var("g").with_ty(dependent_morphism(&binder));
+        let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
+        assert!(
+            matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
+            "the pair binds what its second operand names, got {paired}",
+        );
+        // The name is half the property. The index the second operand carries has to sit
+        // at the depth the pair's own codomain puts it, so that it opens at the pair's
+        // binder — which is what the `Apply` arm asks for one line after building this
+        // type. The first assertion below keeps the fixture dependent, without which the
+        // second holds vacuously.
+        let Type::Fun { codomain, .. } = &paired else {
+            unreachable!("matched a Fun above")
+        };
+        assert!(
+            crate::ccl::subst::references_enclosing_function(codomain),
+            "the fixture's second operand is the dependent one, got {codomain}",
+        );
+        let opened = crate::ccl::subst::open_codomain(&paired, codomain);
+        assert!(
+            !crate::ccl::subst::references_enclosing_function(&opened),
+            "the pair's binder opens its second operand's reference, got {opened}",
+        );
+    }
+
+    /// A **refined** function operand drops the pair to [`Type::Hole`].
+    ///
+    /// The match is on the bare [`Type::Fun`], so `{(k: Int) ⇒ B | p}` takes the fallback
+    /// arm and the pair loses the domain, the codomain and the binder that operand still
+    /// carries — the hazard [`Type::fun_kind`] peels refinements to avoid. Pinned on the
+    /// gap: an `#[ignore]` reports the same green whether it closed, regressed, or went
+    /// away, and the failure is silent otherwise, a `Hole` being what an operand of no
+    /// known shape yields too.
+    #[test]
+    #[should_panic(expected = "a refined operand is still a function")]
+    fn a_zip_reads_through_a_refined_operand() {
+        let binder = Name::raw("k");
+        let refined = Type::refined_one(
+            dependent_morphism(&binder),
+            Refinement::born(Rc::new(
+                Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)),
+            )),
+        );
+        let f = plain_morphism();
+        let g = var("g").with_ty(refined);
+        let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
+        assert!(
+            matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
+            "a refined operand is still a function, so the pair binds what it names, \
+             got {paired}",
+        );
     }
 
     /// Eliminating a lambda preserves its [`FunKind`].
