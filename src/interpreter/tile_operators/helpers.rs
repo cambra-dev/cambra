@@ -133,14 +133,9 @@ pub(crate) fn change_tiling_result(
             domain: domain.clone(),
             codomain: Box::new(change_tiling_result(codomain, transformation)),
         },
-        Tiling::CurriedFunction {
-            domain1,
-            domain2,
-            codomain,
-        } => Tiling::CurriedFunction {
-            domain1: domain1.clone(),
-            domain2: domain2.clone(),
-            codomain: transformation(codomain).extent(),
+        Tiling::CurriedFunction { domains, codomain } => Tiling::CurriedFunction {
+            domains: domains.clone(),
+            codomain: Box::new(change_tiling_result(codomain, transformation)),
         },
         _ => panic!("Cannot apply Map to {input_tiling}"),
     }
@@ -175,17 +170,19 @@ pub(crate) fn process_tile_result(
             )),
         },
         Tile::CurriedFunction {
-            domain1,
+            domains,
             offsets,
-            domain2,
             codomain,
             domain_predicate,
             deleted,
         } => Tile::CurriedFunction {
-            domain1,
+            domains,
             offsets,
-            domain2,
-            codomain: transformation(codomain),
+            codomain: Box::new(process_tile_result(
+                &input_tiling.codomain().unwrap_or_else(|| unreachable!()),
+                *codomain,
+                transformation,
+            )),
             domain_predicate,
             deleted,
         },
