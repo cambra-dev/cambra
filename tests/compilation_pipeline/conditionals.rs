@@ -564,7 +564,8 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 // the feed extraction once lowering admits the shape; the if/else and elif forms
 // above exercise it. A *scrutinee / pattern* feed has no boolean to gate on there and
 // stays rejected. Inside a loop it is admitted, by the per-arm refined-source channels
-// the fan-out builds (`two_defers_fed_from_complementary_arms` in `feeds_cases`).
+// the fan-out builds, and one such `Case` feeding two deferred collections is two of
+// those channels (`two_defers_fed_from_complementary_match_arms` in `feeds_cases`).
 
 // ---------------------------------------------------------------------------
 // Comprehension over a conditional collection

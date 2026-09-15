@@ -1210,11 +1210,13 @@ The value-`Case` positions ride the same union-of-restricts:
   scrutinee / pattern feed stays rejected there; a no-else partial feed is still blocked earlier
   at lowering (bare `if` as a value expression).
 
-  A conditional feed **inside a loop** takes the per-arm refined-source channels instead, and a
-  pattern arm is admitted there: the fan-out converts the tag test to a guard at its own
-  consumption point. One `Case` fans out once per deferred collection it feeds, each pass
-  leaving the arms it did not take (`channelize`'s `residual_after_fanout`), so two defers fed
-  from complementary arms are two channels over one conditional.
+  A conditional feed **inside a loop** takes the per-arm refined-source channels instead. One
+  `Case` fans out once per deferred collection it feeds, and each pass leaves the arms it did
+  not take (`channelize`'s `residual_after_fanout`), so two defers fed from complementary arms
+  are two channels over one conditional. The fan-out reads a pattern arm through the
+  tag-to-guard rewrite, which puts `variant_is` in the arm's refinement predicate and
+  `variant_project` in its channel value; the rewrite runs on a copy, so the arm in the tree
+  keeps its scrutinee and its pattern for the next defer's pass to read.
 - **Comprehension over / with a conditional** — *implemented*. A conditional **element**
   (`[a if g(x) else b for x in xs]`) fans the source out by each arm's *element-dependent* gate —
   `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of filtered maps (`fan_out_element_case` in
