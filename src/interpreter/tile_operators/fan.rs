@@ -719,9 +719,16 @@ impl TileProducer for SelectFieldProducer {
         node.child("input", self.input.inspect(opts))
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let asked = self.at_field(projection_guard);
-        let tile = self.input.get(asked);
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        // The whole product is pulled, not this field alone, because a narrowed
+        // pull is unsound through a cumulative cache: [`Memo`] merges what a pull
+        // returned and then answers later pulls from that cache without going
+        // below, so a pull naming one field would record a partial answer as the
+        // whole one and a sibling selector would read a field that was never
+        // fetched. Releasing is the opposite case and does name one field
+        // ([`Self::release_impl`]): what a consumer is finished with is its own
+        // business, and says nothing about a sibling's.
+        let tile = self.input.get(self.input.tiling().universal_guard());
         let Tile::Record(mut fields) = tile else {
             panic!(
                 "SelectField({}) expected a record tile, got {tile:?}",

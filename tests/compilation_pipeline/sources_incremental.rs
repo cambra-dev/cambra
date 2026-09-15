@@ -842,6 +842,9 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
+    // One lap is one delivery followed by one pull. A `Memo` re-reads only after a
+    // delivery, so a component read through a `let` answers the previous tile to a
+    // pull that skipped one.
     let mut pull = |source: &Rc<RefCell<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
         source.borrow_mut().add_data(
             &rows
@@ -852,7 +855,7 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         if done {
             source.borrow_mut().set_yield_predicate(Predicate::True);
         }
-        let mut tile = producer.get(producer.tiling().universal_guard());
+        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
         tile.compact();
         sort_sealed_function_by_domain(tile)
     };
@@ -919,7 +922,7 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
                 .collect::<Vec<_>>(),
         );
-        let mut tile = producer.get(producer.tiling().universal_guard());
+        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
         tile.compact();
         producer.release(tile.to_guard());
         sort_sealed_function_by_domain(tile)
