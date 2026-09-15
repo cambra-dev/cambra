@@ -26,18 +26,12 @@
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
 import { isChildEdge, roleLabel, walkStarts } from "./types";
 import type { Resolved, Store } from "./store";
+import { el } from "./dom";
 
 // Depth to expand to on first render, matching the tree panes'.
 const DEFAULT_EXPAND_DEPTH = 3;
 
 const INDENT = "    ";
-
-function el(tag: string, className?: string, text?: string): HTMLElement {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
 // `Restrict [0,100] #4021`, or `Sink(main) #4103` for a boundary node, which has
 // no tiling.
