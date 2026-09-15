@@ -624,12 +624,23 @@ fn freshen_watches(
         let copy = TraitObligation::new_from(&obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
         copy.watch(&Type::Infer(Rc::clone(v)), pos);
-        // Phase 2: now that re-entry finds the copy, freshen the output.
+        // Phase 2: now that re-entry finds the copy, freshen the output and the
+        // input expressions a refinement template builds from.
         copy.set_assoc_types(
             obligation
                 .assoc_types()
                 .iter()
                 .map(|ty| freshen_above(lim, ty, target, cache))
+                .collect(),
+        );
+        let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation_inputs");
+        copy.set_input_exprs(
+            copy.input_exprs()
+                .into_iter()
+                .map(|mut expr| {
+                    freshen_expr_type_slots(&mut expr, lim, target, cache);
+                    expr
+                })
                 .collect(),
         );
     }
