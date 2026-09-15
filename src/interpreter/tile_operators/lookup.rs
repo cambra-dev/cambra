@@ -1,3 +1,4 @@
+use crate::interpreter::Deleted;
 use bit_set::BitSet;
 
 use super::*;
@@ -135,12 +136,9 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
         // A **collection of keys per row** — what a correlated comprehension's key binder
         // is, one group of keys per outer row. The answer keeps the grouping: one answer
         // per key, where its key sits.
-        Tiling::CurriedFunction {
-            domain1, domain2, ..
-        } => Tiling::CurriedFunction {
-            domain1: domain1.clone(),
-            domain2: domain2.clone(),
-            codomain: option_extent,
+        Tiling::CurriedFunction { domains, .. } => Tiling::CurriedFunction {
+            domains: domains.clone(),
+            codomain: Box::new(Tiling::Scalar(option_extent)),
         },
         other => panic!("CheckedLookup keys must be a scalar or a stream, got {other}"),
     }
@@ -332,7 +330,7 @@ impl TileProducer for CheckedLookupProducer {
             Tiling::Scalar(e) => e.clone(),
             Tiling::SealedFunction { codomain, .. } => codomain.extent(),
             // A collection of answers per row, one per key of that row's group.
-            Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
+            Tiling::CurriedFunction { codomain, .. } => codomain.extent(),
             other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
@@ -380,31 +378,25 @@ impl TileProducer for CheckedLookupProducer {
                     // would have to re-offset the groups it left, so a tile that cannot
                     // answer them all answers none and waits.
                     Tile::CurriedFunction {
-                        ref domain1,
+                        ref domains,
                         ref offsets,
-                        ref domain2,
                         ref codomain,
                         ref domain_predicate,
                         ..
                     } => {
+                        let inner = domains.last().expect("a curried tile has levels");
+                        let keys = scalar_tile_to_column_value((**codomain).clone());
                         let (kept, answers) =
-                            Self::answer_rows(domain2, codomain, &RowCollection::Shared(&coll));
-                        if kept.len() < domain2.len() {
+                            Self::answer_rows(inner, &keys, &RowCollection::Shared(&coll));
+                        if kept.len() < inner.len() {
                             return empty_scalar;
                         }
-                        let Tiling::CurriedFunction {
-                            codomain: out_ext, ..
-                        } = self.tiling()
-                        else {
-                            panic!("Lookup answers a collection per row when its keys are one")
-                        };
                         Tile::curried_function(
-                            domain1.clone(),
+                            domains.clone(),
                             offsets.clone(),
-                            domain2.clone(),
-                            ColumnValue::from_values(answers, out_ext),
+                            Box::new(Tile::Scalar(ColumnValue::from_values(answers, &out_extent))),
                             domain_predicate.clone(),
-                            BitSet::new(),
+                            Deleted::none(),
                         )
                     }
                     other => {
