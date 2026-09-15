@@ -174,7 +174,7 @@ fn flatten_channel_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Exp
     out
 }
 
-/// Unwrap the post-elim constant-stream wrapper `x ▷ const`, returning `x`.
+/// Unwrap the post-elim constant-function wrapper `x ▷ const`, returning `x`.
 fn unwrap_const(e: Expr) -> Expr {
     let TypedExprNode::Apply { argument, function } = e.node else {
         panic!("letrec recognition: expected `x ▷ const`, got a non-application");
@@ -258,7 +258,7 @@ fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Exp
     let source = slots.pop().expect("snapshot carries the source");
     let slot_val_ty = |e: &Expr| {
         e.ty.codomain()
-            .expect("letrec recognition: snapshot slot is a stream")
+            .expect("letrec recognition: snapshot slot is a function")
     };
     let mut p_tys: Vec<Type> = slots.iter().map(slot_val_ty).collect();
     p_tys.push(slot_val_ty(&source));
@@ -359,9 +359,9 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
     let decision_ty = decision
         .ty
         .codomain()
-        .expect("letrec recognition: decision is a stream");
+        .expect("letrec recognition: decision is a function");
     // A writer whose decision uses neither a snapshot read nor the loop item
-    // (`flag := True`) elim-collapses to a constant stream `⟨record⟩ ▷ const`
+    // (`flag := True`) elim-collapses to a constant function `⟨record⟩ ▷ const`
     // — the snapshot scaffold (and with it the source term) is gone. The
     // writer then has an empty read set, the const application itself as its
     // (input-ignoring) body, and the identity over the site domain as its
@@ -480,7 +480,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 // carries the join `transact_phase` stamped.
                 let value_ty =
                     b.ty.codomain()
-                        .expect("letrec recognition: history binding is a stream");
+                        .expect("letrec recognition: history binding is a function");
                 // The join is unrefined, so nothing is peeled here. A refinement is a fact
                 // about one value and a mutable variable holds a different value at each commit, so
                 // the join over its contributions carries none — the reason reading the seed
@@ -500,12 +500,12 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
             TxnBinding::Commit => {
                 let site_dom =
                     b.ty.domain()
-                        .expect("letrec recognition: commit binding is a stream");
+                        .expect("letrec recognition: commit binding is a function");
                 writers.push(recover_writer(&site_dom, def));
             }
             TxnBinding::Tap => {
                 // The tap's mutable variable field keeps the binding's own site-domained
-                // stream type (𝐼 ⇒ V): the channel union channelize already
+                // collection type (𝐼 ⤇ 𝑉): the channel union channelize already
                 // assembled references the taps at that type, and the mutable variable
                 // registration resolves the branch regardless of the field's
                 // domain.
@@ -691,7 +691,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         .iter()
         .map(|e| {
             e.ty.codomain()
-                .expect("letrec recognition: previous-value slot is a stream")
+                .expect("letrec recognition: previous-value slot is a function")
         })
         .collect();
 
@@ -833,7 +833,7 @@ fn rewrite_hist_reads(
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
                     // A tap read ``__hist ≫ variant_project(`commit) ≫ .__to_<feed>``:
-                    // its stream type is the history record\'s field type.
+                    // its function type is the history record\'s field type.
                     let field = f.clone();
                     let field_ty = hist_ty_field(hist_ty, &field);
                     Some((hist_field_read(hist, hist_ty, field, field_ty), 3))

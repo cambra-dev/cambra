@@ -140,7 +140,7 @@ def atomsNameAtMostOne : List Atom → Bool
   | [] => true
   | a :: rest => rest.all (· == a)
 
-/-- How many **shapes** a position names: an atom, a record, a variant, an arrow. Capped at
+/-- How many **shapes** a position names: an atom, a record, a variant, a function. Capped at
 two, which is all any caller asks.
 
 `coalesce_compact_go` materializes a position from exactly one of them and reports two as
@@ -1075,7 +1075,7 @@ What stands instead is an exhaustive evaluation over the kinds built from six po
 identity, three types naming one shape each, a second range, and a position naming two — which
 is where both defects lived, since both were about a parameter that names one shape or does
 not. The check is a bound on the universe, not on the depth: nothing here nests a bound inside a
-record or an arrow.
+record or a function.
 -/
 
 /-- Six positions: the two degenerate readings and four that name a type. -/

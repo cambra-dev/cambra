@@ -3002,15 +3002,15 @@ else:
 // These tests run inference on lowered-but-NOT-channelized trees, exercising
 // the `Defer`/`Feed`/`Define` typing rules directly: a defer binding types
 // as a feed history `feed(δ ⤇ value)`, feeds contribute `Fun(δ, elem)` channel
-// shapes into it, defines set the whole stream outright, and reads discharge
-// transparently through the handle as that stream. A channel's *domain* is a
+// shapes into it, defines set the whole collection outright, and reads discharge
+// transparently through the handle as that collection. A channel's *domain* is a
 // rigid nominal `Type::ChanDom(d)` minted at the `let d = defer()` site, so
 // reads type concretely against that name at inference (no `Infer` residue);
 // `channelize` later substitutes the assembled channel domain for `ChanDom`.
 
 /// Destructure `ty` as a feed history `feed(domain ⤇ value)` and return the
 /// channel's element type `value`; panics otherwise. A feed reads as its whole
-/// stream, so its element type is the history's `value` slot directly (there is
+/// collection, so its element type is the history's `value` slot directly (there is
 /// no separate scalar payload to peel — scalar `<<=` is rejected by typing).
 fn feed_value(ty: &Type) -> &Type {
     match ty {
@@ -3034,7 +3034,7 @@ fn test_defined_defer_is_feed_of_collection() {
 #[test]
 fn test_scalar_define_is_rejected() {
     // A scalar `<<=` RHS is disallowed — `<<=` only accepts collections
-    // (`Fun`s), so an `Int` fails to align with the channel stream.
+    // (`Fun`s), so an `Int` fails to align with the channel's collection type.
     let errs = infer_program_err("x = defer()\nx <<= 1\nx");
     assert!(
         !errs.is_empty(),
@@ -3056,21 +3056,21 @@ fn test_scalar_feeds_join_in_channel() {
 
 #[test]
 fn test_defined_defer_reads_through_aggregate() {
-    // A collection define sets the whole stream; `sum` reads the handle as
-    // that stream and aggregates it to a scalar.
+    // A collection define sets the channel outright; `sum` reads the handle as
+    // that collection and aggregates it to a scalar.
     assert_eq!(infer_program("x = defer()\nx <<= [1,2,3]\nsum(x)"), int());
 }
 
 #[test]
 fn test_fed_defer_reads_through_aggregate() {
-    // `sum` consumes the feed handle as its channel stream `(α → γ)`.
+    // `sum` consumes the feed handle as its read view `(α ⤇ γ)`.
     assert_eq!(infer_program("x = defer()\nx << 1\nx << 2\nsum(x)"), int());
 }
 
 #[test]
 fn test_defer_chain_flattens_feeds() {
-    // `x <<= y` sets x's channel to y's whole stream. A feed reads through as
-    // its stream, so x gets y's stream directly (a single feed layer, not
+    // `x <<= y` sets x's channel to y's whole read view. A feed reads through to
+    // that view, so x gets y's collection directly (a single feed layer, not
     // nested); channelize later binds x to y's channel.
     let ty = infer_program("x = defer()\ny = defer()\nx <<= y\ny <<= [0, 1]\nx");
     assert_eq!(*feed_value(&ty), int());

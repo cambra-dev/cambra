@@ -742,7 +742,7 @@ pub struct CompactType {
     /// the absorbing element (here from intersecting disjoint tag sets at
     /// negative polarity).
     pub var: Option<CompactVariant>,
-    /// Arrow shape, if any: see [`CompactFun`]. Carries the Pi binder, the merged
+    /// Function shape, if any: see [`CompactFun`]. Carries the Pi binder, the merged
     /// [`KindPin`], the [`CompactTypeKind`], and the codomain. Recursively merged
     /// with polarity flip on the domain. Plain functions *and* dependent sums both
     /// live here — one slot, so the two ways a sum reaches a position (directly, and

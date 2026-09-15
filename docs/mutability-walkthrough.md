@@ -67,7 +67,7 @@ the *whole history* of the variable, not its latest snapshot.
 
 ```
   cnt := 0
-  for i in [1, 2, 3]:          cnt : [0, 2] ⇒ Int
+  for i in [1, 2, 3]:          cnt : [0, 2] ⤇ Int
       cnt += i
                          position:   0     1     2
                             value:   1     3     6
@@ -87,7 +87,7 @@ domain:
 | | extent (the final thing) | tiling (the progress algebra) |
 |---|---|---|
 | a value type | its set of final values | its partial states, joined by `⊕` |
-| a mutable variable | the total functions `𝐷 ⇒ 𝑉` | the accumulating partial `𝐷 ⇀ 𝑉` |
+| a mutable variable | the total functions `𝐷 ⤇ 𝑉` | the accumulating partial `𝐷 ⇀ 𝑉` |
 
 Each mutation is a `⊕`-extension by one position. The tiling *implements* the function; it
 does not redefine it. This is the sentence that makes everything after it ordinary:
@@ -112,11 +112,11 @@ The two differ only in their merge/read law:
   wr:   5    ·    9    ·                 wr:   a    b    ·    c
   val:  5    5    9    9                 val: {a}  {b}  {}   {c}
         └────┴─── carried ───┘
-  a read derefs to one scalar            a read yields the whole stream
+  a read derefs to one scalar            a read yields the whole collection
 ```
 
 One type carries both: `Type::History { value, domain, kind }`, where `kind` is
-`Overwrite` (displayed `Mut(𝑉, 𝐷)`) or `Append` (displayed `feed(𝐷 ⇒ 𝑉)`). This
+`Overwrite` (displayed `Mut(𝑉, 𝐷)`) or `Append` (displayed `feed(𝐷 ⤇ 𝑉)`). This
 distinction is the through-line of the whole design — it is why the eliminator has two
 halves, and why the two get different aliasing rules (see
 [§5](#5-mutability-is-a-type)).
@@ -158,8 +158,8 @@ has a unique solution because every recursive reference is **causal**: it consul
 
 | Builtin | Type | Meaning |
 |---|---|---|
-| `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | the history at the predecessor of a position; the default at the first |
-| `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | the write of the latest commit strictly *before* a time; the default if none |
+| `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | the history at the predecessor of a position; the default at the first |
+| `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | the write of the latest commit strictly *before* a time; the default if none |
 
 Every cycle in the reference graph must cross one of these. That is the whole
 well-foundedness argument: go around any cycle and the position strictly decreases, so
@@ -167,7 +167,7 @@ induction along the domain order gives a unique solution.
 
 ```mermaid
 flowchart LR
-    C["__commits<br/>(one record per request)"] -->|"reads balance(t)"| B["balance : Txn ⇒ Int"]
+    C["__commits<br/>(one record per request)"] -->|"reads balance(t)"| B["balance : Txn ⤇ Int"]
     B -.->|"get_prev_txn — strictly earlier"| C
     linkStyle 1 stroke-dasharray:5
 ```
@@ -184,7 +184,7 @@ The two overwrite domains look symmetric in the model and are not, for one reaso
 its history is directly the recurrence:
 
 ```
-cnt : IncrIdx ⇒ Int  =  λ 𝑟 → get_prev_seq(cnt, 𝑟, 0) + 1
+cnt : IncrIdx ⤇ Int  =  λ 𝑟 → get_prev_seq(cnt, 𝑟, 0) + 1
 ```
 
 **A transactional variable's domain is *nobody's* writer domain.** Writers iterate
@@ -195,11 +195,11 @@ records:
 ```
   writer site (one per `with begin():`)          the mutable variable's history
   ┌──────────────────────────────────┐           ┌──────────────────────────────┐
-  │ per iteration 𝑟:                 │           │ balance : Txn ⇒ Int          │
+  │ per iteration 𝑟:                 │           │ balance : Txn ⤇ Int          │
   │   t = begin_incr(𝑟)   ← oracle   │  ──────▶  │  λ 𝑡 → get_prev_txn(         │
   │   {time: t, write: balance(t)+1} │           │      commits, 𝑡, 0)          │
   └──────────────────────────────────┘           └──────────────────────────────┘
-      a stream over the *request* domain             a function of *commit time*
+    a collection over the *request* domain           a function of *commit time*
 ```
 
 Three consequences fall straight out of this shape, and they are worth naming because
@@ -532,23 +532,23 @@ a key of the store all the same.
 lifted into the letrec below — which is the clearest single picture of what this phase does:
 
 ```
-let out : feed(chan(out) ⇒ Int) = defer
+let out : feed(chan(out) ⤇ Int) = defer
 in for r in [10, 20, 30] do unit;
    for __txn_item_0 in [unit] do unit;
    letrec
-     pool : (Txn ⇒ Int) =
+     pool : (Txn ⤇ Int) =
        λ __t : Txn →
          ( (time: …, write: …) ▷ zip ⊎ (time: …, write: …) ▷ zip,   ← both sites, merged
            __t, 100 ) ▷ get_prev_txn
 
-     __commits : ([0, 2] ⇒ {…, decision: {`commit{writes: (Int), to_out_0: Int} | `abort}}) =
+     __commits : ([0, 2] ⤇ {…, decision: {`commit{writes: (Int), to_out_0: Int} | `abort}}) =
        λ __r : [0, 2] → … `commit((writes: (__txp.0 - __txp.1), to_out_0: __txp.0 - __txp.1)) …
 
-     __commits : ([0, 0] ⇒ {…, decision: {`commit{writes: (Int), to_out_1: Int} | `abort}}) =
+     __commits : ([0, 0] ⤇ {…, decision: {`commit{writes: (Int), to_out_1: Int} | `abort}}) =
        λ __r : [0, 0] → … `commit((writes: (__txp.0 - 5), to_out_1: __txp.0 - 5)) …
 
-     to_out_0 : ([0, 2] ⇒ Int) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_0
-     to_out_1 : ([0, 0] ⇒ Int) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_1
+     to_out_0 : ([0, 2] ⤇ Int) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_0
+     to_out_1 : ([0, 0] ⤇ Int) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_1
    in feed(out, to_out_0); feed(out, to_out_1); pool ▷ final_read
 ```
 
@@ -589,7 +589,7 @@ asserts fire in **release**, not debug, because a leaked marker is a miscompile 
 ```
 let x : Int = 0
 in letrec
-     __hist : ([0, 2] ⇒ {`commit{writes: (Int)} | `abort}) =
+     __hist : ([0, 2] ⤇ {`commit{writes: (Int)} | `abort}) =
        λ __pos : [0, 2] →
          let __prev : (Int) = (__hist ≫ variant_project(`commit) ≫ .writes, __pos, (x))
                               ▷ get_prev_seq
@@ -625,14 +625,14 @@ channel carries no guard, so a cycle has no well-founded solution.
 The phase is **origin-agnostic**: `mut_elim` has already hoisted in-loop feeds to ordinary
 feeds of the loop's history, so nothing here distinguishes an accumulator-loop feed from a
 scalar one. Closing the tree is then a pure substitution — each rigid `ChanDom(d)` to its
-channel's concrete domain, each `Feed` history to its stream `Fun` — possible only because
+channel's concrete domain, each `Feed` history to its bare `Fun` — possible only because
 inference typed every consumer against the rigid name instead of leaving an `Infer`.
 
 **Example B**'s tail after it. The two taps become one channel, and `out`'s domain is the
-**union** of the two sites' request domains — one reply stream fed from two writers:
+**union** of the two sites' request domains — one reply channel fed from two writers:
 
 ```
-in letrec out : ([0, 2] | [0, 0] ⇒ Int) = to_out_0 ⊎ to_out_1
+in letrec out : ([0, 2] | [0, 0] ⤇ Int) = to_out_0 ⊎ to_out_1
 in pool ▷ final_read
 ```
 
@@ -665,7 +665,7 @@ shaped for a consumer that refuses to rebuild a body.
 
 ```
 let x : Int = 0
-in let __hist : {acc#8: ([0, 2] ⇒ Int)} =
+in let __hist : {acc#8: ([0, 2] ⤇ Int)} =
      transact (acc = x) { [acc]⇒[acc] over iterate ≫ [1, 2, 3] do <the decision body, verbatim> }
 in let x : Int = (__hist.acc#8, x) ▷ final_or_default
 in x
@@ -675,10 +675,10 @@ in x
 variable's history:
 
 ```
-let __hist : {pool#6: (Txn ⇒ Int), to_out_0: ([0, 2] ⇒ Int), to_out_1: ([0, 0] ⇒ Int)} =
+let __hist : {pool#6: (Txn ⤇ Int), to_out_0: ([0, 2] ⤇ Int), to_out_1: ([0, 0] ⤇ Int)} =
   transact (pool = 100) { [pool]⇒[pool] over iterate ≫ [10, 20, 30] do <decision>;
                           [pool]⇒[pool] over iterate ≫ [unit]         do <decision> }
-in let out : ([0, 2] | [0, 0] ⇒ Int) = __hist.__to_out_0 ⊎ __hist.__to_out_1
+in let out : ([0, 2] | [0, 0] ⤇ Int) = __hist.__to_out_0 ⊎ __hist.__to_out_1
 in __hist.pool#6 ▷ final_read
 ```
 
@@ -768,7 +768,7 @@ section is mostly about it.
 `Tile::Store` is the one thing mutability added to the substrate, and it is worth being
 precise about what kind of addition it is. Its **extent** is an ordinary function's:
 `Tiling::Store { domain, codomain }` and `Tiling::SealedFunction { domain, codomain }` both
-report `Function { domain, codomain }`. A store is a `Txn ⇒ {key: value}`; there is no new
+report `Function { domain, codomain }`. A store is a `Txn ⤇ {key: value}`; there is no new
 final value in the world.
 
 What is new is the **progress algebra** — which is exactly the split §2's table draws:

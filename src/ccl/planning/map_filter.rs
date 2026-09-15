@@ -97,7 +97,7 @@ pub(super) fn insert_map_filters(expr: &mut Expr) {
         Type::fun(upstream_codomain, filtered.clone()),
     );
     // The site now takes the narrowed collection, and its Pi binder retires. An
-    // `Apply`'s function slot carries the same arrow, so it is re-typed with the node:
+    // `Apply`'s function slot carries the same function type, so it is re-typed with the node:
     // leaving it behind makes the node disagree with itself.
     let retyped = Type::fun(filtered, site_codomain);
     if let TypedExprNode::Apply { argument, function } = &mut elts[site].node {

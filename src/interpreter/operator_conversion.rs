@@ -1724,7 +1724,7 @@ fn convert_impl_inner(
         // `argument` is the predicate `D ⇒ Bool` (a closed combinator chain
         // after lambda elimination), and `function` is `Builtin::Iterate`.
         // The result of `Apply(p, Iterate)` represents the refined-domain
-        // iteration source `{D | p} ⇒ {D | p}`.
+        // iteration source `{D | p} ⤇ {D | p}`.
         //
         // Iterate is strictly chain-head: it asserts `input.is_none()`.
         // Mid-chain filters use the separate `Builtin::Restrict` arm
@@ -1773,7 +1773,7 @@ fn convert_impl_inner(
 
         // filter_values(p): the **value-preserving** mid-chain filter (a writer
         // decision body's value-`Case` fan-out arm). Requires `input=Some(_)` — the
-        // `D ⇒ V` element stream. Unlike `restrict` (which returns the domain
+        // `D ⤇ V` element collection. Unlike `restrict` (which returns the domain
         // identity for a source a map re-indexes), this keeps each surviving
         // element's value `V`, so the arm's `≫ eᵢ` maps the elements directly. The
         // fed input feeds both the `Filter` value stream and the predicate, so it is

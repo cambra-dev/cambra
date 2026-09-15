@@ -891,7 +891,7 @@ mod tests {
     }
 
     /// A history's flavour is part of its identity: a `Mut(Int, Txn)` mutable variable and
-    /// a `Feed(Int, Txn)` channel are the same `domain ⇒ value` shape and must not
+    /// a `Feed(Int, Txn)` channel are the same `domain ⤇ value` shape and must not
     /// key alike, or a clone pinned to one would serve a use of the other.
     #[test]
     fn history_kind_is_part_of_the_key() {

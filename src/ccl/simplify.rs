@@ -1264,10 +1264,10 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
             _ => None,
         };
         // With 𝑓 absent the `.0` arm hands `apply` the curry's argument unchanged,
-        // so `map(𝑔)` is the whole replacement and carries the curry's arrow as it
+        // so `map(𝑔)` is the whole replacement and carries the curry's type as it
         // stands — rebuilding it would drop the Pi binder a dependent refinement
         // needs and mint the kind bare. With 𝑓 present the map node is a minted
-        // element behind 𝑓, spanning 𝑓's codomain at 𝑓's kind, and the curry's arrow
+        // element behind 𝑓, spanning 𝑓's codomain at 𝑓's kind, and the curry's type
         // rides the compose that replaces the node.
         let mapped = (!suffix.is_empty()).then(|| {
             let map_ty = match &f {
@@ -1776,7 +1776,7 @@ mod tests {
     /// survives without `is_iteration` flagging `restrict` itself.
     #[test]
     fn simplify_preserves_restrict_over_iteration_under_const_reduce() {
-        // `restrict(p)` applied to an iterate source: `{Int | p} ⇒ Int`.
+        // `restrict(p)` applied to an iterate source: `{Int | p} ⤇ Int`.
         let pred = apply_primitive(
             Expr::lit(Lit::Bool(false)).with_ty(Type::Base(BaseType::Bool)),
             Builtin::Const,
@@ -1956,15 +1956,15 @@ mod tests {
         assert_eq!(simplify(expr), id().with_ty(curry_ty));
     }
 
-    /// The rewrite carries the curry's arrow rather than rebuilding it: a Pi binder
+    /// The rewrite carries the curry's type rather than rebuilding it: a Pi binder
     /// and a `Data` kind on it survive.
     ///
-    /// Rebuilding the arrow from its parts mints `FunKind::Compute` and drops the
+    /// Rebuilding the type from its parts mints `FunKind::Compute` and drops the
     /// binder, which reads a collection as a capability and unbinds a dependent
     /// refinement's key. Both arms of the rule are covered — with 𝑓 absent the
-    /// `map` node carries the arrow itself, with 𝑓 present the compose does.
+    /// `map` node carries the type itself, with 𝑓 present the compose does.
     #[test]
-    fn simplify_exponential_eta_carries_the_curry_arrow() {
+    fn simplify_exponential_eta_carries_the_curry_type() {
         let b_ty = int_ty();
         let c_ty = Type::Base(BaseType::String);
         let c2_ty = Type::Base(BaseType::Bool);
@@ -1979,7 +1979,7 @@ mod tests {
             ));
             typed_compose(vec![zip_pair(p1, arm, &FunKind::Compute), apply, g.clone()])
         };
-        // `(k: A) ⤇ (B ⤇ Bool)` — a named, data-kinded curry arrow.
+        // `(k: A) ⤇ (B ⤇ Bool)` — a named, data-kinded curry type.
         let curry_ty = |domain: Type| Type::Fun {
             name: Some(Name::from("k")),
             fun_kind: FunKind::Data(None),
@@ -2000,7 +2000,7 @@ mod tests {
         assert_eq!(
             simplify(bare).ty,
             bare_ty,
-            "𝑓 absent: map must carry the arrow"
+            "𝑓 absent: map must carry the curry's type"
         );
 
         // 𝑓 present: the `.0 ≫ 𝑓` arm, over a domain of its own.
@@ -2021,7 +2021,7 @@ mod tests {
         assert_eq!(
             simplify(prefixed).ty,
             prefixed_ty,
-            "𝑓 present: the compose must carry the arrow"
+            "𝑓 present: the compose must carry the curry's type"
         );
     }
 

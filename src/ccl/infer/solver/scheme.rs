@@ -826,7 +826,7 @@ fn seed_pairings_go(
             seed_pairings_go(uv, dv, lim, out, seen);
             seed_pairings_go(ud, dd, lim, out, seen);
         }
-        // A feed handle reads through to its stream `Fun(domain, value)`
+        // A feed handle reads through to its read view `Fun(domain, value)`
         // during coalescing (`dissolve_read_feeds`), so the use side may be
         // the dissolved `Fun` where the definition still carries the
         // `History` — or vice versa. Pair the corresponding slots.

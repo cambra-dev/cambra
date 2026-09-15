@@ -1378,7 +1378,7 @@ pub(super) fn emit_expr_stmt<C: Typing>(
 /// the function and instantiates a fresh `ρ` per call site — exactly the
 /// "fresh defer per call" semantics the channelization float gives it.
 pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
-    // A feed channel is a non-causal history `domain ⇒ value`: fresh vars for
+    // A feed channel is a non-causal history `domain ⤇ value`: fresh vars for
     // both. The `value` accumulates the fed element type. The `domain` is a
     // placeholder here — for a `let d = Defer` (the only shape lowering emits)
     // [`emit_let`] immediately replaces it with the rigid nominal `ChanDom(d)`
@@ -1393,7 +1393,7 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
 }
 
 /// Deref a mutable variable reference to its value type. A no-op on every other
-/// type — a feed channel included, since reading one yields its whole stream
+/// type — a feed channel included, since reading one yields its whole collection
 /// rather than a scalar value ([`Type::mut_value_type`]).
 pub(super) fn read_through(ty: &Type) -> Type {
     ty.mut_value_type().unwrap_or(ty).clone()
@@ -1505,10 +1505,10 @@ fn constrain_into_feed<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     match target_ty.as_feed() {
         Some((domain, value)) => {
-            // The channel is the history's `domain ⤇ value` stream; the
+            // The channel is the history's `domain ⤇ value` collection; the
             // contribution flows into it (`Fun(δ, elem)` for a feed, the whole
             // collection for a define). A **data** function, matching the read view
-            // `constrain_go` reconstructs for an `Append` history — the stream
+            // `constrain_go` reconstructs for an `Append` history — the read view
             // *is* the accumulated collection, and the kinds are incomparable,
             // so a `Compute` channel here would reject every collection fed into
             // it.
@@ -2473,7 +2473,7 @@ fn emit_transact_writer<C: Typing>(
 /// `Fun(domain, α)` (the value's history over the mutable variable's sequencing domain),
 /// what a variable projection `__hist.key` yields; a read reduces it to the
 /// latest `α` via `final_or_default(history, init)`. The init is the position-0
-/// value, so it bounds the codomain `α` (`init <: α`), not the whole stream.
+/// value, so it bounds the codomain `α` (`init <: α`), not the whole collection.
 /// There is no recurrence *fixpoint* over a step type — the mutable variable↔writer cycle
 /// is realized operationally at op-conversion — so no `σ <: α` constraint, just
 /// each writer's per-key mutable variable round-trip.

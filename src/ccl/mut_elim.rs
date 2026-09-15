@@ -952,7 +952,7 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
-/// xs`) is read (dereferenced) to its underlying `D ⇒ V` collection — the
+/// xs`) is read (dereferenced) to its underlying `D ⤇ V` collection — the
 /// mutable variable's value type; `erase_mut` clears the residual `Mut` on the source node
 /// at the end of the phase.
 pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
@@ -960,8 +960,8 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
     loop {
         match t {
             Type::Refinement(inner, _) => t = inner,
-            // Only a mutable collection derefs to its `D ⇒ V` value here;
-            // a feed reads as its whole stream and never reaches this phase's
+            // Only a mutable collection derefs to its `D ⤇ V` value here;
+            // a feed reads as its whole collection and never reaches this phase's
             // loop-source destructuring.
             Type::History {
                 value,
@@ -1696,7 +1696,7 @@ pub(crate) fn mut_var_value_tys<'a>(
     fn walk(e: &Expr, out: &mut HashMap<Name, Type>) {
         // A mutable variable is never wrapped in anything but `Refinement` before this
         // phase, and only an *overwrite* history is one — a `Feed` channel reads as its
-        // whole stream rather than as a value, which is why `mut_value_type` and not
+        // whole collection rather than as a value, which is why `mut_value_type` and not
         // `is_handle` is the test.
         if let TypedExprNode::Var(name) = &e.node
             && let Some(value) = e.ty.mut_value_type()
