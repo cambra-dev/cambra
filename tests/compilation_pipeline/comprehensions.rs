@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
-use cambra::interpreter::{ColumnValue, Predicate, Tile, Value, tuple_field};
+use cambra::interpreter::{ColumnValue, Deleted, Predicate, Tile, Value, tuple_field};
 use indoc::indoc;
 use rstest_log::rstest;
 
@@ -305,12 +305,14 @@ fn a_correlated_inner_comprehension_without_an_aggregate() {
     check_tile(
         "[[v * r for v in [1, 2]] for r in [1, 2]]",
         Tile::curried_function(
-            ColumnValue::UInts(vec![0, 1]),
-            ColumnValue::UInts(vec![0, 2]),
-            ColumnValue::UInts(vec![0, 1, 0, 1]),
-            ColumnValue::Ints(vec![1, 2, 2, 4]),
+            vec![
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+            ],
+            vec![ColumnValue::UInts(vec![0, 2])],
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 2, 4]))),
             Predicate::True,
-            BitSet::new(),
+            Deleted::none(),
         ),
     );
 }
@@ -327,26 +329,31 @@ fn a_correlated_comprehension_without_an_aggregate_over_a_collection() {
         [[v * r for v in c] for r in [1, 2]]
     "#});
     let Tile::CurriedFunction {
-        domain1,
+        domains,
         offsets,
-        domain2,
         codomain,
         ..
     } = tile
     else {
         panic!("a comprehension yielding a collection per row tiles as a curried function")
     };
-    let groups = domain1.len();
+    let [outer, inner] = domains.as_slice() else {
+        panic!("one level per comprehension, so two here; got {domains:?}")
+    };
+    let Tile::Scalar(values) = codomain.as_ref() else {
+        panic!("the codomain is one value per innermost entry, got {codomain:?}")
+    };
+    let groups = outer.len();
     let mut got: Vec<(usize, Value, Value)> = Vec::new();
     for g in 0..groups {
-        let start = offsets.index_at(g).as_uint();
+        let start = offsets[0].index_at(g).as_uint();
         let end = if g + 1 < groups {
-            offsets.index_at(g + 1).as_uint()
+            offsets[0].index_at(g + 1).as_uint()
         } else {
-            domain2.len()
+            inner.len()
         };
         for j in start..end {
-            got.push((g, domain2.index_at(j), codomain.index_at(j)));
+            got.push((g, inner.index_at(j), values.index_at(j)));
         }
     }
     got.sort_by_key(|(g, k, _)| (*g, format!("{k:?}")));
@@ -551,5 +558,70 @@ fn a_correlated_filter_over_a_collection_does_not_compile() {
         "},
         // 1*(10+20) + 2*(10+20).
         Value::Int(90),
+    );
+}
+
+/// Correlated nesting at **depth three and four**, which the two-level curried tiling could
+/// not hold: pairing produced a `CurriedFunction` and consumed a `SealedFunction`, so the
+/// operator was not closed under its own output. A curried tile carries one offsets array
+/// per level now, so a pairing appends a level and an aggregate collapses one
+/// (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::depth_2("sum([sum([v * r for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// (1+2)³, each level contributing its own factor.
+#[case::depth_3(
+    "sum([sum([sum([v * r * q for v in [1, 2]]) for r in [1, 2]]) for q in [1, 2]])",
+    27
+)]
+// (1+2)⁴ — the depth is not bounded, so a fourth level needs no further change.
+#[case::depth_4(
+    "sum([sum([sum([sum([a * b * c * d for a in [1, 2]]) for b in [1, 2]]) for c in [1, 2]]) for d in [1, 2]])",
+    81
+)]
+// A collection as the innermost source, whose domain comes from the data rather than
+// from an extent, nests the same way.
+#[case::depth_3_collection(
+    "m = map([(\"a\", 1), (\"b\", 2)])\nsum([sum([sum([v * r * q for v in m]) for r in [1, 2]]) for q in [1, 2]])",
+    27
+)]
+// An inner comprehension that reads nothing outer still broadcasts, one level down.
+#[case::depth_3_partial(
+    "sum([sum([sum([v for v in [1, 2]]) * r for r in [1, 2]]) for q in [1, 2]])",
+    18
+)]
+fn a_correlated_comprehension_nests_to_any_depth(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// Nesting **with no aggregate at any level**: three comprehensions leave three domain
+/// levels, which is the tile shape rather than a fold of it.
+///
+/// The depth cases above all sum at every level, so each `Product` is consumed by a
+/// `MapAggregate` that collapses the level it just added. Here nothing collapses, and the
+/// levels stand.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_comprehension_nests_without_an_aggregate() {
+    // `q`, `r` and `v` each range over [1, 2], and the innermost entry is their product.
+    check_tile(
+        "[[[v * r * q for v in [1, 2]] for r in [1, 2]] for q in [1, 2]]",
+        Tile::curried_function(
+            vec![
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1]),
+            ],
+            vec![
+                ColumnValue::UInts(vec![0, 2]),
+                ColumnValue::UInts(vec![0, 2, 4, 6]),
+            ],
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![
+                1, 2, 2, 4, 2, 4, 4, 8,
+            ]))),
+            Predicate::True,
+            Deleted::none(),
+        ),
     );
 }

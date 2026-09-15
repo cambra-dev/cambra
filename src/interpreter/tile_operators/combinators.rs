@@ -1,3 +1,4 @@
+use crate::interpreter::Deleted;
 use bit_set::BitSet;
 use log::trace;
 use std::{collections::HashMap, iter};
@@ -33,9 +34,8 @@ impl Converse {
             .split_function_extent()
             .unwrap_or_else(|| panic!("Converse expected function, got {:?}", input.tiling()));
         let tiling = Tiling::CurriedFunction {
-            domain1: codomain,
-            domain2: domain.clone(),
-            codomain: domain,
+            domains: vec![codomain, domain.clone()],
+            codomain: Box::new(Tiling::Scalar(domain)),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -114,16 +114,15 @@ fn converse_group_by_key<K: PartialOrd>(
     // domain2/codomain_out: original domain values reordered to match sorted groups.
     let domain2_col = domain.select_indices(order.into_iter(), n);
     Tile::curried_function(
-        domain1_col,
-        ColumnValue::UInts(group_starts),
-        domain2_col.clone(),
-        domain2_col,
+        vec![domain1_col, domain2_col.clone()],
+        vec![ColumnValue::UInts(group_starts)],
+        Box::new(Tile::Scalar(domain2_col)),
         if domain_predicate.as_bool().unwrap_or(false) {
             Predicate::True
         } else {
             Predicate::False
         },
-        output_deleted,
+        Deleted::at_level(1, output_deleted),
     )
 }
 
@@ -352,13 +351,13 @@ pub struct Uncurry {
 impl Uncurry {
     /// Create an `Uncurry` operator that flattens a curried function into a sealed function.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
-        let Tiling::CurriedFunction {
-            domain1,
-            domain2,
-            codomain,
-        } = input.tiling()
-        else {
+        let Tiling::CurriedFunction { domains, codomain } = input.tiling() else {
             panic!("Uncurry expected CurriedFunction, got {:?}", input.tiling())
+        };
+        // Flattening pairs two levels, so it takes exactly two. A deeper function
+        // flattens one level at a time.
+        let [domain1, domain2] = domains.as_slice() else {
+            panic!("Uncurry flattens two levels, got {}", domains.len())
         };
         let pair_extent = Extent::Record(HashMap::from([
             (tuple_field(0), domain1.clone()),
@@ -366,7 +365,7 @@ impl Uncurry {
         ]));
         let tiling = Tiling::SealedFunction {
             domain: pair_extent,
-            codomain: Box::new(Tiling::Scalar(codomain.clone())),
+            codomain: codomain.clone(),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -415,15 +414,18 @@ impl TileProducer for UncurryProducer {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         match input_tile {
             Tile::CurriedFunction {
-                domain1,
+                domains,
                 offsets,
-                domain2,
                 codomain,
                 domain_predicate,
                 ..
             } => {
+                let [domain1, domain2] = domains.as_slice() else {
+                    panic!("Uncurry flattens two levels, got {}", domains.len())
+                };
+                let codomain = scalar_tile_to_column_value(*codomain);
                 // Extract offsets as a vec of usize.
-                let ColumnValue::UInts(offsets_vec) = offsets else {
+                let ColumnValue::UInts(offsets_vec) = &offsets[0] else {
                     panic!("CurriedFunction offsets must be ColumnValue::UInts");
                 };
 
@@ -449,7 +451,7 @@ impl TileProducer for UncurryProducer {
                 // Build the pair domain column as Record with fields _0 and _1.
                 let pair_domain = ColumnValue::Records(HashMap::from([
                     (tuple_field(0), expanded_domain1),
-                    (tuple_field(1), domain2),
+                    (tuple_field(1), domain2.clone()),
                 ]));
 
                 let inner_pred = if domain_predicate.as_bool().unwrap_or(true) {
@@ -659,28 +661,31 @@ impl TileProducer for FilterProducer {
             // the groups a filter shortens.
             (
                 Tile::CurriedFunction {
-                    domain2: pred_keys,
+                    domains: pred_domains,
                     codomain: pred_outputs,
                     ..
                 },
                 Tile::CurriedFunction {
-                    domain1,
+                    domains,
                     offsets,
-                    domain2,
                     codomain,
                     domain_predicate,
                     deleted,
                 },
             ) => {
+                let pred_keys = pred_domains
+                    .last()
+                    .expect("a curried tile has levels")
+                    .clone();
+                let inner = domains.last().expect("a curried tile has levels").clone();
                 // **The mask is positional**, as in the sealed case above, so it applies
                 // only while the two sides are in step. An input with nothing in it is
                 // already filtered — the predicate keeps answering for entries whose rows
                 // have been handed on.
-                if domain2.is_empty() {
+                if inner.is_empty() {
                     return Tile::CurriedFunction {
-                        domain1,
+                        domains,
                         offsets,
-                        domain2,
                         codomain,
                         domain_predicate,
                         deleted,
@@ -694,7 +699,7 @@ impl TileProducer for FilterProducer {
                 // predicate reach entries the input has not.
                 assert_eq!(
                     pred_keys.len(),
-                    domain2.len(),
+                    inner.len(),
                     "a correlated filter needs its predicate and its rows in step; the \
                      predicate has answered for a different number of entries than the rows \
                      carry. A source that delivers rows one at a time is the case this does \
@@ -704,17 +709,17 @@ impl TileProducer for FilterProducer {
                 // equal keys are what makes it the right mask. The second walks both
                 // columns, so it is checked where checks cost nothing.
                 debug_assert!(
-                    pred_keys == domain2,
+                    pred_keys == inner,
                     "a correlated filter's predicate and rows agree in count but not in \
                      keys, so the mask is positional over two different orders",
                 );
-                let mask = pred_outputs
+                let pred_column = scalar_tile_to_column_value(*pred_outputs);
+                let mask = pred_column
                     .as_bitvec()
                     .unwrap_or_else(|| panic!("Expected bools"));
                 let mut output = Tile::CurriedFunction {
-                    domain1,
+                    domains,
                     offsets,
-                    domain2,
                     codomain,
                     domain_predicate,
                     deleted,
@@ -846,27 +851,30 @@ impl TileProducer for MapFilterProducer {
 
         let Tile::CurriedFunction {
             codomain: pred_rows,
-            domain2: pred_domain2,
+            domains: pred_domains,
             ..
         } = predicate_result
         else {
             panic!("MapFilter predicate produced {predicate_result:?}, expected a CurriedFunction");
         };
         let Tile::CurriedFunction {
-            domain2: input_domain2,
+            domains: input_domains,
             ..
         } = &input_result
         else {
             panic!("MapFilter input produced {input_result:?}, expected a CurriedFunction");
         };
+        let pred_inner = pred_domains.last().expect("a curried tile has levels");
+        let input_inner = input_domains.last().expect("a curried tile has levels");
         // The mask is positional over the flattened rows, so the two sides must be
         // the same flattening of the same keys. They share an upstream `FanOut`, so
         // a mismatch is a planning bug rather than a data-dependent case.
         debug_assert_eq!(
-            &pred_domain2, input_domain2,
+            pred_inner, input_inner,
             "MapFilter predicate and input must flatten the same inner domains"
         );
-        let mask = pred_rows
+        let pred_column = scalar_tile_to_column_value(*pred_rows);
+        let mask = pred_column
             .as_bitvec()
             .unwrap_or_else(|| panic!("MapFilter predicate codomain is not boolean"));
         input_result.retain(mask);
@@ -1052,9 +1060,8 @@ impl IterateRowCollection {
             )
         };
         let tiling = Tiling::CurriedFunction {
-            domain1: domain.clone(),
-            domain2: (**key).clone(),
-            codomain: (**value).clone(),
+            domains: vec![domain.clone(), (**key).clone()],
+            codomain: Box::new(Tiling::Scalar((**value).clone())),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -1077,9 +1084,9 @@ impl TileOperator for IterateRowCollection {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (key, value) = match self.tiling() {
-            Tiling::CurriedFunction {
-                domain2, codomain, ..
-            } => (domain2.clone(), codomain.clone()),
+            Tiling::CurriedFunction { domains, codomain } => {
+                (domains[1].clone(), codomain.extent())
+            }
             other => {
                 unreachable!("IterateRowCollection tiles as a curried function, got {other:?}")
             }
@@ -1173,12 +1180,11 @@ impl TileProducer for IterateRowCollectionProducer {
         // live store would never reach a terminal answer for the rows it already has.
         let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain1));
         let mut tile = Tile::curried_function(
-            domain1,
-            ColumnValue::UInts(offsets),
-            ColumnValue::from_values(keys, &self.key),
-            ColumnValue::from_values(outputs, &self.value),
+            vec![domain1, ColumnValue::from_values(keys, &self.key)],
+            vec![ColumnValue::UInts(offsets)],
+            Box::new(Tile::Scalar(ColumnValue::from_values(outputs, &self.value))),
             domain_predicate,
-            deleted,
+            Deleted::at_level(1, deleted),
         );
         // **What this producer released, it drops here**, because it cannot drop it
         // upstream: a released key is one binding of a materialized map, and the map is a
@@ -1227,15 +1233,15 @@ impl TileProducer for IterateRowCollectionProducer {
 ///
 /// **The inner side is a stream, not an extent**, and that is what lets one builder serve
 /// both sources a comprehension can have. A list literal's domain is an index range, so the
-/// inner stream is an `IterateExtent` over it. A map's is its present-key refinement, which
-/// `extent_of` strips to answer the unbounded key type, so the inner stream is `MapDomain`
-/// of the collection instead. Both carry that domain in their codomain, which is all this
-/// reads.
+/// inner stream is an `IterateExtent` over it. A map's is its present-key refinement,
+/// which `extent_of` strips to answer the unbounded key type, so the inner stream is
+/// `MapDomain` of the collection instead. Both carry that domain in their codomain, which
+/// is all this reads.
 ///
 /// The codomain is the pair the morphism reads: `_0` the row's value, `_1` the element.
 pub struct Product {
-    /// Output tiling: `CurriedFunction { domain1: outer.domain, domain2: inner domain,
-    /// codomain: {_0: outer codomain, _1: inner domain} }`.
+    /// Output tiling: `CurriedFunction { domain1: outer.domain, domain2: inner inner_domain,
+    /// codomain: {_0: outer codomain, _1: inner inner_domain} }`.
     base: OperatorBase,
     /// The outer stream, one group per row.
     outer: Box<dyn TileOperator>,
@@ -1246,11 +1252,15 @@ pub struct Product {
 impl Product {
     /// Pair every row of `outer` with every element of the domain `inner` carries.
     pub fn new(outer: Box<dyn TileOperator>, inner: Box<dyn TileOperator>) -> Self {
-        let Tiling::SealedFunction { domain, codomain } = outer.tiling() else {
-            panic!(
-                "Product expected a SealedFunction outer stream, got {:?}",
-                outer.tiling()
-            )
+        // The outer stream is either a plain stream of rows or a function already grouped
+        // by earlier pairings. Pairing appends a level either way, which is what makes this
+        // operator closed under its own output and correlated nesting unbounded in depth.
+        let (outer_domains, outer_codomain) = match outer.tiling() {
+            Tiling::SealedFunction { domain, codomain } => {
+                (vec![domain.clone()], codomain.extent())
+            }
+            Tiling::CurriedFunction { domains, codomain } => (domains.clone(), codomain.extent()),
+            other => panic!("Product expected a function as its outer stream, got {other:?}"),
         };
         let Tiling::SealedFunction {
             codomain: inner_domain,
@@ -1265,13 +1275,14 @@ impl Product {
         let inner_domain = inner_domain.extent();
         // The row's value as one extent, however many columns carry it: a product row
         // spreads over a column per field, and the pair this builds holds it whole.
+        let mut domains = outer_domains;
+        domains.push(inner_domain.clone());
         let tiling = Tiling::CurriedFunction {
-            domain1: domain.clone(),
-            domain2: inner_domain.clone(),
-            codomain: Extent::Record(HashMap::from([
-                (tuple_field(0), codomain.extent()),
+            domains,
+            codomain: Box::new(Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), outer_codomain),
                 (tuple_field(1), inner_domain),
-            ])),
+            ])))),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -1318,9 +1329,9 @@ struct ProductProducer {
     base: ProducerBase,
     /// The outer stream.
     outer: Box<dyn TileProducer>,
-    /// The inner stream, read once for its domain.
+    /// The inner stream, read once for its inner_domain.
     inner: Box<dyn TileProducer>,
-    /// The inner domain, kept after the inner stream has delivered all of it.
+    /// The inner_domain, kept after the inner stream has delivered all of them.
     ///
     /// **Every group holds the whole domain**, so a row cannot be emitted until the inner
     /// side is complete — a group built from a prefix would claim a row finished with
@@ -1349,41 +1360,66 @@ impl TileProducer for ProductProducer {
             }
         }
         let outer_tile = self.outer.get(self.outer.tiling().universal_guard());
-        let Tile::SealedFunction {
-            domain,
-            codomain,
-            domain_predicate,
-            deleted,
-        } = outer_tile
-        else {
-            panic!("Product expected a SealedFunction outer tile")
-        };
-        let outer = scalar_tile_to_column_value(*codomain);
-        let empty = |inner_domain: ColumnValue| {
+        // A stream of rows is one level; a function already paired is as many as it has.
+        // Either way the pairing appends one below whatever arrived.
+        let (outer_domains, outer_offsets, outer_codomain, domain_predicate, deleted) =
+            match outer_tile {
+                Tile::SealedFunction {
+                    domain,
+                    codomain,
+                    domain_predicate,
+                    deleted,
+                } => (
+                    vec![domain],
+                    Vec::new(),
+                    *codomain,
+                    domain_predicate,
+                    Deleted::at_level(0, deleted),
+                ),
+                Tile::CurriedFunction {
+                    domains,
+                    offsets,
+                    codomain,
+                    domain_predicate,
+                    deleted,
+                } => (domains, offsets, *codomain, domain_predicate, deleted),
+                other => panic!("Product expected a function as its outer tile, got {other:?}"),
+            };
+        let outer = scalar_tile_to_column_value(outer_codomain);
+        let empty = |inner_domain: &ColumnValue| {
+            let mut domains: Vec<ColumnValue> = outer_domains
+                .iter()
+                .map(|d| d.select_indices(iter::empty(), 0))
+                .collect();
+            domains.push(inner_domain.select_indices(iter::empty(), 0));
+            let offsets = vec![ColumnValue::UInts(Vec::new()); domains.len() - 1];
             Tile::curried_function(
-                domain.select_indices(iter::empty(), 0),
-                ColumnValue::UInts(Vec::new()),
-                inner_domain.select_indices(iter::empty(), 0),
-                ColumnValue::Records(HashMap::from([
+                domains,
+                offsets,
+                Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
                     (tuple_field(0), outer.select_indices(iter::empty(), 0)),
                     (
                         tuple_field(1),
                         inner_domain.select_indices(iter::empty(), 0),
                     ),
-                ])),
+                ])))),
                 Predicate::False,
-                BitSet::new(),
+                Deleted::none(),
             )
         };
         // Nothing to pair against yet, or nothing to pair: an empty inner side gives every
         // row an empty group, which a curried tile cannot hold — its offsets are strictly
         // ascending — so there is no group to emit.
         let Some(inner_domain) = self.inner_domain.clone() else {
-            return empty(ColumnValue::UInts(Vec::new()));
+            return empty(&ColumnValue::UInts(Vec::new()));
         };
-        let (rows, width) = (domain.len(), inner_domain.len());
+        let rows = outer_domains
+            .last()
+            .expect("the outer tile has at least one level")
+            .len();
+        let width = inner_domain.len();
         if width == 0 || rows == 0 {
-            return empty(inner_domain);
+            return empty(&inner_domain);
         }
         let total = rows * width;
         // Row-major: row `r` occupies `r * width .. (r + 1) * width`, so the row's value
@@ -1394,24 +1430,33 @@ impl TileProducer for ProductProducer {
         // arrives — the same statement [`IterateRowCollection`] makes about a map value
         // carrying its own keys, and what lets an aggregate over one settle per row while
         // the outer side stays open.
-        let domain_predicate = domain_predicate.union(&Predicate::from_column_value(&domain));
-        // A curried tile's `deleted` indexes its **flat innermost** entries
-        // ([`Tile::CurriedFunction`]), and pairing turns each outer row into a group of
-        // `width` of them. A deleted row is therefore a deleted group: its whole run is
-        // marked, where carrying the row's own index through marks one entry of whichever
-        // group covers that flat position.
-        let deleted: BitSet = deleted
+        let domain_predicate =
+            domain_predicate.union(&Predicate::from_column_value(&outer_domains[0]));
+        // The outer's levels are the output's, level for level, so a removal above its
+        // innermost rides through at the level it already names. Its innermost becomes the
+        // run of `width` pairs that element opened, which is the level `compact` reads.
+        let outer_innermost = outer_domains.len() - 1;
+        let mut out_deleted = Deleted::none();
+        for k in 0..outer_innermost {
+            *out_deleted.level_mut(k) = deleted.level(k).clone();
+        }
+        *out_deleted.level_mut(outer_innermost + 1) = deleted
+            .level(outer_innermost)
             .iter()
             .flat_map(|row| (row * width)..((row + 1) * width))
             .collect();
+        let deleted = out_deleted;
+        let mut domains = outer_domains;
+        domains.push(domain_column.clone());
+        let mut offsets = outer_offsets;
+        offsets.push(ColumnValue::UInts((0..rows).map(|r| r * width).collect()));
         let mut tile = Tile::curried_function(
-            domain,
-            ColumnValue::UInts((0..rows).map(|r| r * width).collect()),
-            domain_column.clone(),
-            ColumnValue::Records(HashMap::from([
+            domains,
+            offsets,
+            Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
                 (tuple_field(0), outer_column),
                 (tuple_field(1), domain_column),
-            ])),
+            ])))),
             domain_predicate,
             deleted,
         );
@@ -1466,18 +1511,19 @@ mod tests {
         // Expected pair domain: Record with _0=[1,1,2] and _1=[10,20,30]
 
         let curried_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![1, 2]),
-            offsets: ColumnValue::UInts(vec![0, 2]),
-            domain2: ColumnValue::UInts(vec![10, 20, 30]),
-            codomain: ColumnValue::UInts(vec![100, 200, 300]),
+            domains: vec![
+                ColumnValue::UInts(vec![1, 2]),
+                ColumnValue::UInts(vec![10, 20, 30]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 2])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
             domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         let input_producer = TestTileProducer::new(curried_tile, curried_tiling.clone());
@@ -1578,18 +1624,19 @@ mod tests {
         // Expected expanded_domain1: [A, B, C]
 
         let curried_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![100, 200, 300]),
-            offsets: ColumnValue::UInts(vec![0, 1, 2]),
-            domain2: ColumnValue::UInts(vec![10, 20, 30]),
-            codomain: ColumnValue::UInts(vec![1, 2, 3]),
+            domains: vec![
+                ColumnValue::UInts(vec![100, 200, 300]),
+                ColumnValue::UInts(vec![10, 20, 30]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 1, 2])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 2, 3]))),
             domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
@@ -1667,18 +1714,19 @@ mod tests {
         // fields (_0 and _1) set to Predicate::True.
 
         let curried_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![1, 2, 3]),
-            offsets: ColumnValue::UInts(vec![0, 1, 2]),
-            domain2: ColumnValue::UInts(vec![10, 20, 30]),
-            codomain: ColumnValue::UInts(vec![100, 200, 300]),
+            domains: vec![
+                ColumnValue::UInts(vec![1, 2, 3]),
+                ColumnValue::UInts(vec![10, 20, 30]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 1, 2])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
             domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
@@ -1730,18 +1778,19 @@ mod tests {
         // fields (_0 and _1) set to Predicate::False.
 
         let curried_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![1, 2]),
-            offsets: ColumnValue::UInts(vec![0, 1]),
-            domain2: ColumnValue::UInts(vec![10, 20]),
-            codomain: ColumnValue::UInts(vec![100, 200]),
+            domains: vec![
+                ColumnValue::UInts(vec![1, 2]),
+                ColumnValue::UInts(vec![10, 20]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 1])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
             domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
@@ -1788,9 +1837,8 @@ mod tests {
         let output_tiling = {
             let (domain, codomain) = input_tiling.split_function_extent().unwrap();
             Tiling::CurriedFunction {
-                domain1: codomain,
-                domain2: domain.clone(),
-                codomain: domain,
+                domains: vec![codomain, domain.clone()],
+                codomain: Box::new(Tiling::Scalar(domain)),
             }
         };
         let mut producer = ConverseProducer {
@@ -1819,9 +1867,8 @@ mod tests {
         };
         let result = run_converse(tile, sealed_fn_tiling());
         let Tile::CurriedFunction {
-            domain1,
+            domains,
             offsets,
-            domain2,
             domain_predicate,
             deleted,
             ..
@@ -1830,11 +1877,11 @@ mod tests {
             panic!("expected CurriedFunction");
         };
         // Two distinct codomain values: 10 and 20.
-        assert_eq!(domain1, ColumnValue::Ints(vec![10, 20]));
+        assert_eq!(domains[0], ColumnValue::Ints(vec![10, 20]));
         // Group for 10 starts at 0 (rows 0 and 2 map to 10); group for 20 starts at 2.
-        assert_eq!(offsets, ColumnValue::UInts(vec![0, 2]));
-        // domain2 is sorted by codomain key: [0, 2] for key 10, then [1] for key 20.
-        assert_eq!(domain2, ColumnValue::Ints(vec![0, 2, 1]));
+        assert_eq!(offsets[0], ColumnValue::UInts(vec![0, 2]));
+        // The inner level is sorted by codomain key: [0, 2] for key 10, then [1] for 20.
+        assert_eq!(domains[1], ColumnValue::Ints(vec![0, 2, 1]));
         assert_eq!(domain_predicate, Predicate::True);
         assert!(deleted.is_empty(), "no deleted entries expected");
     }
@@ -1872,17 +1919,18 @@ mod tests {
         };
         let result = run_converse(tile, sealed_fn_tiling());
         let Tile::CurriedFunction {
-            deleted, domain2, ..
+            deleted, domains, ..
         } = result
         else {
             panic!("expected CurriedFunction");
         };
+        let domain2 = domains[1].clone();
         // Sorted order: row 1 (key 10) first, then row 0 (key 20), then row 2 (key 20).
         // Output position 1 holds original row 0, which was deleted.
         assert_eq!(domain2, ColumnValue::Ints(vec![1, 0, 2]));
         let mut expected = BitSet::new();
         expected.insert(1);
-        assert_eq!(deleted, expected);
+        assert_eq!(deleted.level(1), &expected);
     }
 
     /// Multiple deleted rows are all remapped correctly.
@@ -1908,7 +1956,7 @@ mod tests {
         let mut expected = BitSet::new();
         expected.insert(0);
         expected.insert(1);
-        assert_eq!(deleted, expected);
+        assert_eq!(deleted.level(1), &expected);
     }
 
     /// A deleted input row is a deleted **group**, and a curried tile's `deleted` indexes
@@ -1953,9 +2001,8 @@ mod tests {
             deleted,
         };
         let out_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::String),
-            codomain: Extent::Base(BaseType::Int),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::String)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
         let mut producer = IterateRowCollectionProducer {
             base: ProducerBase::new(IterateRowCollectionProducer::alloc_id(), &out_tiling),
@@ -1964,8 +2011,8 @@ mod tests {
             value: Extent::Base(BaseType::Int),
         };
         let Tile::CurriedFunction {
+            domains,
             offsets,
-            domain2,
             deleted,
             ..
         } = producer.get(out_tiling.universal_guard())
@@ -1974,15 +2021,16 @@ mod tests {
         };
         assert_eq!(
             offsets,
-            ColumnValue::from_uints(vec![0, 2]),
+            vec![ColumnValue::from_uints(vec![0, 2])],
             "two groups of two"
         );
-        assert_eq!(domain2.len(), 4, "four flat entries");
+        assert_eq!(domains[1].len(), 4, "four flat entries");
         let mut expected = BitSet::new();
         expected.insert(0);
         expected.insert(1);
         assert_eq!(
-            deleted, expected,
+            deleted.level(1),
+            &expected,
             "row 0 opened flat entries 0..2, so both are deleted"
         );
     }
@@ -2006,12 +2054,11 @@ mod tests {
         let mut deleted = BitSet::new();
         deleted.insert(0);
         let out_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::Int),
-            codomain: Extent::Record(HashMap::from([
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::Int)],
+            codomain: Box::new(Tiling::Scalar(Extent::Record(HashMap::from([
                 (tuple_field(0), Extent::Base(BaseType::Int)),
                 (tuple_field(1), Extent::Base(BaseType::Int)),
-            ])),
+            ])))),
         };
         let mut producer = ProductProducer {
             base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
@@ -2026,8 +2073,8 @@ mod tests {
             inner_domain: None,
         };
         let Tile::CurriedFunction {
+            domains,
             offsets,
-            domain2,
             deleted,
             ..
         } = producer.get(out_tiling.universal_guard())
@@ -2036,15 +2083,16 @@ mod tests {
         };
         assert_eq!(
             offsets,
-            ColumnValue::from_uints(vec![0, 2]),
+            vec![ColumnValue::from_uints(vec![0, 2])],
             "each row pairs with both inner elements"
         );
-        assert_eq!(domain2.len(), 4, "four flat pairs");
+        assert_eq!(domains[1].len(), 4, "four flat pairs");
         let mut expected = BitSet::new();
         expected.insert(0);
         expected.insert(1);
         assert_eq!(
-            deleted, expected,
+            deleted.level(1),
+            &expected,
             "outer row 0 opened flat entries 0..2, so both are deleted"
         );
     }

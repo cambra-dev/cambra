@@ -4099,7 +4099,7 @@ fn result_extent(tiling: &Tiling) -> Extent {
         Tiling::Scalar(e) => e.clone(),
         Tiling::Record(_) => tiling.extent(),
         Tiling::SealedFunction { codomain, .. } => codomain.extent(),
-        Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
+        Tiling::CurriedFunction { codomain, .. } => codomain.extent(),
         t => panic!("unexpected tiling in codomain_extent: {t:?}"),
     }
 }
