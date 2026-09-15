@@ -132,7 +132,10 @@ pub enum Tile {
         /// one is flattened across its parent's groups. Always at least two.
         domains: Vec<ColumnValue>,
         /// One offsets column per level above the innermost, so
-        /// `offsets.len() == domains.len() - 1`. Each is `ColumnValue::UInts`.
+        /// `offsets.len() == domains.len() - 1`. Each is `ColumnValue::UInts` and
+        /// **non-decreasing**: two equal starts are the element whose group holds nothing.
+        /// A key with an empty group is a collection that is empty, which an aggregate
+        /// folds to its identity; a key that is gone is absent from the column instead.
         offsets: Vec<ColumnValue>,
         /// The codomain, vectorized one entry per innermost domain element — the same
         /// convention [`Self::SealedFunction`]'s codomain follows, so a fold may leave a
@@ -517,14 +520,20 @@ impl Tile {
                 );
                 // Combine the caller's mask with the logical-deletion bits, as the sealed
                 // case does: keep row j only if the mask says so and it is not deleted.
-                let innermost_removed = deleted.level(domains.len() - 1);
+                //
+                // Only the innermost mark is consumed. A mark above it is a release, which
+                // [`Tile::compact`] realises by pruning, and the levels above the innermost
+                // do not change length here — so the mark stays valid and stays pending
+                // rather than being cleared by a filter that did not act on it.
+                let innermost = domains.len() - 1;
+                let innermost_removed = deleted.level(innermost).clone();
                 let keep: BitVec = mask
                     .iter()
                     .enumerate()
                     .map(|(j, keep)| keep && !innermost_removed.contains(j))
                     .collect();
                 retain_levels(domains, offsets, codomain, &keep);
-                deleted.clear();
+                *deleted.level_mut(innermost) = BitSet::new();
             }
             // An aggregation is flat columns over the same positions its function's
             // innermost level has, so it filters position-wise like a scalar does. A
@@ -577,36 +586,36 @@ impl Tile {
     /// This is the counterpart to [`Tile::mark_deleted`] and is called before
     /// operators iterate over tile data so they only process live entries.
     pub fn compact(&mut self) {
-        let n = match self {
+        match self {
             Tile::SealedFunction {
                 deleted, domain, ..
             } => {
                 if deleted.is_empty() {
                     return;
                 }
-                domain.len()
+                let n = domain.len();
+                let removed = deleted.clone();
+                let mask: BitVec = (0..n).map(|i| !removed.contains(i)).collect();
+                self.retain(&mask);
             }
+            // A curried tile is pruned rather than filtered: a mark at any level takes its
+            // subtree, which a mask over the innermost cannot say and which `retain`
+            // deliberately does not do — there, an emptied group stays.
             Tile::CurriedFunction {
-                deleted, domains, ..
+                domains,
+                offsets,
+                codomain,
+                deleted,
+                ..
             } => {
                 if deleted.is_empty() {
                     return;
                 }
-                domains[domains.len() - 1].len()
+                let removed = std::mem::take(deleted);
+                prune_marked(domains, offsets, codomain, &removed);
             }
-            _ => return,
-        };
-        // Build the keep-mask from the deleted set, then let retain() do the work
-        // (retain also clears deleted).
-        let deleted_clone = match self {
-            Tile::SealedFunction { deleted, .. } => deleted.clone(),
-            Tile::CurriedFunction {
-                domains, deleted, ..
-            } => deleted.level(domains.len() - 1).clone(),
-            _ => unreachable!(),
-        };
-        let mask: BitVec = (0..n).map(|i| !deleted_clone.contains(i)).collect();
-        self.retain(&mask);
+            _ => (),
+        }
     }
 
     /// Removes all data in this tile that is specified by the guard.
@@ -666,14 +675,12 @@ impl Tile {
             // **A guard nests as deeply as the type does.** `Domain(p)` names the
             // outermost level; each `Codomain` wrapper steps one level in, so
             // `Codomain(Domain(p))` names level 1 and `Codomain(Codomain(Domain(p)))`
-            // level 2. Marking is always over the innermost rows, so a named element
-            // takes its whole subtree with it.
+            // level 2. The named element is marked at its own level and [`Tile::compact`]
+            // takes its subtree with it — marking the rows beneath it instead would make a
+            // released group indistinguishable from one a filter emptied.
             (
                 Tile::CurriedFunction {
-                    domains,
-                    offsets,
-                    deleted,
-                    ..
+                    domains, deleted, ..
                 },
                 guard @ TileGuard::Function(_),
             ) => {
@@ -688,13 +695,11 @@ impl Tile {
                     "a release guard names level {level} of a {}-level curried tile",
                     domains.len()
                 );
-                let owner = ancestor_at(domains, offsets, level);
                 let named = domains[level].clone();
-                let innermost = domains.len() - 1;
-                let removed = deleted.level_mut(innermost);
-                for (row, &ancestor) in owner.iter().enumerate() {
-                    if pred.contains(&named.index_at(ancestor)) {
-                        removed.insert(row);
+                let removed = deleted.level_mut(level);
+                for i in 0..named.len() {
+                    if pred.contains(&named.index_at(i)) {
+                        removed.insert(i);
                     }
                 }
             }
@@ -892,84 +897,45 @@ fn level_run(offsets: &[usize], i: usize, below_len: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// Which elements of each level have at least one surviving descendant, innermost first.
+/// Rebuild every level, keeping the innermost entries `keep_inner` selects.
 ///
-/// A curried tile's offsets are strictly ascending, so a group holding nothing cannot be
-/// represented at all ([`validate_tile`]). Pruning therefore has to propagate upward: an
-/// element whose whole run below is gone goes with it, and so on to the outermost level.
-fn alive_levels(
-    domains: &[ColumnValue],
-    offsets: &[ColumnValue],
-    keep_inner: &BitVec,
-) -> Vec<BitVec> {
-    let depth = domains.len();
-    let mut alive: Vec<BitVec> = domains
-        .iter()
-        .map(|d| BitVec::from_elem(d.len(), false))
-        .collect();
-    for j in 0..domains[depth - 1].len() {
-        alive[depth - 1].set(j, keep_inner[j]);
-    }
-    for k in (0..depth - 1).rev() {
-        let below_len = domains[k + 1].len();
-        let run_starts = level_offsets(&offsets[k]);
-        for i in 0..domains[k].len() {
-            let (start, end) = level_run(run_starts, i, below_len);
-            let any = (start..end).any(|j| alive[k + 1][j]);
-            alive[k].set(i, any);
-        }
-    }
-    alive
-}
-
-/// Rebuild every level, keeping the innermost rows `keep_inner` selects and dropping each
-/// ancestor left with none.
+/// **Only the innermost level loses elements.** An element above it stays whether or not a
+/// descendant does, because the offsets are non-decreasing and so carry the empty group that
+/// leaves ([`Tile::CurriedFunction`]): filtering every element out of a collection leaves
+/// that collection empty, not its key absent. Removing the key is what [`prune_marked`]
+/// does, and a release is what asks for it.
 ///
-/// The kept children of a surviving parent stay contiguous, because the kept indices at a
-/// level preserve their original order and the runs they came from were disjoint and
-/// ordered — which is what lets a parent's new offset be the rank of its first kept child.
+/// One offsets column therefore moves — the one indexing the innermost level. Each start
+/// becomes the number of kept entries before it, which is what leaves two equal starts where
+/// a whole group went.
 fn retain_levels(
     domains: &mut [ColumnValue],
-    offsets: &mut Vec<ColumnValue>,
+    offsets: &mut [ColumnValue],
     codomain: &mut Tile,
     keep_inner: &BitVec,
 ) {
     let depth = domains.len();
-    let alive = alive_levels(domains, offsets, keep_inner);
-    let kept: Vec<Vec<usize>> = (0..depth)
-        .map(|k| (0..domains[k].len()).filter(|&i| alive[k][i]).collect())
+    let inner_len = domains[depth - 1].len();
+    let mut rank = Vec::with_capacity(inner_len + 1);
+    let mut kept_so_far = 0;
+    for j in 0..inner_len {
+        rank.push(kept_so_far);
+        if keep_inner[j] {
+            kept_so_far += 1;
+        }
+    }
+    rank.push(kept_so_far);
+
+    let rebased: Vec<usize> = level_offsets(&offsets[depth - 2])
+        .iter()
+        .map(|&start| rank[start])
         .collect();
+    offsets[depth - 2] = ColumnValue::UInts(rebased);
 
-    let mut new_offsets = Vec::with_capacity(depth - 1);
-    for k in 0..depth - 1 {
-        let below_len = domains[k + 1].len();
-        let run_starts = level_offsets(&offsets[k]);
-        let mut rank_of = vec![usize::MAX; below_len];
-        for (rank, &j) in kept[k + 1].iter().enumerate() {
-            rank_of[j] = rank;
-        }
-        let mut starts = Vec::with_capacity(kept[k].len());
-        for &i in &kept[k] {
-            let (start, end) = level_run(run_starts, i, below_len);
-            let first = (start..end)
-                .find(|&j| alive[k + 1][j])
-                .expect("a level element survives only when a descendant does");
-            starts.push(rank_of[first]);
-        }
-        new_offsets.push(ColumnValue::UInts(starts));
-    }
-
-    for k in 0..depth {
-        domains[k] = domains[k].select_indices(kept[k].iter().copied(), kept[k].len());
-    }
-    // The codomain is vectorized over the innermost level, so it keeps exactly the rows
-    // that level kept.
-    let mut inner_mask = BitVec::from_elem(alive[depth - 1].len(), false);
-    for &row in &kept[depth - 1] {
-        inner_mask.set(row, true);
-    }
-    codomain.retain(&inner_mask);
-    *offsets = new_offsets;
+    let kept: Vec<usize> = (0..inner_len).filter(|&j| keep_inner[j]).collect();
+    let n = kept.len();
+    codomain.retain(keep_inner);
+    domains[depth - 1] = domains[depth - 1].select_indices(kept.into_iter(), n);
 }
 
 /// The keys of the groups `domain_predicate` does **not** call whole.
@@ -1021,6 +987,76 @@ fn guard_level(guard: &TileGuard) -> Option<(usize, Predicate)> {
             _ => return None,
         }
     }
+}
+
+/// For each element at `level`, the index of its parent at `level - 1`.
+fn parents_at(domains: &[ColumnValue], offsets: &[ColumnValue], level: usize) -> Vec<usize> {
+    let below_len = domains[level].len();
+    let starts = level_offsets(&offsets[level - 1]);
+    let mut parent = vec![0usize; below_len];
+    for i in 0..domains[level - 1].len() {
+        let (start, end) = level_run(starts, i, below_len);
+        for slot in parent.iter_mut().take(end).skip(start) {
+            *slot = i;
+        }
+    }
+    parent
+}
+
+/// Physically remove every marked element, and everything below it.
+///
+/// Marking runs **downward**, which is what separates a released element from one a filter
+/// emptied: a released group takes its subtree and is gone, while a group a filter emptied
+/// keeps its place and holds nothing ([`Tile::retain`]). Each surviving parent's new offset
+/// is the number of surviving children before its old run, so a group left empty by the
+/// prune is two equal starts rather than a missing key.
+fn prune_marked(
+    domains: &mut [ColumnValue],
+    offsets: &mut [ColumnValue],
+    codomain: &mut Tile,
+    deleted: &Deleted,
+) {
+    let depth = domains.len();
+    let mut alive: Vec<BitVec> = Vec::with_capacity(depth);
+    for k in 0..depth {
+        let mut level = BitVec::from_elem(domains[k].len(), false);
+        let parent = (k > 0).then(|| parents_at(domains, offsets, k));
+        for i in 0..domains[k].len() {
+            let kept =
+                !deleted.level(k).contains(i) && parent.as_ref().is_none_or(|p| alive[k - 1][p[i]]);
+            level.set(i, kept);
+        }
+        alive.push(level);
+    }
+
+    let kept: Vec<Vec<usize>> = (0..depth)
+        .map(|k| (0..domains[k].len()).filter(|&i| alive[k][i]).collect())
+        .collect();
+    let mut new_offsets = Vec::with_capacity(depth - 1);
+    for k in 0..depth - 1 {
+        let below_len = domains[k + 1].len();
+        let starts = level_offsets(&offsets[k]);
+        let mut rank = Vec::with_capacity(below_len + 1);
+        let mut surviving = 0;
+        for kept_below in alive[k + 1].iter().take(below_len) {
+            rank.push(surviving);
+            if kept_below {
+                surviving += 1;
+            }
+        }
+        rank.push(surviving);
+        let new_starts = kept[k]
+            .iter()
+            .map(|&i| rank[level_run(starts, i, below_len).0])
+            .collect();
+        new_offsets.push(ColumnValue::UInts(new_starts));
+    }
+
+    codomain.retain(&alive[depth - 1]);
+    for k in 0..depth {
+        domains[k] = domains[k].select_indices(kept[k].iter().copied(), kept[k].len());
+    }
+    offsets.clone_from_slice(&new_offsets);
 }
 
 /// For each innermost row, the index of the element at `level` that owns it.
@@ -1081,8 +1117,8 @@ pub fn validate_tile(tile: &Tile) -> bool {
                 let below_len = domains[k + 1].len();
                 let below: Vec<Value> = domains[k + 1].clone().drain_to_value_iter().collect();
                 starts.len() == domains[k].len()
-                    && starts.windows(2).all(|w| w[0] < w[1])
-                    && starts.last().is_none_or(|o| *o < below_len)
+                    && starts.windows(2).all(|w| w[0] <= w[1])
+                    && starts.last().is_none_or(|o| *o <= below_len)
                     && (0..starts.len()).all(|i| {
                         let (start, end) = level_run(starts, i, below_len);
                         end - start
@@ -1645,10 +1681,12 @@ mod tests {
         assert!(!deleted.level(1).contains(2));
     }
 
+    /// A release marks the element the guard names, **at that element's own level**, and
+    /// `compact` is what takes its group with it. Marking the entries beneath it instead
+    /// would leave a released group and a filtered-empty one the same shape.
     #[test]
-    fn remove_guarded_curried_function_domain_removes_whole_group() {
+    fn remove_guarded_curried_function_domain_marks_the_named_group() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
-        // Logically removes group 0 (flat indices 0,1) via domain guard on d1=0.
         let mut tile = cf_uint_int(
             vec![0, 1],
             vec![0, 2],
@@ -1661,9 +1699,23 @@ mod tests {
         let Tile::CurriedFunction { deleted, .. } = &tile else {
             panic!("expected CurriedFunction");
         };
-        assert!(deleted.level(1).contains(0));
-        assert!(deleted.level(1).contains(1));
-        assert!(!deleted.level(1).contains(2));
+        assert!(deleted.level(0).contains(0), "the named group is marked");
+        assert!(!deleted.level(0).contains(1), "its sibling is not");
+        assert!(
+            deleted.level(1).is_empty(),
+            "the entries beneath it are not marked; `compact` takes them"
+        );
+
+        tile.compact();
+        let Tile::CurriedFunction {
+            domains, offsets, ..
+        } = &tile
+        else {
+            panic!("expected CurriedFunction");
+        };
+        assert_eq!(domains[0], ColumnValue::UInts(vec![1]), "group 0 is gone");
+        assert_eq!(domains[1], ColumnValue::UInts(vec![12]), "with its entries");
+        assert_eq!(offsets[0], ColumnValue::UInts(vec![0]));
     }
 
     #[test]
@@ -1733,26 +1785,35 @@ mod tests {
         assert_eq!(tile, cf_three_groups());
     }
 
+    /// **A filter empties a group; it does not remove one.** Every key stays, and a key
+    /// whose entries all went holds nothing — which two equal starts say. Removing the key
+    /// is what a release asks for, and `compact` is where that happens.
     #[test]
-    fn retain_curried_function_keep_none_empties_tile() {
+    fn retain_curried_function_keep_none_leaves_every_group_empty() {
         let mut tile = cf_three_groups();
         tile.retain(&BitVec::from_elem(6, false));
         assert_eq!(
             tile,
-            cf_uint_int(vec![], vec![], vec![], vec![], Predicate::False)
+            cf_uint_int(
+                vec![10, 20, 30],
+                vec![0, 0, 0],
+                vec![],
+                vec![],
+                Predicate::False
+            )
         );
     }
 
     #[test]
     fn retain_curried_function_keep_entire_first_group() {
         let mut tile = cf_three_groups();
-        // Keep positions 0,1 (group 0); drop the rest.
+        // Keep positions 0,1 (group 10); groups 20 and 30 are left empty.
         tile.retain(&BitVec::from_fn(6, |i| i < 2));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![10],
-                vec![0],
+                vec![10, 20, 30],
+                vec![0, 2, 2],
                 vec![0, 1],
                 vec![100, 110],
                 Predicate::False
@@ -1763,16 +1824,15 @@ mod tests {
     #[test]
     fn retain_curried_function_keep_entire_middle_group() {
         let mut tile = cf_three_groups();
-        // Keep positions 2,3,4 (group 1); drop the rest.
-        tile.retain(&BitVec::from_fn(6, |i| (2..=4).contains(&i)));
+        tile.retain(&BitVec::from_fn(6, |i| (2..5).contains(&i)));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![20],
-                vec![0],
+                vec![10, 20, 30],
+                vec![0, 0, 3],
                 vec![2, 3, 4],
                 vec![200, 210, 220],
-                Predicate::False,
+                Predicate::False
             )
         );
     }
@@ -1780,27 +1840,31 @@ mod tests {
     #[test]
     fn retain_curried_function_keep_entire_last_group() {
         let mut tile = cf_three_groups();
-        // Keep position 5 (group 2); drop the rest.
         tile.retain(&BitVec::from_fn(6, |i| i == 5));
         assert_eq!(
             tile,
-            cf_uint_int(vec![30], vec![0], vec![5], vec![300], Predicate::False)
+            cf_uint_int(
+                vec![10, 20, 30],
+                vec![0, 0, 0],
+                vec![5],
+                vec![300],
+                Predicate::False
+            )
         );
     }
 
     #[test]
     fn retain_curried_function_drop_entire_middle_group() {
         let mut tile = cf_three_groups();
-        // Keep groups 0 and 2; drop group 1 (positions 2,3,4).
-        tile.retain(&BitVec::from_fn(6, |i| !(2..=4).contains(&i)));
+        tile.retain(&BitVec::from_fn(6, |i| !(2..5).contains(&i)));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![10, 30],
-                vec![0, 2],
+                vec![10, 20, 30],
+                vec![0, 2, 2],
                 vec![0, 1, 5],
                 vec![100, 110, 300],
-                Predicate::False,
+                Predicate::False
             )
         );
     }
@@ -1808,31 +1872,30 @@ mod tests {
     #[test]
     fn retain_curried_function_partial_mask_within_group() {
         let mut tile = cf_three_groups();
-        // Keep only d2[1] from group 0 and d2[3] from group 1; drop everything else.
-        // Positions kept: 1 and 3.
+        // One survivor in each of groups 10 and 20; group 30 keeps nothing.
         tile.retain(&BitVec::from_fn(6, |i| i == 1 || i == 3));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![10, 20],
-                vec![0, 1],
+                vec![10, 20, 30],
+                vec![0, 1, 2],
                 vec![1, 3],
                 vec![110, 210],
-                Predicate::False,
+                Predicate::False
             )
         );
     }
 
     #[test]
-    fn retain_curried_function_partial_mask_prunes_empty_group() {
+    fn retain_curried_function_partial_mask_empties_the_groups_it_clears() {
         let mut tile = cf_three_groups();
-        // Keep d2[2] and d2[4] (both in group 1); groups 0 and 2 have no survivors.
+        // Keep d2[2] and d2[4] (both in group 20); groups 10 and 30 are left empty.
         tile.retain(&BitVec::from_fn(6, |i| i == 2 || i == 4));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![20],
-                vec![0],
+                vec![10, 20, 30],
+                vec![0, 0, 2],
                 vec![2, 4],
                 vec![200, 220],
                 Predicate::False
