@@ -114,9 +114,17 @@ pub enum ConstrainError {
     /// [`super::coalesce::CoalesceError::DomainJoinConflict`].
     DataDomainMismatch {
         /// The supplied collection's domain.
-        lhs: Type,
+        lhs: Box<Type>,
         /// The domain demanded at the position.
-        rhs: Type,
+        rhs: Box<Type>,
+        /// The comparison that found them unequal.
+        ///
+        /// Carried because the two domains can render alike: what separates them is a
+        /// binder identity a domain holds and does not print, and an inequality between
+        /// two identical-looking types names nothing. Only the reporting layer knows how
+        /// the pair will render, so it chooses which of the two to show
+        /// ([`crate::ccl::infer::map_constrain_err`]).
+        cause: Box<ConstrainError>,
     },
     /// Collections over distinct domains met as **lower bounds** of one variable — the
     /// arms of a conditional flowing into one join.
@@ -1162,16 +1170,17 @@ fn constrain_go_impl(
                             }
                         });
                     // Whichever edge found the two domains unequal, the report is the
-                    // inequality and not the sub-comparison that exposed it — except
-                    // for an `SmtError`, which established nothing: relabelling it
-                    // would claim a conflict that no comparison decided. See
-                    // [`super::smt`].
+                    // inequality and not the sub-comparison that exposed it — except for
+                    // an `SmtError`, which established nothing: relabelling it would claim
+                    // a conflict that no comparison decided. See [`super::smt`]. The
+                    // sub-comparison rides along as the inequality's `cause`.
                     if let Err(err) = decided {
                         return match err {
                             ConstrainError::SmtError { .. } => Err(err),
                             _ => Err(ConstrainError::DataDomainMismatch {
-                                lhs: (**d0).clone(),
-                                rhs: (**d1).clone(),
+                                lhs: Box::new((**d0).clone()),
+                                rhs: Box::new((**d1).clone()),
+                                cause: Box::new(err),
                             }),
                         };
                     }

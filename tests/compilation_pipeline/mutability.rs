@@ -2124,3 +2124,35 @@ fn test_a_branch_value_reads_what_the_branch_wrote(#[case] code: &str, #[case] e
 fn test_match_arm_write_carries(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
+
+/// Where a domain mismatch's two sides render alike, the report names the comparison
+/// that found them unequal rather than the inequality itself.
+///
+/// An exact annotation on a mutable collection binds a witness of its own, while the
+/// comprehension initializing it hands back a collection at the witness it opened. The
+/// two differ, and both print `σ` — a witness's binder identity is not something
+/// `Display` shows.
+#[test]
+fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
+    let code = indoc! {r#"
+        held = box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+        await_final(qty)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errs = match compile_program(&mut ctx, code, consumer) {
+        Ok(_) => panic!("the annotation binds its own witness, so the comprehension is rejected"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, "<identical-rendering-test>", code);
+    assert!(
+        rendered.contains("First structural difference"),
+        "the report quotes where the two sides diverge rather than asserting an \
+         inequality between two types it prints alike, got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("WitnessRef("),
+        "and the divergence it quotes is the binder identity, got:\n{rendered}",
+    );
+}
