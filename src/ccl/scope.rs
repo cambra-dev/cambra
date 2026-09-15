@@ -211,7 +211,7 @@ where
 
     match &e.node {
         // ---- Leaves ---------------------------------------------------------
-        // `Carried` is a leaf here, not a `VarRef`. Its name addresses a variable the
+        // `LoadFrom` is a leaf here, not a `VarRef`. Its name addresses a variable the
         // *retired* version declared, so it is the source's own spelling and stays
         // that: resolving it against this version's scope would rename it to a binder
         // it does not refer to, and the version that retires the variable has no such
@@ -220,7 +220,7 @@ where
         | N::Builtin(_)
         | N::Proj(_)
         | N::Source(_)
-        | N::Carried(_)
+        | N::LoadFrom(_)
         | N::Defer
         | N::Error => {}
         N::Var(n) => f(ScopedItem::VarRef(n)),
@@ -497,7 +497,7 @@ where
         | N::Builtin(_)
         | N::Proj(_)
         | N::Source(_)
-        | N::Carried(_)
+        | N::LoadFrom(_)
         | N::Defer
         | N::Error
         | N::Apply { .. }
@@ -615,7 +615,7 @@ mod tests {
             }),
             node(N::Proj(ProjKey::Index(0))),
             node(N::Source("src".into())),
-            node(N::Carried("carried_var".into())),
+            node(N::LoadFrom("load_from_var".into())),
             node(N::Defer),
             node(N::Error),
         ]
@@ -709,7 +709,7 @@ mod tests {
         N::MutWrite { .. } => "MutWrite",
         N::Proj(_) => "Proj",
         N::Source(_) => "Source",
-        N::Carried(_) => "Carried",
+        N::LoadFrom(_) => "LoadFrom",
         N::Defer => "Defer",
         N::Error => "Error",
     }

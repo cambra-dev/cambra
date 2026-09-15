@@ -191,7 +191,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
         },
 
-        // `carried(x)` is typed by its context. The value it denotes belongs to
+        // `@LoadFrom(x)` is typed by its context. The value it denotes belongs to
         // the retired version of the program, which this compilation cannot see:
         // it is handed a `HashMap<VarPath, Value>` at operator conversion, long
         // after inference, and a runtime `Value` carries no CCL type to read a
@@ -203,7 +203,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // What the predecessor holds is checked against the type this concludes,
         // and a reload whose value does not fit it is refused
         // (`src/interpreter/operator_conversion.rs`, `state_conflicts`).
-        TypedExprNode::Carried(_) => ctx.normalize_annotation(&expr.ty),
+        TypedExprNode::LoadFrom(_) => ctx.normalize_annotation(&expr.ty),
 
         TypedExprNode::Compose(elts) => {
             // A chain's kind is *decided where it is built*, never by what

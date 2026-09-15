@@ -718,7 +718,7 @@ pub(super) fn lower_middle_stmt(
             // scope — see `src/ccl/design/hot-reload.md`, "Seeding a variable
             // from the value the predecessor held". It is a spelling here, not a
             // reference, which is why it never goes through `lower_expr`.
-            let val = ctx.tag_image(Expr::carried(source.node.as_str()), source.span);
+            let val = ctx.tag_image(Expr::load_from(source.node.as_str()), source.span);
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
                 stmt.span,
