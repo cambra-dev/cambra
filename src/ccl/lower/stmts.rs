@@ -117,7 +117,7 @@ pub(super) fn lower_stmts_recovering(
         })
         .collect();
     let outputs = ctx.tag_machinery(
-        Expr::new(TypedExprNode::Outputs(outs)),
+        Expr::new(TypedExprNode::Record(outs)),
         program_span,
         "lower.sink_outputs",
     );
@@ -133,12 +133,12 @@ pub(super) fn lower_stmts_recovering(
 /// of the program produces an `ExprStmt(effect, continuation)` where the
 /// continuation may contain further `Let` bindings from later `http_serve`
 /// calls.  Stopping at the first `ExprStmt` would place the
-/// [`Outputs`](TypedExprNode::Outputs) outside those inner bindings, making its
+/// output list outside those inner bindings, making its
 /// names unbound.
 ///
 /// The `ExprStmt` node "drives the feed": `simplify` drops it once
 /// [`crate::ccl::channelize`] has extracted all `Feed` nodes from the body,
-/// leaving a clean `Let* Outputs{…}` shape that `compile_program` compiles one
+/// leaving a clean `Let* Record{…}` shape that `compile_program` compiles one
 /// output at a time.
 fn append_outputs_at_tail(
     expr: Expr,

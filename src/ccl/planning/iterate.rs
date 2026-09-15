@@ -243,18 +243,10 @@ pub(super) fn insert_iterate_recurse(
                 wrap_with_iterate(&mut w.source, discharged, "transact-source");
             }
         }
-        // Each program output is its own collection, compiled with `input=None` by
-        // [`convert_outputs_to_operators`](crate::interpreter::operator_conversion::convert_outputs_to_operators),
-        // so a function-typed one is an iteration site.
-        TypedExprNode::Outputs(outs) => {
-            for (_, out) in outs.iter_mut() {
-                if matches!(&out.ty, Type::Fun { .. }) {
-                    wrap_with_iterate(out, discharged, "output");
-                }
-            }
-        }
-        // A product's components are not iteration sites as components — see
-        // [`mark_component_source`] for what makes one a site anyway.
+        // A product's entries: a component of a value, or an entry of the program's
+        // output list, which is the same node ([`crate::ccl::lower`] builds the list
+        // as a `Record`). Either way an entry is an iteration site exactly when it
+        // holds a collection — see [`mark_component_source`].
         TypedExprNode::Tuple(elts) => {
             for elt in elts.iter_mut() {
                 mark_component_source(elt, discharged);
@@ -269,18 +261,25 @@ pub(super) fn insert_iterate_recurse(
     }
 }
 
-/// Mark `component`, a component of a product value, as an iteration site when it
-/// holds a collection.
+/// Mark `component`, an entry of a product, as an iteration site when it holds a
+/// collection.
 ///
-/// A collection component compiles exactly as a collection compiles anywhere: the
-/// product holds the tile it produces, keeping its own domain
-/// ([`SelectField`](crate::interpreter::tile_operators::SelectField) is what reads
-/// one back out). So the component needs the iteration every collection needs, and
-/// there is no shape here that a collection elsewhere does not have.
+/// A collection entry compiles exactly as a collection compiles anywhere: the product
+/// holds the tile it produces, keeping its own domain
+/// ([`SelectField`](crate::interpreter::tile_operators::SelectField) is what reads one
+/// back out), and a program output is compiled with `input=None` by
+/// [`convert_outputs_to_operators`](crate::interpreter::operator_conversion::convert_outputs_to_operators).
+/// Both need the iteration every collection needs.
 ///
-/// Tuples and records differ only in whether a component carries a name, so the rule
-/// is one rule. The kind test peels the refinement a filtered component carries: a
-/// filtered collection is a collection.
+/// **Being a collection is the whole test**, and the two halves of it each rule out a
+/// shape that looks like the other. A refinement is a fact about the value rather than
+/// a different shape, so it peels first: a filtered collection is a collection, and
+/// iterating it is what makes its rows reach anything. A compute function tiles at a
+/// function extent too and is not swept, so `FunKind` is what separates them; handing
+/// one an iteration source gives it an input it rejects.
+///
+/// Tuples, records and the output list differ only in whether an entry carries a name,
+/// so the rule is one rule.
 fn mark_component_source(
     component: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -377,8 +376,8 @@ pub(super) fn wrap_with_iterate(
     // arm runs before [`is_iteration_bearing`]'s early-return below
     // because Let isn't recognised as iteration-bearing on its own.
     //
-    // No matching `Outputs` arm here: [`insert_iterate_recurse`] runs first and
-    // has already wrapped every function-typed output, so a descent here would
+    // No matching product arm here: [`insert_iterate_recurse`] runs first and has
+    // already wrapped every entry that holds a collection, so a descent here would
     // re-visit iterate-led nodes.
     if let TypedExprNode::Let {
         bound_expr, body, ..
@@ -643,8 +642,7 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         TypedExprNode::Copair(_)
         | TypedExprNode::DisjointJoin(_)
         | TypedExprNode::Tuple(_)
-        | TypedExprNode::Record(_)
-        | TypedExprNode::Outputs(_) => true,
+        | TypedExprNode::Record(_) => true,
         TypedExprNode::Var(_)
             if matches!(
                 &head.ty,
@@ -693,6 +691,7 @@ mod tests {
     use crate::ccl::FieldKey;
     use crate::ccl::ccl_utils::is_trivially_true_predicate;
     use crate::ccl::symbolic::symbolic;
+    use rstest::rstest;
     // `super::*` also glob-imports `lambda_elim::compose`; name the test-helper
     // `compose` (`Expr::compose`) explicitly so it wins over the glob.
     use super::super::test_helpers::compose;
@@ -1320,34 +1319,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_insert_iterate_recurse_outputs_wraps_function_outputs() {
-        // Each function-typed program output is an iteration site
-        // (`convert_outputs_to_operators` compiles each with
-        // `input=None`).
-        let int = int_ty();
-        let mut expr = Expr::new(TypedExprNode::Outputs(vec![
-            ("xs".to_string(), list_123()),
-            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
-        ]))
-        .with_ty(Type::Record(vec![
-            ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
-            ("n".to_string(), int),
-        ]));
+    /// **Being a collection is the whole test** for a product entry, and `FunKind` is
+    /// what decides it: a compute function tiles at a function extent too and is not
+    /// swept, so handing one an iteration source gives it an input it rejects.
+    ///
+    /// A filtered collection carries its predicate on its **domain** — `{D | p} ⤇ V`,
+    /// the restriction still owed — so it reads as a collection here without the test
+    /// looking past anything, and the end-to-end cases cover it
+    /// (`tests/compilation_pipeline/records.rs`,
+    /// `test_filter_over_a_projected_component`, and
+    /// `a_conditionally_fed_output_compiles` for the same shape as a program output).
+    ///
+    /// The cases reach one node for both meanings, since a program's output list is a
+    /// `Record` like any other.
+    #[rstest]
+    #[case::collection(data_fun_ty(Type::UIntRange(3), int_ty()), true)]
+    #[case::compute_function(fun_ty(Type::UIntRange(3), int_ty()), false)]
+    #[case::scalar(int_ty(), false)]
+    fn test_a_product_entry_is_a_site_exactly_when_it_holds_a_collection(
+        #[case] entry_ty: Type,
+        #[case] expect_site: bool,
+    ) {
+        let entry = list_123().with_ty(entry_ty.clone());
+        let mut expr = Expr::new(TypedExprNode::Record(vec![("out".to_string(), entry)]))
+            .with_ty(Type::Record(vec![("out".to_string(), entry_ty.clone())]));
         insert_iterate_recurse(&mut expr, &Default::default());
-        let TypedExprNode::Outputs(outs) = &expr.node else {
-            panic!("expected Outputs, got: {}", symbolic(&expr));
+        let TypedExprNode::Record(fields) = &expr.node else {
+            panic!("still a record: {}", symbolic(&expr));
         };
-        let xs = &outs.iter().find(|(n, _)| n == "xs").unwrap().1;
-        assert!(
-            is_iterate_apply(chain_head(xs)),
-            "function-typed output `xs` should be iterate-led, got: {}",
-            symbolic(xs)
-        );
-        let n = &outs.iter().find(|(n, _)| n == "n").unwrap().1;
-        assert!(
-            matches!(n.node, TypedExprNode::Lit(_)),
-            "scalar output `n` should be untouched"
+        assert_eq!(
+            is_iterate_apply(chain_head(&fields[0].1)),
+            expect_site,
+            "{entry_ty} as a product entry: got {}",
+            symbolic(&fields[0].1),
         );
     }
 

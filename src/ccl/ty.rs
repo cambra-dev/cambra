@@ -3576,7 +3576,6 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Defer
         | N::Begin { .. }
         | N::LoadFrom(_)
-        | N::Outputs(_)
         | N::Error => true,
         // The two shapes a term this walk compares never holds; the catch-all says why.
         N::LetRec { .. } | N::Transact { .. } => false,
@@ -3804,7 +3803,7 @@ fn eq_term_modulo_ty_slots_go(
                 payload: p2,
             },
         ) => t1 == t2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
-        (N::Record(f1), N::Record(f2)) | (N::Outputs(f1), N::Outputs(f2)) => {
+        (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
                 && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
                     n1 == n2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)

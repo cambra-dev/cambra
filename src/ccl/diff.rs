@@ -510,7 +510,7 @@ impl<'a> Indexed<'a> {
 /// permutation of them a move.
 fn has_unordered_children(e: &TypedExpr) -> bool {
     use super::TypedExprNode as N;
-    matches!(e.node, N::Record(_) | N::Outputs(_) | N::DisjointJoin(_))
+    matches!(e.node, N::Record(_) | N::DisjointJoin(_))
 }
 
 /// The direct child expressions of `e`, borrowed for `e`'s lifetime.
@@ -569,7 +569,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
             v
         }
         N::VariantCtor { payload, .. } => vec![payload],
-        N::Record(fields) | N::Outputs(fields) => fields.iter().map(|(_, e)| e).collect(),
+        N::Record(fields) => fields.iter().map(|(_, e)| e).collect(),
         N::Transact { keys, writers, .. } => {
             let mut v: Vec<&TypedExpr> = keys.iter().map(|k| &k.init).collect();
             for w in writers {

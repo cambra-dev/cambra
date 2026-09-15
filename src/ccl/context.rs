@@ -735,7 +735,7 @@ impl Default for GlobalContext {
 
 /// The compiled output for one entry of the program's output list.
 ///
-/// A program's [`Outputs`](crate::ccl::TypedExprNode::Outputs) always has zero or
+/// A program's output list always has zero or
 /// one `main` entries plus zero or more sink entries.  The `main` entry carries
 /// the program's primary output (the value of its trailing expression for pure
 /// programs); sink entries correspond to externally-managed
@@ -771,9 +771,9 @@ impl CompiledOutput {
 /// never returns `Ok`; pure programs are driven entirely by the `main` output's
 /// producer.
 pub struct CompiledProgram {
-    /// Join-planned CCL expression.  For sink programs this is `Let* Outputs{…}`;
+    /// Join-planned CCL expression.  For sink programs this is `Let* Record{…}`;
     /// for pure programs it is the bare lowered expression at the tail of the
-    /// `Let*` chain, with no `Outputs` node — a lone output needs no list to name
+    /// `Let*` chain, with no output list — a lone output needs no list to name
     /// it, and `compile_program` synthesises the `main` entry.
     ///
     /// Boxed because a [`NodeId`](crate::ccl::content_hash::NodeId) is a node's
@@ -2075,7 +2075,7 @@ fn compile_to_in(
 ///   producer is subscribed to `main_consumer`.  The caller drives the main
 ///   loop by repeatedly calling [`TileProducer::get`] on that producer.
 /// - **Sink programs** (e.g. `http_serve`): one entry per sink name of the
-///   trailing `Outputs{…}`, each wired to a [`SinkConsumer`] that dispatches
+///   trailing `Record{…}`, each wired to a [`SinkConsumer`] that dispatches
 ///   to the registered [`DataSink`](crate::interpreter::DataSink).  For
 ///   sink-only programs the supplied `main_consumer` is dropped before
 ///   returning.
@@ -2175,7 +2175,7 @@ fn compile_version(
 
     // Compile to one operator per program output.  Pure programs (no sinks) end
     // up at this point with a bare expression at the tail of the `Let*` chain
-    // rather than an `Outputs`, so a single `("main", op)` entry is synthesised
+    // rather than an output list, so a single `("main", op)` entry is synthesised
     // for them and the rest of the function operates uniformly on
     // `Vec<(name, op)>`.
     // Assign every mutable variable its identity before anything is built from the

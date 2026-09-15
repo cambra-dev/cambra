@@ -738,32 +738,36 @@ mod tests {
         );
     }
 
+    /// The whole-tree entry point reaches a program's output list, which is a
+    /// `Record` at the tail of the root `Let*` chain: each output that holds a
+    /// collection is an iteration site, since `convert_outputs_to_operators`
+    /// compiles each with `input=None`.
     #[test]
-    fn test_insert_iterate_markers_outputs_root_wraps_each_function_output() {
-        // Programs that bind a sink end in an `Outputs` — each function-typed
-        // output is an iteration site (`compile_program` dispatches to
-        // `convert_outputs_to_operators`, which compiles each with
-        // `input=None`).
+    fn test_insert_iterate_markers_wraps_each_collection_output() {
         let int = int_ty();
-        let out_ty = fun_ty(Type::UIntRange(3), int.clone());
-        let mut expr = Expr::new(TypedExprNode::Outputs(vec![
+        let out_ty = data_fun_ty(Type::UIntRange(3), int.clone());
+        let mut expr = Expr::new(TypedExprNode::Record(vec![
             ("out_a".to_string(), list_123()),
             ("out_b".to_string(), list_123()),
+            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
         ]))
         .with_ty(Type::Record(vec![
             ("out_a".to_string(), out_ty.clone()),
             ("out_b".to_string(), out_ty),
+            ("n".to_string(), int),
         ]));
 
         insert_iterate_markers(&mut expr, &Default::default());
 
-        let TypedExprNode::Outputs(outs) = &expr.node else {
-            panic!("expected Outputs, got: {}", symbolic(&expr));
+        let TypedExprNode::Record(outs) = &expr.node else {
+            panic!("expected a record, got: {}", symbolic(&expr));
         };
         for (name, value) in outs {
-            assert!(
+            let expected = name != "n";
+            assert_eq!(
                 is_iterate_apply(chain_head(value)),
-                "output `{name}` should be iterate-led, got: {}",
+                expected,
+                "output `{name}`: got {}",
                 symbolic(value)
             );
         }

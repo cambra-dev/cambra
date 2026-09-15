@@ -176,20 +176,18 @@ Neither is a "union", and the name matters: in type theory a *union type* is **u
 
 Op-conversion accordingly compiles a fed union as a flat merge — a disjoint join — and **rejects** a fed `Copair` rather than compiling it as the operation it is not. Nothing builds one today: `Builtin::Copair` needs a `++` inside a lambda over its parameter, which fails earlier. When something does, it needs a tagged fed form, not the flat merge.
 
-### `Outputs` — the program's output list, not a record
+### The program's output list is a `Record`
 
-`Outputs(Vec<(String, TypedExpr)>)` is what a program that binds a sink ends in: one named output per sink, each its own collection. `Record` has the same payload shape and denotes something else — one value whose fields are its components — and the two need opposite treatment everywhere a pass distinguishes a collection from a value.
-
-Shape does not recover the distinction. Lowering appends the output list at the tail of the root `Let*` chain so each entry is in scope of the bindings above it, and a program whose trailing expression is a record literal has that same shape:
+A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at the tail of the root `Let*` chain so each entry is in scope of the bindings above it. A program whose trailing expression is a record literal has that same shape, and nothing tells them apart:
 
 ```
 x = 1
 (a=[1, 2, 3], b=[4, 5, 6])
 ```
 
-While the two shared a node, `planning::insert_iterate_markers` read every `Record` as an output list and made each function-typed field an iteration site. That is right for an output and wrong for a record: a record's collection-valued field is a value it holds, so turning it into an iteration site left op-conversion's product arm assembling a product of collections with the combinator that zips them — `(D ⤇ A, D ⤇ B)` as `D ⤇ (A, B)`.
+Nothing needs to. `compile_program` reads the sink registry, which is the same fact lowering read when it decided to append the list at all, and dispatches to `convert_outputs_to_operators` for one operator per entry or `convert_to_operators` for a single `main`. A record literal is never in that position, because the appended list goes at the tail and the program's own trailing expression sits inside it.
 
-`Outputs` is born in lowering and consumed by `convert_outputs_to_operators`, which compiles one operator per entry and never builds a record. A pure program has a single output and no `Outputs` node — its trailing expression *is* that output, and a trailing product is a record value like any other.
+Each entry is an iteration site exactly when it holds a collection, which is the rule a product value's components already follow (`planning::iterate`'s `mark_component_source`): an output is compiled with `input=None`, and so is a component, and a collection needs the iteration a collection needs. A pure program has a single output and no list — its trailing expression *is* that output.
 
 ### `Transact` — the domain-parameterized recurrence carrier
 

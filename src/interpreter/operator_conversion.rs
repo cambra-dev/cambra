@@ -163,7 +163,7 @@ fn compile_let_binding(
     Ok(body_input)
 }
 
-/// Compile a `Let* Outputs{…}` tree into one operator per output, sharing scope
+/// Compile a `Let* Record{…}` tree into one operator per output, sharing scope
 /// (and thus the [`FanOut`]/[`Memo`] handles for upstream `Let` bindings) across
 /// every output.
 ///
@@ -173,7 +173,7 @@ fn compile_let_binding(
 /// a fresh, independent subgraph.
 ///
 /// The expression must consist of zero or more `Let` bindings followed by an
-/// [`Outputs`](TypedExprNode::Outputs); any other shape returns
+/// [`Record`](TypedExprNode::Record); any other shape returns
 /// [`ConversionError::Unsupported`].
 pub fn convert_outputs_to_operators(
     expr: &Expr,
@@ -187,23 +187,23 @@ pub fn convert_outputs_to_operators(
         } => {
             let mut scope = ctx.enter_scope();
             // No surrounding iteration here — this entry point compiles a
-            // `Let* Outputs` chain from the top — so every binding is free.
+            // `Let* Record` chain from the top — so every binding is free.
             compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
             convert_outputs_to_operators(body, &mut scope)
         }
-        TypedExprNode::Outputs(outs) => outs
+        TypedExprNode::Record(outs) => outs
             .iter()
             .map(|(name, elt)| {
                 let op = convert_impl(elt, None, ctx)?;
                 // The sink is the program's output boundary, so it belongs to the
-                // output expression rather than to the `Outputs` or the program root.
+                // output expression rather than to the list or the program root.
                 let _scope = crate::ccl::provenance::converting(elt.node_id());
                 record_sink(name);
                 Ok((name.clone(), op))
             })
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
-            "convert_outputs_to_operators: expected Let* Outputs, got {other:?}"
+            "convert_outputs_to_operators: expected Let* Record, got {other:?}"
         ))),
     }
 }

@@ -33,7 +33,7 @@ Lowering extracts the literal `(port, method, path)` at compile time and constru
 The CCL AST carries **no representation of the configuration** — the rendezvous between the source/sink objects and the compiled operator graph is entirely through these registries.  This is why lowering must special-case `http_serve`: it needs the literal arguments at compile time to create the objects.
 
 After the full CCL pipeline runs, `compile_program` calls `convert_outputs_to_operators` on the
-join-planned `Let* Outputs{…}` tree. This walks the `Let*` chain in a single pass, wrapping each
+join-planned `Let* Record{…}` tree. This walks the `Let*` chain in a single pass, wrapping each
 binding once in `Memo`/`FanOut` and entering a shared scope, then compiles each output's expression
 in that shared scope to produce one operator per sink. Every sink subgraph branches off the same
 memoised upstream operators, so no shared computation is duplicated across sinks. The main program

@@ -2100,6 +2100,33 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
     );
 }
 
+/// A **conditionally fed** output compiles, which is the program output that carries
+/// a refinement.
+///
+/// Feeding a response under a guard restricts the channel's domain, so the output's
+/// type is `{source(…) | __elem ▷ …} ⤇ String` rather than a bare arrow. The output
+/// list is an ordinary `Record`, so planning decides each entry by whether it holds a
+/// collection — and a filtered collection is a collection, its predicate riding the
+/// domain. Reading the outer shape instead would answer the same here and differ on a
+/// compute-typed entry, which is the distinction
+/// `test_a_product_entry_is_a_site_exactly_when_it_holds_a_collection` pins.
+///
+/// No sink program in the suite fed a response under a guard before this one, so the
+/// refined output reached nothing.
+#[test]
+fn a_conditionally_fed_output_compiles() {
+    let code = indoc! {r#"
+        reqs, resps = http_serve("0", "GET", "/g")
+        for req in reqs:
+            if req != "skip":
+                resps << req
+    "#};
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    compile_program(&mut ctx, code, consumer)
+        .expect("a guarded feed restricts the output's domain, and it is still a collection");
+}
+
 /// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the
 /// pre-lambda-elim as-of-read rewrite turns it into `as_of(…) ≫ (λ x → x + 1)`,
 /// whose reply lambda the elim pass point-frees. Running the rewrite before

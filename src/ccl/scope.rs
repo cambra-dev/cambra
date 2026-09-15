@@ -249,7 +249,7 @@ where
                 open(f, c);
             }
         }
-        N::Record(fields) | N::Outputs(fields) => {
+        N::Record(fields) => {
             for (_, c) in fields {
                 open(f, c);
             }
@@ -510,7 +510,6 @@ where
         | N::List(_)
         | N::Tuple(_)
         | N::Record(_)
-        | N::Outputs(_)
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
@@ -596,10 +595,6 @@ mod tests {
             node(N::Record(vec![
                 ("a".into(), var("ra")),
                 ("b".into(), var("rb")),
-            ])),
-            node(N::Outputs(vec![
-                ("oa".into(), var("va")),
-                ("ob".into(), var("vb")),
             ])),
             node(N::Compose(vec![var("c0"), var("c1")])),
             TypedExpr::copair(vec![var("cp0"), var("cp1")]),
@@ -704,7 +699,6 @@ mod tests {
         N::For { .. } => "For",
         N::Tuple(_) => "Tuple",
         N::Record(_) => "Record",
-        N::Outputs(_) => "Outputs",
         N::Compose(_) => "Compose",
         N::Copair(_) => "Copair",
         N::DisjointJoin(_) => "DisjointJoin",

@@ -483,7 +483,7 @@ The pipeline always bottoms out at one of three consumer shapes:
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`
    at `compile_program`.
-3. A trailing `Outputs` of sink-bound names — `convert_outputs_to_operators`
+3. A trailing `Record` of sink-bound names — `convert_outputs_to_operators`
    compiles one operator per entry, sharing the scope (and therefore the
    `FanOut` / `Memo` of let-bound upstream) across every entry.  Each entry
    is subscribed by its corresponding `SinkConsumer`.
