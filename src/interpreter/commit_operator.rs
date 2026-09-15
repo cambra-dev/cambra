@@ -6492,8 +6492,11 @@ mod tests {
                 },
             };
             let g = source.tiling().universal_guard();
-            let mut p = source.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
-            let Ok(value) = read_initial_scalar(&mut *p) else {
+            // The scheduler outlives the subscription: `read_initial_scalar` delivers
+            // between its pulls, so dropping it here would drop every queued wakeup.
+            let mut sched = Scheduler::new();
+            let mut p = source.subscribe(g, Box::new(|| {}), &mut sched);
+            let Ok(value) = read_initial_scalar(&mut *p, &mut sched) else {
                 panic!("a decided seed settles on the first pull");
             };
             value
