@@ -1890,7 +1890,7 @@ fn show_binders() -> bool {
 // `collect_str`s it, and the golden fixtures pin it byte-exactly on every
 // `type` field. Changing any notation here (`⇒`, `[0, N]`, `Mut(…)`, the
 // singleton spelling, braces) is a deliberate corpus-wide re-bless: rerun
-// cambra-inspector/scripts/regen-fixtures.sh and commit the classified diff.
+// web/scripts/regen-fixtures.sh and commit the classified diff.
 /// Renders through [`fmt_type`] with no enclosing function: a self-contained
 /// type carries every function its references name, so the spelling is
 /// complete. A type shown detached from a function that binds one of its references renders that

@@ -72,7 +72,7 @@ hot-reload suite shares.
 
 The program inspector has no example corpus of its own: `cambra --inspect-only
 <program>` takes any of these sources, and
-[`cambra-inspector/scripts/fixtures.manifest`](../cambra-inspector/scripts/fixtures.manifest)
+[`web/scripts/fixtures.manifest`](../web/scripts/fixtures.manifest)
 selects the few whose payload is committed as a golden fixture. A program added
 for pane coverage alone needs no fixture row — ratchet 5 of
 [tests/inspector_goldens.rs](../tests/inspector_goldens.rs) walks every source

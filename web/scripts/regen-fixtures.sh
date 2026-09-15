@@ -15,7 +15,7 @@
 # so the regen path and the tests can never disagree about the corpus. A row is two
 # words and nothing else, so the two parsers have nothing to disagree about.
 #
-# Usage: cambra-inspector/scripts/regen-fixtures.sh [output-dir]
+# Usage: web/scripts/regen-fixtures.sh [output-dir]
 #
 # With no argument, writes the committed fixture directory (the fix path). The
 # ci.sh drift gate passes a temp directory (must be an absolute path — the
@@ -32,8 +32,8 @@ command -v cargo > /dev/null 2>&1 || {
 }
 
 cd "$(dirname "$0")/../.." || exit 1 # -> cambra/ repo root
-MANIFEST="cambra-inspector/scripts/fixtures.manifest"
-FIX="${1:-cambra-inspector/web/src/__fixtures__}"
+MANIFEST="web/scripts/fixtures.manifest"
+FIX="${1:-web/src/__fixtures__}"
 mkdir -p "${FIX}"
 
 while read -r name example; do
@@ -66,4 +66,4 @@ done < "${MANIFEST}"
 
 echo "done. Review the diff: git diff ${FIX}"
 echo "If web/src/ changed too, rebuild and commit the bundle:"
-echo "  (cd cambra-inspector/web && npm run build)   # ci_web compares dist/index.html"
+echo "  (cd web && npm run build)   # ci_web compares dist/index.html"

@@ -100,7 +100,7 @@ Pass `--inspect-only` to compile a program and serve a read-only view of it — 
 cargo run -- --inspect-only tests/programs/polymorphic/program.cambra
 ```
 
-Same default port, and exclusive with the flags that run a program (`--inspect`, `--control`): one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
+Same default port, and exclusive with the flags that run a program (`--inspect`, `--control`): one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
 
 ### Control port
 

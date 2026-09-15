@@ -60,7 +60,7 @@ way.
 ## Regenerating
 
 ```bash
-cambra-inspector/scripts/regen-fixtures.sh   # from the cambra/ repo root
+web/scripts/regen-fixtures.sh   # from the cambra/ repo root
 ```
 
 This wraps the per-example `--dump-snapshot` dumps (one-shot — it does **not**
@@ -75,4 +75,4 @@ by design (and `wireValidate.ts` enforces the shape).
 
 A re-bless pins more than the shape, and every diff in one has to be classified
 before it is committed: see
-[The golden fixtures](../../../CLAUDE.md#the-golden-fixtures).
+[The golden fixtures](../../CLAUDE.md#the-golden-fixtures).
