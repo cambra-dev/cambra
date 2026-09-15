@@ -1719,12 +1719,14 @@ A statement that contributes nothing, for a block that takes statements and
 expects no value:
 
 ```python
-for m in entries:
+total := 0
+for m in [`debit(3), `credit(4)]:
     match m:
         case `debit(d):
             total += d
         case `credit(c):
             pass
+total                 # 3
 ```
 
 A `match` arm is where one is needed. An `if` arm can be left out — a guard
@@ -1732,14 +1734,16 @@ with no `else` does nothing at the positions it rejects — while a `match`'s
 arms partition the scrutinee's tags, so an arm that does nothing is still
 written.
 
-The blocks that expect no value are a `for`-loop body, a `with begin():`
-block, and the `if` / `match` arms inside one. Everywhere else a block's value
-is its last statement, so `pass` stands before that statement and not as it:
-`def todo(x): pass` is rejected, because the function body must yield a value.
+`pass` contributes nothing at every position, last included, so a block reads
+as though it were not written. The blocks that expect no value are a `for`-loop
+body, a `with begin():` block, and the `if` / `match` arms inside one.
+Everywhere else a block's value is its last statement, and a block of nothing
+but `pass` has no statement to be one: `def todo(x): pass` is rejected, because
+the function body must yield a value.
 
-A loop body of nothing but `pass` is a loop that does nothing, and compiles as
-one. A `with begin():` block of nothing but `pass` is rejected, by the rule
-that a transaction must write or feed
+A loop body of nothing but `pass` is a loop whose body has no effect; the loop
+still runs, once per element of its source. A `with begin():` block of nothing
+but `pass` is rejected, by the rule that a transaction must write or feed
 ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)).
 
 ### 4.8 `return`

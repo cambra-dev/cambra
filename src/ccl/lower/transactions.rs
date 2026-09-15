@@ -216,7 +216,7 @@ fn lower_tx_block_scoped(
         _ => fallback_span,
     };
     let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
-    for stmt in stmts.iter().rev() {
+    for (_, stmt) in contributing_stmts(stmts).rev() {
         chain = match &stmt.node {
             // `balance := value` — the transactional mutable variable write. `:=` is the
             // sole variable-write operator; `write_or_let` gates it (a write to a
@@ -314,10 +314,6 @@ fn lower_tx_block_scoped(
                     "nested `with begin():` transactions are not supported",
                 ));
             }
-            // `pass` contributes no statement, so the chain passes through
-            // (`docs/chl-spec.md`, "4.7 `pass`"). A block of nothing but `pass` has no
-            // footprint, which the caller's must-do-something check reports.
-            ChlStmt::Pass => chain,
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,

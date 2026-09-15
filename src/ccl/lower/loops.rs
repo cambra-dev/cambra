@@ -356,13 +356,22 @@ fn lower_for_body_stmts_scoped(
         !stmts.is_empty(),
         "lower_for_body_stmts: empty body (parser invariant violated)"
     );
-    let (last, rest) = stmts.split_last().unwrap();
+
+    // The body's value is its last *contributing* statement ([`contributing_stmts`]).
+    // A body that contributes nothing is `unit` — the same terminal a guard with no
+    // `else` falls through to — so the loop still runs, once per element of its source,
+    // and its body has no effect.
+    let mut contributing = contributing_stmts(stmts);
+    let Some((_, last)) = contributing.next_back() else {
+        let body_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
+        return Ok(ctx.tag_machinery(Expr::lit(Lit::Unit), body_span, "lower.loop_unit"));
+    };
 
     // Each binding carries its statement's span so the `Let` folded around the
     // terminal below can be tagged as that statement's direct image.
     let mut bindings: Vec<(String, Expr, Option<Type>, Span)> = Vec::new();
 
-    for stmt in rest {
+    for (_, stmt) in contributing {
         match &stmt.node {
             // A type alias binds nothing, so it contributes no `Let` to the frame.
             ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => {}
@@ -441,9 +450,6 @@ fn lower_for_body_stmts_scoped(
                      is not yet supported",
                 ));
             }
-            // `pass` contributes no statement, so it binds nothing here
-            // (`docs/chl-spec.md`, "4.7 `pass`").
-            ChlStmt::Pass => {}
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -623,10 +629,6 @@ fn lower_for_body_terminal(
             "a `with begin():` transaction inside a generator/nested for-loop body \
              is not yet supported",
         )),
-        // `pass` contributes no statement, and a loop body expects no value, so a body
-        // that ends in one ends in `unit` — the same terminal a guard with no `else`
-        // falls through to (`docs/chl-spec.md`, "4.7 `pass`").
-        ChlStmt::Pass => Ok(ctx.tag_image(Expr::lit(Lit::Unit), stmt.span)),
         _ => Err(LoweringError::unsupported(
             stmt.span,
             "for-loop body must end in a yield, `<<` feed, nested for, if-guard, or match",
@@ -971,7 +973,7 @@ fn lower_loop_body_chain_scoped(
     // `tag_image`; the `ExprStmt` that sequences one statement before the rest is
     // manufactured plumbing (`src/ccl/design/provenance.md`, "The seam").
     let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), for_span, "lower.loop_unit");
-    for stmt in body_stmts.iter().rev() {
+    for (_, stmt) in contributing_stmts(body_stmts).rev() {
         chain = match &stmt.node {
             // `x = value` — a plain immutable binding. Inside a loop body it
             // is a per-iteration shadowing `let`, *never* a mutable write: `=`
@@ -1176,9 +1178,6 @@ fn lower_loop_body_chain_scoped(
                 let begin = ctx.tag_image(Expr::begin(block), stmt.span);
                 ctx.tag_machinery(Expr::expr_stmt(begin, chain), stmt.span, "lower.stmt_seq")
             }
-            // `pass` contributes no statement, so the chain passes through
-            // (`docs/chl-spec.md`, "4.7 `pass`").
-            ChlStmt::Pass => chain,
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
