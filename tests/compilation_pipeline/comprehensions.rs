@@ -625,3 +625,21 @@ fn a_correlated_comprehension_nests_without_an_aggregate() {
         ),
     );
 }
+
+/// A collection that is **empty** folds to the aggregate's identity, and the row it belongs
+/// to keeps its place.
+///
+/// Read as a collection, because summing the outer level hides the whole difference: `sum`
+/// over a row that is absent and over one that folds to `0` answer alike, so a scalar case
+/// here would pass before the change as readily as after. A curried tile's offsets are
+/// non-decreasing, so a row whose collection holds nothing keeps its group and holds nothing
+/// ([design-operators.md, "A correlated inner comprehension"](src/interpreter/design-operators.md#a-correlated-inner-comprehension)).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// `r = 1` keeps `v = 2`; `r = 2` keeps nothing, and was the row that used to disappear.
+#[case::one_row_emptied("[sum([v * r for v in [1, 2] if v > r]) for r in [1, 2]]", &[2, 0])]
+// Neither row keeps anything, so both fold to the identity where the tile used to be empty.
+#[case::every_row_emptied("[sum([v * r for v in [1, 2] if v > r * 10]) for r in [1, 2]]", &[0, 0])]
+fn an_emptied_row_keeps_its_place(#[case] program: &str, #[case] expected: &[i64]) {
+    check_tile(program, make_int_list(expected));
+}
