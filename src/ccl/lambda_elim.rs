@@ -221,11 +221,8 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
-/// Returns [`Type::Hole`] if either argument does not have a concrete function
-/// type; inference will fill in the gaps in that case. A **refined** function operand
-/// takes that path as well, the match being on the bare [`Type::Fun`]:
-/// [`Type::fun_kind`] peels refinements because a refined function still carries a
-/// kind, and a binder rides one the same way.
+/// Returns [`Type::Hole`] unless both arguments match a bare [`Type::Fun`]; inference
+/// fills in the gap in that case.
 ///
 /// The domain is `f`'s, but the **kind is declared** rather than read off `f`: a zip of
 /// morphism columns denotes what the lambda being eliminated denotes, and its first column
@@ -1908,6 +1905,28 @@ mod tests {
         Expr::var(s)
     }
 
+    /// `(k: Int) ⇒ {Int | k}` — a morphism whose codomain references its own binder.
+    fn dependent_morphism(binder: &Name) -> Type {
+        let int = Type::Base(BaseType::Int);
+        Type::pi_kinded(
+            binder,
+            int.clone(),
+            Type::refined(
+                int.clone(),
+                RefinementSet::one(Refinement::born(Rc::new(
+                    Expr::var(binder.clone()).with_ty(int),
+                ))),
+            ),
+            FunKind::Compute,
+        )
+    }
+
+    /// `Int ⇒ Int` — a morphism over the same domain, depending on nothing.
+    fn plain_morphism() -> Expr {
+        let int = Type::Base(BaseType::Int);
+        var("f").with_ty(Type::fun(int.clone(), int))
+    }
+
     /// A zip whose **second** operand is the dependent one keeps the binder.
     ///
     /// The pair's codomain holds both operands' codomains, so a reference the second
@@ -1916,22 +1935,9 @@ mod tests {
     /// on this very type one line after building it.
     #[test]
     fn a_zip_takes_its_binder_from_either_operand() {
-        let int = Type::Base(BaseType::Int);
         let binder = Name::raw("k");
-        // `f : Int ⇒ Int`, plain; `g : (k: Int) ⇒ {Int | …}`, dependent on its binder.
-        let dependent = Type::pi_kinded(
-            &binder,
-            int.clone(),
-            Type::refined(
-                int.clone(),
-                RefinementSet::one(Refinement::born(Rc::new(
-                    Expr::var(binder.clone()).with_ty(int.clone()),
-                ))),
-            ),
-            FunKind::Compute,
-        );
-        let f = var("f").with_ty(Type::fun(int.clone(), int.clone()));
-        let g = var("g").with_ty(dependent);
+        let f = plain_morphism();
+        let g = var("g").with_ty(dependent_morphism(&binder));
         let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
         assert!(
             matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
@@ -1953,6 +1959,34 @@ mod tests {
         assert!(
             !crate::ccl::subst::references_enclosing_function(&opened),
             "the pair's binder opens its second operand's reference, got {opened}",
+        );
+    }
+
+    /// A **refined** function operand drops the pair to [`Type::Hole`].
+    ///
+    /// The match is on the bare [`Type::Fun`], so `{(k: Int) ⇒ B | p}` takes the fallback
+    /// arm and the pair loses the domain, the codomain and the binder that operand still
+    /// carries — the hazard [`Type::fun_kind`] peels refinements to avoid. Pinned on the
+    /// gap: an `#[ignore]` reports the same green whether it closed, regressed, or went
+    /// away, and the failure is silent otherwise, a `Hole` being what an operand of no
+    /// known shape yields too.
+    #[test]
+    #[should_panic(expected = "a refined operand is still a function")]
+    fn a_zip_reads_through_a_refined_operand() {
+        let binder = Name::raw("k");
+        let refined = Type::refined_one(
+            dependent_morphism(&binder),
+            Refinement::born(Rc::new(
+                Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)),
+            )),
+        );
+        let f = plain_morphism();
+        let g = var("g").with_ty(refined);
+        let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
+        assert!(
+            matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
+            "a refined operand is still a function, so the pair binds what it names, \
+             got {paired}",
         );
     }
 
