@@ -108,10 +108,32 @@ const ALLOWED_NATURE = ["expansion", "machinery"];
 const ALLOWED_ROLE = ["operator", "source", "sink"];
 const ALLOWED_EDGE_KIND = ["value", "share"];
 
+/** The character cap on a rendered value in {@link describe}. */
+const GOT_MAX = 120;
+
+/**
+ * The `got` half of a {@link WireError}.
+ *
+ * A type name is the right answer for a type mismatch — "expected string, got
+ * number" — and no answer at all for a check on a value: a span-ordering
+ * violation reported `got object`, so the spans it rejected never reached the
+ * message rejecting them. An object or array therefore renders as its value,
+ * capped so a large one cannot bury the path that names it. The opening bracket
+ * says which of the two it is, so only a value JSON refuses falls back to the
+ * type name.
+ */
 function describe(v: unknown): string {
   if (v === null) return "null";
-  if (Array.isArray(v)) return "array";
-  return typeof v;
+  if (typeof v !== "object") return typeof v;
+  const kind = Array.isArray(v) ? "array" : "object";
+  let text: string;
+  try {
+    text = JSON.stringify(v) ?? kind;
+  } catch {
+    // A cycle, or a value JSON refuses. The type name is all that is left.
+    return kind;
+  }
+  return text.length <= GOT_MAX ? text : `${text.slice(0, GOT_MAX)}…`;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -197,7 +219,11 @@ function validateSpans(v: unknown, path: string): void {
     seen.add(key);
     const extent = sp.end - sp.start;
     if (extent < previousExtent) {
-      throw new WireError(`${path}.spans[${i}]`, "spans ordered narrowest first", sp);
+      throw new WireError(
+        `${path}.spans[${i}]`,
+        `spans ordered narrowest first (width >= ${previousExtent})`,
+        sp,
+      );
     }
     previousExtent = extent;
   });

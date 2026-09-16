@@ -22,7 +22,8 @@
 //!    that equals a fresh dump of itself;
 //! 4. the corpus programs still trigger the passes they were chosen to pin;
 //! 5. **every** program in the gallery — not just the five with fixtures —
-//!    produces a payload the wire validator accepts;
+//!    produces a payload the wire validator accepts, on the contract its
+//!    pinned compile outcome selects;
 //! 6. two compiles of one program in one process differ in id numbering and
 //!    nothing else.
 //!
@@ -31,13 +32,14 @@
 //! program added for backend coverage belongs in ratchet 5, which reads every
 //! gallery source and commits nothing.
 //!
-//! Three programs — `txn_multi_read`, `for_accumulator` and
-//! `source_accumulator` — are in the corpus without a committed fixture. Their
+//! Four programs — `txn_multi_read`, `for_accumulator`, `source_accumulator`
+//! and `inner_join` — are in the corpus without a committed fixture. Their
 //! payloads run to five figures of lines each, which is a document nobody reads
 //! and a re-bless nobody can review, so what they are here for is asserted
 //! structurally over a fresh dump instead: the dense channelize window, the
 //! `Transact`/`Letrec` rewrite tags that reach the wire, and a store's trigger
-//! iterating a data source.
+//! iterating a data source. Ratchet 5 validates all four like any other gallery
+//! program, naming the source it dumped when one fails.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -126,42 +128,42 @@ fn snapshot_dumps_are_cross_process_deterministic() {
     for entry in corpus() {
         assert_dumps_agree(&entry.example);
     }
-    // The two programs whose payloads are too large to commit (see
-    // `assert_dense_window_sanity`) are the heaviest synthesis in the corpus and
-    // so the likeliest to expose hash-iteration-ordered minting — exactly what
-    // this test exists to catch. They carry no fixture, so the manifest loop
-    // above does not reach them.
+    // The programs whose payloads are too large to commit (see
+    // `fixtures.manifest`) carry no fixture, so the manifest loop above does
+    // not reach them. They are the heaviest synthesis here, and a hash join
+    // mints from keyed lookups besides — both are where hash-iteration-ordered
+    // minting would show, which is what this test exists to catch.
     assert_dumps_agree("txn_multi_read");
     assert_dumps_agree("for_accumulator");
+    assert_dumps_agree("source_accumulator");
+    assert_dumps_agree("inner_join");
 }
 
 /// Two spawns of one program produce byte-identical dumps.
 fn assert_dumps_agree(example: &str) {
-    {
-        let first = dump(example);
-        let second = dump(example);
-        if first != second {
-            // Preserve both dumps for diffing before panicking.
-            let dir = std::env::temp_dir();
-            let a = dir.join(format!("{example}.dump1.json"));
-            let b = dir.join(format!("{example}.dump2.json"));
-            std::fs::write(&a, &first).expect("writing first dump");
-            std::fs::write(&b, &second).expect("writing second dump");
-            let diff_at = first
-                .iter()
-                .zip(second.iter())
-                .position(|(x, y)| x != y)
-                .unwrap_or_else(|| first.len().min(second.len()));
-            panic!(
-                "--dump-snapshot for {example} is NOT cross-process deterministic \
-                 (first difference at byte {diff_at}; dumps preserved at {} and {}). \
-                 Golden fixtures cannot be blessed until the nondeterminism source \
-                 is fixed — see `snapshot_dumps_are_cross_process_deterministic` \
-                 for the first suspects.",
-                a.display(),
-                b.display()
-            );
-        }
+    let first = dump(example);
+    let second = dump(example);
+    if first != second {
+        // Preserve both dumps for diffing before panicking.
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("{example}.dump1.json"));
+        let b = dir.join(format!("{example}.dump2.json"));
+        std::fs::write(&a, &first).expect("writing first dump");
+        std::fs::write(&b, &second).expect("writing second dump");
+        let diff_at = first
+            .iter()
+            .zip(second.iter())
+            .position(|(x, y)| x != y)
+            .unwrap_or_else(|| first.len().min(second.len()));
+        panic!(
+            "--dump-snapshot for {example} is NOT cross-process deterministic \
+             (first difference at byte {diff_at}; dumps preserved at {} and {}). \
+             Golden fixtures cannot be blessed until the nondeterminism source \
+             is fixed — see `snapshot_dumps_are_cross_process_deterministic` \
+             for the first suspects.",
+            a.display(),
+            b.display()
+        );
     }
 }
 
@@ -691,10 +693,11 @@ fn committed_fixtures_are_structurally_valid() {
             .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
         let v: Value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("{} is valid JSON: {e}", path.display()));
+        let at = path.display().to_string();
         if v["meta"]["payloadKind"] == "failed" {
-            cambra::inspector_server::wire_check::assert_degraded_snapshot_shape(&v);
+            cambra::inspector_server::wire_check::assert_degraded_snapshot_shape_at(&v, &at);
         } else {
-            cambra::inspector_server::wire_check::assert_snapshot_shape(&v);
+            cambra::inspector_server::wire_check::assert_snapshot_shape_at(&v, &at);
         }
     }
 }
@@ -714,8 +717,33 @@ fn committed_fixtures_are_structurally_valid() {
 /// rejected program.
 const DUMP_PANICS: &[&str] = &[];
 
+/// The gallery programs that do **not** compile, so the sweep below validates
+/// them on the degraded contract rather than the successful one.
+///
+/// Pinned for the same reason `DUMP_PANICS` is, and in the same two directions.
+/// The sweep reads each payload's own `payloadKind` to pick a contract, so a
+/// program that silently stops compiling would slide onto the degraded contract
+/// and pass — a regression the wire validators cannot see, because a degraded
+/// payload is a legal document. A program that starts compiling must leave this
+/// list; one that newly fails is a regression, not a list entry.
+///
+/// Being non-empty, it is also what bounds the walk: a sweep that stops
+/// reaching the gallery reports these as missing.
+const COMPILE_FAILS: &[&str] = &[
+    "discount_contract",
+    "fanout",
+    "ledger_balance",
+    "nonneg_inventory",
+    "reachability",
+    "refinement",
+    "storefront",
+    "txn_kv",
+    "type_error",
+    "while_counter",
+];
+
 /// Every `*.cambra` source under `tests/programs/`, as (program-directory name,
-/// repo-root-relative path). Walks the directory rather than reading a list:
+/// absolute path). Walks the directory rather than reading a list:
 /// the gallery's membership is the directory, and a source no test names is
 /// exactly the one this sweep is here to reach.
 fn gallery_sources() -> Vec<(String, PathBuf)> {
@@ -736,10 +764,14 @@ fn gallery_sources() -> Vec<(String, PathBuf)> {
         out.extend(sources.into_iter().map(|p| (name.clone(), p)));
     }
     out.sort();
+    // A walk that stops reaching the directory is the failure this guards; the
+    // size of the gallery is not pinned here, because a count would need an
+    // edit for every program added and this sweep exists to cost nothing. What
+    // bounds it is `COMPILE_FAILS` below: a non-empty list, compared exactly.
     assert!(
-        out.len() > 20,
-        "the gallery sweep found only {} sources — the walk is wrong, not the gallery",
-        out.len()
+        !out.is_empty(),
+        "the gallery sweep found no sources under {} — the walk is wrong, not the gallery",
+        dir.display()
     );
     out
 }
@@ -780,41 +812,62 @@ fn dump_source(path: &Path) -> Option<Vec<u8>> {
 /// do for the six.
 #[test]
 fn every_gallery_program_produces_a_valid_payload() {
-    let mut validated = 0usize;
     let mut panicked = Vec::new();
+    let mut degraded = Vec::new();
     for (name, path) in gallery_sources() {
-        match dump_source(&path) {
-            None => panicked.push(name),
-            Some(raw) => {
-                let v: Value = serde_json::from_slice(&raw)
-                    .unwrap_or_else(|e| panic!("{}: dump is valid JSON: {e}", path.display()));
-                match v["meta"]["payloadKind"].as_str() {
-                    Some("program") => {
-                        cambra::inspector_server::wire_check::assert_snapshot_shape(&v)
-                    }
-                    Some("failed") => {
-                        cambra::inspector_server::wire_check::assert_degraded_snapshot_shape(&v)
-                    }
-                    other => panic!("{}: unknown payloadKind {other:?}", path.display()),
-                }
-                validated += 1;
+        let Some(raw) = dump_source(&path) else {
+            panicked.push(name);
+            continue;
+        };
+        // Repo-relative, so a failure names a path a reader can open.
+        let at = path
+            .strip_prefix(repo_root())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let v: Value = serde_json::from_slice(&raw)
+            .unwrap_or_else(|e| panic!("{at}: dump is valid JSON: {e}"));
+        match v["meta"]["payloadKind"].as_str() {
+            Some("program") => {
+                cambra::inspector_server::wire_check::assert_snapshot_shape_at(&v, &at)
             }
+            Some("failed") => {
+                degraded.push(name);
+                cambra::inspector_server::wire_check::assert_degraded_snapshot_shape_at(&v, &at)
+            }
+            other => panic!("{at}: unknown payloadKind {other:?}"),
         }
     }
-    panicked.sort();
-    panicked.dedup();
-    let mut expected: Vec<String> = DUMP_PANICS.iter().map(|s| (*s).to_string()).collect();
-    expected.sort();
     assert_eq!(
-        panicked, expected,
+        pinned(&mut panicked),
+        listed(DUMP_PANICS),
         "the set of gallery programs whose dump panics changed. A program that \
          now dumps must be removed from DUMP_PANICS; one that newly panics is a \
          regression, not a list entry."
     );
-    assert!(
-        validated >= 25,
-        "only {validated} gallery payloads validated — the sweep stopped reaching the gallery"
+    assert_eq!(
+        pinned(&mut degraded),
+        listed(COMPILE_FAILS),
+        "the set of gallery programs that do not compile changed. A program that \
+         now compiles must be removed from COMPILE_FAILS; one that newly fails is \
+         a regression, not a list entry."
     );
+}
+
+/// The observed program names, sorted and deduped for comparison against a
+/// pinned list. A program directory with several sources reports once, as the
+/// pinned lists name directories.
+fn pinned(names: &mut Vec<String>) -> Vec<String> {
+    names.sort();
+    names.dedup();
+    std::mem::take(names)
+}
+
+/// A pinned list in the shape `pinned` returns.
+fn listed(names: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+    out.sort();
+    out
 }
 
 // ---------------------------------------------------------------------------
