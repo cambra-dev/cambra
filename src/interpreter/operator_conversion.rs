@@ -40,9 +40,9 @@ use crate::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, SelectField, TileOperator,
-            Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, level_count,
-            zip_arms_at, zip_arms_named_at,
+            MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
+            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
+            level_count, zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
     },
@@ -1714,6 +1714,12 @@ fn convert_impl_inner(
         }
 
         // map_domain transforms the codomain of its argument to a copy of the domain.
+        //
+        // Chain-head only. Every emitter puts `map_domain` in a source position — join
+        // planning's flattened and permuted domains, and the named inner source of a
+        // correlated comprehension — and `is_iteration_bearing` keeps an `iterate` off the
+        // front of it for that reason. Accepting an input here would give the same term a
+        // second reading that nothing writes.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::MapDomain) =>
         {
@@ -2035,6 +2041,66 @@ fn convert_impl_inner(
                 keys,
                 option_extent,
             )))
+        }
+
+        // A correlated inner comprehension whose inner source planning **named**
+        // (`src/ccl/planning/correlated.rs`). The source carries its domain in its
+        // codomain, so it compiles as its own iteration and [`Product`] pairs it with each
+        // outer row; everything after that is the arm below.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::CurryOver) =>
+        {
+            let outer = expect_input(input, "curry_over")?;
+            let TypedExprNode::Tuple(operands) = &argument.node else {
+                return Err(ConversionError::Unsupported(format!(
+                    "`curry_over` takes its source and its morphism as a pair, got `{}`",
+                    symbolic(argument)
+                )));
+            };
+            let [source, morphism] = operands.as_slice() else {
+                return Err(ConversionError::Unsupported(format!(
+                    "`curry_over` takes exactly a source and a morphism, got {} operands",
+                    operands.len()
+                )));
+            };
+            let inner = convert_impl(source, None, ctx)?;
+            let pairs = Box::new(Product::new(outer, inner));
+            convert_impl(morphism, Some(pairs), ctx)
+        }
+
+        // **A correlated inner comprehension**: `curry(𝑔)` composed onto the outer stream,
+        // where `𝑔` takes the pair `(outer value, inner element)` because the inner body reads
+        // the outer binder. Running `𝑔` once per pair and grouping by the outer row is a
+        // collection per row, which is what [`Product`] emits and what `𝑔` then compiles over
+        // like any other morphism over a stream. An uncorrelated inner comprehension never
+        // reaches here: its body closes over nothing outer, so lambda elimination leaves a
+        // `const` and no pair.
+        //
+        // The inner side comes from the type, which is what makes it the same set for every
+        // row. A per-row inner collection is the same output shape from a different builder
+        // (`src/interpreter/design-operators.md`, "Where a collection is materialized").
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Curry)
+                && input.is_some()
+                && as_builtin(argument).is_none() =>
+        {
+            let outer = expect_input(input, "curry")?;
+            let Some(Type::Tuple(pair)) = argument.ty.domain() else {
+                return Err(ConversionError::TypeError(format!(
+                    "a curried morphism takes the pair of what it is curried over and what it \
+                     iterates, so its domain is a two-element tuple; got {}",
+                    argument.ty
+                )));
+            };
+            let [_, inner] = pair.as_slice() else {
+                return Err(ConversionError::TypeError(format!(
+                    "a curried morphism's domain pairs exactly two, got {}",
+                    argument.ty
+                )));
+            };
+            let inner = ctx.extent_of(inner)?;
+            let pairs = Box::new(Product::new(outer, Box::new(IterateExtent::new(inner))));
+            convert_impl(argument, Some(pairs), ctx)
         }
 
         TypedExprNode::Apply { argument, function } => {

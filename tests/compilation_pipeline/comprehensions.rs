@@ -318,3 +318,249 @@ fn a_whole_collection_fold_keeps_its_element_materialized(
 ) {
     check_scalar(program, Value::Int(total));
 }
+/// A **correlated** inner comprehension — its body reads the outer binder, so each outer row
+/// gets its own inner pass. `lambda_elim` writes that as `curry(𝑔)` over the outer stream,
+/// where `𝑔` takes the pair of the outer value and the inner element, and op-conversion pairs
+/// them (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
+///
+/// The **uncorrelated** case is beside it because it compiles by a different route and always
+/// did: a body closing over nothing outer leaves a `const`, computed once and broadcast.
+///
+/// One case reaches op-conversion with its `curry` intact, which is the second of the two
+/// routes a correlated site has and the only coverage of it:
+/// `body_ignores_the_inner_element`. Deleting either route drops a program the other does
+/// not serve.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::correlated("sum([sum([v * r for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// A **collection** source, whose domain no extent describes: 1*(1+2) + 2*(1+2).
+#[case::collection_source(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([sum([v * r for v in c]) for r in [1, 2]])
+    "#},
+    9
+)]
+// (1+2+3) twice, the inner sum shared.
+#[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
+// The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
+#[case::outer_binder_outside("sum([r * sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// A body that reads the outer binder and **never applies the inner source**, so `𝑔` is a
+// projection with no source in it for planning to name. It compiles by the second route —
+// op-conversion reading the domain off the type — which nothing else here covers: 3*(1+2).
+#[case::body_ignores_the_inner_element("sum([sum([r for v in [1, 2, 3]]) for r in [1, 2]])", 9)]
+fn a_correlated_inner_comprehension_runs_per_outer_row(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A correlated inner comprehension with **no aggregate over it**: the pairing is the whole
+/// compilation, and the curried tile is the answer.
+///
+/// Every other case here sums, which hides that `MapAggregate` is a consumer rather than a
+/// requirement — `Product` emits a collection per row, and a comprehension that yields one
+/// keeps it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_inner_comprehension_without_an_aggregate() {
+    // `r` ranges over [1, 2] and `v` over [1, 2], so row `r` holds [r, 2r].
+    check_tile(
+        "[[v * r for v in [1, 2]] for r in [1, 2]]",
+        Tile::function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 2]),
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 2, 4]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    );
+}
+
+/// The same over a **collection** source, whose keys are the inner domain.
+///
+/// Read as a set of `(row, key, value)` triples: a map carries its entries in its own order,
+/// and what the pairing decides is the grouping rather than the order within a group.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_comprehension_without_an_aggregate_over_a_collection() {
+    let tile = run_pipeline(indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        [[v * r for v in c] for r in [1, 2]]
+    "#});
+    let levels = tile.key_levels();
+    let [(_, outer), (_, inner)] = levels.as_slice() else {
+        panic!("one level per comprehension, so two here; got {levels:?}")
+    };
+    let Tile::Scalar(values) = tile.deepest_values() else {
+        panic!(
+            "the values are one per innermost entry, got {:?}",
+            tile.deepest_values()
+        )
+    };
+    let Tile::Function { values: groups, .. } = &tile else {
+        panic!("a comprehension yielding a collection per row tiles as a collection")
+    };
+    let mut got: Vec<(usize, Value, Value)> = Vec::new();
+    for g in 0..outer.len() {
+        let (start, end) = groups.row_run(g);
+        for j in start..end {
+            got.push((g, inner.index_at(j), values.index_at(j)));
+        }
+    }
+    got.sort_by_key(|(g, k, _)| (*g, format!("{k:?}")));
+    assert_eq!(
+        got,
+        vec![
+            (0, Value::String("a".into()), Value::Int(1)),
+            (0, Value::String("b".into()), Value::Int(2)),
+            (1, Value::String("a".into()), Value::Int(2)),
+            (1, Value::String("b".into()), Value::Int(4)),
+        ]
+    );
+}
+
+/// An outer comprehension that yields a collection while its inner one aggregates — the
+/// aggregate is inside, so the answer is a stream rather than a scalar.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_inner_aggregate_under_a_collection_result() {
+    // 1*(1+2) and 2*(1+2).
+    check_tile(
+        "[sum([v * r for v in [1, 2]]) for r in [1, 2]]",
+        make_int_list(&[3, 6]),
+    );
+}
+
+/// A **map comprehension whose body never reads the element** does not compile, with or
+/// without an enclosing comprehension.
+///
+/// Nothing here is about correlation or nesting: this one-line program fails, and so does
+/// the base branch's, which has none of the correlated work. A body that reads the element
+/// applies the collection, which is what puts it in the term
+/// (`sum([v for v in c])` answers 3). A body that does not leaves the collection reachable
+/// only through its domain's carried `collection_contains`, which op-conversion meets as a
+/// non-combinator handed an input.
+///
+/// The correlated form fails too and reports differently — reading the domain off the type
+/// answers the unbounded key type — which is why the message, not just the failure, is
+/// pinned here.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "non-combinator collection_contains")]
+fn a_map_comprehension_that_ignores_the_element_does_not_compile() {
+    check_scalar(
+        indoc! {r#"
+            c = map([("a", 1), ("b", 2)])
+            sum([1 for v in c])
+        "#},
+        // One per entry.
+        Value::Int(2),
+    );
+}
+
+/// A correlated inner comprehension **inside a transaction**, where the outer binder is the
+/// transaction's own row. Nothing about it is transactional: the same pairing serves it as
+/// serves a bare nested comprehension, which is why a list source works here before a
+/// collection source does anywhere.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::list_source("sum([v * r for v in [1, 2, 3]])", 18)]
+// Over a collection, whose domain comes from the data: 1*(1+2) + 2*(1+2).
+#[case::collection_source("sum([v * r for v in c])", 9)]
+fn a_correlated_comprehension_runs_inside_a_transaction(
+    #[case] comprehension: &str,
+    #[case] total: i64,
+) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                c = map([("a", 1), ("b", 2)])
+                n: Mut(Int, Txn) := 0
+                for r in [1, 2]:
+                    with begin():
+                        n := n + {}
+                await_final(n)
+            "#},
+            comprehension
+        ),
+        Value::Int(total),
+    );
+}
+
+/// Correlated nesting at **depth three and four**, which the two-level curried tiling could
+/// not hold: pairing produced a two-level tile and consumed a one-level one, so the operator
+/// was not closed under its own output. A function tile carries one offsets array per level
+/// now, so a pairing appends a level and an aggregate collapses one
+/// (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 1*(1+2+3) + 2*(1+2+3).
+#[case::depth_2("sum([sum([v * r for v in [1, 2, 3]]) for r in [1, 2]])", 18)]
+// (1+2)³, each level contributing its own factor.
+#[case::depth_3(
+    "sum([sum([sum([v * r * q for v in [1, 2]]) for r in [1, 2]]) for q in [1, 2]])",
+    27
+)]
+// (1+2)⁴ — the depth is not bounded, so a fourth level needs no further change.
+#[case::depth_4(
+    "sum([sum([sum([sum([a * b * c * d for a in [1, 2]]) for b in [1, 2]]) for c in [1, 2]]) for d in [1, 2]])",
+    81
+)]
+// A collection as the innermost source, whose domain comes from the data rather than
+// from an extent, nests the same way.
+#[case::depth_3_collection(
+    indoc! {r#"
+        m = map([("a", 1), ("b", 2)])
+        sum([sum([sum([v * r * q for v in m]) for r in [1, 2]]) for q in [1, 2]])
+    "#},
+    27
+)]
+// An inner comprehension that reads nothing outer still broadcasts, one level down.
+#[case::depth_3_partial(
+    "sum([sum([sum([v for v in [1, 2]]) * r for r in [1, 2]]) for q in [1, 2]])",
+    18
+)]
+fn a_correlated_comprehension_nests_to_any_depth(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// Nesting **with no aggregate at any level**: three comprehensions leave three domain
+/// levels, which is the tile shape rather than a fold of it.
+///
+/// The depth cases above all sum at every level, so each `Product` is consumed by a
+/// `MapAggregate` that collapses the level it just added. Here nothing collapses, and the
+/// levels stand.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_comprehension_nests_without_an_aggregate() {
+    // `q`, `r` and `v` each range over [1, 2], and the innermost entry is their product.
+    check_tile(
+        "[[[v * r * q for v in [1, 2]] for r in [1, 2]] for q in [1, 2]]",
+        Tile::function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 2]),
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                Box::new(Tile::grouped(
+                    ColumnValue::UInts(vec![0, 2, 4, 6]),
+                    ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![
+                        1, 2, 2, 4, 2, 4, 4, 8,
+                    ]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    );
+}

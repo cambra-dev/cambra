@@ -65,8 +65,9 @@ equivalent tiles with some data released may.
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
 `Tile::append_level` builds a `Function` one level deeper than the function tile it is given,
-out of that tile's codomain. One level is the base case, so an operator that appends a level
-is closed under its own output. `Tiling::append_level` is the same step on the static shape.
+out of that tile's codomain: `Product` repeats each row's value across the group it opens.
+One level is the base case, so an operator that appends a level is closed under its own
+output. `Tiling::append_level` is the same step on the static shape.
 
 The appended level is whole for every parent it names. A parent's keys occupy one contiguous run
 of the level below and `merge` concatenates levels rather than reaching inside a group, so no
@@ -532,6 +533,43 @@ The pipeline always bottoms out at one of three consumer shapes:
 In all three cases planning has ensured every iteration site has an explicit
 `iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
 what to emit based only on its own AST shape and the input flowing in.
+
+### A correlated inner comprehension
+
+An inner comprehension whose body reads the **outer** binder runs once per outer row, over its
+own copy of the inner domain. `lambda_elim` writes that as `curry(𝑔)` composed onto the outer
+stream, where `𝑔` takes the pair of the outer value and the inner element. The pair is what
+carries the correlation: an uncorrelated body never forms one, leaving a `const` that is
+computed once and broadcast.
+
+Compiling it is the pairing. [`Product`] gives each outer row a group holding the whole inner
+domain, one level deeper than the outer stream — a collection per row — and `𝑔` then compiles over
+that like any other morphism over a stream, its result inheriting the grouping.
+The inner source does not mention the outer binder, so every row iterates the same domain and
+the pairing is a cartesian product. A source that differs per row is the same output shape
+from a different builder ([Where a collection is materialized](#where-a-collection-is-materialized)),
+where the per-row collection arrives as a value rather than being selected by the binder.
+
+Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
+comprehension is aggregated, and a comprehension that yields a collection per row leaves the
+curried tile as the answer.
+
+**Nesting is unbounded, because the two operators are inverse at one level each.** `Product`
+takes a stream or a curried function and appends a level; `MapAggregate` collapses the
+innermost level and leaves whichever shape that implies, a sealed function at one domain and
+a curried one at more. So a comprehension nested 𝑛 deep pairs 𝑛−1 times on the way in and
+folds 𝑛 times on the way out, and no operator sees a shape it did not already handle at
+depth two.
+
+**Where the inner domain comes from is what the term has to say**, and planning decides which
+of two shapes op-conversion sees (`src/ccl/planning/correlated.rs`). A site whose source
+planning named is [`Builtin::CurryOver`], whose first operand compiles as its own iteration; a
+site it left alone keeps its `curry`, and op-conversion reads the domain off the type.
+
+[`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
+stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
+its key sits. A tile that cannot answer every key answers none, since an undecided key would
+have to re-offset the groups it left.
 
 ### Where a collection is materialized
 
