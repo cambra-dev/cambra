@@ -13,10 +13,11 @@ A PR body is a map for the reviewer.
 
 The author is the worst-placed person to describe a change. You know why every hunk exists, so you write from the shape of the investigation and in the vocabulary you invented while working — neither of which the reviewer has. A reader holding only the diff can write only what the diff supports, which is exactly what the reviewer will be holding.
 
-Keep the fresh reader cold in two ways:
+Keep the fresh reader cold in three ways:
 
 - **When rewriting an existing description, tell the subagent not to read the current title or body.** A weak description anchors its own rewrite on the framing you are trying to escape.
 - **Read the diff with `gh pr diff <n>`, not `gh pr diff --patch <n>`.** `--patch` prefixes the commit message, and under `gh pr create --fill` the commit message *is* the existing body — so a draft meant to be blind has already read the text it replaces.
+- **Hand over captured evidence, and no narrative.** Error text you reproduced, output you ran, sizes you measured: the drafter cannot obtain these, because it never ran the failure. What it must not inherit is your framing, your vocabulary, and your account of the investigation.
 
 When you cannot delegate, hold to the same discipline directly: work from the diff and the files it touches, and treat any sentence you could not have written from the diff alone as suspect.
 
@@ -39,13 +40,17 @@ The title obeys the body's rules too: it stands alone, and it uses the reviewer'
 
 **Open with a summary that stands alone** — one paragraph, before the first heading: **why** (the problem in terms the reviewer can understand), **what** (a concise description of the change), **so what** (the impact of the change). A reader who stops there should be able to say what the PR does and why it exists. An opening that starts mid-mechanism fails that test; that sentence is the second paragraph's job.
 
-**The description is a review guide.** Order sections the way the change should be read: the core mechanism of the change first, then its consequences, then test coverage and docs changes. One idea per section, and name a section for the idea rather than for the files it touches — a section per changed file is noise.
+**The description is a review guide.** Order sections the way the change should be read: the core mechanism of the change first, then its consequences, then test coverage and docs changes. One idea per section, and name a section for the idea rather than for the files it touches — a section per changed file is noise. A section named "X and Y" is two sections, or a bullet list. Each section says what the code did before alongside what it does now: a section written only in the new state reads as documentation, and the reviewer cannot tell which half of it is the change.
 
-**Focus on the *changes*. Push long-lived information to the docs.** Some content belongs only in a PR description: what connects the old and new versions of the code — why the old shape was wrong, what a reviewer should be suspicious of, how to read the diff. Everything else belongs in the codebase itself, with the description carrying a short summary of it. Terms and concepts the PR introduces get a one-line gloss so the body still reads on its own.
+**Quote the output the change alters.** A change that moves text a human reads — an error message, a log line, CLI output, a rendered doc — shows that text before and after, and gives the mechanism a clause. A reviewer recovers a signature from the diff; the message that signature produces is what the diff does not carry. Capture both halves from a run rather than composing them from the format string.
+
+**Focus on the *changes*. Push long-lived information to the docs.** Some content belongs only in a PR description: what connects the old and new versions of the code — why the old shape was wrong, what a reviewer should be suspicious of, how to read the diff. Everything else belongs in the codebase itself, with the description carrying a short summary of it. Gloss in one line any term a reviewer cannot resolve from the title and the diff's file names — inherited repo jargon as much as a term the PR coins. Fluency in the local vocabulary is what hides which words those are.
 
 **Where the body and a doc would say the same thing, cite and summarize in a sentence.** One sentence handing off to a doc or a code pointer beats a restatement: the restatement drifts from the doc by the next change, and then two places disagree. Use repo-relative Markdown links, which GitHub resolves in a PR body, and point at a heading rather than a section number — `§3.9` rots at the next reordering, which is why the repo's reference conventions require a heading. `./ci.sh doc_refs` does **not** check descriptions (nor anything under `.claude/`), so confirm by hand that the heading exists and the anchor spells it correctly.
 
 This applies hardest to the diff's *own* comments and docs. A change that explains itself in a new code comment, doc comment, or design-doc section has already published its reasoning; the body states the change and points at where the reasoning lives, in a clause rather than a paragraph. Restating a comment the same diff adds is the most common way a small PR ends up with a long description.
+
+**A deletion is justified by what made the old code dead.** A property claimed for something else so that the removal reads as principled is a claim the reviewer has to check and the codebase does not support.
 
 **Limit the size of the description.** It scales *sub-linearly* with the size of the change: a description is the first few levels of a tree, each level pointing at the next and carrying exponentially more detail than the last. The larger the PR, the larger the fraction of self-describing content that has to live in the codebase instead.
 
@@ -77,7 +82,7 @@ Write three revisions before posting. A description is read by every reviewer an
 
 1. **Draft** from the diff.
 2. **Check against the rules.** Is the title an imperative? Does the opening stand alone? Is the section order a reading order? Is anything durable stated only here — or restated here from a comment the diff itself adds? Then count the words and compare against the budget; if the draft is over, the cut comes from what the codebase already says, not from the reviewer's map.
-3. **Check against the diff.** Re-verify every name, count, and list. A compression pass introduces factual errors more readily than a draft does — an over-cut description that says a pass is affected when the diff exempts it is worse than a long one.
+3. **Check against the diff.** Re-verify every name, count, and list, and re-run whatever produced a quoted message or a measured number — neither is a name, a count, or a list, and both go stale the moment a format string changes. A compression pass introduces factual errors more readily than a draft does — an over-cut description that says a pass is affected when the diff exempts it is worse than a long one.
 
 ## Posting and updating
 
