@@ -37,7 +37,7 @@ jobs:
   repo_checks:
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      is_code_change: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -92,7 +92,7 @@ jobs:
   # queue.
   clippy:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -105,7 +105,7 @@ jobs:
   # ungated code (a test calling a debug-only fn) breaks here and nowhere else.
   clippy_release:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -117,7 +117,7 @@ jobs:
   # would cost more setup than the work they do.
   lint:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -159,7 +159,7 @@ jobs:
   # no compilation.
   test:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -193,7 +193,7 @@ jobs:
   # either direction.
   formal:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -211,7 +211,7 @@ jobs:
   # a different build from the one the suite compiles, sharing nothing with it.
   fixtures:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -223,7 +223,7 @@ jobs:
   # and no Rust, so it shares none of the setup above.
   web:
     needs: repo_checks
-    if: ${{ !cancelled() && needs.repo_checks.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -249,7 +249,7 @@ jobs:
       # A docs-only PR skips the code gates, and `skipped` is not a failure.
       # `cancelled` is, because a cancelled gate checked nothing.
       - name: No-op for docs
-        if: needs.repo_checks.outputs.code == 'false'
+        if: needs.repo_checks.outputs.is_code_change == 'false'
         run: echo "Only documentation changed. The code gates were skipped."
 
       - name: Collect gate results
@@ -269,7 +269,7 @@ jobs:
         # pushes fire as 'pull_request' events instead.
         if: >-
           failure() && github.event_name == 'push' &&
-          needs.repo_checks.outputs.code == 'true'
+          needs.repo_checks.outputs.is_code_change == 'true'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ vars.SLACK_CI_CHANNEL }}
