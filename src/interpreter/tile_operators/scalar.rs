@@ -101,21 +101,21 @@ impl TileProducer for ConstantProducer {
     }
 }
 
-/// Unwraps a `SealedFunction` with `domain = Units(1)` to produce its single codomain element.
+/// Unwraps a `Function` with `domain = Units(1)` to produce its single codomain element.
 ///
-/// The input must have a `SealedFunction` tiling with `domain = Extent::Units(1)`.
-/// The output tiling is the codomain of that `SealedFunction`.
+/// The input must have a `Function` tiling with `domain = Extent::Units(1)`.
+/// The output tiling is the codomain of that `Function`.
 pub struct ToScalar {
-    /// The `SealedFunction`-typed input to unwrap.
+    /// The `Function`-typed input to unwrap.
     input: Box<dyn TileOperator>,
-    /// Output tiling: the codomain of the input's `SealedFunction` tiling.
+    /// Output tiling: the codomain of the input's `Function` tiling.
     base: OperatorBase,
 }
 
 impl ToScalar {
     /// Construct a `ToScalar` operator.
     ///
-    /// Panics if `input` does not have a `SealedFunction` tiling.
+    /// Panics if `input` does not have a `Function` tiling.
     /// The domain `Units(1)` constraint is checked at `get`-time.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().codomain().unwrap_or_else(|| {
@@ -167,11 +167,11 @@ impl TileOperator for ToScalar {
 /// **Two input shapes**, mirroring [`VariantProject`]:
 /// - `Scalar(payload)` — a bare payload column (the scalar `VariantCtor`). The
 ///   output is `Scalar(Union)`.
-/// - `SealedFunction { D ⇒ Scalar(payload) }` — a payload *stream* (a
+/// - `Function { D ⇒ Scalar(payload) }` — a payload *stream* (a
 ///   `VariantCtor` inside a lambda body, ``λ p → `cᵢ(eᵢ(p))``, so it can sit as the
 ///   RHS of a `≫` and flat-merge with sibling arms). The wrap runs element-wise
 ///   over the codomain, **preserving the domain** `D`: the output is
-///   `SealedFunction { D ⇒ Scalar(Union) }`.
+///   `Function { D ⇒ Scalar(Union) }`.
 pub struct VariantWrap {
     /// The payload operator feeding `variants[tag]`.
     input: Box<dyn TileOperator>,
@@ -180,7 +180,7 @@ pub struct VariantWrap {
     /// Per-variant extents of the full union; `input` feeds the `tag` arm.
     variant_extents: TagMap<Extent>,
     /// Output tiling — `Scalar(Union)` for a scalar payload, or
-    /// `SealedFunction { D ⇒ Scalar(Union) }` for a payload stream.
+    /// `Function { D ⇒ Scalar(Union) }` for a payload stream.
     base: OperatorBase,
 }
 
@@ -188,7 +188,7 @@ impl VariantWrap {
     /// Construct a `VariantWrap` placing `input`'s payload at the `tag` arm of a
     /// union of `variant_extents`. The output tiling follows the
     /// payload's: a `Scalar` payload yields `Scalar(Union)`; a payload *stream*
-    /// `SealedFunction { D ⇒ Scalar(_) }` yields `SealedFunction { D ⇒
+    /// `Function { D ⇒ Scalar(_) }` yields `Function { D ⇒
     /// Scalar(Union) }` (the wrap is element-wise over the codomain).
     pub fn new(
         input: Box<dyn TileOperator>,
@@ -201,10 +201,9 @@ impl VariantWrap {
         );
         let union_ext = Extent::Union(variant_extents.clone());
         let tiling = match input.tiling() {
-            Tiling::SealedFunction { domain, .. } => Tiling::SealedFunction {
-                domain: domain.clone(),
-                codomain: Box::new(Tiling::Scalar(union_ext)),
-            },
+            Tiling::Function { keys, .. } => {
+                Tiling::function(keys.clone(), Tiling::Scalar(union_ext))
+            }
             _ => Tiling::Scalar(union_ext),
         };
         Self {
@@ -296,23 +295,18 @@ impl TileProducer for VariantWrapProducer {
             }
             // Payload *stream* → wrap the codomain element-wise, preserving the
             // domain `D`, so the constructor composes as `payload ≫ variant_wrap`.
-            Tile::SealedFunction {
-                domain,
-                codomain,
-                domain_predicate,
-                deleted,
-            } => {
-                let payload = scalar_tile_to_column_value(*codomain);
-                Tile::SealedFunction {
-                    domain,
-                    codomain: Box::new(Tile::Scalar(wrap_variant_column(
-                        payload,
-                        &self.tag,
-                        &self.variant_extents,
-                    ))),
-                    domain_predicate,
-                    deleted,
-                }
+            mut tile @ Tile::Function { .. } => {
+                let slot = tile.deepest_values_mut();
+                let payload = scalar_tile_to_column_value(std::mem::replace(
+                    slot,
+                    Tile::Record(HashMap::new()),
+                ));
+                *slot = Tile::Scalar(wrap_variant_column(
+                    payload,
+                    &self.tag,
+                    &self.variant_extents,
+                ));
+                tile
             }
             other => panic!("VariantWrap: unexpected payload tile {other:?}"),
         }
@@ -349,15 +343,15 @@ impl TileProducer for VariantWrapProducer {
 /// (a `≫`-chain: `𝑑` is the eliminated scrutinee morphism, and the two elements
 /// after it are functions of its output).
 /// It is a *single* step, not a restrict followed by a projection — see below.
-/// The output is a `SealedFunction { 𝑑 ⇒ P_𝑐ᵢ }`: arm `𝑐ᵢ`'s inner payload column,
+/// The output is a `Function { 𝑑 ⇒ P_𝑐ᵢ }`: arm `𝑐ᵢ`'s inner payload column,
 /// keyed by the scrutinee positions that carried tag `𝑐ᵢ`.
 ///
-/// **Two input shapes, both yielding a `SealedFunction` keyed by the scrutinee's
+/// **Two input shapes, both yielding a `Function` keyed by the scrutinee's
 /// domain:**
 /// - `Scalar(Union)` — a bare union column (the `VariantCtor`/`VariantWrap`
 ///   shape). The domain is *implicit* `0..N`, so the projected keys are the
 ///   `UInt` positions carrying the tag.
-/// - `SealedFunction { D ⇒ Scalar(Union) }` — a union *stream* whose element
+/// - `Function { D ⇒ Scalar(Union) }` — a union *stream* whose element
 ///   domain `D` is explicit (a variant field of a record stream, `x.f`). The
 ///   projected keys are the **actual `D` keys** at the tagged positions,
 ///   *not* synthetic positions — so the projected payload co-iterates by key
@@ -388,7 +382,7 @@ impl TileProducer for VariantWrapProducer {
 /// total by construction).
 pub struct VariantProject {
     /// The scrutinee operator, producing a `Scalar(Union)` tile or a
-    /// `SealedFunction { D ⇒ Scalar(Union) }` tile.
+    /// `Function { D ⇒ Scalar(Union) }` tile.
     input: Box<dyn TileOperator>,
     /// The tag to project.
     tag: FieldKey,
@@ -396,7 +390,7 @@ pub struct VariantProject {
     /// alongside the tiling so an empty result can be built at the right column
     /// shape without destructuring it back out.
     payload_extent: Extent,
-    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
+    /// Output tiling — `Function { <scrutinee domain> ⇒ the `tag` arm }`.
     base: OperatorBase,
 }
 
@@ -404,7 +398,7 @@ impl VariantProject {
     /// Construct a `VariantProject` reading arm `tag` out of the scrutinee's
     /// union. The projected sub-domain is keyed by the scrutinee's own domain: a
     /// bare `Scalar(Union)` scrutinee has the implicit `UInt` `0..N` domain,
-    /// while a `SealedFunction { D ⇒ Scalar(Union) }` scrutinee keeps `D`. All
+    /// while a `Function { D ⇒ Scalar(Union) }` scrutinee keeps `D`. All
     /// arms of one `match` share the scrutinee's domain extent, so they
     /// flat-merge back to the full domain.
     /// `payload_extent` is the projected arm's extent, taken from the node's own
@@ -414,20 +408,27 @@ impl VariantProject {
     /// tag, and the projection is empty; the operator still needs a codomain
     /// extent to describe that empty result, and only the type knows it.
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey, payload_extent: Extent) -> Self {
-        let domain_extent = match input.tiling() {
-            Tiling::Scalar(Extent::Union(_)) => Extent::Base(BaseType::UInt),
-            Tiling::SealedFunction { domain, codomain } => match codomain.as_ref() {
-                Tiling::Scalar(Extent::Union(_)) => domain.clone(),
-                other => panic!(
-                    "VariantProject: SealedFunction scrutinee must have a Scalar(Union) codomain, \
-                     got {other:?}"
-                ),
-            },
-            other => panic!("VariantProject: scrutinee must be a (Sealed)Union, got {other:?}"),
-        };
-        let tiling = Tiling::SealedFunction {
-            domain: domain_extent,
-            codomain: Box::new(Tiling::Scalar(payload_extent.clone())),
+        // The scrutinee is a union, either bare or as the values of a function of any
+        // arity. The output keeps that arity and narrows only the codomain, so a union
+        // per innermost element projects per innermost element. The output is a function
+        // either way: a bare union is keyed by the implicit `0..N` positions the tile
+        // materializes.
+        let tiling = match input.tiling() {
+            Tiling::Scalar(Extent::Union(_)) => Tiling::function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(payload_extent.clone()),
+            ),
+            t @ Tiling::Function {
+                values: codomain, ..
+            } => {
+                assert!(
+                    matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_))),
+                    "VariantProject: a scrutinee must have a Scalar(Union) codomain, got \
+                     {codomain:?}"
+                );
+                change_tiling_result(t, |_| Tiling::Scalar(payload_extent.clone()))
+            }
+            other => panic!("VariantProject: a scrutinee must be a union, got {other:?}"),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -505,18 +506,27 @@ impl TileProducer for VariantProjectProducer {
         // supplied below as the positions themselves.
         let (domain_col, domain_predicate, deleted, cv) = match tile {
             Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
-            Tile::SealedFunction {
-                domain,
-                codomain,
+            Tile::Function {
+                row_starts,
+                keys,
+                values,
                 domain_predicate,
                 deleted,
-            } => (
-                Some(domain),
-                domain_predicate,
-                deleted,
-                scalar_tile_to_column_value(*codomain),
-            ),
-            other => panic!("VariantProject expects a (Sealed)Union input, got {other:?}"),
+            } => {
+                assert_eq!(
+                    row_starts.len(),
+                    1,
+                    "VariantProject rebuilds its keys from the positions it keeps, which has \
+                     no meaning inside a grouping"
+                );
+                (
+                    Some(keys),
+                    domain_predicate,
+                    deleted,
+                    scalar_tile_to_column_value(*values),
+                )
+            }
+            other => panic!("VariantProject expects a union input, got {other:?}"),
         };
         let ColumnValue::Union(arms) = cv else {
             panic!("VariantProject expects a Union codomain, got {cv:?}");
@@ -554,12 +564,12 @@ impl TileProducer for VariantProjectProducer {
             // declared payload extent.
             None => ColumnValue::from_values(Vec::new(), &self.payload_extent),
         };
-        Tile::SealedFunction {
-            domain: out_domain,
-            codomain: Box::new(Tile::Scalar(out_codomain)),
+        Tile::function(
+            out_domain,
+            Box::new(Tile::Scalar(out_codomain)),
             domain_predicate,
-            deleted: BitSet::new(),
-        }
+            BitSet::new(),
+        )
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -575,7 +585,7 @@ impl TileProducer for VariantProjectProducer {
         // positions themselves — so it takes no domain guard and falls to the whole-tile
         // case below.
         if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard
-            && matches!(self.input.tiling(), Tiling::SealedFunction { .. })
+            && matches!(self.input.tiling(), Tiling::Function { .. })
         {
             self.input.release(obsolete_guard);
             return;
@@ -600,11 +610,11 @@ impl TileProducer for VariantProjectProducer {
 /// [`VariantProject`]'s empty projection on a width-subtype scrutinee.
 pub struct VariantIs {
     /// The scrutinee operator, producing a `Scalar(Union)` tile or a
-    /// `SealedFunction { D ⇒ Scalar(Union) }` tile.
+    /// `Function { D ⇒ Scalar(Union) }` tile.
     input: Box<dyn TileOperator>,
     /// The tag to test for.
     tag: FieldKey,
-    /// Identity and the output tiling — `SealedFunction { <scrutinee domain> ⇒ Bool }`.
+    /// Identity and the output tiling — `Function { <scrutinee domain> ⇒ Bool }`.
     base: OperatorBase,
 }
 
@@ -614,20 +624,22 @@ impl VariantIs {
     /// codomain is `Bool` rather than the arm's payload, and unlike a projection
     /// every key of the domain is answered.
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
-        let domain_extent = match input.tiling() {
-            Tiling::Scalar(Extent::Union(_)) => Extent::Base(BaseType::UInt),
-            Tiling::SealedFunction { domain, codomain } => match codomain.as_ref() {
-                Tiling::Scalar(Extent::Union(_)) => domain.clone(),
-                other => panic!(
-                    "VariantIs: SealedFunction scrutinee must have a Scalar(Union) codomain, \
-                     got {other:?}"
-                ),
-            },
-            other => panic!("VariantIs: scrutinee must be a (Sealed)Union, got {other:?}"),
-        };
-        let tiling = Tiling::SealedFunction {
-            domain: domain_extent,
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Bool))),
+        // As [`VariantProject::new`], with `Bool` in place of the arm's payload.
+        let tiling = match input.tiling() {
+            Tiling::Scalar(Extent::Union(_)) => Tiling::function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Bool)),
+            ),
+            t @ Tiling::Function {
+                values: codomain, ..
+            } => {
+                assert!(
+                    matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_))),
+                    "VariantIs: a scrutinee must have a Scalar(Union) codomain, got {codomain:?}"
+                );
+                change_tiling_result(t, |_| Tiling::Scalar(Extent::Base(BaseType::Bool)))
+            }
+            other => panic!("VariantIs: a scrutinee must be a union, got {other:?}"),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -687,18 +699,26 @@ impl TileProducer for VariantIsProducer {
         let tile = self.input.get(projection_guard);
         let (domain_col, domain_predicate, deleted, cv) = match tile {
             Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
-            Tile::SealedFunction {
-                domain,
-                codomain,
+            Tile::Function {
+                keys,
+                values,
                 domain_predicate,
                 deleted,
-            } => (
-                Some(domain),
-                domain_predicate,
-                deleted,
-                scalar_tile_to_column_value(*codomain),
-            ),
-            other => panic!("VariantIs expects a (Sealed)Union input, got {other:?}"),
+                ..
+            } => {
+                assert!(
+                    !values.is_function(),
+                    "VariantIs rebuilds its domain from the positions it keeps, which has \
+                     no meaning above one level"
+                );
+                (
+                    Some(keys),
+                    domain_predicate,
+                    deleted,
+                    scalar_tile_to_column_value(*values),
+                )
+            }
+            other => panic!("VariantIs expects a union input, got {other:?}"),
         };
         let ColumnValue::Union(arms) = cv else {
             panic!("VariantIs expects a Union codomain, got {cv:?}");
@@ -724,12 +744,12 @@ impl TileProducer for VariantIsProducer {
             Some(d) => d.select_indices(positions.iter().copied(), positions.len()),
             None => ColumnValue::from_uints(positions),
         };
-        Tile::SealedFunction {
-            domain: out_domain,
-            codomain: Box::new(Tile::Scalar(ColumnValue::Bools(answers))),
+        Tile::function(
+            out_domain,
+            Box::new(Tile::Scalar(ColumnValue::Bools(answers))),
             domain_predicate,
-            deleted: BitSet::new(),
-        }
+            BitSet::new(),
+        )
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -756,14 +776,11 @@ impl TileProducer for ToScalarProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = input_result
-        else {
-            panic!("ToScalarProducer expected SealedFunction")
+        let Tile::Function { keys, values, .. } = input_result else {
+            panic!("ToScalarProducer expected a collection tile")
         };
-        assert_eq!(domain, ColumnValue::Units(1));
-        *codomain
+        assert_eq!(keys, ColumnValue::Units(1));
+        *values
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -831,14 +848,11 @@ mod tests {
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let tile = producer.get(producer.tiling().universal_guard());
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = tile
-        else {
-            panic!("expected SealedFunction, got {tile:?}");
+        let Tile::Function { keys, values, .. } = tile else {
+            panic!("expected Function, got {tile:?}");
         };
-        assert_eq!(domain, ColumnValue::from_uints(vec![0, 2]));
-        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![10, 30])));
+        assert_eq!(keys, ColumnValue::from_uints(vec![0, 2]));
+        assert_eq!(*values, Tile::Scalar(ColumnValue::Ints(vec![10, 30])));
     }
 
     /// ``VariantProject(`abort)`` narrows to the tag-1 sub-domain (position 1) and
@@ -851,14 +865,11 @@ mod tests {
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let tile = producer.get(producer.tiling().universal_guard());
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = tile
-        else {
-            panic!("expected SealedFunction, got {tile:?}");
+        let Tile::Function { keys, values, .. } = tile else {
+            panic!("expected Function, got {tile:?}");
         };
-        assert_eq!(domain, ColumnValue::from_uints(vec![1]));
-        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Units(1)));
+        assert_eq!(keys, ColumnValue::from_uints(vec![1]));
+        assert_eq!(*values, Tile::Scalar(ColumnValue::Units(1)));
     }
 
     /// **A tag the scrutinee's value does not carry projects empty**, and is not
@@ -896,17 +907,14 @@ mod tests {
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let out = producer.get(producer.tiling().universal_guard());
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = out
-        else {
-            panic!("expected SealedFunction, got {out:?}");
+        let Tile::Function { keys, values, .. } = out else {
+            panic!("expected Function, got {out:?}");
         };
-        assert_eq!(domain, ColumnValue::from_uints(vec![]));
+        assert_eq!(keys, ColumnValue::from_uints(vec![]));
         assert_eq!(
-            *codomain,
+            *values,
             Tile::Scalar(ColumnValue::Ints(vec![])),
-            "the empty codomain is shaped by the declared arm extent (Int), not \
+            "the empty values is shaped by the declared arm extent (Int), not \
              by the tag that happened to be present"
         );
     }
@@ -955,17 +963,14 @@ mod tests {
         );
         let out = producer.get(producer.tiling().universal_guard());
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = out
-        else {
-            panic!("expected SealedFunction, got {out:?}");
+        let Tile::Function { keys, values, .. } = out else {
+            panic!("expected Function, got {out:?}");
         };
         // Disjoint tag partitions {0,2} and {1,3} re-total to the full 0..4 range,
         // sorted by position, with each position's arm value.
-        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2, 3]));
+        assert_eq!(keys, ColumnValue::from_uints(vec![0, 1, 2, 3]));
         assert_eq!(
-            *codomain,
+            *values,
             Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))
         );
     }
@@ -981,21 +986,22 @@ mod tests {
         // A union stream over arbitrary UInt keys [10, 11, 12]: commit(100),
         // abort, commit(120). The explicit keys (not 0..N) prove real-key
         // preservation.
-        let union_stream_tile = Tile::SealedFunction {
-            domain: ColumnValue::from_uints(vec![10, 11, 12]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::positional_union(
+        let union_stream_tile = Tile::function(
+            ColumnValue::from_uints(vec![10, 11, 12]),
+            Box::new(Tile::Scalar(ColumnValue::positional_union(
                 &[0, 1, 0],
                 vec![ColumnValue::Ints(vec![100, 120]), ColumnValue::Units(1)],
             ))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        };
-        let union_stream_tiling = Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(Extent::Union(TagMap::from_positional(
-                vec![Extent::Base(BaseType::Int), Extent::Base(BaseType::Unit)],
-            )))),
-        };
+            Predicate::True,
+            BitSet::new(),
+        );
+        let union_stream_tiling = Tiling::function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
+                Extent::Base(BaseType::Int),
+                Extent::Base(BaseType::Unit),
+            ]))),
+        );
 
         // ``VariantProject(`commit)`` keeps the *actual* keys 10 and 12.
         let vp = VariantProject::new(
@@ -1008,49 +1014,51 @@ mod tests {
         );
         assert_eq!(
             vp.tiling(),
-            &Tiling::SealedFunction {
-                domain: Extent::Base(BaseType::UInt),
-                codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-            }
+            &Tiling::function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int))
+            )
         );
 
         // The outer element stream (e.g. `x.time`) over the *same* keys.
-        let outer_tile = Tile::SealedFunction {
-            domain: ColumnValue::from_uints(vec![10, 11, 12]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        };
-        let outer_tiling = Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+        let outer_tile = Tile::function(
+            ColumnValue::from_uints(vec![10, 11, 12]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let outer_tiling = Tiling::function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
 
         // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the FanIn joins
         // the full outer stream with the tag-restricted payload on shared keys.
-        let mut fan = FanIn::new(vec![
+        let ops: Vec<Box<dyn TileOperator>> = vec![
             Box::new(FixedOp {
                 tile: outer_tile,
                 tiling: outer_tiling,
             }),
             Box::new(vp),
-        ]);
+        ];
+        let mut fan = FanIn::new_at(
+            (0..2).map(crate::interpreter::tuple_field).collect(),
+            ops,
+            1,
+        );
         let mut sched = Scheduler::new();
         let mut producer =
             fan.subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let out = producer.get(producer.tiling().universal_guard());
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = out
-        else {
-            panic!("expected SealedFunction, got {out:?}");
+        let Tile::Function { keys, values, .. } = out else {
+            panic!("expected Function, got {out:?}");
         };
         // Only the commit keys survive the join, aligned by key: (time, payload)
         // = (1, 100) at key 10 and (3, 120) at key 12.
-        assert_eq!(domain, ColumnValue::from_uints(vec![10, 12]));
-        let Tile::Record(fields) = *codomain else {
-            panic!("expected a Record codomain, got {codomain:?}");
+        assert_eq!(keys, ColumnValue::from_uints(vec![10, 12]));
+        let Tile::Record(fields) = *values else {
+            panic!("expected a Record values, got {values:?}");
         };
         assert_eq!(fields["_0"], Tile::Scalar(ColumnValue::Ints(vec![1, 3])));
         assert_eq!(
@@ -1072,29 +1080,29 @@ mod tests {
     /// driver reclaims the prefix it has consumed.
     #[test]
     fn variant_project_forwards_a_partial_domain_release_to_its_scrutinee() {
-        let scrut_tiling = Tiling::SealedFunction {
-            domain: Extent::uint_range(2),
-            codomain: Box::new(Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
+        let scrut_tiling = Tiling::function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
                 FieldKey::Index(0),
                 Extent::Base(BaseType::Int),
-            )])))),
-        };
+            )]))),
+        );
         let (spy, released) = ReleaseSpy::new(
-            Tile::SealedFunction {
-                domain: ColumnValue::from_uints(vec![0, 1]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![(
+            Tile::function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![(
                     FieldKey::Index(0),
                     UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![10, 20])),
                 )])))),
-                domain_predicate: Predicate::False,
-                deleted: BitSet::new(),
-            },
+                Predicate::False,
+                BitSet::new(),
+            ),
             scrut_tiling.clone(),
         );
-        let out_tiling = Tiling::SealedFunction {
-            domain: Extent::uint_range(2),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+        let out_tiling = Tiling::function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
         let mut producer = VariantProjectProducer {
             base: ProducerBase::new(VariantProjectProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
@@ -1122,26 +1130,26 @@ mod tests {
     #[test]
     fn variant_wrap_forwards_a_partial_domain_release_to_its_payload() {
         let commit = FieldKey::Name("commit".into());
-        let payload_tiling = Tiling::SealedFunction {
-            domain: Extent::uint_range(2),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+        let payload_tiling = Tiling::function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
         let (spy, released) = ReleaseSpy::new(
-            Tile::SealedFunction {
-                domain: ColumnValue::from_uints(vec![0, 1]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
-                domain_predicate: Predicate::False,
-                deleted: BitSet::new(),
-            },
+            Tile::function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                Predicate::False,
+                BitSet::new(),
+            ),
             payload_tiling.clone(),
         );
-        let out_tiling = Tiling::SealedFunction {
-            domain: Extent::uint_range(2),
-            codomain: Box::new(Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
+        let out_tiling = Tiling::function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
                 commit.clone(),
                 Extent::Base(BaseType::Int),
-            )])))),
-        };
+            )]))),
+        );
         let mut producer = VariantWrapProducer {
             base: ProducerBase::new(VariantWrapProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),

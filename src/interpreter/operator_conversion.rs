@@ -37,7 +37,8 @@ use crate::{
             Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling,
-            Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in, fan_in_named,
+            Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in_at,
+            fan_in_named_at, level_count,
         },
         tuple_field,
     },
@@ -90,7 +91,7 @@ use std::{
 /// program never fully applies — reaches the catch-all `Apply` arm and errors there;
 /// see `src/ccl/design/optimization.md`, "Limitations". What is missing is the
 /// combinator rather than the shape: a curried data function is a tiling
-/// (`CurriedFunction`), which planning's group-by rewrite builds from `converse`. A
+/// (`Function`), which planning's group-by rewrite builds from `converse`. A
 /// curried *compute* function has no counterpart, and the kind is why — a tile
 /// carries values, not closures, and a compute function has no data behind it to
 /// materialize.
@@ -1495,6 +1496,11 @@ fn convert_impl_inner(
             if as_builtin(function) == Some(Builtin::Zip) =>
         {
             let input = expect_input(input, "zip")?;
+            // The arms are each applied to `input`, so the levels they run over are its —
+            // which is what the pair sits under. Their own shapes cannot say: two arms that
+            // agree below the ambient (two projections of one grouped row, say) look
+            // pairable all the way down.
+            let ambient = level_count(input.tiling());
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
@@ -1540,7 +1546,7 @@ fn convert_impl_inner(
                         };
                         ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
-                    Ok(fan_in(ops))
+                    Ok(fan_in_at(ops, ambient))
                 }
                 TypedExprNode::Record(fields) => {
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
@@ -1555,7 +1561,7 @@ fn convert_impl_inner(
                             ))
                         })
                         .collect();
-                    Ok(fan_in_named(ops?))
+                    Ok(fan_in_named_at(ops?, ambient))
                 }
                 other => Err(ConversionError::Unsupported(format!(
                     "zip expects a Tuple or Record argument, got {:?}",
@@ -1710,7 +1716,7 @@ fn convert_impl_inner(
             Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
         }
 
-        // uncurry flattens a curried function into a sealed function with a pair domain.
+        // uncurry flattens a curried function into a function with a pair domain.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Uncurry) =>
         {
@@ -1795,7 +1801,7 @@ fn convert_impl_inner(
         // `map_filter(p)`: filter the inner collections of a partition, per outer
         // key. The fed input is the curried collection, fanned to the value side and
         // the predicate exactly as `filter_values` fans its element stream — the
-        // difference is the shape, `CurriedFunction` rather than `SealedFunction`,
+        // difference is the shape, `Function` rather than `Function`,
         // and so the domain the predicate selects on is the inner one.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::MapFilter) =>
@@ -2149,19 +2155,21 @@ fn convert_impl_inner(
                 // the way through — nothing is erased to a position here.
                 Builtin::VariantProject(tag) => {
                     // The scrutinee is either a bare `Scalar(Union)` (the
-                    // `VariantCtor` shape) or a union *stream* `SealedFunction {
+                    // `VariantCtor` shape) or a union *stream* `Function {
                     // D ⇒ Scalar(Union) }` (a variant field of a record stream);
                     // `VariantProject` derives its output domain from whichever.
                     let ok = match input.tiling() {
                         Tiling::Scalar(Extent::Union(_)) => true,
-                        Tiling::SealedFunction { codomain, .. } => {
+                        Tiling::Function {
+                            values: codomain, ..
+                        } => {
                             matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
                         }
                         _ => false,
                     };
                     if !ok {
                         return Err(ConversionError::TypeError(format!(
-                            "variant_project({tag}) expects a (Sealed)Union scrutinee, got {}",
+                            "variant_project({tag}) expects a union scrutinee, got {}",
                             input.tiling()
                         )));
                     }
@@ -2187,14 +2195,16 @@ fn convert_impl_inner(
                 Builtin::VariantIs(tag) => {
                     let ok = match input.tiling() {
                         Tiling::Scalar(Extent::Union(_)) => true,
-                        Tiling::SealedFunction { codomain, .. } => {
+                        Tiling::Function {
+                            values: codomain, ..
+                        } => {
                             matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
                         }
                         _ => false,
                     };
                     if !ok {
                         return Err(ConversionError::TypeError(format!(
-                            "variant_is({tag}) expects a (Sealed)Union scrutinee, got {}",
+                            "variant_is({tag}) expects a union scrutinee, got {}",
                             input.tiling()
                         )));
                     }
@@ -2247,7 +2257,7 @@ fn convert_impl_inner(
             }
         }
 
-        // List literal: materialise as SealedFunction(UIntRange(n), T).
+        // List literal: materialise as Function(UIntRange(n), T).
         TypedExprNode::List(elts) => {
             // The element extent comes from the list's own type — see
             // `compile_list_fn` for why a value cannot supply it.
@@ -2286,7 +2296,9 @@ fn convert_impl_inner(
                 .iter()
                 .map(|elt| convert_impl(elt, None, ctx))
                 .collect();
-            Ok(fan_in(ops?))
+            let ops = ops?;
+            let ambient = leaf_ambient(ops.iter().map(|op| op.tiling()));
+            Ok(fan_in_at(ops, ambient))
         }
 
         TypedExprNode::Record(fields) => {
@@ -2295,7 +2307,9 @@ fn convert_impl_inner(
                 .iter()
                 .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
                 .collect();
-            Ok(fan_in_named(ops?))
+            let ops = ops?;
+            let ambient = leaf_ambient(ops.iter().map(|(_, op)| op.tiling()));
+            Ok(fan_in_named_at(ops, ambient))
         }
 
         // Literal constant: produce a scalar.
@@ -2426,6 +2440,30 @@ fn compile_list_fn(
         codomain: Box::new(elt_extent),
     };
     Ok(Box::new(Constant::new(fn_value, fn_extent)))
+}
+
+/// The ambient iteration a product's **leaf** components stand over.
+///
+/// A product former with no input compiles components that each carry their own iteration,
+/// so there is nothing to read the ambient off except the components themselves — and they
+/// must agree on it, which is the rule `main` enforced by requiring one tiling variant. A
+/// scalar component contributes no level and the pairing is a plain record, which
+/// [`fan_in_at`] routes elsewhere.
+fn leaf_ambient<'a>(tilings: impl Iterator<Item = &'a Tiling>) -> usize {
+    let mut ambient = 1;
+    for (i, t) in tilings.enumerate() {
+        let levels = level_count(t);
+        if i == 0 {
+            ambient = levels.max(1);
+        } else {
+            debug_assert_eq!(
+                levels.max(1),
+                ambient,
+                "a product's leaf components stand over one iteration, so they nest alike",
+            );
+        }
+    }
+    ambient
 }
 
 /// Evaluate a constant CCL expression to a [`Value`].
@@ -3732,10 +3770,10 @@ fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
 /// Reject a lookup whose collection has no answer shape.
 ///
 /// Two shapes answer, and `CheckedLookup` asserts rather than re-checks them. A
-/// **streamed** collection tiles as a sealed function over a **scalar** codomain: the
+/// **streamed** collection tiles as a one-level function over a **scalar** codomain: the
 /// operator searches the domain column to decide presence and carries one codomain value as
-/// the `` `some `` payload, so a codomain of any other shape — a `CurriedFunction`'s
-/// collection-valued rows, a `Record`'s several columns — has nothing to put there. A
+/// the `` `some `` payload, so anything holding more than one value per key — a further
+/// domain level, a `Record`'s several columns — has nothing to put there. A
 /// **materialized** collection is one map value, as a mutable collection's mutable variable holds
 /// it; it carries its own bindings, and any value can be the payload.
 ///
@@ -3746,7 +3784,7 @@ fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
 /// permanent shape mismatch reported that way is a lookup that spins instead of erroring.
 fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), ConversionError> {
     let answerable = match tiling {
-        Tiling::SealedFunction { codomain, .. } => matches!(codomain.as_ref(), Tiling::Scalar(_)),
+        Tiling::Function { values, .. } => matches!(values.as_ref(), Tiling::Scalar(_)),
         Tiling::Scalar(Extent::Function { .. }) => true,
         _ => false,
     };
@@ -3754,7 +3792,7 @@ fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), Conversi
         return Ok(());
     }
     Err(ConversionError::Unsupported(format!(
-        "`c[k]?` needs a collection that tiles either as a sealed function over a scalar \
+        "`c[k]?` needs a collection that tiles either as a one-level function over a scalar \
          codomain, so that its domain can be searched and its values carried as the `some` \
          payload, or as one materialized map value; this one tiles as {tiling}. A \
          collection-valued codomain is the usual reason"
@@ -3784,7 +3822,7 @@ fn proj_named_field(
 /// Apply a built-in binary operation to `input`.
 ///
 /// `input` must produce a record with fields `_0` and `_1` — either as a
-/// `SealedFunction` over some domain (morphism context) or as a `Scalar`
+/// `Function` over some domain (morphism context) or as a `Scalar`
 /// constant record (scalar context).  Returns `MapResult(input, Constant(BinOp(op)))`.
 fn apply_binop(
     input: Box<dyn TileOperator>,
@@ -3899,7 +3937,7 @@ fn union_operand_ops(
 
 /// Apply a built-in unary operation to the input stream.
 ///
-/// `input` must have a `SealedFunction` tiling.
+/// `input` must have a `Function` tiling.
 /// Returns `MapResult(input, Constant(UnaryOp(op)))`.
 fn apply_unaryop(
     input: Box<dyn TileOperator>,
@@ -4011,14 +4049,17 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
 ///
 /// For `Scalar(e)` returns `e`; for `Record(fields)` returns `Extent::Record` over
 /// the field extents (arising when a non-constant tuple is compiled via [`ScalarFanIn`]);
-/// for `SealedFunction { codomain, .. }` returns `codomain.extent()`.
+/// for `Function { codomain, .. }` returns `codomain.extent()`.
 fn result_extent(tiling: &Tiling) -> Extent {
     match tiling {
         Tiling::Scalar(e) => e.clone(),
         Tiling::Record(_) => tiling.extent(),
-        Tiling::SealedFunction { codomain, .. } => codomain.extent(),
-        Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
-        t => panic!("unexpected tiling in codomain_extent: {t:?}"),
+        // A chain of collections holds its result under every level, so descend the whole
+        // chain: a binop or a projection acts on one element, not on a group of them. The
+        // descent stops at a `Scalar`, so a materialized collection — one cell holding a
+        // whole map — is itself the result.
+        Tiling::Function { values, .. } => result_extent(values),
+        t => panic!("unexpected tiling in result_extent: {t:?}"),
     }
 }
 
@@ -4441,17 +4482,14 @@ mod variant_ctor_tests {
     }
 
     /// The value at the single row of a driven eliminator's re-totaled
-    /// `SealedFunction` result.
+    /// `Function` result.
     fn single_row(tile: Tile) -> Value {
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = tile
-        else {
-            panic!("expected a SealedFunction (re-totaled fan-out), got {tile:?}");
+        let Tile::Function { keys, values, .. } = tile else {
+            panic!("expected a Function (re-totaled fan-out), got {tile:?}");
         };
-        assert_eq!(domain.len(), 1, "one-element scrutinee → one output row");
-        let Tile::Scalar(cv) = *codomain else {
-            panic!("expected a Scalar codomain");
+        assert_eq!(keys.len(), 1, "one-element scrutinee → one output row");
+        let Tile::Scalar(cv) = *values else {
+            panic!("expected a Scalar values");
         };
         cv.index_at(0)
     }
@@ -4705,9 +4743,9 @@ mod variant_ctor_tests {
                 )])),
             ),
         ]));
-        let stream_tile = Tile::SealedFunction {
-            domain: ColumnValue::from_uints(vec![0, 1]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
+        let stream_tile = Tile::function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
                 ("time".to_string(), ColumnValue::Ints(vec![10, 20])),
                 (
                     "decision".to_string(),
@@ -4718,13 +4756,11 @@ mod variant_ctor_tests {
                     )])),
                 ),
             ])))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        };
-        let stream_tiling = Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(stream_extent)),
-        };
+            Predicate::True,
+            BitSet::new(),
+        );
+        let stream_tiling =
+            Tiling::function(Extent::Base(BaseType::UInt), Tiling::Scalar(stream_extent));
         let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
             tile: stream_tile,
             tiling: stream_tiling,
@@ -4734,15 +4770,12 @@ mod variant_ctor_tests {
         let op = convert_impl(&transformer, Some(stream_op), &mut ctx).expect("op-conversion");
         let tile = drive(op);
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = tile
-        else {
-            panic!("expected SealedFunction, got {tile:?}");
+        let Tile::Function { keys, values, .. } = tile else {
+            panic!("expected Function, got {tile:?}");
         };
-        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
-        let Tile::Record(fields) = *codomain else {
-            panic!("expected a Record codomain, got {codomain:?}");
+        assert_eq!(keys, ColumnValue::from_uints(vec![0, 1]));
+        let Tile::Record(fields) = *values else {
+            panic!("expected a Record values, got {values:?}");
         };
         // Each row keeps its own outer `time` (10, 20) paired with its own commit
         // payload (1, 2) — proving the by-key co-iteration.
@@ -4836,31 +4869,28 @@ mod variant_ctor_tests {
 
         // Drive over the value stream [0, 1] (injected at the op boundary).
         let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
-            tile: Tile::SealedFunction {
-                domain: ColumnValue::from_uints(vec![0, 1]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1]))),
-                domain_predicate: Predicate::True,
-                deleted: BitSet::new(),
-            },
-            tiling: Tiling::SealedFunction {
-                domain: Extent::Base(BaseType::UInt),
-                codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-            },
+            tile: Tile::function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            tiling: Tiling::function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
         });
 
         let mut ctx = OpConversionContext::new();
         let op = convert_impl(&transformer, Some(stream_op), &mut ctx).expect("op-conversion");
         let tile = drive(op);
 
-        let Tile::SealedFunction {
-            domain, codomain, ..
-        } = tile
-        else {
-            panic!("expected SealedFunction, got {tile:?}");
+        let Tile::Function { keys, values, .. } = tile else {
+            panic!("expected Function, got {tile:?}");
         };
-        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
-        let Tile::Scalar(cv) = *codomain else {
-            panic!("expected a Scalar(Union) codomain, got {codomain:?}");
+        assert_eq!(keys, ColumnValue::from_uints(vec![0, 1]));
+        let Tile::Scalar(cv) = *values else {
+            panic!("expected a Scalar(Union) values, got {values:?}");
         };
         // p == 0 → commit(1); p == 1 → abort(unit).
         assert_eq!(
