@@ -3,6 +3,15 @@ description: >-
   The setup every Rust gate shares: the pinned stable toolchain, the Cargo build
   cache, and the z3 binary refinement subtyping shells out to.
 
+inputs:
+  cache-key:
+    description: >-
+      A `rust-cache` key to share with another job, for a job whose Cargo build
+      is identical to that one's. Empty (the default) keys the cache on this
+      job's own name, which is what a gate with a build of its own wants.
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -19,6 +28,10 @@ runs:
     # rebuild against a cache that stays warm for every other branch.
     - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       with:
+        # An empty `shared-key` is falsy to the action, which then keys on the
+        # job name. A non-empty one replaces that name rather than extending it,
+        # so two jobs naming the same key read and write one entry.
+        shared-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
 
     # The refinement-entailment fallback shells out to a `z3` subprocess

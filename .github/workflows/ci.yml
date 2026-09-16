@@ -152,11 +152,11 @@ jobs:
         if: success() || failure()
         run: ./ci.sh doc
 
-  # The suite, both ways — the longest gate, so it sets the run's wall clock.
-  # The lint jobs are separate because clippy runs through clippy-driver, which
-  # cargo fingerprints separately from rustc: a clippy pass warms nothing the
-  # suite then reuses (see `ci_clippy` in ci.sh), so splitting them duplicates
-  # no compilation.
+  # The suite — the longest gate, so it sets the run's wall clock. The lint jobs
+  # are separate because clippy runs through clippy-driver, which cargo
+  # fingerprints separately from rustc: a clippy pass warms nothing the suite
+  # then reuses (see `ci_clippy` in ci.sh), so splitting them duplicates no
+  # compilation.
   test:
     needs: repo_checks
     if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
@@ -164,6 +164,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/rust
+        with:
+          # `test_reversed` runs this job's command with one env var changed, so
+          # the two compile the same artifacts. One shared entry, rather than a
+          # second copy that starts cold. Both jobs save it on main; whichever
+          # loses that race logs "already exists" and continues.
+          cache-key: test
 
       - name: Test
         # `CAMBRA_PROVENANCE_GATE=1` makes every compile fold every gated pane pair
@@ -173,17 +179,31 @@ jobs:
         # step, which is worth paying to keep the next one from doing the same.
         run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
+  # The same suite with every refinement set built in reversed physical order.
+  # A refinement set is unordered by contract, but two classes of
+  # order-dependence survive a compile-clean rewrite and only running the suite
+  # both ways exercises them: a consumer that iterates the set and lets the order
+  # reach something observable, and a dedup that keeps the first-inserted of two
+  # `eq`-equal refinements whose predicate terms carry different embedded type
+  # slots. Nothing in the type system catches either, so an unrun knob would rot
+  # exactly as an uncompiled feature does.
+  #
+  # Its own job, though the env var is read at runtime and a second step in
+  # `test` would reuse that job's binaries for free. Reusing them serialized 46s
+  # of pure execution behind the first run; compiling a second copy in parallel
+  # costs wall clock only if this job overtakes `test`, and it starts a whole
+  # compile behind.
+  test_reversed:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+        with:
+          cache-key: test
+
       - name: Test (reversed refinement order)
-        # A refinement set is unordered by contract, but two classes of
-        # order-dependence survive a compile-clean rewrite and only running the
-        # suite both ways exercises them: a consumer that iterates the set and
-        # lets the order reach something observable, and a dedup that keeps the
-        # first-inserted of two `eq`-equal refinements whose predicate terms carry
-        # different embedded type slots. Nothing in the type system catches
-        # either, so an unrun knob would rot exactly as an uncompiled feature
-        # does. The env var is read at runtime, so this reuses the binaries the
-        # step above already built, which is why both live in one job.
-        if: success() || failure()
         run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
 
   # The Lean model: `lake build` elaborates every theorem and evaluates every
@@ -240,7 +260,7 @@ jobs:
   # Keeping that name on a job that only collects results is what lets the gates
   # above be split, renamed, or added to without a ruleset edit.
   check:
-    needs: [repo_checks, lint, clippy, clippy_release, test, formal, fixtures, web]
+    needs: [repo_checks, lint, clippy, clippy_release, test, test_reversed, formal, fixtures, web]
     # `always()` so this runs when a gate failed; without it the job would be
     # skipped and the required check would never report.
     if: always()
