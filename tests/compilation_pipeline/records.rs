@@ -358,32 +358,35 @@ fn test_product_of_collections_is_a_record_of_tables() {
     );
 }
 
-/// A record with a collection field is a constant, so a list of them is one too:
-/// `expr_to_value` reaches the nested list and builds its table.
+/// A list of records holding a collection is the struct-of-arrays a record literal
+/// compiles to, with the collection field a level.
 ///
-/// A list literal's elements are whole `Value`s, so the record rides one column
-/// boxed (`Scalar(Records)`) rather than as the struct-of-arrays a record
-/// literal compiles to, and each `b` cell carries its own table.
+/// The literal builds the table it denotes: `a` is one column over the two elements, and
+/// `b` is a level whose groups are each element's own keys. A column has nowhere to put a
+/// level, so boxing the record into one would have to materialize every `b` into a cell.
 #[test]
 fn test_list_of_records_holding_collections() {
     check_tile(
         "xs = [(a=1, b=[1, 2]), (a=3, b=[4, 5])]; xs",
         Tile::function(
             ColumnValue::UInts(vec![0, 1]),
-            Box::new(Tile::Scalar(ColumnValue::Records(
+            Box::new(Tile::Record(
                 [
-                    ("a".to_string(), ColumnValue::Ints(vec![1, 3])),
+                    ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
                     (
                         "b".to_string(),
-                        ColumnValue::Variants(vec![
-                            make_int_collection(&[1, 2]),
-                            make_int_collection(&[4, 5]),
-                        ]),
+                        Tile::grouped(
+                            ColumnValue::UInts(vec![0, 2]),
+                            ColumnValue::UInts(vec![0, 1, 0, 1]),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
+                            Predicate::True,
+                            BitSet::new(),
+                        ),
                     ),
                 ]
                 .into_iter()
                 .collect(),
-            ))),
+            )),
             Predicate::True,
             BitSet::new(),
         ),
