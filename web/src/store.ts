@@ -243,7 +243,17 @@ export class Store {
    * {@link SOURCE_PANE}).
    */
   setSelection(selection: Selection, origin: string | null = null): void {
-    if (selectionsEqual(selection, this.resolved.selection)) return;
+    // `origin` is part of the answer, not just of the request: a pane reads it
+    // to leave its own scroll alone. Re-selecting what is already selected from
+    // a *different* origin is therefore a real change — it is how "go to this
+    // node" reaches a pane that already has that node selected and scrolled
+    // away. Comparing the selection alone swallowed exactly that gesture.
+    if (
+      selectionsEqual(selection, this.resolved.selection) &&
+      origin === this.resolved.origin
+    ) {
+      return;
+    }
     this.resolved = this.resolve(selection, origin);
     // Notify every subscriber even if one throws: a single broken view must not
     // starve the others. We do NOT swallow the error — it is surfaced via
