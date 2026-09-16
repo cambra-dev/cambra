@@ -326,7 +326,8 @@ shrinks every descendant's. Each commit is a PR head, so each should build.
 #### Reading the stack's shape
 
 **A PR's base ref on GitHub is the stack's topology.** Any local record of it is a cache that goes
-stale as main advances:
+stale as main advances. Where the PRs belong to a GitHub stack object that base is GitHub-managed
+and a direct edit is refused; see "GitHub-native stacks" below.
 
 ```bash
 gh pr list --author @me --state open --json number,headRefName,baseRefName
@@ -354,6 +355,117 @@ gh pr list --author @me --state open --json number,headRefName,baseRefName
   between commits. Confirm with `jj status`, `grep`, or a real `cargo build`.
 - **A git worktree is not a jj repo.** A jj command inside one fails with `There is no jj repo in
   "."`. Use a workspace.
+
+### GitHub-native stacks
+
+A **stack object** is GitHub-side state linking a chain of PRs, listed at
+`GET /repos/OWNER/REPO/stacks` and reachable per-PR through GraphQL `pullRequest.stack`. It is
+GitHub-side only: jj bookmarks and any local tracking know nothing about it. Chaining a PR's base
+onto the branch below, as "One stack, one workspace" does, does not create one — `gh stack link`
+does, and a PR outside a stack object keeps an editable base.
+
+The stack object owns the base branches of its members. Everything below follows from that.
+
+#### Creating and growing a stack
+
+`gh stack link` takes branch names, PR numbers or PR URLs in stack order, bottom first, and keeps no
+local tracking state; its help names jj among the tools it is meant to sit beside.
+
+```bash
+gh stack link dmills/<bottom> dmills/<next> dmills/<top>
+gh stack link <stack-number> dmills/<new-top>    # append to an existing stack
+```
+
+It pushes each branch, reuses an open PR where one exists and opens one otherwise, and chains the
+bases. `--base` sets what the bottom targets, and `--open` marks every PR ready for review, so pass
+it only when that is intended. It never removes a PR from a stack, so it creates and grows but does
+not reorder.
+
+#### A stack locks its members' base branches
+
+While a PR belongs to a stack, every base edit is refused:
+
+```
+PATCH /repos/OWNER/REPO/pulls/N  -f base=…
+  422  Cannot change the base branch because the pull request is part of a stack.
+```
+
+Two ways that reads as something else:
+
+- `gh pr edit <n> --base <branch>` fails with an unrelated *Projects (classic) is being deprecated*
+  GraphQL warning, leaves the base unchanged, and never mentions stacks. Diagnose with
+  `gh api -X PATCH` instead, and re-read the base afterwards rather than trusting either command.
+- Closing the PR does not free it: `422 Cannot change the base branch of a closed pull request`.
+
+#### A merged PR is a permanent member, so a stack stops being dissolvable
+
+`gh stack unstack <n>` is the documented escape, and it refuses wholesale once any member has
+merged:
+
+```
+✗ Unstacking not allowed: Pull requests #187, #203 cannot be removed from this stack
+```
+
+A PR cannot be un-merged, so that stack can never be dissolved. Since members merge in the normal
+course of landing a stack, treat `unstack` as available only until the stack's first merge.
+
+#### Restructuring a locked stack
+
+`gh stack submit` rebuilds the GitHub stack from local tracking, and that path sets bases the REST
+endpoint refuses. It is the way to reorder, reparent, or drop members of a stack that `unstack` will
+not release:
+
+```bash
+gh stack checkout <any-member-PR>      # import the remote stack into local tracking
+gh stack unstack <n> --local           # drop local tracking only; GitHub untouched
+gh stack init <bottom> … <top>         # non-interactive; adopt the branches in the new order
+gh stack submit                        # push branches AND set every base; creates a new stack
+```
+
+`init` reports `Found PRs for N of N branches` when each branch already has one, and `submit` prints
+`Updated base branch for PR #N to <branch>` for exactly the bases that moved.
+
+`submit` migrates the open PRs into the new stack and strands the merged ones in the old, which
+shrinks to a tombstone holding only them, at their original positions. The new stack is dissolvable
+until its own first merge. `submit` leaves drafts as drafts; `--open` marks every PR ready for
+review.
+
+`gh stack modify` is the command the extension's docs point at for restructuring, but it is a TUI
+whose only flags are `--abort` and `--continue`, so a script or an agent cannot drive it.
+
+#### Never force-push a head to a commit at or below its base
+
+Reordering puts some branch below one it used to sit above, which makes this the default failure of
+hand-pushing a reorder. What GitHub does depends on how the head sits against the base, and only one
+of the two is recoverable:
+
+- **Head equal to the base commit** — the PR has no commits, GitHub closes it (`state: CLOSED`,
+  `mergedAt: null`), and `gh pr reopen <n>` after repushing restores the body, draft state, base and
+  reviews.
+- **Head an ancestor of the base** — the base already contains it, so GitHub marks it
+  `merged: true`. It is gone: `gh pr reopen` answers *can't be reopened because it was already
+  merged*, and no API un-merges a PR. Nothing reaches `main`, the merge being bookkeeping, but the
+  PR number and its description are lost.
+
+So do not push branches by hand and then repair bases. Run a reorder through `init` and `submit`,
+which push and re-base in one step.
+
+#### Operational notes
+
+- `gh stack` needs a checked-out branch. On a detached HEAD it fails with *failed to get current
+  branch: not on any branch*, so run it from a workspace or worktree.
+- `gh stack checkout <PR>` writes local branches and switches to one. Run it in a scratch checkout,
+  not in one holding work.
+- Stack numbers and PR numbers do not overlap, so a bare number is unambiguous to `gh stack`.
+- `GH_DEBUG=api gh stack <cmd>` prints the request and the real API error; the extension's own
+  wording hides both.
+- Membership, including merged members and their positions:
+
+```bash
+gh api graphql -f query='query { repository(owner:"OWNER", name:"REPO") {
+  pullRequest(number:N) { stack { number size entries(first:20) { nodes {
+    position pullRequest { number state merged headRefName baseRefName } } } } } } }'
+```
 
 ### Parallel Workspaces
 
