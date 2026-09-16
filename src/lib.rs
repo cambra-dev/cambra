@@ -10,4 +10,3 @@ pub mod live_program;
 pub mod pretty_graph;
 pub mod pretty_tree;
 pub mod util;
-pub mod web_inspector;
