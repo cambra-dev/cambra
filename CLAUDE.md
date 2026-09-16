@@ -257,89 +257,226 @@ When you are using compact, focus on test output and code changes.
 - Do not attribute authorship to AI tools or models anywhere git records it — neither commit messages nor PR descriptions. This covers any form the attribution takes: `Co-Authored-By:` trailers, "Generated with"/"Created with" footers (e.g. `🤖 Generated with [Claude Code]`), tool/model names in the body, and any future variant. The rule is the intent (no AI authorship credit), not a fixed list of strings. PR descriptions matter because this repo squash-merges, so the PR body becomes the commit message on the main branch.
 - When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
    1. `git fetch origin`
-   2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
+   2. `git log main..origin/main --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
 - Writing a PR title and description — or a commit description, which `gh pr create --fill` copies into the body verbatim — is the `pr-description` skill's job (`.claude/skills/pr-description/SKILL.md`): draft it cold in a subagent, an imperative title, summary first, then a review guide, sub-linear length, the Markdown mechanics, and the `gh api` workaround for editing a posted title and body. Load it rather than working from memory.
 
-### Stack Management & Rebasing (jj vs git-spice)
+### Stack Management & Rebasing (jj)
 
-Engineers in this repo manage and rebase stacked PRs using either `jj` (jujutsu) or `git-spice` (`gs`). **Default to trying `jj` first** for stack operations, but consult your memory files, environment-specific prompts, or the current repository state (e.g. active git branches vs. jj bookmarks) to verify if the engineer is actively using `git-spice`.
+`jj` (jujutsu, currently 0.44) is initialized over this repo's git checkout. Bookmarks are git
+branches, so `git` and `gh` see every commit jj makes.
 
-#### Option A: Stacked PRs with git-spice
-
-This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs when working with standard Git branches. Workflow for creating a new PR in a stack:
-
-> **Before submitting:** run `./ci.sh` and confirm it passes. `gs branch submit` runs no checks of its own, so this is the only gate before GitHub CI sees the branch — and it lints in all three configurations (an un-run release clippy pass is the most common way CI fails after a green local `cargo clippy`).
-
-**git-spice branch creation** (stage changes first, then):
+#### One stack, one workspace
 
 ```bash
-gs branch create -m "commit message"   # creates branch + commit in one step
-gs branch submit --fill --no-draft     # submit to GitHub
-gs stack submit --update-only          # add nav comments to all PRs in stack
+jj workspace add ../cambra-<task> --name <task> -r main
+cd ../cambra-<task>
 ```
 
-**Plain git then track** (more control over commit flow):
+Each workspace has its own working-copy commit, so concurrent tasks never share `@` or see each
+other's edits, and each moves only the bookmarks it pushes.
+
+The PR at the bottom of the stack:
 
 ```bash
-git checkout -b <branch-name>
-git add <files> && git commit -m "..."
-gs branch track --base <parent-branch>   # register with git-spice
-gs branch submit --fill --no-draft
-gs stack submit --update-only
+# ... make the change ...
+jj describe -m "Imperative subject line"
+jj bookmark set dmills/<name> -r @
+jj git push --named dmills/<name>=@
+gh pr create --base main --head dmills/<name> --fill
 ```
 
-Notes:
+Each PR above it repeats that from a new commit, based on the branch below:
 
-- Prefer `gs branch create` over `git checkout -b` for branch creation — if `spice.branchCreate.prefix` is configured, git-spice will apply it automatically, avoiding manual prefix guessing.
-- For a PR stacked on `main`, `--base main` is implicit; for stacked PRs use `--base <parent-branch>`.
-- `gs stack submit` discovers existing PRs by branch name and adds navigation comments. Use `--update-only` to skip prompts for branches without PRs yet.
-- To view the current stack: `gs log long`
+```bash
+jj new
+# ... make the change ...
+jj describe -m "Imperative subject line"
+jj bookmark set dmills/<next> -r @
+jj git push --named dmills/<next>=@
+gh pr create --base dmills/<name> --head dmills/<next> --fill
+```
 
-#### Option B: Rebasing a stack with jujutsu (jj)
+`--named <name>=<rev>` registers a bookmark origin lacks; `--bookmark <name>` pushes one it already
+has. 0.44 has no `--allow-new`. Branch names carry the `dmills/` prefix, applied by hand. A PR
+stacked on a draft stays a draft: take the flag from the base rather than from this recipe.
 
-`jj` (jujutsu, currently 0.43) is initialized over the same git repo as git-spice. Unlike `git rebase`/`gs`, jj records conflicts *inside* commits and does not stop mid-rebase, so the whole stack moves in one command and you resolve conflicts afterward, bottom→tip, with automatic propagation.
+**Before pushing:** run `./ci.sh` at the tip and confirm it passes — an un-run release clippy pass
+is the most common way CI fails after a green `cargo clippy`. Do not sweep it down the stack head by
+head; every PR gets its own CI job, so pushing runs them all in parallel.
 
-Mental model:
+#### Following main
 
-- jj **bookmarks** are git branches. Each git-spice branch head appears as a bookmark on the matching commit; `main@origin`, `<name>@origin` are remote-tracking. `@` is the working-copy commit (itself a real, editable commit).
-- Every operation is recorded in the **op log** — `jj op log` — and any prior state is recoverable with `jj op restore <op-id>`. This is your undo; there is no "rebase --abort" because a rebase never leaves you detached.
-- An edit lands in `@` as it is made. There is no staging area, so the commit an edit belongs to is
-  chosen before the edit rather than after: run `jj new` before starting a unit of work, and
-  `jj new --insert-after <head>` followed by `jj bookmark set <name> -r @` when the work belongs to
-  an existing bookmark. `.claude/hooks/jj-published-commit.py` reports the case that rewrites
-  published history — `@` at or below a pushed bookmark — and judges nothing else.
+```bash
+jj git fetch
+jj rebase -s <stack-root-change-id> --onto main
+jj git push -r 'main..@'
+```
 
-Workflow (validated rebasing the inspector stack onto `dmills/txn-mutability`):
+`-s` moves that commit and every descendant, bookmarks riding along, so one command moves the whole
+stack. A lone PR is `jj rebase -b dmills/<name> --onto main`, where `-b` moves the commits reachable
+from the bookmark but not from `main`. `-d` and `--destination` are aliases for `--onto`.
 
-1. **Sync + validate.** `jj git fetch`. If a local bookmark is stale, move it: `jj bookmark set <name> -r <name>@origin --allow-backwards`. Cross-check the stack against `gs ll` — every git-spice branch should be a bookmark on the expected commit, with matching per-branch commit counts.
-2. **Check base lineage before rebasing.** `jj log -r 'main..<target>'` and confirm the target descends from what your stack assumes. A target that predates a layout-affecting change your stack is written against (e.g. a directory rename) causes *silent* structural breakage jj will not flag as a conflict — verify the file layout matches (`git ls-tree`) first.
-3. **Checkpoint.** `jj op log --limit 1` — note the op id to `jj op restore` back to if needed.
-4. **Rebase the whole stack in one command:** `jj rebase -s <stack-base-change-id> -d <target-bookmark>`. `-s` moves that commit and *all* descendants (bookmarks + working copy ride along). Conflicts are recorded in-commit; jj reports which commits are conflicted and does not stop.
-5. **Resolve bottom→tip.** `jj edit <change-id>` enters a commit; `jj resolve --list` lists its conflicts; edit files to remove markers (jj uses git-style `<<<<<<<`/`>>>>>>>` plus diff-style `%%%%%%%`/`+++++++` hunks). Run `cargo build` before moving up — resolving a parent auto-propagates and shrinks descendants' conflicts. Aim for each stack commit (each is a PR head) to build green.
-6. **Verify at the tip:** `jj edit <tip-bookmark>` then `./ci.sh` (the same authoritative gate as any push — all three clippy passes + doc + tests).
+`-r 'main..@'` pushes every bookmark on the stack. `--tracked` pushes every tracked bookmark in the
+repo, other workspaces' included, so it is the wrong tool here.
 
-Gotchas:
+Conflicts are recorded in-commit and jj does not stop. Resolve bottom→tip: `jj edit <change-id>`
+enters a commit, `jj resolve --list` lists its conflicts, and resolving a parent propagates down and
+shrinks every descendant's. Each commit is a PR head, so each should build.
 
-- **Conflict propagation:** after `jj rebase`, *every* descendant of the first conflicted commit shows "(conflict)" — most of that is the parent's conflict propagated down, and clears when you resolve the parent. Don't resolve the same hunk in five commits; fix it once at the lowest commit that owns it.
-- **Required-field fallout is not a conflict:** adding a required struct field low in the stack breaks construction sites in files with no textual conflict (including the new base's code). These surface as compile errors, not conflict markers — resolve them in the commit that introduced the field so that commit builds.
-- **Stale editor diagnostics:** LSP/rustc diagnostics can lag the working copy after `jj edit` hops between commits — a reported conflict marker or missing field may be from a commit you already moved off of. Confirm ground truth with `jj status` / `grep` / a real `cargo build` before acting on a surprising diagnostic.
-- **Bookmarks ride their commits automatically** — never move them by hand during a rebase.
-- **No concurrent mutators:** never run two agents (or an agent + yourself) mutating the same jj working copy at once — the shared commit graph will corrupt. Read-only investigation in parallel is fine.
-- jj resolves are amended in place (no separate "continue" step); the op log is the only undo you need.
+#### Reading the stack's shape
 
-### Parallel Workspaces (Multi-Tasking)
+**A PR's base ref on GitHub is the stack's topology.** Any local record of it is a cache that goes
+stale as main advances. Where the PRs belong to a GitHub stack object that base is GitHub-managed
+and a direct edit is refused; see "GitHub-native stacks" below.
 
-This repository supports parallel development using native `jj` workspaces (the `jj` equivalent of Git worktrees).
+```bash
+gh pr list --author @me --state open --json number,headRefName,baseRefName
+```
 
-- **Create a workspace:** `jj workspace add ../cambra-feature --name feature`
-- **List workspaces:** `jj workspace list`
-- **Remove a workspace:** `jj workspace forget <name>` then `rm -rf ../path`
+#### Gotchas
 
-#### Stale Working Copies
+- **Every command snapshots the working copy** and rewrites `@` unless given
+  `--ignore-working-copy`. A bookmark sitting on `@` moves with the snapshot and exports to git, so
+  a bare `jj status` can leave a branch on an empty commit while origin keeps the real one. Read
+  with `jj log -r @ --ignore-working-copy`; recover with `jj bookmark set <name> -r <good-sha>
+  --allow-backwards` then `jj abandon <empty-sha>`.
+- **The op log is the undo.** `jj op log` records every operation and `jj op restore <op-id>`
+  returns to one. A rebase never leaves the repo detached, so there is no `--abort`.
+- **An edit lands in `@` as it is made.** There is no staging area, so the commit an edit belongs to
+  is chosen before the edit rather than after: run `jj new` before starting a unit of work.
+  `.claude/hooks/jj-published-commit.py` reports the case that rewrites published history — `@` at
+  or below a pushed bookmark — and judges nothing else.
+- **Conflicts propagate before they are resolved.** Every descendant of the first conflicted commit
+  reports a conflict, most of it inherited. Fix the hunk once, at the lowest commit that owns it.
+- **Required-field fallout is not a conflict.** A required struct field added low in a stack breaks
+  construction sites in files with no textual conflict. These surface as compile errors; resolve
+  them in the commit that introduced the field.
+- **Stale editor diagnostics.** LSP and rustc diagnostics lag the working copy after `jj edit` hops
+  between commits. Confirm with `jj status`, `grep`, or a real `cargo build`.
+- **A git worktree is not a jj repo.** A jj command inside one fails with `There is no jj repo in
+  "."`. Use a workspace.
 
-Because all workspaces share a unified history graph, editing or rebasing an ancestor commit from Workspace A will cause Workspace B to become "stale" if its current commit depends on that ancestor.
+### GitHub-native stacks
 
-If a workspace reports it is stale or blocks commands, synchronize its filesystem by running:
+A **stack object** is GitHub-side state linking a chain of PRs, listed at
+`GET /repos/OWNER/REPO/stacks` and reachable per-PR through GraphQL `pullRequest.stack`. It is
+GitHub-side only: jj bookmarks and any local tracking know nothing about it. Chaining a PR's base
+onto the branch below, as "One stack, one workspace" does, does not create one — `gh stack link`
+does, and a PR outside a stack object keeps an editable base.
+
+The stack object owns the base branches of its members. Everything below follows from that.
+
+#### Creating and growing a stack
+
+`gh stack link` takes branch names, PR numbers or PR URLs in stack order, bottom first, and keeps no
+local tracking state; its help names jj among the tools it is meant to sit beside.
+
+```bash
+gh stack link dmills/<bottom> dmills/<next> dmills/<top>
+gh stack link <stack-number> dmills/<new-top>    # append to an existing stack
+```
+
+It pushes each branch, reuses an open PR where one exists and opens one otherwise, and chains the
+bases. `--base` sets what the bottom targets, and `--open` marks every PR ready for review, so pass
+it only when that is intended. It never removes a PR from a stack, so it creates and grows but does
+not reorder.
+
+#### A stack locks its members' base branches
+
+While a PR belongs to a stack, every base edit is refused:
+
+```
+PATCH /repos/OWNER/REPO/pulls/N  -f base=…
+  422  Cannot change the base branch because the pull request is part of a stack.
+```
+
+Two ways that reads as something else:
+
+- `gh pr edit <n> --base <branch>` fails with an unrelated *Projects (classic) is being deprecated*
+  GraphQL warning, leaves the base unchanged, and never mentions stacks. Diagnose with
+  `gh api -X PATCH` instead, and re-read the base afterwards rather than trusting either command.
+- Closing the PR does not free it: `422 Cannot change the base branch of a closed pull request`.
+
+#### A merged PR is a permanent member, so a stack stops being dissolvable
+
+`gh stack unstack <n>` is the documented escape, and it refuses wholesale once any member has
+merged:
+
+```
+✗ Unstacking not allowed: Pull requests #187, #203 cannot be removed from this stack
+```
+
+A PR cannot be un-merged, so that stack can never be dissolved. Since members merge in the normal
+course of landing a stack, treat `unstack` as available only until the stack's first merge.
+
+#### Restructuring a locked stack
+
+`gh stack submit` rebuilds the GitHub stack from local tracking, and that path sets bases the REST
+endpoint refuses. It is the way to reorder, reparent, or drop members of a stack that `unstack` will
+not release:
+
+```bash
+gh stack checkout <any-member-PR>      # import the remote stack into local tracking
+gh stack unstack <n> --local           # drop local tracking only; GitHub untouched
+gh stack init <bottom> … <top>         # non-interactive; adopt the branches in the new order
+gh stack submit                        # push branches AND set every base; creates a new stack
+```
+
+`init` reports `Found PRs for N of N branches` when each branch already has one, and `submit` prints
+`Updated base branch for PR #N to <branch>` for exactly the bases that moved.
+
+`submit` migrates the open PRs into the new stack and strands the merged ones in the old, which
+shrinks to a tombstone holding only them, at their original positions. The new stack is dissolvable
+until its own first merge. `submit` leaves drafts as drafts; `--open` marks every PR ready for
+review.
+
+`gh stack modify` is the command the extension's docs point at for restructuring, but it is a TUI
+whose only flags are `--abort` and `--continue`, so a script or an agent cannot drive it.
+
+#### Never force-push a head to a commit at or below its base
+
+Reordering puts some branch below one it used to sit above, which makes this the default failure of
+hand-pushing a reorder. What GitHub does depends on how the head sits against the base, and only one
+of the two is recoverable:
+
+- **Head equal to the base commit** — the PR has no commits, GitHub closes it (`state: CLOSED`,
+  `mergedAt: null`), and `gh pr reopen <n>` after repushing restores the body, draft state, base and
+  reviews.
+- **Head an ancestor of the base** — the base already contains it, so GitHub marks it
+  `merged: true`. It is gone: `gh pr reopen` answers *can't be reopened because it was already
+  merged*, and no API un-merges a PR. Nothing reaches `main`, the merge being bookkeeping, but the
+  PR number and its description are lost.
+
+So do not push branches by hand and then repair bases. Run a reorder through `init` and `submit`,
+which push and re-base in one step.
+
+#### Operational notes
+
+- `gh stack` needs a checked-out branch. On a detached HEAD it fails with *failed to get current
+  branch: not on any branch*, so run it from a workspace or worktree.
+- `gh stack checkout <PR>` writes local branches and switches to one. Run it in a scratch checkout,
+  not in one holding work.
+- Stack numbers and PR numbers do not overlap, so a bare number is unambiguous to `gh stack`.
+- `GH_DEBUG=api gh stack <cmd>` prints the request and the real API error; the extension's own
+  wording hides both.
+- Membership, including merged members and their positions:
+
+```bash
+gh api graphql -f query='query { repository(owner:"OWNER", name:"REPO") {
+  pullRequest(number:N) { stack { number size entries(first:20) { nodes {
+    position pullRequest { number state merged headRefName baseRefName } } } } } } }'
+```
+
+### Parallel Workspaces
+
+- **Create:** `jj workspace add ../cambra-<task> --name <task> -r main`
+- **List:** `jj workspace list`
+- **Remove:** `jj workspace forget <name>`, then delete the directory
+
+All workspaces share one commit graph, so rebasing a commit from one workspace leaves another stale
+when its working-copy commit descends from what moved. A workspace that reports staleness or blocks
+commands is resynchronized with:
 
 ```bash
 jj workspace update-stale
+```

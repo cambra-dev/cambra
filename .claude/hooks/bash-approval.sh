@@ -12,12 +12,6 @@ if echo "${COMMAND}" | grep -q "^gh pr create"; then
   exit 0
 fi
 
-# gs branch submit: heredoc body breaks normal wildcard matching
-if echo "${COMMAND}" | grep -q "^gs branch submit"; then
-  echo '{"permissionDecision": "allow"}'
-  exit 0
-fi
-
 # git commit: heredoc message breaks normal wildcard matching
 if echo "${COMMAND}" | grep -q "^git commit"; then
   echo '{"permissionDecision": "allow"}'

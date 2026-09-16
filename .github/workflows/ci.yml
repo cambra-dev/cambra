@@ -6,9 +6,12 @@ on:
   pull_request: # Trigger on all PRs to satisfy branch protection
     types: [opened, synchronize, reopened]
 
-# Group runs by workflow + PR branch (head_ref) so duplicate runs (e.g. from
-# git-spice force-pushing twice) cancel the earlier one. head_ref is empty on
-# pushes to main, so those fall back to run_id and are never cancelled.
+# Group runs by workflow + PR branch (head_ref) so duplicate runs, as a restack
+# that force-pushes a branch twice produces, cancel the earlier one. A cancelled
+# run's `check` job collects every gate as "cancelled" and reports failure, so
+# read a PR's status at its head SHA rather than from `gh pr checks`, which
+# unions across runs. head_ref is empty on pushes to main, so those fall back to
+# run_id and are never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
