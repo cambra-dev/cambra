@@ -155,6 +155,25 @@ describe("nodesInRange: containment is decided on visible text", () => {
     // next line and stays out.
     expect(t.nodesInRange(0, 6).sort((a, b) => a - b)).toEqual([61]);
   });
+
+  // The region has an upper bound as well as a lower one. Monotonicity alone
+  // is satisfied by growing to the root, so it cannot see a region that grows
+  // too far; these pin what must stay *out*.
+  it("explains the construct the drag covers, and not its parent", () => {
+    // Over `block:`'s visible extent. Widening to the raw span of the node
+    // clause 1 picked put `hi` past the trimmed end of every ancestor closing
+    // on the same newline, so each read as cut and was absorbed whole.
+    expect(t.selectionRegion(6, 19)).toEqual({ from: 6, to: 19 });
+  });
+
+  it("does not drag an untouched sibling in behind the parent", () => {
+    const region = t.selectionRegion(6, 19);
+    expect(t.nodesInRange(region.from, region.to).sort((a, b) => a - b)).toEqual([62, 63]);
+  });
+
+  it("keeps a caret inside the construct it is in", () => {
+    expect(t.selectionRegion(15, 19)).toEqual({ from: 15, to: 19 });
+  });
 });
 
 describe("nodesInRange: visible extents are measured in bytes", () => {

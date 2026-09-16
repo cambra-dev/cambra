@@ -16,6 +16,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 
 import { renderApp } from "./main";
 import { Store } from "./store";
+import type { Resolved } from "./store";
 import { SourceView } from "./sourceView";
 import { TreeView, serializeTree } from "./treeView";
 
@@ -25,9 +26,11 @@ import { fixture, irPaneById, operatorPaneById, stubLayout, theNode } from "./__
 import { isIrPane } from "./types";
 import type { Snapshot } from "./types";
 
+import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
 const listMin = fixture(listMinJson);
+const arithmetic = fixture(arithmeticJson);
 // The tree-shaped panes. The layout draws every pane; these tests drive the
 // source<->tree link, and the operator pane's own rendering is covered in
 // operatorView.dom.test.ts.
@@ -178,22 +181,35 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
 
   it("says so in a pane that holds no part of the selection", () => {
-    // `ExprStmt` is rewritten away by channelize, so a click on a statement
-    // has no counterpart downstream: those panes light up entirely as traces.
-    // A pane of amber rows with no explanation reads as a fault, so the pane
-    // says which it is. Reproduced here by widening a downstream twin so the
-    // pane holds a highlight that is not an anchor.
-    const snap = structuredClone(listMin) as Snapshot;
+    // `ExprStmt` is rewritten away by channelize, so a click on a statement has
+    // no counterpart downstream: `post-channelize` lights up entirely as
+    // traces. A pane of amber rows with no explanation reads as a fault, so the
+    // pane says which it is. `arithmetic` byte 7 is such a click — the pane
+    // holds nine highlights and no anchor.
+    const snap = arithmetic;
     const root = document.createElement("div");
     document.body.appendChild(root);
     const store = new Store(snap);
-    const pane = snap.panes.find((p) => p.id === "post-channelize")!;
+    const pane = irPaneById(snap, "post-channelize");
     const body = document.createElement("div");
     root.appendChild(body);
-    new TreeView(body, store, pane.id, (pane as { root: number }).root);
+    new TreeView(body, store, pane.id, pane.root);
+
+    let latest: Resolved | null = null;
+    store.subscribe((r) => {
+      latest = r;
+    });
+
+    // Highlights but no anchor: the pane says so.
+    store.setSelection({ kind: "source", from: 7, to: 7 });
+    expect(latest!.result.highlightsByPane.get(pane.id)?.size ?? 0).toBeGreaterThan(0);
+    expect(latest!.primaryByPane.get(pane.id)?.size ?? 0).toBe(0);
+    expect(body.querySelector(".no-anchor-notice")).not.toBeNull();
 
     // An anchor in this pane: no notice.
-    store.setSelection({ kind: "node", paneId: pane.id, nodeId: 1 }, pane.id);
+    const anchored = [...(latest!.result.highlightsByPane.get(pane.id) ?? [])][0];
+    store.setSelection({ kind: "node", paneId: pane.id, nodeId: anchored }, pane.id);
+    expect(latest!.primaryByPane.get(pane.id)?.size ?? 0).toBeGreaterThan(0);
     expect(body.querySelector(".no-anchor-notice")).toBeNull();
 
     // Nothing selected: no notice either.
@@ -224,6 +240,36 @@ describe("view integration: cross-pane source<->tree linking", () => {
     for (const [id, n] of calls) {
       if (id !== origin) expect(n, `${id} scrolls`).toBeGreaterThan(0);
     }
+  });
+
+  it("re-selecting the same node from elsewhere scrolls the pane that held it", () => {
+    // The "go to this node" gestures — an operator-pane reference row, a
+    // repeated goto-definition, the hover jump — dispatch the selection with no
+    // origin so every pane scrolls, including the one the reader is in. When
+    // that node is already the selection, only the origin differs; comparing
+    // the selection alone swallowed the gesture and nothing moved.
+    const { store, trees } = mountApp(listMin);
+    const origin = "post-inference";
+    const lit = theNode(irPaneById(listMin, origin), "Lit(Int(1))");
+
+    // Clicked here: this pane deliberately does not scroll.
+    store.setSelection({ kind: "node", paneId: origin, nodeId: lit.nodeId }, origin);
+
+    let scrolls = 0;
+    for (const row of trees.get(origin)!.querySelectorAll(".tree-row")) {
+      (row as HTMLElement).scrollIntoView = () => {
+        scrolls += 1;
+      };
+    }
+
+    // Same node, no origin: "take me there".
+    let latest: Resolved | null = null;
+    store.subscribe((r) => {
+      latest = r;
+    });
+    store.setSelection({ kind: "node", paneId: origin, nodeId: lit.nodeId });
+    expect(latest!.origin).toBeNull();
+    expect(scrolls).toBeGreaterThan(0);
   });
 
   it("a jump scrolls every pane, including the one it came from", () => {

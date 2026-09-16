@@ -240,7 +240,12 @@ export function buildIndices(
   //
   // Closed to a fixed point, since taking a cut node whole can leave a further
   // node partly inside. A node *containing* the region is never taken: that is
-  // clause 1's job, and following it here would climb to the root. Capped
+  // clause 1's job, and following it here would climb to the root. That holds
+  // only if both clauses measure the same way: the region is kept in **visible**
+  // offsets, because clause 2 and `nodesInRange` both classify on `visible`. A
+  // raw extent from clause 1 ends past the trimmed end of any ancestor closing
+  // on the same newline, so the ancestor fails `encloses`, reads as cut, and is
+  // absorbed whole — and every co-terminal ancestor above it in turn. Capped
   // rather than looped, on the same reasoning as elsewhere — it terminates at
   // the root's extent, and saying so in the code beats trusting the argument.
   const selectionRegion = (from: number, to: number): { from: number; to: number } => {
@@ -251,8 +256,8 @@ export function buildIndices(
       if (predicateIds.has(row.nodeId)) continue;
       const v = visible(row.start, row.end);
       if (v.start > from || to > v.end) continue;
-      if (inside === null || row.end - row.start < inside.end - inside.start) {
-        inside = { start: row.start, end: row.end };
+      if (inside === null || v.end - v.start < inside.end - inside.start) {
+        inside = v;
       }
     }
     if (inside !== null) {
@@ -268,8 +273,8 @@ export function buildIndices(
         const covered = lo <= v.start && v.end <= hi;
         const encloses = v.start <= lo && hi <= v.end;
         if (!overlaps || covered || encloses) continue;
-        lo = Math.min(lo, row.start);
-        hi = Math.max(hi, row.end);
+        lo = Math.min(lo, v.start);
+        hi = Math.max(hi, v.end);
         grew = true;
       }
       if (!grew) break;

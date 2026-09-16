@@ -301,10 +301,12 @@ export class SourceView {
     // in progress. The reply carries no selection change, so it does not
     // re-enter this listener.
     //
-    // A pointer selection is left alone while the button is down: snapping
-    // mid-drag would move the end of the range the reader is still dragging.
-    // `mouseup` below snaps once the gesture is finished. A keyboard selection
-    // has no such window, so it snaps as it arrives.
+    // Every `selectionSet` update is forwarded, pointer and keyboard alike, so
+    // a drag reports its range as it grows. The range is taken as the reader
+    // drew it: nothing snaps it to a construct boundary, because `resolve`
+    // already widens it to the construct it explains (`selectionRegion`), and
+    // rewriting the reader's own range mid-drag would move the end they are
+    // still dragging.
     const selectionSync = EditorView.updateListener.of((update) => {
       if (!update.selectionSet) return;
       const range = update.state.selection.main;
