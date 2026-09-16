@@ -538,7 +538,9 @@ pub(crate) fn run(
     // point at which eager trait narrowing can be checked against the ground truth
     // it was approximating incrementally. Debug-only, and a pure read of the graph.
     #[cfg(debug_assertions)]
-    solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok());
+    crate::ccl::provenance::run_debug_check(|| {
+        solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok())
+    });
 
     // Every requirement a definition places on one of its own values is recorded by
     // now, so this is where they can be read *together* — the step narrowing cannot

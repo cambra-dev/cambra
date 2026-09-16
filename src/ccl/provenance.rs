@@ -1975,10 +1975,10 @@ impl Drop for PreservingIds {
 /// **preserves** ids instead of freshening them.
 ///
 /// Reach for it through
-/// [`TypedExpr::clone_preserving_ids`](crate::ccl::expr::TypedExpr::clone_preserving_ids),
-/// never directly: the scope must cover the clone and nothing else, and a
-/// genuine duplication performed inside one would silently produce a
-/// duplicate id.
+/// [`TypedExpr::clone_preserving_ids`](crate::ccl::expr::TypedExpr::clone_preserving_ids)
+/// or [`run_debug_check`], never directly: the scope must cover the clone and
+/// nothing else, and a genuine duplication performed inside one would silently
+/// produce a duplicate id.
 #[must_use]
 pub(crate) fn preserve_ids() -> PreservingIds {
     PRESERVING_IDS.with(|c| c.set(c.get() + 1));
@@ -2016,6 +2016,51 @@ pub(crate) fn preserve_ids() -> PreservingIds {
 pub(crate) fn preserving_ids<R>(f: impl FnOnce() -> R) -> R {
     let _guard = preserve_ids();
     f()
+}
+
+thread_local! {
+    /// Depth of the enclosing [`run_debug_check`] scopes.
+    static SEALED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a [`run_debug_check`] scope is open on this thread, so
+/// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) builds a throwaway
+/// rather than minting.
+pub(crate) fn record_sealed() -> bool {
+    SEALED.with(std::cell::Cell::get) > 0
+}
+
+/// Run a debug-only check with the provenance record **sealed**: nothing `f`
+/// builds takes an identity.
+///
+/// A check that mints is observable. [`NodeId`] is a process-global counter, so
+/// an id minted here shifts every id minted after it, and the same program
+/// compiles to two different id sets — one per build configuration. The
+/// inspector's golden corpus records those ids, so a minting check makes the
+/// fixtures debug-only and a release run of `committed_fixtures_match_fresh_dumps`
+/// reports drift that belongs to the check rather than to the compiler.
+///
+/// Inside the scope a clone keeps its origin's id and a construction takes
+/// [`NodeId::PLACEHOLDER`] — the region forms of
+/// [`TypedExpr::clone_preserving_ids`] and [`TypedExpr::throwaway`]. Both rest on
+/// one precondition, and it is the caller's: **`f` builds nothing that reaches a
+/// tree.** A check resolves, compares and drops, so the duplicate ids the clone
+/// half can manufacture are unreachable rather than merely unlikely;
+/// `assert_unique_node_ids` backstops a placeholder that escapes regardless.
+///
+/// A check that only reads needs no scope and loses nothing by having one. Reach
+/// for this wherever the check *resolves* a type: resolution forces suspended
+/// substitutions at each refinement leaf, which rebuilds the predicate term.
+///
+/// [`TypedExpr::clone_preserving_ids`]: crate::ccl::expr::TypedExpr::clone_preserving_ids
+/// [`TypedExpr::throwaway`]: crate::ccl::expr::TypedExpr::throwaway
+#[cfg(debug_assertions)]
+pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
+    let _preserving = preserve_ids();
+    SEALED.with(|c| c.set(c.get() + 1));
+    let r = f();
+    SEALED.with(|c| c.set(c.get() - 1));
+    r
 }
 
 /// The id a clone of `origin` should carry, and the one place that decides.
