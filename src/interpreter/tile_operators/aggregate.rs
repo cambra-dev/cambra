@@ -283,26 +283,32 @@ pub struct MapExtractAggregate {
 impl MapExtractAggregate {
     /// Create a new `MapExtractAggregate` operator.
     ///
-    /// `input` must have a `Function` tiling whose codomain is
-    /// `Aggregation { accumulator: A }`.  The output tiling is
-    /// `Function { domain: input.domain, codomain: Scalar(A) }`.
+    /// `input` must be a collection chain ending in `Aggregation { accumulator: A }`, at
+    /// whatever depth. The output replaces that aggregation with what it extracts to.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
-        let accumulator_of = |codomain: &Tiling| match codomain {
-            Tiling::Aggregation { accumulator, .. } => (**accumulator).clone(),
-            t => panic!("MapExtractAggregate expected an Aggregation codomain, got {t:?}"),
-        };
-        let tiling = match input.tiling() {
-            Tiling::Function { keys, values } => Tiling::Function {
-                keys: keys.clone(),
-                values: Box::new(accumulator_of(values)),
-            },
-            t => panic!("MapExtractAggregate expected a collection input, got {t:?}"),
-        };
+        assert!(
+            input.tiling().is_function(),
+            "MapExtractAggregate expected a collection input, got {}",
+            input.tiling()
+        );
+        let tiling = extract_innermost(input.tiling());
         Self {
             base: OperatorBase::new(tiling),
             input,
             kind,
         }
+    }
+}
+
+/// Replace the aggregation a collection chain ends in with the value it extracts to.
+fn extract_innermost(tiling: &Tiling) -> Tiling {
+    match tiling {
+        Tiling::Function { keys, values } => Tiling::Function {
+            keys: keys.clone(),
+            values: Box::new(extract_innermost(values)),
+        },
+        Tiling::Aggregation { accumulator, .. } => (**accumulator).clone(),
+        t => panic!("MapExtractAggregate expected an aggregation under the keys, got {t}"),
     }
 }
 
@@ -347,46 +353,30 @@ impl TileProducer for MapExtractAggregateProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_result = self.input.get(self.input.tiling().universal_guard());
-        // The shape passes through; only the codomain changes and the non-terminal
-        // elements go. Rebuilding with the same levels is what keeps a deeper fold's
-        // grouping intact for the fold above it.
-        let (rebuild, codomain): (Box<dyn FnOnce(Tile) -> Tile>, Box<Tile>) = match input_result {
-            Tile::Function {
-                row_starts,
-                keys,
-                values: codomain,
-                domain_predicate,
-                ..
-            } => (
-                Box::new(move |extracted| {
-                    Tile::grouped(
-                        row_starts,
-                        keys,
-                        Box::new(extracted),
-                        domain_predicate,
-                        BitSet::new(),
-                    )
-                }),
-                codomain,
-            ),
-            other => panic!("MapExtractAggregate expected a function tile, got {other:?}"),
-        };
+        let mut output = self.input.get(self.input.tiling().universal_guard());
+        // Every level passes through; only what sits under the innermost changes, and the
+        // non-terminal keys of that level go. Keeping the levels is what leaves a deeper
+        // fold's grouping intact for the fold above it.
+        let slot = output.deepest_values_mut();
+        let folded = std::mem::replace(slot, Tile::Record(HashMap::new()));
         let Tile::Aggregation {
             accumulator,
             terminal,
             ..
-        } = *codomain
+        } = folded
         else {
-            panic!("MapExtractAggregate expected an Aggregation codomain")
+            panic!("MapExtractAggregate expected an aggregation under the keys, got {folded:?}")
         };
         // Emit only the elements whose aggregation is terminal.
         let mask = terminal
             .as_bitvec()
             .unwrap_or_else(|| panic!("Expected bools"));
-        let mut output = rebuild(self.kind.extract(*accumulator));
-        // One bool per accumulator, so the mask is over the collection's keys.
-        output.retain_keys(mask);
+        *slot = self.kind.extract(*accumulator);
+        // One bool per accumulator, so the mask is over the innermost collection's keys.
+        output
+            .innermost_level_mut()
+            .unwrap_or_else(|| unreachable!("the input tiles as a collection"))
+            .retain_keys(mask);
         output
     }
 
@@ -542,7 +532,7 @@ fn fold_innermost(tiling: &Tiling, kind: AggregateKind) -> Tiling {
     }
 }
 
-/// A folded tiling's key extent per level, outermost first, and the accumulator extent the
+/// A folded tiling's key extent per level, outermost first, and the accumulator tiling the
 /// chain ends in.
 fn folded_shape(tiling: &Tiling) -> (Vec<Extent>, Tiling) {
     let mut extents = Vec::new();

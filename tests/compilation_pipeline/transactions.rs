@@ -430,6 +430,20 @@ fn commit_stream(ticks: &[usize], values: &[i64]) -> Tile {
 fn final_mut_var_value(code: &str) -> Value {
     use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
     let tile = run_pipeline(code);
+    // A **keyed** mutable variable reads back as the collection it is, one key per row.
+    // Fold it to the single map value the callers assert on, which is the shape-independence
+    // this helper exists for.
+    if let Tile::Function { keys, values, .. } = &tile {
+        let values = scalar_tile_to_column_value((**values).clone());
+        return Value::Function(
+            (0..keys.len())
+                .map(|i| cambra::interpreter::FuncBinding {
+                    input: keys.index_at(i),
+                    output: values.index_at(i),
+                })
+                .collect(),
+        );
+    }
     let column = scalar_tile_to_column_value(tile);
     assert_eq!(
         column.len(),

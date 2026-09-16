@@ -453,7 +453,7 @@ mod tests {
     //
     // Arms are built here rather than taken from a producer: what is under test is
     // the algebra, and the one production shape that needs it
-    // (`Tile::CurriedFunction::to_guard`) mixes a `Domain` arm with a `Codomain`
+    // (`Tile::Function::to_guard`) mixes a `Domain` arm with a `Codomain`
     // one, whose intersect is unimplemented.
 
     /// Arms stay flat: a union against an existing `Or` appends rather than nests.
@@ -496,7 +496,7 @@ mod tests {
         assert!(!TileGuard::Or(vec![upto(1), upto(2)]).is_universal());
     }
 
-    // ── FunctionGuard::intersect ───────────────────────────────────────────────
+    // ── FunctionGuard::intersect ───────────────────────────────────
 
     #[test]
     fn function_guard_intersect_empty_dominates() {

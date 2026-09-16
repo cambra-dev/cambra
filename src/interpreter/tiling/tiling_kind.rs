@@ -250,11 +250,21 @@ impl Tiling {
         self.domain_extent().is_some()
     }
 
+    /// The innermost collection of this chain: the one whose values are not a collection.
+    /// `None` where there is no collection at all.
+    pub fn innermost_level(&self) -> Option<&Tiling> {
+        match self {
+            Tiling::Function { values, .. } if values.is_function() => values.innermost_level(),
+            Tiling::Function { .. } => Some(self),
+            _ => None,
+        }
+    }
+
     /// Whether this tiling is a collection **level**, the test an operator makes when it
     /// walks a chain of them.
     ///
     /// Narrower than [`Self::has_domain`], which a materialized function cell and a store
-    /// also answer: only this variant has keys in a column and a nested tiling under them.
+    /// also answer: only this variant has its keys in a column and a tiling under them.
     pub fn is_function(&self) -> bool {
         matches!(self, Tiling::Function { .. })
     }
@@ -297,6 +307,32 @@ impl Tiling {
         Tiling::Function {
             keys,
             values: Box::new(values),
+        }
+    }
+
+    /// This collection tiling with a level appended below its innermost one — the shape
+    /// [`Tile::append_level`] gives the tiles.
+    ///
+    /// A collection is the base case, so an operator that appends a level tiles one deeper
+    /// than its input at whatever depth it arrives, and is closed under its own output.
+    pub fn append_level(&self, keys: Extent, values: Tiling) -> Tiling {
+        match self {
+            Tiling::Function {
+                keys: outer,
+                values: inner,
+            } if inner.is_function() => Tiling::Function {
+                keys: outer.clone(),
+                values: Box::new(inner.append_level(keys, values)),
+            },
+            // The innermost collection: the new level takes the place of its values.
+            Tiling::Function { keys: outer, .. } => Tiling::Function {
+                keys: outer.clone(),
+                values: Box::new(Tiling::Function {
+                    keys,
+                    values: Box::new(values),
+                }),
+            },
+            other => panic!("append_level expects a collection tiling, got {other}"),
         }
     }
 
@@ -663,5 +699,28 @@ mod tests {
         }
         .to_string();
         assert!(s.starts_with("agg("), "expected 'agg(' in '{s}'");
+    }
+
+    // ── Tiling::append_level ──────────────────────────────────────────────────
+
+    #[test]
+    fn append_level_reads_a_one_level_collection_as_the_base_case() {
+        let deeper =
+            scalar_function(int(), bool_ext()).append_level(range(4), Tiling::Scalar(bool_ext()));
+        assert_eq!(deeper, curried(int(), range(4), bool_ext()));
+    }
+
+    #[test]
+    fn append_level_is_closed_under_its_own_output() {
+        let deeper =
+            curried(int(), range(4), bool_ext()).append_level(int(), Tiling::Scalar(int()));
+        assert_eq!(
+            deeper,
+            Tiling::function(
+                int(),
+                Tiling::function(range(4), Tiling::function(int(), Tiling::Scalar(int())))
+            ),
+            "the new level is innermost"
+        );
     }
 }
