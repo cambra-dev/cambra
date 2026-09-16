@@ -41,7 +41,7 @@ Each `TileOperator` declares a `Tiling` that tells consumers what structure to e
 | `Scalar(Extent)` | A single value, possibly still unknown (represented as an empty `ColumnValue`). |
 | `Record(fields)` | A named collection of sub-tilings, one per field. The tiles are records with fields that are the tiles of the sub-tilings |
 | `SealedFunction { domain, codomain }` | A function mapping with structured codomain. Domain values accumulate incrementally; a `domain_predicate` on the tile signals when all have arrived. |
-| `CurriedFunction { domain1, domain2, codomain }` | Logically, this tiling is equivalent to `SealedFunction(domain1, SealedFunction(domain2, codomain))`. It has a custom layout for efficiency, detailed in the `Tile` table below. |
+| `CurriedFunction { domains, codomain }` | A function curried over `domains.len()` levels, outermost first — logically the nest of `SealedFunction`s those levels spell out. It has a custom layout for efficiency, detailed in the `Tile` table below. |
 | `Aggregation { accumulator }` | An ongoing aggregate with scalar accumulator type. |
 
 `Tiling::extent()` converts a `Tiling` to the corresponding `Extent` (the type-level view).
@@ -58,7 +58,7 @@ A `Tile` holds the actual data. Its shape mirrors its `Tiling`:
 | `Scalar(ColumnValue)` |  The two tiles in this tiling are `⊥` and the specific scalar of the tiling. `⊥` is represented as an empty `ColumnValue` and the scalar is represented as a `ColumnValue` of length 1 |
 | `Record(fields)` | A Record of other `Tiles` |
 | `SealedFunction { domain, codomain, domain_predicate }` | Each `Tile` is the set of known mappings of the function.  The `domain` is a `ColumnValue` of the domain elements, and the `codomain` is another `Tile`, which must be implicitly vectorized.  For example, a `Scalar` tiling is stored as a `ColumnValue` instead of a single element. |
-| `CurriedFunction { domain1, offsets, domain2, codomain, domain_predicate }` | Each tile represents the known mappings of a curried function of type `domain1 → domain2 → codomain`. In the implementation, this is realized as sorted and aligned `ColumnValue`s of domain1 elements and offsets, where the offsets index into the codomain and domain2 `ColumnValue`. |
+| `CurriedFunction { domains, offsets, codomain, domain_predicate }` | Each tile represents the known mappings of a curried function of type `domains[0] → … → domains[n-1] → codomain`. In the implementation, this is realized as aligned `ColumnValue`s with one offsets column between each adjacent pair of levels: `offsets[k][i]` is where element `i` of `domains[k]` starts in `domains[k + 1]`, and the codomain is flattened across the innermost level. |
 | `Aggregation { accumulator, terminal }` | Logically, this tiling knows the final number of inputs `N` that will be aggregated and the tiles are of form `(count, accumulator)`.  However, for making this feasible to compute, we instead store a terminal flag indicating `count == N`. |
 
 `Tile::is_terminal()` returns true when a tile carries complete, final data. No larger tiles will ever be returned, although
@@ -67,7 +67,18 @@ equivalent tiles with some data released may.
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
 Tiles representing collections (`SealedFunction` and `CurriedFunction`) support logical deletes by storing a `BitSet` of deleted values.  These are set by filteriing operator like `Restrict` and compacted away by
-stateful operators like `Memo` and aggregation.
+stateful operators like `Memo` and aggregation. A `CurriedFunction` carries **one set per domain
+level**, so a bit names a position in that level's own column and a removed group and a removed
+entry are different bits rather than one bit read two ways. Every producer today removes at the
+innermost level, a group going by way of its entries, which is where `Tile::retain` reads.
+
+A group may hold nothing. The offsets are non-decreasing, so two equal starts are a key whose group
+is empty, and an aggregate over that key folds to the aggregate's identity rather than dropping the
+key.
+
+An empty group and a removed one are different tiles. `Tile::retain` empties a group and leaves its
+key; a release removes the key, marked in `deleted` at that key's own level and realised by
+`Tile::compact`, which prunes the marked element's subtree with it.
 
 ### TileGuard
 
@@ -100,6 +111,10 @@ Refines interest in a `SealedFunction` or `CurriedFunction` tiling:
 |---------|---------|
 | `Domain(Predicate)` | Interested only in domain elements matching the predicate. |
 | `Codomain(TileGuard)` | Interested only in codomain elements that are part of the subtiling specified by the guard. |
+
+Against a `CurriedFunction` the two compose into a level reference: `Domain` names the outermost
+level, and each enclosing `Codomain` steps one level in, so a tile of 𝑛 levels names its innermost
+under 𝑛−1 wrappers (`Tile::to_guard`, `guard_level`).
 
 "Interested in everything" and "interested in nothing" are not separate variants — they are the trivial/degenerate guards, recognized via `is_universal()` / `is_empty()` (an empty guard is the annihilator under `intersect`).
 
@@ -222,7 +237,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapResultWithSource` | `SealedFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `SealedFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a sealed function from keys to their output values. |
 | `FanIn` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. Prefer the free `fan_in` factory at op-conversion call sites: it dispatches to `FanIn` (function-tiled arms) or `ScalarFanIn` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `ScalarFanIn` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling. The scalar counterpart of `FanIn`; reachable from op-conversion via the `fan_in` factory. Re-reads every operand on every pull, so the only release it can forward is the universal one. |
-| `MapResult` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `CurriedFunction`, and `SealedFunction` tilings. When the **data** input is itself a `CurriedFunction`, it maps the function over each codomain list, producing a `CurriedFunction` with the same domain and transformed values. A **`Scalar` data input against a `CurriedFunction` function** is the single-key lookup `groupby(c, k)(v)`: the same walk at one key, yielding that key's group as a `SealedFunction` — one currying level shallower, since the scalar consumes `domain1`. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A `SealedFunction` function draws the same distinction: a row whose key it has not answered yet is withheld — dropped from the output, its domain position subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
+| `MapResult` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `CurriedFunction`, and `SealedFunction` tilings. When the **data** input is itself a `CurriedFunction`, it maps the function over each codomain list, producing a `CurriedFunction` with the same domain and transformed values. A **`Scalar` data input against a `CurriedFunction` function** is the single-key lookup `groupby(c, k)(v)`: the same walk at one key, yielding that key's group as a `SealedFunction` — one currying level shallower, since the scalar consumes `domains[0]`. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A `SealedFunction` function draws the same distinction: a row whose key it has not answered yet is withheld — dropped from the output, its domain position subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
 | `MapResultToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant (or zips it in, per its mode), preserving the domain. The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
 | `Converse` | `SealedFunction(domain → Scalar(codomain))` | `CurriedFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
@@ -230,7 +245,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapDomain` | `SealedFunction(A → *)` | `SealedFunction(A → Scalar(A))` | Replaces the codomain of a sealed function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
 | `Filter` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(extent → Scalar(A))` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements where the predicate on the value evaluates to `true`. <br>TODO can probably remove this in favor of Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(A → *)` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
-| `MapFilter` | Predicate: `CurriedFunction(K → I → bool)` <br>Data: `CurriedFunction(K → I → V)` | Same as input | Filters the **inner** collections of a curried function, one outer key at a time — the survivors differ per key, which `Filter` and `Restrict` cannot express because they narrow a single domain. The predicate's flattened codomain is the mask over the CSR rows directly, so `domain1` and the per-key structure are untouched and `Tile::retain` rebuilds `offsets`. Planning emits it where a refinement rides an inner collection's domain under the outer key's binder, which is what a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produces. |
+| `MapFilter` | Predicate: `CurriedFunction(K → I → bool)` <br>Data: `CurriedFunction(K → I → V)` | Same as input | Filters the **inner** collections of a curried function, one outer key at a time — the survivors differ per key, which `Filter` and `Restrict` cannot express because they narrow a single domain. The predicate's flattened codomain is the mask over the CSR rows directly, so `domains[0]` and the per-key structure are untouched and `Tile::retain` rebuilds `offsets`. Planning emits it where a refinement rides an inner collection's domain under the outer key's binder, which is what a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produces. |
 | `Aggregate` | `SealedFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `SealedFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile. Constructed with an `only_terminal` flag: when `true` it emits only once the aggregation is marked terminal (the `only_terminal: false` path is currently `todo!()`). |
 | `MapAggregate` | `CurriedFunction(domain → codomain)` | `SealedFunction(domain → Aggregation)` | Performs a per-key aggregation |

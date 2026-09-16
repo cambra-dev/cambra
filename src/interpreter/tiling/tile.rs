@@ -6,6 +6,79 @@ use std::collections::{HashMap, HashSet};
 use bit_set::BitSet;
 use bit_vec::BitVec;
 
+/// The logically removed elements of a curried tile, **one set per domain level**.
+///
+/// The level is part of the index. A bit in level `k` is a position in `domains[k]`, so a
+/// removed group and a removed entry are different bits in different sets rather than two
+/// readings of one — and a producer says which it holds at the point it builds one. Reading
+/// the two as one index space is what put a group ordinal into the innermost set, twice, in
+/// operators that had every other field right.
+///
+/// A level with nothing removed need not be stored, so a `Deleted` may be shorter than the
+/// tile is deep and [`Deleted::none`] is the empty one.
+#[derive(Clone, Debug, Default)]
+pub struct Deleted {
+    levels: Vec<BitSet>,
+}
+
+/// A level stored empty and a level not stored are the same statement, so equality reads the
+/// levels rather than the vector. Deriving it would make [`Deleted::level_mut`] observable:
+/// reaching for a level to insert nothing would leave a value that compares unequal to the
+/// one it started as, and `Tile::contains_guarded` decides on exactly that comparison.
+impl PartialEq for Deleted {
+    fn eq(&self, other: &Self) -> bool {
+        let depth = self.levels.len().max(other.levels.len());
+        (0..depth).all(|k| self.level(k) == other.level(k))
+    }
+}
+
+impl Eq for Deleted {}
+
+impl Deleted {
+    /// Nothing removed, at any level.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The positions removed at `level`, which is a position in that level's domain column.
+    pub fn at_level(level: usize, removed: BitSet) -> Self {
+        let mut levels = vec![BitSet::new(); level];
+        levels.push(removed);
+        Self { levels }
+    }
+
+    /// The set at `level`, empty where nothing there is removed.
+    pub fn level(&self, level: usize) -> &BitSet {
+        static EMPTY: std::sync::OnceLock<BitSet> = std::sync::OnceLock::new();
+        self.levels
+            .get(level)
+            .unwrap_or_else(|| EMPTY.get_or_init(BitSet::new))
+    }
+
+    /// The set at `level`, growing to reach it.
+    pub fn level_mut(&mut self, level: usize) -> &mut BitSet {
+        if self.levels.len() <= level {
+            self.levels.resize(level + 1, BitSet::new());
+        }
+        &mut self.levels[level]
+    }
+
+    /// Whether nothing is removed anywhere.
+    pub fn is_empty(&self) -> bool {
+        self.levels.iter().all(BitSet::is_empty)
+    }
+
+    /// The number of levels this stores, which may be fewer than the tile is deep.
+    pub fn stored_levels(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Remove everything, at every level.
+    pub fn clear(&mut self) {
+        self.levels.clear();
+    }
+}
+
 use crate::{
     ccl::AggregateKind,
     interpreter::{
@@ -40,33 +113,48 @@ pub enum Tile {
         /// that has ever been seen—not just the survivors—enabling complete source releasing.
         deleted: BitSet,
     },
-    /// A two-level curried function.
+    /// A curried function of any depth, `D₀ → D₁ → … → Dₙ₋₁ → C`.
     ///
-    /// Stored in a Compressed Sparse Row (CSR)-like layout: `domain1` is sorted so lookups can be done
-    /// in O(log n) via binary search, `offsets[i]` is the start index in
-    /// `codomain` and `domain2` for `domain1[i]`, and `codomain` is the flattened sequence of
-    /// all codomain values across all groups.  Group `i` occupies
-    /// `codomain[offsets[i]..offsets[i+1]]` (or `codomain[offsets[i]..]` for
-    /// the last group).  Because `codomain` is a single `ColumnValue`,
-    /// vectorized transformations over the full codomain are straightforward.
+    /// Stored in a Compressed Sparse Row (CSR)-like layout, one offsets array per level
+    /// above the innermost. `domains[0]` is sorted so lookups can be done in O(log n) via
+    /// binary search; `offsets[k][i]` is the start index in `domains[k + 1]` for element
+    /// `i` of `domains[k]`, and element `i`'s run ends where `i + 1`'s begins (at the end
+    /// of the level, for the last element). `codomain` is the flattened sequence of
+    /// codomain values across every innermost group, so vectorized transformations over
+    /// the full codomain are straightforward.
+    ///
+    /// The offsets are what a [`Tile::SealedFunction`] codomain cannot supply: a codomain
+    /// tile is vectorized one entry per domain position, which can express a nested
+    /// function only when every parent holds the same inner domain. A per-parent inner
+    /// domain is ragged, and ragged needs the offsets.
     CurriedFunction {
-        /// Sorted domain keys, enabling O(log n) lookup by binary search.
-        domain1: ColumnValue,
-        /// Start offsets into `domain2` and `codomain`, one per value in `domain1`.
-        offsets: ColumnValue,
-        /// Flattened domain2 values
-        domain2: ColumnValue,
-        /// Flattened codomain values; supports vectorized transformations.
-        codomain: ColumnValue,
-        /// The region of `domain1` for which no new elements will ever be seen — the same
-        /// statement [`Self::SealedFunction`]'s makes, and covering each key in the region
-        /// together with its whole `domain2`/`codomain` list.
+        /// Domain columns, outermost first. `domains[0]` is sorted and dense; each later
+        /// one is flattened across its parent's groups. Always at least two.
+        domains: Vec<ColumnValue>,
+        /// One offsets column per level above the innermost, so
+        /// `offsets.len() == domains.len() - 1`. Each is `ColumnValue::UInts` and
+        /// **non-decreasing**: two equal starts are the element whose group holds nothing.
+        /// A key with an empty group is a collection that is empty, which an aggregate
+        /// folds to its identity; a key that is gone is absent from the column instead.
+        offsets: Vec<ColumnValue>,
+        /// The codomain, vectorized one entry per innermost domain element — the same
+        /// convention [`Self::SealedFunction`]'s codomain follows, so a fold may leave a
+        /// [`Self::Aggregation`] here.
+        codomain: Box<Tile>,
+        /// The region of `domains[0]` for which no new elements will ever be seen — the
+        /// same statement [`Self::SealedFunction`]'s makes, and covering each key in the
+        /// region together with every level below it.
         domain_predicate: Predicate,
-        /// Set of flat `domain2`/`codomain` row indices that have been logically removed by
-        /// filtering.  1 = deleted; empty means all rows are present.  Preserved for the
-        /// same reason as [`Tile::SealedFunction::deleted`]: so `to_guard` can report every
-        /// domain2 value ever seen, enabling complete source releasing.
-        deleted: BitSet,
+        /// Logically removed elements, one set per domain level ([`Deleted`]). 1 = removed;
+        /// empty means every element is present. Preserved for the same reason as
+        /// [`Tile::SealedFunction::deleted`]: so `to_guard` can report every innermost
+        /// domain value ever seen, enabling complete source releasing.
+        ///
+        /// Every producer today removes at the innermost level only, a group being removed
+        /// by removing its entries. The level is stored rather than assumed because the two
+        /// index spaces are otherwise the same type, which is how a group ordinal reached
+        /// the innermost set.
+        deleted: Deleted,
     },
     /// A Tile representing the state of a scalar aggregation.
     Aggregation {
@@ -161,8 +249,11 @@ impl Tile {
                 domain, deleted, ..
             } => domain.len() - deleted.len(),
             Tile::CurriedFunction {
-                domain2, deleted, ..
-            } => domain2.len() - deleted.len(),
+                domains, deleted, ..
+            } => {
+                let innermost = domains.len() - 1;
+                domains[innermost].len() - deleted.level(innermost).len()
+            }
             Tile::Aggregation { accumulator, .. } => accumulator.len(),
             // A `Store` is a right-continuous *step function* over its decided
             // prefix, not a list of change events: a tick absent from `changes`
@@ -291,35 +382,48 @@ impl Tile {
             }
             (
                 Tile::CurriedFunction {
-                    domain1: s_domain1,
+                    domains: s_domains,
                     offsets: s_offsets,
-                    domain2: s_domain2,
                     codomain: s_codomain,
                     domain_predicate: s_pred,
                     deleted: s_deleted,
                 },
                 Tile::CurriedFunction {
-                    domain1: o_domain1,
+                    domains: o_domains,
                     offsets: o_offsets,
-                    domain2: o_domain2,
                     codomain: o_codomain,
                     domain_predicate: o_pred,
                     deleted: o_deleted,
                 },
             ) => {
-                // Shift o's offsets by the current size of s's domain2 so they index into
-                // the combined domain2 = [s_domain2..., o_domain2...].
-                let s_d2_len = s_domain2.len();
-                let mut o_offsets = o_offsets;
-                s_domain1.append(o_domain1);
-                o_offsets.for_each_uint(|u| *u += s_d2_len);
-                s_offsets.append(o_offsets);
-                s_domain2.append(o_domain2);
-                s_codomain.append(o_codomain);
+                assert_eq!(
+                    s_domains.len(),
+                    o_domains.len(),
+                    "merging curried tiles of different depths"
+                );
+                // Each level concatenates, so o's offsets into the level below shift by
+                // that level's current size in s, and a removal shifts by its own level's.
+                // Read every length before appending.
+                let level_lens: Vec<usize> = s_domains.iter().map(ColumnValue::len).collect();
+                for (k, mut o_level) in o_offsets.into_iter().enumerate() {
+                    o_level.for_each_uint(|u| *u += level_lens[k + 1]);
+                    s_offsets[k].append(o_level);
+                }
+                for (s_level, o_level) in s_domains.iter_mut().zip(o_domains) {
+                    s_level.append(o_level);
+                }
+                s_codomain.merge(*o_codomain);
                 *s_pred = s_pred.union(&o_pred);
-                // Shift other's deleted row indices into the combined flat array.
-                for idx in o_deleted.iter() {
-                    s_deleted.insert(idx + s_d2_len);
+                for (k, shift) in level_lens
+                    .iter()
+                    .enumerate()
+                    .take(o_deleted.stored_levels())
+                {
+                    let removed: Vec<usize> = o_deleted.level(k).iter().collect();
+                    let s_level = s_deleted.level_mut(k);
+                    for idx in removed {
+                        s_level.insert(idx + shift);
+                    }
                 }
             }
             (Tile::Record(s_fields), Tile::Record(ref mut o_fields)) => {
@@ -401,56 +505,46 @@ impl Tile {
                 deleted.clear();
             }
             Tile::CurriedFunction {
-                domain1,
+                domains,
                 offsets,
-                domain2,
                 codomain,
                 deleted,
                 ..
             } => {
-                // The mask is over the flat domain2/codomain rows.
+                // The mask is over the flat innermost rows.
+                let inner = domains.last().expect("a curried tile has levels");
                 assert_eq!(
                     mask.len(),
-                    domain2.len(),
-                    "retain mask length must equal domain2 length"
+                    inner.len(),
+                    "retain mask length must equal the innermost domain length"
                 );
-                // Clone offsets so we can write to *offsets afterward.
-                let old_offsets = match &*offsets {
-                    ColumnValue::UInts(v) => v.clone(),
-                    _ => panic!("CurriedFunction offsets must be UInts"),
-                };
-                let n = domain1.len();
-                let domain2_total = domain2.len();
-                // Recompute domain1 and offsets, dropping groups with no survivors.
-                // Collect kept domain2 indices in order so that group contiguity is
-                // preserved in the compacted flat arrays.
-                let mut new_domain1_keep: Vec<usize> = Vec::new();
-                let mut new_offsets: Vec<usize> = Vec::new();
-                let mut kept_indices: Vec<usize> = Vec::new();
-                for i in 0..n {
-                    let start = old_offsets[i];
-                    let end = if i + 1 < n {
-                        old_offsets[i + 1]
-                    } else {
-                        domain2_total
-                    };
-                    // Keep flat row j if the caller's mask says keep AND j is not logically deleted.
-                    let group_kept: Vec<usize> = (start..end)
-                        .filter(|&j| mask[j] && !deleted.contains(j))
-                        .collect();
-                    if !group_kept.is_empty() {
-                        new_offsets.push(kept_indices.len());
-                        new_domain1_keep.push(i);
-                        kept_indices.extend(group_kept);
-                    }
-                }
-                let kept_len = kept_indices.len();
-                *domain1 = domain1
-                    .select_indices(new_domain1_keep.iter().cloned(), new_domain1_keep.len());
-                *offsets = ColumnValue::UInts(new_offsets);
-                *domain2 = domain2.select_indices(kept_indices.iter().cloned(), kept_len);
-                *codomain = codomain.select_indices(kept_indices.iter().cloned(), kept_len);
-                deleted.clear();
+                // Combine the caller's mask with the logical-deletion bits, as the sealed
+                // case does: keep row j only if the mask says so and it is not deleted.
+                //
+                // Only the innermost mark is consumed. A mark above it is a release, which
+                // [`Tile::compact`] realises by pruning, and the levels above the innermost
+                // do not change length here — so the mark stays valid and stays pending
+                // rather than being cleared by a filter that did not act on it.
+                let innermost = domains.len() - 1;
+                let innermost_removed = deleted.level(innermost).clone();
+                let keep: BitVec = mask
+                    .iter()
+                    .enumerate()
+                    .map(|(j, keep)| keep && !innermost_removed.contains(j))
+                    .collect();
+                retain_levels(domains, offsets, codomain, &keep);
+                *deleted.level_mut(innermost) = BitSet::new();
+            }
+            // An aggregation is flat columns over the same positions its function's
+            // innermost level has, so it filters position-wise like a scalar does. A
+            // per-level fold leaves one under a curried tile, which is what reaches here.
+            Tile::Aggregation {
+                accumulator,
+                terminal,
+                ..
+            } => {
+                accumulator.retain(mask);
+                terminal.retain(mask);
             }
             _ => panic!("retain not supported for {self:?}"),
         }
@@ -462,10 +556,23 @@ impl Tile {
     /// deleted entries when iteration over only live entries is required.
     pub fn mark_deleted(&mut self, mask: &BitVec) {
         match self {
-            Tile::SealedFunction { deleted, .. } | Tile::CurriedFunction { deleted, .. } => {
+            Tile::SealedFunction { deleted, .. } => {
                 for (i, keep) in mask.iter().enumerate() {
                     if !keep {
                         deleted.insert(i);
+                    }
+                }
+            }
+            // The mask is over the innermost level, which is where the codomain is
+            // vectorized and so where a caller's per-entry decision lands.
+            Tile::CurriedFunction {
+                domains, deleted, ..
+            } => {
+                let innermost = domains.len() - 1;
+                let level = deleted.level_mut(innermost);
+                for (i, keep) in mask.iter().enumerate() {
+                    if !keep {
+                        level.insert(i);
                     }
                 }
             }
@@ -479,35 +586,36 @@ impl Tile {
     /// This is the counterpart to [`Tile::mark_deleted`] and is called before
     /// operators iterate over tile data so they only process live entries.
     pub fn compact(&mut self) {
-        let n = match self {
+        match self {
             Tile::SealedFunction {
                 deleted, domain, ..
             } => {
                 if deleted.is_empty() {
                     return;
                 }
-                domain.len()
+                let n = domain.len();
+                let removed = deleted.clone();
+                let mask: BitVec = (0..n).map(|i| !removed.contains(i)).collect();
+                self.retain(&mask);
             }
+            // A curried tile is pruned rather than filtered: a mark at any level takes its
+            // subtree, which a mask over the innermost cannot say and which `retain`
+            // deliberately does not do — there, an emptied group stays.
             Tile::CurriedFunction {
-                deleted, domain2, ..
+                domains,
+                offsets,
+                codomain,
+                deleted,
+                ..
             } => {
                 if deleted.is_empty() {
                     return;
                 }
-                domain2.len()
+                let removed = std::mem::take(deleted);
+                prune_marked(domains, offsets, codomain, &removed);
             }
-            _ => return,
-        };
-        // Build the keep-mask from the deleted set, then let retain() do the work
-        // (retain also clears deleted).
-        let deleted_clone = match self {
-            Tile::SealedFunction { deleted, .. } | Tile::CurriedFunction { deleted, .. } => {
-                deleted.clone()
-            }
-            _ => unreachable!(),
-        };
-        let mask: BitVec = (0..n).map(|i| !deleted_clone.contains(i)).collect();
-        self.retain(&mask);
+            _ => (),
+        }
     }
 
     /// Removes all data in this tile that is specified by the guard.
@@ -564,52 +672,34 @@ impl Tile {
                     }
                 }
             }
-            // CurriedFunction + Domain: mark all flat rows belonging to matching domain1 groups.
+            // **A guard nests as deeply as the type does.** `Domain(p)` names the
+            // outermost level; each `Codomain` wrapper steps one level in, so
+            // `Codomain(Domain(p))` names level 1 and `Codomain(Codomain(Domain(p)))`
+            // level 2. The named element is marked at its own level and [`Tile::compact`]
+            // takes its subtree with it — marking the rows beneath it instead would make a
+            // released group indistinguishable from one a filter emptied.
             (
                 Tile::CurriedFunction {
-                    domain1,
-                    offsets,
-                    domain2,
-                    deleted,
-                    ..
+                    domains, deleted, ..
                 },
-                TileGuard::Function(FunctionGuard::Domain(pred)),
+                guard @ TileGuard::Function(_),
             ) => {
-                let ColumnValue::UInts(offset_vec) = &*offsets else {
-                    panic!("CurriedFunction offsets must be UInts");
-                };
-                let offset_vec = offset_vec.clone();
-                let n = domain1.len();
-                let domain2_total = domain2.len();
-                for i in 0..n {
-                    if pred.contains(&domain1.index_at(i)) {
-                        let start = offset_vec[i];
-                        let end = if i + 1 < n {
-                            offset_vec[i + 1]
-                        } else {
-                            domain2_total
-                        };
-                        for j in start..end {
-                            deleted.insert(j);
-                        }
-                    }
-                }
-            }
-            // CurriedFunction + Codomain(Domain(pred)): mark flat rows whose domain2 value matches.
-            (
-                Tile::CurriedFunction {
-                    domain2, deleted, ..
-                },
-                TileGuard::Function(FunctionGuard::Codomain(inner)),
-            ) => {
-                let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
+                let Some((level, pred)) = guard_level(&guard) else {
                     unimplemented!(
-                        "CurriedFunction remove_guarded only supports Codomain(Domain(pred))"
+                        "CurriedFunction remove_guarded only supports a Domain under some \
+                         number of Codomains, got {guard:?}"
                     )
                 };
-                for j in 0..domain2.len() {
-                    if pred.contains(&domain2.index_at(j)) {
-                        deleted.insert(j);
+                assert!(
+                    level < domains.len(),
+                    "a release guard names level {level} of a {}-level curried tile",
+                    domains.len()
+                );
+                let named = domains[level].clone();
+                let removed = deleted.level_mut(level);
+                for i in 0..named.len() {
+                    if pred.contains(&named.index_at(i)) {
+                        removed.insert(i);
                     }
                 }
             }
@@ -649,7 +739,8 @@ impl Tile {
     /// For Scalar: universal if the scalar is known and empty otherwise
     /// For Aggregation: universal if terminal and empty otherwise
     /// For SealedFunction: Domain predicate for all domain values
-    /// For CurriedFunction, Codomain(Domain(predicate)) for all domain2 values (TODO for now we assume unique domain2)
+    /// For CurriedFunction, `Domain` over the groups the predicate calls whole, plus
+    /// `Codomain(Domain(...))` over the keys of the groups it does not
     ///
     /// Important note around logical deletes: we don't release eagerly when logically deleting rows via the
     /// deleted bitsets, so `to_guard` includes logically-deleted rows when constructing the guards.
@@ -678,16 +769,36 @@ impl Tile {
                     ))
                 }
             }
+            // **A key is released by its group where the group is whole.** A codomain guard
+            // names keys and says nothing about which group they sit in, so releasing one
+            // releases it in *every* group — sound only while no key repeats across groups,
+            // which a curried-function tile permits (`validate_tile` asks for uniqueness
+            // within a group and no more) and a collection held per row routinely does. The
+            // `domain_predicate` is what separates the two cases: it names the groups that
+            // will see no new elements, each together with its whole list, so `Domain` over
+            // that region releases those groups outright and their keys need no naming. A
+            // group outside it may still grow, so its keys are named the only way the
+            // vocabulary allows.
             Tile::CurriedFunction {
-                domain2,
+                domains,
+                offsets,
                 domain_predicate,
                 ..
-            } => TileGuard::flatten_or(vec![
-                TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
-                    FunctionGuard::Domain(Predicate::from_column_value(domain2)),
-                )))),
-                TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            ]),
+            } => {
+                let open_keys = Predicate::from_column_value(&keys_of_open_groups(
+                    domains,
+                    offsets,
+                    domain_predicate,
+                ));
+                // Those keys are the innermost level's, so the guard names that level: one
+                // `Codomain` per level in ([`guard_level`]). Two levels make that one
+                // wrapper, and deeper it is more — a single wrapper would name level 1 with
+                // the innermost level's keys.
+                TileGuard::flatten_or(vec![
+                    guard_at_level(domains.len() - 1, open_keys),
+                    TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+                ])
+            }
             // The store's guard is over its commit-time domain (the change
             // ticks), like a `SealedFunction` — consumers release a prefix of it.
             Tile::Store {
@@ -708,19 +819,17 @@ impl Tile {
     }
 
     /// Creates a `Tile::CurriedFunction` and does dev-build-only validation for correct structure.
-    /// Pass `BitSet::new()` for `deleted` when no entries are logically removed.
+    /// Pass [`Deleted::none`] when nothing is logically removed.
     pub fn curried_function(
-        domain1: ColumnValue,
-        offsets: ColumnValue,
-        domain2: ColumnValue,
-        codomain: ColumnValue,
+        domains: Vec<ColumnValue>,
+        offsets: Vec<ColumnValue>,
+        codomain: Box<Tile>,
         domain_predicate: Predicate,
-        deleted: BitSet,
+        deleted: Deleted,
     ) -> Tile {
         let result = Tile::CurriedFunction {
-            domain1,
+            domains,
             offsets,
-            domain2,
             codomain,
             domain_predicate,
             deleted,
@@ -731,32 +840,291 @@ impl Tile {
         );
         result
     }
+
+    /// For each element of `level`, the values of its ancestors from the outermost level
+    /// down to and including itself.
+    ///
+    /// A key repeats across its siblings' groups, so an element deeper than the outermost
+    /// is identified by its path and not by its own value — which is what a per-level fold
+    /// has to key its accumulators on.
+    pub fn curried_paths_at(&self, level: usize) -> Vec<Vec<Value>> {
+        let Tile::CurriedFunction {
+            domains, offsets, ..
+        } = self
+        else {
+            panic!("curried_paths_at expects a curried tile, got {self:?}")
+        };
+        let mut paths: Vec<Vec<Value>> = (0..domains[0].len())
+            .map(|i| vec![domains[0].index_at(i)])
+            .collect();
+        for k in 0..level {
+            let starts = level_offsets(&offsets[k]);
+            let below_len = domains[k + 1].len();
+            let mut next = vec![Vec::new(); below_len];
+            for (i, parent) in paths.iter().enumerate() {
+                let (start, end) = level_run(starts, i, below_len);
+                for (j, slot) in next.iter_mut().enumerate().take(end).skip(start) {
+                    let mut path = parent.clone();
+                    path.push(domains[k + 1].index_at(j));
+                    *slot = path;
+                }
+            }
+            paths = next;
+        }
+        paths
+    }
+}
+
+/// The offsets column at one level, as the `usize` run-starts it is required to be.
+fn level_offsets(offsets: &ColumnValue) -> &[usize] {
+    match offsets {
+        ColumnValue::UInts(v) => v,
+        other => panic!("CurriedFunction offsets must be UInts, got {other:?}"),
+    }
+}
+
+/// The half-open run of level-below indices belonging to element `i`.
+///
+/// The last element runs to the end of the level, which is why the level's length is
+/// needed: the offsets column stores starts only.
+fn level_run(offsets: &[usize], i: usize, below_len: usize) -> (usize, usize) {
+    let start = offsets[i];
+    let end = if i + 1 < offsets.len() {
+        offsets[i + 1]
+    } else {
+        below_len
+    };
+    (start, end)
+}
+
+/// Rebuild every level, keeping the innermost entries `keep_inner` selects.
+///
+/// **Only the innermost level loses elements.** An element above it stays whether or not a
+/// descendant does, because the offsets are non-decreasing and so carry the empty group that
+/// leaves ([`Tile::CurriedFunction`]): filtering every element out of a collection leaves
+/// that collection empty, not its key absent. Removing the key is what [`prune_marked`]
+/// does, and a release is what asks for it.
+///
+/// One offsets column therefore moves — the one indexing the innermost level. Each start
+/// becomes the number of kept entries before it, which is what leaves two equal starts where
+/// a whole group went.
+fn retain_levels(
+    domains: &mut [ColumnValue],
+    offsets: &mut [ColumnValue],
+    codomain: &mut Tile,
+    keep_inner: &BitVec,
+) {
+    let depth = domains.len();
+    let inner_len = domains[depth - 1].len();
+    let mut rank = Vec::with_capacity(inner_len + 1);
+    let mut kept_so_far = 0;
+    for j in 0..inner_len {
+        rank.push(kept_so_far);
+        if keep_inner[j] {
+            kept_so_far += 1;
+        }
+    }
+    rank.push(kept_so_far);
+
+    let rebased: Vec<usize> = level_offsets(&offsets[depth - 2])
+        .iter()
+        .map(|&start| rank[start])
+        .collect();
+    offsets[depth - 2] = ColumnValue::UInts(rebased);
+
+    let kept: Vec<usize> = (0..inner_len).filter(|&j| keep_inner[j]).collect();
+    let n = kept.len();
+    codomain.retain(keep_inner);
+    domains[depth - 1] = domains[depth - 1].select_indices(kept.into_iter(), n);
+}
+
+/// The keys of the groups `domain_predicate` does **not** call whole.
+///
+/// A group inside the predicate is released by its own `domain1` value, so naming its keys
+/// would release them in every other group too ([`Tile::to_guard`]).
+fn keys_of_open_groups(
+    domains: &[ColumnValue],
+    offsets: &[ColumnValue],
+    domain_predicate: &Predicate,
+) -> ColumnValue {
+    let inner = &domains[domains.len() - 1];
+    if domain_predicate.is_false() {
+        return inner.clone();
+    }
+    let outer = &domains[0];
+    let owner = ancestor_at(domains, offsets, 0);
+    let open: Vec<usize> = (0..inner.len())
+        .filter(|&row| !domain_predicate.contains(&outer.index_at(owner[row])))
+        .collect();
+    let kept = open.len();
+    inner.select_indices(open.into_iter(), kept)
+}
+
+/// The guard naming `level` with `pred`: the inverse of [`guard_level`].
+fn guard_at_level(level: usize, pred: Predicate) -> TileGuard {
+    (0..level).fold(
+        TileGuard::Function(FunctionGuard::Domain(pred)),
+        |inner, _| TileGuard::Function(FunctionGuard::Codomain(Box::new(inner))),
+    )
+}
+
+/// The level a release guard names, and the predicate it names it with.
+///
+/// `Domain(p)` is level 0 and each enclosing `Codomain` steps one level in, mirroring how
+/// the curried type nests. Any other shape is not a level reference.
+fn guard_level(guard: &TileGuard) -> Option<(usize, Predicate)> {
+    let mut level = 0;
+    let mut current = guard;
+    loop {
+        match current {
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                return Some((level, pred.clone()));
+            }
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                level += 1;
+                current = inner;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// For each element at `level`, the index of its parent at `level - 1`.
+fn parents_at(domains: &[ColumnValue], offsets: &[ColumnValue], level: usize) -> Vec<usize> {
+    let below_len = domains[level].len();
+    let starts = level_offsets(&offsets[level - 1]);
+    let mut parent = vec![0usize; below_len];
+    for i in 0..domains[level - 1].len() {
+        let (start, end) = level_run(starts, i, below_len);
+        for slot in parent.iter_mut().take(end).skip(start) {
+            *slot = i;
+        }
+    }
+    parent
+}
+
+/// Physically remove every marked element, and everything below it.
+///
+/// Marking runs **downward**, which is what separates a released element from one a filter
+/// emptied: a released group takes its subtree and is gone, while a group a filter emptied
+/// keeps its place and holds nothing ([`Tile::retain`]). Each surviving parent's new offset
+/// is the number of surviving children before its old run, so a group left empty by the
+/// prune is two equal starts rather than a missing key.
+fn prune_marked(
+    domains: &mut [ColumnValue],
+    offsets: &mut [ColumnValue],
+    codomain: &mut Tile,
+    deleted: &Deleted,
+) {
+    let depth = domains.len();
+    let mut alive: Vec<BitVec> = Vec::with_capacity(depth);
+    for k in 0..depth {
+        let mut level = BitVec::from_elem(domains[k].len(), false);
+        let parent = (k > 0).then(|| parents_at(domains, offsets, k));
+        for i in 0..domains[k].len() {
+            let kept =
+                !deleted.level(k).contains(i) && parent.as_ref().is_none_or(|p| alive[k - 1][p[i]]);
+            level.set(i, kept);
+        }
+        alive.push(level);
+    }
+
+    let kept: Vec<Vec<usize>> = (0..depth)
+        .map(|k| (0..domains[k].len()).filter(|&i| alive[k][i]).collect())
+        .collect();
+    let mut new_offsets = Vec::with_capacity(depth - 1);
+    for k in 0..depth - 1 {
+        let below_len = domains[k + 1].len();
+        let starts = level_offsets(&offsets[k]);
+        let mut rank = Vec::with_capacity(below_len + 1);
+        let mut surviving = 0;
+        for kept_below in alive[k + 1].iter().take(below_len) {
+            rank.push(surviving);
+            if kept_below {
+                surviving += 1;
+            }
+        }
+        rank.push(surviving);
+        let new_starts = kept[k]
+            .iter()
+            .map(|&i| rank[level_run(starts, i, below_len).0])
+            .collect();
+        new_offsets.push(ColumnValue::UInts(new_starts));
+    }
+
+    codomain.retain(&alive[depth - 1]);
+    for k in 0..depth {
+        domains[k] = domains[k].select_indices(kept[k].iter().copied(), kept[k].len());
+    }
+    offsets.clone_from_slice(&new_offsets);
+}
+
+/// For each innermost row, the index of the element at `level` that owns it.
+fn ancestor_at(domains: &[ColumnValue], offsets: &[ColumnValue], level: usize) -> Vec<usize> {
+    let depth = domains.len();
+    let mut owner: Vec<usize> = (0..domains[level].len()).collect();
+    for k in level..depth - 1 {
+        let starts = level_offsets(&offsets[k]);
+        let below_len = domains[k + 1].len();
+        let mut next = vec![0usize; below_len];
+        for (i, &parent) in owner.iter().enumerate() {
+            let (start, end) = level_run(starts, i, below_len);
+            for row in next.iter_mut().take(end).skip(start) {
+                *row = parent;
+            }
+        }
+        owner = next;
+    }
+    owner
 }
 
 pub fn validate_tile(tile: &Tile) -> bool {
     match tile {
         Tile::CurriedFunction {
-            domain1,
+            domains,
             offsets,
-            domain2,
             codomain,
             domain_predicate: _,
-            deleted: _,
+            deleted,
         } => {
-            let ColumnValue::UInts(offsets) = offsets else {
+            // At least two levels, one offsets column between each adjacent pair, and a
+            // codomain value per innermost element.
+            if domains.len() < 2
+                || offsets.len() + 1 != domains.len()
+                || domains[domains.len() - 1].len() != codomain.len()
+            {
                 return false;
-            };
-            let domain2_values: Vec<_> = domain2.clone().drain_to_value_iter().collect();
-            domain2.len() == codomain.len()
-                && HashSet::<Value>::from_iter(domain1.clone().drain_to_value_iter()).len()
-                    == domain1.len()
-                && offsets.windows(2).all(|w| w[0] < w[1])
-                && offsets.windows(2).all(|w| {
-                    w[1] - w[0]
-                        == HashSet::<Value>::from_iter(domain2_values[w[0]..w[1]].iter().cloned())
-                            .len()
-                })
-                && offsets.last().is_none_or(|o| *o < domain2.len())
+            }
+            // Each stored level is bounded by that level's own domain column. The level
+            // is part of the index ([`Deleted`]), so a group and an entry are no longer the
+            // same bit read two ways, and this bound checks each for what it is.
+            if deleted.stored_levels() > domains.len()
+                || (0..deleted.stored_levels())
+                    .any(|k| deleted.level(k).iter().any(|i| i >= domains[k].len()))
+            {
+                return false;
+            }
+            // The outermost keys are unique; a deeper level is unique only *within* a
+            // group, since a key may repeat across its siblings' groups.
+            let outer: Vec<Value> = domains[0].clone().drain_to_value_iter().collect();
+            if HashSet::<Value>::from_iter(outer.iter().cloned()).len() != domains[0].len() {
+                return false;
+            }
+            (0..offsets.len()).all(|k| {
+                let ColumnValue::UInts(starts) = &offsets[k] else {
+                    return false;
+                };
+                let below_len = domains[k + 1].len();
+                let below: Vec<Value> = domains[k + 1].clone().drain_to_value_iter().collect();
+                starts.len() == domains[k].len()
+                    && starts.windows(2).all(|w| w[0] <= w[1])
+                    && starts.last().is_none_or(|o| *o <= below_len)
+                    && (0..starts.len()).all(|i| {
+                        let (start, end) = level_run(starts, i, below_len);
+                        end - start
+                            == HashSet::<Value>::from_iter(below[start..end].iter().cloned()).len()
+                    })
+            })
         }
         Tile::SealedFunction {
             domain, codomain, ..
@@ -825,12 +1193,11 @@ mod tests {
     #[test]
     fn tile_lookup_function_true_predicate_is_terminal() {
         let tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![]),
-            offsets: ColumnValue::UInts(vec![]),
-            domain2: ColumnValue::UInts(vec![]),
-            codomain: ColumnValue::UInts(vec![]),
+            domains: vec![ColumnValue::UInts(vec![]), ColumnValue::UInts(vec![])],
+            offsets: vec![ColumnValue::UInts(vec![])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![]))),
             domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
         assert!(tile.is_terminal());
     }
@@ -856,13 +1223,68 @@ mod tests {
         pred: Predicate,
     ) -> Tile {
         Tile::curried_function(
-            ColumnValue::UInts(d1),
-            ColumnValue::UInts(offsets),
-            ColumnValue::UInts(d2),
-            ColumnValue::Ints(cod),
+            vec![ColumnValue::UInts(d1), ColumnValue::UInts(d2)],
+            vec![ColumnValue::UInts(offsets)],
+            Box::new(Tile::Scalar(ColumnValue::Ints(cod))),
             pred,
-            BitSet::new(),
+            Deleted::none(),
         )
+    }
+
+    /// The codomain arm names the level its keys came from, which at three levels is not
+    /// level 1. `keys_of_open_groups` answers the innermost domain, and [`guard_level`]
+    /// reads one `Codomain` wrapper as level 1 — so a single wrapper would hand a consumer
+    /// the innermost keys against the middle level's domain.
+    #[test]
+    fn to_guard_curried_function_names_the_innermost_level_at_depth_three() {
+        let tile = Tile::curried_function(
+            vec![
+                ColumnValue::UInts(vec![0]),
+                ColumnValue::UInts(vec![10, 11]),
+                ColumnValue::UInts(vec![100, 101, 102, 103]),
+            ],
+            vec![ColumnValue::UInts(vec![0]), ColumnValue::UInts(vec![0, 2])],
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4]))),
+            // Every group open, so every innermost key is named.
+            Predicate::False,
+            Deleted::none(),
+        );
+        let guard = tile.to_guard();
+        let (level, pred) = guard_level(&guard).expect("a level reference, got {guard:?}");
+        assert_eq!(level, 2, "the innermost level of a three-level tile");
+        assert!(
+            pred.contains(&Value::UInt(100)) && pred.contains(&Value::UInt(103)),
+            "the arm carries the innermost keys, got {pred:?}"
+        );
+    }
+
+    /// A level stored empty is the level absent, which is what keeps [`Deleted::level_mut`]
+    /// from being observable — `Tile::contains_guarded` decides by comparing a probe against
+    /// the tile it was cloned from.
+    #[test]
+    fn deleted_compares_by_level_not_by_storage() {
+        let mut reached = Deleted::none();
+        let _ = reached.level_mut(3);
+        assert_eq!(reached, Deleted::none(), "reaching a level removes nothing");
+        assert!(reached.is_empty());
+
+        let mut one = BitSet::new();
+        one.insert(1);
+        let marked = Deleted::at_level(2, one.clone());
+        assert_eq!(
+            marked.level(2),
+            &one,
+            "the bit is at the level it was given"
+        );
+        assert!(
+            marked.level(1).is_empty() && marked.level(9).is_empty(),
+            "every other level, stored or not, is empty"
+        );
+        assert_ne!(
+            marked,
+            Deleted::at_level(1, one),
+            "the level is part of the index"
+        );
     }
 
     /// Build a TileGuard for releasing domain2 values described by `pred` from a CurriedFunction.
@@ -1064,27 +1486,62 @@ mod tests {
         assert!(!pred.contains(&Value::UInt(99)));
     }
 
+    /// A group the predicate calls whole is released by its own key; only the groups it
+    /// leaves open contribute a codomain arm. Keys repeat across groups here, which is what
+    /// makes the distinction observable: naming a whole group's keys would release them in
+    /// the open group too.
     #[test]
-    fn to_guard_curried_function_nonempty_domain_predicate_produces_or() {
-        // When domain_predicate is non-False it should appear as a second arm of an Or
-        // alongside the domain2-derived codomain guard.
-        let pred = Predicate::LessThanEq(Value::UInt(0));
-        let tile = cf_uint_int(vec![0], vec![0], vec![10, 11], vec![100, 110], pred.clone());
-        let guard = tile.to_guard();
-        // Expect Or([Codomain(Domain(domain2_pred)), Domain(pred)])
-        let TileGuard::Or(arms) = guard else {
-            panic!("expected Or guard when domain_predicate is non-False, got {guard:?}");
-        };
-        assert_eq!(arms.len(), 2);
-        // One arm covers domain1 (the released-region predicate).
-        assert!(
-            arms.iter()
-                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_))))
+    fn to_guard_curried_function_names_only_the_open_groups_keys() {
+        // Groups 0 and 1, both keyed 10 and 11; the predicate calls group 0 whole.
+        let tile = cf_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 10, 11],
+            vec![100, 110, 200, 210],
+            Predicate::LessThanEq(Value::UInt(0)),
         );
-        // One arm covers domain2 (the codomain inner guard).
+        let TileGuard::Or(arms) = tile.to_guard() else {
+            panic!("expected an Or over the two halves")
+        };
+        let codomain = arms
+            .iter()
+            .find_map(|a| match a {
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => Some(inner.as_ref()),
+                _ => None,
+            })
+            .expect("the open group contributes a codomain arm");
+        let TileGuard::Function(FunctionGuard::Domain(keys)) = codomain else {
+            panic!("a codomain arm guards the inner domain, got {codomain:?}")
+        };
+        // Group 1's keys, named once each rather than twice.
+        assert!(keys.contains(&Value::UInt(10)));
+        assert!(keys.contains(&Value::UInt(11)));
         assert!(
             arms.iter()
-                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Codomain(_))))
+                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_)))),
+            "the whole group is released by its own key"
+        );
+    }
+
+    /// With every group whole there is nothing left for a codomain arm to name, so the
+    /// guard is the domain half alone — which is what lets a consumer recognise it as
+    /// universal where the predicate is.
+    #[test]
+    fn to_guard_curried_function_whole_groups_name_no_keys() {
+        let tile = cf_uint_int(
+            vec![0],
+            vec![0],
+            vec![10, 11],
+            vec![100, 110],
+            Predicate::True,
+        );
+        let guard = tile.to_guard();
+        assert!(
+            matches!(
+                guard,
+                TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+            ),
+            "expected the domain half alone, got {guard:?}"
         );
     }
 
@@ -1183,7 +1640,7 @@ mod tests {
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![11]));
         tile.remove_guarded(cf_release_guard(pred));
         let Tile::CurriedFunction {
-            domain2,
+            domains,
             codomain,
             deleted,
             ..
@@ -1192,12 +1649,15 @@ mod tests {
             panic!("expected CurriedFunction");
         };
         // Physical arrays unchanged.
-        assert_eq!(*domain2, ColumnValue::UInts(vec![10, 11, 12]));
-        assert_eq!(*codomain, ColumnValue::Ints(vec![100, 110, 120]));
+        assert_eq!(domains[1], ColumnValue::UInts(vec![10, 11, 12]));
+        assert_eq!(
+            **codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![100, 110, 120]))
+        );
         // Only flat index 1 (d2=11) is logically deleted.
-        assert!(!deleted.contains(0));
-        assert!(deleted.contains(1));
-        assert!(!deleted.contains(2));
+        assert!(!deleted.level(1).contains(0));
+        assert!(deleted.level(1).contains(1));
+        assert!(!deleted.level(1).contains(2));
     }
 
     #[test]
@@ -1216,15 +1676,17 @@ mod tests {
         let Tile::CurriedFunction { deleted, .. } = &tile else {
             panic!("expected CurriedFunction");
         };
-        assert!(deleted.contains(0));
-        assert!(deleted.contains(1));
-        assert!(!deleted.contains(2));
+        assert!(deleted.level(1).contains(0));
+        assert!(deleted.level(1).contains(1));
+        assert!(!deleted.level(1).contains(2));
     }
 
+    /// A release marks the element the guard names, **at that element's own level**, and
+    /// `compact` is what takes its group with it. Marking the entries beneath it instead
+    /// would leave a released group and a filtered-empty one the same shape.
     #[test]
-    fn remove_guarded_curried_function_domain_removes_whole_group() {
+    fn remove_guarded_curried_function_domain_marks_the_named_group() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
-        // Logically removes group 0 (flat indices 0,1) via domain guard on d1=0.
         let mut tile = cf_uint_int(
             vec![0, 1],
             vec![0, 2],
@@ -1237,9 +1699,23 @@ mod tests {
         let Tile::CurriedFunction { deleted, .. } = &tile else {
             panic!("expected CurriedFunction");
         };
-        assert!(deleted.contains(0));
-        assert!(deleted.contains(1));
-        assert!(!deleted.contains(2));
+        assert!(deleted.level(0).contains(0), "the named group is marked");
+        assert!(!deleted.level(0).contains(1), "its sibling is not");
+        assert!(
+            deleted.level(1).is_empty(),
+            "the entries beneath it are not marked; `compact` takes them"
+        );
+
+        tile.compact();
+        let Tile::CurriedFunction {
+            domains, offsets, ..
+        } = &tile
+        else {
+            panic!("expected CurriedFunction");
+        };
+        assert_eq!(domains[0], ColumnValue::UInts(vec![1]), "group 0 is gone");
+        assert_eq!(domains[1], ColumnValue::UInts(vec![12]), "with its entries");
+        assert_eq!(offsets[0], ColumnValue::UInts(vec![0]));
     }
 
     #[test]
@@ -1309,26 +1785,35 @@ mod tests {
         assert_eq!(tile, cf_three_groups());
     }
 
+    /// **A filter empties a group; it does not remove one.** Every key stays, and a key
+    /// whose entries all went holds nothing — which two equal starts say. Removing the key
+    /// is what a release asks for, and `compact` is where that happens.
     #[test]
-    fn retain_curried_function_keep_none_empties_tile() {
+    fn retain_curried_function_keep_none_leaves_every_group_empty() {
         let mut tile = cf_three_groups();
         tile.retain(&BitVec::from_elem(6, false));
         assert_eq!(
             tile,
-            cf_uint_int(vec![], vec![], vec![], vec![], Predicate::False)
+            cf_uint_int(
+                vec![10, 20, 30],
+                vec![0, 0, 0],
+                vec![],
+                vec![],
+                Predicate::False
+            )
         );
     }
 
     #[test]
     fn retain_curried_function_keep_entire_first_group() {
         let mut tile = cf_three_groups();
-        // Keep positions 0,1 (group 0); drop the rest.
+        // Keep positions 0,1 (group 10); groups 20 and 30 are left empty.
         tile.retain(&BitVec::from_fn(6, |i| i < 2));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![10],
-                vec![0],
+                vec![10, 20, 30],
+                vec![0, 2, 2],
                 vec![0, 1],
                 vec![100, 110],
                 Predicate::False
@@ -1339,16 +1824,15 @@ mod tests {
     #[test]
     fn retain_curried_function_keep_entire_middle_group() {
         let mut tile = cf_three_groups();
-        // Keep positions 2,3,4 (group 1); drop the rest.
-        tile.retain(&BitVec::from_fn(6, |i| (2..=4).contains(&i)));
+        tile.retain(&BitVec::from_fn(6, |i| (2..5).contains(&i)));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![20],
-                vec![0],
+                vec![10, 20, 30],
+                vec![0, 0, 3],
                 vec![2, 3, 4],
                 vec![200, 210, 220],
-                Predicate::False,
+                Predicate::False
             )
         );
     }
@@ -1356,27 +1840,31 @@ mod tests {
     #[test]
     fn retain_curried_function_keep_entire_last_group() {
         let mut tile = cf_three_groups();
-        // Keep position 5 (group 2); drop the rest.
         tile.retain(&BitVec::from_fn(6, |i| i == 5));
         assert_eq!(
             tile,
-            cf_uint_int(vec![30], vec![0], vec![5], vec![300], Predicate::False)
+            cf_uint_int(
+                vec![10, 20, 30],
+                vec![0, 0, 0],
+                vec![5],
+                vec![300],
+                Predicate::False
+            )
         );
     }
 
     #[test]
     fn retain_curried_function_drop_entire_middle_group() {
         let mut tile = cf_three_groups();
-        // Keep groups 0 and 2; drop group 1 (positions 2,3,4).
-        tile.retain(&BitVec::from_fn(6, |i| !(2..=4).contains(&i)));
+        tile.retain(&BitVec::from_fn(6, |i| !(2..5).contains(&i)));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![10, 30],
-                vec![0, 2],
+                vec![10, 20, 30],
+                vec![0, 2, 2],
                 vec![0, 1, 5],
                 vec![100, 110, 300],
-                Predicate::False,
+                Predicate::False
             )
         );
     }
@@ -1384,31 +1872,30 @@ mod tests {
     #[test]
     fn retain_curried_function_partial_mask_within_group() {
         let mut tile = cf_three_groups();
-        // Keep only d2[1] from group 0 and d2[3] from group 1; drop everything else.
-        // Positions kept: 1 and 3.
+        // One survivor in each of groups 10 and 20; group 30 keeps nothing.
         tile.retain(&BitVec::from_fn(6, |i| i == 1 || i == 3));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![10, 20],
-                vec![0, 1],
+                vec![10, 20, 30],
+                vec![0, 1, 2],
                 vec![1, 3],
                 vec![110, 210],
-                Predicate::False,
+                Predicate::False
             )
         );
     }
 
     #[test]
-    fn retain_curried_function_partial_mask_prunes_empty_group() {
+    fn retain_curried_function_partial_mask_empties_the_groups_it_clears() {
         let mut tile = cf_three_groups();
-        // Keep d2[2] and d2[4] (both in group 1); groups 0 and 2 have no survivors.
+        // Keep d2[2] and d2[4] (both in group 20); groups 10 and 30 are left empty.
         tile.retain(&BitVec::from_fn(6, |i| i == 2 || i == 4));
         assert_eq!(
             tile,
             cf_uint_int(
-                vec![20],
-                vec![0],
+                vec![10, 20, 30],
+                vec![0, 0, 2],
                 vec![2, 4],
                 vec![200, 220],
                 Predicate::False

@@ -1,3 +1,4 @@
+use crate::interpreter::Deleted;
 use bit_set::BitSet;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -37,11 +38,19 @@ impl MapResult {
         // Special case: when function is CurriedFunction(B, C, D), we need to produce a CurriedFunction output.
         // The input domain becomes the output domain1, and the function's domain2/codomain become output domain2/codomain.
         if let Tiling::CurriedFunction {
-            domain1: fn_domain1,
-            domain2: fn_domain2,
+            domains: fn_domains,
             codomain: fn_codomain,
         } = function_tiling
         {
+            // A function tile is two-level here: the lookup `B → C → D` a keyed collection
+            // presents. Deeper functions reach `MapResult` as *data*, not as the function
+            // operand.
+            let [fn_domain1, fn_domain2] = fn_domains.as_slice() else {
+                panic!(
+                    "MapResult takes a two-level function, got {} levels",
+                    fn_domains.len()
+                )
+            };
             let input_tiling = input.tiling();
             // A **scalar** input consumes `domain1`: applying a keyed collection
             // at one key yields that key's collection, not a family of them, so
@@ -57,7 +66,7 @@ impl MapResult {
                 return Self {
                     base: OperatorBase::new(Tiling::SealedFunction {
                         domain: fn_domain2.clone(),
-                        codomain: Box::new(Tiling::Scalar(fn_codomain.clone())),
+                        codomain: fn_codomain.clone(),
                     }),
                     input,
                     function,
@@ -78,16 +87,17 @@ impl MapResult {
                     d.clone()
                 }
                 Tiling::CurriedFunction {
-                    domain1: d,
+                    domains: d,
                     codomain: c,
                     ..
                 } => {
                     // Verify the codomain matches the function's domain1
                     assert_eq!(
-                        c, fn_domain1,
+                        &c.extent(),
+                        fn_domain1,
                         "Input codomain extent must match function domain1"
                     );
-                    d.clone()
+                    d[0].clone()
                 }
                 _ => panic!(
                     "MapResult with CurriedFunction function requires SealedFunction or CurriedFunction input, got {:?}",
@@ -96,8 +106,7 @@ impl MapResult {
             };
             // Output is CurriedFunction(input_domain, fn_domain2, fn_codomain)
             let tiling = Tiling::CurriedFunction {
-                domain1: input_domain,
-                domain2: fn_domain2.clone(),
+                domains: vec![input_domain, fn_domain2.clone()],
                 codomain: fn_codomain.clone(),
             };
             return Self {
@@ -222,23 +231,32 @@ impl TileProducer for MapResultProducer {
 
         // When the function is a CurriedFunction, we need special-case handling.
         if let Tile::CurriedFunction {
-            domain1: f_domain,
-            offsets,
-            domain2: f_domain2,
+            domains: f_domains,
+            offsets: f_offsets,
             codomain: f_codomain,
             domain_predicate: f_domain_predicate,
             ..
         } = function_tile
         {
+            // A function operand is the two-level lookup a keyed collection presents; a
+            // deeper function reaches this operator as data, not here.
+            let [f_domain, f_domain2] = f_domains.as_slice() else {
+                panic!(
+                    "MapResult takes a two-level function tile, got {} levels",
+                    f_domains.len()
+                )
+            };
+            let offsets = &f_offsets[0];
+            let f_codomain = scalar_tile_to_column_value(*f_codomain);
             // Get the correct extents from the CurriedFunction tiling.
             // For CurriedFunction(A, B, C), domain2 is B and codomain is C.
             let (f_domain2_extent, f_codomain_extent) = if let Tiling::CurriedFunction {
-                domain2: d2_extent,
+                domains: f_extents,
                 codomain: c_extent,
                 ..
             } = &f_tiling
             {
-                (d2_extent.clone(), c_extent.clone())
+                (f_extents[1].clone(), c_extent.extent())
             } else {
                 panic!("Expected CurriedFunction tiling for CurriedFunction tile")
             };
@@ -412,12 +430,11 @@ impl TileProducer for MapResultProducer {
             let output_domain_predicate = domain_predicate.minus(&incomplete_predicate);
             // Build new CurriedFunction with filtered domain and transformed codomain
             return Tile::CurriedFunction {
-                domain1: new_domain,
-                offsets: new_offsets,
-                domain2: new_domain2,
-                codomain: new_codomain,
+                domains: vec![new_domain, new_domain2],
+                offsets: vec![new_offsets],
+                codomain: Box::new(Tile::Scalar(new_codomain)),
                 domain_predicate: output_domain_predicate,
-                deleted: BitSet::new(),
+                deleted: Deleted::none(),
             };
         }
 
@@ -875,18 +892,16 @@ mod tests {
             codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
         let fn_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
         let (fn_spy, released) = ReleaseSpy::new(
             Tile::CurriedFunction {
-                domain1: ColumnValue::UInts(vec![0]),
-                offsets: ColumnValue::UInts(vec![0]),
-                domain2: ColumnValue::UInts(vec![1]),
-                codomain: ColumnValue::UInts(vec![1]),
+                domains: vec![ColumnValue::UInts(vec![0]), ColumnValue::UInts(vec![1])],
+                offsets: vec![ColumnValue::UInts(vec![0])],
+                codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![1]))),
                 domain_predicate: Predicate::True,
-                deleted: BitSet::new(),
+                deleted: Deleted::none(),
             },
             fn_tiling,
         );
@@ -944,18 +959,19 @@ mod tests {
 
         // Create a CurriedFunction tile
         let curried_fn_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![0, 1]),
-            offsets: ColumnValue::UInts(vec![0, 2]),
-            domain2: ColumnValue::UInts(vec![10, 20, 30]),
-            codomain: ColumnValue::UInts(vec![100, 200, 300]),
+            domains: vec![
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![10, 20, 30]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 2])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
             domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
 
         let function_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         // Create a SealedFunction tile with unsorted domain
@@ -977,9 +993,8 @@ mod tests {
 
         // Create MapResultProducer and test it
         let output_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         let mut map_result = MapResultProducer {
@@ -994,29 +1009,32 @@ mod tests {
         // Verify the result
         match result {
             Tile::CurriedFunction {
-                domain1,
+                domains,
                 offsets,
-                domain2,
                 codomain,
                 ..
             } => {
+                let [domain1, domain2] = domains.as_slice() else {
+                    panic!("expected two levels")
+                };
+                let codomain = scalar_tile_to_column_value(*codomain);
                 // After sorting unsorted input {2, 0, 1} with codomain {1, 0, 1},
                 // we get sorted {0, 1, 2} with codomain {0, 1, 1}
                 assert_eq!(domain1.len(), 3, "domain1 should have 3 elements");
-                assert_eq!(offsets.len(), 3, "offsets should have 3 elements");
+                assert_eq!(offsets[0].len(), 3, "offsets should have 3 elements");
                 assert_eq!(domain2.len(), 4, "domain2 should have 4 elements");
                 assert_eq!(codomain.len(), 4, "codomain should have 4 elements");
 
                 // Verify domain1 is sorted: [0, 1, 2]
                 if let ColumnValue::UInts(d1) = domain1 {
-                    assert_eq!(d1, vec![0, 1, 2], "domain1 should be sorted");
+                    assert_eq!(*d1, vec![0, 1, 2], "domain1 should be sorted");
                 } else {
                     panic!("domain1 should be UInts");
                 }
 
                 // Verify offsets: [0, 2, 3]
-                if let ColumnValue::UInts(offs) = offsets {
-                    assert_eq!(offs, vec![0, 2, 3], "offsets should be [0, 2, 3]");
+                if let ColumnValue::UInts(offs) = &offsets[0] {
+                    assert_eq!(*offs, vec![0, 2, 3], "offsets should be [0, 2, 3]");
                 } else {
                     panic!("offsets should be UInts");
                 }
@@ -1024,7 +1042,7 @@ mod tests {
                 // Verify domain2: [10, 20, 30, 30]
                 if let ColumnValue::UInts(d2) = domain2 {
                     assert_eq!(
-                        d2,
+                        *d2,
                         vec![10, 20, 30, 30],
                         "domain2 should be [10, 20, 30, 30]"
                     );
@@ -1063,17 +1081,18 @@ mod tests {
     fn map_result_producer_curried_function_domain_predicate() {
         let f_pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
         let curried_fn_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![0, 1]),
-            offsets: ColumnValue::UInts(vec![0, 1]),
-            domain2: ColumnValue::UInts(vec![10, 20]),
-            codomain: ColumnValue::UInts(vec![100, 200]),
+            domains: vec![
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![10, 20]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 1])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
             domain_predicate: f_pred,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
         let function_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
 
         let sealed_fn_tile = Tile::SealedFunction {
@@ -1088,9 +1107,8 @@ mod tests {
         };
 
         let output_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
         let mut map_result = MapResultProducer {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
@@ -1101,7 +1119,7 @@ mod tests {
         let result = map_result.get(map_result.tiling().universal_guard());
 
         let Tile::CurriedFunction {
-            domain1,
+            domains,
             domain_predicate: out_pred,
             ..
         } = result
@@ -1110,10 +1128,10 @@ mod tests {
         };
 
         // Only x=0 and x=1 have entries in the output (y=2,3 absent from CurriedFunction).
-        let ColumnValue::UInts(d1_vals) = domain1 else {
+        let ColumnValue::UInts(d1_vals) = &domains[0] else {
             panic!("domain1 should be UInts");
         };
-        assert_eq!(d1_vals, vec![0, 1], "only x=0,1 should appear in domain1");
+        assert_eq!(*d1_vals, vec![0, 1], "only x=0,1 should appear in domain1");
 
         assert!(
             out_pred.contains(&Value::UInt(0))
@@ -1128,17 +1146,18 @@ mod tests {
     #[test]
     fn map_result_producer_curried_function_domain_predicate_both_true() {
         let curried_fn_tile = Tile::CurriedFunction {
-            domain1: ColumnValue::UInts(vec![0, 1]),
-            offsets: ColumnValue::UInts(vec![0, 1]),
-            domain2: ColumnValue::UInts(vec![10, 20]),
-            codomain: ColumnValue::UInts(vec![100, 200]),
+            domains: vec![
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![10, 20]),
+            ],
+            offsets: vec![ColumnValue::UInts(vec![0, 1])],
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
             domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
+            deleted: Deleted::none(),
         };
         let function_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
         let sealed_fn_tile = Tile::SealedFunction {
             domain: ColumnValue::UInts(vec![0, 1]),
@@ -1151,9 +1170,8 @@ mod tests {
             codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
         let output_tiling = Tiling::CurriedFunction {
-            domain1: Extent::Base(BaseType::UInt),
-            domain2: Extent::Base(BaseType::UInt),
-            codomain: Extent::Base(BaseType::UInt),
+            domains: vec![Extent::Base(BaseType::UInt), Extent::Base(BaseType::UInt)],
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
         };
         let mut map_result = MapResultProducer {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),

@@ -1,3 +1,4 @@
+use crate::interpreter::Deleted;
 use bit_set::BitSet;
 use log::trace;
 use std::collections::HashMap;
@@ -6,7 +7,7 @@ use super::*;
 use crate::interpreter::operator_graph::value_at;
 use crate::{
     interpreter::{
-        ColumnValue, Consumer, Extent, Scheduler, forwarding_consumer, shared_consumer, tuple_field,
+        ColumnValue, Consumer, Scheduler, forwarding_consumer, shared_consumer, tuple_field,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -101,23 +102,12 @@ impl FanIn {
                     )),
                 }
             }
-            Tiling::CurriedFunction {
-                domain1, domain2, ..
-            } => {
+            Tiling::CurriedFunction { domains, .. } => {
                 for op in ops.iter().skip(1) {
-                    if let Tiling::CurriedFunction {
-                        domain1: d1,
-                        domain2: d2,
-                        ..
-                    } = op.tiling()
-                    {
+                    if let Tiling::CurriedFunction { domains: other, .. } = op.tiling() {
                         assert_eq!(
-                            domain1, d1,
-                            "FanIn: all CurriedFunction inputs must have the same domain1"
-                        );
-                        assert_eq!(
-                            domain2, d2,
-                            "FanIn: all CurriedFunction inputs must have the same domain2"
+                            domains, other,
+                            "FanIn: all CurriedFunction inputs must share their domains"
                         );
                     } else {
                         panic!(
@@ -126,9 +116,8 @@ impl FanIn {
                     }
                 }
                 Tiling::CurriedFunction {
-                    domain1: domain1.clone(),
-                    domain2: domain2.clone(),
-                    codomain: Extent::Record(
+                    domains: domains.clone(),
+                    codomain: Box::new(Tiling::Record(
                         names
                             .iter()
                             .zip(ops.iter())
@@ -137,10 +126,10 @@ impl FanIn {
                                 else {
                                     panic!("Expected CurriedFunction, got {}", op.tiling())
                                 };
-                                (name.clone(), cod.clone())
+                                (name.clone(), (**cod).clone())
                             })
                             .collect(),
-                    ),
+                    )),
                 }
             }
             _ => panic!(
@@ -358,38 +347,30 @@ impl TileProducer for FanInProducer {
             }
             Tile::CurriedFunction { .. } => {
                 // All inputs are CurriedFunction tiles
-                let mut domain1: Option<ColumnValue> = None;
-                let mut offsets: Option<ColumnValue> = None;
-                let mut domain2: Option<ColumnValue> = None;
+                let mut domains: Option<Vec<ColumnValue>> = None;
+                let mut offsets: Option<Vec<ColumnValue>> = None;
                 let mut domain_pred: Option<Predicate> = None;
                 let mut codomains = Vec::new();
 
                 for t in tiles.into_iter() {
                     match t {
                         Tile::CurriedFunction {
-                            domain1: d1,
+                            domains: ds,
                             offsets: offs,
-                            domain2: d2,
                             codomain: cod,
                             domain_predicate,
                             ..
                         } => {
-                            if let Some(ref prev_d1) = domain1 {
+                            if let Some(ref prev) = domains {
                                 assert_eq!(
-                                    prev_d1, &d1,
-                                    "FanIn: all inputs must have the same domain1"
+                                    prev, &ds,
+                                    "FanIn: all inputs must share their domain levels"
                                 );
                             }
-                            if let Some(ref prev_offs) = offsets {
+                            if let Some(ref prev) = offsets {
                                 assert_eq!(
-                                    prev_offs, &offs,
-                                    "FanIn: all inputs must have the same offsets"
-                                );
-                            }
-                            if let Some(ref prev_d2) = domain2 {
-                                assert_eq!(
-                                    prev_d2, &d2,
-                                    "FanIn: all inputs must have the same domain2"
+                                    prev, &offs,
+                                    "FanIn: all inputs must share their offsets"
                                 );
                             }
                             if let Some(ref mut prev) = domain_pred {
@@ -397,10 +378,9 @@ impl TileProducer for FanInProducer {
                             } else {
                                 domain_pred = Some(domain_predicate.clone());
                             }
-                            domain1 = Some(d1);
+                            domains = Some(ds);
                             offsets = Some(offs);
-                            domain2 = Some(d2);
-                            codomains.push(cod);
+                            codomains.push(scalar_tile_to_column_value(*cod));
                         }
                         _ => panic!("FanIn: cannot mix CurriedFunction and other tile types"),
                     }
@@ -415,12 +395,11 @@ impl TileProducer for FanInProducer {
                         .collect(),
                 );
                 Tile::CurriedFunction {
-                    domain1: domain1.unwrap(),
+                    domains: domains.unwrap(),
                     offsets: offsets.unwrap(),
-                    domain2: domain2.unwrap(),
-                    codomain: codomain_record,
+                    codomain: Box::new(Tile::Scalar(codomain_record)),
                     domain_predicate: domain_pred.unwrap(),
-                    deleted: BitSet::new(),
+                    deleted: Deleted::none(),
                 }
             }
             _ => panic!("FanIn: all inputs must be SealedFunction or CurriedFunction tiles"),

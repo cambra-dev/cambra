@@ -180,19 +180,32 @@ impl TileGuard {
                 Tiling::SealedFunction { codomain, .. },
             ) => g.check_from(codomain.as_ref()),
 
-            // CurrriedFunction tilings support only domain guards or domain(codomain) guards to reference
-            // the inner domain.
+            // A curried tiling supports a `Domain` guard under any number of `Codomain`
+            // wrappers: each wrapper steps one level in, so the guard nests as deeply as
+            // the type does and there is one level it can name per domain.
             (
                 TileGuard::Function(FunctionGuard::Domain(pred)),
-                Tiling::CurriedFunction { domain1, .. },
-            ) => pred.is_applicable_to(domain1),
+                Tiling::CurriedFunction { domains, .. },
+            ) => pred.is_applicable_to(&domains[0]),
             (
                 TileGuard::Function(FunctionGuard::Codomain(g)),
-                Tiling::CurriedFunction { domain2, .. },
-            ) => match g.as_ref() {
-                TileGuard::Function(FunctionGuard::Domain(pred)) => pred.is_applicable_to(domain2),
-                _ => false,
-            },
+                Tiling::CurriedFunction { domains, .. },
+            ) => {
+                let mut level = 1;
+                let mut current = g.as_ref();
+                loop {
+                    match current {
+                        TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                            break level < domains.len() && pred.is_applicable_to(&domains[level]);
+                        }
+                        TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                            level += 1;
+                            current = inner;
+                        }
+                        _ => break false,
+                    }
+                }
+            }
 
             // Record guards must have the same key set, with each field guard
             // compatible with the corresponding field tiling.

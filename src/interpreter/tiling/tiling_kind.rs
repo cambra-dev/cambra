@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, fmt};
 
+use crate::interpreter::tiling::tile::Deleted;
 use bit_set::BitSet;
 use bit_vec::BitVec;
 
@@ -29,11 +30,22 @@ pub enum Tiling {
         domain: Extent,
         codomain: Box<Tiling>,
     },
-    /// A function of type A -> B -> C
+    /// A curried function `D₀ → D₁ → … → Dₙ₋₁ → C`, carrying one group per element of
+    /// every domain above the last.
+    ///
+    /// This is [`Tiling::SealedFunction`] plus **offsets**, and differs in nothing else:
+    /// the runtime shape is a CSR layout with one offsets array per level above the
+    /// innermost, so a group may hold a different number of elements at each level. That
+    /// raggedness is the whole of what a sealed function cannot express — its codomain is
+    /// vectorized one entry per domain position, with nothing to say where one parent's
+    /// run ends, so it can nest a function only when every parent holds the same inner
+    /// domain.
     CurriedFunction {
-        domain1: Extent,
-        domain2: Extent,
-        codomain: Extent,
+        /// Domain extents, outermost first. At least two.
+        domains: Vec<Extent>,
+        /// The codomain at the innermost level, which may be structured — an
+        /// [`Tiling::Aggregation`] is what a per-level fold leaves here.
+        codomain: Box<Tiling>,
     },
     /// Result of an aggregation
     Aggregation {
@@ -64,17 +76,17 @@ impl Tiling {
                     codomain: Box::new(codomain.extent()),
                 }
             }
-            Tiling::CurriedFunction {
-                domain1,
-                domain2,
-                codomain,
-            } => Extent::Function {
-                domain: Box::new(domain1.clone()),
-                codomain: Box::new(Extent::Function {
-                    domain: Box::new(domain2.clone()),
-                    codomain: Box::new(codomain.clone()),
-                }),
-            },
+            // One `Extent::Function` per level, built innermost outward, so the extent
+            // nests as deeply as the tiling does.
+            Tiling::CurriedFunction { domains, codomain } => {
+                domains
+                    .iter()
+                    .rev()
+                    .fold(codomain.extent(), |acc, domain| Extent::Function {
+                        domain: Box::new(domain.clone()),
+                        codomain: Box::new(acc),
+                    })
+            }
             Tiling::Aggregation { accumulator, .. } => accumulator.clone(),
         }
     }
@@ -110,9 +122,9 @@ impl Tiling {
             Tiling::Scalar(Extent::Function { codomain, .. }) => {
                 Some(Tiling::Scalar(*codomain.clone()))
             }
-            Tiling::SealedFunction { codomain, .. } | Tiling::Store { codomain, .. } => {
-                Some(*codomain.clone())
-            }
+            Tiling::SealedFunction { codomain, .. }
+            | Tiling::Store { codomain, .. }
+            | Tiling::CurriedFunction { codomain, .. } => Some(*codomain.clone()),
             _ => None,
         }
     }
@@ -125,7 +137,7 @@ impl Tiling {
             Tiling::SealedFunction { domain, .. } | Tiling::Store { domain, .. } => {
                 Some(domain.clone())
             }
-            Tiling::CurriedFunction { domain1, .. } => Some(domain1.clone()),
+            Tiling::CurriedFunction { domains, .. } => Some(domains[0].clone()),
             _ => None,
         }
     }
@@ -153,17 +165,15 @@ impl Tiling {
                 domain_predicate: Predicate::False,
                 deleted: BitSet::new(),
             },
-            Tiling::CurriedFunction {
-                domain1: domain1_extent,
-                domain2: domain2_extent,
-                codomain: codomain_extent,
-            } => Tile::curried_function(
-                ColumnValue::from_values(Vec::new(), domain1_extent),
-                ColumnValue::UInts(Vec::new()),
-                ColumnValue::from_values(Vec::new(), domain2_extent),
-                ColumnValue::from_values(Vec::new(), codomain_extent),
+            Tiling::CurriedFunction { domains, codomain } => Tile::curried_function(
+                domains
+                    .iter()
+                    .map(|d| ColumnValue::from_values(Vec::new(), d))
+                    .collect(),
+                vec![ColumnValue::UInts(Vec::new()); domains.len() - 1],
+                Box::new(codomain.empty_tile()),
                 Predicate::False,
-                BitSet::new(),
+                Deleted::none(),
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
                 kind: *kind,
@@ -230,12 +240,12 @@ impl fmt::Display for Tiling {
             Tiling::Record(fields) => fmt_record(f, fields),
             Tiling::SealedFunction { domain, codomain } => write!(f, "SF({domain:?} → {codomain})"),
             Tiling::Store { domain, codomain } => write!(f, "Store({domain:?} → {codomain})"),
-            Tiling::CurriedFunction {
-                domain1,
-                domain2,
-                codomain,
-            } => {
-                write!(f, "CF({domain1:?} → {domain2:?} → {codomain:?})")
+            Tiling::CurriedFunction { domains, codomain } => {
+                write!(f, "CF(")?;
+                for domain in domains {
+                    write!(f, "{domain:?} → ")?;
+                }
+                write!(f, "{codomain})")
             }
             Tiling::Aggregation { kind, accumulator } => {
                 write!(f, "agg({kind:?}, {accumulator:?})")
@@ -379,11 +389,15 @@ mod tests {
         assert_eq!(Tiling::Scalar(int()).codomain(), None);
     }
 
+    /// A curried function answers its codomain like a sealed one: the two differ in the
+    /// offsets between levels and in nothing else, so a fold can leave an
+    /// [`Tiling::Aggregation`] here and the level above can read it.
     #[test]
-    fn codomain_lookup_function_is_none() {
-        // CurriedFunction has no structured codomain tiling via codomain().
-        // Its codomain is accessed through domain2 and codomain extents directly.
-        assert_eq!(curried(int(), bool_ext(), int()).codomain(), None);
+    fn codomain_of_a_curried_function_is_its_innermost_codomain() {
+        assert_eq!(
+            curried(int(), bool_ext(), int()).codomain(),
+            Some(Tiling::Scalar(int()))
+        );
     }
 
     // ── Tiling::domain_extent ─────────────────────────────────────────────────

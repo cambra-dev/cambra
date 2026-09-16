@@ -49,11 +49,11 @@ pub(super) mod tests {
         }
     }
 
+    /// A two-level curried tiling, the shape most callers want.
     pub(crate) fn curried(domain1: Extent, domain2: Extent, codomain: Extent) -> Tiling {
         Tiling::CurriedFunction {
-            domain1,
-            domain2,
-            codomain,
+            domains: vec![domain1, domain2],
+            codomain: Box::new(Tiling::Scalar(codomain)),
         }
     }
 
