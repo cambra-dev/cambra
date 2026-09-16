@@ -1,9 +1,11 @@
 use bit_set::BitSet;
 use bit_vec::BitVec;
 use log::trace;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use super::*;
+use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
@@ -12,13 +14,13 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-/// Reduces a `SealedFunction` input to a single scalar via an aggregation operation.
+/// Reduces a `Function` input to a single scalar via an aggregation operation.
 ///
 /// On each `get`, reads all codomain values from the input and folds them into a
 /// running `Tile::Aggregation` accumulator. The result becomes terminal once the
 /// input's `domain_predicate` is `True` (all elements seen).
 pub struct Aggregate {
-    /// The `SealedFunction`-typed input whose codomain elements are aggregated.
+    /// The `Function`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
     /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
     base: OperatorBase,
@@ -27,18 +29,14 @@ pub struct Aggregate {
 impl Aggregate {
     /// Construct an `Aggregate` operator.
     ///
-    /// Panics if `input` does not have a `SealedFunction` tiling, or if `kind`
+    /// Panics if `input` does not have a `Function` tiling, or if `kind`
     /// does not support the codomain element type.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         let err = || panic!("Cannot apply {kind:?} to non-function {:?}", input.tiling());
-        let codomain_extent = input
-            .tiling()
-            .codomain()
-            .map(|t| t.extent())
-            .unwrap_or_else(err);
+        let values = input.tiling().codomain().unwrap_or_else(err);
         let tiling = Tiling::Aggregation {
             kind,
-            accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
+            accumulator: Box::new(kind.output_tiling(&values).unwrap_or_else(err)),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -90,12 +88,12 @@ impl AggregateProducer {
         let (kind, accumulator) = match &tiling {
             Tiling::Aggregation {
                 kind,
-                accumulator: acc_extent,
+                accumulator: acc_tiling,
             } => (
                 *kind,
                 Tile::Aggregation {
                     kind: *kind,
-                    accumulator: kind.initial_accumulator(acc_extent),
+                    accumulator: Box::new(kind.initial_accumulator(acc_tiling)),
                     terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
                 },
             ),
@@ -126,11 +124,11 @@ impl TileProducer for AggregateProducer {
         let mut input_result = self.input.get(i_tiling.universal_guard());
         let upstream_guard = input_result.to_guard();
         input_result.compact();
-        let Tile::SealedFunction { codomain, .. } = input_result else {
-            panic!("Aggregate expected function tiling, got {input_result:?}");
+        let Tile::Function { codomain, .. } = input_result else {
+            panic!("Aggregate expected a collection, got {input_result:?}");
         };
         self.input.release(upstream_guard);
-        let values = scalar_tile_to_column_value(*codomain);
+        let values = *codomain;
 
         let is_terminal = self.input.obsolete_guard().is_universal();
         trace!(
@@ -145,7 +143,7 @@ impl TileProducer for AggregateProducer {
         else {
             panic!("Accumulator must be Aggregation tile")
         };
-        self.kind.accumulate(accumulator, &values, 0, values.len());
+        self.kind.accumulate(accumulator, &values, 0, values.rows());
         terminal.set(0, is_terminal);
         self.accumulator.clone()
     }
@@ -246,7 +244,7 @@ impl TileProducer for ExtractAggregateProducer {
         }
         if self.only_terminal {
             if terminal.index_at(0).as_bool() {
-                Tile::Scalar(self.kind.extract(accumulator))
+                self.kind.extract(*accumulator)
             } else {
                 self.tiling().empty_tile()
             }
@@ -262,39 +260,40 @@ impl TileProducer for ExtractAggregateProducer {
     }
 }
 
-/// Extracts terminal per-key aggregation results from a
-/// `SealedFunction(D, Aggregation)`, producing a `SealedFunction(D, Scalar)`.
+/// Extracts terminal aggregation results, turning an `Aggregation` codomain into a `Scalar`
+/// one and leaving the domain structure alone.
 ///
-/// For each domain element, the aggregation value is extracted and emitted only
-/// when that element's terminal flag is `true`.  Non-terminal elements are
-/// filtered out of the output domain.
+/// Both function shapes reach this, because [`MapAggregate`] leaves whichever its input's
+/// depth calls for: `Function(D, Aggregation)` becomes `Function(D, Scalar)`,
+/// and `Function(D₀ … Dₙ₋₁, Aggregation)` becomes the same levels over a `Scalar`.
+/// An element is emitted only where its terminal flag is set; the rest are filtered out,
+/// which for a nested tile also drops every key left holding nothing.
 pub struct MapExtractAggregate {
-    /// The `SealedFunction(D, Aggregation)`-typed input.
+    /// The `Function(D, Aggregation)`-typed input.
     input: Box<dyn TileOperator>,
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
-    /// Output tiling: `SealedFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
+    /// Output tiling: `Function { domain: input.domain, codomain: Scalar(output_extent) }`.
     base: OperatorBase,
 }
 
 impl MapExtractAggregate {
     /// Create a new `MapExtractAggregate` operator.
     ///
-    /// `input` must have a `SealedFunction` tiling whose codomain is
+    /// `input` must have a `Function` tiling whose codomain is
     /// `Aggregation { accumulator: A }`.  The output tiling is
-    /// `SealedFunction { domain: input.domain, codomain: Scalar(A) }`.
+    /// `Function { domain: input.domain, codomain: Scalar(A) }`.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
+        let accumulator_of = |codomain: &Tiling| match codomain {
+            Tiling::Aggregation { accumulator, .. } => (**accumulator).clone(),
+            t => panic!("MapExtractAggregate expected an Aggregation codomain, got {t:?}"),
+        };
         let tiling = match input.tiling() {
-            Tiling::SealedFunction { domain, codomain } => match codomain.as_ref() {
-                Tiling::Aggregation { accumulator, .. } => Tiling::SealedFunction {
-                    domain: domain.clone(),
-                    codomain: Box::new(Tiling::Scalar(accumulator.clone())),
-                },
-                t => panic!(
-                    "MapExtractAggregate expected SealedFunction(Aggregation) codomain, got {t:?}"
-                ),
+            Tiling::Function { domain, codomain } => Tiling::Function {
+                domain: domain.clone(),
+                codomain: Box::new(accumulator_of(codomain)),
             },
-            t => panic!("MapExtractAggregate expected SealedFunction input, got {t:?}"),
+            t => panic!("MapExtractAggregate expected a collection input, got {t:?}"),
         };
         Self {
             base: OperatorBase::new(tiling),
@@ -346,14 +345,29 @@ impl TileProducer for MapExtractAggregateProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
-        let Tile::SealedFunction {
-            domain,
-            codomain,
-            domain_predicate,
-            ..
-        } = input_result
-        else {
-            panic!("MapExtractAggregate expected SealedFunction tile")
+        // The shape passes through; only the codomain changes and the non-terminal
+        // elements go. Rebuilding with the same levels is what keeps a deeper fold's
+        // grouping intact for the fold above it.
+        let (rebuild, codomain): (Box<dyn FnOnce(Tile) -> Tile>, Box<Tile>) = match input_result {
+            Tile::Function {
+                row_starts,
+                domain,
+                codomain,
+                domain_predicate,
+                ..
+            } => (
+                Box::new(move |extracted| {
+                    Tile::grouped(
+                        row_starts,
+                        domain,
+                        Box::new(extracted),
+                        domain_predicate,
+                        BitSet::new(),
+                    )
+                }),
+                codomain,
+            ),
+            other => panic!("MapExtractAggregate expected a function tile, got {other:?}"),
         };
         let Tile::Aggregation {
             accumulator,
@@ -361,19 +375,15 @@ impl TileProducer for MapExtractAggregateProducer {
             ..
         } = *codomain
         else {
-            panic!("MapExtractAggregate expected SealedFunction(Aggregation) codomain")
+            panic!("MapExtractAggregate expected an Aggregation codomain")
         };
-        // Emit only the domain elements whose per-key aggregation is terminal.
+        // Emit only the elements whose aggregation is terminal.
         let mask = terminal
             .as_bitvec()
             .unwrap_or_else(|| panic!("Expected bools"));
-        let mut output = Tile::SealedFunction {
-            domain,
-            codomain: Box::new(Tile::Scalar(self.kind.extract(accumulator))),
-            domain_predicate,
-            deleted: BitSet::new(),
-        };
-        output.retain(mask);
+        let mut output = rebuild(self.kind.extract(*accumulator));
+        // One bool per accumulator, so the mask is over the collection's keys.
+        output.retain_keys(mask);
         output
     }
 
@@ -389,49 +399,159 @@ impl TileProducer for MapExtractAggregateProducer {
     }
 }
 
-/// Performs a per-key aggregation over a [`Tile::CurriedFunction`], producing a
-/// `SealedFunction` that maps each domain key to an in-progress aggregation.
+/// Order two element paths lexicographically.
 ///
-/// For a lookup `D → [C]` and an [`AggregateKind`], `MapAggregate` produces a
-/// sealed function `D → Aggregation(C)`.  New data from partial lookups is
-/// merged into per-key accumulators on each `get`; each key's aggregation
-/// becomes terminal when the input lookup's `domain_predicate` is `True`.
+/// [`Value`] is `PartialOrd` and not `Ord`, so incomparable components compare equal here:
+/// the order only has to group a parent's children together, which any total order does.
+fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
+    for (x, y) in a.iter().zip(b) {
+        match x.partial_cmp(y) {
+            Some(Ordering::Equal) | None => continue,
+            Some(other) => return other,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Rebuild a function of `extents.len()` domain levels from the sorted paths of its
+/// innermost elements, with `codomain` already vectorized over those elements.
+///
+/// Each level nests inside the one above it, so a new key at a level starts its run of
+/// children where the level below has reached. The paths must arrive sorted: a parent's
+/// children are contiguous only then.
+fn build_curried_from_paths(
+    paths: &[&[Value]],
+    extents: &[Extent],
+    codomain: Tile,
+    domain_predicate: Predicate,
+) -> Tile {
+    let depth = extents.len();
+    let mut columns: Vec<Vec<Value>> = vec![Vec::new(); depth];
+    let mut starts: Vec<Vec<usize>> = vec![Vec::new(); depth.saturating_sub(1)];
+    let mut last: Vec<Option<Vec<Value>>> = vec![None; depth];
+    for path in paths {
+        for level in 0..depth {
+            let prefix = &path[..=level];
+            if last[level].as_deref() == Some(prefix) {
+                continue;
+            }
+            if level + 1 < depth {
+                starts[level].push(columns[level + 1].len());
+            }
+            columns[level].push(path[level].clone());
+            last[level] = Some(prefix.to_vec());
+            // A new element invalidates every prefix below it, so the next path opens fresh
+            // elements there instead of extending the previous parent's last child.
+            for deeper in last.iter_mut().skip(level + 1) {
+                *deeper = None;
+            }
+        }
+    }
+    let mut domains: Vec<ColumnValue> = columns
+        .into_iter()
+        .zip(extents)
+        .map(|(values, extent)| ColumnValue::from_values(values, extent))
+        .collect();
+    if depth == 1 {
+        return Tile::function(
+            domains.pop().unwrap_or_else(|| unreachable!()),
+            Box::new(codomain),
+            domain_predicate,
+            BitSet::new(),
+        );
+    }
+    nest_levels(
+        domains,
+        starts.into_iter().map(ColumnValue::UInts).collect(),
+        Box::new(codomain),
+        domain_predicate,
+    )
+}
+
+/// Collapses the **innermost** collection of a nested tile into an aggregation, leaving the
+/// levels above it intact.
+///
+/// For `K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ C` and an [`AggregateKind`] it produces `K₀ ⤇ … ⤇ Kₙ₋₂ ⤇
+/// Aggregation(C)`. Collapsing one level per operator is what lets nested aggregation nest:
+/// each `sum` in `sum([sum([…]) for …])` is one of these.
+///
+/// Accumulators are keyed by the **path** of the element being folded into, not by its own
+/// value: a key repeats across its siblings' groups, so below the outermost level a value
+/// does not identify an element. New data merges on each `get`; an element's aggregation
+/// becomes terminal where the input's `domain_predicate` names its outermost ancestor.
 pub struct MapAggregate {
     /// The lookup-function input to aggregate per key.
     input: Box<dyn TileOperator>,
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
-    /// Output tiling: `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
+    /// Output tiling: `Function { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
     base: OperatorBase,
 }
 
 impl MapAggregate {
     /// Create a new `MapAggregate` operator.
     ///
-    /// `input` must have a `CurriedFunction` tiling; `kind` must support the
+    /// `input` must have a `Function` tiling; `kind` must support the
     /// lookup's codomain element type.  The output tiling is
-    /// `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
+    /// `Function { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
-        let (domain, input_codomain) = match input.tiling() {
-            Tiling::CurriedFunction {
-                domain1, codomain, ..
-            } => (domain1.clone(), codomain.clone()),
-            t => panic!("MapAggregate requires CurriedFunction input, got {t:?}"),
+        // A collection whose values are not themselves a collection has no level above the
+        // one being folded, which is `Aggregate`'s shape rather than this one's.
+        let Tiling::Function { codomain, .. } = input.tiling() else {
+            panic!(
+                "MapAggregate requires a collection input, got {}",
+                input.tiling()
+            )
         };
-        let output_extent = kind.output_extent(&input_codomain).unwrap_or_else(|| {
-            panic!("Cannot apply {kind:?} to codomain extent {input_codomain:?}")
-        });
-        let tiling = Tiling::SealedFunction {
-            domain,
-            codomain: Box::new(Tiling::Aggregation {
-                kind,
-                accumulator: output_extent,
-            }),
-        };
+        assert!(
+            matches!(codomain.as_ref(), Tiling::Function { .. }),
+            "MapAggregate folds a collection of collections, got {}",
+            input.tiling()
+        );
+        let tiling = fold_innermost(input.tiling(), kind);
         Self {
             base: OperatorBase::new(tiling),
             input,
             kind,
+        }
+    }
+}
+
+/// Replace `tiling`'s innermost collection with the aggregation that folds it.
+fn fold_innermost(tiling: &Tiling, kind: AggregateKind) -> Tiling {
+    let Tiling::Function { domain, codomain } = tiling else {
+        panic!("fold_innermost walks a chain of collections, got {tiling}")
+    };
+    match codomain.as_ref() {
+        Tiling::Function { .. } => Tiling::Function {
+            domain: domain.clone(),
+            codomain: Box::new(fold_innermost(codomain, kind)),
+        },
+        inner => {
+            let accumulator = kind
+                .output_tiling(inner)
+                .unwrap_or_else(|| panic!("Cannot apply {kind:?} to values {inner}"));
+            Tiling::Aggregation {
+                kind,
+                accumulator: Box::new(accumulator),
+            }
+        }
+    }
+}
+
+/// A folded tiling's key extent per level, outermost first, and the accumulator extent the
+/// chain ends in.
+fn folded_shape(tiling: &Tiling) -> (Vec<Extent>, Tiling) {
+    let mut extents = Vec::new();
+    let mut node = tiling;
+    loop {
+        match node {
+            Tiling::Function { domain, codomain } => {
+                extents.push(domain.clone());
+                node = codomain;
+            }
+            Tiling::Aggregation { accumulator, .. } => return (extents, (**accumulator).clone()),
+            other => panic!("MapAggregate leaves collections around an aggregation, got {other}"),
         }
     }
 }
@@ -469,7 +589,7 @@ struct MapAggregateProducer {
     /// The aggregation operation.
     kind: AggregateKind,
     /// Running per-key accumulators, grown as new keys arrive across `get` calls.
-    accumulators: HashMap<Value, ColumnValue>,
+    accumulators: HashMap<Vec<Value>, Tile>,
 }
 
 impl TileProducer for MapAggregateProducer {
@@ -484,65 +604,94 @@ impl TileProducer for MapAggregateProducer {
         trace!("{} received {input_tile:?}", self.name());
         let upstream_guard = input_tile.to_guard();
         input_tile.compact();
-        let Tile::CurriedFunction {
-            domain1,
-            offsets,
-            domain2: _,
-            codomain,
-            domain_predicate,
-            ..
-        } = input_tile
+        let Tile::Function {
+            domain_predicate, ..
+        } = &input_tile
         else {
-            panic!("MapAggregate requires a CurriedFunction tile")
+            panic!("MapAggregate requires a collection tile, got {input_tile:?}")
         };
-        // output_extent is the accumulator extent from the Aggregation codomain tiling.
-        let output_extent = self.tiling().codomain().unwrap().extent();
-        let domain_extent = self.tiling().domain_extent().unwrap();
-        // Merge newly arrived values into per-key accumulators.
+        let domain_predicate = domain_predicate.clone();
+
+        // Descend to the collection being folded, extending the key path at every level.
+        // Its rows are the elements the groups fold into, so `parent_paths` names them.
+        let mut node = &input_tile;
+        let mut parent_paths = vec![Vec::new()];
+        let folded = loop {
+            parent_paths = node.key_paths(&parent_paths);
+            let Tile::Function { codomain, .. } = node else {
+                unreachable!("the loop only descends into a collection")
+            };
+            match codomain.as_ref() {
+                Tile::Function {
+                    codomain: inner, ..
+                } if inner.is_function() => node = codomain,
+                Tile::Function { .. } => break codomain.as_ref(),
+                other => panic!("MapAggregate folds a collection of collections, got {other:?}"),
+            }
+        };
+        let Tile::Function { codomain, .. } = folded else {
+            unreachable!("the loop breaks on a collection")
+        };
+        let values = (**codomain).clone();
+        let (extents, output_tiling) = folded_shape(self.tiling());
+
+        // Fold each group into its row's accumulator. A group is a contiguous run of the
+        // folded collection's values, so the fold stays vectorized.
         let kind = &self.kind;
         let accumulators = &mut self.accumulators;
-        let n = domain1.len();
-        for i in 0..n {
-            let key = domain1.index_at(i);
-            let start = offsets.index_at(i).as_uint();
-            let end = if i + 1 < n {
-                offsets.index_at(i + 1).as_uint()
-            } else {
-                codomain.len()
-            };
+        for (row, path) in parent_paths.iter().enumerate() {
+            let (start, end) = folded.row_run(row);
             let acc = accumulators
-                .entry(key)
-                .or_insert_with(|| kind.initial_accumulator(&output_extent));
-            kind.accumulate(acc, &codomain, start, end);
+                .entry(path.clone())
+                .or_insert_with(|| kind.initial_accumulator(&output_tiling));
+            kind.accumulate(acc, &values, start, end);
         }
 
         // Release received values
         self.input.release(upstream_guard);
 
-        // Build the output tile from all known per-key accumulators.
-        // TODO apply the domain predicate to each domain value.
-        let is_terminal = domain_predicate.as_bool().unwrap_or(false);
-        let n = self.accumulators.len();
-        let (domain_values, accumulator_values): (Vec<Value>, Vec<Value>) = self
+        // Build the output from all known accumulators.
+        //
+        // **Terminal per element, which is what the predicate says.** A `domain_predicate`
+        // names the region of the outermost domain that will see no new elements, each key
+        // together with every level below it — so an element
+        // whose outermost ancestor lies inside it has a complete group and its accumulator
+        // is the answer, whatever the rest of the domain is still doing. Reading the
+        // predicate as one bool answers "not yet" for every element whenever any part of the
+        // domain is open, which is never right for a live source: a collection held per row
+        // is complete as soon as its row arrives, and an aggregate over one would otherwise
+        // never settle.
+        let mut entries: Vec<(Vec<Value>, Tile)> = self
             .accumulators
             .iter()
-            .map(|(key, acc)| (key.clone(), acc.as_single().unwrap()))
-            .unzip();
-        Tile::SealedFunction {
-            domain: ColumnValue::from_values(domain_values, &domain_extent),
-            codomain: Box::new(Tile::Aggregation {
-                kind: self.kind,
-                accumulator: ColumnValue::from_values(accumulator_values, &output_extent),
-                terminal: ColumnValue::Bools(BitVec::from_elem(n, is_terminal)),
-            }),
-            domain_predicate,
-            deleted: BitSet::new(),
+            .map(|(path, acc)| (path.clone(), acc.clone()))
+            .collect();
+        // Sorted so the outermost column stays ordered and a parent's children sit
+        // contiguously, which is what rebuilding the offsets assumes.
+        entries.sort_by(|a, b| compare_paths(&a.0, &b.0));
+
+        let terminal: BitVec = entries
+            .iter()
+            .map(|(path, _)| domain_predicate.contains(&path[0]))
+            .collect();
+        // One accumulator per key, run together in path order: a scalar fold's rows are a
+        // column, and `Sole`'s are the elements' own levels.
+        let mut accumulator = output_tiling.empty_at_no_rows();
+        for (_, acc) in &entries {
+            accumulator.merge_rows(acc.clone());
         }
+        let aggregation = Tile::Aggregation {
+            kind: self.kind,
+            accumulator: Box::new(accumulator),
+            terminal: ColumnValue::Bools(terminal),
+        };
+        let paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
+        build_curried_from_paths(&paths, &extents, aggregation, domain_predicate)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // The output domain *is* this producer's accumulator key set, and the
-        // input's `domain1` is that same key set, so a domain release names
+        // input's own keys are that same key set, so a domain release names
         // exactly which accumulators to drop and forwards verbatim. Keeping a
         // released key would re-emit it on the next pull, since `get_impl` builds
         // its output from every accumulator it holds.
@@ -553,7 +702,9 @@ impl TileProducer for MapAggregateProducer {
                 self.input.release(self.input.tiling().universal_guard());
             }
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                self.accumulators.retain(|key, _| !pred.contains(key));
+                // The guard names the outermost domain, which is the head of every
+                // accumulator's path.
+                self.accumulators.retain(|path, _| !pred.contains(&path[0]));
                 self.input
                     .release(TileGuard::Function(FunctionGuard::Domain(pred)));
             }
@@ -568,12 +719,12 @@ mod tests {
     use crate::interpreter::tile_operators::test_helpers::{QuietSpy, ReleaseSpy};
     use crate::interpreter::{BaseType, Extent, Predicate, Tile};
     fn int_sealed(domain: Vec<usize>, values: Vec<i64>) -> Tile {
-        Tile::SealedFunction {
-            domain: ColumnValue::from_uints(domain),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(values))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        }
+        Tile::function(
+            ColumnValue::from_uints(domain),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            Predicate::True,
+            BitSet::new(),
+        )
     }
 
     /// An `Aggregate`'s accumulator *is* its whole output, so once the consumer
@@ -581,14 +732,14 @@ mod tests {
     /// return released data, which a caching consumer merges into itself twice.
     #[test]
     fn aggregate_goes_quiet_after_a_universal_release() {
-        let in_tiling = Tiling::SealedFunction {
-            domain: Extent::uint_range(2),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+        let in_tiling = Tiling::function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
         let (spy, _released) = ReleaseSpy::new(int_sealed(vec![0, 1], vec![10, 20]), in_tiling);
         let tiling = Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: Extent::Base(BaseType::Int),
+            accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
         let mut producer = AggregateProducer::new(tiling.clone(), Box::new(spy));
 
@@ -596,7 +747,10 @@ mod tests {
         let Tile::Aggregation { accumulator, .. } = &first else {
             panic!("expected an Aggregation tile, got {first:?}");
         };
-        assert_eq!(accumulator.as_single().unwrap(), Value::Int(30));
+        assert_eq!(
+            *accumulator,
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![30])))
+        );
 
         producer.release(tiling.universal_guard());
         assert_eq!(
@@ -611,14 +765,14 @@ mod tests {
     /// ran dry would otherwise strand the remainder upstream.
     #[test]
     fn aggregate_releases_its_input_universally() {
-        let in_tiling = Tiling::SealedFunction {
-            domain: Extent::uint_range(2),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+        let in_tiling = Tiling::function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
         let (spy, released) = ReleaseSpy::new(int_sealed(vec![0], vec![10]), in_tiling.clone());
         let tiling = Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: Extent::Base(BaseType::Int),
+            accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
         let mut producer = AggregateProducer::new(tiling.clone(), Box::new(spy));
 
@@ -631,35 +785,45 @@ mod tests {
         let _ = in_tiling;
     }
 
-    /// A **per-key** release must drop exactly those accumulators and forward the
-    /// same domain predicate upstream. `get_impl` rebuilds its output from every
-    /// accumulator it holds, so a kept-but-released key is re-emitted; and the
-    /// input's `domain1` is the same key set, so nothing else would reclaim it.
+    /// A **per-key** release drops exactly those accumulators. `get_impl` rebuilds its
+    /// output from every accumulator it holds, so a kept-but-released key is re-emitted.
+    ///
+    /// The input here declares itself final, so the first pull already releases it whole
+    /// ([`Tile::to_guard`]) and every later guard is covered by that one. Forwarding is
+    /// therefore not observable on this fixture, and
+    /// [`map_aggregate_forwards_a_per_key_release_to_an_open_input`] pins it on one where
+    /// it is.
     #[test]
-    fn map_aggregate_drops_and_forwards_a_per_key_release() {
+    fn map_aggregate_drops_a_per_key_release() {
         let key_extent = Extent::Base(BaseType::Int);
-        let in_tiling = Tiling::CurriedFunction {
-            domain1: key_extent.clone(),
-            domain2: Extent::Base(BaseType::Int),
-            codomain: Extent::Base(BaseType::Int),
-        };
+        let in_tiling = Tiling::function(
+            key_extent.clone(),
+            Tiling::function(
+                Extent::Base(BaseType::Int),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
         // Keys 1 and 2, each with two values: 1 -> [10, 20], 2 -> [30, 40].
-        let tile = Tile::curried_function(
+        let tile = Tile::function(
             ColumnValue::Ints(vec![1, 2]),
-            ColumnValue::from_uints(vec![0, 2]),
-            ColumnValue::Ints(vec![0, 1, 0, 1]),
-            ColumnValue::Ints(vec![10, 20, 30, 40]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0, 2]),
+                ColumnValue::Ints(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
             Predicate::True,
             BitSet::new(),
         );
         let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
-        let out_tiling = Tiling::SealedFunction {
-            domain: key_extent,
-            codomain: Box::new(Tiling::Aggregation {
+        let out_tiling = Tiling::function(
+            key_extent,
+            Tiling::Aggregation {
                 kind: AggregateKind::Sum,
-                accumulator: Extent::Base(BaseType::Int),
-            }),
-        };
+                accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+            },
+        );
         let mut producer = MapAggregateProducer {
             base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
@@ -668,8 +832,8 @@ mod tests {
         };
 
         let first = producer.get(out_tiling.universal_guard());
-        let Tile::SealedFunction { domain, .. } = &first else {
-            panic!("expected a SealedFunction, got {first:?}");
+        let Tile::Function { domain, .. } = &first else {
+            panic!("expected a collection, got {first:?}");
         };
         assert_eq!(domain.len(), 2, "both keys aggregate on the first pull");
 
@@ -682,14 +846,19 @@ mod tests {
         )));
         producer.release(key_one.clone());
 
+        // Key 1 is released at the input, by the universal release the first pull already
+        // issued. Which guard covered it is the sibling test's subject, not this one's.
         assert!(
-            released.borrow().contains(&key_one),
-            "the per-key release must reach the input, got {:?}",
+            released
+                .borrow()
+                .iter()
+                .any(|g| g.is_universal() || *g == key_one),
+            "the released key must be covered at the input, got {:?}",
             released.borrow()
         );
         let second = producer.get(out_tiling.universal_guard());
-        let Tile::SealedFunction { domain, .. } = &second else {
-            panic!("expected a SealedFunction, got {second:?}");
+        let Tile::Function { domain, .. } = &second else {
+            panic!("expected a collection, got {second:?}");
         };
         assert_eq!(
             domain.index_at(0),
@@ -697,5 +866,69 @@ mod tests {
             "only the unreleased key may be emitted, got {second:?}"
         );
         assert_eq!(domain.len(), 1, "the released key must be gone: {second:?}");
+    }
+
+    /// A per-key release **reaches the input**, which the case above cannot show.
+    ///
+    /// The input's `domain_predicate` calls both groups whole without being `True`, so
+    /// [`Tile::to_guard`] answers a bounded `Domain` rather than the universal guard that
+    /// covers every later release. The only guard naming key 1 on its own is then the one
+    /// `release_impl` forwards. The input's own keys are this producer's accumulator key
+    /// set, so nothing else would reclaim the key.
+    #[test]
+    fn map_aggregate_forwards_a_per_key_release_to_an_open_input() {
+        let key_extent = Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::function(
+            key_extent.clone(),
+            Tiling::function(
+                Extent::Base(BaseType::Int),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let tile = Tile::function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0, 2]),
+                ColumnValue::Ints(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::LessThanEq(Value::Int(2)),
+            BitSet::new(),
+        );
+        let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
+        let out_tiling = Tiling::function(
+            key_extent,
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+            },
+        );
+        let mut producer = MapAggregateProducer {
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+        };
+        producer.get(out_tiling.universal_guard());
+        assert!(
+            !released.borrow().iter().any(TileGuard::is_universal),
+            "a bounded predicate is not released whole, got {:?}",
+            released.borrow()
+        );
+
+        let key_one = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
+            intervalsets::IntervalSet::from(intervalsets::Interval::closed(
+                Value::Int(1),
+                Value::Int(1),
+            )),
+        )));
+        producer.release(key_one.clone());
+        assert!(
+            released.borrow().contains(&key_one),
+            "the per-key release must reach the input, got {:?}",
+            released.borrow()
+        );
     }
 }

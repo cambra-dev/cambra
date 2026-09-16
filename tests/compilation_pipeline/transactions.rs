@@ -414,12 +414,12 @@ fn test_multi_variable_transactions(#[case] code: &str, #[case] expected: i64) {
 /// `u1 -> …`). A feed inside a `with begin():` block produces one entry per
 /// *committed* transaction, so a denied commit contributes no tick.
 fn commit_stream(ticks: &[usize], values: &[i64]) -> Tile {
-    Tile::SealedFunction {
-        domain: ColumnValue::UInts(ticks.to_vec()),
-        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec()))),
-        domain_predicate: Predicate::True,
-        deleted: BitSet::new(),
-    }
+    Tile::function(
+        ColumnValue::UInts(ticks.to_vec()),
+        Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec()))),
+        Predicate::True,
+        BitSet::new(),
+    )
 }
 
 /// Drive a program whose result is an `await_final` read and return the `Value` it
@@ -621,15 +621,15 @@ fn two_reply_feeds_one_transaction() {
                     outb << b
             (outa, outb)
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![1, 2, 3]),
-            codomain: Box::new(Tile::tuple(vec![
+        Tile::function(
+            ColumnValue::UInts(vec![1, 2, 3]),
+            Box::new(Tile::tuple(vec![
                 Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6])),
                 Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14])),
             ])),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+            Predicate::True,
+            BitSet::new(),
+        ),
     );
 }
 
@@ -656,12 +656,12 @@ fn reply_feed_under_one_route_does_not_overfire() {
                         b := b + x
             out
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![2, 3]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+        Tile::function(
+            ColumnValue::UInts(vec![2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     );
 }
 
@@ -690,18 +690,18 @@ fn both_arms_feed_in_committing_block() {
         // route): variant 0 is the `if` arm (x=2,3 → 2,3), variant 1 the `else`
         // (x=1 → 0). Same union shape as the read-only both-arms reply, over the
         // committing-block feed indexing (cf. `reply_feed_under_one_route`).
-        Tile::SealedFunction {
-            domain: ColumnValue::positional_union(
+        Tile::function(
+            ColumnValue::positional_union(
                 &[0, 0, 1],
                 vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
             ),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            domain_predicate: Predicate::Union(TagMap::from_positional(vec![
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
+            Predicate::Union(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
             ])),
-            deleted: BitSet::new(),
-        },
+            BitSet::new(),
+        ),
     );
 }
 
@@ -723,12 +723,12 @@ fn ryw_of_conditionally_written_key_after_case() {
                     out << a
             out
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![1, 2, 3]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 10, 20]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+        Tile::function(
+            ColumnValue::UInts(vec![1, 2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 10, 20]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     );
 }
 
@@ -751,12 +751,12 @@ fn conditional_reply_in_readonly_block() {
                         resp << pool
             resp
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+        Tile::function(
+            ColumnValue::UInts(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     );
 }
 
@@ -778,18 +778,18 @@ fn conditional_if_else_reply_in_readonly_block() {
                         resp << 0
             resp
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::positional_union(
+        Tile::function(
+            ColumnValue::positional_union(
                 &[0, 0, 1],
                 vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
             ),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            domain_predicate: Predicate::Union(TagMap::from_positional(vec![
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
+            Predicate::Union(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
             ])),
-            deleted: BitSet::new(),
-        },
+            BitSet::new(),
+        ),
     );
 }
 
@@ -806,8 +806,8 @@ fn conditional_if_else_reply_in_readonly_block() {
 /// value at each tick is schedule-dependent, but every draw commits exactly once
 /// and the pool is conserved.
 fn assert_drawdown_replies(tile: &Tile, initial: i64, draws: &[i64]) {
-    let Tile::SealedFunction { codomain, .. } = tile else {
-        panic!("expected a SealedFunction reply stream, got {tile:?}");
+    let Tile::Function { codomain, .. } = tile else {
+        panic!("expected a Function reply stream, got {tile:?}");
     };
     let Tile::Scalar(ColumnValue::Ints(vals)) = codomain.as_ref() else {
         panic!("expected an Ints reply codomain, got {codomain:?}");
@@ -2154,7 +2154,7 @@ fn live_read_combining_request_and_store_compiles() {
 fn live_reply_combines_request_and_store() {
     use cambra::ccl::context::CompileResultExt;
     use cambra::ccl::{BaseType, Type};
-    use cambra::interpreter::{Extent, TestDataSource, Value, sort_sealed_function_by_domain};
+    use cambra::interpreter::{Extent, TestDataSource, Value, sort_function_by_domain};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2197,8 +2197,8 @@ fn live_reply_combines_request_and_store() {
     let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
     result.compact();
     assert_eq!(
-        sort_sealed_function_by_domain(result),
-        sort_sealed_function_by_domain(make_int_list(&[65, 75])),
+        sort_function_by_domain(result),
+        sort_function_by_domain(make_int_list(&[65, 75])),
     );
 }
 
@@ -2903,7 +2903,7 @@ fn in_block_reply_with_deny_is_dense() {
 /// reach. The completed value has a name of its own (`await_final`).
 #[test]
 fn live_read_progresses_past_deny() {
-    use cambra::interpreter::sort_sealed_function_by_domain;
+    use cambra::interpreter::sort_function_by_domain;
 
     let code = indoc! {r#"
         resps = defer()
@@ -2943,12 +2943,12 @@ fn live_read_progresses_past_deny() {
     let mut result = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
     result.compact();
 
-    let result = sort_sealed_function_by_domain(result);
-    let Tile::SealedFunction {
+    let result = sort_function_by_domain(result);
+    let Tile::Function {
         domain, codomain, ..
     } = &result
     else {
-        panic!("expected a SealedFunction reply stream, got {result:?}");
+        panic!("expected a Function reply stream, got {result:?}");
     };
     let Tile::Scalar(ColumnValue::Ints(vals)) = codomain.as_ref() else {
         panic!("expected an Ints reply codomain, got {codomain:?}");

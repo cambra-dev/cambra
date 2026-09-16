@@ -16,10 +16,10 @@ use crate::{
 // UnionOperator / UnionProducer
 // ---------------------------------------------------------------------------
 
-/// Merges N `SealedFunction` operators into one by taking the discriminated
+/// Merges N `Function` operators into one by taking the discriminated
 /// union of their domains, over a codomain its **caller declares**.
 ///
-/// The output tiling is `SealedFunction { domain: Union(d₀, …, dₙ₋₁), codomain }`.
+/// The output tiling is `Function { domain: Union(d₀, …, dₙ₋₁), codomain }`.
 /// The domain keeps every arm apart — which arm a row came from is what
 /// `final_or_default` dispatches on. The codomain does the opposite: the arms are
 /// alternative values at one row, so it is their **join** — but that join is
@@ -27,10 +27,10 @@ use crate::{
 /// type. It is passed in rather than re-derived here (see [`new`](Self::new)).
 pub struct UnionOperator {
     base: OperatorBase,
-    /// Input operators; each must have a `SealedFunction` tiling.
+    /// Input operators; each must have a `Function` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
     /// Flat-merge mode (see [`new_flat`](Self::new_flat)): arms share one domain
-    /// extent with disjoint positions, merged into a single flat `SealedFunction`
+    /// extent with disjoint positions, merged into a single flat `Function`
     /// (sorted by domain key) rather than a tagged `ColumnValue::Union`.
     flat: bool,
 }
@@ -38,7 +38,7 @@ pub struct UnionOperator {
 impl UnionOperator {
     /// Create a new `UnionOperator` from the given input operators.
     ///
-    /// All inputs must be `SealedFunction` tilings.  The output domain is
+    /// All inputs must be `Function` tilings.  The output domain is
     /// `Extent::Union` of all input domains.
     ///
     /// `declared_codomain` is the merged column's value extent, read off the union
@@ -65,14 +65,14 @@ impl UnionOperator {
         let domains: Vec<Extent> = inputs
             .iter()
             .map(|op| match op.tiling() {
-                Tiling::SealedFunction { domain, .. } => domain.clone(),
-                other => panic!("UnionOperator: expected SealedFunction, got {other}"),
+                Tiling::Function { domain, .. } => domain.clone(),
+                other => panic!("UnionOperator: expected a function tiling, got {other}"),
             })
             .collect();
         let codomains: Vec<&Tiling> = inputs
             .iter()
             .map(|op| match op.tiling() {
-                Tiling::SealedFunction { codomain, .. } => codomain.as_ref(),
+                Tiling::Function { codomain, .. } => codomain.as_ref(),
                 _ => unreachable!(),
             })
             .collect();
@@ -111,10 +111,7 @@ impl UnionOperator {
             Tiling::Scalar(declared_codomain)
         };
 
-        Tiling::SealedFunction {
-            domain: Extent::Union(TagMap::from_positional(domains)),
-            codomain: Box::new(codomain),
-        }
+        Tiling::function(Extent::Union(TagMap::from_positional(domains)), codomain)
     }
 
     /// Collapse the coproduct domain [`new`](Self::new) built back to the one
@@ -126,9 +123,14 @@ impl UnionOperator {
     /// genuinely differ are a copairing, and [`new`](Self::new) is the
     /// constructor for those.
     fn flatten_domain(tiling: Tiling) -> Tiling {
-        let Tiling::SealedFunction { domain, codomain } = tiling else {
-            return tiling;
+        let (domain, codomain) = match tiling {
+            Tiling::Function { domain, codomain } => (domain, codomain),
+            other => return other,
         };
+        // A nest is not the shape a flat merge reassembles; hand it back untouched.
+        if codomain.as_ref().is_function() {
+            return Tiling::Function { domain, codomain };
+        }
         let mut arms = match domain {
             Extent::Union(ds) => ds.into_values(),
             other => vec![other],
@@ -142,7 +144,7 @@ impl UnionOperator {
                  extents; arms over distinct index sets are a copairing"
             );
         }
-        Tiling::SealedFunction { domain, codomain }
+        Tiling::Function { domain, codomain }
     }
 
     /// A **flat-merge** union: arms over the *same* base extent (disjoint runtime
@@ -166,7 +168,7 @@ impl UnionOperator {
     }
 }
 
-/// Flat-merge disjoint `SealedFunction` arms into one flat tile, sorted by domain
+/// Flat-merge disjoint `Function` arms into one flat tile, sorted by domain
 /// key. Each arm is a filtered slice of the *same* fed element stream (a
 /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`, or a `match`'s
 /// tag fan-out), so the arms' keys are disjoint and reassemble the full column —
@@ -188,15 +190,20 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     let mut pairs: Vec<(Value, Value)> = Vec::new();
     let mut domain_predicate = Predicate::False;
     for (i, tile) in tiles.into_iter().enumerate() {
-        let Tile::SealedFunction {
+        let Tile::Function {
             domain,
             codomain,
             domain_predicate: dp,
             deleted,
+            ..
         } = tile
         else {
-            panic!("flat_merge: expected SealedFunction arm, got {tile:?}");
+            panic!("flat_merge: expected a collection arm, got {tile:?}");
         };
+        assert!(
+            !codomain.is_function(),
+            "flat_merge interleaves arms by key, which names one level"
+        );
         if i == 0 {
             domain_predicate = dp;
         }
@@ -260,12 +267,12 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     // scalar field stays `Tile::Scalar`, a compound (tuple/record) field unboxes
     // the record-valued column back into a struct-of-arrays `Tile::Record`.
     let cv = ColumnValue::from_values(values, &value_extent);
-    Tile::SealedFunction {
-        domain: ColumnValue::from_values(keys, domain_extent),
-        codomain: Box::new(column_value_to_tile(cv, codomain_tiling)),
+    Tile::function(
+        ColumnValue::from_values(keys, domain_extent),
+        Box::new(column_value_to_tile(cv, codomain_tiling)),
         domain_predicate,
-        deleted: BitSet::new(),
-    }
+        BitSet::new(),
+    )
 }
 
 impl TileOperator for UnionOperator {
@@ -303,7 +310,7 @@ impl TileOperator for UnionOperator {
     }
 }
 
-/// Producer for [`UnionOperator`]: concatenates all input `SealedFunction` tiles
+/// Producer for [`UnionOperator`]: concatenates all input `Function` tiles
 /// into a single tile with a `ColumnValue::Union` domain and interleaved codomain.
 struct UnionProducer {
     base: ProducerBase,
@@ -338,7 +345,7 @@ impl TileProducer for UnionProducer {
                 // ready", which would hold the union non-terminal forever).
                 if p.obsolete_guard().is_universal() {
                     let mut released = p.tiling().empty_tile();
-                    if let Tile::SealedFunction {
+                    if let Tile::Function {
                         domain_predicate, ..
                     } = &mut released
                     {
@@ -356,10 +363,8 @@ impl TileProducer for UnionProducer {
             // both ends: the domain the arms share, and the codomain shape the
             // decision field carries.
             let (domain_extent, codomain_tiling) = match self.tiling() {
-                Tiling::SealedFunction { domain, codomain } => {
-                    (domain.clone(), (**codomain).clone())
-                }
-                other => panic!("flat union tiling is a SealedFunction, got {other}"),
+                Tiling::Function { domain, codomain } => (domain.clone(), (**codomain).clone()),
+                other => panic!("a flat union tiling is a function, got {other}"),
             };
             return flat_merge(tiles, &domain_extent, &codomain_tiling);
         }
@@ -372,12 +377,17 @@ impl TileProducer for UnionProducer {
 
         for tile in tiles {
             match tile {
-                Tile::SealedFunction {
+                Tile::Function {
                     domain,
                     codomain,
                     domain_predicate: dp,
                     deleted,
+                    ..
                 } => {
+                    assert!(
+                        !codomain.is_function(),
+                        "a union concatenates arms into one domain, which names one level"
+                    );
                     // Shift each deleted index into the combined domain's position space.
                     for idx in deleted.iter() {
                         combined_deleted.insert(idx + domain_offset);
@@ -387,7 +397,7 @@ impl TileProducer for UnionProducer {
                     codomains.push(*codomain);
                     domain_predicates.push(dp);
                 }
-                other => panic!("UnionProducer: expected SealedFunction, got {other:?}"),
+                other => panic!("UnionProducer: expected a collection tile, got {other:?}"),
             }
         }
 
@@ -429,12 +439,12 @@ impl TileProducer for UnionProducer {
             Tile::Scalar(combined)
         };
 
-        Tile::SealedFunction {
-            domain: union_domain,
-            codomain: Box::new(codomain_tile),
+        Tile::function(
+            union_domain,
+            Box::new(codomain_tile),
             domain_predicate,
-            deleted: combined_deleted,
-        }
+            combined_deleted,
+        )
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -481,22 +491,22 @@ mod tests {
     // ── UnionProducer::release_impl ───────────────────────────────────────────
 
     fn int_sealed_tiling() -> Tiling {
-        Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::Int),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        }
+        Tiling::function(
+            Extent::Base(BaseType::Int),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
     }
 
     fn int_sealed_tile() -> Tile {
-        Tile::SealedFunction {
-            domain: ColumnValue::Ints(vec![1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        }
+        Tile::function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            Predicate::True,
+            BitSet::new(),
+        )
     }
 
-    /// A `SealedFunction` operator with a chosen tiling, for asserting on what
+    /// A `Function` operator with a chosen tiling, for asserting on what
     /// [`UnionOperator::new`] *declares* (the tiling), independent of any data.
     struct TilingOnly(Tiling);
 
@@ -525,15 +535,15 @@ mod tests {
     }
 
     fn sealed_with_codomain(codomain: Extent) -> Box<dyn TileOperator> {
-        Box::new(TilingOnly(Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(codomain)),
-        }))
+        Box::new(TilingOnly(Tiling::function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(codomain),
+        )))
     }
 
     fn union_codomain(op: &UnionOperator) -> Tiling {
-        let Tiling::SealedFunction { codomain, .. } = op.tiling() else {
-            panic!("union of sealed functions is a sealed function");
+        let Tiling::Function { codomain, .. } = op.tiling() else {
+            panic!("a union of functions is a function");
         };
         (**codomain).clone()
     }
@@ -632,10 +642,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "arms with differing codomains merge into one column")]
     fn differing_non_scalar_codomains_are_rejected_at_construction() {
-        let nested = Box::new(TilingOnly(Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(int_sealed_tiling()),
-        })) as Box<dyn TileOperator>;
+        let nested = Box::new(TilingOnly(Tiling::function(
+            Extent::Base(BaseType::UInt),
+            int_sealed_tiling(),
+        ))) as Box<dyn TileOperator>;
         let _ = UnionOperator::new(
             vec![sealed_with_codomain(Extent::Base(BaseType::Int)), nested],
             Extent::Base(BaseType::Int),
@@ -644,17 +654,17 @@ mod tests {
 
     // ── flat_merge: the arms' domains must partition, not overlap ─────────────
 
-    /// A `SealedFunction` arm holding `(key, value)` pairs — one slice of the
+    /// A `Function` arm holding `(key, value)` pairs — one slice of the
     /// fed element stream, as a tag fan-out or a first-match value-`Case` produces.
     fn flat_arm(pairs: &[(usize, i64)]) -> Tile {
-        Tile::SealedFunction {
-            domain: ColumnValue::from_uints(pairs.iter().map(|(k, _)| *k).collect()),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(
+        Tile::function(
+            ColumnValue::from_uints(pairs.iter().map(|(k, _)| *k).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(
                 pairs.iter().map(|(_, v)| *v).collect(),
             ))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        }
+            Predicate::True,
+            BitSet::new(),
+        )
     }
 
     /// The precondition holding: disjoint arms reassemble into the full column,
@@ -666,11 +676,11 @@ mod tests {
             &Extent::uint_range(4),
             &Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let Tile::SealedFunction {
+        let Tile::Function {
             domain, codomain, ..
         } = out
         else {
-            panic!("flat merge yields a SealedFunction");
+            panic!("flat merge yields a Function");
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2, 3]));
         assert_eq!(
@@ -690,16 +700,18 @@ mod tests {
             tag: FieldKey::Index(tag),
             inner: Box::new(Value::UInt(inner)),
         };
-        let arm = |pairs: Vec<(Value, i64)>| Tile::SealedFunction {
-            domain: ColumnValue::from_values(
-                pairs.iter().map(|(k, _)| k.clone()).collect(),
-                &coproduct_extent(),
-            ),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(
-                pairs.iter().map(|(_, v)| *v).collect(),
-            ))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
+        let arm = |pairs: Vec<(Value, i64)>| {
+            Tile::function(
+                ColumnValue::from_values(
+                    pairs.iter().map(|(k, _)| k.clone()).collect(),
+                    &coproduct_extent(),
+                ),
+                Box::new(Tile::Scalar(ColumnValue::Ints(
+                    pairs.iter().map(|(_, v)| *v).collect(),
+                ))),
+                Predicate::True,
+                BitSet::new(),
+            )
         };
         // Arms arrive out of order and each straddles both tags.
         let out = flat_merge(
@@ -710,11 +722,11 @@ mod tests {
             &coproduct_extent(),
             &Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let Tile::SealedFunction {
+        let Tile::Function {
             domain, codomain, ..
         } = out
         else {
-            panic!("flat merge yields a SealedFunction");
+            panic!("flat merge yields a Function");
         };
         assert_eq!(
             (0..domain.len())
@@ -773,13 +785,13 @@ mod tests {
                     as Box<dyn TileProducer>
             })
             .collect();
-        let union_tiling = Tiling::SealedFunction {
-            domain: Extent::Union(TagMap::from_positional(vec![
+        let union_tiling = Tiling::function(
+            Extent::Union(TagMap::from_positional(vec![
                 Extent::Base(BaseType::Int),
                 Extent::Base(BaseType::Int),
             ])),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
         let mut producer = UnionProducer {
             base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
             inputs,
@@ -797,8 +809,8 @@ mod tests {
         )));
         let tile = producer.get(union_tiling.universal_guard());
 
-        let Tile::SealedFunction { domain, .. } = tile else {
-            panic!("union of sealed functions is a sealed function");
+        let Tile::Function { domain, .. } = tile else {
+            panic!("a union of functions is a function");
         };
         let ColumnValue::Union(arms) = domain else {
             panic!("the union domain is a discriminated union, got {domain:?}");
@@ -847,13 +859,13 @@ mod tests {
         let log0: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
         let log1: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
 
-        let union_tiling = Tiling::SealedFunction {
-            domain: Extent::Union(TagMap::from_positional(vec![
+        let union_tiling = Tiling::function(
+            Extent::Union(TagMap::from_positional(vec![
                 Extent::Base(BaseType::Int),
                 Extent::Base(BaseType::Int),
             ])),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
 
         let producer = UnionProducer {
             base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),

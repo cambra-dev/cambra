@@ -15,8 +15,8 @@ use crate::helpers::*;
 /// result tile, sorted. A conditional-collection result is a tagged union whose
 /// single non-empty variant carries the selected arm's elements.
 fn codomain_ints(tile: &Tile) -> Vec<i64> {
-    let Tile::SealedFunction { codomain, .. } = tile else {
-        panic!("expected a SealedFunction tile, got {tile:?}");
+    let Tile::Function { codomain, .. } = tile else {
+        panic!("expected a Function tile, got {tile:?}");
     };
     let Tile::Scalar(ColumnValue::Ints(v)) = codomain.as_ref() else {
         panic!("expected an Ints scalar codomain, got {codomain:?}");

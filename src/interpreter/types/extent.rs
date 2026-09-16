@@ -284,7 +284,7 @@ pub trait DataSourceDomainExtentImpl {
     ///
     /// Used by [`crate::interpreter::tile_operators::MapResultWithSource`] to map each domain
     /// element to its corresponding output value when building a
-    /// `SealedFunction { domain, codomain: Scalar(output_values) }` tile.
+    /// `Function { domain, codomain: Scalar(output_values) }` tile.
     fn get(&self, keys: ColumnValue) -> ColumnValue;
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapResultWithSource`].

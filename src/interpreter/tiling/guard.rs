@@ -26,6 +26,36 @@ pub enum TileGuard {
     Or(Vec<TileGuard>),
 }
 
+/// Whether two guards name the same place — the same nesting, down to the predicate.
+fn same_place(a: &TileGuard, b: &TileGuard) -> bool {
+    match (a, b) {
+        (
+            TileGuard::Function(FunctionGuard::Domain(_)),
+            TileGuard::Function(FunctionGuard::Domain(_)),
+        ) => true,
+        (
+            TileGuard::Function(FunctionGuard::Codomain(x)),
+            TileGuard::Function(FunctionGuard::Codomain(y)),
+        ) => same_place(x, y),
+        _ => false,
+    }
+}
+
+/// The union of two guards naming the same place, which [`same_place`] has established.
+fn union_in_place(a: &TileGuard, b: &TileGuard) -> TileGuard {
+    match (a, b) {
+        (
+            TileGuard::Function(FunctionGuard::Domain(p)),
+            TileGuard::Function(FunctionGuard::Domain(q)),
+        ) => TileGuard::Function(FunctionGuard::Domain(p.union(q))),
+        (
+            TileGuard::Function(FunctionGuard::Codomain(x)),
+            TileGuard::Function(FunctionGuard::Codomain(y)),
+        ) => TileGuard::Function(FunctionGuard::Codomain(Box::new(union_in_place(x, y)))),
+        _ => unreachable!("only two guards naming one place are unioned this way"),
+    }
+}
+
 impl TileGuard {
     /// Builds a `TileGuard` from a list of arms, flattening any nested `Or`
     /// variants.  Returns the single element directly when `arms` has length
@@ -45,10 +75,22 @@ impl TileGuard {
         } else {
             flat.truncate(1);
         }
-        match flat.len() {
+        // Two arms naming the same place are one arm over the union of what they name.
+        // Leaving them apart would make a guard's shape depend on how it was assembled,
+        // and a consumer that matches on the shape reads that as a different guard.
+        let mut merged: Vec<TileGuard> = Vec::with_capacity(flat.len());
+        for arm in flat {
+            match merged.iter().position(|g| same_place(g, &arm)) {
+                Some(i) => {
+                    merged[i] = union_in_place(&merged[i], &arm);
+                }
+                None => merged.push(arm),
+            }
+        }
+        match merged.len() {
             0 => unreachable!("flatten_or called with no arms"),
-            1 => flat.into_iter().next().unwrap(),
-            _ => TileGuard::Or(flat),
+            1 => merged.into_iter().next().unwrap(),
+            _ => TileGuard::Or(merged),
         }
     }
 
@@ -166,33 +208,25 @@ impl TileGuard {
             (TileGuard::Scalar(_), Tiling::Scalar(_)) => true,
             (TileGuard::Aggregation(_), Tiling::Aggregation { .. }) => true,
 
-            // SealedFunction tilings can have domain guards which are always allowed, or
+            // Function tilings can have domain guards which are always allowed, or
             // codomain guards which match their codomain tiling. A Store shares the
             // function shape: consumers release a prefix of its commit-time domain
             // (a `Domain` guard) — that is its only release form (a store's
             // `to_guard` is `Function(Domain(_))`), so no `Codomain` arm.
-            (
-                TileGuard::Function(FunctionGuard::Domain(pred)),
-                Tiling::SealedFunction { domain, .. } | Tiling::Store { domain, .. },
-            ) => pred.is_applicable_to(domain),
-            (
-                TileGuard::Function(FunctionGuard::Codomain(g)),
-                Tiling::SealedFunction { codomain, .. },
-            ) => g.check_from(codomain.as_ref()),
+            (TileGuard::Function(FunctionGuard::Domain(pred)), Tiling::Store { domain, .. }) => {
+                pred.is_applicable_to(domain)
+            }
 
-            // CurrriedFunction tilings support only domain guards or domain(codomain) guards to reference
-            // the inner domain.
-            (
-                TileGuard::Function(FunctionGuard::Domain(pred)),
-                Tiling::CurriedFunction { domain1, .. },
-            ) => pred.is_applicable_to(domain1),
+            // A collection supports a `Domain` guard naming its own keys and a `Codomain`
+            // guard naming what sits under them. The guard nests exactly as the tiling does,
+            // so stepping in is one recursion with nothing to translate.
+            (TileGuard::Function(FunctionGuard::Domain(pred)), Tiling::Function { domain, .. }) => {
+                pred.is_applicable_to(domain)
+            }
             (
                 TileGuard::Function(FunctionGuard::Codomain(g)),
-                Tiling::CurriedFunction { domain2, .. },
-            ) => match g.as_ref() {
-                TileGuard::Function(FunctionGuard::Domain(pred)) => pred.is_applicable_to(domain2),
-                _ => false,
-            },
+                Tiling::Function { codomain, .. },
+            ) => g.check_from(codomain),
 
             // Record guards must have the same key set, with each field guard
             // compatible with the corresponding field tiling.
@@ -209,9 +243,8 @@ impl TileGuard {
     }
 }
 
-/// A guard on a [`Tile::SealedFunction`](crate::interpreter::Tile::SealedFunction) or
-/// [`Tile::CurriedFunction`](crate::interpreter::Tile::CurriedFunction), specifying
-/// which part of the function is of interest.
+/// A guard on a [`Tile::Function`](crate::interpreter::Tile::Function), naming which
+/// part of it is of interest: its own keys, or what those keys hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionGuard {
     Domain(Predicate),
@@ -426,31 +459,31 @@ mod tests {
         assert_eq!(arms.len(), 2);
     }
 
-    // ── SealedFunctionGuard::intersect ────────────────────────────────────────
+    // ── FunctionGuard::intersect ───────────────────────────────────────────────
 
     #[test]
-    fn sfg_intersect_empty_dominates() {
+    fn function_guard_intersect_empty_dominates() {
         let result = FunctionGuard::Domain(Predicate::True)
             .intersect(&FunctionGuard::Domain(Predicate::False));
         assert!(matches!(result, FunctionGuard::Domain(Predicate::False)));
     }
 
     #[test]
-    fn sfg_intersect_universal_is_identity() {
+    fn function_guard_intersect_universal_is_identity() {
         let result = FunctionGuard::Domain(Predicate::True)
             .intersect(&FunctionGuard::Domain(Predicate::True));
         assert!(matches!(result, FunctionGuard::Domain(Predicate::True)));
     }
 
     #[test]
-    fn sfg_intersect_domain_domain() {
+    fn function_guard_intersect_domain_domain() {
         let result = FunctionGuard::Domain(Predicate::True)
             .intersect(&FunctionGuard::Domain(Predicate::False));
         assert!(matches!(result, FunctionGuard::Domain(Predicate::False)));
     }
 
     #[test]
-    fn sfg_intersect_codomain_codomain() {
+    fn function_guard_intersect_codomain_codomain() {
         let result = FunctionGuard::Codomain(Box::new(TileGuard::Scalar(true)))
             .intersect(&FunctionGuard::Codomain(Box::new(TileGuard::Scalar(false))));
         assert_eq!(
@@ -472,7 +505,7 @@ mod tests {
     fn agg_tiling() -> Tiling {
         Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: int(),
+            accumulator: Box::new(Tiling::Scalar(int())),
         }
     }
 
@@ -484,7 +517,7 @@ mod tests {
 
     #[test]
     fn check_from_scalar_rejects_non_scalar_tiling() {
-        assert!(!TileGuard::Scalar(true).check_from(&sealed(int(), bool_ext())));
+        assert!(!TileGuard::Scalar(true).check_from(&scalar_function(int(), bool_ext())));
         assert!(!TileGuard::Scalar(true).check_from(&agg_tiling()));
     }
 
@@ -497,40 +530,37 @@ mod tests {
     #[test]
     fn check_from_aggregation_rejects_non_aggregation_tiling() {
         assert!(!TileGuard::Aggregation(true).check_from(&Tiling::Scalar(int())));
-        assert!(!TileGuard::Aggregation(true).check_from(&sealed(int(), bool_ext())));
+        assert!(!TileGuard::Aggregation(true).check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
     fn check_from_function_domain_matches_sealed_function_tiling() {
-        assert!(domain_guard(Predicate::True).check_from(&sealed(int(), bool_ext())));
-        assert!(domain_guard(Predicate::False).check_from(&sealed(int(), bool_ext())));
+        assert!(domain_guard(Predicate::True).check_from(&scalar_function(int(), bool_ext())));
+        assert!(domain_guard(Predicate::False).check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
     fn check_from_function_codomain_matches_sealed_function_tiling() {
-        // A Codomain(Domain(_)) guard is valid against a SealedFunction whose
+        // A Codomain(Domain(_)) guard is valid against a Function whose
         // codomain is itself a function tiling.
-        let nested = sealed(int(), bool_ext());
-        let outer = Tiling::SealedFunction {
-            domain: int(),
-            codomain: Box::new(nested),
-        };
+        let nested = scalar_function(int(), bool_ext());
+        let outer = Tiling::function(int(), nested);
         let g = codomain_guard(domain_guard(Predicate::True));
         assert!(g.check_from(&outer));
     }
 
     #[test]
     fn check_from_function_codomain_scalar_against_sealed_function_tiling() {
-        // Codomain(Scalar) is valid when the sealed function's codomain is a scalar.
+        // Codomain(Scalar) is valid when the function's codomain is a scalar.
         let g = codomain_guard(TileGuard::Scalar(true));
-        assert!(g.check_from(&sealed(int(), bool_ext())));
+        assert!(g.check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
     fn check_from_function_codomain_wrong_shape_against_sealed_function_tiling() {
-        // Codomain(Aggregation) against a sealed function with scalar codomain must fail.
+        // Codomain(Aggregation) against a function with scalar codomain must fail.
         let g = codomain_guard(TileGuard::Aggregation(true));
-        assert!(!g.check_from(&sealed(int(), bool_ext())));
+        assert!(!g.check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
@@ -541,14 +571,14 @@ mod tests {
     #[test]
     fn check_from_function_codomain_domain_matches_curried_function_tiling() {
         // Codomain(Domain(_)) is the canonical way to address the inner domain of
-        // a CurriedFunction.
+        // a Function.
         let g = codomain_guard(domain_guard(Predicate::True));
         assert!(g.check_from(&curried(range(4), int(), int())));
     }
 
     #[test]
     fn check_from_function_codomain_scalar_rejects_curried_function_tiling() {
-        // Codomain(Scalar) is not a valid guard shape for a CurriedFunction.
+        // Codomain(Scalar) is not a valid guard shape for a Function.
         let g = codomain_guard(TileGuard::Scalar(true));
         assert!(!g.check_from(&curried(range(4), int(), int())));
     }

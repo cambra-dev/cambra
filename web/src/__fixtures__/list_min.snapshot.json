@@ -2716,7 +2716,7 @@
           "label": "IterateExtent",
           "nodeId": 414,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → {[0, 3]})",
+          "tiling": "Fn({[0, 3]} → {[0, 3]})",
           "spans": [
             {
               "start": 1,
@@ -2752,7 +2752,7 @@
           "label": "MapResult",
           "nodeId": 416,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → Int)",
+          "tiling": "Fn({[0, 3]} → Int)",
           "spans": [
             {
               "start": 1,

@@ -1,193 +1,118 @@
-use bit_set::BitSet;
-use log::trace;
 use std::collections::HashMap;
 
 use super::*;
 use crate::interpreter::operator_graph::value_at;
 use crate::{
-    interpreter::{
-        ColumnValue, Consumer, Extent, Scheduler, forwarding_consumer, shared_consumer, tuple_field,
-    },
+    interpreter::{Consumer, Scheduler, forwarding_consumer, shared_consumer, tuple_field},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
 
-/// Combines multiple sealed-function operators sharing the same domain into a
-/// single sealed-function operator whose codomain is a record of all their codomains.
+/// Combines multiple function operators sharing the same domain into a single function
+/// operator whose codomain is a record of all their codomains.
 ///
-/// All inputs must have `SealedFunction` tilings with compatible domains.
+/// All inputs must be collections over compatible keys.
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct FanIn {
-    /// Output tiling: either a `SealedFunction { domain, codomain: Record { … } }`
-    /// or a `CurriedFunction { domain1, domain2, codomain: Record { … } }`,
-    /// depending on the input operators.
+    /// Output tiling: the ambient levels, with a `Record` where the operands' values sat.
     base: OperatorBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
-    /// The input function operators to zip together (either all `SealedFunction` or all `CurriedFunction`).
+    /// The input collections to pair.
     inputs: Vec<Box<dyn TileOperator>>,
+    /// The ambient levels the pair sits under.
+    depth: usize,
+}
+
+/// The number of collection levels `tiling` carries before its values.
+pub fn level_count(tiling: &Tiling) -> usize {
+    match tiling {
+        Tiling::Function { codomain, .. } => 1 + level_count(codomain),
+        _ => 0,
+    }
+}
+
+/// `tiling`'s first `depth` levels, with `inner` beneath them.
+fn with_values_at(tiling: &Tiling, depth: usize, inner: Tiling) -> Tiling {
+    if depth == 0 {
+        return inner;
+    }
+    let Tiling::Function { domain, codomain } = tiling else {
+        unreachable!("the depth was counted off this tiling")
+    };
+    Tiling::Function {
+        domain: domain.clone(),
+        codomain: Box::new(with_values_at(codomain, depth - 1, inner)),
+    }
 }
 
 impl FanIn {
-    /// Create a new `FanIn` operator over the given input operators.
+    /// Create a `FanIn` pairing its operands over their first `depth` levels.
     ///
-    /// All inputs must be either all `SealedFunction` tilings with the same domain,
-    /// or all `CurriedFunction` tilings with the same domain1, offsets, and domain2.
-    /// The output `tiling` and `extent` are derived: each input's codomain extent
-    /// becomes a field (`_0`, `_1`, …) in a `Record` codomain.
-    pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
-        trace!(
-            "Creating zip with inputs {}",
-            inputs
+    /// `depth` is the **ambient iteration** — how many levels the operands were applied
+    /// over. It is the caller's to state, not something the operands say: two arms that
+    /// agree below the ambient (two projections of one grouped row, say) look pairable all
+    /// the way down, and two that differ there are the collection-valued component case.
+    pub fn new_at(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>, depth: usize) -> Self {
+        assert!(!ops.is_empty(), "FanIn requires at least one input");
+        assert!(depth > 0, "FanIn pairs under at least one ambient level");
+        // The operands agree on the ambient levels — they were applied over them — and may
+        // differ below. Their runtime *presence* may still differ (one branch has emitted
+        // 0..3 while another has 0..2), which `FanInProducer::get_impl` intersects.
+        for op in ops.iter() {
+            for d in 0..depth {
+                let (Tiling::Function { domain, .. }, Tiling::Function { domain: other, .. }) =
+                    (ops[0].tiling().values_at(d), op.tiling().values_at(d))
+                else {
+                    panic!(
+                        "FanIn pairs collections over {depth} ambient level(s), got {} and {}",
+                        ops[0].tiling(),
+                        op.tiling()
+                    )
+                };
+                assert_eq!(
+                    domain, other,
+                    "FanIn's operands share the ambient iteration, so they agree on its keys \
+                     at every level"
+                );
+            }
+        }
+        let record = Tiling::Record(
+            names
                 .iter()
-                .map(|i| i.tiling().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+                .zip(ops.iter())
+                .map(|(name, op)| (name.clone(), op.tiling().values_at(depth).clone()))
+                .collect(),
         );
-        assert!(!inputs.is_empty(), "FanIn requires at least one input");
-        let names = (0..inputs.len()).map(tuple_field).collect();
-        Self::new_impl(names, inputs)
-    }
-
-    /// Construct a `FanIn` with explicit named fields for record literals.
-    ///
-    /// Like [`Self::new`] but uses caller-supplied field names instead of
-    /// the synthetic `_0`, `_1`, … names used for tuples.
-    pub fn new_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Self {
-        assert!(!inputs.is_empty(), "FanIn requires at least one input");
-        let (names, ops) = inputs.into_iter().unzip();
-        Self::new_impl(names, ops)
-    }
-
-    fn new_impl(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>) -> Self {
-        // The [`fan_in`] dispatcher guarantees all inputs are function-typed
-        // (otherwise it routes to [`ScalarFanIn`]).  Inputs may still have
-        // *different* tile-level presence at runtime — e.g. one branch has
-        // emitted positions 0..3 while another has only 0..2 — which is
-        // handled by an intersection step in `FanInProducer::get_impl`.
-        let first_tiling = ops[0].tiling();
-        let tiling = match first_tiling {
-            Tiling::SealedFunction { domain, .. } => {
-                for op in ops.iter().skip(1) {
-                    if let Tiling::SealedFunction { domain: d, .. } = op.tiling() {
-                        assert_eq!(
-                            domain, d,
-                            "FanIn: all SealedFunction inputs must have the same domain"
-                        );
-                    } else {
-                        panic!(
-                            "FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
-                        );
-                    }
-                }
-                Tiling::SealedFunction {
-                    domain: domain.clone(),
-                    codomain: Box::new(Tiling::Record(
-                        names
-                            .iter()
-                            .zip(ops.iter())
-                            .map(|(name, op)| {
-                                (
-                                    name.clone(),
-                                    op.tiling()
-                                        .codomain()
-                                        .unwrap_or_else(|| {
-                                            panic!("Expected function, got {}", op.tiling())
-                                        })
-                                        .clone(),
-                                )
-                            })
-                            .collect(),
-                    )),
-                }
-            }
-            Tiling::CurriedFunction {
-                domain1, domain2, ..
-            } => {
-                for op in ops.iter().skip(1) {
-                    if let Tiling::CurriedFunction {
-                        domain1: d1,
-                        domain2: d2,
-                        ..
-                    } = op.tiling()
-                    {
-                        assert_eq!(
-                            domain1, d1,
-                            "FanIn: all CurriedFunction inputs must have the same domain1"
-                        );
-                        assert_eq!(
-                            domain2, d2,
-                            "FanIn: all CurriedFunction inputs must have the same domain2"
-                        );
-                    } else {
-                        panic!(
-                            "FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
-                        );
-                    }
-                }
-                Tiling::CurriedFunction {
-                    domain1: domain1.clone(),
-                    domain2: domain2.clone(),
-                    codomain: Extent::Record(
-                        names
-                            .iter()
-                            .zip(ops.iter())
-                            .map(|(name, op)| {
-                                let Tiling::CurriedFunction { codomain: cod, .. } = op.tiling()
-                                else {
-                                    panic!("Expected CurriedFunction, got {}", op.tiling())
-                                };
-                                (name.clone(), cod.clone())
-                            })
-                            .collect(),
-                    ),
-                }
-            }
-            _ => panic!(
-                "FanIn: all inputs must have function tilings (SealedFunction or CurriedFunction)"
-            ),
-        };
+        let tiling = with_values_at(ops[0].tiling(), depth, record);
         Self {
             base: OperatorBase::new(tiling),
             names,
             inputs: ops,
+            depth,
         }
     }
 }
 
-/// Tile-polymorphic fan-in factory.
-///
-/// Given N operators representing the arms of a CCL-level `zip(f₀, …, fₙ₋₁)`,
-/// returns the correct tile-level combinator for the arms' runtime tilings:
-///
-/// - If every arm has a scalar tiling (`Scalar` or a `Record` of scalars),
-///   the fan-in is just a record-of-values and [`ScalarFanIn`] is returned.
-/// - Otherwise the arms carry function tilings and [`FanIn`] is returned,
-///   which fans the shared domain out into a record-codomain sealed/curried
-///   function.
-///
-/// Callers at op-conversion can hand the compiled arms to this factory
-/// without knowing what tiling the arms ended up with — the upstream
-/// `input` at the zip call site determines that, and the factory picks
-/// the right combinator. See the "CCL types vs. tilings" section of
-/// [`design-operators.md`](./design-operators.md) for why the same
-/// CCL-level `zip` compiles to two different tile operators.
-pub fn fan_in(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+pub fn fan_in_at(inputs: Vec<Box<dyn TileOperator>>, depth: usize) -> Box<dyn TileOperator> {
     if inputs.iter().all(|op| op.tiling().is_scalar()) {
-        Box::new(ScalarFanIn::new(inputs))
-    } else {
-        Box::new(FanIn::new(inputs))
+        return Box::new(ScalarFanIn::new(inputs));
     }
+    let names = (0..inputs.len()).map(tuple_field).collect();
+    Box::new(FanIn::new_at(names, inputs, depth))
 }
 
-/// Named-field variant of [`fan_in`]: like [`fan_in`] but uses caller-supplied
+/// Named-field variant of [`fan_in_at`]: like [`fan_in_at`] but uses caller-supplied
 /// field names instead of the synthetic `_0`, `_1`, … names.
-pub fn fan_in_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn TileOperator> {
+pub fn fan_in_named_at(
+    inputs: Vec<(String, Box<dyn TileOperator>)>,
+    depth: usize,
+) -> Box<dyn TileOperator> {
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
-        Box::new(ScalarFanIn::new_named(inputs))
-    } else {
-        Box::new(FanIn::new_named(inputs))
+        return Box::new(ScalarFanIn::new_named(inputs));
     }
+    let (names, ops) = inputs.into_iter().unzip();
+    Box::new(FanIn::new_at(names, ops, depth))
 }
 
 impl TileOperator for FanIn {
@@ -207,6 +132,7 @@ impl TileOperator for FanIn {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(FanInProducer {
+            depth: self.depth,
             base: ProducerBase::new(FanInProducer::alloc_id(), self.tiling()),
             names: self.names.clone(),
             inputs: self
@@ -231,6 +157,8 @@ struct FanInProducer {
     names: Vec<String>,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
+    /// The ambient levels the pair sits under ([`FanIn`]).
+    depth: usize,
 }
 
 impl TileProducer for FanInProducer {
@@ -261,8 +189,8 @@ impl TileProducer for FanInProducer {
             .collect();
 
         match &tiles[0] {
-            Tile::SealedFunction { .. } => {
-                // All inputs are SealedFunction tiles, but they may differ in
+            Tile::Function { .. } => {
+                // All inputs are Function tiles, but they may differ in
                 // which *actual rows* are present — one branch may have
                 // emitted positions 0..3 while another has only 0..2 (or one
                 // input's upstream release shrank its known region).  We
@@ -280,13 +208,13 @@ impl TileProducer for FanInProducer {
                 let mut presence: Option<Predicate> = None;
                 let mut domain_pred: Option<Predicate> = None;
                 for t in tiles.iter() {
-                    let Tile::SealedFunction {
+                    let Tile::Function {
                         domain,
                         domain_predicate,
                         ..
                     } = t
                     else {
-                        panic!("FanIn: cannot mix SealedFunction and other tile types")
+                        panic!("FanIn: cannot mix collection and non-collection tiles")
                     };
                     let p = Predicate::from_column_value(domain);
                     presence = Some(match presence {
@@ -304,41 +232,31 @@ impl TileProducer for FanInProducer {
                 // Filter each tile to the intersection of present positions
                 // (compute "to_remove" as that tile's domain minus the
                 // intersection, then drop those rows).
-                let mut output_domain: Option<ColumnValue> = None;
+                let mut skeleton: Option<Tile> = None;
                 let mut codomains: Vec<Tile> = Vec::with_capacity(tiles.len());
-                for t in tiles.into_iter() {
-                    let Tile::SealedFunction {
-                        domain: tile_domain,
-                        codomain,
-                        domain_predicate,
-                        deleted,
-                    } = t
-                    else {
+                for mut filtered in tiles.into_iter() {
+                    let Tile::Function { domain, .. } = &filtered else {
                         unreachable!()
                     };
-                    let domain_presence = Predicate::from_column_value(&tile_domain);
-                    let to_remove = domain_presence.minus(&presence);
-                    let mut filtered = Tile::SealedFunction {
-                        domain: tile_domain,
-                        codomain,
-                        domain_predicate,
-                        deleted,
-                    };
+                    let to_remove = Predicate::from_column_value(domain).minus(&presence);
                     if to_remove.as_bool() != Some(false) {
                         filtered
                             .remove_guarded(TileGuard::Function(FunctionGuard::Domain(to_remove)));
                     }
                     filtered.compact();
-                    let Tile::SealedFunction {
-                        domain, codomain, ..
-                    } = filtered
-                    else {
-                        unreachable!()
-                    };
-                    if output_domain.is_none() {
-                        output_domain = Some(domain);
-                    }
-                    codomains.push(*codomain);
+                    // Lift the values out, leaving the chain of keys behind: what stays is
+                    // the output's own shape, and every input has to agree on it.
+                    codomains.push(std::mem::replace(
+                        filtered.values_at_mut(self.depth),
+                        Tile::Record(HashMap::new()),
+                    ));
+                    debug_assert!(
+                        skeleton.as_ref().is_none_or(|s: &Tile| {
+                            s.key_levels()[..self.depth] == filtered.key_levels()[..self.depth]
+                        }),
+                        "FanIn: inputs disagree on the levels they are paired over"
+                    );
+                    skeleton.get_or_insert(filtered);
                 }
 
                 let names = &self.names;
@@ -349,81 +267,18 @@ impl TileProducer for FanInProducer {
                         .map(move |(i, cv)| (names[i].clone(), cv))
                         .collect(),
                 );
-                Tile::SealedFunction {
-                    domain: output_domain.unwrap(),
-                    codomain: Box::new(codomain_record),
-                    domain_predicate: intersect_pred,
-                    deleted: BitSet::new(),
-                }
+                let mut out = skeleton.expect("FanIn has at least one input");
+                *out.values_at_mut(self.depth) = codomain_record;
+                let Tile::Function {
+                    domain_predicate, ..
+                } = &mut out
+                else {
+                    unreachable!("the skeleton is one of the collection inputs")
+                };
+                *domain_predicate = intersect_pred;
+                out
             }
-            Tile::CurriedFunction { .. } => {
-                // All inputs are CurriedFunction tiles
-                let mut domain1: Option<ColumnValue> = None;
-                let mut offsets: Option<ColumnValue> = None;
-                let mut domain2: Option<ColumnValue> = None;
-                let mut domain_pred: Option<Predicate> = None;
-                let mut codomains = Vec::new();
-
-                for t in tiles.into_iter() {
-                    match t {
-                        Tile::CurriedFunction {
-                            domain1: d1,
-                            offsets: offs,
-                            domain2: d2,
-                            codomain: cod,
-                            domain_predicate,
-                            ..
-                        } => {
-                            if let Some(ref prev_d1) = domain1 {
-                                assert_eq!(
-                                    prev_d1, &d1,
-                                    "FanIn: all inputs must have the same domain1"
-                                );
-                            }
-                            if let Some(ref prev_offs) = offsets {
-                                assert_eq!(
-                                    prev_offs, &offs,
-                                    "FanIn: all inputs must have the same offsets"
-                                );
-                            }
-                            if let Some(ref prev_d2) = domain2 {
-                                assert_eq!(
-                                    prev_d2, &d2,
-                                    "FanIn: all inputs must have the same domain2"
-                                );
-                            }
-                            if let Some(ref mut prev) = domain_pred {
-                                *prev = prev.intersect(&domain_predicate);
-                            } else {
-                                domain_pred = Some(domain_predicate.clone());
-                            }
-                            domain1 = Some(d1);
-                            offsets = Some(offs);
-                            domain2 = Some(d2);
-                            codomains.push(cod);
-                        }
-                        _ => panic!("FanIn: cannot mix CurriedFunction and other tile types"),
-                    }
-                }
-
-                let names = &self.names;
-                let codomain_record = ColumnValue::Records(
-                    codomains
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(i, cv)| (names[i].clone(), cv))
-                        .collect(),
-                );
-                Tile::CurriedFunction {
-                    domain1: domain1.unwrap(),
-                    offsets: offsets.unwrap(),
-                    domain2: domain2.unwrap(),
-                    codomain: codomain_record,
-                    domain_predicate: domain_pred.unwrap(),
-                    deleted: BitSet::new(),
-                }
-            }
-            _ => panic!("FanIn: all inputs must be SealedFunction or CurriedFunction tiles"),
+            other => panic!("FanIn: every input must be a collection tile, got {other:?}"),
         }
     }
 
@@ -579,6 +434,7 @@ mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
     use crate::interpreter::{BaseType, ColumnValue, Extent};
+    use bit_set::BitSet;
 
     /// A `ScalarFanIn` re-reads every operand on every pull, so it can only pass a
     /// release on once there will be no next pull — which is exactly what a
@@ -679,38 +535,38 @@ mod tests {
     // the inputs vec — fine for branches that always advance in lockstep,
     // wrong as soon as they don't.
     //
-    // We construct two `SealedFunction` test tiles over the same domain
+    // We construct two `Function` test tiles over the same domain
     // type but with *different actual positions present* (branch A has
     // positions [0, 1, 2]; branch B has only [0, 1]) and a `FanInProducer`
     // directly over them, then check that the merged output is restricted
     // to the intersection [0, 1].
 
-    /// Two `SealedFunction` inputs with different sets of present positions.
+    /// Two `Function` inputs with different sets of present positions.
     /// The output should restrict to the intersection of those positions.
     #[test]
     fn fan_in_producer_intersects_branch_presence() {
-        let input_tiling = Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
-        };
-        let tile_a = Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 12]))),
+        let input_tiling = Tiling::function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::UInt)),
+        );
+        let tile_a = Tile::function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 12]))),
             // Non-terminal: branch A has emitted [0, 1, 2] but its
             // upstream hasn't yet signaled "no more".
-            domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
-        };
-        let tile_b = Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![20, 21]))),
-            domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
-        };
+            Predicate::False,
+            BitSet::new(),
+        );
+        let tile_b = Tile::function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![20, 21]))),
+            Predicate::False,
+            BitSet::new(),
+        );
 
-        let output_tiling = Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Record(HashMap::from([
+        let output_tiling = Tiling::function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Record(HashMap::from([
                 (
                     "a".to_string(),
                     Tiling::Scalar(Extent::Base(BaseType::UInt)),
@@ -719,9 +575,10 @@ mod tests {
                     "b".to_string(),
                     Tiling::Scalar(Extent::Base(BaseType::UInt)),
                 ),
-            ]))),
-        };
+            ])),
+        );
         let mut fan_in = FanInProducer {
+            depth: 1,
             base: ProducerBase::new(FanInProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
             inputs: vec![
@@ -731,34 +588,34 @@ mod tests {
         };
 
         let result = fan_in.get(fan_in.tiling().universal_guard());
-        let Tile::SealedFunction {
+        let Tile::Function {
             domain, codomain, ..
         } = result
         else {
-            panic!("expected SealedFunction output, got {result:?}");
+            panic!("expected Function output, got {result:?}");
         };
         // Intersection of [0, 1, 2] and [0, 1] is [0, 1].
         let ColumnValue::UInts(domain_vals) = domain else {
-            panic!("expected UInts domain, got {domain:?}");
+            panic!("expected UInts keys, got {domain:?}");
         };
         assert_eq!(
             domain_vals,
             vec![0, 1],
-            "output domain should be the intersection of input presences"
+            "output keys should be the intersection of input presences"
         );
 
         let Tile::Record(field_tiles) = *codomain else {
-            panic!("expected Record codomain");
+            panic!("expected Record values");
         };
         assert_eq!(
             scalar_tile_to_column_value(field_tiles.get("a").unwrap().clone()),
             ColumnValue::UInts(vec![10, 11]),
-            "branch a's codomain should be filtered to positions [0, 1]",
+            "branch a's values should be filtered to positions [0, 1]",
         );
         assert_eq!(
             scalar_tile_to_column_value(field_tiles.get("b").unwrap().clone()),
             ColumnValue::UInts(vec![20, 21]),
-            "branch b's codomain should remain [0, 1] (already its full presence)",
+            "branch b's values should remain [0, 1] (already its full presence)",
         );
     }
 }
