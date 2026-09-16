@@ -16,6 +16,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 
 import { renderApp } from "./main";
 import { Store } from "./store";
+import type { Resolved } from "./store";
 import { SourceView } from "./sourceView";
 import { TreeView, serializeTree } from "./treeView";
 
@@ -25,9 +26,11 @@ import { fixture, irPaneById, operatorPaneById, stubLayout, theNode } from "./__
 import { isIrPane } from "./types";
 import type { Snapshot } from "./types";
 
+import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
 const listMin = fixture(listMinJson);
+const arithmetic = fixture(arithmeticJson);
 // The tree-shaped panes. The layout draws every pane; these tests drive the
 // source<->tree link, and the operator pane's own rendering is covered in
 // operatorView.dom.test.ts.
@@ -38,6 +41,7 @@ const treePanes = listMin.panes.filter(isIrPane);
 function mountApp(snap: Snapshot): {
   store: Store;
   source: HTMLElement;
+  sourceView: SourceView;
   trees: Map<string, HTMLElement>;
 } {
   const root = document.createElement("div");
@@ -49,7 +53,7 @@ function mountApp(snap: Snapshot): {
   root.appendChild(sourceBody);
   // SourceView is constructed FIRST (as in main.ts) — the ordering that let
   // Bug 1's throw starve every later subscriber.
-  new SourceView(sourceBody, store);
+  const sourceView = new SourceView(sourceBody, store);
 
   const trees = new Map<string, HTMLElement>();
   // The tree panes only. `TreeView` cannot draw a graph, and these tests assert
@@ -61,7 +65,7 @@ function mountApp(snap: Snapshot): {
     trees.set(pane.id, body);
     if (pane.nodes.length > 0) new TreeView(body, store, pane.id, pane.root);
   }
-  return { store, source: sourceBody, trees };
+  return { store, source: sourceBody, sourceView, trees };
 }
 
 describe("view integration: cross-pane source<->tree linking", () => {
@@ -90,11 +94,200 @@ describe("view integration: cross-pane source<->tree linking", () => {
 
     // posAtCoords is unusable in jsdom (no layout); drive the store directly,
     // which is the exact code path the bug lived in.
-    store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
+    store.setSelection({ kind: "source", from: lit.spans[0]!.start, to: lit.spans[0]!.start });
 
     for (const [, body] of trees) {
       expect(body.querySelectorAll(".tree-row.selected, .tree-row.linked").length).toBeGreaterThan(0);
     }
+  });
+
+  it("a dragged range in the editor selects every node it covers", async () => {
+    // The real gesture: CodeMirror owns the selection, and `selectionSync`
+    // turns it into a store selection. Dispatching a range is what a drag
+    // leaves behind, and needs no layout — unlike posAtCoords.
+    const { store, source, sourceView } = mountApp(listMin);
+
+    // `[1, 2, 3, 4]` — the three literals at [1,2), [4,5) and [7,8) lie inside
+    // [1,8); the enclosing List [1,12) does not, so it is not named.
+    sourceView.view.dispatch({ selection: { anchor: 1, head: 8 } });
+    await Promise.resolve(); // `selectionSync` defers through a microtask
+
+    const resolved = store.getResolved();
+    expect(resolved.selection).toEqual({ kind: "source", from: 1, to: 8 });
+
+    // Anchors live on the anchor pane now, not on every pane.
+    const anchorPane = irPaneById(listMin, "post-inference");
+    const names = (label: string): number => theNode(anchorPane, label).nodeId;
+    const anchors = [...resolved.primaryByPane.get("post-inference")!].sort((a, b) => a - b);
+    for (const label of ["Lit(Int(1))", "Lit(Int(2))", "Lit(Int(3))"]) {
+      expect(anchors, `${label} is an anchor`).toContain(names(label));
+    }
+    expect(anchors).not.toContain(names("Lit(Int(4))"));
+    // One strong region: the dragged range itself. Strong is what the reader
+    // pointed at, and a drag points at one contiguous run of text — the nodes
+    // inside it are what it *resolved* to, and read as traces.
+    expect(source.querySelectorAll(".cm-sel-node").length).toBe(1);
+    expect(resolved.pointedAt).toEqual({ from: 1, to: 8 });
+  });
+
+  it("a caret in the editor selects one node, as a click always did", async () => {
+    const { store, sourceView } = mountApp(listMin);
+    sourceView.view.dispatch({ selection: { anchor: 1, head: 1 } });
+    await Promise.resolve();
+
+    const resolved = store.getResolved();
+    expect(resolved.selection).toEqual({ kind: "source", from: 1, to: 1 });
+    // A caret points at the token under it — `1` — and resolves to the node
+    // that token sits in. The node is an anchor; so are its images, which a
+    // round trip can bring back into this pane, so containment is the claim.
+    expect(resolved.pointedAt).toEqual({ from: 1, to: 2 });
+    const anchorPane = irPaneById(listMin, "post-inference");
+    expect([...resolved.primaryByPane.get("post-inference")!]).toContain(
+      theNode(anchorPane, "Lit(Int(1))").nodeId,
+    );
+  });
+
+  it("draws only the clicked pane's span strongly when panes disagree on extent", () => {
+    // The behaviour `txn_multi_read` exposed and no committed fixture covers:
+    // the panes disagree about how much source a node claims, so reading every
+    // pane's anchor as primary drew the widest of them strongly and a click
+    // anywhere inside it looked the same. Widening one downstream twin
+    // reproduces the disagreement over a real payload.
+    //
+    // `[1, 2, 3, 4]` — the literal `1` is [1,2) in post-inference; its
+    // post-channelize twin is widened to [1,5) (`1, 2`). Clicking the literal
+    // must draw `1` strongly and the rest of the wider span lightly, not the
+    // whole of `1, 2` strongly.
+    const snap = structuredClone(listMin) as Snapshot;
+    const widened = snap.panes.find((p) => p.id === "post-channelize")!;
+    const twin = (widened as { nodes: { nodeId: number; spans: unknown[] }[] }).nodes.find(
+      (n) => n.nodeId === 1,
+    )!;
+    twin.spans = [{ start: 1, end: 5 }];
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const store = new Store(snap);
+    new SourceView(root, store);
+
+    store.setSelection({ kind: "source", from: 1, to: 1 });
+
+    const strong = [...root.querySelectorAll(".cm-sel-node")].map((e) => e.textContent).join("");
+    const light = [...root.querySelectorAll(".cm-link-node")].map((e) => e.textContent).join("");
+    expect(strong).toBe("1");
+    expect(light).toBe(", 2");
+  });
+
+
+
+  it("says so in a pane that holds no part of the selection", () => {
+    // `ExprStmt` is rewritten away by channelize, so a click on a statement has
+    // no counterpart downstream: `post-channelize` lights up entirely as
+    // traces. A pane of amber rows with no explanation reads as a fault, so the
+    // pane says which it is. `arithmetic` byte 7 is such a click — the pane
+    // holds nine highlights and no anchor.
+    const snap = arithmetic;
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const store = new Store(snap);
+    const pane = irPaneById(snap, "post-channelize");
+    const body = document.createElement("div");
+    root.appendChild(body);
+    new TreeView(body, store, pane.id, pane.root);
+
+    let latest: Resolved | null = null;
+    store.subscribe((r) => {
+      latest = r;
+    });
+
+    // Highlights but no anchor: the pane says so.
+    store.setSelection({ kind: "source", from: 7, to: 7 });
+    expect(latest!.result.highlightsByPane.get(pane.id)?.size ?? 0).toBeGreaterThan(0);
+    expect(latest!.primaryByPane.get(pane.id)?.size ?? 0).toBe(0);
+    expect(body.querySelector(".no-anchor-notice")).not.toBeNull();
+
+    // An anchor in this pane: no notice.
+    const anchored = [...(latest!.result.highlightsByPane.get(pane.id) ?? [])][0];
+    store.setSelection({ kind: "node", paneId: pane.id, nodeId: anchored }, pane.id);
+    expect(latest!.primaryByPane.get(pane.id)?.size ?? 0).toBeGreaterThan(0);
+    expect(body.querySelector(".no-anchor-notice")).toBeNull();
+
+    // Nothing selected: no notice either.
+    store.setSelection(null);
+    expect(body.querySelector(".no-anchor-notice")).toBeNull();
+  });
+
+  it("the pane a selection came from does not scroll itself", () => {
+    // Every row is in the DOM and jsdom has no layout, so the observable is the
+    // scrollIntoView call rather than a position: the clicked pane must not
+    // make one, and the others must.
+    const { store, trees } = mountApp(listMin);
+    const calls = new Map<string, number>();
+    for (const [id, body] of trees) {
+      calls.set(id, 0);
+      for (const row of body.querySelectorAll(".tree-row")) {
+        (row as HTMLElement).scrollIntoView = () => {
+          calls.set(id, (calls.get(id) ?? 0) + 1);
+        };
+      }
+    }
+
+    const origin = "post-inference";
+    const lit = theNode(irPaneById(listMin, origin), "Lit(Int(1))");
+    store.setSelection({ kind: "node", paneId: origin, nodeId: lit.nodeId }, origin);
+
+    expect(calls.get(origin)).toBe(0);
+    for (const [id, n] of calls) {
+      if (id !== origin) expect(n, `${id} scrolls`).toBeGreaterThan(0);
+    }
+  });
+
+  it("re-selecting the same node from elsewhere scrolls the pane that held it", () => {
+    // The "go to this node" gestures — an operator-pane reference row, a
+    // repeated goto-definition, the hover jump — dispatch the selection with no
+    // origin so every pane scrolls, including the one the reader is in. When
+    // that node is already the selection, only the origin differs; comparing
+    // the selection alone swallowed the gesture and nothing moved.
+    const { store, trees } = mountApp(listMin);
+    const origin = "post-inference";
+    const lit = theNode(irPaneById(listMin, origin), "Lit(Int(1))");
+
+    // Clicked here: this pane deliberately does not scroll.
+    store.setSelection({ kind: "node", paneId: origin, nodeId: lit.nodeId }, origin);
+
+    let scrolls = 0;
+    for (const row of trees.get(origin)!.querySelectorAll(".tree-row")) {
+      (row as HTMLElement).scrollIntoView = () => {
+        scrolls += 1;
+      };
+    }
+
+    // Same node, no origin: "take me there".
+    let latest: Resolved | null = null;
+    store.subscribe((r) => {
+      latest = r;
+    });
+    store.setSelection({ kind: "node", paneId: origin, nodeId: lit.nodeId });
+    expect(latest!.origin).toBeNull();
+    expect(scrolls).toBeGreaterThan(0);
+  });
+
+  it("a jump scrolls every pane, including the one it came from", () => {
+    // Goto-definition and the operator pane's reference rows mean "go there",
+    // so they pass no origin and the pane holding the target moves too.
+    const { store, trees } = mountApp(listMin);
+    const target = "post-inference";
+    let scrolled = 0;
+    for (const row of trees.get(target)!.querySelectorAll(".tree-row")) {
+      (row as HTMLElement).scrollIntoView = () => {
+        scrolled += 1;
+      };
+    }
+
+    const lit = theNode(irPaneById(listMin, target), "Lit(Int(1))");
+    store.setSelection({ kind: "node", paneId: target, nodeId: lit.nodeId });
+
+    expect(scrolled).toBeGreaterThan(0);
   });
 
   it("a source selection produces a primary source highlight (.cm-sel-node)", () => {
@@ -102,7 +295,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
     const pre = irPaneById(listMin, "pre-inference");
     const lit = theNode(pre, "Lit(Int(1))");
 
-    store.setSelection({ kind: "source", byteOffset: lit.spans[0]!.start });
+    store.setSelection({ kind: "source", from: lit.spans[0]!.start, to: lit.spans[0]!.start });
     expect(source.querySelectorAll(".cm-sel-node").length).toBeGreaterThan(0);
   });
 });

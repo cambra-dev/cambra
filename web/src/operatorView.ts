@@ -45,6 +45,8 @@ interface NodeHandle {
   row: HTMLElement;
   parentId: number | null;
   expand: () => void;
+  /** The row's position in render order — see the tree pane's `NodeHandle`. */
+  order: number;
 }
 
 export class OperatorView {
@@ -57,6 +59,7 @@ export class OperatorView {
   // `TreeView` makes.
   private readonly handles = new Map<number, NodeHandle>();
   private markedRows: HTMLElement[] = [];
+  private nextOrder = 0;
 
   constructor(parent: HTMLElement, store: Store, pane: OperatorPane) {
     this.store = store;
@@ -81,6 +84,7 @@ export class OperatorView {
   ): HTMLElement {
     const container = el("div", "tree-node");
     const row = el("div", "tree-row selectable");
+    const order = this.nextOrder++;
     const children = node.inputs.filter(isChildEdge);
     const references = node.inputs.filter((e) => !isChildEdge(e));
     const hasChildren = children.length > 0 || references.length > 0;
@@ -105,13 +109,16 @@ export class OperatorView {
 
     row.addEventListener("click", (e) => {
       if (e.target === twisty) return;
-      this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: node.nodeId });
+      this.store.setSelection(
+        { kind: "node", paneId: this.paneId, nodeId: node.nodeId },
+        this.paneId,
+      );
     });
 
     if (!hasChildren) {
       twisty.textContent = "·";
       twisty.classList.add("leaf");
-      this.handles.set(node.nodeId, { row, parentId, expand: () => {} });
+      this.handles.set(node.nodeId, { row, parentId, order, expand: () => {} });
       return container;
     }
 
@@ -143,6 +150,7 @@ export class OperatorView {
     this.handles.set(node.nodeId, {
       row,
       parentId,
+      order,
       expand: () => {
         if (!expanded) {
           expanded = true;
@@ -167,6 +175,8 @@ export class OperatorView {
     row.appendChild(el("span", "node-label", subscribed ? subscribed.label : "?"));
     row.appendChild(el("span", "node-id", `#${edge.subscribed}`));
     row.addEventListener("click", () => {
+      // A jump to the row this one points at, so no origin: this pane scrolls
+      // to the target like any other.
       this.store.setSelection({ kind: "node", paneId: this.paneId, nodeId: edge.subscribed });
     });
     container.appendChild(row);
@@ -193,23 +203,20 @@ export class OperatorView {
 
     const highlights = resolved.result.highlightsByPane.get(this.paneId);
     if (!highlights || highlights.size === 0) return;
-    const primary = resolved.primaryByPane.get(this.paneId) ?? null;
+    const primaries = resolved.primaryByPane.get(this.paneId);
 
+    // Scroll to the drawn row earliest in render order, as the tree panes do.
+    let topmost: NodeHandle | null = null;
     for (const nodeId of highlights) {
       const handle = this.handles.get(nodeId);
       if (!handle) continue;
       this.expandAncestors(nodeId);
-      handle.row.classList.add(nodeId === primary ? "selected" : "linked");
+      handle.row.classList.add(primaries?.has(nodeId) ? "selected" : "linked");
       this.markedRows.push(handle.row);
+      if (topmost === null || handle.order < topmost.order) topmost = handle;
     }
 
-    const scrollTo =
-      primary !== null && this.handles.has(primary)
-        ? primary
-        : highlights.values().next().value;
-    if (scrollTo !== undefined) {
-      this.handles.get(scrollTo)?.row.scrollIntoView({ block: "nearest" });
-    }
+    if (resolved.origin !== this.paneId) topmost?.row.scrollIntoView({ block: "start" });
   }
 }
 
