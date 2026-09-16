@@ -57,8 +57,10 @@ ci_formal() {
     return 0
   fi
   (cd formal && lake build) || return 1
-  # `ci_all` runs the suite next, so the differential tests ride that run rather
-  # than a second one. A bare `./ci.sh formal` still wants its own.
+  # This gate is the differential tests' only caller: their target is
+  # `test = false` in Cargo.toml, so a bare `cargo test` skips it and `ci_test`
+  # needs no Lean toolchain to run the suite. Naming the target explicitly is
+  # what still builds and runs it.
   #
   # `--nocapture` so each oracle's case count reaches the log. Without it a run
   # that compared nothing is indistinguishable from one that compared

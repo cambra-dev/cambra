@@ -21,14 +21,30 @@ permissions:
   # Permissions to see changed files for the paths-filter action below.
   pull-requests: read
 
+# Each gate is its own job, so they run in parallel and the run takes as long as
+# its slowest gate rather than the sum of all of them. `check` at the bottom
+# collects their results and is the one required status check.
+#
+# Every code gate below gates on `!cancelled()` rather than on `needs`-success:
+# a failed doc-reference check must not skip them all, or one run stops
+# reporting every error it found. The flag is still set in that case, because
+# `repo_checks` runs its filter step on failure too.
 jobs:
-  check:
+  # The checks that need no build toolchain, plus the code-changed flag every
+  # other job gates on. Nothing here depends on the flag: a docs-only PR is
+  # exactly when a section anchor rots, so the doc-reference check has to run
+  # on it.
+  repo_checks:
     runs-on: ubuntu-latest
+    outputs:
+      is_code_change: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # Full-history fetch of all refs so the pre-rewrite tripwire below
           # sees every commit reachable from the repo, not just the PR head.
+          # The other jobs take the default shallow checkout; this is the only
+          # gate that reads history.
           fetch-depth: 0
 
       # This repo was recreated from filter-rewritten history; cbf7ce76 is the
@@ -44,24 +60,23 @@ jobs:
           fi
 
       # Validate intra-repo doc references (Markdown links/anchors + code->doc
-      # citations). Deliberately runs on EVERY PR — including docs-only ones,
-      # which the paths-filter below marks as `code: false` and otherwise skips,
-      # yet are exactly when section anchors rot. Needs only python3 (present on
-      # the runner), no Rust toolchain, so it runs before setup.
+      # citations). Needs only python3, present on the runner.
       - name: Doc references
+        if: success() || failure()
         run: ./ci.sh doc_refs
 
       # Gate the interpreter's no-back-channel invariant (operators exchange
       # tiles through `get`, never through shared mutable state). Python-only
-      # like the doc-ref check, so it runs here rather than behind the toolchain
-      # setup, and ahead of the paths filter below so it cannot be skipped.
+      # like the doc-ref check.
       - name: Shared state
+        if: success() || failure()
         run: ./ci.sh shared_state
 
-      # 1. Detect if changes are only in ignored paths
-      # Skip CI for changes that don't affect code
+      # Skip the code gates for changes that touch no code. Runs last so a
+      # failure above cannot leave the flag unset.
       - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         id: filter
+        if: success() || failure()
         with:
           filters: |
             code:
@@ -71,133 +86,86 @@ jobs:
               # Catch-all: run for everything else
               - '**'
 
-      # 2. Setup Toolchain (Only if code changed)
-      - name: Setup Rust
-        if: steps.filter.outputs.code == 'true'
-        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache
-        if: steps.filter.outputs.code == 'true'
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
-      # The Lean development in `formal/` is checked by *building* it: `lake
-      # build` elaborates every theorem and evaluates every `#guard`, so without
-      # a toolchain on the runner the `Formal model` step below would skip and
-      # gate nothing. elan is pinned by release and verified by hash, the same
-      # discipline as pinning the actions above by SHA, and it installs the
-      # version `formal/lean-toolchain` names rather than a floating one.
-      - name: Setup Lean
-        if: steps.filter.outputs.code == 'true'
-        run: |
-          curl -sSfL -o /tmp/elan.tar.gz \
-            https://github.com/leanprover/elan/releases/download/v4.2.3/elan-x86_64-unknown-linux-gnu.tar.gz
-          echo "df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2  /tmp/elan.tar.gz" \
-            | sha256sum -c -
-          tar xzf /tmp/elan.tar.gz -C /tmp
-          /tmp/elan-init -y --default-toolchain "$(cat formal/lean-toolchain)" >/dev/null
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-
-      # Node toolchain for the web frontend (vitest + bundle).
-      # TODO: pin to a SHA to match this repo's action-pinning convention.
-      - name: Setup Node
-        if: steps.filter.outputs.code == 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4
-        with:
-          node-version: 20
-
-      # The refinement-entailment fallback shells out to a `z3` subprocess
-      # (`easy_smt::ContextBuilder::with_z3_defaults` in
-      # `src/ccl/infer/solver/smt.rs`), so without the binary on PATH every
-      # query fails and the solver slot poisons. Pinned by release and verified
-      # by hash, the same discipline as the elan install above, and for a
-      # sharper reason: z3's answers decide refinement subtyping, so a version
-      # floating with the runner image would move what the type checker accepts
-      # without a commit saying so.
-      - name: Setup Z3
-        if: steps.filter.outputs.code == 'true'
-        run: |
-          curl -sSfL -o /tmp/z3.zip \
-            https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip
-          echo "7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e  /tmp/z3.zip" \
-            | sha256sum -c -
-          unzip -q /tmp/z3.zip -d /tmp
-          echo "/tmp/z3-4.16.0-x64-glibc-2.39/bin" >> "$GITHUB_PATH"
-
-      # 3. Run Checks (Only if code changed)
-      - name: Shellcheck
-        if: steps.filter.outputs.code == 'true'
-        run: ./ci.sh shellcheck
-
-      # Workaround: rustpython-parser v0.2.0's build script generates a source
-      # file (python.rs) outside target/. rust-cache restores compiled artifacts
-      # but not that generated file, so clippy/test fail with a missing include.
-      # Cleaning the package forces its build script to re-run every time.
-      - name: Clean rustpython-parser cache
-        run: cargo clean -p rustpython-parser 2>/dev/null || true
-
-      - name: Format
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
-        run: ./ci.sh fmt
-
+  # Lints the crate with `--all-targets` in debug — the baseline pass. Its own
+  # job because each clippy configuration is a distinct fingerprint: cargo
+  # rebuilds for every one of them, so running them together only makes them
+  # queue.
+  clippy:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
       - name: Clippy
-        # Run even if earlier steps failed so we see all errors in one run.
-        # (Steps default to `if: success()`, which skips on prior failure.)
-        #
-        # An alternative would be to split this into multiple jobs (e.g. check -> execute -> results),
-        # but then we pay a (small) latency overhead for staring up 3 runners.
-        #
-        # Read more about the "hidden ifs" and general inanity here
-        # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy
 
+  # The same lint in release, which is the only pass that compiles the test
+  # target in release — so a `#[cfg(debug_assertions)]`-gated item referenced by
+  # ungated code (a test calling a debug-only fn) breaks here and nowhere else.
+  clippy_release:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
       - name: Clippy (release)
-        # Lints all targets — including the test target — in release. The debug
-        # checks never compile tests in release, so debug-only gating that
-        # breaks release builds (a `#[cfg(debug_assertions)]` item referenced by
-        # ungated code) only surfaces here. Runs even if earlier steps failed.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy_release
 
+  # The checks that finish in seconds, kept together because three more runners
+  # would cost more setup than the work they do.
+  lint:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+
+      # Every step below runs even if an earlier one failed, so one run reports
+      # every error rather than only the first. Steps default to
+      # `if: success()`, which skips on prior failure.
+      # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
+      - name: Shellcheck
+        run: ./ci.sh shellcheck
+
+      - name: Format
+        if: success() || failure()
+        run: ./ci.sh fmt
+
       - name: Clippy (lib only)
-        # Every pass above uses `--all-targets`, which unifies the *self*
+        # Both passes above use `--all-targets`, which unifies the *self*
         # dev-dependency's `test-helpers` feature into the lib under test — so
         # they only ever compile the library with that feature ON, and the
         # feature-off configuration a consumer builds is compiled by nothing.
         # Resolver 3 keeps the feature out of a plain lib build, so the gap is
-        # silent: ungated code calling a gated item passes everything above and
-        # fails `cargo build --lib`.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        # silent: ungated code calling a gated item passes both and fails
+        # `cargo build --lib`.
+        if: success() || failure()
         run: ./ci.sh clippy_lib
 
       - name: Doc
         # Builds rustdoc with broken intra-doc links denied, which is what makes
         # a `[`identifier`]` reference in a doc comment a checkable citation
         # rather than prose that rots silently.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        if: success() || failure()
         run: ./ci.sh doc
 
-      - name: Formal model
-        # Builds the Lean model, which is what checks its proofs, then diffs the
-        # model's verdicts against the solver's. Placed before `Test` so the
-        # oracle binary exists by the time the suite runs: the differential tests
-        # skip themselves without it, and skipping is the failure mode this step
-        # exists to remove.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
-        run: ./ci.sh formal
+  # The suite, both ways — the longest gate, so it sets the run's wall clock.
+  # The lint jobs are separate because clippy runs through clippy-driver, which
+  # cargo fingerprints separately from rustc: a clippy pass warms nothing the
+  # suite then reuses (see `ci_clippy` in ci.sh), so splitting them duplicates
+  # no compilation.
+  test:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
 
       - name: Test
-        # Run even if earlier steps failed so we see all errors in one run.
-        # (Steps default to `if: success()`, which skips on prior failure.)
-        #
-        # An alternative would be to split this into multiple jobs (e.g. check -> execute -> results),
-        # but then we pay a (small) latency overhead for staring up 3 runners.
-        #
-        # Read more about the "hidden ifs" and general inanity here
-        # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
         # `CAMBRA_PROVENANCE_GATE=1` makes every compile fold every gated pane pair
         # and gate the leak classes, so the gate's corpus is the whole test suite
         # rather than the handful of programs `context.rs`'s `corpus()` lists. Two
@@ -206,7 +174,6 @@ jobs:
         run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
       - name: Test (reversed refinement order)
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
         # A refinement set is unordered by contract, but two classes of
         # order-dependence survive a compile-clean rewrite and only running the
         # suite both ways exercises them: a consumer that iterates the set and
@@ -214,38 +181,95 @@ jobs:
         # first-inserted of two `eq`-equal refinements whose predicate terms carry
         # different embedded type slots. Nothing in the type system catches
         # either, so an unrun knob would rot exactly as an uncompiled feature
-        # does. The env var is read at *runtime*, so this reuses the binaries
-        # the step above already built.
+        # does. The env var is read at runtime, so this reuses the binaries the
+        # step above already built, which is why both live in one job.
+        if: success() || failure()
         run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
 
+  # The Lean model: `lake build` elaborates every theorem and evaluates every
+  # `#guard`, then the differential tests diff the model's verdicts against the
+  # solver's. Those tests skip themselves when the oracle binary is absent, so
+  # without this gate nothing notices the model drifting from the solver, in
+  # either direction.
+  formal:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+
+      - uses: ./.github/actions/lean
+
+      - name: Formal model
+        run: ./ci.sh formal
+
+  # The golden wire fixtures: regenerate into a temp dir and diff against the
+  # committed corpus, plus the orphan-fixture check. Its own job because
+  # `regen-fixtures.sh` drives a bare `cargo run`, which resolves without the
+  # self dev-dependency and so builds the `test-helpers`-off configuration —
+  # a different build from the one the suite compiles, sharing nothing with it.
+  fixtures:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
       - name: Fixtures
-        # The golden wire fixtures: regenerate into a temp dir and diff against
-        # the committed corpus, plus the orphan-fixture check. Needs its own step
-        # because CI invokes each gate individually and never calls `ci_all`, so
-        # a gate that exists only in `ci.sh` runs locally and nowhere else.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh fixtures
 
+  # The frontend: typecheck + vitest + committed-bundle freshness. Needs Node
+  # and no Rust, so it shares none of the setup above.
+  web:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # TODO: pin to a SHA to match this repo's action-pinning convention.
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4
+        with:
+          node-version: 20
+
       - name: Web
-        # The frontend: typecheck + vitest + committed-bundle freshness.
-        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh web
 
-        # 4. Success Signal for noops
+  # The one required status check: ruleset "CI" requires the context `check`.
+  # Keeping that name on a job that only collects results is what lets the gates
+  # above be split, renamed, or added to without a ruleset edit.
+  check:
+    needs: [repo_checks, lint, clippy, clippy_release, test, formal, fixtures, web]
+    # `always()` so this runs when a gate failed; without it the job would be
+    # skipped and the required check would never report.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # A docs-only PR skips the code gates, and `skipped` is not a failure.
+      # `cancelled` is, because a cancelled gate checked nothing.
       - name: No-op for docs
-        if: steps.filter.outputs.code == 'false'
-        run: echo "Only documentation changed. Skipped CI checks."
+        if: needs.repo_checks.outputs.is_code_change == 'false'
+        run: echo "Only documentation changed. The code gates were skipped."
+
+      - name: Collect gate results
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        # Through the environment, not interpolated into the command: the JSON
+        # is multi-line and would otherwise be spliced into the shell.
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "${RESULTS}"
+          echo "::error::A CI gate did not pass; see the results above."
+          exit 1
 
       - name: Notify Slack on failure
-        # failure() is true if *any* previous step failed, even if later steps
-        # succeeded, so this fires regardless of which check caught the error.
-        #
         # Only notify on pushes to main, not PRs. The push trigger is scoped
         # to branches: [main], so event_name == 'push' implies main. PR branch
         # pushes fire as 'pull_request' events instead.
-        #
-        # Only fire if this is a run with codechanges.
-        if: failure() && github.event_name == 'push' && steps.filter.outputs.code == 'true'
+        if: >-
+          failure() && github.event_name == 'push' &&
+          needs.repo_checks.outputs.is_code_change == 'true'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ vars.SLACK_CI_CHANNEL }}
