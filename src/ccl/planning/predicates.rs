@@ -64,8 +64,7 @@ use crate::ccl::RefinementSet;
 /// as a `Fun.name` Pi binder in a type slot, which every equality path ignores
 /// (`eq_term_modulo_ty_slots` is type-blind; the structural reconcile strips Pi
 /// names via `without_pi_names`). The invariant this backs is purely about the
-/// compared term. Only reached from a `debug_assert!`, but it must compile in
-/// release too (the macro still type-checks its argument), so it is not gated.
+/// compared term.
 fn term_mentions_pair_binder(e: &Expr) -> bool {
     let here = match &e.node {
         TypedExprNode::Var(n) => n.is_synthetic_pair(),
@@ -306,8 +305,11 @@ fn compile_refinements(
             // into the compared *term*. It legitimately survives as a `Fun.name` Pi
             // binder in a type slot (which `eq_term_modulo_ty_slots` is type-blind
             // to), so the check is term-only. Assert that load-bearing invariant
-            // rather than leaving it argued.
-            debug_assert!(
+            // rather than leaving it argued. Enforced in every build: a predicate
+            // this skipped in release is one whose producer/consumer match compares
+            // terms that are not value functions, and that mismatch surfaces later
+            // as an unrelated operator-conversion failure.
+            assert!(
                 !term_mentions_pair_binder(&compiled),
                 "a `__pair` binder survived into a compiled predicate term, \
                  breaking the value-function property the structural \

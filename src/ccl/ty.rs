@@ -127,11 +127,12 @@ impl<T> TagMap<T> {
     /// Build from arms in any order, sorting into canonical order.
     ///
     /// # Panics
-    /// In debug builds, if a key repeats — an arm set with a duplicate tag has no
-    /// meaning (which of the two would a value with that tag belong to?).
+    /// If a key repeats — an arm set with a duplicate tag has no meaning (which of
+    /// the two would a value with that tag belong to?). Checked in every build: one
+    /// pass over the vector the line above just sorted.
     pub fn from_arms(mut arms: Vec<(FieldKey, T)>) -> Self {
         arms.sort_by(|(a, _), (b, _)| a.cmp(b));
-        debug_assert!(
+        assert!(
             arms.windows(2).all(|w| w[0].0 != w[1].0),
             "TagMap: duplicate tag in arm set"
         );
