@@ -771,8 +771,8 @@ mod tests {
 
     #[test]
     fn test_is_iteration_bearing_map_domain_apply() {
-        // `Apply(_, MapDomain)` internalises iteration in op-conversion
-        // (its arm asserts `input.is_none()`), so wrapping would break it.
+        // `Apply(_, MapDomain)` is a source: op-conversion's arm takes no input, so
+        // prepending an `iterate` would strand it mid-chain.
         let int = int_ty();
         let inner = list_123();
         let expr = apply_builtin(
