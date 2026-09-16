@@ -38,6 +38,16 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # implies rather than reading it off the storage this reverses. Same argument as
 # `ci_clippy_lib`: a configuration nothing runs is a configuration that rots.
 ci_test() { cargo test -p cambra -q; }
+# The suite with `debug_assertions` off, which no other gate runs: `ci_test`
+# runs it on, and `ci_clippy_release` lints that configuration without running
+# it. A check compiled out here and nowhere else makes two compilers, and the
+# failure is silent in the direction that matters — a `#[should_panic]` test
+# pinning a `debug_assert!` passes in the build where the assert fires and only
+# there, and a debug-only path that mints a `NodeId` shifts every id after it.
+# Behavior that depends on *optimization* is out of scope, which is what lets
+# `profile.no-assertions` keep `dev`'s `opt-level` and this gate cost about what
+# `ci_test` costs.
+ci_test_no_assertions() { cargo test -p cambra -q --profile no-assertions; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list
 # (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
@@ -297,6 +307,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test || failed="${failed} test"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_test_no_assertions || failed="${failed} test_no_assertions"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fixtures || failed="${failed} fixtures"

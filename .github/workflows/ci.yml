@@ -179,6 +179,23 @@ jobs:
         # step, which is worth paying to keep the next one from doing the same.
         run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
+  # The suite with `debug_assertions` off — the configuration a release build
+  # compiles, at `dev`'s compile cost (`profile.no-assertions`). Its own
+  # `rust-cache` entry, unlike `test_reversed`: that job changes an env var the
+  # binaries read at runtime, while `debug-assertions` is a codegen flag, so this
+  # job shares no artifacts with `test` and keying it on `test` would have the
+  # two evict each other.
+  test_no_assertions:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+
+      - name: Test (no debug assertions)
+        run: ./ci.sh test_no_assertions
+
   # The same suite with every refinement set built in reversed physical order.
   # A refinement set is unordered by contract, but two classes of
   # order-dependence survive a compile-clean rewrite and only running the suite
@@ -260,7 +277,7 @@ jobs:
   # Keeping that name on a job that only collects results is what lets the gates
   # above be split, renamed, or added to without a ruleset edit.
   check:
-    needs: [repo_checks, lint, clippy, clippy_release, test, test_reversed, formal, fixtures, web]
+    needs: [repo_checks, lint, clippy, clippy_release, test, test_reversed, test_no_assertions, formal, fixtures, web]
     # `always()` so this runs when a gate failed; without it the job would be
     # skipped and the required check would never report.
     if: always()

@@ -875,6 +875,11 @@ impl TypedExpr {
     /// `Hole` is the lowering-phase placeholder. The inference pass converts it to a
     /// registered [`Type::Infer`] variable before type-checking begins.
     pub fn new(node: TypedExprNode) -> Self {
+        // A `run_debug_check` scope seals the record: a diagnostic must not
+        // perturb the ids it may be reporting on.
+        if crate::ccl::provenance::record_sealed() {
+            return Self::throwaway(node);
+        }
         let node_id = NodeId::fresh();
         crate::ccl::provenance::on_mint(node_id);
         TypedExpr {
