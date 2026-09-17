@@ -20,20 +20,27 @@
 //!   writer reports the timestamp it observed as its proposal's snapshot.
 //!
 //! Both the **engine** and the **operator** are multi-key. The store is
-//! `CommitTimestamp ⇀ (Key ⇀ Value)`, held as per-tick write sets with a per-key
-//! latest-write index; the in-engine read is `read_as_of(t, key)` (folding the
-//! delta history), and the whole-store render is
+//! `CommitTimestamp ⇀ {key: value}`, held in the engine as per-tick write sets with a
+//! per-key latest-write index; the in-engine read is `read_as_of(t, key)` (folding the
+//! write history), and the whole-store render is
 //! [`CommitEngine::render_full_store_tile`]. Disjoint write sets never conflict;
 //! decided-absence is where a tick that wrote other keys is absent for this key,
-//! though decided — its value holding from the latest earlier change. A writer's
-//! proposal carries its read and write sets as *maps*: each rides a tile cell as
-//! a [`map_to_value`] `Value::Function` in a `ColumnValue::Variants` column
-//! (heterogeneous key sets per cell, no `Function`), so the proposal
-//! stream is `step → {snap, reads, writes}` with `reads`/`writes` map-valued. The
-//! operator's output is the full store as a [`Tile::Store`] changelog in that
-//! same delta encoding, which the writers *fold* per key ([`store_current`] /
-//! [`store_value_at`]) when they read it back through the cycle — the step
-//! function, never mistaken for a directly-indexed `Function`.
+//! though decided — its value holding from the latest earlier change.
+//!
+//! The operator's output is the full store as a [`Tile::Store`]: one **changelog per
+//! key**, holding the ticks that wrote it against the values written. The writers *fold*
+//! a changelog ([`store_current`] / [`store_value_at`]) when they read the store back
+//! through the cycle — the step function, never mistaken for a directly-indexed
+//! `Function`. A tick's write set spanning several keys is one tick in each of their
+//! changelogs, so heterogeneity across ticks needs no encoding of its own.
+//!
+//! A writer's *proposal*, unlike the store, carries its read and write sets as map cells:
+//! each rides a [`map_to_value`] `Value::Function` in a `ColumnValue::Variants` column, so
+//! the proposal stream is `step → {snap, reads, writes}` with `reads`/`writes` map-valued.
+//! Their key sets are the writer's **static** footprint — a decision writes every carry key
+//! of the store consuming it, and the read set names every key the writer reads, omitting
+//! one the store has no value for yet. The cell is the representation they have, not one
+//! the shape requires.
 //!
 //! # Concurrency is logical
 //!
@@ -56,6 +63,7 @@ use crate::interpreter::{
 use crate::pretty_graph::VizOptions;
 use crate::pretty_tree::InspectNode;
 
+use crate::interpreter::operator_conversion::{store_key, store_key_name};
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
 use crate::interpreter::tile_operators::{OperatorBase, impl_operator_base, impl_producer_base};
 
@@ -277,37 +285,81 @@ impl CommitEngine {
         }
     }
 
-    /// Render the full store as a [`Tile::Store`] changelog `CommitTimestamp ⇀
-    /// (Key ⇀ Value)`: each committed tick as a change carrying its *write-set
-    /// delta*, encoded via [`map_to_value`] into the `deltas` `Variants` column,
-    /// with `frontier` the watermark. A consumer reads state by *folding* the
-    /// changelog per key ([`store_value_at`] / [`store_snapshot_at`], latest delta
-    /// containing the key `≤ t`); a tick whose delta omits a key is decided-absent
-    /// for it, its value holding from the latest earlier change. This is the
-    /// multi-key operator's output — the writers read it back through the cycle,
-    /// and it is the step function, not a `Function`, so the fold cannot be
-    /// mistaken for direct indexing.
-    pub fn render_full_store_tile(&self) -> Tile {
-        let ticks: Vec<usize> = self.committed.keys().copied().collect();
-        let deltas: Vec<Value> = self.committed.values().map(map_to_value).collect();
-        // The decided frontier is the watermark; an induction engine that has not
-        // stepped yet is undecided (`False`). The frontier is `LessThanEq(w)` even
-        // when the latest position(s) carried no write, so a trailing run of
-        // carries stays decided — the changelog is sparse but the frontier is not.
-        let frontier = match self.decided_watermark() {
-            Some(w) => Predicate::LessThanEq(Value::UInt(w)),
-            None => Predicate::False,
+    /// Render the full store as a [`Tile::Store`] over `tiling`: one changelog per key,
+    /// holding the ticks at which the engine committed a write to it against the values
+    /// written, with `frontier` the watermark. A consumer reads state by *folding* a
+    /// changelog ([`store_value_at`] / [`store_snapshot_at`], latest tick `≤ t`); a tick
+    /// a changelog omits is decided-absent for that key, its value holding from the
+    /// latest earlier change. This is the multi-key operator's output — the writers read
+    /// it back through the cycle, and it is the step function, not a `Function`, so the
+    /// fold cannot be mistaken for direct indexing.
+    ///
+    /// The key space comes from `tiling` rather than from the commits, so a key the
+    /// engine has never written is present with an empty changelog. That is what a fold
+    /// needs to distinguish "written nothing yet" from "not a key of this store".
+    pub fn render_full_store_tile(&self, tiling: &Tiling) -> Tile {
+        let Tiling::Record(logs) = tiling.store_state() else {
+            unreachable!("a store's state tiling is a record of per-key changelogs")
         };
+        debug_assert!(
+            self.committed
+                .values()
+                .flat_map(HashMap::keys)
+                .all(|key| { store_key_name(key).is_some_and(|name| logs.contains_key(name)) }),
+            "a committed write names a key outside the store's declared key space, so \
+             rendering would drop it: committed {:?}, declared {:?}",
+            self.committed,
+            logs.keys().collect::<Vec<_>>(),
+        );
+        let state = logs
+            .into_iter()
+            .map(|(key, log)| {
+                let Tiling::Function { values, .. } = log else {
+                    unreachable!("a store key's changelog tiling is a collection")
+                };
+                let runtime = store_key(&key, Value::Unit);
+                let written: Vec<(CommitTs, Value)> = self
+                    .committed
+                    .iter()
+                    .filter_map(|(tick, delta)| Some((*tick, delta.get(&runtime)?.clone())))
+                    .collect();
+                let ticks = ColumnValue::from_uints(written.iter().map(|(t, _)| *t).collect());
+                let column = ColumnValue::from_values(
+                    written.into_iter().map(|(_, v)| v).collect(),
+                    &values.extent(),
+                );
+                let tile = Tile::function(
+                    ticks,
+                    Box::new(Tile::Scalar(column)),
+                    // A changelog holds every write the engine has committed, so it is
+                    // decided exactly where the store is. The store's own `frontier` is
+                    // what a consumer reads; this keeps the sub-tile self-describing.
+                    self.frontier_predicate(),
+                    bit_set::BitSet::new(),
+                );
+                (key, tile)
+            })
+            .collect();
         Tile::Store {
-            changes: ColumnValue::from_uints(ticks),
-            deltas: ColumnValue::Variants(deltas),
-            frontier,
+            state: Box::new(Tile::Record(state)),
+            frontier: self.frontier_predicate(),
             // A rendered store is *live* on both closure axes by default: the
             // engine tracks commits, not writers, so a producer that knows which
             // of its writers have finished layers `terminal` and `closed_keys` on
             // top (keeping the numeric frontier).
             terminal: false,
             closed_keys: Vec::new(),
+        }
+    }
+
+    /// The decided frontier as a predicate: the watermark, or `False` for an induction
+    /// engine that has not stepped yet. It is `LessThanEq(w)` even when the latest
+    /// position(s) carried no write, so a trailing run of carries stays decided — a
+    /// changelog is sparse but the frontier is not.
+    fn frontier_predicate(&self) -> Predicate {
+        match self.decided_watermark() {
+            Some(w) => Predicate::LessThanEq(Value::UInt(w)),
+            None => Predicate::False,
         }
     }
 }
@@ -410,10 +462,7 @@ const MAX_INIT_PULLS: usize = 8;
 /// — terminality is a separate flag, never a `True` frontier that would discard
 /// `w` — so the watermark reads directly and counts trailing carries. `None` for
 /// an undecided/empty changelog.
-fn frontier_from_domain(domain: &ColumnValue, domain_predicate: &Predicate) -> Option<CommitTs> {
-    if domain.is_empty() {
-        return None;
-    }
+fn frontier_from_domain(domain_predicate: &Predicate) -> Option<CommitTs> {
     match domain_predicate {
         Predicate::LessThanEq(Value::UInt(f)) => Some(*f),
         _ => None,
@@ -422,29 +471,26 @@ fn frontier_from_domain(domain: &ColumnValue, domain_predicate: &Predicate) -> O
 
 // ── Step-function reads over a `Tile::Store` changelog ────────────────────────
 //
-// A `Tile::Store` *is* its changelog: `changes[i]` committed the write-set delta
-// `deltas[i]` (a `map_to_value` cell), ticks strictly ascending, `frontier`
-// the decided watermark. These four functions are the sanctioned way to read a
-// store's value — a plain index into `changes` is meaningless, because a tick
-// absent from the changelog is *decided-absent* (its value holds from the latest
-// earlier change), not unknown. They fold with right-continuous step
-// interpolation, and are the single tile-level store read: the writers
-// (`store_current`) and the value-stream projection both route through them, the
-// tile-side counterpart of the engine's own `read_as_of` fold over its BTreeMap.
+// A `Tile::Store` *is* its changelogs: key `k`'s holds the ticks that wrote `k`,
+// strictly ascending, against the values written there, with `frontier` the decided
+// watermark. These four functions are the sanctioned way to read a store's value — a
+// plain index into a changelog is meaningless, because a tick absent from it is
+// *decided-absent* (its value holds from the latest earlier change), not unknown. They
+// fold with right-continuous step interpolation, and are the single tile-level store
+// read: the writers (`store_current`) and the value-stream projection both route through
+// them, the tile-side counterpart of the engine's own `read_as_of` fold over its BTreeMap.
 
-/// The decided frontier tick of a store tile, from its `frontier` predicate and
-/// `changes`. `None` if `tile` is not a [`Tile::Store`], is empty, or is
-/// undecided. Mirrors [`frontier_from_domain`]: `LessThanEq(w)` reads the
-/// watermark directly; the terminal `True` flip takes the final (largest) change
-/// tick.
+/// The decided frontier tick of a store tile, from its `frontier` predicate. `None` if
+/// `tile` is not a [`Tile::Store`], has recorded no write at all, or is undecided.
+/// Mirrors [`frontier_from_domain`]: `LessThanEq(w)` reads the watermark directly.
 pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
-    let Tile::Store {
-        changes, frontier, ..
-    } = tile
-    else {
+    let Tile::Store { frontier, .. } = tile else {
         return None;
     };
-    frontier_from_domain(changes, frontier)
+    if store_change_ticks(tile).is_empty() {
+        return None;
+    }
+    frontier_from_domain(frontier)
 }
 
 /// `key`'s value as of commit time `t`: the latest change at a tick `≤ t` whose
@@ -453,26 +499,13 @@ pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
 /// tile-level analog of [`CommitEngine::read_as_of`] (which folds the engine's
 /// `BTreeMap`); this folds the rendered changelog a consumer holds.
 pub fn store_value_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
-    let Tile::Store {
-        changes, deltas, ..
-    } = tile
-    else {
-        return None;
-    };
-    // Scan newest-first: the first change `≤ t` that names `key` is its value as
-    // of `t` (ticks ascending, so once `tick ≤ t` every earlier index is too).
-    for i in (0..changes.len()).rev() {
-        let Value::UInt(tick) = changes.index_at(i) else {
-            continue;
-        };
-        if tick > t {
-            continue;
-        }
-        if let Some(v) = value_to_map(&deltas.index_at(i)).get(key) {
-            return Some(v.clone());
-        }
-    }
-    None
+    let (written, values) = changelog(tile, key)?;
+    // Scan newest-first: the last tick `≤ t` in `key`'s changelog is its value as of
+    // `t` (ticks ascending, so once `tick ≤ t` every earlier index is too).
+    (0..written.len())
+        .rev()
+        .find(|i| matches!(written.index_at(*i), Value::UInt(tick) if tick <= t))
+        .map(|i| changelog_value(values, i))
 }
 
 /// `key`'s value written **at exactly** tick `t` — the delta at tick `t` if it
@@ -481,18 +514,10 @@ pub fn store_value_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
 /// event a reply tap is, so a position that did not fire the tap yields `None`
 /// (and the dense read omits it).
 pub fn store_delta_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
-    let Tile::Store {
-        changes, deltas, ..
-    } = tile
-    else {
-        return None;
-    };
-    for i in 0..changes.len() {
-        if changes.index_at(i) == Value::UInt(t) {
-            return value_to_map(&deltas.index_at(i)).get(key).cloned();
-        }
-    }
-    None
+    let (written, values) = changelog(tile, key)?;
+    (0..written.len())
+        .find(|i| written.index_at(*i) == Value::UInt(t))
+        .map(|i| changelog_value(values, i))
 }
 
 /// Fold `key`'s value at changelog tick `t` under the store's **carry policy** —
@@ -539,32 +564,28 @@ pub fn fold_changelog_key_ascending(
     carry_forward: bool,
 ) -> Vec<Option<Value>> {
     let queries: Vec<CommitTs> = query_ticks.into_iter().collect();
-    let Tile::Store {
-        changes, deltas, ..
-    } = tile
-    else {
+    let Some((written, values)) = changelog(tile, key) else {
         return vec![None; queries.len()];
     };
-    let n = changes.len();
+    let n = written.len();
     let mut idx = 0usize; // next unprocessed change index (monotonic)
     let mut carry: Option<Value> = None; // running latest write ≤ the current query
     let mut out = Vec::with_capacity(queries.len());
     for t in queries {
         let mut exact: Option<Value> = None;
         while idx < n {
-            let Value::UInt(tick) = changes.index_at(idx) else {
+            let Value::UInt(tick) = written.index_at(idx) else {
                 idx += 1;
                 continue;
             };
             if tick > t {
                 break;
             }
-            if let Some(v) = value_to_map(&deltas.index_at(idx)).get(key) {
-                carry = Some(v.clone());
-                if tick == t {
-                    exact = Some(v.clone());
-                }
+            let v = changelog_value(values, idx);
+            if tick == t {
+                exact = Some(v.clone());
             }
+            carry = Some(v);
             idx += 1;
         }
         out.push(if carry_forward { carry.clone() } else { exact });
@@ -579,23 +600,12 @@ pub fn fold_changelog_key_ascending(
 /// keys at a single commit time, which a bank of independent per-key
 /// `Function` reads (the source of the read-skew divergence) cannot.
 pub fn store_snapshot_at(tile: &Tile, t: CommitTs) -> HashMap<Value, Value> {
-    let Tile::Store {
-        changes, deltas, ..
-    } = tile
-    else {
-        return HashMap::new();
-    };
-    let mut acc = HashMap::new();
-    for i in 0..changes.len() {
-        let Value::UInt(tick) = changes.index_at(i) else {
-            continue;
-        };
-        if tick > t {
-            break;
-        }
-        acc.extend(value_to_map(&deltas.index_at(i)));
-    }
-    acc
+    tile.store_keys()
+        .filter_map(|name| {
+            let key = store_key(name, Value::Unit);
+            Some((key.clone(), store_value_at(tile, t, &key)?))
+        })
+        .collect()
 }
 
 /// `key`'s current value — its latest change at or below the decided frontier —
@@ -696,12 +706,11 @@ pub fn map_to_value(map: &HashMap<Value, Value>) -> Value {
 ///
 /// A non-`Function` cell is `unreachable!`, not a runtime error: every map cell
 /// this decodes rode a `ColumnValue::Variants` column whose extent is a
-/// [`map_extent`] (`Key ⇀ Value`). That holds for store deltas (rendered by
-/// [`CommitEngine::render_full_store_tile`]) and for proposal read/write sets
-/// (inference's `emit_transact_writer` types the proposal codomain's
-/// `reads`/`writes` fields as map-valued, and the writer renders them via
-/// [`map_to_value`]). A non-`Function` value would be a `Variants` cell holding
-/// something other than its declared map extent — impossible by construction.
+/// [`map_extent`] (`Key ⇀ Value`). That holds for proposal read/write sets —
+/// inference's `emit_transact_writer` types the proposal codomain's `reads`/`writes`
+/// fields as map-valued, and the writer renders them via [`map_to_value`]. A
+/// non-`Function` value would be a `Variants` cell holding something other than its
+/// declared map extent — impossible by construction.
 pub fn value_to_map(v: &Value) -> HashMap<Value, Value> {
     match v {
         Value::Function(bindings) => bindings
@@ -716,8 +725,9 @@ pub fn value_to_map(v: &Value) -> HashMap<Value, Value> {
 }
 
 /// The extent of a `Key ⇀ Value` map cell — a [`map_to_value`] `Value::Function`
-/// carried in a `Variants` column. Used for both store deltas (the full-store
-/// codomain) and a proposal's read/write sets.
+/// carried in a `Variants` column. This is a **proposal's** read and write sets, which is
+/// where the encoding survives: the store's own state is a record keyed by the same keys
+/// ([`full_store_tiling`]), and a proposal's key sets are as static as the store's.
 fn map_extent(key_extent: &Extent, value_extent: &Extent) -> Extent {
     Extent::Function {
         domain: Box::new(key_extent.clone()),
@@ -726,16 +736,57 @@ fn map_extent(key_extent: &Extent, value_extent: &Extent) -> Extent {
 }
 
 /// The full multi-key store tiling: a [`Tiling::Store`] step function
-/// `CommitTimestamp ⇀ (Key ⇀ Value)`, each change tick carrying a `Key ⇀ Value`
-/// delta cell. The codomain is a `Scalar` of the map extent because a whole
-/// delta rides one cell as a `Value::Function`. The `Store` tiling (not
-/// `Function`) is what marks the output as a changelog to be folded, not a
-/// function to be indexed.
-pub fn full_store_tiling(key_extent: &Extent, value_extent: &Extent) -> Tiling {
+/// `CommitTimestamp ⇀ {key: value}`, whose codomain names every key the store holds
+/// with that key's own value tiling. The `Store` tiling (not `Function`) is what marks
+/// the output as a changelog to be folded, not a function to be indexed.
+///
+/// `values` is one entry per store key — a mutable variable or a reply tap — under the
+/// key's [`store_key`] name. Carrying each key's tiling is what lets the keys differ: a
+/// single shared codomain could only describe a heterogeneous store as the union of its
+/// keys' extents, which names what any key might hold rather than what each one does.
+pub fn full_store_tiling(values: HashMap<String, Tiling>) -> Tiling {
     Tiling::Store {
         domain: Extent::Base(BaseType::UInt),
-        codomain: Box::new(Tiling::Scalar(map_extent(key_extent, value_extent))),
+        codomain: Box::new(Tiling::Record(values)),
     }
+}
+
+/// The changelog of store key `key`: the commit ticks that wrote it, ascending, against
+/// the values written there. `None` for a tile that is not a store, for a value that is
+/// not a store key, and for a key outside this store's key space.
+fn changelog<'a>(tile: &'a Tile, key: &Value) -> Option<(&'a ColumnValue, &'a Tile)> {
+    tile.store_changelog(store_key_name(key)?)
+}
+
+/// The value a changelog holds at index `i`.
+///
+/// A store key's value is one whole [`Value`]: the engine folds in values and the writers
+/// propose in them, so a compound accumulator boxes its fields into a single record cell
+/// rather than spreading them over a tile. The changelog's values are therefore a column.
+fn changelog_value(values: &Tile, i: usize) -> Value {
+    match values {
+        Tile::Scalar(column) => column.index_at(i),
+        other => panic!("a store key's changelog holds one value per tick; got {other:?}"),
+    }
+}
+
+/// Every commit tick at which the store recorded a write, ascending and deduplicated: the
+/// union of its keys' changelogs. A carry-forward read emits a position at each of these,
+/// because a tick that wrote some other key still carries this one forward.
+pub fn store_change_ticks(tile: &Tile) -> Vec<CommitTs> {
+    let mut ticks = std::collections::BTreeSet::new();
+    for key in tile.store_keys() {
+        let Some((written, _)) = tile.store_changelog(key) else {
+            continue;
+        };
+        ticks.extend(
+            (0..written.len()).filter_map(|i| match written.index_at(i) {
+                Value::UInt(t) => Some(t),
+                _ => None,
+            }),
+        );
+    }
+    ticks.into_iter().collect()
 }
 
 /// Field names of the proposal-stream codomain record. `F_WRITES` is shared with
@@ -801,18 +852,17 @@ pub struct CommitOperator {
 /// Graph edges for a store's per-key tick-0 operators, keyed by the store key.
 impl CommitOperator {
     /// Create a commit operator whose store starts at `init` (the tick-0 state),
-    /// with keys in `key_extent` and values in `value_extent`.
+    /// holding the keys `values` names with the value tiling it gives each.
     ///
     /// `writer_write_keys[k]` is writer `k`'s **static** write footprint — every
     /// key that writer might write, whether or not it does on a given attempt.
     /// Its length is the writer count. See [`Self::writer_write_keys`].
     pub fn new(
         init: HashMap<Value, Value>,
-        key_extent: Extent,
-        value_extent: Extent,
+        values: HashMap<String, Tiling>,
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
-        let output_tiling = full_store_tiling(&key_extent, &value_extent);
+        let output_tiling = full_store_tiling(values);
         Self {
             init,
             init_ops: Vec::new(),
@@ -833,11 +883,10 @@ impl CommitOperator {
     /// engine-level tests.)
     pub fn with_init_ops(
         init_ops: Vec<(Value, Box<dyn TileOperator>)>,
-        key_extent: Extent,
-        value_extent: Extent,
+        values: HashMap<String, Tiling>,
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
-        let output_tiling = full_store_tiling(&key_extent, &value_extent);
+        let output_tiling = full_store_tiling(values);
         Self {
             init: HashMap::new(),
             init_ops,
@@ -1101,7 +1150,7 @@ impl TileProducer for CommitProducer {
         if n > 0 {
             self.drain_start = (self.drain_start + 1) % n;
         }
-        let mut store = self.engine.render_full_store_tile();
+        let mut store = self.engine.render_full_store_tile(self.tiling());
         // Signal terminality once every writer is done: the store is then fully
         // decided (no more commits), so the watermark `LessThanEq(w)` becomes
         // `True`. A downstream `read`/output gates on this to know the cycle has
@@ -1259,11 +1308,10 @@ impl InductionStore {
         init_ops: Vec<(Value, Box<dyn TileOperator>)>,
         write_keys: Vec<Value>,
         tap_fields: Vec<String>,
-        key_extent: Extent,
-        value_extent: Extent,
+        values: HashMap<String, Tiling>,
         resume_at: CommitTs,
     ) -> Self {
-        let output_tiling = full_store_tiling(&key_extent, &value_extent);
+        let output_tiling = full_store_tiling(values);
         Self {
             init_ops,
             body_input: CycleSlot::new(),
@@ -1383,7 +1431,7 @@ impl InductionStoreProducer {
     /// recurrence is final (the accumulator can no longer change, so a downstream
     /// `ExtractLast` / `final_or_default` resolves).
     fn render_store(&self, recurrence_final: bool) -> Tile {
-        let mut store = self.engine.render_full_store_tile();
+        let mut store = self.engine.render_full_store_tile(self.tiling());
         if recurrence_final && let Tile::Store { terminal, .. } = &mut store {
             *terminal = true;
         }
@@ -1660,7 +1708,6 @@ impl TileProducer for StoreValueStreamProducer {
         // domain predicate so a downstream terminal read resolves; a live one
         // carries the store's `LessThanEq` watermark through.
         let Tile::Store {
-            changes,
             frontier,
             terminal,
             closed_keys,
@@ -1694,13 +1741,10 @@ impl TileProducer for StoreValueStreamProducer {
         // smear one writer's reply across another's commit ticks on the shared
         // clock). One O(changes) ascending pass folds every tick — the released
         // prefix is still walked so the carry is built correctly, then dropped at
-        // emit time (the accumulating consumer has already merged it).
-        let all_ticks: Vec<usize> = (0..changes.len())
-            .filter_map(|i| match changes.index_at(i) {
-                Value::UInt(tick) => Some(tick),
-                _ => None,
-            })
-            .collect();
+        // emit time (the accumulating consumer has already merged it). The ticks are
+        // the store's, not this key's: a carry gains a position wherever any key was
+        // written.
+        let all_ticks: Vec<usize> = store_change_ticks(&store);
         let folded = fold_changelog_key_ascending(
             &store,
             all_ticks.iter().copied(),
@@ -2090,15 +2134,11 @@ impl TileProducer for StoreDenseReadProducer {
         // can find the carry source of the first still-needed position. Only a
         // carry read back-references earlier ticks; a tap needs no such cache.
         if self.carry_forward
-            && let Tile::Store {
-                changes, deltas, ..
-            } = &store
+            && let Some((written, _)) = changelog(&store, &self.key)
         {
-            self.key_write_ticks = (0..changes.len())
-                .filter_map(|i| match changes.index_at(i) {
-                    Value::UInt(t) if value_to_map(&deltas.index_at(i)).contains_key(&self.key) => {
-                        Some(t)
-                    }
+            self.key_write_ticks = (0..written.len())
+                .filter_map(|i| match written.index_at(i) {
+                    Value::UInt(t) => Some(t),
                     _ => None,
                 })
                 .collect();
@@ -4162,7 +4202,7 @@ mod tests {
     /// ([`store_key`](crate::interpreter::operator_conversion::store_key)), which is the
     /// shape `body_decision_at` reads the write set's names back from.
     fn acct(name: &str) -> Value {
-        crate::interpreter::operator_conversion::store_key(name, Value::Unit)
+        store_key(name, Value::Unit)
     }
 
     /// Build a read/write set or initial state from `(account, balance)` pairs.
@@ -4208,16 +4248,13 @@ mod tests {
 
         // The rendered store: a sparse changelog (2 change ticks) whose *length*
         // is the decided frontier region (4 positions), not the change count.
-        let tile = e.render_full_store_tile();
+        let tile = e.render_full_store_tile(&store_tiling(&["acc"]));
         assert!(validate_tile(&tile));
-        let Tile::Store {
-            changes, frontier, ..
-        } = &tile
-        else {
+        let Tile::Store { frontier, .. } = &tile else {
             panic!("induction render is a Store");
         };
         assert_eq!(
-            changes.len(),
+            store_change_ticks(&tile).len(),
             2,
             "only the two committing positions are changes"
         );
@@ -4225,7 +4262,7 @@ mod tests {
         assert_eq!(
             store_frontier(&tile).map(|w| w + 1),
             Some(4),
-            "a store's decided region is [0, 3], not changes.len()"
+            "a store's decided region is [0, 3], not the change count"
         );
     }
 
@@ -4449,8 +4486,7 @@ mod tests {
             )],
             vec![acc.clone()],
             Vec::new(),
-            key_extent(),
-            value_extent(),
+            store_values(&["acc"]),
             // A store built with its source, not one resuming a running program.
             0,
         );
@@ -4510,11 +4546,8 @@ mod tests {
         let acc = acct("acc");
         // Final accumulator value: 0 (carry) → 0 (carry) → 3 → 7.
         assert_eq!(store_current(&tile, &acc).map(|(_, v)| v), Some(int(7)));
-        let Tile::Store { changes, .. } = &tile else {
-            panic!("induction store output is a Store");
-        };
         assert_eq!(
-            changes.len(),
+            store_change_ticks(&tile).len(),
             3,
             "tick 0 (the init seed) plus the two firing positions (items 3, 4); the rest carry"
         );
@@ -4531,11 +4564,8 @@ mod tests {
             store_current(&tile, &acct("acc")).map(|(_, v)| v),
             Some(int(16))
         );
-        let Tile::Store { changes, .. } = &tile else {
-            panic!("induction store output is a Store");
-        };
         assert_eq!(
-            changes.len(),
+            store_change_ticks(&tile).len(),
             4,
             "tick 0 (the init seed) plus every committing position (a dense changelog)"
         );
@@ -4556,11 +4586,8 @@ mod tests {
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
 
         let full = pull_to_terminal(&mut sched, &mut producer);
-        let Tile::Store { changes, .. } = &full else {
-            panic!("induction store output is a Store");
-        };
         assert_eq!(
-            changes.len(),
+            store_change_ticks(&full).len(),
             4,
             "full dense changelog: seed + three writes"
         );
@@ -4577,11 +4604,8 @@ mod tests {
             Some(int(16)),
             "the accumulator still reads its correct final value after GC"
         );
-        let Tile::Store { changes, .. } = &bounded else {
-            panic!("induction store output is a Store");
-        };
         assert_eq!(
-            changes.len(),
+            store_change_ticks(&bounded).len(),
             1,
             "keep-latest GC drops the superseded prefix (ticks 0,1,2), keeping only \
              the latest write (tick 3) — the changelog no longer grows with positions"
@@ -4660,7 +4684,7 @@ mod tests {
             reads: balances(&[("acc", 5)]),
             writes: balances(&[("acc", 8)]),
         }); // tick 3: acc = 8
-        let store = e.render_full_store_tile();
+        let store = e.render_full_store_tile(&store_tiling(&["acc", "other"]));
         let acc = acct("acc");
         let queries: Vec<usize> = (0..=4).collect();
         for carry in [true, false] {
@@ -4908,7 +4932,7 @@ mod tests {
 
         // The rendered store confirms tick 2 is decided-absent for alice — the
         // frontier snapshot still folds her value forward from tick 1.
-        let tile = e.render_full_store_tile();
+        let tile = e.render_full_store_tile(&store_tiling(&["alice", "bob"]));
         assert_eq!(store_current(&tile, &acct("alice")), Some((2, int(70))));
         assert_eq!(store_current(&tile, &acct("bob")), Some((2, int(20))));
     }
@@ -4998,9 +5022,7 @@ mod tests {
         }
 
         const KEYS: u64 = 4;
-        let key = |i: usize| {
-            crate::interpreter::operator_conversion::store_key(&format!("k{i}"), Value::Unit)
-        };
+        let key = |i: usize| store_key(&format!("k{i}"), Value::Unit);
         let read_int = |m: &HashMap<Value, Value>, k: usize| match &m[&key(k)] {
             Value::Int(n) => *n,
             other => unreachable!("key holds an int, got {other:?}"),
@@ -5105,13 +5127,12 @@ mod tests {
         }
     }
 
-    /// The full multi-key store renders as `CommitTimestamp ⇀ (Key ⇀ Value)`:
-    /// per-tick write-set deltas encoded as `Value::Function` maps in a
-    /// `Variants` column — heterogeneous key sets per tick, validating as a tile,
-    /// and round-tripping back to maps. This is the encoding the multi-key
-    /// operator and the E4 proposal wrapper rely on.
+    /// The full multi-key store renders as `CommitTimestamp ⇀ {key: value}`: one
+    /// changelog per key, so a tick whose write set names some keys and not others is a
+    /// tick those keys' changelogs carry and the rest omit. Heterogeneity per tick needs
+    /// no encoding of its own — it is which changelogs a tick appears in.
     #[test]
-    fn full_store_renders_heterogeneous_deltas() {
+    fn full_store_renders_heterogeneous_write_sets() {
         let mut e = CommitEngine::new(balances(&[("alice", 100), ("bob", 50)]));
         e.attempt(Proposal {
             snapshot: 0,
@@ -5124,37 +5145,37 @@ mod tests {
             writes: balances(&[("alice", 70), ("bob", 30)]),
         }); // tick 2: writes alice AND bob (different key set than tick 1)
 
-        let tile = e.render_full_store_tile();
+        let tile = e.render_full_store_tile(&store_tiling(&["alice", "bob"]));
         assert!(validate_tile(&tile));
-        let Tile::Store {
-            changes,
-            deltas,
-            frontier,
-            ..
-        } = &tile
-        else {
+        let Tile::Store { frontier, .. } = &tile else {
             panic!("expected Store");
         };
-        assert_eq!(changes, &ColumnValue::from_uints(vec![0, 1, 2]));
         assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(2)));
-        let ColumnValue::Variants(deltas) = deltas else {
-            panic!("expected a Variants column of map deltas");
-        };
-        // Tick 0 = init {alice, bob}; tick 1 = {alice}; tick 2 = {alice, bob}.
+        // Tick 0 = init {alice, bob}; tick 1 = {alice}; tick 2 = {alice, bob}. So
+        // alice's changelog carries every tick and bob's skips the one that passed him
+        // over — the tick numbering is shared, the ticks held are not.
         assert_eq!(
-            value_to_map(&deltas[0]),
-            balances(&[("alice", 100), ("bob", 50)])
+            changelog_of(&tile, "alice"),
+            vec![(0, int(100)), (1, int(70)), (2, int(70))]
         );
-        assert_eq!(value_to_map(&deltas[1]), balances(&[("alice", 70)]));
-        assert_eq!(
-            value_to_map(&deltas[2]),
-            balances(&[("alice", 70), ("bob", 30)])
-        );
+        assert_eq!(changelog_of(&tile, "bob"), vec![(0, int(50)), (2, int(30))]);
+    }
+
+    /// A store key's changelog as `(tick, value)` pairs.
+    fn changelog_of(tile: &Tile, key: &str) -> Vec<(usize, Value)> {
+        let (ticks, values) = tile.store_changelog(key).expect("a key of this store");
+        (0..ticks.len())
+            .map(|i| match ticks.index_at(i) {
+                Value::UInt(t) => (t, changelog_value(values, i)),
+                other => panic!("a change tick is a UInt; got {other:?}"),
+            })
+            .collect()
     }
 
     // --- The engine as a live tile operator ---------------------------------
 
-    /// Keys are account names (strings); values are balances (ints).
+    /// Keys are account names (strings); values are balances (ints). These type a
+    /// *proposal's* read and write sets, which ride one cell per attempt.
     fn key_extent() -> Extent {
         Extent::Base(BaseType::String)
     }
@@ -5162,27 +5183,49 @@ mod tests {
         Extent::Base(BaseType::Int)
     }
 
+    /// A store's per-key value tilings over `accounts`: one key each, holding a balance.
+    fn store_values(accounts: &[&str]) -> HashMap<String, Tiling> {
+        accounts
+            .iter()
+            .map(|a| ((*a).to_string(), Tiling::Scalar(value_extent())))
+            .collect()
+    }
+
+    /// The whole store tiling over `accounts`, which a render needs to name its keys.
+    fn store_tiling(accounts: &[&str]) -> Tiling {
+        full_store_tiling(store_values(accounts))
+    }
+
+    /// The store's per-key value tilings for exactly the keys `init` seeds.
+    fn keyed_like(init: &HashMap<Value, Value>) -> HashMap<String, Tiling> {
+        init.keys()
+            .map(|k| {
+                let name = store_key_name(k).expect("an initial state is keyed by store keys");
+                (name.to_string(), Tiling::Scalar(value_extent()))
+            })
+            .collect()
+    }
+
     /// The decoded store: per-tick delta maps, sorted by tick.
     type StoreEntries = Vec<(usize, HashMap<Value, Value>)>;
 
     /// Decode a full store tile into `(frontier, entries)`, or `None` if the
-    /// store is not yet decided (empty / undecided). Reads the [`Tile::Store`]
-    /// changelog directly — the writer-side counterpart of
+    /// store is not yet decided (empty / undecided). Reassembles the per-tick write sets
+    /// from the per-key changelogs — the writer-side counterpart of
     /// [`CommitEngine::render_full_store_tile`].
     fn decode_store(tile: &Tile) -> Option<(usize, StoreEntries)> {
         let frontier = store_frontier(tile)?;
-        let Tile::Store {
-            changes, deltas, ..
-        } = tile
-        else {
-            return None;
-        };
-        let entries = (0..changes.len())
-            .map(|i| {
-                let Value::UInt(tick) = changes.index_at(i) else {
-                    unreachable!("store change ticks are UInt")
-                };
-                (tick, value_to_map(&deltas.index_at(i)))
+        let entries = store_change_ticks(tile)
+            .into_iter()
+            .map(|tick| {
+                let delta = tile
+                    .store_keys()
+                    .filter_map(|name| {
+                        let key = store_key(name, Value::Unit);
+                        Some((key.clone(), store_delta_at(tile, tick, &key)?))
+                    })
+                    .collect();
+                (tick, delta)
             })
             .collect();
         Some((frontier, entries))
@@ -5222,7 +5265,7 @@ mod tests {
         init: HashMap<Value, Value>,
     ) -> Box<dyn TileProducer> {
         let writes = all_writers_write(&init, 1);
-        let mut op = CommitOperator::new(init, key_extent(), value_extent(), writes);
+        let mut op = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         (op.writer_input_setter(0))(input);
         let guard = op.tiling().universal_guard();
         op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
@@ -5296,17 +5339,17 @@ mod tests {
         let tile = producer.get(producer.tiling().universal_guard());
         assert!(validate_tile(&tile));
         let Tile::Store {
-            changes,
-            frontier,
-            terminal,
-            ..
+            frontier, terminal, ..
         } = &tile
         else {
             panic!("expected Store store tile");
         };
         // Tick 1 (A) committed; B's grant was stale → no tick consumed. The
         // (materialized) writer is terminal, so the store is closed at watermark 1.
-        assert_eq!(changes, &ColumnValue::from_uints(vec![0, 1]));
+        assert_eq!(
+            changelog_of(&tile, "pool"),
+            vec![(0, int(100)), (1, int(30))]
+        );
         assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(1)));
         assert!(terminal);
         assert_eq!(store_at(&tile, &acct("pool")), Some((1, 30)));
@@ -5323,15 +5366,15 @@ mod tests {
 
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::Store {
-            changes,
-            frontier,
-            terminal,
-            ..
+            frontier, terminal, ..
         } = &tile
         else {
             panic!("expected Store store tile");
         };
-        assert_eq!(changes, &ColumnValue::from_uints(vec![0, 1, 2]));
+        assert_eq!(
+            changelog_of(&tile, "pool"),
+            vec![(0, int(100)), (1, int(30)), (2, int(20))]
+        );
         // Both proposals committed and the writer is terminal → store closed at
         // watermark 2 (the frontier keeps its numeric watermark; terminality is
         // the separate flag).
@@ -5439,7 +5482,7 @@ mod tests {
     fn single_writer_cycle() {
         let init = balances(&[("n", 0)]);
         let writes = all_writers_write(&init, 1);
-        let commit = CommitOperator::new(init, key_extent(), value_extent(), writes);
+        let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_writer = commit.writer_input_setter(0);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         // The body reads a branch of the store (the operator's own output).
@@ -5540,8 +5583,7 @@ mod tests {
         // the last of them finishes.
         let commit = CommitOperator::new(
             balances(&[("pool", init)]),
-            key_extent(),
-            value_extent(),
+            store_values(&["pool"]),
             vec![vec![pool.clone()]; draws.len()],
         );
         let setters: Vec<_> = (0..draws.len())
@@ -5845,8 +5887,7 @@ mod tests {
         let pool_init = balances(&[("pool", 100)]);
         let commit = CommitOperator::new(
             pool_init.clone(),
-            key_extent(),
-            value_extent(),
+            store_values(&["pool"]),
             all_writers_write(&pool_init, 2),
         );
         let set_a = commit.writer_input_setter(0);
@@ -5893,8 +5934,7 @@ mod tests {
         let pool_init = balances(&[("pool", 100)]);
         let commit = CommitOperator::new(
             pool_init.clone(),
-            key_extent(),
-            value_extent(),
+            store_values(&["pool"]),
             all_writers_write(&pool_init, 2),
         );
         let set_a = commit.writer_input_setter(0);
@@ -6022,7 +6062,7 @@ mod tests {
     fn read_as_of_resolves_at_watermark() {
         let init = balances(&[("n", 0)]);
         let writes = all_writers_write(&init, 1);
-        let commit = CommitOperator::new(init, key_extent(), value_extent(), writes);
+        let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_writer = commit.writer_input_setter(0);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_writer(Box::new(CounterBody::new(store_fan.branch(), acct("n"), 3)));
@@ -6150,7 +6190,7 @@ mod tests {
         pulls: usize,
     ) -> Tile {
         let writes = all_writers_write(&init, 2);
-        let commit = CommitOperator::new(init, key_extent(), value_extent(), writes);
+        let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
@@ -6256,14 +6296,15 @@ mod tests {
     #[test]
     fn store_value_stream_projects_committed_values() {
         let value_ext = Extent::Base(BaseType::Int);
-        let mut engine = CommitEngine::new(HashMap::from([(Value::Unit, int(100))]));
+        let acc = acct("acc");
+        let mut engine = CommitEngine::new(HashMap::from([(acc.clone(), int(100))]));
         engine.attempt(Proposal {
             snapshot: 0,
             reads: HashMap::new(),
-            writes: HashMap::from([(Value::Unit, int(60))]),
+            writes: HashMap::from([(acc.clone(), int(60))]),
         });
-        let mut store_tile = engine.render_full_store_tile();
-        let store_tiling = full_store_tiling(&Extent::Base(BaseType::String), &value_ext);
+        let store_tiling = store_tiling(&["acc"]);
+        let mut store_tile = engine.render_full_store_tile(&store_tiling);
 
         // While committing, the stream is non-terminal but already carries both
         // the tick-0 init (100) and the committed value (60) — observable now.
@@ -6272,7 +6313,7 @@ mod tests {
                 tiling: store_tiling.clone(),
                 tile: store_tile.clone(),
             }),
-            Value::Unit,
+            acc.clone(),
             value_ext.clone(),
             true, // carry: hold the committed value forward
         );
@@ -6302,7 +6343,7 @@ mod tests {
                 tiling: store_tiling,
                 tile: store_tile,
             }),
-            Value::Unit,
+            acc.clone(),
             value_ext.clone(),
             true, // carry: hold the committed value forward
         );
@@ -6339,8 +6380,9 @@ mod tests {
             writes: balances(&[("bob", 20)]),
         }); // tick 2: bob
 
-        // Live: `frontier` carries the watermark `≤ 2`.
-        let live = e.render_full_store_tile();
+        // Live: `frontier` carries the watermark `≤ 2`. `carol` is a key of the store
+        // that nothing has written, so her changelog is present and empty.
+        let live = e.render_full_store_tile(&store_tiling(&["alice", "bob", "carol"]));
         assert_eq!(store_frontier(&live), Some(2));
         // `store_current` folds past tick 2 (which wrote only bob) back to tick 1
         // for alice, and reads bob directly at tick 2.
@@ -6371,14 +6413,8 @@ mod tests {
             store_frontier(&Tile::Scalar(ColumnValue::from_ints(vec![1]))),
             None
         );
-        // An empty changelog is undecided → no frontier.
-        let undecided = Tile::Store {
-            changes: ColumnValue::from_uints(vec![]),
-            deltas: ColumnValue::Variants(vec![]),
-            frontier: Predicate::LessThanEq(Value::UInt(0)),
-            terminal: false,
-            closed_keys: Vec::new(),
-        };
+        // A store nothing has written yet is undecided → no frontier.
+        let undecided = store_tiling(&["alice"]).empty_tile();
         assert_eq!(store_frontier(&undecided), None);
     }
 
@@ -6434,20 +6470,43 @@ mod tests {
 
     // ── Tile::Store step-function reads (Stage 2) ─────────────────────────────
 
-    /// Build a `Tile::Store` changelog from `(tick, &[(account, balance)])`
-    /// deltas (ticks must be strictly ascending) with the given decided
-    /// `frontier`.
-    fn store_tile(entries: &[(usize, &[(&str, i64)])], frontier: Predicate) -> Tile {
-        let changes = ColumnValue::from_uints(entries.iter().map(|(t, _)| *t).collect());
-        let deltas = ColumnValue::Variants(
-            entries
-                .iter()
-                .map(|(_, m)| map_to_value(&balances(m)))
-                .collect(),
-        );
+    /// Build a `Tile::Store` over `accounts` from `(tick, &[(account, balance)])` write
+    /// sets (ticks must be strictly ascending), decided through `frontier`.
+    ///
+    /// `accounts` is the key space, spelled out because it is static: two fragments of
+    /// one store hold the same keys whatever either of them has been written, which is
+    /// what lets them merge.
+    fn store_tile(
+        accounts: &[&str],
+        entries: &[(usize, &[(&str, i64)])],
+        frontier: Predicate,
+    ) -> Tile {
+        let mut written: HashMap<&str, Vec<(usize, i64)>> =
+            accounts.iter().map(|a| (*a, Vec::new())).collect();
+        for (tick, writes) in entries {
+            for (account, balance) in *writes {
+                written
+                    .get_mut(account)
+                    .unwrap_or_else(|| panic!("{account} is not one of this store's keys"))
+                    .push((*tick, *balance));
+            }
+        }
+        let state = written
+            .into_iter()
+            .map(|(account, log)| {
+                let tile = Tile::function(
+                    ColumnValue::from_uints(log.iter().map(|(t, _)| *t).collect()),
+                    Box::new(Tile::Scalar(ColumnValue::from_ints(
+                        log.iter().map(|(_, b)| *b).collect(),
+                    ))),
+                    frontier.clone(),
+                    bit_set::BitSet::new(),
+                );
+                (account.to_string(), tile)
+            })
+            .collect();
         let tile = Tile::Store {
-            changes,
-            deltas,
+            state: Box::new(Tile::Record(state)),
             frontier,
             terminal: false,
             closed_keys: Vec::new(),
@@ -6460,6 +6519,7 @@ mod tests {
     /// `alice`, tick 2 writes only `bob`. Decided through the watermark `w`.
     fn skew_store(w: usize) -> Tile {
         store_tile(
+            &["alice", "bob"],
             &[
                 (0, &[("alice", 100), ("bob", 50)]),
                 (1, &[("alice", 70)]),
@@ -6480,6 +6540,7 @@ mod tests {
         // 5, not 3 (the former `True`-reconstruction undercounted to the latest
         // change).
         let done = store_tile(
+            &["alice"],
             &[(0, &[("alice", 100)]), (3, &[("alice", 70)])],
             Predicate::LessThanEq(Value::UInt(5)),
         );
@@ -6489,7 +6550,10 @@ mod tests {
         // `True`-reconstruction would have given.
         assert_eq!(store_frontier(&done).map(|w| w + 1), Some(6));
         // Empty changelog and non-store tiles have no frontier.
-        assert_eq!(store_frontier(&store_tile(&[], Predicate::False)), None);
+        assert_eq!(
+            store_frontier(&store_tile(&["alice"], &[], Predicate::False)),
+            None
+        );
         assert_eq!(
             store_frontier(&Tile::Scalar(ColumnValue::Ints(vec![1]))),
             None
@@ -6541,7 +6605,7 @@ mod tests {
         assert_eq!(store_current(&live, &acct("alice")), Some((2, int(70))));
         assert_eq!(store_current(&live, &acct("bob")), Some((2, int(40))));
         // An undecided store (nothing committed yet) has no current value.
-        let undecided = store_tile(&[(0, &[("alice", 100)])], Predicate::False);
+        let undecided = store_tile(&["alice"], &[(0, &[("alice", 100)])], Predicate::False);
         assert_eq!(store_current(&undecided, &acct("alice")), None);
     }
 
@@ -6571,10 +6635,12 @@ mod tests {
         // Two changelog fragments — a decided prefix and a later commit — merge
         // by appending ticks and unioning the frontier to the larger watermark.
         let mut s = store_tile(
+            &["alice", "bob"],
             &[(0, &[("alice", 100), ("bob", 50)]), (1, &[("alice", 70)])],
             Predicate::LessThanEq(Value::UInt(1)),
         );
         s.merge(store_tile(
+            &["alice", "bob"],
             &[(2, &[("bob", 40)])],
             Predicate::LessThanEq(Value::UInt(2)),
         ));
@@ -6599,25 +6665,30 @@ mod tests {
 
     #[test]
     fn validate_tile_rejects_malformed_store() {
-        // Mismatched changes/deltas lengths.
-        assert!(!validate_tile(&Tile::Store {
-            changes: ColumnValue::from_uints(vec![0, 1]),
-            deltas: ColumnValue::Variants(vec![map_to_value(&balances(&[("a", 1)]))]),
+        // Built as literals: `Tile::function` validates what it builds, so a malformed
+        // changelog cannot be constructed through it.
+        let log = |ticks: Vec<usize>, values: Vec<i64>| Tile::Function {
+            row_starts: ColumnValue::from_uints(vec![0]),
+            keys: ColumnValue::from_uints(ticks),
+            values: Box::new(Tile::Scalar(ColumnValue::from_ints(values))),
+            domain_predicate: Predicate::False,
+            deleted: bit_set::BitSet::new(),
+        };
+        let store = |state: Tile| Tile::Store {
+            state: Box::new(state),
             frontier: Predicate::False,
             terminal: false,
             closed_keys: Vec::new(),
-        }));
+        };
+        let one_key = |log: Tile| store(Tile::Record(HashMap::from([("a".to_string(), log)])));
         // Non-ascending change ticks.
-        assert!(!validate_tile(&Tile::Store {
-            changes: ColumnValue::from_uints(vec![2, 1]),
-            deltas: ColumnValue::Variants(vec![
-                map_to_value(&balances(&[("a", 1)])),
-                map_to_value(&balances(&[("a", 2)])),
-            ]),
-            frontier: Predicate::False,
-            terminal: false,
-            closed_keys: Vec::new(),
-        }));
+        assert!(!validate_tile(&one_key(log(vec![2, 1], vec![1, 2]))));
+        // More values than ticks to hold them.
+        assert!(!validate_tile(&one_key(log(vec![0], vec![1, 2]))));
+        // A state that is not a record of changelogs.
+        assert!(!validate_tile(&store(Tile::Scalar(
+            ColumnValue::from_ints(vec![1])
+        ))));
     }
     /// Two memo'd readers of one cyclic store both end at the final state, in whichever
     /// order they are pulled.

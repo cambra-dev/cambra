@@ -49,7 +49,9 @@ pub enum Tiling {
         /// The commit-time domain (`Txn`).
         domain: Extent,
         /// The per-key state record `{key: value}` the store maps each commit
-        /// time to.
+        /// time to. One field per mutable variable and reply tap, each with that
+        /// key's own value tiling — so a collection-valued key names its elements
+        /// here, where one shared value extent could only name their union.
         codomain: Box<Tiling>,
     },
 }
@@ -102,6 +104,24 @@ impl Tiling {
             }
             Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
         }
+    }
+
+    /// The tiling of a [`Tile::Store`]'s `state`: the codomain record with each field
+    /// turned into that key's changelog, `domain ⤇ value`. This is the shape the store
+    /// encodes its step function in, and the one [`Tile::check_from`] validates against.
+    ///
+    /// Panics on any tiling but a [`Tiling::Store`].
+    pub fn store_state(&self) -> Tiling {
+        let Tiling::Store { domain, codomain } = self else {
+            panic!("store_state: not a store tiling: {self}")
+        };
+        let Tiling::Record(keys) = &**codomain else {
+            panic!("a store's codomain is a per-key record; got {codomain}")
+        };
+        Tiling::Record(transform_hashmap_values(keys, |value| Tiling::Function {
+            keys: domain.clone(),
+            values: Box::new(value.clone()),
+        }))
     }
 
     pub fn codomain(&self) -> Option<Tiling> {
@@ -165,12 +185,12 @@ impl Tiling {
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: Box::new(accumulator.empty_at_no_rows()),
             },
-            // An empty store: no change events yet, frontier undecided, live, and
-            // no key closed — a writer that has not been pulled yet may still
-            // write any of them.
-            Tiling::Store { domain, .. } => Tile::Store {
-                changes: ColumnValue::from_values(Vec::new(), domain),
-                deltas: ColumnValue::Variants(Vec::new()),
+            // An empty store: every key's changelog empty, frontier undecided, live,
+            // and no key closed — a writer that has not been pulled yet may still
+            // write any of them. The key space is the record's, so it is present from
+            // the start even though nothing has been written.
+            Tiling::Store { .. } => Tile::Store {
+                state: Box::new(self.store_state().empty_over(1)),
                 frontier: Predicate::False,
                 terminal: false,
                 closed_keys: Vec::new(),
