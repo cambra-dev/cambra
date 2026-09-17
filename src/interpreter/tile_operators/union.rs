@@ -404,10 +404,6 @@ impl TileProducer for UnionProducer {
                     deleted,
                     ..
                 } => {
-                    assert!(
-                        !codomain.is_function(),
-                        "a union concatenates arms into one domain, which names one level"
-                    );
                     // Shift each deleted index into the combined domain's position space.
                     for idx in deleted.iter() {
                         combined_deleted.insert(idx + domain_offset);
@@ -438,25 +434,22 @@ impl TileProducer for UnionProducer {
         ));
         union_domain.debug_assert_union_invariants();
 
-        // Concatenate like columns. The arms always agree on column kind, because
-        // two alternative value spaces at one position can only be *tagged* — the
-        // solver won't infer an untagged sum from a collision — so differing arms
-        // are both `ColumnValue::Union` and `append` merges their tag maps.
+        // The arms' values stand one after another over the concatenated keys, in arm order
+        // — which is what [`Tile::merge_rows`] appends, whatever the values are. A column
+        // appends; a collection appends its rows with each run shifted past the keys already
+        // there, so an arm holding a collection per key keeps its own grouping.
+        //
+        // The arms always agree on shape, because two alternative value spaces at one
+        // position can only be *tagged* — the solver won't infer an untagged sum from a
+        // collision — so differing arms are both `ColumnValue::Union` and appending merges
+        // their tag maps.
         let codomain_tile: Tile = {
-            let mut cols = codomains.into_iter().map(|c| match c {
-                Tile::Scalar(cv) => cv,
-                other => panic!("UnionProducer: a merged arm is one column, got {other:?}"),
-            });
-            let mut combined = cols.next().expect("at least one arm");
-            for cv in cols {
-                debug_assert_eq!(
-                    std::mem::discriminant(&combined),
-                    std::mem::discriminant(&cv),
-                    "arms merging into one column disagree on column kind"
-                );
-                combined.append(cv);
+            let mut arms = codomains.into_iter();
+            let mut combined = arms.next().expect("at least one arm");
+            for arm in arms {
+                combined.merge_rows(arm);
             }
-            Tile::Scalar(combined)
+            combined
         };
 
         Tile::function(
