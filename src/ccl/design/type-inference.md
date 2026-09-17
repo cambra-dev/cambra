@@ -2440,23 +2440,16 @@ from](#where-the-candidates-come-from)).
   graph.
   Giving [`FunKindVar`] a level is what would retire this entry.
 
-- **There is no runtime witness yet, so a sum over a kind naming no candidate cannot be
-  consumed.**
-  A sum is a pair, and consuming one projects its witness and dispatches; nothing today
-  can read a witness off a value. That is a gap to close, not a property of the design —
-  the runtime witness is the load-bearing planned item
-  (`src/ccl/design/collections.md`, "Compiling a conditional collection"). Over **named
-  candidates** this does not bite — the gate fan-out compiles the conditional and the
-  realized union's extent is the selected domain — which is exactly why the gap has stayed
-  invisible: the conditional-collection path is the one case that does not need the general
-  mechanism. It bites where the kind names none: iterating a `Collection(𝑇)` parameter has to
-  find the actual
-  runtime domain, and [`extent_of`] maps a *type* to an `Extent`. The shape to follow is
-  `Type::DataSource` → `Extent::DataSourceDomain`, which resolves an opaque domain to a
-  runtime handle; the witness wants the same treatment. This is the general machinery
-  a [first-class `Collection` value](collections.md#compiling-a-conditional-collection)
-  needs, and the
-  conditional-collection fan-out is its special case rather than a step toward it.
+- **A collection whose domain is the witness cannot be iterated.**
+  A sum is a pair, and consuming one reads the witness off the value: the introduction stays
+  standing, [`extent_of`] bounds the keys from the witness's kind, and the value holds which
+  keys it has (`src/ccl/design/collections.md`, "Compiling a conditional collection"). A
+  `Map(𝐾, 𝑉)` parameter and a jagged `List(List(𝑇))` literal compile on that. What is left is
+  the **iteration source**: every site starts from `IterateExtent` over an extent read off the
+  type, and a bound is not something to enumerate. What it needs is a source taking the
+  collection as an input and emitting the domain the tile holds — not the `Type::DataSource` →
+  `Extent::DataSourceDomain` shape, since a collection is not a source and registers with no
+  scheduler.
 
   Consuming a **heterogeneous** sum (`Σ (𝑇 : [Int, String]). 𝑇`) additionally needs the
   consumer valid at every candidate, which for a genuine dispatch is a trait bound. The
