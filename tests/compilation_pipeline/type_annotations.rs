@@ -450,7 +450,7 @@ fn a_let_bound_constant_returned_directly() {
 /// against the pre-elimination predicate. Once it passes, the program evaluates
 /// `4 // 2`. The rejecting counterpart is `tests/programs/refinement/`.
 #[test]
-#[should_panic(expected = "produced an invalid tree: [Type mismatch")]
+#[should_panic(expected = "post-planning produced an invalid tree: [Type mismatch")]
 fn refinements_that_survive_to_post_planning_check_are_rejected() {
     check_scalar(
         indoc! {r#"
@@ -804,5 +804,17 @@ def f(p) => {UInt where _ == p ^+ p}:
 f(1)
         "#},
         "Type mismatch for Apply: expected UInt, found Int",
+    )
+}
+
+/// Type error messages show the original code the user wrote, despite
+/// the pre-inference ANF phase.
+#[test]
+fn complex_anf() {
+    check_compile_error(
+        indoc! {r#"
+1 + 2 + "Hello" + 4 + 5
+        "#},
+        "1 + 2 + \"Hello\" + 4 + 5",
     )
 }

@@ -155,10 +155,12 @@ pub enum Stmt {
     /// A bare expression evaluated for effect (or as a module's final value).
     Expr(Spanned<Expr>),
 
-    /// Assignment: `target = value`.
+    /// Assignment: `target = value`, or `target ^= value` for an opaque binder
+    /// ([`BindingTransparency`]).
     Assign {
         target: Spanned<AssignTarget>,
         value: Spanned<Expr>,
+        transparency: BindingTransparency,
     },
 
     /// Annotated assignment: `target: ty = value` or `target <: ty = value`.
@@ -371,6 +373,20 @@ pub enum AnnotationMode {
     /// `x <: T` — the binder's type is *inferred*, with `T` as an upper bound.
     /// The value's own type flows through.
     Bounded,
+}
+
+/// Whether a binder's references may be discharged to its initializer.
+///
+/// Experimental, and so absent from `docs/chl-spec.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingTransparency {
+    /// `x = e` — the binder carries `e` as its definiens, so a type that
+    /// mentions `x` outside the binder's scope reads `e` in its place.
+    Transparent,
+    /// `x ^= e` — the binder carries no definiens. `x` is bound at `e`'s type,
+    /// refinements and all, and that type is everything a later type learns
+    /// about it.
+    Opaque,
 }
 
 /// The left-hand side of an assignment, augmented assignment, defer-define,

@@ -1712,8 +1712,10 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 /// [`debug_assert_no_mut_var_let`].
 pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
     debug_assert_no_mut_var_let(expr);
+    let mut anf: HashMap<Name, &Expr> = HashMap::new();
+    collect_anf_temps(expr, &mut anf);
     let mut errors = Vec::new();
-    check_mut_discipline_go(expr, &mut errors);
+    check_mut_discipline_go(expr, &anf, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1816,7 +1818,50 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
     );
 }
 
-fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
+/// Every A-normalization temp's binder and the term it names.
+///
+/// Names are α-unique after `uniquify`, so a flat map resolves each reference
+/// without a scope stack — the argument [`check_mut_write_targets`] makes for
+/// its own binder map.
+fn collect_anf_temps<'e>(expr: &'e Expr, out: &mut HashMap<Name, &'e Expr>) {
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        ..
+    } = &expr.node
+        && matches!(
+            binding.name,
+            Name::Synthetic {
+                kind: crate::ccl::names::SyntheticKind::AnfTemp,
+                ..
+            }
+        )
+    {
+        out.insert(binding.name.clone(), bound_expr);
+    }
+    expr.walk_children(|c| collect_anf_temps(c, out));
+}
+
+/// Read an argument through the A-normalization temps naming it, down to the
+/// term the program wrote.
+///
+/// Rule 1 is a test on the argument *term*: `bump(x if True else y)` is refused
+/// because a selection has no single introduction to trace. A-normalization
+/// names every compound argument, so without this the rule meets a `Var` at
+/// every call site and the selection is refused for the weaker reason that the
+/// temp's own type is not a mutable variable — the same verdict, reported
+/// against a binder the program does not contain.
+fn read_through_anf<'e>(mut arg: &'e Expr, anf: &HashMap<Name, &'e Expr>) -> &'e Expr {
+    while let TypedExprNode::Var(name) = &arg.node {
+        match anf.get(name) {
+            Some(definiens) => arg = definiens,
+            None => break,
+        }
+    }
+    arg
+}
+
+fn check_mut_discipline_go(expr: &Expr, anf: &HashMap<Name, &Expr>, errors: &mut Vec<InferError>) {
     // The `symbolic(expr)` render for error labels is computed *lazily* — only
     // in the branches that actually raise an error — because this walk visits
     // every node and the no-error path is overwhelmingly common; rendering the
@@ -1867,6 +1912,7 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
         if let Type::Fun { domain, .. } = fn_ty
             && domain.mut_value_type().is_some()
         {
+            let argument = read_through_anf(argument, anf);
             if !matches!(argument.node, TypedExprNode::Var(_)) {
                 errors.push(InferError::MutNotBareVariable {
                     at: symbolic(argument),
@@ -1901,7 +1947,7 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
         _ => {}
     }
 
-    expr.walk_children(|e| check_mut_discipline_go(e, errors));
+    expr.walk_children(|e| check_mut_discipline_go(e, anf, errors));
 }
 
 /// Enforce that every [`TypedExprNode::MutWrite`] (`:=` / `+=`) targets a
@@ -2010,8 +2056,8 @@ mod tests {
     use crate::ccl::infer::{bool_lit_ty, int_lit_ty, str_lit_ty};
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind, Type,
-        TypedBinding, TypedExpr, TypedExprNode,
+        AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, CompareKind, Expr,
+        Lit, LogicKind, Type, TypedBinding, TypedExpr, TypedExprNode,
     };
 
     /// [`infer`] with the blame nodes stripped, for the assertions that compare
@@ -2233,6 +2279,7 @@ mod tests {
                 name: "p".into(),
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(body),
         });
@@ -2425,6 +2472,7 @@ mod tests {
                 name: "xs".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
@@ -2452,6 +2500,7 @@ mod tests {
                 name: "xs".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
@@ -2469,6 +2518,7 @@ mod tests {
                 name: "xs".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
@@ -2495,6 +2545,7 @@ mod tests {
                 name: "xs".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::var("xs")),
         });
@@ -2532,6 +2583,7 @@ mod tests {
                     name: "m".into(),
                     ty: Type::infer(),
                     user_annotation: Some(ann),
+                    transparency: BindingTransparency::Transparent,
                 },
                 body: Box::new(Expr::var("m")),
             });
@@ -2590,6 +2642,7 @@ mod tests {
                 name: "xs".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::var("xs")),
         });
@@ -2609,6 +2662,7 @@ mod tests {
                 name: "xs".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
@@ -2681,6 +2735,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::String)),
+                transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
             body: Box::new(Expr::var("x")),
@@ -2705,6 +2760,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),
             body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
@@ -2726,6 +2782,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),
             body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
@@ -3238,6 +3295,7 @@ mod tests {
                     name: "x".into(),
                     ty: Type::infer(),
                     user_annotation: Some(ann),
+                    transparency: BindingTransparency::Transparent,
                 },
                 body: Box::new(Expr::apply(Expr::var("x"), inner)),
             });
@@ -3281,6 +3339,7 @@ mod tests {
                     name: "x".into(),
                     ty: Type::infer(),
                     user_annotation: Some(Type::Base(BaseType::String)),
+                    transparency: BindingTransparency::Transparent,
                 },
                 body: Box::new(Expr::var("x")),
             })),
@@ -3311,6 +3370,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::Int)),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::lit(Lit::Unit)),
         });
@@ -3568,6 +3628,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -3628,6 +3689,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -3681,6 +3743,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Infer(var), // unsolved
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -3971,6 +4034,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Base(BaseType::String),
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
         })

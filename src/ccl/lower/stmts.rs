@@ -5,7 +5,10 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 
 use super::*;
 use crate::{
-    ccl::{BaseType, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExprNode},
+    ccl::{
+        BaseType, BindingTransparency, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding,
+        TypedExprNode,
+    },
     chl_parser::ast::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
         Spanned, Stmt as ChlStmt, TypeAnnotation,
@@ -530,7 +533,7 @@ pub(super) fn lower_middle_stmt(
         //   <body>
         // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
         // in general.
-        ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
+        ChlStmt::Assign { target, value, .. } if is_http_serve_tuple_assign(target, value) => {
             if !is_top_level {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -646,11 +649,20 @@ pub(super) fn lower_middle_stmt(
         // A type alias declares no value, so the continuation passes through
         // unchanged: `pre_declare_type_aliases` already put the name in scope, and
         // the statement leaves no trace in the lowered program.
-        ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => Ok(body),
-        ChlStmt::Assign { target, value } => {
+        ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
+            Ok(body)
+        }
+        ChlStmt::Assign {
+            target,
+            value,
+            transparency,
+        } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
-            Ok(ctx.tag_image(Expr::let_bind(name, val, body), stmt.span))
+            Ok(ctx.tag_image(
+                Expr::let_bind_with(name, val, body, binding_transparency(*transparency)),
+                stmt.span,
+            ))
         }
         ChlStmt::AnnAssign {
             target,
@@ -996,7 +1008,7 @@ pub(super) fn lower_middle_stmt(
 pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet<String>) {
     for stmt in stmts {
         match &stmt.node {
-            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => {}
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {}
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::AugAssign { target, .. }
@@ -1723,7 +1735,7 @@ pub(super) fn pre_declare_type_aliases(
     let mut errors = Vec::new();
     let mut declared: HashSet<&str> = HashSet::new();
     for stmt in stmts {
-        let ChlStmt::Assign { target, value } = &stmt.node else {
+        let ChlStmt::Assign { target, value, .. } = &stmt.node else {
             continue;
         };
         let Some((name, rhs)) = type_alias_decl(target, value) else {
@@ -2128,6 +2140,7 @@ pub(super) fn lower_match_over(
                     name: binder.into(),
                     ty: Type::Hole,
                     user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
                 },
                 empty_payload,
             }),

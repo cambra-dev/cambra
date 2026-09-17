@@ -6,10 +6,12 @@ The passes that turn a fully type-inferred CCL tree into tile-dataflow operators
 
 ## Inlining Pass (`ccl/inline.rs`)
 
-`inline_non_iterable_lambdas` runs **after `infer`** and **before `lambda_elim`**. It performs two structural rewrites on `Let` bindings, in order:
+`inline_capability_lambdas` runs **after `infer`** and **before `lambda_elim`**. It performs
+three structural rewrites on `Let` bindings, in order:
 
 1. **Alias inlining** — eliminate `let y = x` pure α-renamings.
 2. **UDF inlining** — substitute call sites for functions over non-iterable domains.
+3. **List-element relocation** — move a binding read in a list element into that element.
 
 ### Motivation
 
@@ -50,6 +52,29 @@ At each call site, substitution is paired with beta-reduction of the outer user-
 Multi-arg call-site bodies contain `Apply(Tuple(…), Proj(Index(i)))` (from the uncurried `__arg_pair.i` references). Those literal-tuple projections are folded later by `simplify::try_literal_tuple_projection`; this pass leaves them in place.
 
 After beta-reducing a UDF call, `inline_impl` is re-applied to the result so that any newly-created `Let` bindings (e.g. from a defer-returning argument) are also processed by the alias-inlining and lift steps.
+
+### Moving a binding into a list element
+
+`inline_list_element_reads` replaces a list element that reads a `Let` binder with that
+binder's definiens, dropping the `Let` when no reader remains. A list literal's elements
+are a value position: op-conversion compiles the whole literal to one table read at
+graph-build time, so an element is sequenced against nothing and the move changes no
+order. A definiens reading a mutable variable the body writes stays bound, because the
+read would otherwise move past the write.
+
+The relocated definiens carries A-normalization's bindings for its own compound
+sub-values, and `flatten_anf_bindings` substitutes each into its one use as the element is
+placed. Without it, a nested constant reaches the element position as a `Let` chain around
+the value former — ``[`a(`b(4))]`` as ``let __anf = `b(4) in `a(__anf)`` — and
+op-conversion reads only the constant formers there (`expr_to_value`), so a program whose
+element is a constant is rejected as a computation. The flattening is scoped to what moves,
+to A-normalization's own binders, and to a binder read once; an element that is a
+computation still reaches that rejection spelled as the computation it is.
+
+A predicate carries its own copy of the `Let` chain riding the term, so both rewrites
+descend into refinement predicates. Rewriting one copy alone leaves a node's type
+describing a collection its value no longer is, which the `post-inline` check reports as a
+domain mismatch.
 
 ### Limitations
 
@@ -315,3 +340,11 @@ The desugaring identity `let x = e1 in e2 ≡ (λx. e2)(e1)` is operationally co
 Instead, the bound expression is converted to an operator, wrapped in a `Memo` (so its value is computed at most once) inside a `FanOut` (so every use in the body shares that one computation), and bound in scope. Each `Var` reference in the body resolves to the shared `FanOut` handle, so a value bound once and used many times is computed once and fanned out to all its uses.
 
 **Prerequisite**: `binding.ty` on the `Let` node's `TypedBinding` must be resolved to a concrete type before compilation — the type inference pass fills it from the inferred type of `bound_expr`.
+
+**A binding's value compiles with the input available where the `Let` sits, so it may not be a
+morphism.** A bound `.0`, or a chain headed by one, reaches an arm that requires an upstream and is
+rejected there; planning's iteration-site walk reads chain heads, so the binder also hides the head
+from the recognizers that materialise a site. A-normalization (`ccl/anf.rs`) names every compound
+operand, including ones lambda elimination later turns into morphisms, and
+`simplify::try_let_morphism_inline` substitutes each such binding into its one use — restoring the
+chain both passes read.

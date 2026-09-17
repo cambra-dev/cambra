@@ -428,7 +428,9 @@ impl Default for OperatorSchemes {
 mod tests {
     use super::super::test_helpers::*;
     use super::OperatorSchemes;
-    use crate::ccl::{AggregateKind, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode};
+    use crate::ccl::{
+        AggregateKind, BindingTransparency, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode,
+    };
 
     /// `GetPrevTxn`'s scheme instantiates to
     /// `((ι ⇒ {time: Txn, write: ν}), Txn, ν) ⇒ ν`: the history domain `ι` is a
@@ -516,6 +518,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Tuple(vec![
                 lit_int(1),

@@ -69,6 +69,26 @@ pub const F_DECISION: &str = "decision";
 /// history argument.
 pub const F_WRITE: &str = "write";
 
+/// Whether a binder's references may be discharged to its definiens.
+///
+/// A `let` telescope entry carries its definiens, so lifting a type past the
+/// binder substitutes it (`src/ccl/design/type-inference.md`, "`let` binders and
+/// scope exit"). An opaque entry withholds it: the type the binder was bound at
+/// is everything a later type learns about it. That is what keeps an initializer
+/// no type can name — a mutable variable's value — out of the refinements the
+/// body builds.
+///
+/// Experimental, and meaningful on a [`TypedExprNode::Let`] binder alone: a
+/// lambda parameter has no definiens to withhold, and a
+/// [`TypedExprNode::MutDecl`] has none inference can write down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingTransparency {
+    /// The entry carries its definiens. Written `x = e` in CHL.
+    Transparent,
+    /// The entry withholds it. Written `x ^= e` in CHL.
+    Opaque,
+}
+
 /// A typed binding site: a named variable together with its type.
 ///
 /// Used in [`TypedExprNode::Lambda`] and [`TypedExprNode::Let`] to carry
@@ -109,6 +129,9 @@ pub struct TypedBinding {
     /// then clears it — a retained annotation is a pre-inference marker that
     /// later passes can only misread.
     pub user_annotation: Option<Type>,
+    /// Whether a type leaving this binder's scope may read the definiens in the
+    /// binder's place. See [`BindingTransparency`].
+    pub transparency: BindingTransparency,
 }
 
 impl TypedBinding {
@@ -121,6 +144,7 @@ impl TypedBinding {
             name: name.into(),
             ty: Type::Hole,
             user_annotation: None,
+            transparency: BindingTransparency::Transparent,
         }
     }
 
@@ -133,6 +157,7 @@ impl TypedBinding {
             name: name.into(),
             ty: Type::Hole,
             user_annotation: Some(annotation),
+            transparency: BindingTransparency::Transparent,
         }
     }
 
@@ -1237,12 +1262,24 @@ impl TypedExpr {
     /// `binding.ty` as the authoritative slot. In normal lowering both start as
     /// [`Type::Infer`] and inference fills them together.
     pub fn let_bind(name: impl Into<Name>, bound_expr: Self, body: Self) -> Self {
+        Self::let_bind_with(name, bound_expr, body, BindingTransparency::Transparent)
+    }
+
+    /// [`let_bind`](Self::let_bind) at a chosen [`BindingTransparency`] — the
+    /// form `x ^= e` lowers through.
+    pub fn let_bind_with(
+        name: impl Into<Name>,
+        bound_expr: Self,
+        body: Self,
+        transparency: BindingTransparency,
+    ) -> Self {
         let ty = bound_expr.ty.clone();
         Self::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: name.into(),
                 ty,
                 user_annotation: None,
+                transparency,
             },
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
@@ -1298,6 +1335,7 @@ impl TypedExpr {
                 name: name.into(),
                 ty: history,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             init: Box::new(init),
             body: Box::new(body),
@@ -1458,6 +1496,7 @@ impl TypedExpr {
                 name: param.into(),
                 ty: param_ty,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(body),
         })
@@ -2306,6 +2345,7 @@ mod tests {
                 name: "x".into(),
                 ty: marker("param_ty"),
                 user_annotation: Some(marker("param_annotation")),
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(TypedExpr::lit(Lit::Unit)),
         });

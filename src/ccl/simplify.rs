@@ -46,12 +46,17 @@
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
+//! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
-use crate::ccl::ccl_utils::{PredMemo, apply_primitive, is_builtin, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{
+    PredMemo, apply_primitive, count_free, is_builtin, walk_refined_predicates_mut,
+};
 use crate::ccl::lambda_elim::{id, zip_pair};
+use crate::ccl::names::SyntheticKind;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, ProjKey, Type, TypedExpr, TypedExprNode,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Name, ProjKey, Type, TypedExpr,
+    TypedExprNode,
 };
 
 // ---------------------------------------------------------------------------
@@ -293,6 +298,11 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         try_string_add_to_concat,
     );
     changed |= ruled("simplify.partial_lookup", expr, try_partial_lookup);
+    changed |= ruled(
+        "simplify.let_morphism_inline",
+        expr,
+        try_let_morphism_inline,
+    );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -965,6 +975,63 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
     )
 }
 
+/// A-normalization's morphism binding: `let x = 𝑚 in 𝑏  ⟹  𝑏[x := 𝑚]`, where `x` is an
+/// [`SyntheticKind::AnfTemp`] binder, `𝑚` is function-typed, and `x` occurs once in `𝑏`.
+///
+/// Point-free CCL has no compiled form for a binding whose value is a morphism.
+/// Op-conversion compiles a binding with the input available where the `let` sits
+/// ([`crate::interpreter::operator_conversion`]'s `Let` arm), and a morphism takes its
+/// input where it is used: a bare `.0` bound by a `let` reaches op-conversion's `Proj`
+/// arm with no input and is rejected there. Planning does not repair it either. Its
+/// iteration-site walk reads chain heads (`src/ccl/planning/iterate.rs`), so a binder
+/// hides the head from the recognizers that rewrite a site, and a join whose operand is
+/// bound reaches op-conversion unmaterialized. Substituting the morphism into its use
+/// site restores the chain both passes read.
+///
+/// A-normalization (`crate::ccl::anf`) names every compound operand, including one that
+/// [`crate::ccl::lambda_elim`] later turns into a morphism: `let x = __iter_record.0 in x
+/// ▷ users` becomes `let x = .0 in x ≫ users`. The binder kind scopes the rule to that
+/// case. A source binding (`let s = source(…)`) and a recurrence carrier (`let __hist =
+/// Transact{…}`) are recognized by their binding, and substituting either one away
+/// strands the consumer that recognizes it.
+///
+/// **One occurrence** makes the rewrite a move rather than a copy, so it duplicates
+/// nothing and drops nothing — which is what makes it safe on a subtree holding an
+/// `iterate` ([`is_iteration`]).
+fn try_let_morphism_inline(expr: &mut Expr) -> bool {
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &expr.node
+    else {
+        return false;
+    };
+    if !matches!(
+        binding.name,
+        Name::Synthetic {
+            kind: SyntheticKind::AnfTemp,
+            ..
+        }
+    ) || !matches!(bound_expr.ty, Type::Fun { .. })
+        || count_free(&binding.name, body) != 1
+    {
+        return false;
+    }
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = take(expr).node
+    else {
+        unreachable!("matched above");
+    };
+    let mut body = *body;
+    crate::ccl::subst::Subst::discharge_in_place(&mut body, &binding.name, &bound_expr);
+    *expr = body;
+    true
+}
+
 /// Const-apply: `⟨f, const(g)⟩ ≫ apply  ⟹  f ≫ g`
 fn try_const_apply(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
@@ -1351,6 +1418,53 @@ mod tests {
 
     fn typed_compose2(f: Expr, g: Expr) -> Expr {
         typed_compose(vec![f, g])
+    }
+
+    fn var_of(name: &Name, ty: Type) -> Expr {
+        Expr::new(TypedExprNode::Var(name.clone())).with_ty(ty)
+    }
+
+    /// An ANF temp naming a morphism is substituted into its one use, restoring the
+    /// chain op-conversion and planning both read.
+    #[test]
+    fn simplify_inlines_an_anf_bound_morphism() {
+        let pair = Type::Tuple(vec![int_ty(), int_ty()]);
+        let proj = Expr::proj_index(0).with_ty(fun_ty(pair.clone(), int_ty()));
+        let users = var("users").with_ty(fun_ty(int_ty(), int_ty()));
+        let name = Name::anf_temp();
+        let expr = Expr::let_bind(
+            name.clone(),
+            proj.clone(),
+            typed_compose2(var_of(&name, fun_ty(pair.clone(), int_ty())), users.clone()),
+        );
+        assert_eq!(simplify(expr), typed_compose2(proj, users));
+    }
+
+    /// A second occurrence makes the substitution a copy, so the rule declines it: the
+    /// binding is what keeps the morphism single.
+    #[test]
+    fn simplify_keeps_an_anf_binding_used_twice() {
+        let ty = fun_ty(int_ty(), int_ty());
+        let name = Name::anf_temp();
+        let expr = Expr::let_bind(
+            name.clone(),
+            var("f").with_ty(ty.clone()),
+            typed_compose2(var_of(&name, ty.clone()), var_of(&name, ty.clone())),
+        );
+        assert_eq!(simplify(expr.clone()), expr);
+    }
+
+    /// A source binding is recognized by its binding, so the rule leaves every binder it
+    /// did not mint alone — including one holding a morphism used once.
+    #[test]
+    fn simplify_keeps_a_non_anf_morphism_binding() {
+        let ty = fun_ty(int_ty(), int_ty());
+        let expr = Expr::let_bind(
+            Name::raw("s"),
+            var("f").with_ty(ty.clone()),
+            typed_compose2(var("s").with_ty(ty.clone()), var("g").with_ty(ty.clone())),
+        );
+        assert_eq!(simplify(expr.clone()), expr);
     }
 
     /// Compose identity (left): id ≫ f  ⟹  f

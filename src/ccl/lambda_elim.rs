@@ -49,7 +49,7 @@ use crate::ccl::ccl_utils::{
 use crate::ccl::provenance;
 use crate::ccl::simplify::simplify;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{BaseType, Branch, Builtin, FieldKey, Lit, Name, Refinement};
+use crate::ccl::{BaseType, BindingTransparency, Branch, Builtin, FieldKey, Lit, Name, Refinement};
 use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 
 // ---------------------------------------------------------------------------
@@ -1820,7 +1820,12 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         } => {
             let def = elim_lambdas(ctx, *bound_expr)?;
             let new_body = elim_lambdas(ctx, *body)?;
-            let ty = if crate::ccl::subst::type_free_vars(&new_body.ty).contains(&binding.name) {
+            // An opaque binder quotes no term in the node's type, so elimination
+            // leaves that type alone: its binder is still spelled by name, as
+            // inference left it (`Typing::close_let_type`).
+            let ty = if binding.transparency == BindingTransparency::Transparent
+                && crate::ccl::subst::type_free_vars(&new_body.ty).contains(&binding.name)
+            {
                 #[cfg(debug_assertions)]
                 {
                     reclosed_let_ty = true;
@@ -1899,8 +1904,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
 mod tests {
     use super::*;
     use crate::ccl::{
-        ArithmeticKind, BaseType, BinOpKind, CompareKind, Expr, Lit, Name, Refinement,
-        RefinementSet, Type, symbolic::symbolic,
+        ArithmeticKind, BaseType, BinOpKind, BindingTransparency, CompareKind, Expr, Lit, Name,
+        Refinement, RefinementSet, Type, symbolic::symbolic,
     };
     use test_log::test;
 
@@ -2487,6 +2492,7 @@ mod tests {
                     name: binder.into(),
                     ty: binder_ty,
                     user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
                 },
                 empty_payload: false,
             }),

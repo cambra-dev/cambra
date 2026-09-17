@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::{
-    ccl::{Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
+    ccl::{BindingTransparency, Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{AssignTarget, Expr as ChlExpr, IfBranch, Spanned, Stmt as ChlStmt},
 };
 
@@ -378,8 +378,12 @@ fn lower_for_body_stmts_scoped(
     for (_, stmt) in contributing {
         match &stmt.node {
             // A type alias binds nothing, so it contributes no `Let` to the frame.
-            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => {}
-            ChlStmt::Assign { target, value } => {
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {}
+            ChlStmt::Assign {
+                target,
+                value,
+                transparency,
+            } => {
                 let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
@@ -391,6 +395,7 @@ fn lower_for_body_stmts_scoped(
                     name,
                     value: val,
                     annotation: None,
+                    transparency: binding_transparency(*transparency),
                     span: stmt.span,
                 });
             }
@@ -415,6 +420,7 @@ fn lower_for_body_stmts_scoped(
                     value: val,
                     annotation: Some(ann),
                     span: stmt.span,
+                    transparency: BindingTransparency::Transparent,
                 });
             }
             ChlStmt::AugAssign { target, .. } => {
@@ -457,6 +463,7 @@ fn lower_for_body_stmts_scoped(
                     value: func_expr,
                     annotation: None,
                     span: stmt.span,
+                    transparency: BindingTransparency::Transparent,
                 });
             }
             // A `with begin():` transaction inside a *generator* loop body is a
@@ -525,14 +532,27 @@ fn lower_for_body_stmts_scoped(
                 name,
                 value,
                 annotation: Some(a),
+                transparency,
                 span,
-            } => (Expr::let_bind_annotated(name, value, body, a), span),
+            } => {
+                // An annotation states the binder's type, which is what an
+                // opaque binder takes from its initializer, so the grammar
+                // admits no annotated `^=` — and an annotated binding that
+                // arrived opaque would lose that here silently.
+                debug_assert_eq!(
+                    transparency,
+                    BindingTransparency::Transparent,
+                    "an annotated binding is transparent"
+                );
+                (Expr::let_bind_annotated(name, value, body, a), span)
+            }
             PrefixStmt::Bind {
                 name,
                 value,
                 annotation: None,
+                transparency,
                 span,
-            } => (Expr::let_bind(name, value, body), span),
+            } => (Expr::let_bind_with(name, value, body, transparency), span),
             PrefixStmt::Effect { effect, span } => (Expr::expr_stmt(effect, body), span),
         };
         ctx.tag_image(wrapped, span)
@@ -546,6 +566,7 @@ enum PrefixStmt {
         name: String,
         value: Expr,
         annotation: Option<Type>,
+        transparency: BindingTransparency,
         span: Span,
     },
     Effect {
@@ -999,6 +1020,7 @@ pub(super) fn lower_direct_mirror_loop(
                 name: iter_var.into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -1069,12 +1091,21 @@ fn lower_loop_body_chain_scoped(
             // is not a mutation operator (accumulators are written with `:=`
             // / `+=`). A loop-carried accumulator therefore never appears here.
             // A type alias binds nothing, so the chain passes through unchanged.
-            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => chain,
-            ChlStmt::Assign { target, value } => {
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
+                chain
+            }
+            ChlStmt::Assign {
+                target,
+                value,
+                transparency,
+            } => {
                 let name = extract_name_target(target, "assignment")?;
                 check_mut_write_context(&name, stmt.span, ctx)?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
+                ctx.tag_image(
+                    Expr::let_bind_with(name, val, chain, binding_transparency(*transparency)),
+                    stmt.span,
+                )
             }
             // `x op= value` — a mutable write, always. A write to an accumulator
             // declared before the loop is the `MutWrite` the phase threads as the

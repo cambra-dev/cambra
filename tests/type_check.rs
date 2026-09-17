@@ -265,6 +265,41 @@ fn refining_addition_is_int_only() {
     );
 }
 
+/// A binder's transparency decides what a type lifted past it reads in the
+/// binder's place: `=` carries its definiens, `^=` withholds it.
+///
+/// The pair is the whole content of [`cambra::ccl::BindingTransparency`], and
+/// `^+` is what makes it visible — its result type quotes the operands.
+#[rstest]
+#[case::transparent(
+    indoc! {r#"
+        y = 5
+        y ^+ y
+    "#},
+    "{Int | __elem == 5 ^+ 5}"
+)]
+#[case::opaque(
+    indoc! {r#"
+        y ^= 5
+        y ^+ y
+    "#},
+    "{Int | __elem == y ^+ y}"
+)]
+fn a_binder_s_transparency_decides_what_its_uses_leave_in_a_type(
+    #[case] code: &str,
+    #[case] expected: &str,
+) {
+    assert_eq!(format!("{}", infer_program(code)), expected);
+}
+
+/// The type an opaque binder is bound at is its initializer's, refinements
+/// included — that is what a later query about the binder's name learns.
+#[test]
+fn an_opaque_binder_inherits_its_initializer_s_refinement() {
+    // The singleton renders in its short form: `{Int | __elem == 5}` is `Int@5`.
+    assert_eq!(format!("{}", infer_program("y ^= 5\ny\n")), "Int@5");
+}
+
 /// The three shapes a trait can take are each exercised by a real program, which is
 /// what keeps the machinery from being fitted to one of them.
 ///
@@ -3327,7 +3362,8 @@ fn projection_diagnostics_name_the_shape() {
 mod letrec_typing {
     use cambra::ccl::infer::{TypeInferenceContext, infer, typecheck};
     use cambra::ccl::{
-        ArithmeticKind, BinOpKind, Builtin, Expr, Lit, Type, TypedBinding, TypedExprNode,
+        ArithmeticKind, BinOpKind, BindingTransparency, Builtin, Expr, Lit, Type, TypedBinding,
+        TypedExprNode,
     };
     use cambra::interpreter::BaseType;
 
@@ -3349,6 +3385,7 @@ mod letrec_typing {
             name: name.into(),
             ty,
             user_annotation: None,
+            transparency: BindingTransparency::Transparent,
         }
     }
 

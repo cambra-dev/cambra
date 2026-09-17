@@ -3,8 +3,10 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
+use crate::ccl::infer::solver::smt::ScopeEnv;
 use crate::ccl::infer::solver::{
-    ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+    ConstrainCache, Derivation, PolyScheme, constrain_subtype_in, constrain_subtype_under_in,
+    fresh_var, prim,
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
@@ -12,8 +14,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Expr, Level, Name, Refinement, RefinementSet, Type, TypedBinding, TypedExpr,
-    TypedExprNode,
+    BaseType, BindingTransparency, Expr, Level, Name, Refinement, RefinementSet, Type,
+    TypedBinding, TypedExpr, TypedExprNode,
 };
 
 use super::emit::{
@@ -26,6 +28,8 @@ use super::schemes::OperatorSchemes;
 use super::typing::Typing;
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
+use crate::util::ScopeStack;
+use std::collections::HashMap;
 
 /// Post-inference structural type-check state.
 ///
@@ -43,10 +47,12 @@ use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 ///
 /// Refinement handling: Check is refinement-*aware* — it constrains the real
 /// (un-stripped) types via [`Typing::require_sub`], so the lattice's
-/// restriction-refinement subsetting (`unrefined ⊀ refined`) is enforced. The explicit
-/// cast operator canonicalizes restriction *acquisition*, so the long-standing
-/// deep strip is gone, and the check runs both after inference *and* after
-/// join planning (`context.rs`).
+/// restriction-refinement subsetting (`unrefined ⊀ refined`) is enforced. Every edge it
+/// draws carries [`CheckCtx::scopes`], so a deficit between two predicates that state
+/// one restriction differently is decided by entailment rather than by structural
+/// matching. The explicit cast operator canonicalizes restriction *acquisition*, so the
+/// long-standing deep strip is gone, and the check runs both after inference *and*
+/// after join planning (`context.rs`).
 ///
 /// There is no cast escape in the adjacency rule: a producer must already
 /// carry the refinement its consumer demands. Join planning makes this hold by
@@ -85,6 +91,52 @@ pub(super) struct CheckCtx {
     /// telescope and the record-time closure observation stays meaningful in
     /// both modes.
     telescope: Telescope,
+    /// **Γ — the type each name in lexical scope is bound at**, built from the
+    /// tree as the walk enters each binder and read by one rule: the refinement
+    /// deficit's semantic fallback, which decides `Γ ⊢ ⋀S₁ ⇒ ⋀S₂` against what Γ
+    /// says about the free names the two sides' predicates read
+    /// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
+    ///
+    /// A binder is bound at the type its own rule hands [`Typing::scoped`] —
+    /// what emission bound it at, resolved. That is a fact about every value
+    /// reaching the binder, which is what makes it an assumption: the binding
+    /// site is held to it by the edge its own rule draws (a `let`'s definiens
+    /// against the binder, an application's argument against the domain).
+    ///
+    /// Not the same environment as name *resolution*, which Check still does
+    /// not do — a `Var` node's recorded type is trusted, and a name this scope
+    /// does not bind is a query with one fewer assumption rather than an error.
+    scopes: ScopeStack<Name, Type>,
+    /// What each [opaque](crate::ccl::BindingTransparency::Opaque) binder was
+    /// bound at, kept past the binder's scope, exactly as
+    /// [`InferCtx`](super::context::InferCtx) keeps it: a type lifted past such a
+    /// binder keeps the name ([`Typing::close_let_type`]), so a query about that
+    /// type outside the scope needs the binder's own refinements to decide it.
+    /// Entries accumulate and are never removed — a uniquified name denotes one
+    /// binding, so the fact it records stays true.
+    opaque_binders: HashMap<Name, Type>,
+}
+
+/// The environment a Check query runs in: the lexical scope at the query, plus
+/// every opaque binder recorded so far.
+///
+/// Built per query from [`CheckCtx`]'s two fields so the borrow stays disjoint from
+/// the errors the same rule pushes, mirroring emission's `SolverScope`.
+struct CheckScope<'a> {
+    scopes: &'a ScopeStack<Name, Type>,
+    opaque_binders: &'a HashMap<Name, Type>,
+}
+
+impl ScopeEnv for CheckScope<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.scopes
+            .lookup(name)
+            .or_else(|| self.opaque_binders.get(name))
+            .cloned()
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
 }
 
 impl CheckCtx {
@@ -100,6 +152,16 @@ impl CheckCtx {
             witness_ctx: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
+            scopes: ScopeStack::default(),
+            opaque_binders: HashMap::new(),
+        }
+    }
+
+    /// The lexical environment this position's queries run in.
+    fn scope(&self) -> CheckScope<'_> {
+        CheckScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
         }
     }
 
@@ -262,23 +324,35 @@ impl Typing for CheckCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        // Delegate to the solver's `constrain_subtype` — the single source of
+        // Delegate to the solver's `constrain_subtype_in` — the single source of
         // truth for width/variance and (since refinements ride the lattice as
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
+        //
+        // **In the scope the edge is drawn in**, so a refinement deficit reaches the
+        // deficit rule's semantic fallback with the program's own binders as
+        // assumptions. A write of `{Int | __elem == __read ^+ 1}` to a variable declared
+        // `{Int | __elem >= 0}` is the shape that needs it: the two predicates match
+        // nowhere structurally, and the entailment holds given the type `__read` is
+        // bound at.
         let mut cache = self.cache();
-        if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
+        let outcome = constrain_subtype_in(sub, sup, &mut cache, &self.scope());
+        if let Err(e) = outcome {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
         Ok(())
     }
 
-    fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
-        // Check trusts each `Var`/binder node's recorded `Type` rather than
-        // resolving names, so there is no name scope to maintain — only the
-        // telescope, for the variables minted under this binder.
-        self.under_binder(name, f)
+    fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        // Check trusts each `Var`/binder node's recorded `Type` rather than resolving
+        // names, so the scope entry is not here to answer a use — it is the assumption
+        // a query under this binder runs with ([`CheckCtx::scopes`]).
+        self.scopes.push_scope();
+        self.scopes.bind(name, ty.clone());
+        let r = self.under_binder(name, f);
+        self.scopes.pop_scope();
+        r
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -296,15 +370,30 @@ impl Typing for CheckCtx {
     fn scoped_let<R>(
         &mut self,
         name: &Name,
-        _bound_ty: &Type,
+        bound_ty: &Type,
         _generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        // See `scoped`: no name scope, no generalization — telescope only.
-        self.under_binder(name, f)
+        // See `scoped`. No generalization either: Check never generalizes
+        // (`is_generalizable` is `false`), so the binder stands for the one type its
+        // definiens has, which is the fact the body's queries assume.
+        self.scoped(name, bound_ty, f)
     }
 
-    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
+        // An opaque binder carries no definiens, so Emit recorded no discharge
+        // and there is none to re-run: the binder's name stands in the lifted
+        // type, and the reconstruction matches the recorded type by keeping it
+        // there.
+        if binding.transparency == BindingTransparency::Opaque {
+            // The name stays in the lifted type, so what it means there — the type it
+            // was bound at — outlives the scope `scoped_let` has just closed
+            // ([`CheckCtx::opaque_binders`]).
+            self.opaque_binders
+                .insert(binding.name.clone(), binding.ty.clone());
+            return body_ty;
+        }
+        let name = &binding.name;
         // Mirror the let-closing in `coalesce_node`'s Let arm (design §6.2):
         // the recorded node type has the binding discharged, so the
         // reconstruction must re-run the same substitution to reconcile under
@@ -392,13 +481,15 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
         let mut cache = self.cache();
-        if let Err(e) = crate::ccl::infer::solver::constrain_subtype_under(
+        let outcome = constrain_subtype_under_in(
             sub,
             sup,
             sub_binders,
             sup_binders,
             &mut cache,
-        ) {
+            &self.scope(),
+        );
+        if let Err(e) = outcome {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
@@ -756,6 +847,7 @@ fn check_predicates(
                         name: Name::elem(),
                         ty: (**base).clone(),
                         user_annotation: None,
+                        transparency: BindingTransparency::Transparent,
                     },
                     body: Box::new(body),
                 })
@@ -828,7 +920,47 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{Lit, TypedExpr};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
+    use std::rc::Rc;
+
+    /// `{Int | p}` over the predicate `__elem <op> rhs`.
+    fn refined(op: CompareKind, rhs: TypedExpr) -> Type {
+        let predicate = TypedExpr::binop(
+            TypedExpr::var(Name::elem()).with_ty(prim(BaseType::Int)),
+            BinOpKind::Compare(op),
+            rhs,
+        )
+        .with_ty(prim(BaseType::Bool));
+        Type::refined_one(prim(BaseType::Int), Refinement::born(Rc::new(predicate)))
+    }
+
+    /// A refinement deficit is decided in the Γ the walk builds from the tree.
+    ///
+    /// The argument's `{Int | __elem == a}` matches nothing the parameter demands —
+    /// `{Int | __elem >= 0}` is a different predicate — so the structural rule reports a
+    /// deficit and the entailment is what admits the call. It holds only given `a >= 0`,
+    /// which is the type the enclosing lambda binds `a` at, and reaches the query because
+    /// the walk records each binder it enters (`src/ccl/design/type-inference.md`, "The
+    /// scope a query runs in").
+    #[test]
+    fn a_deficit_is_decided_under_the_binders_in_scope() {
+        let a = Name::from("a");
+        let non_negative = refined(
+            CompareKind::GreaterOrEq,
+            TypedExpr::lit(Lit::Int(0)).with_ty(prim(BaseType::Int)),
+        );
+        let equals_a = refined(
+            CompareKind::Equals,
+            TypedExpr::var(a.clone()).with_ty(non_negative.clone()),
+        );
+        let f = TypedExpr::var(Name::from("f"))
+            .with_ty(Type::fun(non_negative.clone(), prim(BaseType::Int)));
+        let call = TypedExpr::apply(TypedExpr::var(a.clone()).with_ty(equals_a), f)
+            .with_ty(prim(BaseType::Int));
+        let tree = TypedExpr::lambda(a, non_negative, call);
+
+        assert_eq!(check(&tree), Ok(()), "`__elem == a` entails `__elem >= 0`");
+    }
 
     /// Check mode accumulates: it records every failing rule instead of
     /// returning at the first, and each recorded error is blamed on the node

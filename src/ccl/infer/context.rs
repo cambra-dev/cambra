@@ -15,7 +15,10 @@ use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, Level, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{
+    BindingTransparency, Expr, Level, Lit, Name, Refinement, Type, TypedBinding, TypedExpr,
+    TypedExprNode,
+};
 use crate::util::ScopeStack;
 
 use super::emit::emit_node;
@@ -175,6 +178,40 @@ pub(super) struct InferCtx {
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
     telescope: Telescope,
+    /// What each [opaque](crate::ccl::BindingTransparency::Opaque) binder was
+    /// bound at, kept past the binder's scope.
+    ///
+    /// A type lifted past such a binder keeps the name (`close_let_type`), so a
+    /// query about that type outside the scope needs the binder's own
+    /// refinements to decide it — `{Int | __elem == a ^+ x1}` entails
+    /// `{Int | __elem >= 0}` only given `x1 >= 0`. Entries accumulate and are
+    /// never removed: a uniquified name denotes one binding, so the fact it
+    /// records stays true.
+    opaque_binders: HashMap<Name, Type>,
+}
+
+/// The environment a solver query runs in: the lexical scope at the query,
+/// plus every opaque binder recorded so far.
+///
+/// Both halves answer one question — what is known about a name a predicate
+/// reads — and the scope stack answers it only while the binder is open, which
+/// is not where an opaque binder's uses are decided. Built per query from
+/// [`InferCtx`]'s two fields, so the borrow stays disjoint from the constraint
+/// cache the same call mutates.
+pub(super) struct SolverScope<'a> {
+    scopes: &'a ScopeStack<Name, Binding>,
+    opaque_binders: &'a HashMap<Name, Type>,
+}
+
+impl ScopeEnv for SolverScope<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.scopes
+            .binder_type(name)
+            .or_else(|| self.opaque_binders.get(name).and_then(value_type))
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
 }
 
 impl InferCtx {
@@ -192,6 +229,7 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             telescope: Telescope::empty(),
+            opaque_binders: HashMap::new(),
         }
     }
 
@@ -479,7 +517,11 @@ impl Typing for InferCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        constrain_subtype_in(sub, sup, &mut self.cache, &self.scopes)
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+        };
+        constrain_subtype_in(sub, sup, &mut self.cache, &scope)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
     }
 
@@ -551,7 +593,8 @@ impl Typing for InferCtx {
         r
     }
 
-    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
+        let name = &binding.name;
         // Lifting the body's type past the binder is an application: a `let`
         // telescope entry carries its definiens, so the lift discharges
         // `[name ↦ bound_expr]` (`src/ccl/design/type-inference.md`, "`let`
@@ -580,6 +623,17 @@ impl Typing for InferCtx {
             bound_expr.node,
             TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
         ) {
+            return body_ty;
+        }
+        // An opaque binder is the second exception, and for the reverse reason:
+        // it carries no definiens to discharge, so the name stays in the lifted
+        // type. What it means there is the type it was bound at, which outlives
+        // the scope as a standing fact ([`Self::opaque_binders`]) — that is how
+        // a refinement over the binder is still decided once the binder's scope
+        // has closed. Recorded here because `scoped_let` has just closed that
+        // scope and `binding.ty` is by now the type the variable is bound at.
+        if binding.transparency == BindingTransparency::Opaque {
+            self.opaque_binders.insert(name.clone(), binding.ty.clone());
             return body_ty;
         }
         let lifted = self.fresh();
@@ -675,14 +729,16 @@ impl Typing for InferCtx {
         // below read this one snapshot, so each shows what was inferred rather than the
         // partially modified state a failed `constrain_subtype` leaves behind.
         let inferred_ty = coalesce_for_error(inferred);
-        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &self.scopes).map_err(
-            |_| {
-                self.raise(InferError::AnnotationMismatch {
-                    annotation: ann.clone(),
-                    inferred: inferred_ty.clone(),
-                })
-            },
-        )?;
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+        };
+        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).map_err(|_| {
+            self.raise(InferError::AnnotationMismatch {
+                annotation: ann.clone(),
+                inferred: inferred_ty.clone(),
+            })
+        })?;
         // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
         // above is contravariant in the domain, so it leaves the shared variable *below*
         // every domain annotated with it: a common lower bound, which orders each domain
@@ -711,14 +767,16 @@ impl Typing for InferCtx {
             } = inferred.peel_refinements()
             && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
         {
-            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &self.scopes).map_err(
-                |_| {
-                    self.raise(InferError::AnnotationMismatch {
-                        annotation: ann.clone(),
-                        inferred: inferred_ty,
-                    })
-                },
-            )?;
+            let scope = SolverScope {
+                scopes: &self.scopes,
+                opaque_binders: &self.opaque_binders,
+            };
+            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).map_err(|_| {
+                self.raise(InferError::AnnotationMismatch {
+                    annotation: ann.clone(),
+                    inferred: inferred_ty,
+                })
+            })?;
         }
         Ok(ann_simple)
     }

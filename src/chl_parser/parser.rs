@@ -59,9 +59,9 @@ use chumsky::prelude::*;
 use smol_str::SmolStr;
 
 use crate::chl_parser::ast::{
-    AnnotationMode, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Comprehension, Expr,
-    IfBranch, Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, RecordField, Span,
-    Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
+    AnnotationMode, AssignTarget, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp, CompClause,
+    Comprehension, Expr, IfBranch, Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern,
+    RecordField, Span, Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
 };
 use crate::chl_parser::lexer::{self, Token};
 
@@ -1416,7 +1416,9 @@ where
 /// Intermediate type used inside the statement-level expression dispatch.
 #[derive(Clone)]
 enum AssignTail {
-    Plain(Spanned<Expr>),
+    /// `= value` (transparent) or `^= value` (opaque) — an unannotated
+    /// immutable binding.
+    Plain(BindingTransparency, Spanned<Expr>),
     /// `: ty = value` / `<: ty = value` — an annotated immutable binding.
     Annotated(TypeAnnotation, Spanned<Expr>),
     /// `:= value` — a bare mutable assignment (`MutAssign` with no annotation).
@@ -1454,7 +1456,13 @@ where
     choice((
         just(Token::Eq)
             .ignore_then(rhs.clone())
-            .map(AssignTail::Plain),
+            .map(|v| AssignTail::Plain(BindingTransparency::Transparent, v)),
+        // `^= value` — an opaque binding. Unannotated only: an annotation states
+        // the binder's type, which is what an opaque binder takes from its
+        // initializer.
+        just(Token::CaretEq)
+            .ignore_then(rhs.clone())
+            .map(|v| AssignTail::Plain(BindingTransparency::Opaque, v)),
         // An annotated binding: `: ty` (exact) or `<: ty` (bounded), then `=`
         // (immutable) or `:=` (mutable). The annotation's mode and the
         // assignment operator are independent choices.
@@ -1510,9 +1518,10 @@ fn assign_stmt<'src>(
     let to_target =
         |t| expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid assignment target"));
     let stmt = match tail {
-        AssignTail::Plain(value) => Stmt::Assign {
+        AssignTail::Plain(transparency, value) => Stmt::Assign {
             target: to_target(target)?,
             value,
+            transparency,
         },
         AssignTail::Annotated(ann, val) => Stmt::AnnAssign {
             target: to_target(target)?,
@@ -2158,6 +2167,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn opaque_assignment() {
+        // `x ^= e` — a plain binding that carries no definiens.
+        let m = parse_m("x ^= 0\n");
+        assert!(matches!(
+            m.body[0].node,
+            Stmt::Assign {
+                transparency: BindingTransparency::Opaque,
+                ..
+            }
+        ));
+    }
+
+    /// An annotation states the binder's type, which is what an opaque binder
+    /// takes from its initializer, so the two do not combine.
+    #[test]
+    fn an_opaque_assignment_takes_no_annotation() {
+        let result = parse_module("x: Int ^= 0\n");
+        assert!(
+            !result.errors.is_empty(),
+            "expected `x: Int ^= 0` to be rejected"
+        );
     }
 
     #[test]

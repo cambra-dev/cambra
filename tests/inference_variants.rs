@@ -9,7 +9,8 @@
 
 use cambra::ccl::ArithmeticKind;
 use cambra::ccl::{
-    Branch, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExpr, TypedExprNode,
+    BindingTransparency, Branch, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExpr,
+    TypedExprNode,
     infer::{InferError, LocatedInferError, TypeInferenceContext, infer},
     uniquify,
 };
@@ -57,6 +58,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 name: binding.into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             empty_payload: false,
         }),
@@ -157,6 +159,7 @@ fn variant_param_accepts_subtype() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty.clone()),
+            transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
@@ -176,6 +179,7 @@ fn variant_extra_tag_rejected() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty),
+            transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
@@ -256,6 +260,7 @@ fn value_ascription_accepts_widening() {
             name: "x".into(),
             ty: Type::Hole,
             user_annotation: Some(variant(&[("A", unit_ty()), ("B", unit_ty())])),
+            transparency: BindingTransparency::Transparent,
         },
         bound_expr: Box::new(TypedExpr::variant_ctor("A", lit_unit())),
         body: Box::new(var("x")),
@@ -439,6 +444,7 @@ fn lambda_returns_variant() {
             name: "x".into(),
             ty: int(),
             user_annotation: Some(int()),
+            transparency: BindingTransparency::Transparent,
         },
         body: Box::new(TypedExpr::variant_ctor("some", var("x"))),
     });
@@ -496,6 +502,7 @@ fn payload_covariance_accept() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty.clone()),
+            transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
@@ -513,6 +520,7 @@ fn payload_mismatch_reject() {
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(param_ty),
+            transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
