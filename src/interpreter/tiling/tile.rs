@@ -71,12 +71,12 @@ pub enum Tile {
         terminal: ColumnValue,
     },
     /// A **transactional store**: a right-continuous step function
-    /// `Txn ⇒ {key: value}` over the commit-time domain, materialized as its
-    /// **changelog** — the ticks that committed a write, each carrying that
-    /// tick's write-set *delta*.
+    /// `Txn ⇒ {key: value}` over the commit-time domain, materialized as one
+    /// **changelog per key** — the ticks at which that key was written, against
+    /// the values written there.
     ///
     /// This is not a [`Tile::Function`] and must not be treated as one:
-    /// in a collection a key absent from `changes` is
+    /// in a collection a key absent from a changelog is
     /// **unknown**, whereas here it is **decided-absent — the value holds from
     /// the latest earlier change** (step interpolation). The value at an
     /// arbitrary commit time is obtained by *folding* the changelog
@@ -90,13 +90,16 @@ pub enum Tile {
     /// ordinary-function operations (direct indexing, `ExtractFinal`) from
     /// silently misreading a store. See `src/ccl/design/mutability.md`.
     Store {
-        /// Commit ticks that carry a write (the change events), sorted ascending.
-        changes: ColumnValue,
-        /// Per-tick write-set deltas, parallel to `changes`: `deltas[i]` is the
-        /// map of keys written at `changes[i]`, encoded as a `Variants` cell (via
-        /// [`crate::interpreter::commit_operator::map_to_value`]). A key absent
-        /// from a tick's delta was not written at that tick (its value holds).
-        deltas: ColumnValue,
+        /// One changelog per store key: a [`Tile::Record`] whose fields are the key
+        /// space, each field a [`Tile::Function`] over one row — the commit ticks at
+        /// which that key was written, ascending, against the values written there.
+        /// A tick a key's changelog omits did not write it, so its value holds.
+        ///
+        /// A key's values are a tile, so a collection-valued key carries its elements
+        /// as a level rather than as one materialized cell; and a write set spanning
+        /// several keys lands as one tick in each of their changelogs, which is what
+        /// replaces a per-tick heterogeneous map.
+        state: Box<Tile>,
         /// The decided frontier: `LessThanEq(w)` means every tick `≤ w` is decided
         /// — the watermark `w` counts trailing carries (positions past the latest
         /// *change*), because a store is a right-continuous step function over its
@@ -120,11 +123,10 @@ pub enum Tile {
         /// and earlier whenever some other writer is still running: a store whose keys
         /// are written by different blocks closes each key as that block drains.
         ///
-        /// **Neither axis derives from the other.** A key that is never written
-        /// appears in no delta, so the tile does not know its own key universe and
-        /// cannot read "every key listed here is closed" as "the store is closed".
-        /// They close different things: `terminal` closes the commit-time
-        /// *domain*, `closed_keys` closes a key's *write set*.
+        /// **Neither axis derives from the other**, because they close different
+        /// things: `terminal` closes the commit-time *domain*, `closed_keys` closes a
+        /// key's *write set*. A store whose every key is closed still decides further
+        /// ticks, each carrying every key's value forward.
         ///
         /// Only a per-key **change** stream may reduce on this. A carry-forward
         /// projection gains a position at every tick, including ticks that wrote
@@ -169,10 +171,10 @@ impl Tile {
             } => keys.len() == deleted.len() || values.is_empty(),
             Tile::Aggregation { accumulator, .. } => accumulator.is_empty(),
             // A `Store` is a right-continuous *step function* over its decided prefix, not a
-            // list of change events: a tick absent from `changes` but at or below the
-            // frontier is *decided*, its value holding from the latest earlier change. So it
-            // is empty when nothing is decided, which an undecided (`False`) frontier says
-            // and a `LessThanEq` watermark never does.
+            // list of change events: a tick absent from a key's changelog but at or below
+            // the frontier is *decided*, its value holding from the latest earlier change.
+            // So it is empty when nothing is decided, which an undecided (`False`) frontier
+            // says and a `LessThanEq` watermark never does.
             Tile::Store { frontier, .. } => {
                 !matches!(frontier, Predicate::LessThanEq(Value::UInt(_)))
             }
@@ -198,10 +200,11 @@ impl Tile {
                 Tiling::Function { keys, values },
             ) => key_column.is_compatible_with_extent(keys) && value_tile.check_from(values),
             (Tile::Aggregation { .. }, Tiling::Aggregation { .. }) => true,
-            // The change ticks must lie in the commit domain; the per-tick delta
-            // encoding is trusted (like `Function`).
-            (Tile::Store { changes, .. }, Tiling::Store { domain, .. }) => {
-                changes.is_compatible_with_extent(domain)
+            // The state is a changelog per key, which is what the tiling's own
+            // `store_state` spells out; checking against that checks each key's change
+            // ticks against the commit domain and its values against that key's tiling.
+            (Tile::Store { state, .. }, tiling @ Tiling::Store { .. }) => {
+                state.check_from(&tiling.store_state())
             }
             _ => false,
         }
@@ -321,33 +324,31 @@ impl Tile {
                 })
             }
             // Change-append: `other`'s new commit ticks are strictly greater than any
-            // already present (the changelog only grows forward in commit time), so
-            // appending preserves the ascending order the fold relies on. The frontier
-            // advances to the union — for the watermark `LessThanEq(w)` this is
-            // `LessThanEq(max(w_self, w_other))`; the `terminal` flag ORs (either side
-            // declaring the frontier closed closes it), and `closed_keys` unions for the
-            // same reason — closure is monotone, so a key either side reports closed stays
-            // closed. A store releases by physically dropping a decided prefix (see
+            // already present (a changelog only grows forward in commit time), so
+            // appending preserves the ascending order the fold relies on. Each key's
+            // changelog is one row's collection, so the state merges as the whole value it
+            // is. The frontier advances to the union — for the watermark `LessThanEq(w)`
+            // this is `LessThanEq(max(w_self, w_other))`; the `terminal` flag ORs (either
+            // side declaring the frontier closed closes it), and `closed_keys` unions for
+            // the same reason — closure is monotone, so a key either side reports closed
+            // stays closed. A store releases by physically dropping a decided prefix (see
             // `remove_guarded`), never by logical tombstoning, which is why it carries no
             // `deleted`.
             (
                 Tile::Store {
-                    changes: s_changes,
-                    deltas: s_deltas,
+                    state: s_state,
                     frontier: s_frontier,
                     terminal: s_terminal,
                     closed_keys: s_closed,
                 },
                 Tile::Store {
-                    changes: o_changes,
-                    deltas: o_deltas,
+                    state: o_state,
                     frontier: o_frontier,
                     terminal: o_terminal,
                     closed_keys: o_closed,
                 },
             ) => {
-                s_changes.append(o_changes);
-                s_deltas.append(o_deltas);
+                s_state.merge_part(*o_state, true);
                 *s_frontier = s_frontier.union(&o_frontier);
                 *s_terminal = *s_terminal || o_terminal;
                 s_closed.extend(o_closed);
@@ -670,9 +671,10 @@ impl Tile {
                 ])
             }
             // The store's guard is over its commit-time domain (the change ticks), like a
-            // collection's — consumers release a prefix of it.
+            // collection's — consumers release a prefix of it. A tick naming any key is a
+            // change of the store, so the ticks are the union over the key changelogs.
             Tile::Store {
-                changes,
+                state,
                 frontier,
                 terminal,
                 ..
@@ -681,7 +683,7 @@ impl Tile {
                     TileGuard::Function(FunctionGuard::Domain(Predicate::True))
                 } else {
                     TileGuard::Function(FunctionGuard::Domain(
-                        Predicate::from_column_value(changes).union(frontier),
+                        store_change_ticks(state).union(frontier),
                     ))
                 }
             }
@@ -815,6 +817,42 @@ impl Tile {
             Tile::Function { row_starts, .. } => row_starts.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.rows(),
             Tile::Store { .. } => 1,
+        }
+    }
+
+    /// A store key's changelog: the commit ticks that wrote it, ascending, against the
+    /// values written there. `None` for a tile that is not a store, and for a key outside
+    /// its key space.
+    ///
+    /// This and [`Self::store_keys`] are the only way into a store's state, so the record
+    /// of collections it is encoded as stays this module's business — a reader folds the
+    /// changelog ([`store_value_at`](crate::interpreter::commit_operator::store_value_at)
+    /// and its neighbours) rather than indexing a tick.
+    pub fn store_changelog(&self, key: &str) -> Option<(&ColumnValue, &Tile)> {
+        match self.store_state().get(key)? {
+            Tile::Function { keys, values, .. } => Some((keys, values)),
+            other => unreachable!("a store key's changelog is a collection; got {other:?}"),
+        }
+    }
+
+    /// A store's key space — the mutable variables and reply taps it holds, which is
+    /// static and so complete whether or not a key has been written.
+    pub fn store_keys(&self) -> impl Iterator<Item = &String> {
+        self.store_state().keys()
+    }
+
+    /// The per-key changelogs of a store, empty for any other tile.
+    fn store_state(&self) -> &HashMap<String, Tile> {
+        static NONE: std::sync::LazyLock<HashMap<String, Tile>> =
+            std::sync::LazyLock::new(HashMap::new);
+        let Tile::Store { state, .. } = self else {
+            return &NONE;
+        };
+        match &**state {
+            Tile::Record(keys) => keys,
+            other => {
+                unreachable!("a store's state is a record of per-key changelogs; got {other:?}")
+            }
         }
     }
 
@@ -971,6 +1009,18 @@ pub fn validate_tile(tile: &Tile) -> bool {
     }
 }
 
+/// Every commit tick at which a store's state records a write, as the predicate naming
+/// them: a tick is a change of the store when any one key's changelog carries it.
+fn store_change_ticks(state: &Tile) -> Predicate {
+    let Tile::Record(keys) = state else {
+        unreachable!("a store's state is a record of per-key changelogs; got {state:?}")
+    };
+    keys.values().fold(Predicate::False, |acc, log| match log {
+        Tile::Function { keys, .. } => acc.union(&Predicate::from_column_value(keys)),
+        other => unreachable!("a store key's changelog is a collection; got {other:?}"),
+    })
+}
+
 /// Whether `tile` is well formed as a value vectorized over `rows` rows.
 ///
 /// The three rules, and nothing else: a scalar is one entry per row, a record is its fields
@@ -1026,22 +1076,27 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
             accumulator.rows() == terminal.len()
                 && (accumulator.is_empty() || accumulator.rows() == rows)
         }
-        // A store's changelog is one delta per change tick, and the ticks are strictly
-        // ascending — the fold ([`store_value_at`] et al.) and the change-append `merge`
-        // both depend on it, and neither is type-enforced. It is a whole value rather than
-        // something vectorized, so it stands at one row.
-        Tile::Store {
-            changes, deltas, ..
-        } => {
+        // A store is a record of per-key changelogs, each a collection over the store's
+        // one row, and each one's ticks are strictly ascending — the fold
+        // ([`store_value_at`] et al.) and the change-append `merge` both depend on that,
+        // and neither is type-enforced. It is a whole value rather than something
+        // vectorized, so it stands at one row.
+        Tile::Store { state, .. } => {
+            let Tile::Record(keys) = &**state else {
+                return false;
+            };
             rows == 1
-                && changes.len() == deltas.len()
-                && matches!(deltas, ColumnValue::Variants(_))
-                && (0..changes.len()).all(|i| {
-                    i == 0
-                        || matches!(
-                            (changes.index_at(i - 1), changes.index_at(i)),
+                && valid_over(state, 1)
+                && keys.values().all(|log| {
+                    let Tile::Function { keys, .. } = log else {
+                        return false;
+                    };
+                    (1..keys.len()).all(|i| {
+                        matches!(
+                            (keys.index_at(i - 1), keys.index_at(i)),
                             (Value::UInt(a), Value::UInt(b)) if a < b
                         )
+                    })
                 })
         }
     }
@@ -1389,8 +1444,15 @@ mod tests {
     #[should_panic(expected = "Invalid tile")]
     fn merge_rejects_a_repeated_commit_tick() {
         let store = || Tile::Store {
-            changes: ColumnValue::from_uints(vec![0]),
-            deltas: ColumnValue::Variants(vec![Value::UInt(1)]),
+            state: Box::new(Tile::Record(HashMap::from([(
+                "acc".to_string(),
+                Tile::function(
+                    ColumnValue::UInts(vec![0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                    Predicate::False,
+                    BitSet::new(),
+                ),
+            )]))),
             frontier: Predicate::False,
             terminal: false,
             closed_keys: Vec::new(),

@@ -2601,6 +2601,19 @@ pub(crate) fn store_key(reg: &str, at: Value) -> Value {
     }
 }
 
+/// The mutable variable a store key names — the tag half of [`store_key`], and the field
+/// the key's changelog sits at in a [`Tile::Store`](crate::interpreter::Tile)'s state.
+/// `None` for a value that is not a store key.
+pub(crate) fn store_key_name(key: &Value) -> Option<&str> {
+    match key {
+        Value::Union {
+            tag: FieldKey::Name(reg),
+            ..
+        } => Some(reg),
+        _ => None,
+    }
+}
+
 /// The extent of a store's key space — one arm per mutable variable, plus one per reply tap (a tap
 /// occupies a write-only arm of its own).
 ///
@@ -2656,15 +2669,13 @@ fn build_commit_store(
     // Per scalar key, an acyclic init operator seeding its tick-0 value (a literal
     // init is the trivial op; a computed init drains to its scalar).
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    // The store-wide per-commit value extent describes the map column's
-    // codomain in the store tiling (`full_store_tiling`). Reads project per key
-    // via each `KeyReadInfo.value_extent` and store values are dynamically
-    // tagged, so this is tiling metadata rather than an enforced cell type — but
-    // it must still *describe* the column faithfully, so for a heterogeneous
-    // multi-key store (`Mut(String, Txn)` + `Mut(Int, Txn)`) it is the union of the
-    // distinct per-key extents, not whichever key was iterated last. A
-    // homogeneous store collapses the union to its single extent (the common
-    // case, unchanged).
+    // The store-wide per-commit value extent types a *proposal's* read and write set
+    // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
+    // the extent must describe them all: for a heterogeneous multi-key store
+    // (`Mut(String, Txn)` + `Mut(Int, Txn)`) it is the union of the distinct per-key
+    // extents, not whichever key was iterated last. A homogeneous store collapses the
+    // union to its single extent. The store's own state carries each key's tiling
+    // instead (`store_values` below), which is what makes the union unnecessary there.
     // Whether this store continues a recurrence the retired version was running.
     // A store carrying a value has folded the positions that value summarizes, so
     // its drive resumes above them; one carrying none starts at its declared init
@@ -2737,12 +2748,20 @@ fn build_commit_store(
         })
         .collect();
 
-    let commit = CommitOperator::with_init_ops(
-        init_ops,
-        key_extent.clone(),
-        value_extent.clone(),
-        writer_write_keys,
-    );
+    // The store's state, one field per key with that key's own value tiling. The taps
+    // are read from the writers' bodies rather than from `keys_map`, which does not
+    // hold them until each writer is converted below — after the store they read back.
+    let mut store_values: HashMap<String, Tiling> = keys_map
+        .iter()
+        .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
+        .collect();
+    for taps in &per_writer_taps {
+        for (field, tap_ty) in taps {
+            store_values.insert(field.clone(), Tiling::Scalar(ctx.extent_of(tap_ty)?));
+        }
+    }
+
+    let commit = CommitOperator::with_init_ops(init_ops, store_values, writer_write_keys);
     let setters: Vec<_> = (0..writers.len())
         .map(|k| commit.writer_input_setter(k))
         .collect();
@@ -3327,13 +3346,6 @@ fn build_induction_store_single(
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let taps = body_tap_fields(&w.body.ty);
-    let key_extent = store_key_extent(
-        keys.iter()
-            .map(|k| k.name.field_key())
-            .chain(taps.iter().map(|(f, _)| f.clone()))
-            .map(|f| (f, Extent::Base(BaseType::Unit)))
-            .collect(),
-    );
     let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
     let domain = strip_refinements(domain);
 
@@ -3350,14 +3362,10 @@ fn build_induction_store_single(
     // leading-carry fold default.
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    let mut value_extents: Vec<Extent> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = store_key(&field, Value::Unit);
         let value_extent = ctx.extent_of(&k.init.ty)?;
-        if !value_extents.contains(&value_extent) {
-            value_extents.push(value_extent.clone());
-        }
         // A variable the replaced version was carrying resumes from the value it
         // held; one this version introduces starts from the init it declares.
         // Rebuilding a store therefore changes what the loop does next without
@@ -3488,24 +3496,17 @@ to the other's value",
         tap_fields.push(field);
     }
 
-    let value_extent = match value_extents.len() {
-        0 => Extent::Base(BaseType::Unit),
-        1 => value_extents.pop().expect("len == 1"),
-        _ => Extent::Union(TagMap::from_positional(value_extents)),
-    };
-
     // As in `build_commit_store`: the store, its fan branches and its driver are
     // all minted after the writer's own subexpressions have been converted, so
     // they attribute to the writer rather than to the enclosing binding.
     let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
-    let store = InductionStore::new(
-        init_ops,
-        write_keys,
-        tap_fields,
-        key_extent,
-        value_extent,
-        resume_at,
-    );
+    // The store's state, one field per key — accumulators and taps alike, each with its
+    // own value tiling.
+    let store_values: HashMap<String, Tiling> = keys_map
+        .iter()
+        .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
+        .collect();
+    let store = InductionStore::new(init_ops, write_keys, tap_fields, store_values, resume_at);
     let set_body = store.body_input_setter();
     // Cyclic: the driver reads this store's changelog back to recover each
     // position's previous accumulator, so one fan branch feeds the cycle and the
