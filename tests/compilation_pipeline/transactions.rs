@@ -605,9 +605,13 @@ fn string_valued_store() {
 /// program returns both as a tuple. Each rides the writer decision as its own
 /// `__to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
 /// of squares) = 1,5,14 over commit ticks 1,2,3.
+///
+/// The tuple is a value, so each component is a materialized collection keyed by
+/// commit tick rather than one collection of pairs. The two feeds have their own
+/// domains, and a pair of collections is not a collection of pairs.
 #[test]
 fn two_reply_feeds_one_transaction() {
-    check_tile(
+    check_collection_tile(
         indoc! {r#"
             outa = defer()
             outb = defer()
@@ -621,15 +625,22 @@ fn two_reply_feeds_one_transaction() {
                     outb << b
             (outa, outb)
         "#},
-        Tile::function(
-            ColumnValue::UInts(vec![1, 2, 3]),
-            Box::new(Tile::tuple(vec![
-                Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6])),
-                Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14])),
-            ])),
-            Predicate::True,
-            BitSet::new(),
-        ),
+        // A pair of collections, each keeping its own commit-tick domain — not one
+        // collection of pairs, which is what zipping the two would have made.
+        Tile::tuple(vec![
+            Tile::function(
+                ColumnValue::UInts(vec![1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            Tile::function(
+                ColumnValue::UInts(vec![1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+        ]),
     );
 }
 
@@ -1963,6 +1974,33 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
         "#},
         "read transactional variable `p` inside a `with begin():` block",
     );
+}
+
+/// A **conditionally fed** output compiles, which is the program output that carries
+/// a refinement.
+///
+/// Feeding a response under a guard restricts the channel's domain, so the output's
+/// type is `{source(…) | __elem ▷ …} ⤇ String` rather than an unrefined one. The output
+/// list is an ordinary `Record`, so planning decides each entry by whether it holds a
+/// collection — and a filtered collection is a collection, its predicate riding the
+/// domain. Reading the outer shape instead would answer the same here and differ on a
+/// compute-typed entry, which is the distinction
+/// `test_a_product_entry_is_a_site_exactly_when_it_holds_a_collection` pins.
+///
+/// No sink program in the suite fed a response under a guard before this one, so the
+/// refined output reached nothing.
+#[test]
+fn a_conditionally_fed_output_compiles() {
+    let code = indoc! {r#"
+        reqs, resps = http_serve("0", "GET", "/g")
+        for req in reqs:
+            if req != "skip":
+                resps << req
+    "#};
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    compile_program(&mut ctx, code, consumer)
+        .expect("a guarded feed restricts the output's domain, and it is still a collection");
 }
 
 /// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the

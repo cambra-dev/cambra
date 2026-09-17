@@ -299,3 +299,219 @@ fn test_datasource_named_record_join() {
 fn test_conditional_arms_at_different_record_widths(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
+
+// ---------------------------------------------------------------------------
+// Products holding a collection
+// ---------------------------------------------------------------------------
+
+/// A product value holds each component as the tile its own term produced, so a
+/// collection component stays a sealed function and `SelectField` hands it back.
+///
+/// The components' domains are unrelated, which is what separates a product of
+/// collections from a collection of products: assembling one as the other needs
+/// them to agree.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("r = (cash=10, lines=[1, 2, 3]); r.lines", &[1, 2, 3])]
+#[case("r = (cash=10, lines=[1, 2, 3]); [x * 2 for x in r.lines]", &[2, 4, 6])]
+#[case("t = (10, [4, 5, 6]); t.1", &[4, 5, 6])]
+#[case("r = (a=[1, 2], b=[4, 5, 6]); r.a", &[1, 2])]
+#[case("r = (a=[1, 2], b=[4, 5, 6]); r.b", &[4, 5, 6])]
+#[case("xs = [7, 8]; r = (n=1, held=xs); r.held", &[7, 8])]
+#[case("r = (n=1, inner=(k=2, deep=[7, 8])); r.inner.deep", &[7, 8])]
+fn test_collection_component_of_a_product(#[case] code: &str, #[case] expected: &[i64]) {
+    check_tile(code, make_int_list(expected));
+}
+
+/// The scalar components of such a product are untouched, and an aggregate over
+/// a projected collection component reads it as any other collection.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("r = (cash=10, lines=[1, 2, 3]); r.cash", Value::Int(10))]
+#[case("t = (10, [4, 5, 6]); t.0", Value::Int(10))]
+#[case("r = (cash=10, lines=[1, 2, 3]); sum(r.lines)", Value::Int(6))]
+#[case("t = (10, [4, 5, 6]); sum(t.1)", Value::Int(15))]
+#[case(
+    "r = (n=1, inner=(k=2, deep=[7, 8])); sum(r.inner.deep)",
+    Value::Int(15)
+)]
+fn test_scalar_component_beside_a_collection(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The whole product value: a record of tiles, each component keeping the tiling
+/// its own term produced. The two collections keep their own domains — `a` holds
+/// two elements where `b` holds three — which is what a product of collections is
+/// and a collection of products cannot be.
+#[test]
+fn test_product_of_collections_is_a_record_of_tables() {
+    check_collection_tile(
+        "r = (a=[1, 2], b=[4, 5, 6]); r",
+        Tile::Record(
+            [
+                ("a".to_string(), make_int_list(&[1, 2])),
+                ("b".to_string(), make_int_list(&[4, 5, 6])),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+}
+
+/// A record with a collection field is a constant, so a list of them is one too:
+/// `expr_to_value` reaches the nested list and builds its table.
+///
+/// A list literal's elements are whole `Value`s, so the record rides one column
+/// boxed (`Scalar(Records)`) rather than as the struct-of-arrays a record
+/// literal compiles to, and each `b` cell carries its own table.
+#[test]
+fn test_list_of_records_holding_collections() {
+    check_tile(
+        "xs = [(a=1, b=[1, 2]), (a=3, b=[4, 5])]; xs",
+        Tile::function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Records(
+                [
+                    ("a".to_string(), ColumnValue::Ints(vec![1, 3])),
+                    (
+                        "b".to_string(),
+                        ColumnValue::Variants(vec![
+                            make_int_collection(&[1, 2]),
+                            make_int_collection(&[4, 5]),
+                        ]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    );
+}
+
+/// A component that is computed rather than written out. Holding a collection
+/// means collecting one, and collecting needs something to collect, so planning
+/// marks a computed component as an iteration site even though the component
+/// position itself is not iterated (`planning::iterate`'s
+/// `mark_component_source`). A list literal is the exception at both ends: its
+/// table is built directly, with no iteration in between.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::record_comprehension("r = (n=1, xs=[y * 2 for y in [1, 2, 3]]); sum(r.xs)", Value::Int(12))]
+#[case::record_filtered(
+    "r = (n=1, xs=[y for y in [1, 2, 3] if y > 2]); sum(r.xs)",
+    Value::Int(3)
+)]
+#[case::record_scalar_beside("r = (n=1, xs=[y * 2 for y in [1, 2, 3]]); r.n", Value::Int(1))]
+#[case::tuple_comprehension("t = ([y * 2 for y in [1, 2, 3]], 1); sum(t.0)", Value::Int(12))]
+#[case::tuple_filtered("t = ([y for y in [1, 2, 3] if y > 2], 1); sum(t.0)", Value::Int(3))]
+fn test_computed_collection_component(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A partition is a component like any other. Every key of one holds a further
+/// collection, so it tiles as a curried function rather than a sealed one — and a
+/// component keeps the tiling its own term produced, so there is nothing here to
+/// flatten and nothing to reject.
+///
+/// Held rather than read back: reading a partition's entries takes
+/// `for k -> v in g`, which this version does not lower. What is pinned is that
+/// holding one compiles and leaves its siblings readable.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::record_field(r"r = (n=1, g=groupby([1, 1, 2], \x -> x)); r.n", Value::Int(1))]
+#[case::tuple_component(r"t = (groupby([1, 1, 2], \x -> x), 7); t.1", Value::Int(7))]
+fn a_partition_is_a_product_component_like_any_other(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A `let`-bound partition held as a component panics.
+///
+/// The inline case above compiles, so a product can hold a curried function. What
+/// this one trips is the key binder `groupby` mints, which `subst` reports as
+/// escaping its scope when the `let` is substituted through — a defect in
+/// substitution rather than in how a product holds a component.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::tuple_component(r"g = groupby([1, 1, 2], \x -> x); t = (g, 7); t.1", Value::Int(7))]
+#[ignore = "Barendregt violation in `subst`: a let-bound partition's key binder escapes"]
+fn a_let_bound_partition_component_panics(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A filtered component keeps the domain it binds rather than the extent it was
+/// filtered from: index `2` survives `y > 2` and indices `0` and `1` do not, so the
+/// field's tile is keyed by `2` alone.
+///
+/// The component's tiling is its own, so a sparse domain travels as a sparse
+/// domain. Boxed into a cell it would have to be read back out against something,
+/// and the extent is the only thing available to read it against — which would ask
+/// for keys this collection does not bind.
+#[test]
+fn test_a_filtered_component_keeps_the_domain_it_binds() {
+    check_collection_tile(
+        "r = (n=1, xs=[y for y in [1, 2, 3] if y > 2]); r",
+        Tile::Record(
+            [
+                ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                (
+                    "xs".to_string(),
+                    Tile::function(
+                        ColumnValue::UInts(vec![2]),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+                        Predicate::True,
+                        BitSet::new(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+}
+
+/// A **filter** over a projected collection component, the shape a map over one
+/// does not reach.
+///
+/// A filter plans as `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠`, naming its source twice:
+/// once inside the predicate and once as the composition stage that reads the
+/// surviving domain. That second occurrence puts the projection in function
+/// position with an input, where a map leaves it at the head with none. A
+/// projection denotes a collection rather than transforming one, so it answers an
+/// input the way a free `Var` does — by looking the collection up at each position.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::record(
+    "r = (n=1, xs=[1, 2, 3, 4]); sum([z for z in r.xs if z < 4])",
+    Value::Int(6)
+)]
+#[case::tuple("t = ([1, 2, 3, 4], 1); sum([z for z in t.0 if z < 4])", Value::Int(6))]
+#[case::filtered_component(
+    "r = (n=1, xs=[y for y in [1, 2, 3, 4] if y > 1]); sum([z for z in r.xs if z < 4])",
+    Value::Int(5)
+)]
+#[case::filter_and_map(
+    "r = (n=1, xs=[1, 2, 3, 4]); sum([z * 2 for z in r.xs if z < 4])",
+    Value::Int(12)
+)]
+#[case::nothing_survives(
+    "r = (n=1, xs=[1, 2, 3]); sum([z for z in r.xs if z > 99])",
+    Value::Int(0)
+)]
+#[case::everything_survives(
+    "r = (n=1, xs=[1, 2, 3]); sum([z for z in r.xs if z > 0])",
+    Value::Int(6)
+)]
+#[case::nested_projection(
+    "r = (a=(b=[1, 2, 3, 4])); sum([z for z in r.a.b if z < 3])",
+    Value::Int(3)
+)]
+// Two filters over one component: the projection is read at two different domains.
+#[case::two_filters(
+    "r = (n=1, xs=[1, 2, 3, 4]); sum([z for z in r.xs if z < 4]) + sum([w for w in r.xs if w > 2])",
+    Value::Int(13)
+)]
+fn test_filter_over_a_projected_component(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}

@@ -862,6 +862,16 @@ impl Tile {
         matches!(self, Tile::Function { .. })
     }
 
+    /// Whether a level sits here, or inside a record here — the test an operator makes
+    /// before boxing a value into a column, which has nowhere to put one.
+    pub fn holds_a_level(&self) -> bool {
+        match self {
+            Tile::Function { .. } => true,
+            Tile::Record(fields) => fields.values().any(Tile::holds_a_level),
+            _ => false,
+        }
+    }
+
     /// The key path of every key of this collection, each extending its row's path.
     ///
     /// `row_paths` holds one path per row, so the result — one path per key — is the
