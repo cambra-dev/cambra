@@ -12,7 +12,7 @@ use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
-    sort_sealed_function_by_domain, tuple_field,
+    sort_function_by_domain, tuple_field,
 };
 use rstest_log::rstest;
 
@@ -70,8 +70,7 @@ fn test_record_field_in_comp_body(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_comp_with_record_body() {
-    let tile =
-        sort_sealed_function_by_domain(run_pipeline("[(n=x, doubled=x * 2) for x in [1, 2, 3]]"));
+    let tile = sort_function_by_domain(run_pipeline("[(n=x, doubled=x * 2) for x in [1, 2, 3]]"));
     assert_eq!(
         extract_record_field(tile.clone(), "n"),
         ColumnValue::Ints(vec![1, 2, 3]),
@@ -91,16 +90,11 @@ fn test_comp_with_record_body() {
 )]
 #[case(
     r#"[r.y for r in [(x=1, y="a"), (x=2, y="b"), (x=3, y="c")]]"#,
-    Tile::SealedFunction {
-        domain: ColumnValue::UInts(vec![0, 1, 2]),
-        codomain: Box::new(Tile::Scalar(ColumnValue::Strings(vec![
+    Tile::function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Strings(vec![
             "a".into(),
             "b".into(),
             "c".into(),
-        ]))),
-        domain_predicate: Predicate::True,
-        deleted: BitSet::new(),
-    }
+        ]))), Predicate::True, BitSet::new())
 )]
 fn test_comp_over_record_list(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -110,11 +104,14 @@ fn test_comp_over_record_list(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_comp_filter_on_record_field() {
-    let tile = sort_sealed_function_by_domain(run_pipeline(
+    let tile = sort_function_by_domain(run_pipeline(
         r#"[r.name for r in [(name="alice", age=30), (name="bob", age=17), (name="carol", age=25)] if r.age >= 18]"#,
     ));
-    let Tile::SealedFunction { codomain, .. } = tile else {
-        panic!("expected SealedFunction");
+    let Tile::Function {
+        values: codomain, ..
+    } = tile
+    else {
+        panic!("expected Function");
     };
     assert_eq!(
         scalar_tile_to_column_value(*codomain),
@@ -160,7 +157,7 @@ fn test_join_with_record_body() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_hash_join_record_body() {
-    let tile = sort_sealed_function_by_domain(run_pipeline(
+    let tile = sort_function_by_domain(run_pipeline(
         "[(left=x, right=y) for x in [1, 2, 3] for y in [2, 3, 4] if x == y]",
     ));
     // matched pairs: (2,2) and (3,3)
@@ -249,10 +246,13 @@ fn test_datasource_named_record_join() {
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
-    let tile = sort_sealed_function_by_domain(producer.get(producer.tiling().universal_guard()));
+    let tile = sort_function_by_domain(producer.get(producer.tiling().universal_guard()));
     // Only (id=1, "a") × (id=1, "x") should match
-    let Tile::SealedFunction { codomain, .. } = tile else {
-        panic!("expected SealedFunction, got {tile:?}");
+    let Tile::Function {
+        values: codomain, ..
+    } = tile
+    else {
+        panic!("expected Function, got {tile:?}");
     };
     let Tile::Record(mut fields) = *codomain else {
         panic!("expected Record codomain");

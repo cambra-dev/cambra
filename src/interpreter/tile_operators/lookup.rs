@@ -74,15 +74,15 @@ impl CheckedLookup {
     /// Look each row's key up in that row's collection, over an assembled stream of
     /// `(collection, key)` pairs. The answer's domain is the stream's own.
     pub fn paired(pairs: Box<dyn TileOperator>, option_extent: Extent) -> Result<Self, String> {
-        let Tiling::SealedFunction { domain, codomain } = pairs.tiling() else {
+        let Tiling::Function { keys, values } = pairs.tiling() else {
             return Err(format!(
                 "`lookup?` over an assembled pair needs a stream of rows, got {}",
                 pairs.tiling()
             ));
         };
-        let Tiling::Record(fields) = codomain.as_ref() else {
+        let Tiling::Record(fields) = values.as_ref() else {
             return Err(format!(
-                "`lookup?`'s input rows must be `(collection, key)` pairs, got {codomain}"
+                "`lookup?`'s input rows must be `(collection, key)` pairs, got {values}"
             ));
         };
         // Field 0 is the collection. A nested function tiling is one collection shared by
@@ -92,7 +92,7 @@ impl CheckedLookup {
             .get(&tuple_field(0))
             .ok_or_else(|| "`lookup?`'s input rows have no collection field".to_string())?;
         match collection {
-            Tiling::SealedFunction { .. } | Tiling::Scalar(Extent::Function { .. }) => {}
+            Tiling::Function { .. } | Tiling::Scalar(Extent::Function { .. }) => {}
             other => {
                 return Err(format!(
                     "`c[k]?` over a collection whose values are themselves collections is not \
@@ -113,9 +113,9 @@ impl CheckedLookup {
                 ));
             }
         }
-        let tiling = Tiling::SealedFunction {
-            domain: domain.clone(),
-            codomain: Box::new(Tiling::Scalar(option_extent)),
+        let tiling = Tiling::Function {
+            keys: keys.clone(),
+            values: Box::new(Tiling::Scalar(option_extent)),
         };
         Ok(Self {
             base: OperatorBase::new(tiling),
@@ -128,9 +128,9 @@ impl CheckedLookup {
 fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
     match keys {
         Tiling::Scalar(_) => Tiling::Scalar(option_extent),
-        Tiling::SealedFunction { domain, .. } => Tiling::SealedFunction {
-            domain: domain.clone(),
-            codomain: Box::new(Tiling::Scalar(option_extent)),
+        Tiling::Function { keys, .. } => Tiling::Function {
+            keys: keys.clone(),
+            values: Box::new(Tiling::Scalar(option_extent)),
         },
         other => panic!("CheckedLookup keys must be a scalar or a stream, got {other}"),
     }
@@ -242,24 +242,32 @@ fn answer_in_value(key: &Value, m: &Value) -> Value {
 /// answers immediately ([`answer_in_value`]).
 fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
     match coll {
-        Tile::SealedFunction {
-            domain, codomain, ..
-        } => match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
-            Some(i) => {
-                // `None` here would read as "still deciding" for a shape that will never
-                // change, and the lookup would spin instead of answering. Op-conversion's
-                // `reject_unanswerable_lookup_collection` is what makes this unreachable.
-                let Tile::Scalar(values) = codomain.as_ref() else {
-                    panic!(
-                        "CheckedLookup: an answer's `some` payload is one column value, so the \
+        Tile::Function {
+            keys: domain,
+            values: codomain,
+            ..
+        } => {
+            assert!(
+                !codomain.is_function(),
+                "a streamed collection maps keys to values, so its keys are one level"
+            );
+            match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
+                Some(i) => {
+                    // `None` here would read as "still deciding" for a shape that will never
+                    // change, and the lookup would spin instead of answering. Op-conversion's
+                    // `reject_unanswerable_lookup_collection` is what makes this unreachable.
+                    let Tile::Scalar(values) = codomain.as_ref() else {
+                        panic!(
+                            "CheckedLookup: an answer's `some` payload is one column value, so the \
                          collection's codomain tiles as a scalar; got {codomain:?}"
-                    )
-                };
-                Some(some_of(values.index_at(i)))
+                        )
+                    };
+                    Some(some_of(values.index_at(i)))
+                }
+                None if coll.is_terminal() => Some(none()),
+                None => None,
             }
-            None if coll.is_terminal() => Some(none()),
-            None => None,
-        },
+        }
         Tile::Scalar(col) if !col.is_empty() => Some(answer_in_value(key, &col.index_at(0))),
         // A materialized collection that has not arrived yet.
         Tile::Scalar(_) => None,
@@ -320,7 +328,9 @@ impl TileProducer for CheckedLookupProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
-            Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+            Tiling::Function {
+                values: codomain, ..
+            } => codomain.extent(),
             other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
@@ -347,9 +357,9 @@ impl TileProducer for CheckedLookupProducer {
                     },
                     // A stream of keys, each answered against the same collection — read
                     // once, not lifted into every row.
-                    Tile::SealedFunction {
-                        ref domain,
-                        ref codomain,
+                    Tile::Function {
+                        keys: ref domain,
+                        values: ref codomain,
                         ref domain_predicate,
                         ..
                     } => {
@@ -374,9 +384,9 @@ impl TileProducer for CheckedLookupProducer {
                 tile.compact();
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty scalar, and this operator does the same until its rows arrive.
-                let Tile::SealedFunction {
-                    ref domain,
-                    ref codomain,
+                let Tile::Function {
+                    keys: ref domain,
+                    values: ref codomain,
                     ref domain_predicate,
                     ..
                 } = tile
@@ -444,10 +454,7 @@ impl CheckedLookupProducer {
         domain_predicate: &Predicate,
         out_extent: &Extent,
     ) -> Tile {
-        let Tiling::SealedFunction {
-            domain: dom_ext, ..
-        } = self.tiling()
-        else {
+        let Tiling::Function { keys: dom_ext, .. } = self.tiling() else {
             panic!("CheckedLookup answers a stream when its keys are one")
         };
         // The answer seals only where it holds a row for every key. A key the collection has
@@ -459,14 +466,11 @@ impl CheckedLookupProducer {
         } else {
             Predicate::False
         };
-        Tile::SealedFunction {
-            domain: ColumnValue::from_values(kept, dom_ext),
-            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(answers, out_extent))),
+        Tile::function(
+            ColumnValue::from_values(kept, dom_ext),
+            Box::new(Tile::Scalar(ColumnValue::from_values(answers, out_extent))),
             domain_predicate,
-            // The rows are the live keys the collection has decided, a subsequence of an
-            // already-compacted domain. Carrying the input's bitset forward would name
-            // positions of a column this one no longer shares.
-            deleted: BitSet::new(),
-        }
+            BitSet::new(),
+        )
     }
 }

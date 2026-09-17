@@ -55,7 +55,7 @@ sparse_apply : { SparseFn(T, U), T } ⇒ functionTiling(T, Option(U)).Tile
 ```
 
 `SparseFn` implements the partial function tiling for `T ⇒ Option(U)`, but with a more compact
-representation than mapping every element of the domain. In the implementation this is `Tile::SealedFunction { domain, codomain, domain_predicate, deleted }`: `somes` are the `domain → codomain` mappings and `nones` is the `domain_predicate` seal (the region known to yield no further values).
+representation than mapping every element of the domain. In the implementation this is `Tile::Function { row_starts, keys, values, domain_predicate, deleted }`: `somes` are the keys paired with their values and `nones` is the `domain_predicate` seal (the region known to yield no further values).
 This tiling has universal split-determinism, as all partial-function tilings do.
 
 This representation allows consumers to split on the function's domain and receive a compact

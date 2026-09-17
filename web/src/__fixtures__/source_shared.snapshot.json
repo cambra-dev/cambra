@@ -4394,7 +4394,7 @@
           "label": "IterateExtent",
           "nodeId": 640,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → Source(stdin))",
+          "tiling": "Fn(Source(stdin) → Source(stdin))",
           "spans": [
             {
               "start": 34,
@@ -4412,7 +4412,7 @@
           "label": "MapResultWithSource",
           "nodeId": 641,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 34,
@@ -4467,7 +4467,7 @@
           "label": "MapResultToConst",
           "nodeId": 643,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → {String, String})",
+          "tiling": "Fn(Source(stdin) → {String, String})",
           "spans": [
             {
               "start": 10,
@@ -4522,7 +4522,7 @@
           "label": "MapResult",
           "nodeId": 645,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 10,
@@ -4559,7 +4559,7 @@
           "label": "Memo",
           "nodeId": 646,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 0,
@@ -4587,7 +4587,7 @@
           "label": "FanOutBranch",
           "nodeId": 654,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 87,
@@ -4615,7 +4615,7 @@
           "label": "IterateExtent",
           "nodeId": 647,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → Source(stdin))",
+          "tiling": "Fn(Source(stdin) → Source(stdin))",
           "spans": [
             {
               "start": 77,
@@ -4633,7 +4633,7 @@
           "label": "MapResultWithSource",
           "nodeId": 648,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 77,
@@ -4688,7 +4688,7 @@
           "label": "MapResultToConst",
           "nodeId": 650,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → {String, String})",
+          "tiling": "Fn(Source(stdin) → {String, String})",
           "spans": [
             {
               "start": 54,
@@ -4743,7 +4743,7 @@
           "label": "MapResult",
           "nodeId": 652,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 54,
@@ -4780,7 +4780,7 @@
           "label": "Memo",
           "nodeId": 653,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 43,
@@ -4808,7 +4808,7 @@
           "label": "FanOutBranch",
           "nodeId": 655,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → String)",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "start": 95,
@@ -4836,7 +4836,7 @@
           "label": "FanIn",
           "nodeId": 656,
           "role": "operator",
-          "tiling": "SF(Source(stdin) → {String, String})",
+          "tiling": "Fn(Source(stdin) → {String, String})",
           "spans": [
             {
               "start": 87,
