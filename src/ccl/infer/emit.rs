@@ -1791,7 +1791,7 @@ pub(super) fn emit_let<C: Typing>(
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
     // story.
-    Ok(ctx.close_let_type(&binding.name, bound_expr, body_ty))
+    Ok(ctx.close_let_type(binding, bound_expr, body_ty))
 }
 
 /// Run `f` with every `(name, ty)` pair bound monomorphically, innermost-last
@@ -1887,7 +1887,15 @@ pub(super) fn emit_mut_decl<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx))?;
-    let history = ctx.normalize(&binding.ty);
+    let mut history = ctx.normalize(&binding.ty);
+    // The declared value type's predicates are terms, and the binder's slot is what
+    // carries them to the post-inference wall — an untyped one surfaces there as
+    // `UnresolvedInfer` on the predicate's own nodes (see
+    // `emit_annotation_predicates`). A mutable variable declares its refinement on the
+    // binder rather than in a `user_annotation`, so this is the only place that types it.
+    // Routed through the mode for the reason `emit_lambda`'s call is: Check trusts a
+    // resolved predicate.
+    ctx.type_annotation_predicates(&mut history)?;
     debug_assert!(
         history.mut_value_type().is_some(),
         "a MutDecl binder must be an Overwrite history, got {history}"

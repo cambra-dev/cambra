@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, Type, TypedExprNode,
-    UnaryOpKind,
+    ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
+    TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -366,9 +366,16 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             };
             let val_str = fmt(value, Precedence::Lowest, opts);
             let body_str = fmt(body, Precedence::Lowest, opts);
+            // An opaque binder keeps CHL's `^=`. The two forms differ in what a
+            // type lifted past the binder reads in its place, and nothing in the
+            // term shows that, so one spelling would render them alike.
+            let op = match binding.transparency {
+                BindingTransparency::Transparent => "=",
+                BindingTransparency::Opaque => "^=",
+            };
             (
                 Precedence::Lowest,
-                format!("let {}{ty_str} = {val_str}\nin {body_str}", binding.name),
+                format!("let {}{ty_str} {op} {val_str}\nin {body_str}", binding.name),
             )
         }
 
@@ -708,8 +715,9 @@ mod tests {
     use super::symbolic;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Refinement,
-        TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind, WriterSite,
+        AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, Expr, Lit,
+        LogicKind, Refinement, TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode,
+        UnaryOpKind, WriterSite,
     };
     use rstest::rstest;
     use std::rc::Rc;
@@ -1022,6 +1030,7 @@ in y"
                     name: "x".into(),
                     ty: Type::Base(BaseType::Int),
                     user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
                 },
                 Expr::lit(Lit::Int(0)),
             )],

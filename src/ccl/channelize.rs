@@ -118,8 +118,8 @@ use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
 use crate::ccl::{
-    BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, PredicateId, Refinement, Type,
-    TypedBinding, TypedExpr, TypedExprNode,
+    BaseType, BindingTransparency, Branch, Expr, HistoryKind, Lit, Name, Pattern, PredicateId,
+    Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance,
@@ -523,12 +523,20 @@ fn is_defer_returning(expr: &Expr, name: &Name) -> bool {
 /// Replace the trailing `Var(_)` at the terminal of `expr` (walking
 /// through `ExprStmt`/`Let` chains) with `replacement`.
 ///
+/// Every spine node on the way takes its **type from the new terminal**: a
+/// statement's type is its body's, so a spine whose terminal is swapped for a
+/// value of another type has a stale type at every node above the swap. The
+/// stale type outlives channelization — a `let` that carried the lifted
+/// defer's handle type still claims it over a body that now ends in the
+/// program's result — and surfaces as an `Expected function type` at the
+/// letrec-recognition typecheck rather than here.
+///
 /// Caller is responsible for ensuring `expr` actually ends in a
 /// `Var` (e.g. via [`is_defer_returning`]).
 fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
     let TypedExpr {
         node,
-        ty,
+        ty: _,
         user_annotation,
         node_id,
     } = expr;
@@ -548,6 +556,10 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
             body: Box::new(replace_result_var(*body, replacement)),
         },
         _ => panic!("replace_result_var: expression doesn't end in a Var"),
+    };
+    let ty = match &new_node {
+        TypedExprNode::ExprStmt { body, .. } | TypedExprNode::Let { body, .. } => body.ty.clone(),
+        _ => unreachable!("only the two spine arms above reach here"),
     };
     TypedExpr {
         node: new_node,
@@ -1727,6 +1739,7 @@ fn channelize_cluster(
                     name: name.clone(),
                     ty: channel.ty.clone(),
                     user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
                 },
                 channel,
             ));

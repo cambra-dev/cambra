@@ -476,6 +476,9 @@ fn hash_binding<'a>(
         hash_type(&b.ty, env, free, state);
     }
     hash_opt_type(b.user_annotation.as_ref(), env, free, state);
+    // Authored at the binder and derived from nothing else in the tree, so it
+    // rides both folds: `y = e` and `y ^= e` are different programs.
+    std::mem::discriminant(&b.transparency).hash(state);
 }
 
 /// How much of a node's payload a fold takes in.

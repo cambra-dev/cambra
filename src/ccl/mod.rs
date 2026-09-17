@@ -6,6 +6,7 @@
 //!
 //! See the design docs in `src/ccl/design/` for the full design rationale.
 
+pub mod anf;
 pub mod ccl_utils;
 pub mod channelize;
 pub mod content_hash;
@@ -17,6 +18,7 @@ pub mod lambda_elim;
 pub mod letrec;
 pub mod lower;
 pub mod mut_elim;
+pub mod mut_read;
 pub mod names;
 pub mod panes;
 pub mod planning;
