@@ -17,12 +17,12 @@
 //! (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
 //!
 //! Only a witness over **named candidates** can be realized here: the legs are the
-//! candidates, so there have to be finitely many, named. A witness over `UIntRanges`
-//! (`List(𝑇)`) or the universe (`Collection(𝑇)`) is left alone, and ordinary code over one
-//! still compiles because inlining and monomorphization resolve its domain from the concrete
-//! producer before op-conversion. Such a Σ reaching op-conversion with no concrete domain
-//! fails there, which is the correct signal: that is the case needing a runtime witness
-//! rather than a static realization (`src/ccl/design/collections.md`, "Compiling a
+//! candidates, so there have to be finitely many, named. Realization is therefore one of
+//! three dispositions a witness gets, and this pass decides all three. A determined witness —
+//! one candidate — is erased, term and types together. An undetermined one whose candidates a
+//! `Case` picks between is realized. Every other is **materialized**: the introduction stays
+//! standing and the value carries the witness, which is what a `List(𝑇)`'s `UIntRanges` and a
+//! `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` reach (`src/ccl/design/collections.md`, "Compiling a
 //! conditional collection").
 
 use std::rc::Rc;
@@ -43,8 +43,17 @@ pub(super) fn realize_conditional_collections(
 ) -> std::collections::HashSet<crate::ccl::ty::WitnessId> {
     let mut erased = std::collections::HashMap::new();
     let mut discharged = std::collections::HashSet::new();
+    let mut kept = std::collections::HashSet::new();
     inline_undetermined_conditionals(expr);
-    realize_and_unbox(expr, &mut erased, &PredMemo::new(), false, &mut discharged);
+    realize_and_unbox(
+        expr,
+        &mut erased,
+        &PredMemo::new(),
+        false,
+        &mut discharged,
+        None,
+        &mut kept,
+    );
     // **The other half of the erasure.** `unbox` removed the introduction from the *term*;
     // every type still says `Σ`. A type asserting an indeterminacy the term no longer has
     // is not a harmless leftover: the domain it presents at a consuming site is a witness,
@@ -71,7 +80,10 @@ pub(super) fn realize_conditional_collections(
     // stands over a `Variant` of its legs' domains, and `Realize` asserts the sum over it.
     // A same-domain conditional is that case — one candidate, two legs — and instantiating
     // its assertion would contradict the term it asserts over.
-    collapse_determined_sums(expr, &discharged);
+    // **What the term half declined to erase, the type half must decline too.** Realization
+    // consumed one set and [`unbox`] left the other standing; both are sums that survive.
+    let survives: std::collections::HashSet<_> = discharged.union(&kept).copied().collect();
+    collapse_determined_sums(expr, &survives);
     discharged
 }
 
@@ -140,6 +152,59 @@ fn undetermined_witness(ty: &Type) -> bool {
     )
 }
 
+/// The type each child of `expr` is expected to have, where the position says something the
+/// child's own type does not.
+///
+/// A position says something extra exactly where inference made **several terms lower bounds of
+/// one variable**: the variable's merge is what the position holds, and each term states only
+/// its own contribution. Every such site in `emit.rs` needs an arm here, and the three that can
+/// put a sum at the merged position are:
+///
+/// - **A list literal's elements** (`emit_list`). The whole element type flows into one
+///   variable, sum and all, so that position binds a witness over every candidate that reached
+///   it (`src/ccl/design/type-inference.md`, "The domain join needs `box`").
+/// - **A copair's arms** (`emit_copair`) and **a disjoint join's** (`emit_disjoint_join`). The
+///   operand's own sum is decomposed — its domain becomes a variant tag — so an arm position
+///   binds no witness of its own, but the **codomains** merge into one variable. Where the
+///   elements are themselves collections that merge is a sum, and each arm's child stands at it.
+///   So an arm is handed this node's own type: its `codomain` is the merged one, and it binds no
+///   witness, both of which are what the position holds.
+///
+/// A `box`'s argument is here for a different reason: `box` is the identity on values, so its
+/// argument stands where the application stands, and an annotation naming a described kind lands
+/// on the application while the introduction states the single candidate the value is.
+///
+/// `emit_case` merges its branches the same way and needs no arm: realization consumes a
+/// collection-valued `Case` before this walk reaches it. Every other position types its child by
+/// the child's own term.
+fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
+    match &expr.node {
+        TypedExprNode::Apply { function, .. }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
+        {
+            Some(effective.clone())
+        }
+        TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => Some(effective.clone()),
+        TypedExprNode::List(_) => effective.codomain(),
+        _ => None,
+    }
+}
+
+/// Whether `ty` binds a witness that is **not determined** — the complement, at the outermost
+/// binder, of the one-candidate precondition [`unbox`] erases under.
+///
+/// Wider than [`undetermined_witness`], which asks only whether realization has candidates to
+/// fan out over. A described kind — `UIntRanges` for a `List(𝑇)`, `SubtypesOf(𝐾)` for a
+/// `Map(𝐾, 𝑉)`, the universe for a `Collection(𝑇)` — names no candidate at all, so it is
+/// neither determined nor realizable and the value is what says which domain it is.
+fn binds_an_undetermined_witness(ty: &Type) -> bool {
+    match ty.witness_kind() {
+        None => false,
+        Some(crate::ccl::ty::TypeKind::Enumerated(ds)) => ds.len() != 1,
+        Some(_) => true,
+    }
+}
+
 /// `in_predicate` records that this subtree *is* a refinement predicate. A predicate may
 /// carry no realized collection (`debug_assert_no_iteration_markers_in_type`: a gated union
 /// needs the `iterate`/`restrict` a predicate is forbidden), so realization does not fire
@@ -152,8 +217,13 @@ fn realize_and_unbox(
     memo: &PredMemo<()>,
     in_predicate: bool,
     discharged: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    demand: Option<Type>,
+    kept: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) -> bool {
     let mut changed = false;
+    // Every question below is asked of this rather than of `expr.ty`, because the witness that
+    // has to survive is the one the position binds ([`child_demand`]).
+    let effective = demand.unwrap_or_else(|| expr.ty.clone());
     // **A conditional inside a predicate is left entirely alone** — not only unrealized,
     // but un-rewritten. It is a placeholder: the per-leg discharge replaces the whole
     // predicate with one reading that leg's arm ([`read_the_arm_instead`]), so nothing
@@ -182,9 +252,52 @@ fn realize_and_unbox(
         );
         changed |= realize(expr, discharged);
     }
-    expr.walk_children_mut(|child| {
-        changed |= realize_and_unbox(child, erased, memo, in_predicate, discharged)
-    });
+    // **A position whose witness survives keeps every sum describing it.** The elements are
+    // held at the element position, so collapsing that position's own sum while their
+    // introductions stand would leave the codomain saying one domain where each element says
+    // its own.
+    let below = child_demand(expr, &effective);
+    if below.as_ref().is_some_and(binds_an_undetermined_witness)
+        && let Some(elem) = expr.ty.codomain()
+    {
+        for w in witnesses_named_by(&elem) {
+            kept.insert(*w.id());
+        }
+    }
+    // **A record names each field separately**, so its fields share no one demand the way an
+    // arm list does and [`child_demand`] has none to give them. `transact_phase`'s write set is
+    // the standing case: `(m: 𝑣)` is typed by the mutable variable's *declared* value type, so a
+    // `Mut(List(𝑇), Txn)` write states the one candidate it is at a field bound over
+    // `UIntRanges`.
+    let record_fields = match effective.peel_refinements() {
+        Type::Record(fs) if matches!(expr.node, TypedExprNode::Record(_)) => Some(fs.clone()),
+        _ => None,
+    };
+    if let Some(field_tys) = record_fields {
+        let TypedExprNode::Record(fields) = &mut expr.node else {
+            unreachable!("guarded by the match above")
+        };
+        for (name, child) in fields.iter_mut() {
+            let field = field_tys
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone());
+            changed |=
+                realize_and_unbox(child, erased, memo, in_predicate, discharged, field, kept);
+        }
+    } else {
+        expr.walk_children_mut(|child| {
+            changed |= realize_and_unbox(
+                child,
+                erased,
+                memo,
+                in_predicate,
+                discharged,
+                below.clone(),
+                kept,
+            )
+        });
+    }
     // **A refinement predicate is a term too, and it carries its own copy of the source.**
     // A filter looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so when `src` is
     // a `box` the introduction sits inside the predicate — somewhere the term walk above
@@ -198,6 +311,8 @@ fn realize_and_unbox(
                 memo,
                 true,
                 &mut std::collections::HashSet::new(),
+                None,
+                kept,
             )
         });
     });
@@ -209,11 +324,10 @@ fn realize_and_unbox(
     // Determined means the kind names exactly *one* candidate: one possible witness is no
     // information, so nothing has to carry it — the same reading [`arm_domain`] takes. A
     // sum with two or more candidates that reaches here was **not** realized by a fan-out
-    // above, so its witness is real and has to exist at runtime; erasing it would drop the
-    // discriminant and silently compile the wrong program. Nothing can represent such a
-    // witness yet (`src/ccl/design/collections.md`, "Compiling a conditional collection"),
-    // so it is left standing to be rejected by name at op-conversion — which is the correct
-    // failure, and the signal that the runtime witness is what the program needs.
+    // above, so its witness is real; erasing it would drop the discriminant and silently
+    // compile the wrong program. It is left standing instead, and op-conversion reads the
+    // value's own keys (`src/ccl/design/collections.md`, "Compiling a conditional
+    // collection").
     let (unboxed, erased_here) = {
         let _g = provenance::enter(
             expr.node_id(),
@@ -223,6 +337,8 @@ fn realize_and_unbox(
         unbox(
             std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
             Some(erased),
+            &effective,
+            kept,
         )
     };
     *expr = unboxed;
@@ -740,21 +856,28 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
     fn go(
         expr: &mut Expr,
         erased: &mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
+        demand: Option<Type>,
+        kept: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
     ) {
-        expr.walk_children_mut(|child| go(child, erased));
+        let effective = demand.unwrap_or_else(|| expr.ty.clone());
+        let below = child_demand(expr, &effective);
+        expr.walk_children_mut(|child| go(child, erased, below.clone(), kept));
         let (unboxed, _) = unbox(
             std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
             Some(erased),
+            &effective,
+            kept,
         );
         *expr = unboxed;
     }
     let mut arm = arm;
     let mut erased = std::collections::HashMap::new();
-    go(&mut arm, &mut erased);
+    let mut kept = std::collections::HashSet::new();
+    go(&mut arm, &mut erased, None, &mut kept);
     if !erased.is_empty() {
         instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new());
     }
-    collapse_determined_sums(&mut arm, &std::collections::HashSet::new());
+    collapse_determined_sums(&mut arm, &kept);
     arm
 }
 
@@ -1015,6 +1138,8 @@ fn arm_domain(ty: &Type) -> Option<Type> {
 fn unbox(
     e: Expr,
     erased: Option<&mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>>,
+    effective: &Type,
+    kept: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) -> (Expr, bool) {
     let TypedExprNode::Apply { function, argument } = &e.node else {
         return (e, false);
@@ -1035,6 +1160,21 @@ fn unbox(
     // the witness free, cannot answer. `box`'s function type states the sum it introduces and
     // no rewrite retypes it.
     let stated = function.ty.codomain().unwrap_or_else(|| e.ty.clone());
+    // **An introduction whose position binds an undetermined witness stays**, whatever its own
+    // states. `box` names the single candidate the value is, and the position it fills may bind
+    // a witness over more: a list literal's element position ranges over every candidate that
+    // reached the join, and an annotation names a described kind — `Map(𝐾, 𝑉)` binds
+    // `SubtypesOf(𝐾)` where the value's keys are one candidate. Erasing against the stated kind
+    // is locally justified and drops the injection, leaving a bare collection where every
+    // consumer downstream reads a sum.
+    if binds_an_undetermined_witness(effective) {
+        for ty in [&stated, &e.ty] {
+            for w in witnesses_named_by(ty) {
+                kept.insert(*w.id());
+            }
+        }
+        return (e, false);
+    }
     // Only a determined witness — one candidate — is erasable.
     match stated.witness_kind() {
         Some(crate::ccl::ty::TypeKind::Enumerated(ds)) if ds.len() == 1 => {

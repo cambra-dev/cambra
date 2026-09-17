@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use cambra::interpreter::Value;
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -161,5 +162,87 @@ fn a_filter_over_a_box_that_already_carries_one() {
     check_scalar(
         "x = box([z for z in [1, 2, 3] if z > 1])\nsum([y for y in x if y < 3])",
         Value::Int(2),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A jagged nested collection — the witness the value carries
+// ---------------------------------------------------------------------------
+
+/// **Elements at differing domains, joined into one element position.** Each `box` states the
+/// single candidate it is and the join binds a witness over both, so the witness is neither
+/// determined nor a branch's to pick: the value is what says which domain each element has.
+///
+/// **The aggregates are chosen to distinguish a per-row fold from a flattened one.** `sum` over
+/// `sum` is blind here — `sum([sum(r) for r in xs])` and `sum(flatten(xs))` agree on every
+/// input — so a wrong answer would read as right. `sum` over `max` does not: over rows `[1, 2]`
+/// and `[3, 4, 5]` it answers 7, where flattening answers 5 or 15. One `sum`/`sum` case is kept
+/// as the plain reading.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("sum([max(r) for r in [box([1, 2]), box([3, 4, 5])]])", Value::Int(7))]
+#[case("sum([sum(r) for r in [box([1, 2]), box([3, 4, 5])]])", Value::Int(15))]
+// The other order, so neither aggregate is the one that could be folding both levels.
+#[case("max([sum(r) for r in [box([1, 2]), box([3, 4, 5])]])", Value::Int(12))]
+#[case(
+    "sum([max(r) for r in box([box([1, 2]), box([3, 4, 5])])])",
+    Value::Int(7)
+)]
+// The outer box is determined — one candidate — so its own introduction still erases while
+// the inner ones stand.
+#[case(
+    indoc! {r"
+        x = box([box([1, 2]), box([3, 4, 5])])
+        sum([max(r) for r in x])
+    "},
+    Value::Int(7)
+)]
+// Three elements, so the join names three candidates and no two rows share a length.
+#[case(
+    "sum([max(r) for r in [box([1]), box([2, 3]), box([4, 5, 6])]])",
+    Value::Int(10)
+)]
+// A rectangular literal forms no sum at all: the element domains agree, so the join needs no
+// `box` and the elements are plain collections.
+#[case("sum([max(r) for r in [[1, 2], [3, 4]]])", Value::Int(6))]
+// **Through a copair.** `++` decomposes each operand's own sum into a variant tag, but merges
+// the operands' *codomains* into one variable — so where the elements are collections that
+// merge is a sum, and an arm's elements stand at it exactly as a literal's do.
+#[case(
+    "sum([max(r) for r in ([box([1, 2])] ++ [box([3, 4, 5])])])",
+    Value::Int(7)
+)]
+// Jagged within one arm as well as across the two, so both merges carry candidates.
+#[case(
+    "sum([max(r) for r in ([box([1, 2]), box([3, 4, 5])] ++ [box([6])])])",
+    Value::Int(13)
+)]
+fn a_jagged_nested_collection_is_consumed_at_each_rows_own_domain(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// **Iterating a collection whose domain is the witness is not implemented.** A
+/// `List(List(𝑇))` annotation binds a described kind at both levels, so the outer
+/// comprehension's iteration source has a witness for a domain rather than an extent. The
+/// erasure correctly leaves both introductions standing and the tree type-checks; what is
+/// missing is an iteration source that takes the collection as an input and emits the domain
+/// the value holds, rather than enumerating an extent read off the type.
+///
+/// The same program without the annotation compiles and runs
+/// ([`a_jagged_nested_collection_is_consumed_at_each_rows_own_domain`]), because there the
+/// outer domain is the literal's own index range and only the element position holds a
+/// witness.
+#[test]
+fn iterating_a_witness_domained_collection_is_unimplemented() {
+    check_compile_error(
+        indoc! {r"
+            def f(xs: List(List(Int))):
+                sum([sum(r) for r in xs])
+            f(box([box([1,2]), box([3,4,5])]))
+        "},
+        "list literal reached op-conversion without an input",
     );
 }

@@ -512,15 +512,22 @@ impl CompactType {
 /// `UIntRanges` states of its members ([`crate::ccl::ty::TypeKind::refuses`]).
 ///
 /// A refinement disqualifies it, as it does at the type level: a filtered range has holes,
-/// and admitting it would hand a length witness to a domain that lacks one. So does an
-/// unresolved variable, which has not said what it is; a join asking "is every candidate a
-/// range" must not read silence as yes.
+/// and admitting it would hand a length witness to a domain that lacks one.
+///
+/// **A variable beside the atom does not.** Naming a position is not filling it, and the atom
+/// count is what tells the two apart: a position holding no atom is the one that has said
+/// nothing, and compaction has already folded a variable's bounds into the atoms beside it.
+/// [`denoted_domains`] reads the same position and takes that reading, so both agree on which
+/// positions denote a domain at all.
+///
+/// Excluding one reads as a rejection at the join and as something else at the meet, where
+/// [`CompactTypeKind::merge`] filters candidates: dropping one leaves a kind admitting nothing,
+/// which propagates as a plausible ⊥ rather than failing ([`Type::sum_over`]).
 fn denotes_a_uint_range(ct: &CompactType) -> bool {
     let o = ct.occupied();
     o.atoms == 1
         && o.fun.is_none()
         && !o.others
-        && ct.vars.is_empty()
         && ct.atoms.iter().all(|a| matches!(a, AtomKey::UIntRange(_)))
 }
 
