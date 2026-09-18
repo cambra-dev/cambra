@@ -6,7 +6,10 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
-    chl_parser::ast::{AssignTarget, Expr as ChlExpr, IfBranch, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{
+        AssignTarget, AugOp, CompClause, Comprehension, Expr as ChlExpr, IfBranch, RecordField,
+        Spanned, Stmt as ChlStmt, VariantPayload,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -801,11 +804,11 @@ pub(super) fn find_mutation_loop_vars(
 
 /// Recurse the accumulator scan into `if`/`elif`/`else` branches: a `+=` / `:=`
 /// under a conditional is still a loop-carried accumulator (the conditional
-/// induction write becomes one recurrence leg per path). We descend into `if`
-/// branches only — **not** inner `for` loops (nested-loop mutation is still
-/// unsupported, and a write buried in an inner `for` must stay invisible here so
-/// the caller's `find_nested_mutation_var` reject still fires) nor `with begin()`
-/// blocks (those carry their own transactional keys).
+/// induction write becomes one recurrence leg per path). The scan descends into `if`
+/// branches only — not inner `for` loops, nor `with begin()` blocks, which carry
+/// their own transactional keys. An inner `for` reaching this scan is one
+/// [`fold_inner_accumulation_loops`] left standing, whose write must stay invisible
+/// here so the caller's [`find_nested_mutation_var`] reject still fires.
 fn collect_mutation_loop_vars(
     body: &[Spanned<ChlStmt>],
     scope: &HashSet<String>,
@@ -919,6 +922,317 @@ pub(super) fn find_nested_mutation_var(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Inner accumulation loops
+// ---------------------------------------------------------------------------
+
+/// One `+=` / `-=` inside an inner `for`, with the `if` conditions it sits under.
+struct AccumulationSite<'a> {
+    name: &'a str,
+    target: &'a Spanned<AssignTarget>,
+    op: AugOp,
+    value: &'a Spanned<ChlExpr>,
+    guards: Vec<&'a Spanned<ChlExpr>>,
+    span: Span,
+}
+
+/// Rewrite each inner `for` that only accumulates into the accumulation it denotes.
+///
+/// An inner loop carries nothing across its own iterations but the accumulator, so
+/// `for y in s: total += 𝑒` is the fold `total += sum([𝑒 for y in s])`. Performing
+/// that rewrite before the accumulator scan is what lets loops nest: the enclosing
+/// loop then sees an ordinary top-level write, and the inner iteration compiles by
+/// the comprehension path, which pairs each outer row with the inner domain
+/// (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
+/// Nesting is unbounded, an inner `for` being rewritten after the loops inside it.
+///
+/// Three shapes keep their `for` and meet [`find_nested_mutation_var`]'s reject,
+/// because no aggregate states their law: a `*=` or `//=` write, whose fold `Sum`
+/// is not; a `:=` write, whose last-write-wins law needs the final element rather
+/// than a fold of all of them; and a body holding anything but writes and single-
+/// branch `if`s. A body that reads an accumulator it also writes is rejected by
+/// name instead — each iteration depends on the one before, which is a scan.
+pub(super) fn fold_inner_accumulation_loops(
+    stmts: &[Spanned<ChlStmt>],
+) -> Result<Vec<Spanned<ChlStmt>>, LoweringError> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        match &stmt.node {
+            ChlStmt::For { target, iter, body } => {
+                let body = fold_inner_accumulation_loops(body)?;
+                match fold_accumulating_for(target, iter, &body, stmt.span)? {
+                    Some(folded) => out.extend(folded),
+                    None => out.push(Spanned::new(
+                        stmt.span,
+                        ChlStmt::For {
+                            target: target.clone(),
+                            iter: iter.clone(),
+                            body,
+                        },
+                    )),
+                }
+            }
+            // The accumulator scan descends into `if` branches, so a loop nested in
+            // one is still loop-carried and folds the same way.
+            ChlStmt::If {
+                branches,
+                else_body,
+            } => {
+                let branches = branches
+                    .iter()
+                    .map(|b| {
+                        Ok(IfBranch {
+                            cond: b.cond.clone(),
+                            body: fold_inner_accumulation_loops(&b.body)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LoweringError>>()?;
+                let else_body = else_body
+                    .as_deref()
+                    .map(fold_inner_accumulation_loops)
+                    .transpose()?;
+                out.push(Spanned::new(
+                    stmt.span,
+                    ChlStmt::If {
+                        branches,
+                        else_body,
+                    },
+                ));
+            }
+            _ => out.push(stmt.clone()),
+        }
+    }
+    Ok(out)
+}
+
+/// The statements `for target in iter: body` folds to, or `None` where the body is
+/// not an accumulation the aggregate states.
+fn fold_accumulating_for(
+    target: &Spanned<AssignTarget>,
+    iter: &Spanned<ChlExpr>,
+    body: &[Spanned<ChlStmt>],
+    span: Span,
+) -> Result<Option<Vec<Spanned<ChlStmt>>>, LoweringError> {
+    let mut sites = Vec::new();
+    if !collect_accumulation_sites(body, &[], &mut sites) || sites.is_empty() {
+        return Ok(None);
+    }
+
+    // A fold reads the accumulator once, at the end; a body that reads it per
+    // element is a scan, and folding it would drop the dependence.
+    let written: HashSet<&str> = sites.iter().map(|s| s.name).collect();
+    for site in &sites {
+        for name in &written {
+            if expr_mentions_name(site.value, name) {
+                return Err(LoweringError::unsupported(
+                    site.span,
+                    format!(
+                        "the inner `for` body reads `{name}`, which it also writes, so each \
+                         iteration depends on the one before.  That is a scan rather than a \
+                         fold, and nested-loop scans are not yet supported.  Move the read \
+                         out of the inner loop."
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(Some(
+        sites
+            .iter()
+            .map(|site| {
+                let mut clauses = vec![CompClause::For {
+                    target: target.clone(),
+                    iter: iter.clone(),
+                }];
+                clauses.extend(site.guards.iter().map(|g| CompClause::If((*g).clone())));
+                let comprehension = Spanned::new(
+                    span,
+                    ChlExpr::ListComp(Comprehension {
+                        element: Box::new(site.value.clone()),
+                        clauses,
+                    }),
+                );
+                Spanned::new(
+                    site.span,
+                    ChlStmt::AugAssign {
+                        target: site.target.clone(),
+                        op: site.op,
+                        value: Spanned::new(
+                            span,
+                            ChlExpr::Call {
+                                func: Box::new(Spanned::new(span, ChlExpr::Name("sum".into()))),
+                                args: vec![comprehension],
+                            },
+                        ),
+                    },
+                )
+            })
+            .collect(),
+    ))
+}
+
+/// Collect the body's accumulations, or answer `false` where it holds a statement
+/// that is not one.
+///
+/// A single-branch `if` contributes its condition as a guard, which a comprehension
+/// clause states exactly. An `else` does not: its leg's guard is the negation of
+/// every condition before it, so the two legs are two folds over complementary
+/// domains rather than one, and that body keeps its `for`.
+fn collect_accumulation_sites<'a>(
+    stmts: &'a [Spanned<ChlStmt>],
+    guards: &[&'a Spanned<ChlExpr>],
+    out: &mut Vec<AccumulationSite<'a>>,
+) -> bool {
+    for stmt in stmts {
+        match &stmt.node {
+            ChlStmt::AugAssign { target, op, value } => {
+                let (AugOp::Add | AugOp::Sub) = op else {
+                    return false;
+                };
+                let Some(name) = name_target_as_name(target) else {
+                    return false;
+                };
+                out.push(AccumulationSite {
+                    name,
+                    target,
+                    op: *op,
+                    value,
+                    guards: guards.to_vec(),
+                    span: stmt.span,
+                });
+            }
+            ChlStmt::If {
+                branches,
+                else_body: None,
+            } if branches.len() == 1 => {
+                let mut nested = guards.to_vec();
+                nested.push(&branches[0].cond);
+                if !collect_accumulation_sites(&branches[0].body, &nested, out) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether `name` occurs free-standing anywhere in `expr`.
+///
+/// Conservative about binders: a lambda parameter or comprehension target of the
+/// same name shadows it, and this reports the occurrence anyway. Its one caller
+/// refuses a rewrite on a hit, so over-reporting costs a rejected program rather
+/// than a wrong one.
+fn expr_mentions_name(expr: &Spanned<ChlExpr>, name: &str) -> bool {
+    let any = |es: &[Spanned<ChlExpr>]| es.iter().any(|e| expr_mentions_name(e, name));
+    let fields = |fs: &[RecordField]| fs.iter().any(|f| expr_mentions_name(&f.value, name));
+    let comprehension = |c: &Comprehension| {
+        expr_mentions_name(&c.element, name)
+            || c.clauses.iter().any(|clause| match clause {
+                CompClause::For { iter, .. } => expr_mentions_name(iter, name),
+                CompClause::If(guard) => expr_mentions_name(guard, name),
+            })
+    };
+    match &expr.node {
+        ChlExpr::Name(id) => id.as_str() == name,
+        ChlExpr::Lit(_) => false,
+        ChlExpr::BinOp { left, right, .. } => {
+            expr_mentions_name(left, name) || expr_mentions_name(right, name)
+        }
+        ChlExpr::UnaryOp { operand, .. } => expr_mentions_name(operand, name),
+        ChlExpr::BoolOp { operands, .. } => any(operands),
+        ChlExpr::Compare {
+            left, comparators, ..
+        } => expr_mentions_name(left, name) || any(comparators),
+        ChlExpr::Call { func, args } => expr_mentions_name(func, name) || any(args),
+        ChlExpr::List(es) | ChlExpr::Tuple(es) | ChlExpr::BraceGroup(es) => any(es),
+        ChlExpr::Record(fs) | ChlExpr::BraceRecord(fs) => fields(fs),
+        ChlExpr::BraceRefinement { base, predicate } => {
+            expr_mentions_name(base, name) || expr_mentions_name(predicate, name)
+        }
+        ChlExpr::FunctionType { domain, codomain } => {
+            expr_mentions_name(domain, name) || expr_mentions_name(codomain, name)
+        }
+        ChlExpr::Subscript { target, index, .. } => {
+            expr_mentions_name(target, name) || expr_mentions_name(index, name)
+        }
+        ChlExpr::Attribute { target, .. } => expr_mentions_name(target, name),
+        ChlExpr::VariantCtor { payload, .. } => match payload {
+            Some(VariantPayload::Term(e)) => expr_mentions_name(e, name),
+            Some(VariantPayload::Fields(e)) => expr_mentions_name(e, name),
+            None => false,
+        },
+        ChlExpr::Lambda { body, .. } => expr_mentions_name(body, name),
+        ChlExpr::IfExp {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_mentions_name(cond, name)
+                || expr_mentions_name(then_expr, name)
+                || expr_mentions_name(else_expr, name)
+        }
+        ChlExpr::ListComp(c) | ChlExpr::GenExp(c) => comprehension(c),
+        ChlExpr::Yield(e) => expr_mentions_name(e, name),
+        ChlExpr::Feed { target, value } => {
+            expr_mentions_name(target, name) || expr_mentions_name(value, name)
+        }
+        ChlExpr::Block(stmt) => stmt_mentions_name(stmt, name),
+        ChlExpr::Error => false,
+    }
+}
+
+/// Whether `name` occurs anywhere in `stmt`, reached from a block expression.
+fn stmt_mentions_name(stmt: &Spanned<ChlStmt>, name: &str) -> bool {
+    let block = |b: &[Spanned<ChlStmt>]| b.iter().any(|s| stmt_mentions_name(s, name));
+    let target_mentions = |t: &Spanned<AssignTarget>| target_mentions_name(t, name);
+    match &stmt.node {
+        ChlStmt::Expr(e) => expr_mentions_name(e, name),
+        ChlStmt::Assign { target, value }
+        | ChlStmt::AugAssign { target, value, .. }
+        | ChlStmt::Define { target, value } => {
+            target_mentions(target) || expr_mentions_name(value, name)
+        }
+        ChlStmt::AnnAssign { target, value, .. } | ChlStmt::MutAssign { target, value, .. } => {
+            target_mentions(target) || expr_mentions_name(value, name)
+        }
+        ChlStmt::If {
+            branches,
+            else_body,
+        } => {
+            branches
+                .iter()
+                .any(|b| expr_mentions_name(&b.cond, name) || block(&b.body))
+                || else_body.as_deref().is_some_and(block)
+        }
+        ChlStmt::Match { scrutinee, arms } => {
+            expr_mentions_name(scrutinee, name) || arms.iter().any(|a| block(&a.body))
+        }
+        ChlStmt::For { target, iter, body } => {
+            target_mentions(target) || expr_mentions_name(iter, name) || block(body)
+        }
+        ChlStmt::FunctionDef { output, body, .. } => {
+            output.as_ref().is_some_and(|o| expr_mentions_name(o, name)) || block(body)
+        }
+        ChlStmt::With { context, body, .. } => expr_mentions_name(context, name) || block(body),
+        ChlStmt::Return(e) => e.as_ref().is_some_and(|e| expr_mentions_name(e, name)),
+        ChlStmt::Pass | ChlStmt::Error => false,
+    }
+}
+
+/// Whether `name` occurs in an assignment target — as the name it binds, or inside
+/// the index expression of a `m[k]` write.
+fn target_mentions_name(target: &Spanned<AssignTarget>, name: &str) -> bool {
+    match &target.node {
+        AssignTarget::Name(id) => id.as_str() == name,
+        AssignTarget::Tuple(ts) => ts.iter().any(|t| target_mentions_name(t, name)),
+        AssignTarget::Subscript { target, index } => {
+            expr_mentions_name(target, name) || expr_mentions_name(index, name)
+        }
+    }
 }
 
 /// The `for` statement a loop-lowering entry point is lowering: everything the
@@ -1716,9 +2030,11 @@ x";
         );
     }
 
-    /// Same shape but mutation nested in an inner `for` rather than `if`.
+    /// Same shape but the write sits in an inner `for` rather than an `if`, and is a
+    /// `:=`, whose last-write-wins law no aggregate states. An inner `+=` folds
+    /// instead (`fold_inner_accumulation_loops`).
     #[test]
-    fn test_mutation_nested_in_for_rejected() {
+    fn test_overwrite_nested_in_for_rejected() {
         let code = "\
 x := 0
 for i in [1, 2]:
@@ -1729,8 +2045,8 @@ x";
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message: msg, .. } = &err;
         assert!(
-            msg.contains("nested") && msg.contains("`x`"),
-            "error should call out nested mutation of `x`: {msg}"
+            msg.contains("inner `for`") && msg.contains("`x`"),
+            "error should call out the inner-`for` write of `x`: {msg}"
         );
     }
 

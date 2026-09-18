@@ -1716,9 +1716,26 @@ silently discard every update at the iteration boundary, which is the one thing
 the old value, so a per-iteration rebind reads the binding's *initial* value on
 every iteration.
 
-*Currently unsupported* (see §12): nested for-loops with mutable
-variables, mutable variables introduced inside a loop body or a `with
-begin():` block, and `while` loops.
+An inner `for` that only accumulates runs as the fold it denotes: `for y in ys:
+total += 𝑒` accumulates `sum([𝑒 for y in ys])` once per element of the enclosing
+loop. The inner source may name the outer element, and nesting is unbounded.
+
+```python
+total := 0
+for xs in [[1, 2], [3, 4]]:
+    for x in xs:
+        total += x
+total                            # 10
+```
+
+Only `+=` and `-=` fold, `sum` being the aggregate an accumulation maps onto. An
+inner `for` whose body writes with `*=`, `//=` or `:=` is a lowering error, as is
+one whose body reads an accumulator it also writes — that is a scan, each
+iteration depending on the one before.
+
+*Currently unsupported* (see §12): mutable variables introduced inside a loop
+body or a `with begin():` block, inner-loop writes other than `+=` and `-=`, and
+`while` loops.
 
 ### 4.7 `pass`
 
@@ -3222,9 +3239,10 @@ with parser-level support that lowering rejects:
 - **`while` loops** — currently a parse error (the `while` keyword is
   not yet recognised). Tracked as future work under mutability
   ("while loop lowering").
-- **Nested `for` loops with mutable variables** — a single-level
-  for-loop accumulator works (§4.6), but mutation inside a nested loop
-  is not yet lowered.
+- **An inner `for` whose write is not an accumulation** — an inner loop
+  accumulating with `+=` or `-=` folds (§4.6), while `*=`, `//=` and `:=`
+  have no aggregate stating their law. A body reading the accumulator it
+  writes is a scan rather than a fold, and is rejected separately.
 - **A mutable variable introduced inside a loop body or a transaction
   block** — a mutable variable must be declared before the loop that
   accumulates it (§4.6), and a `with begin():` block may write mutable variables
