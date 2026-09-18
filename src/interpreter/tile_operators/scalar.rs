@@ -56,9 +56,10 @@ impl Constant {
     /// and the arithmetic under it meets a `Value::Function`, while here it
     /// transforms each output and keeps the domain.
     ///
-    /// Which of the two a constant is cannot be read off the value, so the call
-    /// site states it — see [`TypedExprNode::LoadFrom`](crate::ccl::TypedExprNode),
-    /// the one site that does.
+    /// Which of the two a constant is cannot be read off the value, so the call site states
+    /// it. Two do: [`TypedExprNode::LoadFrom`](crate::ccl::TypedExprNode), whose extent comes
+    /// from the loaded value's own type, and `Builtin::EmptyMap`, whose comes from the
+    /// annotation that pinned it — both in `operator_conversion`.
     ///
     /// # Panics
     ///
