@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use bit_set::BitSet;
 
 use super::*;
@@ -101,14 +103,14 @@ impl CheckedLookup {
                 ));
             }
         }
-        // Field 1 is the key, and a key is one value — so the runtime reads a key column
-        // rather than deciding what to do with a structured one.
+        // Field 1 is the key. A key is one value, spread over a column per field where it is
+        // a product, so the runtime pivots it to one column and searches with that.
         match fields.get(&tuple_field(1)) {
-            Some(Tiling::Scalar(_)) => {}
+            Some(t) if is_key_tiling(t) => {}
             other => {
                 return Err(format!(
-                    "`lookup?`'s input rows carry one key each, so field 1 tiles as a scalar; \
-                     got {}",
+                    "`lookup?`'s input rows carry one key each, so field 1 tiles as a scalar \
+                     or as a record of them; got {}",
                     other.map_or_else(|| "no field".to_string(), Tiling::to_string)
                 ));
             }
@@ -125,14 +127,34 @@ impl CheckedLookup {
 }
 
 /// The answer's tiling for a given key tiling: one option per key, in the keys' own shape.
+///
+/// A key is one value however many columns carry it, so a **product** key — a tuple or
+/// record, which tiles as a record of columns — takes the scalar shape
+/// ([`is_key_tiling`], which is what decides it here too).
 fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
+    if is_key_tiling(keys) {
+        return Tiling::Scalar(option_extent);
+    }
     match keys {
-        Tiling::Scalar(_) => Tiling::Scalar(option_extent),
         Tiling::SealedFunction { domain, .. } => Tiling::SealedFunction {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(option_extent)),
         },
         other => panic!("CheckedLookup keys must be a scalar or a stream, got {other}"),
+    }
+}
+
+/// Whether `tiling` carries **one key**: a scalar column, or a record of them.
+///
+/// A product key is spread over a column per field, while a collection's domain holds it as
+/// one `Records` column — two presentations of one value, which
+/// [`scalar_tile_to_column_value`] converts between. Recursive, because a record whose
+/// fields are not themselves keys is not a key, and the converter faults on one.
+fn is_key_tiling(tiling: &Tiling) -> bool {
+    match tiling {
+        Tiling::Scalar(_) => true,
+        Tiling::Record(fields) => fields.values().all(is_key_tiling),
+        _ => false,
     }
 }
 
@@ -338,13 +360,19 @@ impl TileProducer for CheckedLookupProducer {
                 let mut coll = collection.get(collection.tiling().universal_guard());
                 coll.compact();
                 match key_tile {
-                    // No key has arrived yet, so there is nothing to answer.
-                    Tile::Scalar(ref keys) if keys.is_empty() => empty_scalar,
-                    // One key: the scalar form `m[k]?`.
-                    Tile::Scalar(ref keys) => match answer_for(&keys.index_at(0), &coll) {
-                        Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
-                        None => empty_scalar,
-                    },
+                    // One key: the scalar form `m[k]?`, the key pivoted to one column where
+                    // it is a product. An empty column is a key that has not arrived, so
+                    // there is nothing to answer.
+                    Tile::Scalar(_) | Tile::Record(_) => {
+                        let keys = scalar_tile_to_column_value(key_tile);
+                        if keys.is_empty() {
+                            return empty_scalar;
+                        }
+                        match answer_for(&keys.index_at(0), &coll) {
+                            Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
+                            None => empty_scalar,
+                        }
+                    }
                     // A stream of keys, each answered against the same collection — read
                     // once, not lifted into every row.
                     Tile::SealedFunction {
@@ -353,14 +381,21 @@ impl TileProducer for CheckedLookupProducer {
                         ref domain_predicate,
                         ..
                     } => {
-                        let Tile::Scalar(key_col) = codomain.as_ref() else {
-                            panic!(
+                        // A product key arrives as a record of columns and pivots to the one
+                        // column a domain is searched with; a scalar one is already that, and
+                        // borrows, so the common shape is not charged a copy per pull.
+                        let key_col = match codomain.as_ref() {
+                            Tile::Scalar(col) => Cow::Borrowed(col),
+                            record @ Tile::Record(_) => {
+                                Cow::Owned(scalar_tile_to_column_value(record.clone()))
+                            }
+                            other => panic!(
                                 "CheckedLookup: a key is one value, so the key stream's codomain \
-                                 tiles as a scalar; got {codomain:?}"
-                            )
+                                 tiles as a scalar or a record of them; got {other:?}"
+                            ),
                         };
                         let (kept, answers) =
-                            Self::answer_rows(domain, key_col, &RowCollection::Shared(&coll));
+                            Self::answer_rows(domain, &key_col, &RowCollection::Shared(&coll));
                         self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
                     }
                     other => {
@@ -389,18 +424,30 @@ impl TileProducer for CheckedLookupProducer {
                         "CheckedLookup: input rows are `(collection, key)` pairs; got {codomain:?}"
                     )
                 };
-                let (Some(coll_tile), Some(Tile::Scalar(key_col))) =
+                let (Some(coll_tile), Some(key_tile)) =
                     (fields.get(&tuple_field(0)), fields.get(&tuple_field(1)))
                 else {
                     panic!(
                         "CheckedLookup: input rows carry a collection at .0 and one key at .1; got {codomain:?}"
                     )
                 };
+                // Borrowed where the key is already one column; only a product is pivoted,
+                // so the scalar pair stream is not charged a copy of its keys per pull.
+                let key_col = match key_tile {
+                    Tile::Scalar(col) => Cow::Borrowed(col),
+                    record @ Tile::Record(_) => {
+                        Cow::Owned(scalar_tile_to_column_value(record.clone()))
+                    }
+                    other => panic!(
+                        "CheckedLookup: a key is one value, so field 1 tiles as a scalar or a \
+                         record of them; got {other:?}"
+                    ),
+                };
                 let collection = match coll_tile {
                     Tile::Scalar(col) => RowCollection::PerRow(col),
                     shared => RowCollection::Shared(shared),
                 };
-                let (kept, answers) = Self::answer_rows(domain, key_col, &collection);
+                let (kept, answers) = Self::answer_rows(domain, &key_col, &collection);
                 self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
             }
         }
