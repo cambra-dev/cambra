@@ -31,12 +31,13 @@
 //! program added for backend coverage belongs in ratchet 5, which reads every
 //! gallery source and commits nothing.
 //!
-//! Two programs — `txn_multi_read` and `for_accumulator` — are in the corpus
-//! without a committed fixture. Their payloads run to five figures of lines
-//! each, which is a document nobody reads and a re-bless nobody can review, so
-//! what they are here for is asserted structurally over a fresh dump instead:
-//! the dense channelize window, and the `Transact`/`Letrec` rewrite tags that
-//! reach the wire.
+//! Three programs — `txn_multi_read`, `for_accumulator` and
+//! `source_accumulator` — are in the corpus without a committed fixture. Their
+//! payloads run to five figures of lines each, which is a document nobody reads
+//! and a re-bless nobody can review, so what they are here for is asserted
+//! structurally over a fresh dump instead: the dense channelize window, the
+//! `Transact`/`Letrec` rewrite tags that reach the wire, and a store's trigger
+//! iterating a data source.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -525,13 +526,116 @@ fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
         }
     }
 
-    let spans = source["spans"].as_array().expect("spans is an array");
+    // A read *site* is a span, not an operator: one `stdin()` is read by both the
+    // `IterateExtent` that iterates its domain and the `MapResultWithSource` that
+    // reads its values. So the node's spans are compared against the distinct
+    // sites its readers name, not against how many readers there are.
+    //
+    // The sites are the `MapResultWithSource` readers. Each is the operator the
+    // `Source(name)` arm builds, so its span is the `stdin()` the program wrote,
+    // which is what a source node's spans answer. An `IterateExtent` reads the
+    // source and is not a site: it can be rowed against an expression nowhere
+    // near a source read, which `source_accumulator` pins.
+    let site_of = |n: &Value| -> Vec<(u64, u64)> {
+        n["spans"]
+            .as_array()
+            .expect("spans is an array")
+            .iter()
+            .map(|s| {
+                (
+                    s["start"].as_u64().expect("start is a number"),
+                    s["end"].as_u64().expect("end is a number"),
+                )
+            })
+            .collect()
+    };
+    let reader_sites: std::collections::BTreeSet<(u64, u64)> = readers
+        .iter()
+        .filter(|r| r["label"] == "MapResultWithSource")
+        .flat_map(|r| site_of(r))
+        .collect();
+    let source_sites: std::collections::BTreeSet<(u64, u64)> =
+        site_of(source).into_iter().collect();
+    assert_eq!(
+        source_sites, reader_sites,
+        "the source node names {source_sites:?} but is read from {reader_sites:?}: it was minted \
+         against one read rather than after the walk, so `also_consumes` reached none of the others"
+    );
     assert!(
-        spans.len() >= readers.len(),
-        "the source node carries {} span(s) for {} read site(s): it was minted against one \
-         read rather than after the walk, so `also_consumes` reached none of the others",
-        spans.len(),
-        readers.len()
+        reader_sites.len() >= 2,
+        "source_shared reads stdin at two sites; got {reader_sites:?}"
+    );
+}
+
+/// A source read through a store's induction extent is one node with one read
+/// site, read by two operators.
+///
+/// `source_accumulator` loops over `stdin()` and accumulates into a mutable
+/// variable, so the loop's induction extent is the source's own domain and the
+/// accumulator read compiles to a `StoreDenseRead` whose trigger iterates that
+/// extent. Two `IterateExtent`s therefore read one source: the one that heads
+/// the chain reading the source's values, and the store's. Both are read sites
+/// of the source node, and the program names the source once, so the node
+/// carries one span however many operators reach it.
+///
+/// The gallery's other source programs read a source only through the chain
+/// that reads its values, so this is the one that pins an operator reaching a
+/// source from somewhere other than the `Source(name)` it belongs to.
+#[test]
+fn a_source_iterated_by_a_store_is_read_by_two_operators() {
+    let raw = dump("source_accumulator");
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let pane = v["panes"]
+        .as_array()
+        .expect("panes is an array")
+        .iter()
+        .find(|p| p["kind"] == "operators")
+        .expect("source_accumulator has an operator pane");
+    let nodes = pane["nodes"].as_array().expect("nodes is an array");
+
+    let sources: Vec<&Value> = nodes.iter().filter(|n| n["role"] == "source").collect();
+    assert_eq!(
+        sources.len(),
+        1,
+        "the program names one source, so the graph holds one source node"
+    );
+    let source = sources[0];
+    let source_id = source["nodeId"].as_u64().expect("nodeId is a number");
+
+    let readers: Vec<&str> = nodes
+        .iter()
+        .filter(|n| {
+            n["inputs"].as_array().is_some_and(|es| {
+                es.iter()
+                    .any(|e| e["subscribed"].as_u64() == Some(source_id))
+            })
+        })
+        .map(|n| n["label"].as_str().expect("label is a string"))
+        .collect();
+    let iterators = readers.iter().filter(|l| **l == "IterateExtent").count();
+    assert_eq!(
+        iterators, 2,
+        "one `IterateExtent` heads the chain that reads the source's values and one \
+         triggers the `StoreDenseRead` over the same extent; got {readers:?}"
+    );
+
+    // The second reader is the store's, so a `StoreDenseRead` is what makes this
+    // program's shape different from every other source program's.
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["label"] == "StoreDenseRead" || n["label"] == "InductionStore"),
+        "the accumulator compiles to a store; without one the two iterators above \
+         are two source reads, which `source_shared` already pins"
+    );
+
+    // A read site is a span. The program writes `stdin()` once, so however many
+    // operators reach the source, the node names one site.
+    assert_eq!(
+        source["spans"].as_array().expect("spans is an array").len(),
+        1,
+        "the program writes `stdin()` once: {:?}",
+        source["spans"]
     );
 }
 

@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
 use crate::ccl::TagMap;
+use crate::interpreter::operator_graph::{InputTarget, source as source_edge};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, SharedConsumer,
     UnionArm, Value, scheduler::shared_consumer,
@@ -26,10 +27,37 @@ impl IterateExtent {
             domain: extent.clone(),
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
-        Self {
+        let op = Self {
             base: OperatorBase::new(tiling),
             extent,
-        }
+        };
+        op.record_source_reads();
+        op
+    }
+
+    /// Record this operator's read of every source its extent iterates.
+    ///
+    /// The scheduler wakes this operator when the source produces, so it reads
+    /// the source. Recording the read mints the source node this operator's edge
+    /// resolves to; the edge itself comes from `visit_inputs` like every other.
+    /// The read does not attribute that node ([`record_source_iteration`]).
+    ///
+    /// Driven by [`visit_inputs`](TileOperator::visit_inputs) rather than by its
+    /// own walk, so the reads recorded and the edges stated are one list. They
+    /// have to agree: the graph walk resolves each stated source by name and
+    /// asserts a node was minted for it.
+    ///
+    /// The expression comes from the ambient conversion recording, because this
+    /// operator holds no `NodeId` of its own.
+    ///
+    /// [`record_source_iteration`]: crate::interpreter::operator_graph::record_source_iteration
+    fn record_source_reads(&self) {
+        let expr = crate::ccl::provenance::currently_named();
+        self.visit_inputs(&mut |spec| {
+            if let InputTarget::Source(name) = spec.target {
+                crate::interpreter::operator_graph::record_source_iteration(name, expr);
+            }
+        });
     }
 
     fn add_all_source_handles(
@@ -37,33 +65,30 @@ impl IterateExtent {
         consumer: SharedConsumer,
         scheduler: &mut Scheduler,
     ) {
-        match extent {
-            Extent::DataSourceDomain(extent_impl, ..) => {
-                scheduler.add_source_handle(extent_impl.clone(), Rc::downgrade(&consumer));
-            }
-            Extent::Record(fields) => {
-                for field_extent in fields.values() {
-                    Self::add_all_source_handles(field_extent, consumer.clone(), scheduler);
-                }
-            }
-            Extent::Restricted { base, .. } => {
-                Self::add_all_source_handles(base, consumer, scheduler);
-            }
-            Extent::Union(arms) => {
-                for extent in arms.values() {
-                    Self::add_all_source_handles(extent, consumer.clone(), scheduler);
-                }
-            }
-            // Nothing to do for other extents since they all complete from the start of the program
-            _ => {}
-        }
+        extent.for_each_source(&mut |source| {
+            scheduler.add_source_handle(source.clone(), Rc::downgrade(&consumer));
+        });
     }
 }
 
 impl TileOperator for IterateExtent {
     impl_operator_base!();
 
-    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        // One edge per distinct source, not per reach: the edge says this
+        // operator reads that source, and it says it once. A source is one
+        // registered name, which is also how the graph walk resolves the edge.
+        let mut seen: Vec<String> = Vec::new();
+        self.extent.for_each_source(&mut |source| {
+            let source = source.borrow();
+            let name = source.get_id();
+            if seen.iter().any(|s| s == name) {
+                return;
+            }
+            seen.push(name.to_string());
+            visit(source_edge(name));
+        });
+    }
 
     fn subscribe(
         &mut self,
@@ -108,28 +133,20 @@ impl TileOperator for IterateExtent {
 /// Tell every source in `extent` that `producer` is gone, so its release record
 /// goes with it ([`DataSourceDomainExtentImpl::retire_producer`]).
 fn retire_producer_from_extent(extent: &Extent, producer: &str) {
-    match extent {
-        Extent::DataSourceDomain(source) => {
-            // A drop runs wherever the last owner goes, so the source may already
-            // be borrowed by a call further up that stack. Keeping the record is
-            // the conservative outcome — the source retains more than it must —
-            // and the borrow succeeding is the case worth knowing about.
-            match source.try_borrow_mut() {
-                Ok(mut source) => source.retire_producer(producer),
-                Err(_) => debug_assert!(
-                    false,
-                    "{producer} dropped while its source was borrowed, so its \
+    extent.for_each_source(&mut |source| {
+        // A drop runs wherever the last owner goes, so the source may already
+        // be borrowed by a call further up that stack. Keeping the record is
+        // the conservative outcome — the source retains more than it must —
+        // and the borrow succeeding is the case worth knowing about.
+        match source.try_borrow_mut() {
+            Ok(mut source) => source.retire_producer(producer),
+            Err(_) => debug_assert!(
+                false,
+                "{producer} dropped while its source was borrowed, so its \
 release record outlives it",
-                ),
-            }
+            ),
         }
-        Extent::Record(fields) => {
-            for e in fields.values() {
-                retire_producer_from_extent(e, producer);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Producer for [`IterateExtent`]: emits an identity sealed-function tile.
@@ -411,6 +428,45 @@ mod tests {
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value, tuple_field};
     use intervalsets::MaybeEmpty;
     use intervalsets::ops::Contains;
+
+    /// A producer's release record is retired from a source reached through a
+    /// `Union` arm, not only from one reached directly or through a `Record`.
+    ///
+    /// Subscribing registers the record through every compound arm
+    /// ([`release_extent`]), so retiring has to reach the same set. A record
+    /// left behind pins the source's agreement at wherever the dead producer
+    /// stopped, and the source never drops that data again.
+    #[test]
+    fn retire_reaches_a_source_under_a_union_arm() {
+        use crate::ccl::FieldKey;
+        use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
+
+        let src = Rc::new(RefCell::new(TestDataSource::new(
+            "s",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        let extent = Extent::Union(TagMap::from_arms(vec![(
+            FieldKey::Name("only".into()),
+            Extent::DataSourceDomain(as_domain),
+        )]));
+
+        src.borrow_mut().release("p", Predicate::True);
+        assert_eq!(
+            src.borrow().get_released_predicate(),
+            Predicate::True,
+            "`p` holds a record for the retire to find"
+        );
+
+        retire_producer_from_extent(&extent, "p");
+
+        assert_eq!(
+            src.borrow().get_released_predicate(),
+            Predicate::False,
+            "`p` is gone, so its record is gone: an empty agreement, not `p`'s last one"
+        );
+    }
 
     /// Helper: extract the `IntervalSet<usize>` from a `UIntRange` extent.
     fn uint_range_set(extent: &Extent) -> &IntervalSet<usize> {

@@ -38,6 +38,7 @@ mod polymorphic;
 mod prefix_lines;
 mod reachability;
 mod refinement;
+mod source_accumulator;
 mod source_shared;
 mod storefront;
 mod streaming_echo;

@@ -89,56 +89,72 @@ impl Extent {
     /// When subscribing to this extent as an iteration, returns whether to immediately
     /// notify true and whether to add the iterating variable to the scheduler.
     pub fn subscribe_to_iteration_action(&self) -> NotifyOrSubscribeResult {
+        NotifyOrSubscribeResult {
+            notify: self.iteration_is_ready(),
+            // Subscribing is reaching a source: the scheduling loop polls a source
+            // for notifications, and what it wakes is whatever registered against
+            // that same set.
+            subscribe: self.reads_a_source(),
+        }
+    }
+
+    /// Whether iterating this extent can notify immediately, because every
+    /// element is available from the start of the program.
+    ///
+    /// A compound extent is ready when every part of it is: a cross-product
+    /// still growing in one field is still growing, and so is a union with one
+    /// unfinished arm. An extent that cannot be iterated is not ready either.
+    fn iteration_is_ready(&self) -> bool {
         match self {
-            // DataSource extents need to be registered so that the scheduling loop can
-            // poll them for notifications
-            Extent::DataSourceDomain(..) => NotifyOrSubscribeResult {
-                notify: false,
-                subscribe: true,
-            },
-            // Literal range extents are fully ready immediately
-            Extent::UIntRange(..) => NotifyOrSubscribeResult {
-                notify: true,
-                subscribe: false,
-            },
-            // Record extents are immediately ready if all fields are ready,
-            // otherwise we register with the scheduler.
-            Extent::Record(fields) => fields
-                .values()
-                .map(|extent| extent.subscribe_to_iteration_action())
-                .fold(
-                    NotifyOrSubscribeResult {
-                        notify: true,
-                        subscribe: false,
-                    },
-                    |acc, value| NotifyOrSubscribeResult {
-                        notify: acc.notify && value.notify,
-                        subscribe: acc.subscribe || value.subscribe,
-                    },
-                ),
-            // Restricted extents behave like their base record, but also set up the
+            // A source's elements arrive over the life of the program.
+            Extent::DataSourceDomain(..) => false,
+            // Literal range extents are fully ready immediately.
+            Extent::UIntRange(..) => true,
+            Extent::Record(fields) => fields.values().all(Extent::iteration_is_ready),
+            Extent::Union(arms) => arms.values().all(Extent::iteration_is_ready),
+            // Restricted extents behave like their base, which also sets up the
             // restriction producer so it can compute correlation vectors at runtime.
-            Extent::Restricted { base, .. } => base.subscribe_to_iteration_action(),
-            // Union extents iterate each variant in turn; we are ready iff every
-            // variant is ready, and we subscribe iff any variant requires it.
-            Extent::Union(arms) => arms
-                .values()
-                .map(Extent::subscribe_to_iteration_action)
-                .fold(
-                    NotifyOrSubscribeResult {
-                        notify: true,
-                        subscribe: false,
-                    },
-                    |acc, value| NotifyOrSubscribeResult {
-                        notify: acc.notify && value.notify,
-                        subscribe: acc.subscribe || value.subscribe,
-                    },
-                ),
-            // Other Extents cannot be iterated, so nothing to do
-            _ => NotifyOrSubscribeResult {
-                notify: false,
-                subscribe: false,
-            },
+            Extent::Restricted { base, .. } => base.iteration_is_ready(),
+            Extent::Base(_) | Extent::Function { .. } => false,
+        }
+    }
+
+    /// Whether this extent reaches at least one data source.
+    pub fn reads_a_source(&self) -> bool {
+        let mut found = false;
+        self.for_each_source(&mut |_| found = true);
+        found
+    }
+
+    /// Every data source this extent reaches, in extent order, duplicates
+    /// included.
+    ///
+    /// The compound arms are the iterable ones: a `Record` cross-product, a
+    /// `Union` of arms, a `Restricted` base. Iterating an extent registers a
+    /// wake-up against each source here, states an input edge to each, and hands
+    /// each back its release record when the producer goes. All three read this
+    /// one answer, so no walk can reach an arm the others miss.
+    pub fn for_each_source(
+        &self,
+        f: &mut impl FnMut(&Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
+    ) {
+        match self {
+            Extent::DataSourceDomain(source) => f(source),
+            Extent::Record(fields) => {
+                // Canonical field order, not the `HashMap`'s: `visit_inputs`
+                // states these sources as edges, so a per-process order would put
+                // a different edge list on the wire for each run of one program.
+                for (_, field) in crate::util::record_fields_in_order(fields) {
+                    field.for_each_source(f);
+                }
+            }
+            Extent::Union(arms) => {
+                for arm in arms.values() {
+                    arm.for_each_source(f);
+                }
+            }
+            Extent::Restricted { base, .. } => base.for_each_source(f),
+            Extent::Base(_) | Extent::Function { .. } | Extent::UIntRange(_) => {}
         }
     }
 
@@ -526,6 +542,45 @@ mod tests {
     use super::*;
     use crate::ccl::FieldKey;
     use std::collections::HashMap;
+
+    /// A `Record`'s sources come out in canonical field order, whatever order
+    /// its `HashMap` happens to iterate in this process.
+    ///
+    /// `IterateExtent::visit_inputs` states these as edges, so `HashMap` order
+    /// would put a different `inputs` array on the wire for each run of one
+    /// program, and the cross-process determinism ratchet would start failing
+    /// with nothing in the diff to explain it. No gallery program reaches a
+    /// cross-product over two *distinct* sources, so this is the only thing that
+    /// holds the order.
+    #[test]
+    fn a_record_yields_its_sources_in_canonical_field_order() {
+        use crate::interpreter::{test_source::TestDataSource, tuple_field};
+
+        // Source names run counter to field order, so an alphabetical-by-source
+        // walk is distinguishable from a positional-by-field one.
+        let names = ["ee", "dd", "cc", "bb", "aa"];
+        let fields: HashMap<String, Extent> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let source = Rc::new(RefCell::new(TestDataSource::new(
+                    name,
+                    crate::ccl::Type::Base(BaseType::Int),
+                    Extent::Base(BaseType::Int),
+                )));
+                let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = source;
+                (tuple_field(i), Extent::DataSourceDomain(as_domain))
+            })
+            .collect();
+
+        let mut seen = Vec::new();
+        Extent::Record(fields).for_each_source(&mut |s| seen.push(s.borrow().get_id().to_string()));
+
+        assert_eq!(
+            seen, names,
+            "`_0`…`_4` in order, not the map's iteration order"
+        );
+    }
 
     // --- Display tests ---
 
