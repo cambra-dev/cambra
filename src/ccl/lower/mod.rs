@@ -100,6 +100,7 @@ mod functions;
 mod http;
 mod loops;
 mod stmts;
+mod test_sink;
 mod transactions;
 
 /// The names a type alias may not rebind, re-exported so the test that pins the
@@ -118,6 +119,7 @@ use functions::*;
 use http::*;
 use loops::*;
 use stmts::*;
+use test_sink::*;
 use transactions::*;
 
 // ---------------------------------------------------------------------------
@@ -318,6 +320,13 @@ pub struct LoweringContext {
     /// `pub(super)` so the statement submodule can inspect it when deciding
     /// whether to wrap the program tail in the sink-binding `Record`.
     pub(super) sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+
+    /// Test sinks the host supplied before compiling, by binding name.
+    ///
+    /// A host that wants to read a sink back needs the handle before the program that
+    /// writes to it exists. `test_sink()` takes its sink from here when the name is
+    /// present and mints a fresh one when it is not, so a program still runs standalone.
+    pub(super) test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 
     /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
     /// that use the same port.  Created lazily on the first `http_serve` for a port
@@ -542,6 +551,15 @@ impl LoweringContext {
     /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
     /// binding name so that the scheduler can subscribe an
     /// `HttpServerSinkConsumer` to it after operator conversion.
+    /// Adopt the test sinks a registry holds, so `test_sink()` binds the handle its host
+    /// already has rather than minting a second one.
+    pub fn adopt_test_sinks(
+        &mut self,
+        sinks: impl Iterator<Item = (String, Arc<crate::interpreter::TestSink>)>,
+    ) {
+        self.test_sinks.extend(sinks);
+    }
+
     pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
         self.sink_bindings.insert(name.into(), sink);
     }

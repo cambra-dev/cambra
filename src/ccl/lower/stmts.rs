@@ -530,6 +530,31 @@ pub(super) fn lower_middle_stmt(
         //   <body>
         // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
         // in general.
+        // `out = test_sink()` — a `Defer` channel that is also a program output. The
+        // binding name is the sink's name, so the tail record's field for it is the name
+        // the program already wrote to.
+        ChlStmt::Assign { target, value } if is_test_sink_assign(target, value) => {
+            if !is_top_level {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "test_sink is only supported at the top level of a program, \
+                     not inside an if/else branch or function body",
+                ));
+            }
+            let name = extract_test_sink_name(target)?;
+            let sink = ctx
+                .test_sinks
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(crate::interpreter::TestSink::new(name.clone())));
+            ctx.register_sink_binding(name.clone(), sink);
+            let defer = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Defer),
+                stmt.span,
+                "lower.test_sink",
+            );
+            Ok(ctx.tag_image(Expr::let_bind(name, defer, body), stmt.span))
+        }
         ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
             if !is_top_level {
                 return Err(LoweringError::unsupported(

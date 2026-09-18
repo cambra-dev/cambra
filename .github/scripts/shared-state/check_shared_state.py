@@ -83,6 +83,9 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "ambient mutable state"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<usize, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),
+    # The test sink's accumulator: a sink is a terminal consumer at the observation
+    # boundary, and `DataSink::process` takes `&self`.
+    ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
     # `Notified::Flag`, the one-bit input-notified flag; see its type doc.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
