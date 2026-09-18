@@ -2613,8 +2613,11 @@ fn compile_list_fn(
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
 /// The constant *value* formers, each recursing on its children so a constant
-/// nests: a literal, a tuple, a record, and a variant constructor. Anything else is
-/// a computation, which a list literal's element position cannot express.
+/// nests: a literal, a tuple, a record, and a variant constructor. A computation over
+/// them is already a literal by the time it arrives, planning having folded it
+/// (`src/ccl/planning/const_fold.rs` states which shapes it folds and which it leaves);
+/// what reaches the fallback arm is what the fold declined, and a list literal's element
+/// position cannot express it.
 fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
@@ -2647,9 +2650,17 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
             tag: FieldKey::Name(tag.as_str().into()),
             inner: Box::new(expr_to_value(payload)?),
         }),
+        // The element may well *be* a constant and still arrive here: what reaches this
+        // point is what constant folding declined, and it declines an operation with no
+        // result (overflow, division by zero), a `//` whose floor and truncating readings
+        // disagree, and anything inside a definition the body's type discharges
+        // (`src/ccl/planning/const_fold.rs`, "What does not fold"). Saying only "is a
+        // computation" reads as a demand to write a constant where one is already written.
         _ => Err(ConversionError::Unsupported(format!(
-            "a list element must be a constant — a literal, tuple, record or variant \
-             constructor — but this one is a computation: {}",
+            "a list element has to be a value here, and constant folding did not reduce \
+             this one: {}. It declines an operation with no result — an overflow, a \
+             division by zero — a negative `//`, whose two readings disagree, and anything \
+             inside a definition the body's type discharges",
             symbolic(expr)
         ))),
     }
