@@ -3265,6 +3265,33 @@ pub(crate) fn debug_assert_predicate_shape(predicate: &TypedExpr) {
 }
 
 impl Refinement {
+    /// Whether this predicate is a collection's **present-key membership** test,
+    /// `__elem ▷ (𝑚 ▷ collection_contains)`.
+    ///
+    /// A keyed collection's domain carries one of these to say which keys are present.
+    /// It is carried and never executed (`Builtin::CollectionContains`), which is what
+    /// separates it from a filter the program wrote: a pass that compiles refinements into
+    /// terms has to leave this one alone.
+    pub fn is_collection_membership(&self) -> bool {
+        let TypedExprNode::Apply { argument, function } = &self.predicate.node else {
+            return false;
+        };
+        if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
+            return false;
+        }
+        let TypedExprNode::Apply {
+            function: characteristic,
+            ..
+        } = &function.node
+        else {
+            return false;
+        };
+        matches!(
+            &characteristic.node,
+            TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
+        )
+    }
+
     /// Construct a refinement over a **genuinely new** predicate term — one this
     /// call site is *creating*, with no prior refinement identity to preserve
     /// (a freshly-emitted filter, a synthesized loop-join condition, a compiled
