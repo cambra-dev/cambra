@@ -480,6 +480,192 @@ fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
     );
 }
 
+/// Two deferred collections fed from **complementary arms** of one conditional, in a
+/// loop with no accumulator. The `Case` fans out once per defer: each pass extracts its
+/// own arms into refined-source channels and leaves the sibling's arms standing
+/// (`residual_after_fanout` in `channelize`), so an arm feeding the other defer is a
+/// non-feeding arm for this one.
+///
+/// Each channel is read on its own, so the pinned domain is the source restriction the
+/// arm earned — `good` takes index 0 and `bad` index 1 in the `match`, and the reverse
+/// in the `if`. A fan-out routing an arm's values into the sibling's channel fails here,
+/// which a symmetric read of the two would not.
+///
+/// Both spellings are listed because the failure differed by spelling and the cause did
+/// not. A `match`'s arms carry patterns, so the whole `Case` reached the source-less
+/// path and was reported as `PartialFeedCaseUnsupported`; an `if`'s arms are guards, so
+/// the same path built a `Unit` gate whose predicate references the loop binder, which
+/// lambda elimination rejected as a non-dependent arrow over a dependent codomain.
+///
+/// The loop with an accumulator compiles either way — the tap on the writer decision is
+/// a different representation of a conditional feed — so these are the cases the per-arm
+/// channel representation owes.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::match_good("good", &[0usize], &[2i64])]
+#[case::match_bad("bad", &[1], &[3])]
+fn two_defers_fed_from_complementary_match_arms(
+    #[case] read: &str,
+    #[case] domain: &[usize],
+    #[case] codomain: &[i64],
+) {
+    let code = format!(
+        indoc! {r#"
+            good = defer()
+            bad = defer()
+            for m in [`a(2), `b(3)]:
+                match m:
+                    case `a(n):
+                        good << n
+                    case `b(k):
+                        bad << k
+            {}
+        "#},
+        read
+    );
+    check_tile(
+        &code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(domain.to_vec()),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec()))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// The `if`/`else` spelling of [`two_defers_fed_from_complementary_match_arms`].
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::if_good("good", &[1usize], &[2i64])]
+#[case::if_bad("bad", &[0], &[1])]
+fn two_defers_fed_from_complementary_if_arms(
+    #[case] read: &str,
+    #[case] domain: &[usize],
+    #[case] codomain: &[i64],
+) {
+    let code = format!(
+        indoc! {r#"
+            good = defer()
+            bad = defer()
+            for i in [1, 2]:
+                if i > 1:
+                    good << i
+                else:
+                    bad << i
+            {}
+        "#},
+        read
+    );
+    check_tile(
+        &code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(domain.to_vec()),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec()))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// A `case _:` default arm feeding the second defer. `tag_case_to_guard_case` gives a
+/// default arm the trailing `true` guard rather than a `variant_is` test, so its channel
+/// covers the complement of every named arm — two of the three elements here — and the
+/// residual keeps the default arm for the named arm's pass to leave alone.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::named_arm("a", &[0usize], &[1i64])]
+#[case::default_arm("b", &[1, 2], &[7, 7])]
+fn a_default_arm_feeds_its_own_defer(
+    #[case] read: &str,
+    #[case] domain: &[usize],
+    #[case] codomain: &[i64],
+) {
+    let code = format!(
+        indoc! {r#"
+            a = defer()
+            b = defer()
+            for m in [`x(1), `y(2), `z(4)]:
+                match m:
+                    case `x(n):
+                        a << n
+                    case _:
+                        b << 7
+            {}
+        "#},
+        read
+    );
+    check_tile(
+        &code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(domain.to_vec()),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec()))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// Three shapes the per-defer pass admits once it admits two complementary arms. Each
+/// read is weighted apart from the others, so a value landing in the wrong channel
+/// changes the answer.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Three defers off one conditional: the pass runs once per defer, and the third finds
+// the first two's arms already `Unit` in the residual.
+#[case(
+    indoc! {r#"
+        a = defer()
+        b = defer()
+        c = defer()
+        for i in [1, 2, 3]:
+            if i == 1:
+                a << i
+            elif i == 2:
+                b << i * 10
+            else:
+                c << i * 100
+        sum(a) * 10000 + sum(b) * 100 + sum(c)
+    "#},
+    Value::Int(12300)
+)]
+// One defer fed from non-contiguous arms, with the sibling's arm between them: its two
+// channels union, and the arm in between keeps its guard in their predicates.
+#[case(
+    indoc! {r#"
+        a = defer()
+        b = defer()
+        for i in [1, 2, 3]:
+            if i == 1:
+                a << i
+            elif i == 2:
+                b << i
+            else:
+                a << i
+        sum(a) * 10 + sum(b)
+    "#},
+    Value::Int(42)
+)]
+// A read of the first defer between the loop and the program's value, which puts the
+// two defers in separate clusters.
+#[case(
+    indoc! {r#"
+        a = defer()
+        b = defer()
+        for i in [1, 2]:
+            if i > 1:
+                a << i
+            else:
+                b << i
+        t = sum(a)
+        t * 10 + sum(b)
+    "#},
+    Value::Int(21)
+)]
+fn more_defers_off_one_conditional(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// A feed, an ordinary statement, a second feed: an interleaved loop body with no
 /// accumulator. Every position lowers through [`lower_for_body_stmt`], so the first
 /// feed is an effect sequenced before the rest rather than a non-terminal statement to
