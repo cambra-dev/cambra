@@ -296,6 +296,8 @@ pub(super) fn lower_final_stmt(
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
+            let folded = fold_inner_accumulation_loops(for_body)?;
+            let for_body = &folded[..];
             // A non-yielding loop that mutates a declared `Mut(…)`
             // accumulator is a valid *final* statement — the loop runs and its
             // final mutable-variable value is simply unobserved (`Unit`). Mirror
@@ -340,12 +342,12 @@ pub(super) fn lower_final_stmt(
                     return Err(LoweringError::unsupported(
                         last.span,
                         format!(
-                            "mutation of `{nested}` is nested inside an inner \
-                             `for` in this for-loop body; nested-loop mutation \
-                             is not yet supported (a conditional `if p: \
-                             {nested} += …` write is supported — only an inner \
-                             `for` is not).  Move the mutation to the outer loop \
-                             body, or rewrite using a generator expression."
+                            "`{nested}` is written inside an inner `for` by an \
+                             operation no aggregate states.  An inner loop \
+                             accumulating with `+=` or `-=` folds to a `sum`; \
+                             `*=`, `//=` and `:=` do not.  Rewrite the inner loop \
+                             as a generator expression, or move the mutation to \
+                             the outer loop body."
                         ),
                     ));
                 }
@@ -844,6 +846,8 @@ pub(super) fn lower_middle_stmt(
         } => {
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
+            let folded = fold_inner_accumulation_loops(for_body)?;
+            let for_body = &folded[..];
 
             // Detect a mutation loop: at least one `:=` / `+=` to a variable
             // from the outer scope.  Yields are not a barrier — a generator with
@@ -870,23 +874,21 @@ pub(super) fn lower_middle_stmt(
                 };
                 return lower_generator_or_mutation_loop(&site, body, ctx);
             }
-            // Top-level scan found nothing, but a *nested* `if` or
-            // `for` may still mutate an outer-scope variable — we
-            // don't yet support either of those (nested-for is
-            // future work; mutations under `if` need refinement
-            // propagation).  Reject early with a specific message
-            // so users don't see the generic "must end in yield"
-            // error from the generator-for fallback below.
+            // Top-level scan found nothing, but a nested `if` or `for` may still
+            // mutate an outer-scope variable. An inner `for` reaching here is one
+            // `fold_inner_accumulation_loops` left standing, its write being one no
+            // aggregate states; mutations under `if` need refinement propagation.
+            // Reject early with a specific message so users don't see the generic
+            // "must end in yield" error from the generator-for fallback below.
             if let Some(nested) = find_nested_mutation_var(for_body, &scope) {
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     format!(
-                        "mutation of `{nested}` is nested inside an inner `for` \
-                     in this for-loop body; nested-loop mutation is not yet \
-                     supported (a conditional `if p: {nested} += …` write is \
-                     supported — only an inner `for` is not).  Move the mutation \
-                     to the outer loop body, or rewrite using a generator \
-                     expression."
+                        "`{nested}` is written inside an inner `for` by an operation \
+                     no aggregate states.  An inner loop accumulating with `+=` or \
+                     `-=` folds to a `sum`; `*=`, `//=` and `:=` do not.  Rewrite \
+                     the inner loop as a generator expression, or move the mutation \
+                     to the outer loop body."
                     ),
                 ));
             }
