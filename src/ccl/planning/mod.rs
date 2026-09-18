@@ -227,6 +227,21 @@ pub(super) fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
             {
                 replace_tuple_project_with_id(first, ty);
             }
+            // The projection this rewrite just replaced is what made the chain a
+            // compute function of the pair; over the arm's own domain the chain is
+            // whatever the step the projection fed is. A chain's kind is its head's,
+            // and the head is now a minted `id` that declares nothing, so carry the
+            // kind forward onto both rather than leaving the projection's behind.
+            if let TypedExprNode::Compose(elts) = &expr.node
+                && let Some(kind) = elts.get(1).and_then(|e| e.ty.fun_kind()).cloned()
+            {
+                expr.ty.set_fun_kind(kind.clone());
+                if let TypedExprNode::Compose(elts) = &mut expr.node
+                    && let Some(first) = elts.first_mut()
+                {
+                    first.ty.set_fun_kind(kind);
+                }
+            }
         }
         TypedExprNode::Apply { .. } => {
             let mut output_ty = expr.ty.clone();
@@ -241,14 +256,6 @@ pub(super) fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
             *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
         TypedExprNode::Tuple(_) => {
-            if let Type::Tuple(elts) = &mut expr.ty {
-                elts.iter_mut().for_each(|elt| match elt {
-                    Type::Fun { domain, .. } => {
-                        **domain = ty.clone();
-                    }
-                    _ => panic!(),
-                });
-            }
             if let TypedExprNode::Tuple(elts) = &mut expr.node {
                 for elt in elts.iter_mut() {
                     if is_constant(elt) {
@@ -256,6 +263,21 @@ pub(super) fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
                     } else {
                         replace_tuple_project_with_id(elt, ty);
                     }
+                }
+            }
+            // Read the rewritten elements' own types back into the recorded tuple
+            // rather than re-domaining the recorded one in place: an element's rewrite
+            // can change its kind as well as its domain (the `Compose` arm above), and
+            // a tuple that kept the pre-rewrite kind beside a re-kinded element is the
+            // disagreement `typecheck` reports at the hash-join key below.
+            if let (Type::Tuple(recorded), TypedExprNode::Tuple(elts)) = (&mut expr.ty, &expr.node)
+            {
+                for (slot, elt) in recorded.iter_mut().zip(elts) {
+                    assert!(
+                        matches!(slot, Type::Fun { .. }),
+                        "a tuple arm of a single-arm function is a morphism: {slot}"
+                    );
+                    *slot = elt.ty.clone();
                 }
             }
         }
