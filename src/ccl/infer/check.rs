@@ -558,9 +558,10 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
         // which left these unchecked).
-        TypedExprNode::Var(_) | TypedExprNode::Builtin(_) | TypedExprNode::Source(_) => {
-            expr.ty.clone()
-        }
+        TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::LoadFrom(_) => expr.ty.clone(),
 
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 

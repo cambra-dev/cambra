@@ -7,7 +7,7 @@
 //! because it is part of the crate-public surface re-exported from
 //! `tile_operators`.
 
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
 
 use super::{Predicate, Tile, TilePathStep, Tiling};
 use crate::interpreter::{ColumnValue, Extent, Value, bindings_are_list, transform_hashmap_values};
@@ -31,12 +31,27 @@ pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
 
 /// Converts a Scalar tile or Record of Scalars to its underlying [`ColumnValue`].
 pub fn scalar_tile_to_column_value(tile: Tile) -> ColumnValue {
+    try_scalar_tile_to_column_value(tile).expect("Not scalar")
+}
+
+/// The same conversion, answering `None` for a shape that is not a scalar or a record
+/// of them.
+///
+/// For a caller holding a tile whose shape is **data** rather than a compiler
+/// invariant — a seed drained from a producer, where a record with a collection-valued
+/// field is a program the store cannot seed. Such a caller reports it; only a caller
+/// whose tile shape is an invariant may take the panicking form.
+pub fn try_scalar_tile_to_column_value(tile: Tile) -> Option<ColumnValue> {
     match tile {
-        Tile::Scalar(cv) => cv,
+        Tile::Scalar(cv) => Some(cv),
         Tile::Record(m) => {
-            ColumnValue::Records(extract_hashmap_values(m, scalar_tile_to_column_value))
+            let mut fields = HashMap::with_capacity(m.len());
+            for (name, field) in m {
+                fields.insert(name, try_scalar_tile_to_column_value(field)?);
+            }
+            Some(ColumnValue::Records(fields))
         }
-        _ => panic!("Not scalar"),
+        _ => None,
     }
 }
 
@@ -222,10 +237,4 @@ pub(crate) fn extract_predicate(pred: &Predicate, path: &[TilePathStep]) -> Pred
         }
         _ => todo!("We don't support correlated function preds yet"),
     }
-}
-fn extract_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(InputV) -> V>(
-    source: HashMap<K, InputV>,
-    f: F,
-) -> HashMap<K, V> {
-    source.into_iter().map(|(k, v)| (k.clone(), f(v))).collect()
 }

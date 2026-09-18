@@ -319,7 +319,9 @@ fn lower_tx_block_scoped(
                     stmt.span,
                     "a `with begin():` block supports mutable writes (`x := …`, `x += …`), \
                      local bindings (`x = …`), `if cond:` guards, `match` dispatch, \
-                     and feeds (`out << e`)",
+                     and feeds (`out << e`). A declaration goes above the block, \
+                     `@LoadFrom` included: its value is the predecessor's, read once \
+                     at the swap",
                 ));
             }
         };

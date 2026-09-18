@@ -212,15 +212,16 @@ fail.
 ## The one guard: a version must be able to take over the state
 
 `LiveProgram::reload` compares the variables the running program holds against those the new version
-declares, read off its planned tree (`OpConversionContext::state_conflicts`). Three things are
+declares, read off its planned tree (`OpConversionContext::state_conflicts`). Five things are
 refused:
 
-- **A variable the new version no longer declares.** Its value has nowhere to be seeded and would be
-  discarded.
-- **A variable it declares at a different type.** Its value cannot seed a store built for another
-  shape. Allowed through, the store is constructed around a constant of the wrong extent and the
-  process dies on the next pull (`Scalar(Strings([…])) vs Scalar(Int)`), taking every endpoint with
-  it, which is why this is checked rather than left to fail later.
+- **A variable the new version no longer declares and does not load with `@LoadFrom`.** Its value
+  has nowhere to be seeded and would be discarded. Loading it gives it somewhere to go
+  ([Seeding a variable from the value the predecessor held](#seeding-a-variable-from-the-value-the-predecessor-held)).
+- **A variable it declares, or loads with `@LoadFrom`, at a different type.** Its value cannot seed
+  a store built for another shape. Allowed through, the store is constructed around a constant of
+  the wrong extent and the process dies on the next pull (`Scalar(Strings([…])) vs Scalar(Int)`),
+  taking every endpoint with it, which is why this is checked rather than left to fail later.
 - **A value that would move between two declarations the source does not distinguish.** Two
   anonymous call sites of one stateful function are told apart by position alone, so reordering
   them, or inserting a third ahead, hands each variable its neighbour's value. The site's own
@@ -228,6 +229,18 @@ refused:
   while one still present under a different variable has moved (`site_moved`). Refused rather than
   followed, because nothing in the source says which declaration the value belongs to — the refusal
   names both and says that binding each call site to a name is what makes the edit carry.
+- **A `@LoadFrom(x)` where the running program declares `x` more than once under one chain.** The
+  same move with the load's own edit in the way. A load edits the body of every site it sits in, so
+  no site's content survives for `site_moved` to match, and pairing the sites with the declarations
+  by position would carry the swap unremarked. The remedy is the same one: naming each call site
+  gives the load a chain that resolves.
+- **A `@LoadFrom(x)` naming a variable nothing holds.** There is nothing to read: a first
+  compilation has no predecessor at all, and otherwise no variable of that spelling is in scope at
+  that point in the version being replaced.
+- **A `@LoadFrom(x)` naming a variable the running program has decided no value for.** A store
+  nothing reads is never driven, so it declares its variables and hands on nothing. Reported apart
+  from the refusal above because the name addresses a real variable and the source is right about
+  where its value goes: what is missing is the value.
 
 The check runs before anything is torn down, so a refused reload leaves the program whole.
 
@@ -272,6 +285,107 @@ to another port releases the one it left, instead of the process keeping every p
 Dropping the handle is what closes it — `SharedHttpServer` holds the listener alongside the
 dispatcher thread and unblocks the thread on drop, so the thread's own shutdown path runs and its
 `Server` goes with it. `a_port_whose_last_route_goes_is_released` covers both halves.
+
+## Seeding a variable from the value the predecessor held
+
+`@LoadFrom(x)` binds a declaration to the value the retired version held for the mutable variable
+`x`, so a version that renames or retires a variable can still take its value over
+([chl-spec §8.8](../../../docs/chl-spec.md#88-loadfrom) states the language rule). Silence still
+means inherit: a variable the new version declares under the same identity takes the value it held
+whether or not anything names it.
+
+Started from nothing, a source containing `@LoadFrom(x)` is a compile error naming `x`, so a version
+containing one is an upgrade of a specific predecessor. The predecessor today is the in-process
+`Inheritance`, which is what stops such a version being redeployed into a fresh environment, a new
+region, or CI. A durable store would be a second kind of predecessor, and durable state is
+[Sketched](../../../docs/design.md); which predecessors a load may name is settled there rather than
+here. The remedy meanwhile is the version the author needs anyway — the one with the migration taken
+out, which retires nothing further because a name loaded and not declared is gone after the version
+that loaded it.
+
+Lowering erases the decorator: the statement becomes a `let` bound to `TypedExprNode::LoadFrom`, a
+leaf holding the source's own spelling and resolved at operator conversion. That is `Source`'s
+shape, and for `Source`'s reason — the name addresses something the compilation is handed rather
+than something the tree computes. It is not a variable reference, so no scope resolution reaches it
+and `uniquify` leaves the spelling alone; the version that retires `x` has no binder for it to refer
+to.
+
+A loaded value whose extent is a function is built with `Constant::collection`, which tiles it as a
+sealed function (`src/interpreter/design-operators.md`, "Tile Operators") rather than as a bindings
+table a consumer applies. Which of the two a value is cannot be read off the value, so the site
+holding it is the site that says. That is what lets a comprehension iterate a loaded collection, and
+so what makes a unit change on persisted state a declaration.
+
+### Which variable a site addresses
+
+A site has two names in play. The **loaded spelling** is the `x` of `@LoadFrom(x)`, a variable of
+the retired version. The **target** is the binding the
+decorated declaration introduces, a variable of the new version:
+
+```python
+@LoadFrom(qty)      # `qty` is the loaded spelling
+qty_units: Int      # `qty_units` is the target
+```
+
+`state_identities` assigns declarations and load sites their addresses in one walk, so the two
+cannot disagree about what the binding chain at a point is. A declaration's address is the chain
+enclosing it (`VarPath`); a site's is read off the same chain and then resolved outward, the way a
+name resolves in the source — the innermost enclosing chain holding a variable of that spelling
+wins. Outward means the site's own chain and the chains enclosing it, and never a chain below one of
+those: a load inside a stateful function's body finds the ``a`.`total`` of its own instantiation,
+while the same spelling written at the top level reaches nothing, ``a`.`total`` sitting under a
+binding the top level's chain does not contain. A diagnostic names the spelling alone, which is what
+the source contains.
+
+The target contributes no chain segment. A segment comes from descending into a binding's
+definition, and a load's definition is the leaf alone, so nothing is ever declared under the target
+and a segment for it would address nothing. Pushing it would also move the search's innermost
+candidate onto a variable no source can mean: a predecessor that had declared the loaded spelling
+inside an instantiation bound to the target's own spelling.
+
+A chain declaring the spelling once answers whichever site asks — one declaration of an enclosing
+scope, reached by a site per instantiation. A chain declaring it more than once is refused. Those
+declarations are the anonymous call sites of one stateful function, told apart by position alone,
+and a load carries no position that confirms one: `site_moved` catches a declaration moving between
+such positions by the retired site's content, and a load has edited that content at every site it
+sits in. Pairing site 𝑖 with declaration 𝑖 would hand each site its neighbour's value on a reorder.
+Binding each call site to a name gives the load a chain that resolves, and the refusal says so.
+
+Resolution reads what the retired version **declared**, not what it currently holds a value for. A
+store the running program never drove holds no value while still being the variable the name means,
+so answering from the values would report such a name as addressing nothing and refuse the version
+for dropping a variable it says where to put.
+
+### A loaded value summarizes positions
+
+A position is an index into the sequence a store folds — an iteration item or a commit, absolute
+rather than a row offset ([Positions are absolute, in the store and in the drive
+alike](#positions-are-absolute-in-the-store-and-in-the-drive-alike)) — and a store's value at
+position 𝑝 summarizes every position below 𝑝, being their fold.
+
+Whether a rebuilt store resumes above the positions its seed summarizes or begins at its input is
+`continues`, which each store builder hands to `OpConversionContext::iteration_input`. It is a
+question about the seed rather than about the variable. An ordinary reload can answer it by
+identity, because a variable that carries its own value carries its own positions with it; a load
+breaks that coincidence, the target's identity being new while the value it starts at is one the
+retired version folded positions into. So `continues` reads the nodes the `@LoadFrom` leaf reaches
+(`is_a_load`) as well.
+
+Answered per store rather than per key, because one store drives one position sequence: a key added
+beside one that resumes begins wherever that store resumes. What it resumes over follows
+[A variable that begins above its loop's input](#a-variable-that-begins-above-its-loops-input)
+unchanged: the kept iteration where the loop reads the same collection, a fresh fold of the whole
+collection where it reads another.
+
+### Typing
+
+Inference gives the node a fresh variable and the declaration's annotation pins it. Nothing in the
+source names the predecessor's type: the values arrive at operator conversion, long after inference,
+and a runtime `Value` carries no CCL type to read a shape off. What the predecessor holds is checked
+against what inference concluded, by the comparison a declaration gets — a record annotated at one
+of its two fields is a refusal (`StateConflict::LoadFromAt`) rather than a narrowing, because a
+value read at another shape becomes a constant of the wrong extent and the operator built around it
+fails on its first pull rather than at the swap.
 
 ## A subscription lasts as long as its producer
 
@@ -406,7 +520,10 @@ Three things decide where a rebuilt store picks up, and only two of them are han
   stateful function in one expression. An edit to either body leaves it alone, and a reload that
   would move a value between them is refused (`swapping_two_anonymous_call_sites_is_refused`). What
   is left unaddressed is narrower: a reorder that edits both bodies at once leaves neither site
-  present to recognise, so the position decides and the values cross.
+  present to recognise, so the position decides and the values cross. A `@LoadFrom` reaches that
+  shape by construction, editing the body of every site it sits in, which is why a load is refused
+  wherever the chain declares its spelling more than once
+  ([Which variable a site addresses](#which-variable-a-site-addresses)).
 
   **A spelling is not unique, and nothing computed can stand in for one.** A declaration can be
   shadowed, and a function holding a whole stateful loop declares one variable per call site once
