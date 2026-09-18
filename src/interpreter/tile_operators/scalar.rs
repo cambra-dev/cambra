@@ -127,9 +127,11 @@ struct ConstantProducer {
     released: bool,
     /// The collection tile, built on the first pull that asks for one.
     ///
-    /// A constant's bindings table cannot change, so deriving the tile per pull
-    /// re-clones every key and value to reach the same answer. Only the obsolete
-    /// guard varies, and that applies to the copy handed out.
+    /// What holding it saves is the `Value` to [`ColumnValue`] conversion: the
+    /// unzip into keys and values, and a `from_values` over each. The tile is
+    /// still cloned per pull, so the keys and values are re-cloned either way.
+    /// A constant's bindings table cannot change, and the obsolete guard that
+    /// does applies to the copy handed out.
     table: Option<Tile>,
 }
 

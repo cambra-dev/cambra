@@ -306,12 +306,15 @@ impl LiveProgram {
             if !unseatable.is_empty() {
                 // Naming the declarations is the fix for a positional clash, and
                 // it is not one an author would guess from the other refusals.
-                let remedy = if unseatable
-                    .iter()
-                    .any(|c| matches!(c, StateConflict::Moved { .. }))
-                {
+                let remedy = if unseatable.iter().any(|c| {
+                    matches!(
+                        c,
+                        StateConflict::Moved { .. } | StateConflict::LoadFromAnonymous { .. }
+                    )
+                }) {
                     "\nBind each of those declarations to its own name — `a = f(…)` rather than a \
-                     bare `f(…)` — and a reload can follow them wherever they move."
+                     bare `f(…)` — and a reload can follow them wherever they move, and a \
+                     `@LoadFrom` can say which one it reads."
                 } else if unseatable
                     .iter()
                     .any(|c| matches!(c, StateConflict::LoadFromAt { .. }))

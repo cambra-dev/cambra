@@ -422,13 +422,13 @@ pub struct OpConversionContext {
     /// for a first compilation — which is why a version containing one is
     /// refused there rather than converted.
     load_from_values: HashMap<NodeId, Value>,
-    /// The nodes of that tree a fresh compilation would not reproduce, from
-    /// [`unrecomputable_nodes`]. Installed by the same call, because both answer
+    /// The nodes of that tree a fresh compilation would not reproduce
+    /// ([`reads_a_source`]). Installed by the same call, because both answer
     /// about the tree rather than about the compilation.
     unrecomputable: HashSet<NodeId>,
-    /// The nodes of that tree whose value comes from a `@LoadFrom`, from
-    /// [`load_from_derived_nodes`]. Installed by the same call, and read where a
-    /// store decides whether its seed summarizes positions.
+    /// The nodes of that tree whose value comes from a `@LoadFrom`
+    /// ([`is_a_load`]). Off the same [`nodes_reaching`] walk as the field above,
+    /// and read where a store decides whether its seed summarizes positions.
     load_from_derived: HashSet<NodeId>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
     /// `let __hist = Transact{…}` builds the shared store once and mutable variables
@@ -644,8 +644,8 @@ impl OpConversionContext {
             &self.inherited.declared_paths(),
             &self.inherited.mutable_state,
         );
-        self.unrecomputable = unrecomputable_nodes(expr);
-        self.load_from_derived = load_from_derived_nodes(expr);
+        [self.unrecomputable, self.load_from_derived] =
+            nodes_reaching(expr, [reads_a_source, is_a_load]);
     }
 
     /// Install where each node of the tree about to be converted stood in the
@@ -814,7 +814,7 @@ records one and the only site a `Transact` reaches"
     /// released in full holds nothing at all
     /// ([`FanOut::released_in_full`]), so the binding is rebuilt — which
     /// reproduces what the spent one held only where the term is recomputable
-    /// ([`unrecomputable_nodes`]), and where it is not the spent operator is
+    /// ([`recomputable`](Self::recomputable)), and where it is not the spent operator is
     /// still the whole of what this version can have.
     ///
     /// A rebuild for that reason is not a change to what the binding computes,
@@ -925,7 +925,7 @@ records one and the only site a `Transact` reaches"
     /// position, so it reads its input from the beginning — and a kept iteration
     /// cannot offer one, having released the prefix on behalf of consumers the
     /// new version does not have. Rebuilding recovers those positions where the
-    /// term is recomputable ([`unrecomputable_nodes`]) and nothing recovers them
+    /// term is recomputable ([`recomputable`](Self::recomputable)) and nothing recovers them
     /// where it is not, which
     /// [`unreadable_inputs`](Self::unreadable_inputs) reports before teardown
     /// rather than refusing: the elements are gone, so folding from here is all
@@ -1101,12 +1101,25 @@ in it has a correspondent",
         // it is not a drop.
         let declared_by_predecessor = self.minted.declared_paths();
         let mut taken_over: HashSet<VarPath> = HashSet::new();
-        for (site, resolved) in identities.read_load_from(&declared_by_predecessor) {
-            let Some(path) = resolved else {
-                out.push(StateConflict::NoPredecessor {
-                    name: site.name.clone(),
-                });
-                continue;
+        for (site, target) in identities.read_load_from(&declared_by_predecessor) {
+            let path = match target {
+                LoadTarget::Variable(path) => path,
+                // Refused rather than resolved by position: which of the
+                // declarations holds the value the site means is what the source
+                // does not say ([`LoadFromSite::resolve`]). The variables
+                // themselves report as dropped alongside, both being true.
+                LoadTarget::Anonymous => {
+                    out.push(StateConflict::LoadFromAnonymous {
+                        name: site.name.clone(),
+                    });
+                    continue;
+                }
+                LoadTarget::Absent => {
+                    out.push(StateConflict::NoPredecessor {
+                        name: site.name.clone(),
+                    });
+                    continue;
+                }
             };
             // Declared by the running program but holding nothing. The name
             // addresses a real variable, so this is not a drop and not a missing
@@ -1187,7 +1200,7 @@ in it has a correspondent",
     /// mechanisms.
     ///
     /// Rebuilding recovers those positions where the term is recomputable
-    /// ([`unrecomputable_nodes`]) and nothing recovers them where it is not. This
+    /// ([`recomputable`](Self::recomputable)) and nothing recovers them where it is not. This
     /// reports the second case. It does not refuse it, because there is nothing
     /// better available: the elements are gone, so folding from where the input
     /// starts is all that is left, and whether the author meant a running total
@@ -1204,8 +1217,8 @@ in it has a correspondent",
         // answer. A reload whose state all carries forward asks for none, so the
         // correspondence is built on the first source that reads it.
         let correspondence = std::cell::OnceCell::new();
-        let unrecomputable = unrecomputable_nodes(planned);
-        let load_from_derived = load_from_derived_nodes(planned);
+        let [unrecomputable, load_from_derived] =
+            nodes_reaching(planned, [reads_a_source, is_a_load]);
         let carried = self.live_state();
         let sources = writer_sources(planned);
         let mut out = Vec::new();
@@ -3129,31 +3142,27 @@ fn writer_sources(expr: &Expr) -> HashMap<NodeId, Vec<&Expr>> {
     out
 }
 
-/// Every node of `expr` whose value a fresh compilation would **not** reproduce.
+/// A term that reads a data source, which is what makes it **unrecomputable**:
+/// building it again does not yield what it held.
 ///
-/// A term is **recomputable** when building it again yields what it held. A
-/// literal is, and so is any term built only from recomputable terms. A term
-/// that reads a data source is not: a source hands a new producer only what its
-/// retired ones had not finished
-/// (`src/interpreter/producer_releases.rs`), so a rebuild
-/// sees a suffix where the term's own meaning names the whole.
+/// A source hands a new producer only what its retired ones had not finished
+/// (`src/interpreter/producer_releases.rs`), so a rebuild sees a suffix where
+/// the term's own meaning names the whole. A literal is recomputable, and so is
+/// any term built only from recomputable terms.
 ///
 /// This is what a reload needs in order to decide between rebuilding a term and
 /// refusing. Deriving it from the tree is what keeps the decision off the
 /// author: reading a source is a syntactic property of a term, and every other
-/// term's answer is its children's.
-///
-/// A `Var` answers for what its binding was bound to, so a term reading a
-/// mutable variable is unrecomputable through the `Transact` that declares it —
-/// the store folds a source, and a rebuilt store folding the suffix holds a
-/// different value. A name the walk never saw bound is treated as recomputable:
-/// a free name at this point is a builtin, and the tree reaching planning is
-/// point-free.
-pub fn unrecomputable_nodes(expr: &Expr) -> HashSet<NodeId> {
-    nodes_reaching(expr, |node| matches!(node, TypedExprNode::Source(_)))
+/// term's answer is its children's. Propagated through the bindings between, a
+/// term reading a mutable variable is unrecomputable through the `Transact` that
+/// declares it — the store folds a source, and a rebuilt store folding the suffix
+/// holds a different value.
+pub fn reads_a_source(node: &TypedExprNode) -> bool {
+    matches!(node, TypedExprNode::Source(_))
 }
 
-/// Every node of `expr` whose value comes from a `@LoadFrom`.
+/// A term that is the `@LoadFrom` leaf itself, which is what makes every term
+/// above it **loaded**.
 ///
 /// A loaded value summarizes the positions the retired version had folded into
 /// the variable it was loaded from, which is what a store built around it has to
@@ -3161,36 +3170,40 @@ pub fn unrecomputable_nodes(expr: &Expr) -> HashSet<NodeId> {
 /// recurrence rather than begin one, whatever the identity of the variable it
 /// seeds ([`OpConversionContext::iteration_input`]).
 ///
-/// A set rather than a predicate over one node, because the seed reaches the
-/// store through the bindings between: `@LoadFrom` binds a `let`, and the
-/// declaration that uses it names that binding rather than containing the leaf.
-pub fn load_from_derived_nodes(expr: &Expr) -> HashSet<NodeId> {
-    nodes_reaching(expr, |node| matches!(node, TypedExprNode::LoadFrom(_)))
+/// Asked of every node rather than of one, because the seed reaches the store
+/// through the bindings between: `@LoadFrom` binds a `let`, and the declaration
+/// that uses it names that binding rather than containing the leaf.
+pub fn is_a_load(node: &TypedExprNode) -> bool {
+    matches!(node, TypedExprNode::LoadFrom(_))
 }
 
-/// Every node of `expr` whose value comes from a leaf `is_source` accepts.
+/// For each leaf in `leaves`, every node of `expr` whose value comes from one.
 ///
-/// One walk for the two questions asked of a term this way — whether it reads a
-/// data source, and whether it reads a loaded value — because they differ only
-/// in the leaf. What makes them the same walk is the propagation: a `Var` answers
-/// for what its binding was bound to, so the property reaches a use through every
-/// binding between, and a term's answer is otherwise its children's.
-fn nodes_reaching(expr: &Expr, is_source: impl Fn(&TypedExprNode) -> bool) -> HashSet<NodeId> {
-    fn go(
+/// One walk for every question asked of a term this way, because they differ
+/// only in the leaf and agree in the propagation: a `Var` answers for what its
+/// binding was bound to, so the property reaches a use through every binding
+/// between, and a term's answer is otherwise its children's. A name the walk
+/// never saw bound answers `false` for every leaf: a free name at this point is
+/// a builtin, and the tree reaching planning is point-free.
+pub fn nodes_reaching<const N: usize>(
+    expr: &Expr,
+    leaves: [fn(&TypedExprNode) -> bool; N],
+) -> [HashSet<NodeId>; N] {
+    fn go<const N: usize>(
         e: &Expr,
-        is_source: &impl Fn(&TypedExprNode) -> bool,
-        bound: &mut Vec<(Name, bool)>,
-        out: &mut HashSet<NodeId>,
-    ) -> bool {
-        let mut reaches = is_source(&e.node)
-            || match &e.node {
-                TypedExprNode::Var(name) => bound
-                    .iter()
-                    .rev()
-                    .find(|(n, _)| n == name)
-                    .is_some_and(|(_, u)| *u),
-                _ => false,
-            };
+        leaves: &[fn(&TypedExprNode) -> bool; N],
+        bound: &mut Vec<(Name, [bool; N])>,
+        out: &mut [HashSet<NodeId>; N],
+    ) -> [bool; N] {
+        let from_binding = match &e.node {
+            TypedExprNode::Var(name) => bound
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map_or([false; N], |(_, u)| *u),
+            _ => [false; N],
+        };
+        let mut reaches: [bool; N] = std::array::from_fn(|i| leaves[i](&e.node) || from_binding[i]);
         // A `Let`'s binding is in scope for its body and not for its bound
         // expression, so the two halves are walked either side of the push.
         if let TypedExprNode::Let {
@@ -3199,22 +3212,31 @@ fn nodes_reaching(expr: &Expr, is_source: impl Fn(&TypedExprNode) -> bool) -> Ha
             body,
         } = &e.node
         {
-            let bound_is = go(bound_expr, is_source, bound, out);
+            let bound_is = go(bound_expr, leaves, bound, out);
             bound.push((binding.name.clone(), bound_is));
-            let body_is = go(body, is_source, bound, out);
+            let body_is = go(body, leaves, bound, out);
             bound.pop();
-            reaches |= bound_is | body_is;
+            for i in 0..N {
+                reaches[i] |= bound_is[i] | body_is[i];
+            }
         } else {
-            e.walk_children(|child| reaches |= go(child, is_source, bound, out));
+            e.walk_children(|child| {
+                let child_is = go(child, leaves, bound, out);
+                for i in 0..N {
+                    reaches[i] |= child_is[i];
+                }
+            });
         }
-        if reaches {
-            out.insert(e.node_id());
+        for i in 0..N {
+            if reaches[i] {
+                out[i].insert(e.node_id());
+            }
         }
         reaches
     }
 
-    let mut out = HashSet::new();
-    go(expr, &is_source, &mut Vec::new(), &mut out);
+    let mut out = std::array::from_fn(|_| HashSet::new());
+    go(expr, &leaves, &mut Vec::new(), &mut out);
     out
 }
 
@@ -3253,15 +3275,19 @@ pub(crate) struct LoadFromSite {
     /// What inference concluded the value is, which the value the predecessor
     /// holds has to fit.
     ty: Type,
-    /// Its position among the sites sharing this chain and this spelling, assigned
-    /// by the same walk that numbers the declarations.
-    ///
-    /// Inlining duplicates a function body into every call site, so a `@LoadFrom`
-    /// written inside one becomes a site per instantiation. Those sites are told
-    /// apart the way the declarations they address are — by where they appear —
-    /// and reading that off here is what keeps the two halves of one walk from
-    /// disagreeing about which variable a name means.
-    index: usize,
+}
+
+/// What a site's spelling addresses among the retired version's declarations.
+#[derive(Debug, Clone)]
+pub(crate) enum LoadTarget {
+    /// The one variable that spelling names at this site.
+    Variable(VarPath),
+    /// Several declarations share the innermost chain that declares the
+    /// spelling, so only their position among them tells them apart and the
+    /// site names no one of them. See [`LoadFromSite::resolve`].
+    Anonymous,
+    /// No declaration of that spelling is in scope at the site.
+    Absent,
 }
 
 impl LoadFromSite {
@@ -3287,30 +3313,35 @@ impl LoadFromSite {
     /// that declared a variable of this spelling inside an instantiation bound
     /// to the load's own target name would answer for it.
     ///
-    /// Among the candidates a chain admits, the site's own [`index`](Self::index)
-    /// picks the declaration at the same position.
-    fn resolve(&self, declared: &HashSet<VarPath>) -> Option<VarPath> {
-        (0..=self.chain.len()).rev().find_map(|n| {
+    /// A chain declaring the spelling once has nothing to tell apart and answers
+    /// whichever site asks, which is a site per instantiation reaching one
+    /// declaration of an enclosing scope. A chain declaring it more than once is
+    /// [`LoadTarget::Anonymous`]: those declarations are the anonymous call sites
+    /// of one stateful function, told apart by position alone, and a load carries
+    /// no position that confirms one. [`site_moved`] catches a declaration moving
+    /// between such positions because the retired site's content survives the
+    /// edit that moved it; a load edits the body of every site it sits in, so no
+    /// content corresponds and the value would move between them unremarked.
+    fn resolve(&self, declared: &HashSet<VarPath>) -> LoadTarget {
+        for n in (0..=self.chain.len()).rev() {
             let at = |index| VarPath {
                 chain: self.chain[..n].to_vec(),
                 name: self.name.clone(),
                 index,
             };
-            // The site's own position addresses the declaration at the same position:
-            // two anonymous call sites of one stateful function each hold a site and a
-            // declaration, and position is the only thing telling either pair apart.
-            let here = at(self.index);
-            if declared.contains(&here) {
-                return Some(here);
+            // Indices are dense per chain and spelling, so the first is declared
+            // wherever the chain declares the spelling at all, and the second
+            // only where it declares it more than once.
+            if !declared.contains(&at(0)) {
+                continue;
             }
-            // A scope declaring the spelling once has nothing to tell apart, and
-            // answers whichever site asks. That is a load naming a variable of an
-            // enclosing scope: one declaration, but a site per instantiation, so the
-            // positions do not correspond and there is no ambiguity for them to
-            // resolve.
-            let only = at(0);
-            (!declared.contains(&at(1)) && declared.contains(&only)).then_some(only)
-        })
+            return if declared.contains(&at(1)) {
+                LoadTarget::Anonymous
+            } else {
+                LoadTarget::Variable(at(0))
+            };
+        }
+        LoadTarget::Absent
     }
 }
 
@@ -3332,10 +3363,6 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
     struct Walk<'e> {
         chain: Vec<String>,
         counts: Counts,
-        /// Counted apart from the declarations': a site and the declaration it
-        /// addresses are numbered within their own kind, so a scope holding one
-        /// declaration and one site has both at `0`.
-        load_from_counts: Counts,
         out: StateIdentities<'e>,
     }
 
@@ -3361,18 +3388,12 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
             }
         }
         if let TypedExprNode::LoadFrom(name) = &e.node {
-            let index = w
-                .load_from_counts
-                .entry((w.chain.clone(), name.clone()))
-                .or_insert(0);
             w.out.load_from_sites.push(LoadFromSite {
                 node: e.node_id(),
                 name: name.clone(),
                 chain: w.chain.clone(),
                 ty: e.ty.clone(),
-                index: *index,
             });
-            *index += 1;
         }
         // A binding's definition is an address the source names, so a `Transact`
         // inside one is addressed under that name. The binding's *body* is not:
@@ -3420,7 +3441,6 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
     let mut w = Walk {
         chain: Vec::new(),
         counts: Counts::new(),
-        load_from_counts: Counts::new(),
         out: StateIdentities {
             variables: Vec::new(),
             load_from_sites: Vec::new(),
@@ -3431,12 +3451,8 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
 }
 
 impl<'e> StateIdentities<'e> {
-    /// Every mutable variable's identity, in key order, by the `Transact` node
-    /// that declares it.
-    ///
-    /// Handed to conversion so that a store is built under the identities the
-    /// guard checked, rather than under a second derivation of them.
-    /// Every store, as its declaring `Transact` with the variables it declares.
+    /// Every store, as its declaring `Transact` with the variables it declares,
+    /// in key order.
     ///
     /// Keyed by the declaration rather than by the variable because the questions asked
     /// of a store — whether it continues a recurrence, where its drive resumes — are
@@ -3449,12 +3465,16 @@ impl<'e> StateIdentities<'e> {
         out
     }
 
+    /// [`Self::stores`] carrying each variable's identity alone.
+    ///
+    /// Handed to conversion so that a store is built under the identities the
+    /// guard checked, rather than under a second derivation of them. Owned,
+    /// because the context holding it outlives the tree the walk borrows.
     fn variable_paths(&self) -> HashMap<NodeId, Vec<VarPath>> {
-        let mut out: HashMap<NodeId, Vec<VarPath>> = HashMap::new();
-        for v in &self.variables {
-            out.entry(v.declared_by).or_default().push(v.path.clone());
-        }
-        out
+        self.stores()
+            .into_iter()
+            .map(|(node, vars)| (node, vars.iter().map(|v| v.path.clone()).collect()))
+            .collect()
     }
 
     /// What each mutable variable is declared as, by identity — enough to decide
@@ -3483,8 +3503,8 @@ impl<'e> StateIdentities<'e> {
     /// The value each `@LoadFrom(x)` site this version reads resolves to, given
     /// what the retired version `held`.
     ///
-    /// A site that resolves to nothing is left out rather than reported: the
-    /// guard has already refused such a version before anything was torn down
+    /// A site that addresses no one variable is left out rather than reported:
+    /// the guard has already refused such a version before anything was torn down
     /// ([`OpConversionContext::state_conflicts`]), so reaching conversion with
     /// one is a compiler bug, and conversion says so where it meets it.
     fn load_from_values(
@@ -3493,19 +3513,22 @@ impl<'e> StateIdentities<'e> {
         held: &HashMap<VarPath, Value>,
     ) -> HashMap<NodeId, Value> {
         self.read_load_from(declared)
-            .filter_map(|(site, path)| Some((site.node, held.get(&path?)?.clone())))
+            .filter_map(|(site, target)| match target {
+                LoadTarget::Variable(path) => Some((site.node, held.get(&path)?.clone())),
+                LoadTarget::Anonymous | LoadTarget::Absent => None,
+            })
             .collect()
     }
 
-    /// Each `@LoadFrom(x)` site, with the variable it addresses among those the
-    /// retired version `declared` — `None` where nothing does.
+    /// Each `@LoadFrom(x)` site, with what its spelling addresses among the
+    /// variables the retired version `declared`.
     ///
     /// The guard and conversion both read this, so the two cannot disagree about
     /// which variable a site names.
     fn read_load_from<'s>(
         &'s self,
         declared: &'s HashSet<VarPath>,
-    ) -> impl Iterator<Item = (&'s LoadFromSite, Option<VarPath>)> {
+    ) -> impl Iterator<Item = (&'s LoadFromSite, LoadTarget)> {
         self.load_from_sites
             .iter()
             .map(|site| (site, site.resolve(declared)))
@@ -3535,6 +3558,15 @@ pub enum StateConflict {
     /// The site that declared it still exists in the new version, declaring a
     /// different variable. See [`site_moved`].
     Moved { path: VarPath, now: VarPath },
+    /// The new version has a `@LoadFrom(x)` where the running program declares
+    /// `x` more than once under one chain, so the spelling names no one of them.
+    ///
+    /// The [`Moved`](Self::Moved) case with the load's own edit in the way: those
+    /// declarations are told apart by position, and the content that would
+    /// confirm a position is gone from every site a load sits in
+    /// ([`LoadFromSite::resolve`]). Its remedy is the same one — name the
+    /// declarations — which is why it renders in that group.
+    LoadFromAnonymous { name: String },
     /// The new version loads a variable the running program declares but has
     /// decided no value for.
     ///
@@ -3621,6 +3653,11 @@ impl std::fmt::Display for StateConflict {
             StateConflict::NoPredecessor { name } => {
                 write!(f, "`@LoadFrom({name})` has no variable to read")
             }
+            StateConflict::LoadFromAnonymous { name } => write!(
+                f,
+                "`@LoadFrom({name})` names several declarations that are told apart only by \
+                 where they appear",
+            ),
             StateConflict::Moved { path, now } => {
                 // Both directions of a swap are conflicts and describe one thing,
                 // so they render identically and the caller's sort collapses them.
@@ -4596,7 +4633,7 @@ mod recomputability_tests {
             TypedExpr::let_bind("b", TypedExpr::var("a"), TypedExpr::var("b")),
         );
         assert!(
-            unrecomputable_nodes(&e).is_empty(),
+            nodes_reaching(&e, [reads_a_source])[0].is_empty(),
             "nothing here reads a source"
         );
     }
@@ -4608,7 +4645,7 @@ mod recomputability_tests {
         let (bound_id, use_id) = (bound.node_id(), use_in_body.node_id());
         let e = TypedExpr::let_bind("a", bound, use_in_body);
 
-        let out = unrecomputable_nodes(&e);
+        let [out] = nodes_reaching(&e, [reads_a_source]);
         assert!(out.contains(&bound_id), "the source itself");
         assert!(
             out.contains(&use_id),
@@ -4633,7 +4670,7 @@ mod recomputability_tests {
             TypedExpr::tuple(vec![inner, outer_use]),
         );
 
-        let out = unrecomputable_nodes(&e);
+        let [out] = nodes_reaching(&e, [reads_a_source]);
         assert!(
             out.contains(&inner_id),
             "the inner `a` is the source-bound one"

@@ -3163,6 +3163,13 @@ declarations and reject one. Inside a `def`, the name resolves to the variable
 that function's own instantiation declares before it resolves to a top-level one,
 the way a name resolves anywhere else.
 
+A load inside a `def` is refused where the version being replaced called that
+`def` more than once. Each call site declares its own variable of the loaded
+name, and the source tells the call sites apart only by the order they appear in;
+a reorder would move each site's value onto its neighbour with nothing in either
+version saying so. Binding each call site to a name — `a = f(…)` rather than a
+bare `f(…)` — tells them apart, and the load then resolves.
+
 `x` is a name, not an expression, and it is a variable the *previous* version
 declared: the version being compiled need not declare it, and retiring `qty`
 while seeding `qty_units` from it is the case the decorator exists for.
@@ -3184,9 +3191,12 @@ is therefore not a read of a transactional variable and needs no `with begin():`
 block ([8.3 Reads](#83-reads)).
 
 **A variable may be declared, loaded, or both.** A variable the new version
-declares takes the value it held whether or not anything names it. `@LoadFrom` is
-for the variable it declares under a different name, or retires. Doing both keeps
-the old variable live while seeding a new one from it.
+declares carries its value forward whether or not a `@LoadFrom` names it, which
+is the ordinary reload. The decorator is for the variable the new version
+declares under a different name, or retires. A version doing both — declaring `x`
+and loading from `x` — leaves `x` running on its own value and starts the new
+variable at a copy of it taken at the swap. The two are separate variables from
+then on, and neither reads the other.
 
 **The annotation states the shape.** The value the running program holds has to fit
 it, and the two forms ([Two annotation forms: exact and
@@ -3203,11 +3213,17 @@ qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
 A comprehension over a map binds each value and keeps the keys, so that scales
 every quantity the predecessor held.
 
-**A running program is required.** A source containing `@LoadFrom(x)` is an
+**A running program is required today.** A source containing `@LoadFrom(x)` is an
 upgrade of a specific predecessor: compiled from nothing, it is an error naming
 `x`, and so is one naming a variable the running program does not hold. There is
 no `@LoadFrom(x, default)` — a default would turn that error back into a silent
 wrong answer.
+
+A live process is the only predecessor a version can be handed state from today.
+Durable state is **[Tentative]** ([design.md](design.md)), and a process
+restarting from a store on disk is the same migration against a predecessor that
+is not running; which predecessors a load may name is settled with durable state
+rather than here.
 
 **It is transitional.** The seeding happens once, so the decorator comes out in
 the next version. A name a version loads and does not declare is gone after that
