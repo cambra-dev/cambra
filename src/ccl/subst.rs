@@ -1452,11 +1452,12 @@ impl Subst {
                 value,
                 domain,
                 history_kind,
-            } => Type::History {
-                value: Box::new(self.apply_type(value)),
-                domain: Box::new(self.apply_type(domain)),
-                history_kind: *history_kind,
-            },
+                ..
+            } => Type::history(
+                self.apply_type(domain),
+                self.apply_type(value),
+                *history_kind,
+            ),
         }
     }
 

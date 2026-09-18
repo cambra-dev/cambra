@@ -725,6 +725,7 @@ fn erase_chan_domains_in_type(
         value,
         domain,
         history_kind: HistoryKind::Append,
+        ..
     } = ty
     {
         // The handle names its channel, and the channel's assembled type is what says

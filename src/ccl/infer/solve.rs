@@ -500,6 +500,7 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
                 value,
                 domain,
                 history_kind,
+                ..
             },
             other,
         )
@@ -509,6 +510,7 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
                 value,
                 domain,
                 history_kind,
+                ..
             },
         ) => (value, domain, history_kind, other),
         _ => unreachable!("called only when at least one side peels to a History"),
@@ -2496,12 +2498,8 @@ mod tests {
     #[test]
     fn the_projection_monomorphization_reads_through_a_mut_var() {
         use super::recovered_input;
-        use crate::ccl::{HistoryKind, Refinement};
-        let mut_var = |value: Type| Type::History {
-            value: Box::new(value),
-            domain: Box::new(Type::Txn),
-            history_kind: HistoryKind::Overwrite,
-        };
+        use crate::ccl::Refinement;
+        let mut_var = |value: Type| Type::mutable(Type::Txn, value);
         // Refinements are built here rather than via `refined_int`, which is
         // `debug_assertions`-only: the rule under test is not.
         let refined = |inner: Type| {
@@ -2569,13 +2567,9 @@ mod tests {
     #[test]
     fn a_handle_agrees_with_its_read_view_through_refinements() {
         use super::types_agree_modulo_unread;
-        use crate::ccl::{HistoryKind, Refinement};
+        use crate::ccl::Refinement;
         let refined = refined_int(TypedExpr::lit(Lit::Int(8)));
-        let mut_var = |value: Type| Type::History {
-            value: Box::new(value),
-            domain: Box::new(Type::Txn),
-            history_kind: HistoryKind::Overwrite,
-        };
+        let mut_var = |value: Type| Type::mutable(Type::Txn, value);
         let refinement = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
         let on_the_handle =
             |t: Type| Type::refined_one(t, Refinement::sharing(&refinement.predicate));
@@ -2606,11 +2600,7 @@ mod tests {
         ));
         assert!(!types_agree_modulo_unread(
             &mut_var(refined.clone()),
-            &Type::History {
-                value: Box::new(refined),
-                domain: Box::new(Type::Txn),
-                history_kind: HistoryKind::Append,
-            },
+            &Type::feed(Type::Txn, refined),
             true
         ));
     }
