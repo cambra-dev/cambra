@@ -1546,25 +1546,148 @@ acc",
     );
 }
 
-/// Nested `for` loops remain unsupported. The mutable variable machinery is why this
-/// matters: a fresh `:=` inside a loop body can only be a *sequential* mutable variable
-/// (the degenerate domain) precisely because there is no inner loop for it to
-/// accumulate over. If nested loops were ever admitted without also teaching the
-/// phase about a cross-iteration mutable variable declared inside a loop, that reasoning
-/// would silently stop holding — so the rejection is pinned here, next to what
-/// depends on it.
+/// An inner `for` that only accumulates folds to the accumulation it denotes, so a
+/// loop nests. The mutable variable machinery is why the cases below are worth
+/// naming: a fresh `:=` inside a loop body can only be a sequential mutable variable
+/// (the degenerate domain), which holds because lowering rewrites the inner `for`
+/// away before the phase runs, leaving no inner loop for such a variable to
+/// accumulate over. The last case pins that, declaring an accumulator between the
+/// two loops.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// (1+2+3) * (1+2) — the inner source names nothing outer.
+#[case::independent(
+    indoc! {r#"
+        total := 0
+        for x in [1, 2, 3]:
+            for y in [1, 2]:
+                total += x * y
+        total
+    "#},
+    18
+)]
+// The inner source **is** the outer element, the shape a nested loop exists for.
+#[case::inner_source_is_the_outer_element(
+    indoc! {r#"
+        total := 0
+        for xs in [[1, 2], [3, 4]]:
+            for x in xs:
+                total += x
+        total
+    "#},
+    10
+)]
+// 1*(1+2+3) + 2*(1+2+3): the body reads the outer binder, so the pair is correlated.
+#[case::correlated_body(
+    indoc! {r#"
+        total := 0
+        for r in [1, 2]:
+            for v in [1, 2, 3]:
+                total += v * r
+        total
+    "#},
+    18
+)]
+// (1+2)³ — nesting is unbounded, an inner `for` folding after the loops inside it.
+#[case::depth_three(
+    indoc! {r#"
+        total := 0
+        for x in [1, 2]:
+            for y in [1, 2]:
+                for z in [1, 2]:
+                    total += x * y * z
+        total
+    "#},
+    27
+)]
+// A single-branch `if` in the inner body becomes the comprehension's own guard.
+#[case::guarded_inner_write(
+    indoc! {r#"
+        total := 0
+        for x in [1, 2, 3]:
+            for y in [1, 2]:
+                if y > 1:
+                    total += x * y
+        total
+    "#},
+    12
+)]
+// `-=` folds by the same `Sum`, subtracted: 10 - (1+2+3) - (1+2+3).
+#[case::subtracting_accumulator(
+    indoc! {r#"
+        total := 10
+        for x in [1, 2]:
+            for y in [1, 2, 3]:
+                total -= y
+        total
+    "#},
+    -2
+)]
+fn a_nested_for_folds_to_the_accumulation_it_denotes(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// An immutable binding between the two loops, read by the inner body. It asserts in
+/// `Zip`, which takes the ambient iteration from the input's level count and finds two
+/// one-level operands under a count of two.
+///
+/// The defect is not about nesting: writing the fold by hand asserts identically, and
+/// inlining the binding (`total += sum([x * 10 + y for y in [1, 2]])`) answers 66.
 #[test]
-fn nested_for_loops_stay_rejected() {
-    expect_compile_error(
+#[ignore = "pre-existing: a let-bound per-iteration value under a comprehension mis-states Zip's ambient depth"]
+fn a_binding_between_two_loops_reaches_the_inner_body() {
+    check_scalar(
         indoc! {r#"
-            s := 0
+            total := 0
             for x in [1, 2]:
-                for y in [10, 20]:
-                    s += y
-            s
+                base = x * 10
+                for y in [1, 2]:
+                    total += base + y
+            total
         "#},
-        "for-loop body",
+        Value::Int(66),
     );
+}
+
+/// The inner-`for` shapes no aggregate states, each keeping its `for` and meeting the
+/// reject. `*=` has no fold — `Sum` is the only aggregate an accumulation maps onto —
+/// and `:=` wants the last element rather than a fold of all of them. A body that
+/// reads the accumulator it writes is a scan, rejected by its own message: folding it
+/// would drop the dependence each iteration has on the one before.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::multiplying_accumulator(
+    indoc! {r#"
+        s := 1
+        for x in [1, 2]:
+            for y in [2, 3]:
+                s *= y
+        s
+    "#},
+    "an operation no aggregate states"
+)]
+#[case::overwriting_accumulator(
+    indoc! {r#"
+        s := 0
+        for x in [1, 2]:
+            for y in [10, 20]:
+                s := y
+        s
+    "#},
+    "an operation no aggregate states"
+)]
+#[case::reads_what_it_writes(
+    indoc! {r#"
+        s := 0
+        for x in [1, 2]:
+            for y in [1, 2]:
+                s += s + y
+        s
+    "#},
+    "a scan rather than a fold"
+)]
+fn an_inner_for_no_aggregate_states_stays_rejected(#[case] program: &str, #[case] message: &str) {
+    expect_compile_error(program, message);
 }
 
 /// A `mut` loop over a **product** domain is rejected at op-conversion, at every

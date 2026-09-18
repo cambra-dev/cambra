@@ -58,6 +58,7 @@ use crate::interpreter::{
     Tile, TileGuard, Tiling, Value, WakeupQueue, forwarding_consumer, shared_consumer,
     tile_operators::{
         CycleSlot, CyclicSequencingProducer, ProducerBase, TileOperator, TileProducer,
+        materialize_collections,
     },
     tuple_field,
 };
@@ -1290,33 +1291,18 @@ fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     let Tile::Function { keys, values, .. } = tile else {
         return Vec::new();
     };
-    if !matches!(values.as_ref(), Tile::Scalar(_) | Tile::Record(_)) {
-        return Vec::new();
-    }
-    let keys = &keys;
+    // A driver hands its writer one `Value` per position, so an element holding a
+    // collection materializes here: the level below this one is that position's own
+    // collection, and `materialize_collections` turns it into one map value per key.
+    let values = materialize_collections((**values).clone());
     let mut pairs: Vec<(usize, Value)> = (0..keys.len())
         .filter_map(|i| match keys.index_at(i) {
-            Value::UInt(pos) => Some((pos, source_value_at(values, i))),
+            Value::UInt(pos) => Some((pos, values.index_at(i))),
             _ => None,
         })
         .collect();
     pairs.sort_by_key(|(pos, _)| *pos);
     pairs
-}
-
-/// The `Value` at position `i` of a source codomain tile — a scalar column or a
-/// (possibly nested) `Record` of scalar columns.
-fn source_value_at(codomain: &Tile, i: usize) -> Value {
-    match codomain {
-        Tile::Scalar(cv) => cv.index_at(i),
-        Tile::Record(fields) => Value::Record(
-            fields
-                .iter()
-                .map(|(k, t)| (k.clone(), source_value_at(t, i)))
-                .collect(),
-        ),
-        other => panic!("cross-domain writer source column is not scalar/record: {other:?}"),
-    }
 }
 
 /// A **position-driven induction store** (a `mut` loop accumulator, plain or with
