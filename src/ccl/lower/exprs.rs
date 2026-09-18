@@ -7,8 +7,8 @@ use std::rc::Rc;
 use super::*;
 use crate::{
     ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Builtin, CompareKind, Expr, LogicKind, Name,
-        Refinement, Type, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit,
+        LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
     },
     chl_parser::ast::{
@@ -568,13 +568,70 @@ pub(super) fn lower_binop(
         return Ok(Expr::copair(vec![left_expr, right_expr]));
     }
     let kind = chl_binop_to_ccl(op);
+    if op == ChlBinOp::Pow {
+        return Ok(pow_with_checked_exponent(
+            left_expr, right_expr, right.span, ctx,
+        ));
+    }
     Ok(Expr::binop(left_expr, kind, right_expr))
+}
+
+/// `a ** b` with the exponent bound through a **non-negative annotation**.
+///
+/// `**` requires a non-negative exponent: a reciprocal has no integer value, so rather than
+/// give `a ** -n` one, the exponent has to carry `{Int | __elem >= 0}` and a program that
+/// cannot show it is rejected where it is written.
+///
+/// TODO(check-time-smt): stated as an annotated binding rather than in the operator's own
+/// signature, because a demand made by the operator is re-derived by `Check`, which decides
+/// refinements structurally (`constrain_subtype`'s `SkipSmtScope`) and cannot discharge
+/// `{Int | __elem == 3} <: {Int | __elem >= 0}` the way inference does through the semantic
+/// fallback. An annotation is narrowed by inference, so `Check` compares the refinement
+/// against itself and matches. Fold this back into the operator's signature once `Check`
+/// raises its own queries.
+///
+/// The binding costs one thing worth naming: a `**` written *inside* a refinement predicate
+/// makes that predicate a `Let`, so it leaves the SMT fragment as a term rather than as an
+/// unencodable operator. `**` in a predicate was already undecidable — SMT-LIB has no
+/// integer exponentiation — so nothing that worked stops working, but the reason a reader
+/// meets changes, and folding this back into the signature restores it.
+fn pow_with_checked_exponent(
+    base: Expr,
+    exponent: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    const LABEL: &str = "lower.pow_exponent";
+    let binder = Name::fresh("__pow_exp");
+    let predicate = Expr::binop(
+        Expr::var(Name::elem()),
+        BinOpKind::Compare(CompareKind::GreaterOrEq),
+        Expr::lit(Lit::Int(0)),
+    );
+    // Every node of the predicate, before it is sealed into a type slot where the tree walk
+    // no longer reaches it.
+    ctx.tag_predicate(&predicate, span, LABEL);
+    let non_negative = Type::refined_one(
+        Type::Base(BaseType::Int),
+        Refinement::born(Rc::new(predicate)),
+    );
+    let read = ctx.tag_machinery(Expr::var(binder.clone()), span, LABEL);
+    let body = ctx.tag_machinery(
+        Expr::binop(base, BinOpKind::Arithmetic(ArithmeticKind::Pow), read),
+        span,
+        LABEL,
+    );
+    ctx.tag_machinery(
+        Expr::let_bind_annotated(binder, exponent, body, non_negative),
+        span,
+        LABEL,
+    )
 }
 
 /// Map a CHL [`ChlBinOp`] to its CCL [`BinOpKind`] counterpart.
 ///
 /// The mapping mirrors the variant set on `chl_ast::BinOp`, which only
-/// enumerates the operators CHL accepts (`/`, `%`, `**`, `>>`, `~` are
+/// enumerates the operators CHL accepts (`/`, `%`, `>>`, `~` are
 /// rejected at parse time and never appear here). `LogicalAnd/Or/Xor` map
 /// to CCL boolean logic — CHL reuses the `&`/`|`/`^` tokens for logical
 /// (not bitwise) operations. `Copair` is excluded: it lowers
@@ -587,6 +644,7 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
         ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
         ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
+        ChlBinOp::Pow => BinOpKind::Arithmetic(ArithmeticKind::Pow),
         ChlBinOp::LogicalAnd => BinOpKind::BoolLogic(LogicKind::And),
         ChlBinOp::LogicalOr => BinOpKind::BoolLogic(LogicKind::Or),
         ChlBinOp::LogicalXor => BinOpKind::BoolLogic(LogicKind::Xor),

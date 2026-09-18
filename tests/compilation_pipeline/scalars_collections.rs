@@ -129,7 +129,51 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // maps both to the one runtime addition.
 #[case("2 ^+ 3", Value::Int(5))]
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
+// `**` scales a constant without spelling out the zeroes.
+#[case("10 ** 8", Value::Int(100_000_000))]
+// A chain is not evaluated here: `**` answers a bare `Int`, which is not shown non-negative,
+// so it cannot be another `**`'s exponent. Right-associativity is the parser's, pinned by
+// `src/chl_parser/parser.rs`'s `power_precedence_and_associativity`.
+#[case("(2 ** 3) ** 2", Value::Int(64))]
+// Tighter than `*` on either side.
+#[case("2 * 3 ** 2", Value::Int(18))]
+#[case("3 ** 2 * 2", Value::Int(18))]
+// Tighter than the unary minus on its left: `-(2 ** 2)`.
+#[case("-2 ** 2", Value::Int(-4))]
+#[case("2 ** 0", Value::Int(1))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// **`**` requires a non-negative exponent**, and states it as a refinement.
+///
+/// A reciprocal has no integer value, so rather than give `a ** -n` one the exponent has to
+/// carry `{Int | __elem >= 0}`, and a program that cannot show it is rejected where it is
+/// written. That is what leaves the runtime total: computing a reciprocal meant dividing by
+/// a magnitude that is zero for `0 ** -n` and, after `i64` overflow, for a large `n` too.
+///
+/// The demand is **strict** — an `Int` that carries no such refinement is rejected, not
+/// admitted — so what compiles is what a program can show.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::literal("2 ** -1")]
+#[case::zero_base("0 ** -1")]
+// Large enough that the old reciprocal overflowed `i64` on its way to dividing by zero.
+#[case::overflowing("2 ** -64")]
+// Not a literal, so nothing bounds it: an unrefined `Int` cannot show itself non-negative.
+#[case::unrefined("e = 0 - 1\n2 ** e")]
+fn an_exponent_not_shown_non_negative_is_rejected(#[case] code: &str) {
+    check_compile_error(code, "__elem >= 0");
+}
+
+/// What a program *can* show, which is what the refinement admits.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::literal("2 ** 3", Value::Int(8))]
+#[case::zero("2 ** 0", Value::Int(1))]
+// The caller carries the proof, so the body needs none of its own.
+#[case::annotated_parameter("def f(e: {Int where _ >= 0}):\n    2 ** e\n\nf(3)", Value::Int(8))]
+fn a_provably_non_negative_exponent_is_accepted(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
