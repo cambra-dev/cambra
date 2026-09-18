@@ -1371,7 +1371,7 @@ fn load_in_a_loop_body_rejected() {
                     m := m + held
             await_final(m)
         "#},
-        "only assignments",
+        "A declaration goes above the loop, `@LoadFrom` included",
     );
 }
 
@@ -1389,7 +1389,7 @@ fn load_in_a_transaction_block_rejected() {
                     m := m + held
             await_final(m)
         "#},
-        "a `with begin():` block supports",
+        "A declaration goes above the block, `@LoadFrom` included",
     );
 }
 

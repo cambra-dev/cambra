@@ -1273,7 +1273,9 @@ fn lower_loop_body_chain_scoped(
                     "only assignments (`x = …`, `x op= …`), `<<` feeds, \
                      `yield`, `if` guards, `match` dispatch, `with begin():` \
                      transactions, and bare side-effect calls are supported \
-                     inside a for-loop body",
+                     inside a for-loop body. A declaration goes above the loop, \
+                     `@LoadFrom` included: its value is a snapshot, so a \
+                     per-iteration one would be the same constant every time",
                 ));
             }
         };

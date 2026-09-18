@@ -229,6 +229,11 @@ refused:
   while one still present under a different variable has moved (`site_moved`). Refused rather than
   followed, because nothing in the source says which declaration the value belongs to — the refusal
   names both and says that binding each call site to a name is what makes the edit carry.
+- **A `@LoadFrom(x)` where the running program declares `x` more than once under one chain.** The
+  same move with the load's own edit in the way. A load edits the body of every site it sits in, so
+  no site's content survives for `site_moved` to match, and pairing the sites with the declarations
+  by position would carry the swap unremarked. The remedy is the same one: naming each call site
+  gives the load a chain that resolves.
 - **A `@LoadFrom(x)` naming a variable nothing holds.** There is nothing to read: a first
   compilation has no predecessor at all, and otherwise no variable of that spelling is in scope at
   that point in the version being replaced.
@@ -290,10 +295,13 @@ means inherit: a variable the new version declares under the same identity takes
 whether or not anything names it.
 
 Started from nothing, a source containing `@LoadFrom(x)` is a compile error naming `x`, so a version
-containing one is an upgrade of a specific predecessor and cannot be redeployed into a fresh
-environment, a new region, or CI. The remedy is the version the author needs anyway — the one with
-the migration taken out, which retires nothing further because a name loaded and not declared is
-gone after the version that loaded it.
+containing one is an upgrade of a specific predecessor. The predecessor today is the in-process
+`Inheritance`, which is what stops such a version being redeployed into a fresh environment, a new
+region, or CI. A durable store would be a second kind of predecessor, and durable state is
+[Sketched](../../../docs/design.md); which predecessors a load may name is settled there rather than
+here. The remedy meanwhile is the version the author needs anyway — the one with the migration taken
+out, which retires nothing further because a name loaded and not declared is gone after the version
+that loaded it.
 
 Lowering erases the decorator: the statement becomes a `let` bound to `TypedExprNode::LoadFrom`, a
 leaf holding the source's own spelling and resolved at operator conversion. That is `Source`'s
@@ -310,22 +318,38 @@ so what makes a unit change on persisted state a declaration.
 
 ### Which variable a site addresses
 
+A site has two names in play. The **loaded spelling** is the `x` of `@LoadFrom(x)`, a variable of
+the retired version. The **target** is the binding the
+decorated declaration introduces, a variable of the new version:
+
+```python
+@LoadFrom(qty)      # `qty` is the loaded spelling
+qty_units: Int      # `qty_units` is the target
+```
+
 `state_identities` assigns declarations and load sites their addresses in one walk, so the two
 cannot disagree about what the binding chain at a point is. A declaration's address is the chain
 enclosing it (`VarPath`); a site's is read off the same chain and then resolved outward, the way a
 name resolves in the source — the innermost enclosing chain holding a variable of that spelling
-wins. The search starts at the site's chain and does not descend, so a load inside a stateful
-function's body finds the ``a`.`total`` of its own instantiation while the same spelling at the top
-level reaches nothing. A diagnostic names the spelling alone, which is what the source contains.
+wins. Outward means the site's own chain and the chains enclosing it, and never a chain below one of
+those: a load inside a stateful function's body finds the ``a`.`total`` of its own instantiation,
+while the same spelling written at the top level reaches nothing, ``a`.`total`` sitting under a
+binding the top level's chain does not contain. A diagnostic names the spelling alone, which is what
+the source contains.
 
-The binding a load seeds is not on the chain. Nothing is ever declared under that binding, and
-pushing its name would make the innermost candidate one no source can name: a predecessor declaring
-the loaded spelling inside an instantiation bound to the load's own target name.
+The target contributes no chain segment. A segment comes from descending into a binding's
+definition, and a load's definition is the leaf alone, so nothing is ever declared under the target
+and a segment for it would address nothing. Pushing it would also move the search's innermost
+candidate onto a variable no source can mean: a predecessor that had declared the loaded spelling
+inside an instantiation bound to the target's own spelling.
 
-Declarations sharing a chain and a spelling are told apart by index, which is two anonymous call
-sites of one stateful function. Inlining copies a function body into each call site, so a site
-carries an index from the same walk and addresses the declaration at its own position. A scope
-declaring the spelling once has nothing to tell apart and answers whichever site asks.
+A chain declaring the spelling once answers whichever site asks — one declaration of an enclosing
+scope, reached by a site per instantiation. A chain declaring it more than once is refused. Those
+declarations are the anonymous call sites of one stateful function, told apart by position alone,
+and a load carries no position that confirms one: `site_moved` catches a declaration moving between
+such positions by the retired site's content, and a load has edited that content at every site it
+sits in. Pairing site 𝑖 with declaration 𝑖 would hand each site its neighbour's value on a reorder.
+Binding each call site to a name gives the load a chain that resolves, and the refusal says so.
 
 Resolution reads what the retired version **declared**, not what it currently holds a value for. A
 store the running program never drove holds no value while still being the variable the name means,
@@ -334,12 +358,18 @@ for dropping a variable it says where to put.
 
 ### A loaded value summarizes positions
 
+A position is an index into the sequence a store folds — an iteration item or a commit, absolute
+rather than a row offset ([Positions are absolute, in the store and in the drive
+alike](#positions-are-absolute-in-the-store-and-in-the-drive-alike)) — and a store's value at
+position 𝑝 summarizes every position below 𝑝, being their fold.
+
 Whether a rebuilt store resumes above the positions its seed summarizes or begins at its input is
 `continues`, which each store builder hands to `OpConversionContext::iteration_input`. It is a
 question about the seed rather than about the variable. An ordinary reload can answer it by
 identity, because a variable that carries its own value carries its own positions with it; a load
-breaks that coincidence, its target's identity being new while the value it starts at is one the
-retired version folded positions into. So `continues` reads `load_from_derived_nodes` as well.
+breaks that coincidence, the target's identity being new while the value it starts at is one the
+retired version folded positions into. So `continues` reads the nodes the `@LoadFrom` leaf reaches
+(`is_a_load`) as well.
 
 Answered per store rather than per key, because one store drives one position sequence: a key added
 beside one that resumes begins wherever that store resumes. What it resumes over follows
@@ -490,7 +520,10 @@ Three things decide where a rebuilt store picks up, and only two of them are han
   stateful function in one expression. An edit to either body leaves it alone, and a reload that
   would move a value between them is refused (`swapping_two_anonymous_call_sites_is_refused`). What
   is left unaddressed is narrower: a reorder that edits both bodies at once leaves neither site
-  present to recognise, so the position decides and the values cross.
+  present to recognise, so the position decides and the values cross. A `@LoadFrom` reaches that
+  shape by construction, editing the body of every site it sits in, which is why a load is refused
+  wherever the chain declares its spelling more than once
+  ([Which variable a site addresses](#which-variable-a-site-addresses)).
 
   **A spelling is not unique, and nothing computed can stand in for one.** A declaration can be
   shadowed, and a function holding a whole stateful loop declares one variable per call site once

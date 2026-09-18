@@ -1566,6 +1566,109 @@ fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
     );
 }
 
+/// A collection whose load names nothing is refused like a scalar's, before
+/// anything is torn down.
+///
+/// The refusals are checked against a collection as well as a scalar because
+/// `LoadFromAt` compares runtime `Extent`s: a collection's is a function extent,
+/// where a scalar's is not, and only a case off a collection reaches that
+/// comparison.
+#[test]
+fn a_collection_load_naming_nothing_is_refused() {
+    let v1 = indoc! {r#"
+        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        for c in [1]:
+            with begin():
+                qty["sol"] := 3
+        await_final(qty)
+    "#};
+    // `a_loaded_collection_is_transformed_into_its_replacement`'s v2, exactly, but for
+    // the spelling the load names.
+    let v2 = indoc! {r#"
+        @LoadFrom(nonesuch)
+        held <: Map(String, Int)
+        qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+        await_final(qty_units)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 2),
+            ("eth".to_string(), 1),
+            ("sol".to_string(), 3),
+        ],
+    );
+
+    let rendered = match live.reload(&mut ctx, v2, &no_main) {
+        Ok(_) => panic!("`nonesuch` is a variable no version ever declared"),
+        Err(errors) => format!("{errors:?}"),
+    };
+    assert!(
+        rendered.contains("`@LoadFrom(nonesuch)` has no variable to read"),
+        "the refusal names the spelling, got {rendered}",
+    );
+
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 2),
+            ("eth".to_string(), 1),
+            ("sol".to_string(), 3),
+        ],
+        "the refused reload left the collection intact",
+    );
+}
+
+/// A collection read at another codomain is refused under the bounded annotation
+/// too — `<:` leaves the domain to be inferred, and weakens no shape check.
+///
+/// The value carries whole or not at all, so what a migration may change is the
+/// units, not the type they are kept in. `held <: Map(String, String)` compiles
+/// and its comprehension typechecks; the refusal comes from the extent the running
+/// program holds `qty` at, which neither annotation mode reaches.
+#[test]
+fn a_bounded_annotation_does_not_weaken_a_collections_shape_check() {
+    let v1 = indoc! {r#"
+        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        for c in [1]:
+            with begin():
+                qty["sol"] := 3
+        await_final(qty)
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(qty)
+        held <: Map(String, String)
+        labels: Mut(Map(String, String), Txn) := [q + "!" for q in held]
+        await_final(labels)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let _ = drive_main_map(&mut ctx, &mut live);
+
+    let rendered = match live.reload(&mut ctx, v2, &no_main) {
+        Ok(_) => panic!("`qty` holds Ints; the new version reads its values as Strings"),
+        Err(errors) => format!("{errors:?}"),
+    };
+    assert!(
+        rendered.contains("`@LoadFrom` reads `qty`")
+            && rendered.contains("String")
+            && rendered.contains("Int"),
+        "the refusal names the site and both extents, got {rendered}",
+    );
+
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 2),
+            ("eth".to_string(), 1),
+            ("sol".to_string(), 3),
+        ],
+        "the refused reload left the collection intact",
+    );
+}
+
 /// A load resolves to the top-level variable however many bindings enclose the
 /// value on its way to a mutable one.
 ///
@@ -3718,15 +3821,18 @@ fn swapping_two_anonymous_call_sites_is_refused() {
     );
 }
 
-/// A `@LoadFrom` written inside a stateful function is a site per instantiation, and
-/// each seeds from the variable its own call site declares.
+/// A `@LoadFrom` inside a stateful function called more than once is refused: the
+/// spelling names a declaration per call site, and nothing tells them apart.
 ///
-/// Inlining copies the body into every call site, so one load in the source becomes two
-/// sites sharing a chain and a spelling — the shape `index` exists to tell apart.
-/// Addressing them both to the first declaration is accepted rather than refused, so the
-/// program carries on answering with one site holding the other's value.
+/// Inlining copies the body into every call site, so one load in the source becomes
+/// two sites sharing a chain and a spelling, against two declarations sharing them.
+/// Position is the only thing telling either pair apart, and a load is the case
+/// where position cannot be confirmed: the content check that catches a declaration
+/// moving between positions reads the retired site's body, and a load has edited that
+/// body at every site it sits in. [`a_reordered_call_site_under_a_load_is_refused`]
+/// is what accepting the positional pairing would carry.
 #[test]
-fn a_load_inside_a_duplicated_body_seeds_from_its_own_call_site() {
+fn a_load_inside_a_duplicated_body_is_refused() {
     let v1 = indoc! {r#"
         def count_by(items, step) => Int:
             total := 0
@@ -3752,11 +3858,73 @@ fn a_load_inside_a_duplicated_body_seeds_from_its_own_call_site() {
     // 6 at the first site (two steps of 3), 15 at the second (three of 5).
     assert_eq!(drive_main_int(&mut ctx, &mut live), 6015);
 
-    live.reload(&mut ctx, v2, &no_main)
-        .expect("each site loads the variable its own instantiation declares");
-    // Each site's own value scaled by ten, neither folded again. Both sites reading
-    // the first declaration gives 60060.
-    assert_eq!(drive_main_int(&mut ctx, &mut live), 60150);
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("`total` is two declarations, and the load names neither");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains(
+            "`@LoadFrom(total)` names several declarations that are told apart \
+                           only by where they appear"
+        ),
+        "the refusal names the spelling, got {rendered}",
+    );
+    assert!(
+        rendered.contains("Bind each of those declarations to its own name"),
+        "and says what to do about it, got {rendered}",
+    );
+
+    assert_eq!(
+        drive_main_int(&mut ctx, &mut live),
+        6015,
+        "the refused reload left the program running on its own values",
+    );
+}
+
+/// Reordering the call sites under a load is the outcome that refusal prevents.
+///
+/// Resolving each site to the declaration at its own position hands each one its
+/// neighbour's value — 150060 where the site-correct answer is 60150 — and nothing
+/// in either version says a swap happened. A declaration moving between anonymous
+/// positions is `StateConflict::Moved`; this is the same move with the load's own
+/// edit hiding it, so it is refused on the same ground rather than carried wrong.
+#[test]
+fn a_reordered_call_site_under_a_load_is_refused() {
+    let v1 = indoc! {r#"
+        def count_by(items, step) => Int:
+            total := 0
+            for x in items:
+                total := total + step
+            total
+
+        count_by([1, 2], 3) * 1000 + count_by([1, 2, 3], 5)
+    "#};
+    // The same two call sites, swapped, with `total` retired and loaded.
+    let v2 = indoc! {r#"
+        def count_by(items, step) => Int:
+            @LoadFrom(total)
+            held: Int
+            scaled := held * 10
+            for x in items:
+                scaled := scaled + step
+            scaled
+
+        count_by([1, 2, 3], 5) + count_by([1, 2], 3) * 1000
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 6015);
+
+    assert!(
+        live.reload(&mut ctx, v2, &no_main).is_err(),
+        "neither site's value belongs to the position it now sits at",
+    );
+    assert_eq!(
+        drive_main_int(&mut ctx, &mut live),
+        6015,
+        "the refused reload left the program running on its own values",
+    );
 }
 
 /// A call site inserted ahead of an anonymous one is refused on the same ground.

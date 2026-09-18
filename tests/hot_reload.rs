@@ -98,6 +98,8 @@
 //! | `@LoadFrom(x)` names a variable the program declares but has decided no value for | Refused, saying the value is missing rather than the variable |
 //! | A top-level `@LoadFrom(x)` names a variable that lives inside an instantiation | Refused; the search never descends, and that variable is dropped — including where the load's own target is spelled like the binding that variable sits under |
 //! | `@LoadFrom(x)` reads a variable at another type | Refused, naming both types |
+//! | Either of those two, where the variable is a `Map` | Refused alike; the comparison is against the extent the running program holds the collection at, and the bounded `<:` annotation does not weaken it |
+//! | `@LoadFrom(x)` sits inside a stateful function called more than once | Refused; the spelling names a declaration per call site, and a load edits the content that would tell those apart, so a reorder between them cannot be caught. Binding each call site to a name is the remedy, and resolves the load |
 //! | A source containing `@LoadFrom(x)` is started from nothing | Refused; such a version is an upgrade of a specific predecessor |
 //! | The source does not compile | Refused |
 //!
