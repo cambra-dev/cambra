@@ -64,11 +64,24 @@ equivalent tiles with some data released may.
 
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
+`Tile::append_level` builds a `Function` one level deeper than the function tile it is given,
+out of that tile's codomain. One level is the base case, so an operator that appends a level
+is closed under its own output. `Tiling::append_level` is the same step on the static shape.
+
+The appended level is whole for every parent it names. A parent's keys occupy one contiguous run
+of the level below and `merge` concatenates levels rather than reaching inside a group, so no
+later tile adds to a group. The tile therefore calls every key present final together with the
+level just built, and removals ride through level for level — the appended level has removed
+nothing.
+
 Tiles representing collections (`Function`) support logical deletes by storing a `BitSet` of deleted values.  These are set by filteriing operator like `Restrict` and compacted away by
 stateful operators like `Memo` and aggregation. A `Function` carries **one set per domain
 level**, so a bit names a position in that level's own column and a removed group and a removed
-entry are different bits rather than one bit read two ways. Every producer today removes at the
-innermost level, a group going by way of its entries, which is where `Tile::retain` reads.
+entry are different bits rather than one bit read two ways. A producer marks the level its
+removals name: the filters mark the innermost, a group going by way of its entries, which is
+where `Tile::retain` reads. An operator appending a level leaves its input's removals at the
+level that named them — `append_level` promotes a sealed function's flat set to level 0, the
+level its rows now sit at, and carries a nested tile's per-level sets through unchanged.
 
 An empty group and a removed one are different tiles. The offsets are non-decreasing, so two equal
 starts are a key whose group holds nothing, and an aggregate over it folds to the aggregate's
@@ -519,6 +532,48 @@ The pipeline always bottoms out at one of three consumer shapes:
 In all three cases planning has ensured every iteration site has an explicit
 `iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
 what to emit based only on its own AST shape and the input flowing in.
+
+### Where a collection is materialized
+
+A collection reaches an operator in one of two shapes. A **streamed** one carries its keys in
+a domain column, one row per key, and is what every consumer that iterates a collection reads.
+A **materialized** one is a single map value, a binding list carrying its own keys, which is
+what a column holds: a column has one value per row, and a level is not a value.
+
+A producer that knows its values hold a collection hands out the level instead of the cell,
+rather than leaving an adapter to open it downstream. Three do:
+
+- A **list literal** builds the table it denotes, recursing on the element extent: a
+  collection element contributes its own keys as the level below, and a record element
+  holding a collection contributes one sub-tile per field (`list_levels`).
+- A **store read** opens each position's stored value the same way, so a collection-valued
+  key reads as a collection per position rather than a map per position
+  (`stored_value_tiling` / `stored_value_tile`).
+- A **record field** of either keeps the tiling its own term produced, so a projection out
+  of it is a tile operation (`SelectField`) rather than a column one.
+
+Two consumers still take the materialized shape, and both are cases where nothing would read
+the keys: `CheckedLookup` searches the bindings of the row's own value, and `Sole` and
+`Drain` fold a collection whole, so the element they yield is the collection itself.
+
+A **transaction writer body's parameter record** opens the same way, so a collection-valued
+read reaches the body as a level it can iterate (`commit_operator.rs`'s `body_input_tiling`).
+Its *writes* go the other way: a store write is one value per key, so a keyed write's
+`insert` takes the level and the payload materializes where it becomes the decision's value
+(`FunctionDef::apply_tile`, `materialize_collections`).
+
+**A per-row collection is complete as soon as its row arrives.** A map value carries its own
+keys, so nothing waits on a domain closing to know the group is whole. A producer opening one
+says so by naming the rows it delivers in its `domain_predicate`. `MapAggregate` marks each
+accumulator terminal where the predicate names its key, rather than reading the predicate as
+one bool for the whole domain; without that, an aggregate over a live store holds every row
+open forever.
+
+**Its keys repeat across rows.** Two commits of one map carry the same keys, which a nested
+tile permits: `validate_tile` asks for uniqueness within a group and no more. A codomain
+guard names keys and not the group they sit in, so releasing one would release it in every
+other row. `Tile::to_guard` therefore names keys only for the groups its predicate leaves
+open, and releases the whole ones by their own outermost key.
 
 ---
 

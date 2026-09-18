@@ -331,6 +331,14 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             .user_annotation
             .clone()
             .expect("user_annotation is present");
+        // An annotation names the value at this position unless it is itself a handle, so a
+        // mutable variable mention under one reads (`src/ccl/design/mutability.md`, "A
+        // mutable variable read is an explicit operation"). The condition is the
+        // annotation's own shape and nothing narrower: reading the generator-source stamp
+        // off the term instead would make the rule depend on which stamp lowering used.
+        if annotation.mut_value_type().is_none() {
+            ty = read_through(&ty);
+        }
         // A **concrete** function kind on the annotation is a *provenance stamp*:
         // lowering marks a data collection (a comprehension / `groupby`) with a
         // `data_fun(_, _)` annotation, and here we set that kind concretely on the
@@ -931,7 +939,11 @@ pub(super) fn emit_apply<C: Typing>(
         return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
     }
     let raw_arg_ty = ctx.subexpr(argument)?;
-    let fn_ty = ctx.subexpr(function)?;
+    // A function position is a value position, so a mutable variable mention there reads
+    // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
+    // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
+    // relating a mutable variable only to another.
+    let fn_ty = read_through(&ctx.subexpr(function)?);
     // **The one position where a mutable variable's handle survives.** If the parameter is a
     // mutable variable the argument is passed *by reference* and the handle must reach the
     // parameter, so the invariance rule relates the two value types directly — that is
@@ -1424,9 +1436,12 @@ fn denoted_expr(e: &Expr) -> &Expr {
 /// Emit a **value read**: a mutable variable mention here is a *read*, so its handle
 /// derefs to the value it holds.
 ///
-/// This is the ordinary case. A mutable variable's handle survives in exactly two positions —
-/// a pass-by-reference argument (see [`emit_apply`]) and a `MutWrite` target, which is
-/// resolved by name rather than as a subexpression — and the mutability discipline is
+/// This is the ordinary case. A mutable variable's handle survives in exactly three
+/// positions — a pass-by-reference argument (see [`emit_apply`]), a `MutWrite` target, which
+/// is resolved by name rather than as a subexpression, and `await_final`'s operand, which
+/// `emit_apply` reads off the head of the spine as the first of those
+/// (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation") —
+/// and the mutability discipline is
 /// what makes that enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var`,
 /// and rule 2 keeps `Mut` out of every composite, so a parent always knows whether the
 /// operand it is about to constrain is a handle position without inspecting it.

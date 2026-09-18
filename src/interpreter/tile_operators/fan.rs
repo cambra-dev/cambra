@@ -467,7 +467,7 @@ impl TileProducer for MakeRecordProducer {
     }
 }
 
-/// Pick one field out of a **product value**.
+/// Pick one field out of a **product value**, or one component out of a record codomain.
 ///
 /// The eliminator for what [`MakeRecord`] introduces: hand back that field's
 /// sub-tile. This is a *tile* operation, unlike the value-level `RecordField`

@@ -37,8 +37,7 @@ use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    ColumnValue, Consumer, FuncBinding, Predicate, Tile, Value, pull_laps, sort_function_by_domain,
-    tuple_field,
+    ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,31 +160,6 @@ pub(crate) fn make_int_list(v: &[i64]) -> Tile {
         Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
         Predicate::True,
         BitSet::new(),
-    )
-}
-
-/// A **materialized** collection value: the whole `key ↦ value` table in one
-/// cell, which is how a product value holds a collection-valued component.
-pub(crate) fn make_collection(bindings: &[(Value, Value)]) -> Value {
-    Value::Function(
-        bindings
-            .iter()
-            .map(|(input, output)| FuncBinding {
-                input: input.clone(),
-                output: output.clone(),
-            })
-            .collect(),
-    )
-}
-
-/// A materialized collection over the positions `0..v.len()`, the shape a list
-/// literal in a product component compiles to.
-pub(crate) fn make_int_collection(v: &[i64]) -> Value {
-    make_collection(
-        &v.iter()
-            .enumerate()
-            .map(|(i, n)| (Value::UInt(i), Value::Int(*n)))
-            .collect::<Vec<_>>(),
     )
 }
 

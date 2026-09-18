@@ -1,3 +1,4 @@
+use bit_set::BitSet;
 use log::trace;
 
 use crate::{
@@ -15,12 +16,15 @@ use crate::{
         ArithmeticKind,
         BaseType,
         BinOpKind as InterpreterBinOp,
+        ColumnValue,
         CompareKind,
         DataSourceDomainExtentImpl,
         Extent,
         FuncBinding,
         FunctionDef,
         LogicKind,
+        Predicate,
+        Tile,
         UnaryOpKind,
         Value,
         // The runtime commit engine. Its `TransactWriter` is the *operator*
@@ -2042,7 +2046,7 @@ fn convert_impl_inner(
             // `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠`, naming its source twice, and the
             // second occurrence is the composition stage this answers for.
             if let Some(input) = input {
-                if !is_function(&expr.ty) {
+                if !has_domain(&expr.ty) {
                     return Err(ConversionError::Unsupported(format!(
                         "Only higher-order combinators (map, const, zip) can take an input \
                          operator; found input for non-combinator {}",
@@ -2430,7 +2434,7 @@ fn expect_no_input(
     }
 }
 
-/// Compile a list literal to a [`Constant`] holding a `Value::Function` binding table.
+/// Compile a list literal to a [`Constant`] holding the table it denotes.
 ///
 /// `elt_extent` is the element extent taken from the list's **declared type**, not
 /// re-derived from the element values. Two reasons it has to be:
@@ -2442,23 +2446,132 @@ fn expect_no_input(
 ///   elements, so it covers a mixed-tag list correctly by construction. Deriving from
 ///   the values instead means picking one element's extent and hoping it speaks for
 ///   the rest.
+///
+/// **A nested literal is a level per nesting.** An element that is itself a collection
+/// contributes its own keys as the level below, so the constant is the whole table rather
+/// than a column of materialized values an adapter would have to open. That is what lets a
+/// chain of aggregates collapse one level each.
 fn compile_list_fn(
     elts: &[Expr],
     elt_extent: Extent,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let mut bindings = Vec::with_capacity(elts.len());
-    for (i, elt) in elts.iter().enumerate() {
-        bindings.push(FuncBinding {
-            input: Value::UInt(i),
-            output: expr_to_value(elt)?,
-        });
+    let elts: Vec<&Expr> = elts.iter().collect();
+    let (values, values_tiling) = list_levels(&elts, &elt_extent)?;
+    let domain = Extent::uint_range(elts.len());
+    let tiling = Tiling::function(domain.clone(), values_tiling);
+    let tile = Tile::function(
+        ColumnValue::from_values((0..elts.len()).map(Value::UInt).collect(), &domain),
+        Box::new(values),
+        // Every key a literal writes down is present, and no more are coming.
+        Predicate::True,
+        BitSet::new(),
+    );
+    debug_assert!(
+        tile.check_from(&tiling),
+        "a list literal's tile is its tiling's: {tile:?} vs {tiling}"
+    );
+    Ok(Box::new(Constant::collection(tile, tiling)))
+}
+
+/// The tile a list literal's elements denote, one row per element, and its tiling.
+///
+/// Recursion is on the element **extent**, not on the values. A collection element
+/// contributes its own keys as the level below, and a record element holding a collection
+/// contributes one sub-tile per field — which is what keeps a tuple's collection component a
+/// level, where one column would have to box the whole record into a cell. A record holding
+/// no collection stays a column, so an ordinary list of tuples tiles as it always has.
+///
+/// The base case is one entry per element, so `list_levels(&[], e)` is the empty tile at
+/// this extent and needs no case of its own.
+fn list_levels(elts: &[&Expr], elt_extent: &Extent) -> Result<(Tile, Tiling), ConversionError> {
+    match elt_extent {
+        // A collection element: its own keys are the level below, and the elements' tables
+        // run together under one `row_starts` naming where each element's keys begin.
+        Extent::Function {
+            domain: keys,
+            codomain: values,
+        } => {
+            let mut row_starts = Vec::with_capacity(elts.len());
+            let mut level: Vec<Value> = Vec::new();
+            let mut inner: Vec<&Expr> = Vec::new();
+            for elt in elts {
+                let TypedExprNode::List(part) = &elt.node else {
+                    return Err(ConversionError::Unsupported(format!(
+                        "a collection-valued list element must be written out as a list \
+                         literal, but this one is a computation: {}",
+                        symbolic(elt)
+                    )));
+                };
+                row_starts.push(level.len());
+                level.extend((0..part.len()).map(Value::UInt));
+                inner.extend(part.iter());
+            }
+            let (values_tile, values_tiling) = list_levels(&inner, values)?;
+            Ok((
+                Tile::grouped(
+                    ColumnValue::from_uints(row_starts),
+                    ColumnValue::from_values(level, keys),
+                    Box::new(values_tile),
+                    // Every key a literal writes down is present, and no more are coming.
+                    Predicate::True,
+                    BitSet::new(),
+                ),
+                Tiling::function((**keys).clone(), values_tiling),
+            ))
+        }
+        // A record element holding a collection somewhere: one sub-tile per field, each
+        // over the same rows, so the collection-valued field keeps its levels.
+        Extent::Record(fields) if elt_extent.holds_a_collection() => {
+            let mut tiles = HashMap::with_capacity(fields.len());
+            let mut tilings = HashMap::with_capacity(fields.len());
+            for (name, field_extent) in fields {
+                let parts = elts
+                    .iter()
+                    .map(|elt| record_field(elt, name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (tile, tiling) = list_levels(&parts, field_extent)?;
+                tiles.insert(name.clone(), tile);
+                tilings.insert(name.clone(), tiling);
+            }
+            Ok((Tile::Record(tiles), Tiling::Record(tilings)))
+        }
+        _ => {
+            let mut values = Vec::with_capacity(elts.len());
+            for elt in elts {
+                values.push(expr_to_value(elt)?);
+            }
+            Ok((
+                Tile::Scalar(ColumnValue::from_values(values, elt_extent)),
+                Tiling::Scalar(elt_extent.clone()),
+            ))
+        }
     }
-    let fn_value = Value::Function(bindings);
-    let fn_extent = Extent::Function {
-        domain: Box::new(Extent::uint_range(elts.len())),
-        codomain: Box::new(elt_extent),
-    };
-    Ok(Box::new(Constant::new(fn_value, fn_extent)))
+}
+
+/// The sub-expression a record or tuple literal writes at `name`.
+///
+/// A record element is destructured rather than evaluated, because its collection-valued
+/// field has to reach [`list_levels`] as the list literal it is written as.
+fn record_field<'a>(elt: &'a Expr, name: &str) -> Result<&'a Expr, ConversionError> {
+    match &elt.node {
+        TypedExprNode::Tuple(parts) => parts
+            .iter()
+            .enumerate()
+            .find(|(i, _)| tuple_field(*i) == name)
+            .map(|(_, part)| part),
+        TypedExprNode::Record(parts) => parts
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, part)| part),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        ConversionError::Unsupported(format!(
+            "a list element holding a collection must be written out as a record or tuple \
+             literal with a field {name}, but this one is: {}",
+            symbolic(elt)
+        ))
+    })
 }
 
 /// Check that the operator built for a value-position product has that
@@ -2525,7 +2638,7 @@ fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
 /// [`FunKind`] is the whole test: both tile at an [`Extent::Function`], and a `Data`
 /// domain is the one that is swept. A refinement is a fact about the value rather
 /// than a different shape, so it peels first — a filtered collection is a collection.
-fn is_function(ty: &Type) -> bool {
+fn has_domain(ty: &Type) -> bool {
     matches!(
         ty.peel_refinements(),
         Type::Fun {
@@ -3876,13 +3989,6 @@ fn convert_store_read(
 /// input — which is why only the field the other projection *cannot* carry goes this way: a
 /// collection-valued field, which a column has nowhere to put but a boxed cell.
 fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
-    fn holds_a_collection(tiling: &Tiling) -> bool {
-        match tiling {
-            Tiling::Function { .. } => true,
-            Tiling::Record(fields) => fields.values().any(holds_a_collection),
-            _ => false,
-        }
-    }
     match tiling {
         Tiling::Record(_) => true,
         // Every field of such a record, not just the collection-valued one: boxing the
@@ -3890,7 +3996,7 @@ fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
         // nowhere to put a level.
         _ => matches!(
             tiling.deepest_values(),
-            Tiling::Record(fields) if fields.contains_key(name) && fields.values().any(holds_a_collection)
+            Tiling::Record(fields) if fields.contains_key(name) && fields.values().any(Tiling::has_a_level)
         ),
     }
 }
