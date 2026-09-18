@@ -791,6 +791,16 @@ impl Tile {
     }
 
     /// The innermost collection of this chain: the one whose values are not a collection.
+    /// `None` where there is no collection at all.
+    pub fn innermost_level(&self) -> Option<&Tile> {
+        match self {
+            Tile::Function { values, .. } if values.is_function() => values.innermost_level(),
+            Tile::Function { .. } => Some(self),
+            _ => None,
+        }
+    }
+
+    /// The innermost collection of this chain: the one whose values are not a collection.
     ///
     /// `None` where there is no collection at all. Paired with [`Self::key_paths`], this is
     /// where an operator that acts on a chain's elements does its work.
