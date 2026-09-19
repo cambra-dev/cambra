@@ -305,6 +305,7 @@ impl Tile {
                 for key in o_deleted.iter() {
                     s_deleted.insert(key + seen);
                 }
+                collapse_grown_groups(s_starts, s_keys, s_values, s_deleted);
             }
             // A record's fields are whole exactly when the record is: a record of whole
             // values merges field by whole field, and one sitting under a collection merges
@@ -971,6 +972,75 @@ pub fn validate_tile(tile: &Tile) -> bool {
     }
 }
 
+/// Collapse a run of equal keys in one row into the single key it is.
+///
+/// A merge **extends** a collection, so a key it already holds is a group that grew
+/// rather than a second key: a collection delivered a row at a time re-states the row it
+/// is adding to, and the level below gains the new elements. Appending the key again
+/// would leave the level with a repeated key, which no collection admits
+/// ([`valid_over`]) and which a lookup inside the row would only find the first run of.
+///
+/// Only a level whose values are themselves a collection can grow this way. Where they
+/// are not, a repeated key is one position delivered twice — a release-contract
+/// violation rather than growth — and it is left alone so `valid_over` reports it.
+///
+/// The keys of one row run together and a row grows at its end, so a repeat is adjacent
+/// to what it extends; a repeat that is not is a collection whose rows interleave, which
+/// no producer emits.
+fn collapse_grown_groups(
+    row_starts: &mut ColumnValue,
+    keys: &mut ColumnValue,
+    values: &mut Tile,
+    deleted: &mut BitSet,
+) {
+    if !values.is_function() {
+        return;
+    }
+    let ColumnValue::UInts(starts) = row_starts else {
+        return;
+    };
+    let boundaries: HashSet<usize> = starts.iter().copied().collect();
+    let grown: Vec<usize> = (1..keys.len())
+        .filter(|i| !boundaries.contains(i) && keys.index_at(*i) == keys.index_at(i - 1))
+        .collect();
+    if grown.is_empty() {
+        return;
+    }
+    let dropped: HashSet<usize> = grown.iter().copied().collect();
+    debug_assert!(
+        (1..keys.len()).all(|i| dropped.contains(&i)
+            || boundaries.contains(&i)
+            || (0..i).all(|j| dropped.contains(&j) || keys.index_at(j) != keys.index_at(i))),
+        "a key repeats a row's earlier key without extending it, so the rows interleave: \
+         {keys:?}"
+    );
+    // Each dropped key's group joins the one before it, which is the row of `values` just
+    // before: dropping that row's start is what joins the two runs, and the elements
+    // themselves do not move.
+    if let Tile::Function {
+        row_starts: below, ..
+    } = values
+    {
+        let keep: BitVec = (0..below.len()).map(|i| !dropped.contains(&i)).collect();
+        below.retain(&keep);
+    }
+    let keep: BitVec = (0..keys.len()).map(|i| !dropped.contains(&i)).collect();
+    keys.retain(&keep);
+    // This level's own row starts count keys, so each one drops by the repeats before it.
+    let ColumnValue::UInts(starts) = row_starts else {
+        unreachable!("checked above")
+    };
+    for start in starts.iter_mut() {
+        *start -= grown.iter().filter(|d| **d < *start).count();
+    }
+    let shifted: BitSet = deleted
+        .iter()
+        .filter(|k| !dropped.contains(k))
+        .map(|k| k - grown.iter().filter(|d| **d < k).count())
+        .collect();
+    *deleted = shifted;
+}
+
 /// Whether `tile` is well formed as a value vectorized over `rows` rows.
 ///
 /// The three rules, and nothing else: a scalar is one entry per row, a record is its fields
@@ -1054,6 +1124,101 @@ mod tests {
 
     use super::*;
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, TileGuard, Value};
+
+    // ── Merging a collection delivered row by row ─────────────────────────────
+
+    /// One enclosing row's group, for a collection of collections.
+    fn one_group(row: usize, inner: Vec<usize>, values: Vec<i64>) -> Tile {
+        Tile::function(
+            ColumnValue::from_uints(vec![row]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0]),
+                ColumnValue::from_uints(inner),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    /// A merge **extends** a collection, so a key it already holds is that row's group
+    /// growing rather than a second key. A collection delivered a row at a time re-states
+    /// the row it is adding to, which is the only way a level gains elements under a key
+    /// it already has.
+    #[test]
+    fn merging_a_row_that_grew_extends_its_group() {
+        let mut tile = one_group(0, vec![0], vec![10]);
+        tile.merge(one_group(0, vec![1], vec![20]));
+
+        let Tile::Function { keys, values, .. } = &tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        assert_eq!(keys.len(), 1, "row 0 is one key, not two: {tile:?}");
+        assert_eq!(values.row_run(0), (0, 2), "its group holds both elements");
+        assert!(
+            validate_tile(&tile),
+            "and the tile is well formed: {tile:?}"
+        );
+    }
+
+    /// A different key is a new row, which is what the merge did before any row could
+    /// grow — so the collapse must not fold two rows that merely sit next to each other.
+    #[test]
+    fn merging_a_new_row_keeps_it_apart() {
+        let mut tile = one_group(0, vec![0, 1], vec![10, 20]);
+        tile.merge(one_group(1, vec![0], vec![30]));
+
+        let Tile::Function { keys, values, .. } = &tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        assert_eq!(keys.len(), 2, "two enclosing rows: {tile:?}");
+        assert_eq!(values.row_run(0), (0, 2));
+        assert_eq!(values.row_run(1), (2, 3));
+        assert!(
+            validate_tile(&tile),
+            "and the tile is well formed: {tile:?}"
+        );
+    }
+
+    /// A row that grows twice collapses each time, so a collection delivered one element
+    /// per pull ends with one key and the whole run under it.
+    #[test]
+    fn a_row_that_grows_repeatedly_stays_one_key() {
+        let mut tile = one_group(0, vec![0], vec![10]);
+        tile.merge(one_group(0, vec![1], vec![20]));
+        tile.merge(one_group(0, vec![2], vec![30]));
+
+        let Tile::Function { keys, values, .. } = &tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(values.row_run(0), (0, 3));
+        assert!(
+            validate_tile(&tile),
+            "and the tile is well formed: {tile:?}"
+        );
+    }
+
+    /// A **scalar** codomain cannot grow under a key: a repeated key there is one
+    /// position delivered twice, which is a release-contract violation rather than
+    /// growth. It is left for the merge's own check to report rather than folded away,
+    /// because folding it would turn a duplicate delivery into a silently lost value.
+    #[test]
+    #[should_panic(expected = "Invalid tile after merge")]
+    fn a_repeated_scalar_key_is_reported_not_folded() {
+        let leaf = |v: i64| {
+            Tile::function(
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![v]))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let mut tile = leaf(10);
+        tile.merge(leaf(20));
+    }
 
     // ── Tile::is_terminal ─────────────────────────────────────────────────────
 
