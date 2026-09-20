@@ -516,19 +516,34 @@ impl Tile {
         }
     }
 
-    /// Physically remove every logically-deleted key and clear `deleted`.
+    /// Physically remove every logically-deleted key and clear `deleted`, at **every**
+    /// level.
     ///
-    /// After this the collection is compact: every key is live. A removed key takes its
-    /// whole group with it, which a filter over the level below cannot say.
+    /// After this the whole value is compact: every key of every level is live. A removed
+    /// key takes its whole group with it, which a filter over the level below cannot say.
+    ///
+    /// Every level, because a release names the level it is about. Releasing a flat
+    /// collection's keys names the top, and releasing what a nested one holds under a row
+    /// names the level below. Compacting only the top leaves an inner key present but
+    /// deleted, and the next delivery of that key lands beside it rather than replacing
+    /// it — a row holding one key twice, which no collection admits ([`valid_over`]).
     pub fn compact(&mut self) {
-        if let Tile::Function {
-            domain, deleted, ..
-        } = self
-            && !deleted.is_empty()
-        {
-            let removed = std::mem::take(deleted);
-            let keep: BitVec = (0..domain.len()).map(|k| !removed.contains(k)).collect();
-            self.retain_keys(&keep);
+        match self {
+            Tile::Function {
+                domain, deleted, ..
+            } => {
+                if !deleted.is_empty() {
+                    let removed = std::mem::take(deleted);
+                    let keep: BitVec = (0..domain.len()).map(|k| !removed.contains(k)).collect();
+                    self.retain_keys(&keep);
+                }
+                let Tile::Function { codomain, .. } = self else {
+                    unreachable!("retaining keys leaves a collection a collection")
+                };
+                codomain.compact();
+            }
+            Tile::Record(fields) => fields.values_mut().for_each(Tile::compact),
+            _ => {}
         }
     }
 
@@ -1150,6 +1165,62 @@ mod tests {
         )
     }
 
+    /// A release names the level it is about, and what it names is physically gone after
+    /// a compaction. For a nested collection that level is **below** the top, so
+    /// compacting has to reach it — otherwise the key stays present-but-deleted, and the
+    /// next delivery of that key lands beside it instead of replacing it.
+    #[test]
+    fn compacting_reaches_an_inner_level() {
+        let mut tile = one_group(0, vec![0, 1], vec![10, 20]);
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(0)))),
+        ))));
+        tile.compact();
+
+        let Tile::Function { codomain, .. } = &tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        let Tile::Function {
+            domain, deleted, ..
+        } = codomain.as_ref()
+        else {
+            panic!("expected a group under the row, got {codomain:?}");
+        };
+        assert!(deleted.is_empty(), "the released key is gone, not deleted");
+        assert_eq!(domain.len(), 1, "only the unreleased position is left");
+        assert_eq!(domain.index_at(0), Value::UInt(1));
+    }
+
+    /// A record sits between two levels, so a compaction reaches its fields as well: the
+    /// collection under a field is as much a level as one under a key.
+    #[test]
+    fn compacting_reaches_a_record_field() {
+        let mut field = Tile::function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        field.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(0)),
+        )));
+        let mut tile = Tile::Record(HashMap::from([("a".to_string(), field)]));
+        tile.compact();
+
+        let Tile::Record(fields) = &tile else {
+            panic!("expected a record, got {tile:?}");
+        };
+        let Tile::Function {
+            domain, deleted, ..
+        } = &fields["a"]
+        else {
+            panic!("expected a collection in the field, got {:?}", fields["a"]);
+        };
+        assert!(deleted.is_empty(), "the field's released key is gone");
+        assert_eq!(domain.len(), 1);
+        assert_eq!(domain.index_at(0), Value::UInt(1));
+    }
+
     /// A merge **extends** a collection, so a key it already holds is that row's group
     /// growing rather than a second key. A collection delivered a row at a time re-states
     /// the row it is adding to, which is the only way a level gains elements under a key
@@ -1159,11 +1230,14 @@ mod tests {
         let mut tile = one_group(0, vec![0], vec![10]);
         tile.merge(one_group(0, vec![1], vec![20]));
 
-        let Tile::Function { keys, values, .. } = &tile else {
+        let Tile::Function {
+            domain, codomain, ..
+        } = &tile
+        else {
             panic!("expected a collection, got {tile:?}");
         };
-        assert_eq!(keys.len(), 1, "row 0 is one key, not two: {tile:?}");
-        assert_eq!(values.row_run(0), (0, 2), "its group holds both elements");
+        assert_eq!(domain.len(), 1, "row 0 is one key, not two: {tile:?}");
+        assert_eq!(codomain.row_run(0), (0, 2), "its group holds both elements");
         assert!(
             validate_tile(&tile),
             "and the tile is well formed: {tile:?}"
@@ -1177,12 +1251,15 @@ mod tests {
         let mut tile = one_group(0, vec![0, 1], vec![10, 20]);
         tile.merge(one_group(1, vec![0], vec![30]));
 
-        let Tile::Function { keys, values, .. } = &tile else {
+        let Tile::Function {
+            domain, codomain, ..
+        } = &tile
+        else {
             panic!("expected a collection, got {tile:?}");
         };
-        assert_eq!(keys.len(), 2, "two enclosing rows: {tile:?}");
-        assert_eq!(values.row_run(0), (0, 2));
-        assert_eq!(values.row_run(1), (2, 3));
+        assert_eq!(domain.len(), 2, "two enclosing rows: {tile:?}");
+        assert_eq!(codomain.row_run(0), (0, 2));
+        assert_eq!(codomain.row_run(1), (2, 3));
         assert!(
             validate_tile(&tile),
             "and the tile is well formed: {tile:?}"
@@ -1197,11 +1274,14 @@ mod tests {
         tile.merge(one_group(0, vec![1], vec![20]));
         tile.merge(one_group(0, vec![2], vec![30]));
 
-        let Tile::Function { keys, values, .. } = &tile else {
+        let Tile::Function {
+            domain, codomain, ..
+        } = &tile
+        else {
             panic!("expected a collection, got {tile:?}");
         };
-        assert_eq!(keys.len(), 1);
-        assert_eq!(values.row_run(0), (0, 3));
+        assert_eq!(domain.len(), 1);
+        assert_eq!(codomain.row_run(0), (0, 3));
         assert!(
             validate_tile(&tile),
             "and the tile is well formed: {tile:?}"
