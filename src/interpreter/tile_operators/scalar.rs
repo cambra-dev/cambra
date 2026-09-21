@@ -809,7 +809,7 @@ impl TileProducer for VariantIsProducer {
                 ..
             } => {
                 assert!(
-                    !codomain.is_function(),
+                    !codomain.holds_a_level(),
                     "VariantIs rebuilds its domain from the positions it keeps, which has \
                      no meaning above one level"
                 );

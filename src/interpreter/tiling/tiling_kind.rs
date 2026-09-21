@@ -199,6 +199,16 @@ impl Tiling {
         matches!(self, Tiling::Function { .. })
     }
 
+    /// Whether a level sits here, or inside a record here — the static counterpart of
+    /// [`Tile::holds_a_level`](crate::interpreter::Tile::holds_a_level), which carries the rule.
+    pub fn holds_a_level(&self) -> bool {
+        match self {
+            Tiling::Function { .. } => true,
+            Tiling::Record(fields) => fields.values().any(Tiling::holds_a_level),
+            Tiling::Scalar(_) | Tiling::Aggregation { .. } | Tiling::Store { .. } => false,
+        }
+    }
+
     /// The tiling `depth` levels in, which is `self` at depth 0 — the static counterpart of
     /// [`Tile::values_at`].
     pub fn values_at(&self, depth: usize) -> &Tiling {
@@ -209,9 +219,9 @@ impl Tiling {
         }
     }
 
-    /// The tiling sitting under every level of this chain, the static counterpart of
-    /// [`Tile::deepest_values`]. A tiling that is not a collection is its own deepest
-    /// values.
+    /// The tiling sitting under this chain, the static counterpart of
+    /// [`Tile::deepest_values`], which carries the rule. A tiling that is not a collection
+    /// is its own deepest values, a record included.
     pub fn deepest_values(&self) -> &Tiling {
         match self {
             Tiling::Function { codomain, .. } => codomain.deepest_values(),

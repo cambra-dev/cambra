@@ -268,7 +268,7 @@ fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
             domain, codomain, ..
         } => {
             assert!(
-                !codomain.is_function(),
+                !codomain.holds_a_level(),
                 "a streamed collection maps keys to values, so its keys are one level"
             );
             match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {

@@ -260,14 +260,13 @@ impl TileProducer for ExtractAggregateProducer {
     }
 }
 
-/// Extracts terminal aggregation results, turning an `Aggregation` codomain into a `Scalar`
-/// one and leaving the domain structure alone.
+/// Extracts terminal aggregation results from a `Function(D, Aggregation)`, producing a
+/// `Function(D, Scalar)`.
 ///
-/// Both function shapes reach this, because [`MapAggregate`] leaves whichever its input's
-/// depth calls for: `Function(D, Aggregation)` becomes `Function(D, Scalar)`,
-/// and `Function(D₀ … Dₙ₋₁, Aggregation)` becomes the same levels over a `Scalar`.
-/// An element is emitted only where its terminal flag is set; the rest are filtered out,
-/// which for a nested tile also drops every key left holding nothing.
+/// One level, which is the fold's own: [`MapAggregate`] collapses the innermost collection,
+/// so the levels above it stay and this operator reads the one that is left. A fold under
+/// two or more levels leaves `Function(D₀ … Dₙ₋₁, Aggregation)`, which this rejects.
+/// An element is emitted only where its terminal flag is set; the rest are filtered out.
 pub struct MapExtractAggregate {
     /// The `Function(D, Aggregation)`-typed input.
     input: Box<dyn TileOperator>,
@@ -401,13 +400,24 @@ impl TileProducer for MapExtractAggregateProducer {
 
 /// Order two element paths lexicographically.
 ///
-/// [`Value`] is `PartialOrd` and not `Ord`, so incomparable components compare equal here:
-/// the order only has to group a parent's children together, which any total order does.
+/// One level's keys share a type, so comparing two paths compares like with like at every
+/// component and the order is total — which is what [`build_curried_from_paths`] needs, a
+/// parent's children being contiguous only under one.
+///
+/// [`Value`] is `PartialOrd` and not `Ord`, so that precondition is checked rather than
+/// assumed. Treating an incomparable pair as equal would not restore the order: the
+/// comparison would fall through to the next component and sort a parent's children apart,
+/// leaving the rebuild to emit one key twice. `MapResult` makes the same demand of a domain
+/// it sorts (`Tile::Function`'s keys, `map.rs`).
 fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
         match x.partial_cmp(y) {
-            Some(Ordering::Equal) | None => continue,
+            Some(Ordering::Equal) => continue,
             Some(other) => return other,
+            None => panic!(
+                "a level holds keys of two types, so its elements have no order: \
+                 {x:?} against {y:?}"
+            ),
         }
     }
     a.len().cmp(&b.len())
@@ -491,9 +501,11 @@ pub struct MapAggregate {
 impl MapAggregate {
     /// Create a new `MapAggregate` operator.
     ///
-    /// `input` must have a `Function` tiling; `kind` must support the
-    /// lookup's codomain element type.  The output tiling is
-    /// `Function { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
+    /// `input` must have a `Function` tiling whose codomain is a collection; `kind` must
+    /// support that collection's element type. The innermost level becomes an
+    /// `Aggregation` and the levels above it are left as they are
+    /// ([`fold_innermost`]), so a two-level input yields
+    /// `Function { domain, codomain: Aggregation { .. } }`.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         // A collection whose values are not themselves a collection has no level above the
         // one being folded, which is `Aggregate`'s shape rather than this one's.
@@ -612,23 +624,18 @@ impl TileProducer for MapAggregateProducer {
         };
         let domain_predicate = domain_predicate.clone();
 
-        // Descend to the collection being folded, extending the key path at every level.
-        // Its rows are the elements the groups fold into, so `parent_paths` names them.
-        let mut node = &input_tile;
-        let mut parent_paths = vec![Vec::new()];
-        let folded = loop {
-            parent_paths = node.key_paths(&parent_paths);
-            let Tile::Function { codomain, .. } = node else {
-                unreachable!("the loop only descends into a collection")
-            };
-            match codomain.as_ref() {
-                Tile::Function {
-                    codomain: inner, ..
-                } if inner.is_function() => node = codomain,
-                Tile::Function { .. } => break codomain.as_ref(),
-                other => panic!("MapAggregate folds a collection of collections, got {other:?}"),
-            }
-        };
+        // The collection being folded is the innermost one, and the rows it stands over
+        // are the groups: `parent_paths` names them, one path per group.
+        let depth = input_tile.innermost_depth().unwrap_or_else(|| {
+            panic!("MapAggregate folds a collection of collections, got {input_tile:?}")
+        });
+        assert!(
+            depth >= 1,
+            "MapAggregate folds a collection of collections, so the fold sits under a \
+             level: {input_tile:?}"
+        );
+        let parent_paths = input_tile.row_paths_at(depth);
+        let folded = input_tile.values_at(depth);
         let Tile::Function { codomain, .. } = folded else {
             unreachable!("the loop breaks on a collection")
         };

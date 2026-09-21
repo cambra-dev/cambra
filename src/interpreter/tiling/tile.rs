@@ -27,34 +27,35 @@ pub enum Tile {
     /// A collection, `keys ⤇ values` — one new dimension over the rows it sits in.
     ///
     /// **A tile is a value of its type vectorized over `R` rows**, and `R` is set by
-    /// position: 1 at the top level, and inside a collection's `values`, that collection's
+    /// position: 1 at the top level, and inside a collection's `codomain`, that collection's
     /// key count. A [`Self::Scalar`] is one entry per row and a [`Self::Record`] is one
     /// sub-tile per field at the same `R`; a collection groups instead of pairing, which is
     /// what `row_starts` records.
     ///
-    /// Stored Compressed-Sparse-Row-wise: `keys` is every row's keys run together, and
-    /// `values` is a tile over those keys. A chain of collections nests one node per level,
+    /// Stored Compressed-Sparse-Row-wise: `domain` is every row's keys run together, and
+    /// `codomain` is a tile over those keys. A chain of collections nests one node per level,
     /// holding the same columns a flat level list would — and unlike a flat list it can say
     /// where a record sits between two levels, which is what lets records and collections
     /// nest freely.
     Function {
-        /// Where each row's run of keys begins in `keys`, one entry per row. **Non-decreasing**:
+        /// Where each row's run of keys begins in `domain`, one entry per row. **Non-decreasing**:
         /// two equal starts are a row whose group holds nothing. A key with an empty group is
         /// a collection that is empty, which an aggregate folds to its identity; a key that is
-        /// gone is absent from `keys` instead.
+        /// gone is absent from `domain` instead.
         ///
         /// At the top level this is `[0]` — the one row, whose group is the whole collection.
         row_starts: ColumnValue,
-        /// Every row's keys, run together. Sorted within a row, so a lookup inside one is a
-        /// binary search.
+        /// Every row's keys, run together. Unique within a row and otherwise in the order
+        /// they were delivered, which is what [`valid_over`] checks and all a lookup
+        /// inside a row assumes.
         domain: ColumnValue,
-        /// The values, a tile over `keys` — so a fold may leave an [`Self::Aggregation`] here.
+        /// The values, a tile over `domain` — so a fold may leave an [`Self::Aggregation`] here.
         codomain: Box<Tile>,
-        /// The region of `keys` whose values are complete: no new element will be seen under
+        /// The region of `domain` whose values are complete: no new element will be seen under
         /// them, at any depth. Covering every key says the key set itself is closed, which is
         /// what makes [`Tile::is_terminal`] read this as one flag.
         domain_predicate: Predicate,
-        /// Logically removed keys. 1 = removed; empty means every key is present. `keys` is
+        /// Logically removed keys. 1 = removed; empty means every key is present. `domain` is
         /// preserved so `to_guard` can report every key ever seen, enabling complete source
         /// releasing.
         deleted: BitSet,
@@ -158,15 +159,15 @@ impl Tile {
             // A product value is empty when every component is; a struct-of-arrays record
             // fills its fields together, so either reading agrees there.
             Tile::Record(m) => m.values().all(Tile::is_empty),
-            // A collection with no live key holds nothing, and so does one whose values
-            // hold nothing however many keys stand over them — which is what a full release
-            // of a nested collection leaves behind.
+            // A collection holds something as soon as one key is live. A key is data: a
+            // consumer that broadcasts over the keys, or releases them, has an answer
+            // before any value lands. Values that hold nothing is the level below being
+            // empty, which is that level's own answer and not this one's — a full release
+            // of what a nested collection holds leaves its keys standing, and they are
+            // still what it knows.
             Tile::Function {
-                domain,
-                codomain,
-                deleted,
-                ..
-            } => domain.len() == deleted.len() || codomain.is_empty(),
+                domain, deleted, ..
+            } => domain.len() == deleted.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.is_empty(),
             // A `Store` is a right-continuous *step function* over its decided prefix, not a
             // list of change events: a tick absent from `changes` but at or below the
@@ -272,20 +273,20 @@ impl Tile {
             (
                 Tile::Function {
                     row_starts: s_starts,
-                    domain: s_keys,
-                    codomain: s_values,
+                    domain: s_domain,
+                    codomain: s_codomain,
                     domain_predicate: s_pred,
                     deleted: s_deleted,
                 },
                 Tile::Function {
                     row_starts: o_starts,
-                    domain: o_keys,
-                    codomain: o_values,
+                    domain: o_domain,
+                    codomain: o_codomain,
                     domain_predicate: o_pred,
                     deleted: o_deleted,
                 },
             ) => {
-                let seen = s_keys.len();
+                let seen = s_domain.len();
                 if whole {
                     // One row, and both describe it: the keys run together.
                     assert_eq!(
@@ -299,13 +300,13 @@ impl Tile {
                     shifted.for_each_uint(|u| *u += seen);
                     s_starts.append(shifted);
                 }
-                s_keys.append(o_keys);
-                s_values.merge_part(*o_values, false);
+                s_domain.append(o_domain);
+                s_codomain.merge_part(*o_codomain, false);
                 *s_pred = s_pred.union(&o_pred);
                 for key in o_deleted.iter() {
                     s_deleted.insert(key + seen);
                 }
-                collapse_grown_groups(s_starts, s_keys, s_values, s_deleted);
+                collapse_grown_groups(s_starts, s_domain, s_codomain, s_deleted);
             }
             // A record's fields are whole exactly when the record is: a record of whole
             // values merges field by whole field, and one sitting under a collection merges
@@ -361,14 +362,14 @@ impl Tile {
         );
     }
 
-    /// Keep the rows `mask` names, dropping the rest.
+    /// Keep the rows `mask` names, dropping the rest — a filter along the *row* axis.
     ///
     /// The mask is over this tile's own rows, so a scalar keeps the entries it names, a
     /// record keeps them in every field, and a collection keeps those rows' whole groups.
-    pub fn retain(&mut self, mask: &BitVec) {
+    pub fn retain_rows(&mut self, mask: &BitVec) {
         match self {
             Tile::Scalar(cv) => cv.retain(mask),
-            Tile::Record(fields) => fields.values_mut().for_each(|t| t.retain(mask)),
+            Tile::Record(fields) => fields.values_mut().for_each(|t| t.retain_rows(mask)),
             // A kept row brings its whole run of keys, so keeping a row is gathering it:
             // one group per survivor, in order, which is what [`Tile::regroup_rows`] does.
             Tile::Function { .. } => {
@@ -387,7 +388,7 @@ impl Tile {
                 terminal,
                 ..
             } => {
-                accumulator.retain(mask);
+                accumulator.retain_rows(mask);
                 terminal.retain(mask);
             }
             other => panic!("retain not supported for {other:?}"),
@@ -396,7 +397,7 @@ impl Tile {
 
     /// This tile's rows in the order `rows` names them, each as many times as it appears.
     ///
-    /// A gather rather than a filter: [`Tile::retain`] is the case where every row goes to a
+    /// A gather rather than a filter: [`Tile::retain_rows`] is the case where every row goes to a
     /// row of its own or to none, and this is what an operator uses when it rebuilds a
     /// collection by looking rows up.
     pub fn select_rows(&self, rows: &[usize]) -> Tile {
@@ -465,10 +466,12 @@ impl Tile {
         )
     }
 
-    /// Keep the keys `mask` names, dropping the rest — a filter *within* each row.
+    /// Keep the keys `mask` names, dropping the rest — a filter along the *key* axis,
+    /// which is within each row rather than across rows ([`Self::retain_rows`]).
     ///
     /// The mask is over this collection's keys, which is what a predicate over its elements
-    /// produces. Rows keep their identity; only their groups shrink.
+    /// produces. A key goes with the value under it, as a row goes with its group; what
+    /// differs is the axis, so rows keep their identity and only their groups shrink.
     pub fn retain_keys(&mut self, mask: &BitVec) {
         let Tile::Function {
             row_starts,
@@ -498,7 +501,7 @@ impl Tile {
         *domain = domain.select_indices(survivors.iter().copied(), survivors.len());
         *deleted = moved;
         *row_starts = ColumnValue::UInts(new_starts);
-        codomain.retain(mask);
+        codomain.retain_rows(mask);
     }
 
     /// Logically remove the keys `mask` does **not** name, by setting bits in `deleted`.
@@ -543,7 +546,13 @@ impl Tile {
                 codomain.compact();
             }
             Tile::Record(fields) => fields.values_mut().for_each(Tile::compact),
-            _ => {}
+            // A fold holds an element, and `Sole`'s is whatever shape the element has, so
+            // an accumulator can carry levels with released keys of their own. Compacting
+            // it keeps the row count: a collection's rows are its `row_starts`, which
+            // dropping keys rebuilds at the same length, so `accumulator.rows()` still
+            // matches `terminal`.
+            Tile::Aggregation { accumulator, .. } => accumulator.compact(),
+            Tile::Scalar(_) | Tile::Store { .. } => {}
         }
     }
 
@@ -655,7 +664,10 @@ impl Tile {
             // complete as soon as it is there, so every key present is releasable. A
             // collection under a key may still grow, and only `domain_predicate` says which
             // keys it will not; what an open key holds is named one step in, which is where
-            // a `Codomain` guard reads.
+            // a `Codomain` guard reads. A record stands over the same keys rather than
+            // introducing keys of its own, so a collection in one of its fields is a level
+            // under the key like any other — which is [`Tile::holds_a_level`] and not
+            // [`Tile::is_function`].
             Tile::Function {
                 domain,
                 codomain,
@@ -665,7 +677,7 @@ impl Tile {
                 if domain_predicate.is_true() {
                     return TileGuard::Function(FunctionGuard::Domain(Predicate::True));
                 }
-                if !codomain.is_function() {
+                if !codomain.holds_a_level() {
                     return TileGuard::Function(FunctionGuard::Domain(
                         Predicate::from_column_value(domain).union(domain_predicate),
                     ));
@@ -681,7 +693,7 @@ impl Tile {
                     return TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()));
                 }
                 let mut open_values = (**codomain).clone();
-                open_values.retain(&open);
+                open_values.retain_rows(&open);
                 TileGuard::flatten_or(vec![
                     TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
                     TileGuard::Function(FunctionGuard::Codomain(Box::new(
@@ -710,15 +722,15 @@ impl Tile {
 
     /// A collection over one row — the whole value — with dev-build-only validation.
     pub fn function(
-        keys: ColumnValue,
-        values: Box<Tile>,
+        domain: ColumnValue,
+        codomain: Box<Tile>,
         domain_predicate: Predicate,
         deleted: BitSet,
     ) -> Tile {
         Tile::grouped(
             ColumnValue::UInts(vec![0]),
-            keys,
-            values,
+            domain,
+            codomain,
             domain_predicate,
             deleted,
         )
@@ -746,8 +758,13 @@ impl Tile {
         result
     }
 
-    /// The tile sitting under every level of this collection chain — what an operator
-    /// transforms when it changes a collection's values and nothing else.
+    /// The tile sitting under this collection chain — what an operator transforms when it
+    /// changes a collection's values and nothing else.
+    ///
+    /// The chain is the spine of collection nodes, so a record ends it and is itself the
+    /// answer: a collection inside one of its fields is below a *field*, not below this
+    /// chain. [`Self::holds_a_level`] is the question of whether anything below can still
+    /// grow, which does look through a record.
     ///
     /// The runtime counterpart of what
     /// [`change_tiling_result`](crate::interpreter::tile_operators::change_tiling_result)
@@ -790,27 +807,55 @@ impl Tile {
         }
     }
 
-    /// The innermost collection of this chain: the one whose values are not a collection.
+    /// The depth of this chain's innermost collection: the last before its elements.
     ///
-    /// `None` where there is no collection at all. Paired with [`Self::key_paths`], this is
-    /// where an operator that acts on a chain's elements does its work.
-    pub fn innermost_level_mut(&mut self) -> Option<&mut Tile> {
-        // The shape is read through a borrow that ends before the descent, which is what
-        // lets the recursion hand back a reference into `self`.
-        match self {
-            Tile::Function { codomain, .. } if codomain.is_function() => {}
-            Tile::Function { .. } => return Some(self),
-            _ => return None,
-        }
+    /// `None` where there is no collection at all. [`Self::values_at`] takes this depth and
+    /// [`Self::row_paths_at`] the key path of every row that level stands over, which is
+    /// how an operator acting on a chain's elements finds its work.
+    ///
+    /// The chain is the spine of collection nodes, so a record ends it and is the element:
+    /// a collection in one of its fields sits inside that element rather than continuing
+    /// the chain. Whether anything below can still *grow* is [`Self::holds_a_level`], which
+    /// does look through a record; the two questions differ exactly here.
+    pub fn innermost_depth(&self) -> Option<usize> {
         let Tile::Function { codomain, .. } = self else {
-            unreachable!("the shape was matched above")
+            return None;
         };
-        codomain.innermost_level_mut()
+        Some(codomain.innermost_depth().map_or(0, |below| below + 1))
     }
 
-    /// Each level's `(row_starts, keys)`, outermost first: the chain's skeleton, without
+    /// The innermost collection of this chain, to write through
+    /// ([`Self::innermost_depth`]).
+    pub fn innermost_level_mut(&mut self) -> Option<&mut Tile> {
+        let depth = self.innermost_depth()?;
+        Some(self.values_at_mut(depth))
+    }
+
+    /// The key path of every row at `depth`, outermost key first.
+    ///
+    /// Depth 0 is the whole value: one row, whose path is empty. Each level down extends
+    /// its row's path by that level's key, so the rows at `depth` are the keys at
+    /// `depth - 1` and an element's path names it uniquely.
+    pub fn row_paths_at(&self, depth: usize) -> Vec<Vec<Value>> {
+        let mut paths = vec![Vec::new()];
+        let mut node = self;
+        for _ in 0..depth {
+            paths = node.key_paths(&paths);
+            let Tile::Function { codomain, .. } = node else {
+                panic!("no level {depth} in {self:?}")
+            };
+            node = codomain;
+        }
+        paths
+    }
+
+    /// Each level's `(row_starts, domain)`, outermost first: the chain's skeleton, without
     /// the values under it. Two collections carrying the same data over the same keys agree
     /// here whatever their predicates say.
+    ///
+    /// The spine of collection nodes, so a record ends it: what sits in a record's fields
+    /// is below those fields rather than on this chain, and a caller comparing skeletons
+    /// is comparing the levels the two tiles share above their values.
     pub fn key_levels(&self) -> Vec<(&ColumnValue, &ColumnValue)> {
         let mut levels = Vec::new();
         let mut node = self;
@@ -844,10 +889,30 @@ impl Tile {
         matches!(self, Tile::Function { .. })
     }
 
+    /// Whether a level sits here, or inside a record here.
+    ///
+    /// A [`Self::Record`] is one sub-tile per field over the *same* rows, so it introduces
+    /// no dimension of its own and a collection inside one is a level of whatever holds the
+    /// record. A [`Self::Aggregation`] and a [`Self::Store`] carry their own completeness,
+    /// so what they hold is answered by their own guard rather than by descending into it.
+    ///
+    /// Two questions about a codomain read alike and part here. *Does the chain continue?*
+    /// is [`Self::is_function`], which a record answers no to because it **is** the element
+    /// the chain ends at. *Can what this holds still grow?* is this one, and a record
+    /// answers yes for its fields — which is what a guard asks, and what an operator asks
+    /// before boxing a value into a column, a column having nowhere to put a level.
+    pub fn holds_a_level(&self) -> bool {
+        match self {
+            Tile::Function { .. } => true,
+            Tile::Record(fields) => fields.values().any(Tile::holds_a_level),
+            Tile::Scalar(_) | Tile::Aggregation { .. } | Tile::Store { .. } => false,
+        }
+    }
+
     /// The key path of every key of this collection, each extending its row's path.
     ///
     /// `row_paths` holds one path per row, so the result — one path per key — is the
-    /// `row_paths` of whatever collection sits in `values`. A key repeats across its
+    /// `row_paths` of whatever collection sits in `codomain`. A key repeats across its
     /// siblings' groups, so below the top level only the whole path identifies an element.
     pub fn key_paths(&self, row_paths: &[Vec<Value>]) -> Vec<Vec<Value>> {
         let Tile::Function { domain, .. } = self else {
@@ -875,13 +940,22 @@ impl Tile {
     /// already holds it, and that row's value would go with it.
     fn held_guard(&self) -> TileGuard {
         match self {
+            // A record's fields stand over the rows the record does, so what it holds is
+            // what its fields hold — each read the same way, because a `Codomain` arm is
+            // read against every row whatever sits at it.
+            Tile::Record(fields) => TileGuard::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.held_guard()))
+                    .collect(),
+            ),
             Tile::Function {
                 domain, codomain, ..
             } => {
                 let keys_guard = TileGuard::Function(FunctionGuard::Domain(
                     Predicate::from_column_value(domain),
                 ));
-                if !codomain.is_function() {
+                if !codomain.holds_a_level() {
                     return keys_guard;
                 }
                 TileGuard::flatten_or(vec![
@@ -893,7 +967,7 @@ impl Tile {
         }
     }
 
-    /// The half-open run of `keys` belonging to row `row`.
+    /// The half-open run of `domain` belonging to row `row`.
     pub fn row_run(&self, row: usize) -> (usize, usize) {
         let Tile::Function {
             row_starts, domain, ..
@@ -1002,52 +1076,50 @@ pub fn validate_tile(tile: &Tile) -> bool {
 /// would leave the level with a repeated key, which no collection admits
 /// ([`valid_over`]) and which a lookup inside the row would only find the first run of.
 ///
-/// Only a level whose values are themselves a collection can grow this way. Where they
-/// are not, a repeated key is one position delivered twice — a release-contract
-/// violation rather than growth — and it is left alone so `valid_over` reports it.
+/// Only a level holding a further level can grow this way. Where it holds none, a repeated
+/// key is one position delivered twice — a release-contract violation rather than growth
+/// — and it is left alone so `valid_over` reports it.
+///
+/// A record between the two levels grows like any other: [`join_rows`] joins each field
+/// over the rows the key held, the collection fields by their runs and the scalar ones by
+/// having nothing to join.
 ///
 /// The keys of one row run together and a row grows at its end, so a repeat is adjacent
 /// to what it extends; a repeat that is not is a collection whose rows interleave, which
 /// no producer emits.
 fn collapse_grown_groups(
     row_starts: &mut ColumnValue,
-    keys: &mut ColumnValue,
-    values: &mut Tile,
+    domain: &mut ColumnValue,
+    codomain: &mut Tile,
     deleted: &mut BitSet,
 ) {
-    if !values.is_function() {
+    if !codomain.holds_a_level() {
         return;
     }
     let ColumnValue::UInts(starts) = row_starts else {
         return;
     };
     let boundaries: HashSet<usize> = starts.iter().copied().collect();
-    let grown: Vec<usize> = (1..keys.len())
-        .filter(|i| !boundaries.contains(i) && keys.index_at(*i) == keys.index_at(i - 1))
+    let grown: Vec<usize> = (1..domain.len())
+        .filter(|i| !boundaries.contains(i) && domain.index_at(*i) == domain.index_at(i - 1))
         .collect();
     if grown.is_empty() {
         return;
     }
     let dropped: HashSet<usize> = grown.iter().copied().collect();
     debug_assert!(
-        (1..keys.len()).all(|i| dropped.contains(&i)
+        (1..domain.len()).all(|i| dropped.contains(&i)
             || boundaries.contains(&i)
-            || (0..i).all(|j| dropped.contains(&j) || keys.index_at(j) != keys.index_at(i))),
+            || (0..i).all(|j| dropped.contains(&j) || domain.index_at(j) != domain.index_at(i))),
         "a key repeats a row's earlier key without extending it, so the rows interleave: \
-         {keys:?}"
+         {domain:?}"
     );
-    // Each dropped key's group joins the one before it, which is the row of `values` just
+    // Each dropped key's group joins the one before it, which is the row of `codomain` just
     // before: dropping that row's start is what joins the two runs, and the elements
     // themselves do not move.
-    if let Tile::Function {
-        row_starts: below, ..
-    } = values
-    {
-        let keep: BitVec = (0..below.len()).map(|i| !dropped.contains(&i)).collect();
-        below.retain(&keep);
-    }
-    let keep: BitVec = (0..keys.len()).map(|i| !dropped.contains(&i)).collect();
-    keys.retain(&keep);
+    join_rows(codomain, &dropped, domain.len() - grown.len());
+    let keep: BitVec = (0..domain.len()).map(|i| !dropped.contains(&i)).collect();
+    domain.retain(&keep);
     // This level's own row starts count keys, so each one drops by the repeats before it.
     let ColumnValue::UInts(starts) = row_starts else {
         unreachable!("checked above")
@@ -1061,6 +1133,51 @@ fn collapse_grown_groups(
         .map(|k| k - grown.iter().filter(|d| **d < k).count())
         .collect();
     *deleted = shifted;
+}
+
+/// Join each row `dropped` names into the row before it, which is what a level's regrown
+/// key does to the values standing under it.
+///
+/// Per level, because the rows stand where that level's keys did: a collection drops the
+/// row start that separated the two runs, and a record does it field by field, its fields
+/// standing over the same rows. A scalar holds one value per row and has nothing to join —
+/// a regrown key must not restate it, which is the release contract, so the only state
+/// consistent with growth is that the repeat never carried it.
+///
+/// **Joining two rows can grow a key one level further down**, so a collection re-collapses
+/// after it joins. Two keys that repeat were distinct while they sat in different rows, and
+/// [`collapse_grown_groups`] running under the merge saw them that way; the repeat only
+/// exists once this join puts them in one row. The recursion ends at the level whose values
+/// hold none.
+fn join_rows(codomain: &mut Tile, dropped: &HashSet<usize>, rows_after: usize) {
+    match codomain {
+        Tile::Function {
+            row_starts,
+            domain,
+            codomain,
+            deleted,
+            ..
+        } => {
+            let keep: BitVec = (0..row_starts.len())
+                .map(|i| !dropped.contains(&i))
+                .collect();
+            row_starts.retain(&keep);
+            collapse_grown_groups(row_starts, domain, codomain, deleted);
+        }
+        Tile::Record(fields) => fields
+            .values_mut()
+            .for_each(|field| join_rows(field, dropped, rows_after)),
+        Tile::Scalar(cv) => assert!(
+            cv.is_empty() || cv.len() == rows_after,
+            "a regrown key restates a scalar beside it, which the release contract forbids: \
+             {} values over {rows_after} keys",
+            cv.len()
+        ),
+        // An aggregation under a regrown key would be two accumulators for one key, which
+        // is `AggregateKind::accumulate`'s job and not written here because no producer
+        // regrows a key over one; a store is a whole value and never stands under a key.
+        other => todo!("joining {other:?} under a regrown key"),
+    }
 }
 
 /// Whether `tile` is well formed as a value vectorized over `rows` rows.
@@ -1088,7 +1205,7 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
                 return false;
             };
             // A run per row, beginning at 0 and never going backwards — two equal starts
-            // are the row whose group holds nothing — and ending inside `keys`.
+            // are the row whose group holds nothing — and ending inside `domain`.
             if starts.len() != rows
                 || starts.first().is_some_and(|s| *s != 0)
                 || !starts.windows(2).all(|w| w[0] <= w[1])
@@ -1165,6 +1282,552 @@ mod tests {
         )
     }
 
+    // ── Three collection levels ───────────────────────────────────────────────
+
+    /// One `A` key's contribution: the key, then its `B` keys, each with its `C` entries.
+    type ThreeLevelGroup<'a> = (usize, &'a [(usize, &'a [(usize, i64)])]);
+
+    /// `A ⤇ B ⤇ C ⤇ Int`, every group named.
+    ///
+    /// The chain the one-node-per-level representation exists for: each level's
+    /// `row_starts` counts the level above's keys, so the pairing is checked three deep.
+    fn three_levels(groups: &[ThreeLevelGroup<'_>], outer_pred: Predicate) -> Tile {
+        let (mut b_starts, mut b_keys) = (Vec::new(), Vec::new());
+        let (mut c_starts, mut c_keys, mut values) = (Vec::new(), Vec::new(), Vec::new());
+        for (_, bs) in groups {
+            b_starts.push(b_keys.len());
+            for (bk, cs) in *bs {
+                b_keys.push(*bk);
+                c_starts.push(c_keys.len());
+                for (ck, v) in *cs {
+                    c_keys.push(*ck);
+                    values.push(*v);
+                }
+            }
+        }
+        let c = Tile::grouped(
+            ColumnValue::UInts(c_starts),
+            ColumnValue::from_uints(c_keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let b = Tile::grouped(
+            ColumnValue::UInts(b_starts),
+            ColumnValue::from_uints(b_keys),
+            Box::new(c),
+            Predicate::False,
+            BitSet::new(),
+        );
+        Tile::function(
+            ColumnValue::from_uints(groups.iter().map(|(k, _)| *k).collect()),
+            Box::new(b),
+            outer_pred,
+            BitSet::new(),
+        )
+    }
+
+    /// A three-level fixture: `A=10` over `B=1,2`, `A=20` over `B=3`.
+    fn abc() -> Tile {
+        three_levels(
+            &[
+                (10, &[(1, &[(100, 1)]), (2, &[(200, 2), (201, 3)])]),
+                (20, &[(3, &[(300, 4)])]),
+            ],
+            Predicate::False,
+        )
+    }
+
+    /// The pairing rule holds at every level, not just the outermost: each level is one run
+    /// of keys per row of the level above, and the values are one entry per innermost key.
+    #[test]
+    fn three_levels_pair_at_every_level() {
+        assert!(validate_tile(&abc()));
+    }
+
+    /// The check reaches the third level: a `C` run count that disagrees with `B`'s key
+    /// count is rejected even though the two levels above it agree.
+    #[test]
+    fn a_third_level_at_the_wrong_row_count_is_rejected() {
+        let Tile::Function { codomain, .. } = abc() else {
+            unreachable!()
+        };
+        let Tile::Function {
+            row_starts,
+            domain,
+            codomain: c,
+            ..
+        } = *codomain
+        else {
+            unreachable!()
+        };
+        // `B` keeps its three keys; `C` is rebuilt over two rows instead of three.
+        let Tile::Function {
+            domain: c_domain,
+            codomain: c_values,
+            ..
+        } = *c
+        else {
+            unreachable!()
+        };
+        let short = Tile::Function {
+            row_starts: ColumnValue::UInts(vec![0, 1]),
+            domain: c_domain,
+            codomain: c_values,
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        };
+        let b = Tile::Function {
+            row_starts,
+            domain,
+            codomain: Box::new(short),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        };
+        assert!(
+            !valid_over(&b, 1),
+            "C stands over two rows, B has three keys"
+        );
+    }
+
+    /// An element three levels down is named by its whole path, and the chain walk reports
+    /// the level it lives on.
+    #[test]
+    fn three_levels_name_each_element_by_its_path() {
+        let tile = abc();
+        assert_eq!(tile.innermost_depth(), Some(2), "C is two levels in from A");
+        assert_eq!(
+            tile.row_paths_at(3),
+            vec![
+                vec![Value::UInt(10), Value::UInt(1), Value::UInt(100)],
+                vec![Value::UInt(10), Value::UInt(2), Value::UInt(200)],
+                vec![Value::UInt(10), Value::UInt(2), Value::UInt(201)],
+                vec![Value::UInt(20), Value::UInt(3), Value::UInt(300)],
+            ],
+            "each `C` key extends its `B` key's path, which extends its `A` key's"
+        );
+        assert_eq!(
+            tile.values_at(2).rows(),
+            3,
+            "`C` stands over `B`'s three keys"
+        );
+    }
+
+    /// A delivery that re-states a key two levels down grows the innermost group, and the
+    /// levels above it keep their keys: the collapse runs at the level that repeated.
+    #[test]
+    fn merging_three_levels_grows_the_innermost_group() {
+        let mut tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::False);
+        tile.merge(three_levels(&[(10, &[(1, &[(200, 2)])])], Predicate::False));
+
+        assert_eq!(
+            tile.row_paths_at(3),
+            vec![
+                vec![Value::UInt(10), Value::UInt(1), Value::UInt(100)],
+                vec![Value::UInt(10), Value::UInt(1), Value::UInt(200)],
+            ],
+            "one `A` key over one `B` key over both deliveries' `C` entries"
+        );
+        assert!(validate_tile(&tile));
+    }
+
+    /// The same delivery shape one level up: a re-stated `A` key carrying a new `B` key
+    /// grows the middle level rather than repeating `A`.
+    #[test]
+    fn merging_three_levels_grows_a_middle_group() {
+        let mut tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::False);
+        tile.merge(three_levels(&[(10, &[(2, &[(200, 2)])])], Predicate::False));
+
+        let Tile::Function { domain, .. } = &tile else {
+            unreachable!()
+        };
+        assert_eq!(
+            domain.len(),
+            1,
+            "`A` grew rather than repeating: {domain:?}"
+        );
+        assert_eq!(
+            tile.row_paths_at(2),
+            vec![
+                vec![Value::UInt(10), Value::UInt(1)],
+                vec![Value::UInt(10), Value::UInt(2)],
+            ],
+            "both `B` keys sit under the one `A` key"
+        );
+        assert!(validate_tile(&tile));
+    }
+
+    /// The re-collapse joins a group that grew; it does not absorb a position delivered
+    /// twice. Two deliveries naming the same innermost key are one position claimed twice,
+    /// which the release contract forbids, and the recursion stops at the level whose
+    /// values hold none so `valid_over` still sees the repeat.
+    #[test]
+    #[should_panic(expected = "Invalid tile after merge")]
+    fn merging_three_levels_still_rejects_a_repeated_element() {
+        let mut tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::False);
+        tile.merge(three_levels(&[(10, &[(1, &[(100, 2)])])], Predicate::False));
+    }
+
+    /// A release names a level by its depth, and compaction reaches it. Releasing a `C`
+    /// key is two `Codomain` steps in, and the key is physically gone afterwards.
+    #[test]
+    fn compacting_reaches_the_third_level() {
+        let mut tile = abc();
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(200))),
+            )))),
+        ))));
+        tile.compact();
+
+        assert_eq!(
+            tile.row_paths_at(3),
+            vec![
+                vec![Value::UInt(10), Value::UInt(2), Value::UInt(201)],
+                vec![Value::UInt(20), Value::UInt(3), Value::UInt(300)],
+            ],
+            "the `C` keys at or below 200 are gone, and `B=1` is left holding nothing"
+        );
+        assert!(
+            validate_tile(&tile),
+            "an emptied group is still a key: {tile:?}"
+        );
+    }
+
+    /// Filtering the innermost level of three keeps every key above it, so a `B` key whose
+    /// `C` entries all go keeps its identity and holds an empty group.
+    #[test]
+    fn retaining_innermost_keys_of_three_empties_rather_than_removes() {
+        let mut tile = abc();
+        let innermost = tile
+            .innermost_depth()
+            .unwrap_or_else(|| unreachable!("three levels"));
+        // Keep only `C` keys 201 and 300 — `B=1`'s only entry goes.
+        tile.values_at_mut(innermost)
+            .retain_keys(&BitVec::from_fn(4, |k| k >= 2));
+
+        assert_eq!(
+            tile.row_paths_at(2),
+            vec![
+                vec![Value::UInt(10), Value::UInt(1)],
+                vec![Value::UInt(10), Value::UInt(2)],
+                vec![Value::UInt(20), Value::UInt(3)],
+            ],
+            "every `B` key survives the filter that emptied one of them"
+        );
+        assert_eq!(tile.values_at(2).row_run(0), (0, 0), "`B=1` holds nothing");
+        assert!(validate_tile(&tile));
+    }
+
+    /// Releasing exactly what a three-level tile's guard names leaves nothing live.
+    #[test]
+    fn releasing_a_three_level_guard_round_trips() {
+        let mut tile = abc();
+        let guard = tile.to_guard();
+        tile.remove_guarded(guard);
+        tile.compact();
+
+        assert!(
+            tile.row_paths_at(3).is_empty(),
+            "every element the guard named is gone: {tile:?}"
+        );
+        assert!(validate_tile(&tile));
+    }
+
+    // ── A record between two collection levels ────────────────────────────
+
+    /// One `K` key's contribution: the key, the `n` value this delivery carries for it,
+    /// and the `xs` entries under it.
+    type RecordGroup<'a> = (usize, Option<i64>, &'a [(usize, i64)]);
+
+    /// `K ⤇ {n: Int, xs: (J ⤇ Int)}`, one `K` key per group.
+    ///
+    /// A record component may hold **a collection per row** rather than a value per row:
+    /// `xs` restates the rows it sits under as its own outermost level, so each row keys a
+    /// group of its own. That is the shape a product value takes inside a codomain, and the
+    /// alternative — one boxed map per cell — is what it exists to avoid.
+    ///
+    /// `n` is the record's scalar field, one value per `K` key. `None` is a delivery that
+    /// does not carry it, which is what a repeat of a key it already stated must do.
+    fn record_between_levels(
+        groups: &[RecordGroup<'_>],
+        outer_pred: Predicate,
+        inner_pred: Predicate,
+    ) -> Tile {
+        let mut starts = Vec::new();
+        let mut inner_keys = Vec::new();
+        let mut inner_values = Vec::new();
+        for (_, _, entries) in groups {
+            starts.push(inner_keys.len());
+            inner_keys.extend(entries.iter().map(|(k, _)| *k));
+            inner_values.extend(entries.iter().map(|(_, v)| *v));
+        }
+        let b = Tile::grouped(
+            ColumnValue::UInts(starts),
+            ColumnValue::from_uints(inner_keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(inner_values))),
+            inner_pred,
+            BitSet::new(),
+        );
+        Tile::function(
+            ColumnValue::from_uints(groups.iter().map(|(k, _, _)| *k).collect()),
+            Box::new(Tile::Record(HashMap::from([
+                (
+                    "n".to_string(),
+                    Tile::Scalar(ColumnValue::Ints(
+                        groups.iter().filter_map(|(_, n, _)| *n).collect(),
+                    )),
+                ),
+                ("xs".to_string(), b),
+            ]))),
+            outer_pred,
+            BitSet::new(),
+        )
+    }
+
+    /// The record's two fields, as the `n` column and `xs`'s `(domain, codomain)`.
+    fn record_fields(tile: &Tile) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+        let Tile::Function { codomain, .. } = tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        let Tile::Record(fields) = codomain.as_ref() else {
+            panic!("expected a record codomain, got {codomain:?}");
+        };
+        let Tile::Scalar(n) = &fields["n"] else {
+            panic!("expected a scalar at `n`, got {:?}", fields["n"]);
+        };
+        let Tile::Function {
+            domain, codomain, ..
+        } = &fields["xs"]
+        else {
+            panic!("expected a collection at `xs`, got {:?}", fields["xs"]);
+        };
+        let Tile::Scalar(values) = codomain.as_ref() else {
+            panic!("expected scalar values under `xs`, got {codomain:?}");
+        };
+        let column = |c: &ColumnValue| (0..c.len()).map(|i| c.index_at(i)).collect::<Vec<_>>();
+        (column(n), column(domain), column(values))
+    }
+
+    /// A collection under a record's field is a level under the key the record stands on,
+    /// so the key is complete only when every field is. Reading the codomain's node type
+    /// alone calls the record a leaf and releases every `K` key, taking the still-growing
+    /// `J` groups with it.
+    #[test]
+    fn a_record_between_two_levels_holds_its_keys() {
+        let tile = record_between_levels(
+            &[(0, Some(1), &[(100, 10)]), (1, Some(2), &[(200, 20)])],
+            Predicate::False,
+            Predicate::False,
+        );
+
+        // No `K` key is settled, so the domain arm names nothing and drops out of the
+        // union: what is left is the level the record holds, one step in.
+        let TileGuard::Function(FunctionGuard::Codomain(held)) = tile.to_guard() else {
+            panic!(
+                "a still-growing collection under the record holds every key back, so no \
+                 key is named: {:?}",
+                tile.to_guard()
+            );
+        };
+        let TileGuard::Record(fields) = held.as_ref() else {
+            panic!("a record codomain is guarded field-wise, got {held:?}");
+        };
+        assert_eq!(
+            fields.get("n"),
+            Some(&TileGuard::Scalar(true)),
+            "a scalar field is complete as soon as it is there: {fields:?}"
+        );
+        assert_eq!(
+            fields.get("xs"),
+            Some(&TileGuard::Function(FunctionGuard::Domain(
+                Predicate::from_column_value(&ColumnValue::from_uints(vec![100, 200]))
+            ))),
+            "the collection field names the inner keys it holds: {fields:?}"
+        );
+    }
+
+    /// Releasing exactly what the guard named empties what sat under the keys and leaves
+    /// the keys themselves, which are not complete and were never named.
+    #[test]
+    fn releasing_a_record_codomain_keeps_the_keys_above_it() {
+        let mut tile = record_between_levels(
+            &[(0, Some(1), &[(100, 10)]), (1, Some(2), &[(200, 20)])],
+            Predicate::False,
+            Predicate::False,
+        );
+        let guard = tile.to_guard();
+        tile.remove_guarded(guard);
+        tile.compact();
+
+        let Tile::Function { domain, .. } = &tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        assert_eq!(domain.len(), 2, "the unsettled keys stay: {domain:?}");
+        assert_eq!(
+            record_fields(&tile),
+            (vec![], vec![], vec![]),
+            "everything the guard named is gone"
+        );
+    }
+
+    /// A key re-stated to extend the collection under its record grows that collection,
+    /// exactly as it would with no record in the way. The record's scalar field stands one
+    /// value per key and has nothing to join, so the repeat leaves it alone.
+    #[test]
+    fn a_regrown_key_joins_the_collection_inside_its_record() {
+        let mut tile = record_between_levels(
+            &[(0, Some(7), &[(100, 10)])],
+            Predicate::False,
+            Predicate::False,
+        );
+        tile.merge(record_between_levels(
+            &[(0, None, &[(200, 20)])],
+            Predicate::False,
+            Predicate::False,
+        ));
+
+        let Tile::Function { domain, .. } = &tile else {
+            panic!("expected a collection, got {tile:?}");
+        };
+        assert_eq!(
+            domain.len(),
+            1,
+            "the repeat is one key that grew: {domain:?}"
+        );
+        assert_eq!(
+            record_fields(&tile),
+            (
+                vec![Value::Int(7)],
+                vec![Value::UInt(100), Value::UInt(200)],
+                vec![Value::Int(10), Value::Int(20)]
+            ),
+            "both deliveries' entries sit in the one group, over the one scalar value"
+        );
+    }
+
+    /// The other half of that rule: a repeat that re-states the scalar beside the grown
+    /// collection has delivered one position twice, and there is no answer for which value
+    /// stands. `join_rows` says so rather than picking.
+    #[test]
+    #[should_panic(expected = "restates a scalar beside it")]
+    fn a_regrown_key_may_not_restate_the_scalar_beside_it() {
+        let mut tile = record_between_levels(
+            &[(0, Some(7), &[(100, 10)])],
+            Predicate::False,
+            Predicate::False,
+        );
+        tile.merge(record_between_levels(
+            &[(0, Some(9), &[(200, 20)])],
+            Predicate::False,
+            Predicate::False,
+        ));
+    }
+
+    /// Compaction reaches a level held inside a record: a key released there is gone
+    /// afterwards, so the next delivery of it replaces the group rather than landing
+    /// beside it.
+    #[test]
+    fn compacting_reaches_a_level_inside_a_record() {
+        let mut tile = record_between_levels(
+            &[(0, Some(7), &[(100, 10), (200, 20)])],
+            Predicate::False,
+            Predicate::True,
+        );
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Record(HashMap::from([
+                ("n".to_string(), TileGuard::Scalar(false)),
+                (
+                    "xs".to_string(),
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(
+                        100,
+                    )))),
+                ),
+            ])),
+        ))));
+        tile.compact();
+
+        assert_eq!(
+            record_fields(&tile),
+            (
+                vec![Value::Int(7)],
+                vec![Value::UInt(200)],
+                vec![Value::Int(20)]
+            ),
+            "the released inner key is physically gone"
+        );
+    }
+
+    /// A record ends the chain and is the element, so the collection inside one of its
+    /// fields does not extend the chain: the innermost level is the one the record sits
+    /// under. An operator folding `K ⤇ J ⤇ {a: Int, b: (L ⤇ Int)}` folds `J`'s records,
+    /// and `L` is inside the element it folds.
+    #[test]
+    fn a_record_ends_the_chain_and_is_the_element() {
+        assert_eq!(
+            record_between_levels(
+                &[(0, Some(1), &[(100, 10)])],
+                Predicate::False,
+                Predicate::False
+            )
+            .innermost_depth(),
+            Some(0),
+            "the record is `K`'s element, so `K` is the innermost level"
+        );
+        let nested = Tile::function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(record_between_levels(
+                &[(0, Some(1), &[(100, 10)])],
+                Predicate::False,
+                Predicate::False,
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert_eq!(
+            nested.innermost_depth(),
+            Some(1),
+            "a level above it makes that level the innermost, not the record's field"
+        );
+    }
+
+    /// What can still grow looks through a record and stops at an aggregation. A record is
+    /// its fields over the same rows, so a collection in one is a level under the record's
+    /// keys; an aggregation carries `terminal` and answers for itself.
+    #[test]
+    fn holds_a_level_looks_through_a_record_and_stops_at_an_aggregation() {
+        let collection = Tile::function(
+            ColumnValue::from_uints(vec![100]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert!(
+            Tile::Record(HashMap::from([
+                ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                ("b".to_string(), collection.clone()),
+            ]))
+            .holds_a_level(),
+            "a collection in a record's field is a level under the record"
+        );
+        assert!(
+            !Tile::Record(HashMap::from([(
+                "a".to_string(),
+                Tile::Scalar(ColumnValue::Ints(vec![1]))
+            )]))
+            .holds_a_level(),
+            "a record of scalars holds nothing that grows"
+        );
+        assert!(
+            !Tile::Aggregation {
+                kind: AggregateKind::Sole,
+                accumulator: Box::new(collection),
+                terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
+            }
+            .holds_a_level(),
+            "an aggregation carries its own completeness, so it answers for what it holds"
+        );
+    }
     /// A release names the level it is about, and what it names is physically gone after
     /// a compaction. For a nested collection that level is **below** the top, so
     /// compacting has to reach it — otherwise the key stays present-but-deleted, and the
@@ -1388,30 +2051,14 @@ mod tests {
         )
     }
 
-    /// A record component may hold **a collection per row** rather than a value per row.
-    ///
-    /// The component restates the rows it sits under as its own outermost level, so each row
-    /// keys a group of its own. That is the shape a product value takes inside a codomain,
-    /// and the alternative — one boxed map per cell — is what it exists to avoid.
+    /// The two-row case of [`record_between_levels`], named for what it is about: a
+    /// component holding a collection per row. Row 0 holds `[1, 2]`, row 1 holds `[3]`,
+    /// and the inner keys repeat across rows because each row keys a group of its own.
     fn rows_with_a_collection_component() -> Tile {
-        Tile::function(
-            ColumnValue::UInts(vec![0, 1]),
-            Box::new(Tile::Record(HashMap::from([
-                ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![5, 7]))),
-                (
-                    "xs".to_string(),
-                    // Row 0 holds [1, 2]; row 1 holds [3].
-                    Tile::grouped(
-                        ColumnValue::UInts(vec![0, 2]),
-                        ColumnValue::UInts(vec![0, 1, 0]),
-                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-                        Predicate::False,
-                        BitSet::new(),
-                    ),
-                ),
-            ]))),
+        record_between_levels(
+            &[(0, Some(5), &[(0, 1), (1, 2)]), (1, Some(7), &[(0, 3)])],
             Predicate::True,
-            BitSet::new(),
+            Predicate::False,
         )
     }
 
@@ -1441,13 +2088,13 @@ mod tests {
         assert!(!validate_tile(&mismatched));
     }
 
-    /// Retaining a row takes that row's whole group out of a collection component, rather
-    /// than reading the row mask as a mask over the component's entries.
+    /// Retaining a key takes that key's whole group out of a collection component, rather
+    /// than reading the key mask as a mask over the component's entries. The rows the
+    /// component sits over are this collection's own keys, which is why a key mask reaches
+    /// it at all.
     #[test]
-    fn retaining_a_row_takes_its_group_from_a_collection_component() {
+    fn retaining_a_key_takes_its_group_from_a_collection_component() {
         let mut tile = rows_with_a_collection_component();
-        // Keep row 0, drop row 1 — the rows the component sits over are this collection's
-        // own keys.
         tile.retain_keys(&BitVec::from_fn(2, |i| i == 0));
         let Tile::Function { codomain, .. } = &tile else {
             unreachable!()
@@ -2062,8 +2709,18 @@ mod tests {
         let guard = tile.to_guard();
         tile.remove_guarded(guard.clone());
         assert_eq!(tile.to_guard(), guard);
-        // All entries are logically deleted.
-        assert!(tile.is_empty());
+        // Emptiness is per level, which is the distinction a collection's own keys make.
+        // The inner level is empty: every entry it holds is logically deleted. The outer
+        // is not: the guard never named its keys, because nothing says their groups are
+        // complete, and a collection that still knows its keys still knows something.
+        let Tile::Function { codomain, .. } = &tile else {
+            unreachable!("a collection stays a collection")
+        };
+        assert!(
+            codomain.is_empty(),
+            "every entry is logically deleted: {codomain:?}"
+        );
+        assert!(!tile.is_empty(), "the outer keys are still data: {tile:?}");
     }
 
     // ── Tile::retain_keys ─────────────────────────────────────────────────────

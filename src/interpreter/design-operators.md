@@ -40,7 +40,7 @@ Each `TileOperator` declares a `Tiling` that tells consumers what structure to e
 |---------|---------|
 | `Scalar(Extent)` | A single value, possibly still unknown (represented as an empty `ColumnValue`). |
 | `Record(fields)` | A named collection of sub-tilings, one per field. The tiles are records with fields that are the tiles of the sub-tilings |
-| `Function { keys, values }` | A collection `keys ⤇ values` — one new dimension over the rows it sits in. `values` is a tiling in its own right, so a chain of them nests one node per level and a `Record` may sit between two. Keys accumulate incrementally, and a `domain_predicate` on the tile says which of them are complete. The runtime layout is in the `Tile` table below. |
+| `Function { domain, codomain }` | A collection `domain ⤇ codomain` — one new dimension over the rows it sits in. `codomain` is a tiling in its own right, so a chain of them nests one node per level and a `Record` may sit between two. Keys accumulate incrementally, and a `domain_predicate` on the tile says which of them are complete. The runtime layout is in the `Tile` table below. |
 | `Aggregation { accumulator }` | An ongoing aggregate with scalar accumulator type. |
 
 `Tiling::extent()` converts a `Tiling` to the corresponding `Extent` (the type-level view).
@@ -56,7 +56,7 @@ A `Tile` holds the actual data. Its shape mirrors its `Tiling`:
 |---------|----------|
 | `Scalar(ColumnValue)` |  The two tiles in this tiling are `⊥` and the specific scalar of the tiling. `⊥` is represented as an empty `ColumnValue` and the scalar is represented as a `ColumnValue` of length 1 |
 | `Record(fields)` | A Record of other `Tiles` |
-| `Function { row_starts, keys, values, domain_predicate, deleted }` | A tile is a value of type `T` vectorized over `R` rows: `R` is 1 for the tile as a whole, and inside a collection's `values` it is that collection's key count. A collection is the rule that introduces a dimension — `row_starts` has one entry per ambient row naming where that row's run of `keys` begins, and `values` is a tile over those keys. Compressed-Sparse-Row-wise: every row's keys run together in one column, so a chain of collections holds the columns a flat level list would, and unlike a flat list it can say where a `Record` sits between two levels. |
+| `Function { row_starts, domain, codomain, domain_predicate, deleted }` | A tile is a value of type `T` vectorized over `R` rows: `R` is 1 for the tile as a whole, and inside a collection's `codomain` it is that collection's key count. A collection is the rule that introduces a dimension — `row_starts` has one entry per ambient row naming where that row's run of `domain` begins, and `codomain` is a tile over those keys. Compressed-Sparse-Row-wise: every row's keys run together in one column, so a chain of collections holds the columns a flat level list would, and unlike a flat list it can say where a `Record` sits between two levels. |
 | `Aggregation { accumulator, terminal }` | Logically, this tiling knows the final number of inputs `N` that will be aggregated and the tiles are of form `(count, accumulator)`.  However, for making this feasible to compute, we instead store a terminal flag indicating `count == N`. |
 
 `Tile::is_terminal()` returns true when a tile carries complete, final data. No larger tiles will ever be returned, although
@@ -64,16 +64,23 @@ equivalent tiles with some data released may.
 
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
+A merge **extends** a collection, so a key it already holds is a group that grew rather than a
+second key, and the level below gains the new elements (`collapse_grown_groups`). A record
+between the two levels grows the same way: its fields stand over the keys the record does, so
+each is joined over the rows the key held — a collection field by its runs, a scalar field by
+having nothing to join. A scalar holds one value per key, so a regrown key that re-states one
+has delivered a position twice, which the release contract forbids and `join_rows` reports.
+
 Tiles representing collections (`Function`) support logical deletes by storing a `BitSet` of deleted values.  These are set by filteriing operator like `Restrict` and compacted away by
 stateful operators like `Memo` and aggregation. A `Function` carries **one set per domain
 level**, so a bit names a position in that level's own column and a removed group and a removed
 entry are different bits rather than one bit read two ways. Every producer today removes at the
-innermost level, a group going by way of its entries, which is where `Tile::retain` reads.
+innermost level, a group going by way of its entries, which is where `Tile::retain_rows` reads.
 
 An empty group and a removed one are different tiles. The offsets are non-decreasing, so two equal
 starts are a key whose group holds nothing, and an aggregate over it folds to the aggregate's
 identity; a removed key is marked in `deleted` at its own level and taken, with its subtree, by
-`Tile::compact`. `Tile::retain` produces the first and never the second.
+`Tile::compact`. `Tile::retain_rows` produces the first and never the second.
 
 ### TileGuard
 
@@ -110,6 +117,20 @@ Refines interest in a `Function` tiling:
 Against a `Function` the two compose into a level reference: `Domain` names the outermost
 level, and each enclosing `Codomain` steps one level in, so a tile of 𝑛 levels names its innermost
 under 𝑛−1 wrappers (`Tile::to_guard`, `guard_level`).
+
+A `Record` between two levels is a level reference too, not a leaf. Its fields stand over the
+keys the record does, so a collection in one of them is a level under those keys, and a
+`Codomain` naming a record carries a `Record` guard whose fields are read the same way. A key
+is released once every field under it is complete, so a scalar field beside a still-growing
+collection holds the key.
+
+Two questions about a codomain read alike and differ at a record. *Does the chain continue?*
+is `Tile::is_function`: a record ends the chain and is the element, so `MapAggregate` over
+`𝐾 ⤇ 𝐽 ⤇ {a: Int, b: (𝐿 ⤇ Int)}` folds `𝐽`'s records and `𝐿` sits inside the element it
+folds. *Can what this holds still grow?* is `Tile::holds_a_level`, which looks through a record
+because a collection in a field grows under the key the record stands on. Guards, the merge's
+regrown-key fixup, and every operator that treats a codomain as flat columns ask the second;
+the chain walks ask the first.
 
 "Interested in everything" and "interested in nothing" are not separate variants — they are the trivial/degenerate guards, recognized via `is_universal()` / `is_empty()` (an empty guard is the annihilator under `intersect`).
 

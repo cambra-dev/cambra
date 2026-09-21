@@ -136,7 +136,7 @@ pub(super) fn insert_iterate_recurse(
     // Read before the match takes `expr.node` mutably. A `Data` domain is one the
     // runtime sweeps, which is what makes a node an iteration site rather than a
     // morphism waiting for an input.
-    let is_function = matches!(
+    let is_collection = matches!(
         &expr.ty,
         Type::Fun {
             fun_kind: crate::ccl::ty::FunKind::Data(..),
@@ -202,7 +202,9 @@ pub(super) fn insert_iterate_recurse(
         // [`FunKind`](crate::ccl::ty::FunKind) is exactly that distinction, so ask
         // it: a `Data` domain is one the runtime sweeps, which is what an
         // iteration site is.
-        TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands) if is_function => {
+        TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands)
+            if is_collection =>
+        {
             for operand in operands.iter_mut() {
                 wrap_with_iterate(operand, discharged, "copair-operand");
             }

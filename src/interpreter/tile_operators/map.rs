@@ -401,19 +401,12 @@ impl TileProducer for MapResultProducer {
             };
             // The key path of every argument, so a withheld one can name the outermost key
             // that owns it: a key with a row still to come is not answered whole, whatever
-            // depth that row sits at.
-            let mut node = &input_tile;
-            let mut paths = vec![Vec::new()];
-            loop {
-                paths = node.key_paths(&paths);
-                let Tile::Function { codomain, .. } = node else {
-                    unreachable!("the loop only descends into a collection")
-                };
-                if !codomain.is_function() {
-                    break;
-                }
-                node = codomain;
-            }
+            // depth that row sits at. The arguments are the innermost level's keys, so
+            // their paths are the rows one level further in.
+            let innermost = input_tile
+                .innermost_depth()
+                .unwrap_or_else(|| unreachable!("the input was matched as a collection"));
+            let paths = input_tile.row_paths_at(innermost + 1);
             let domain_extent = i_tiling.domain_extent().unwrap();
             let mut keep = bit_vec::BitVec::from_elem(arguments.len(), true);
             let mut withheld = ColumnValue::from_values(Vec::new(), &domain_extent);

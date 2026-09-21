@@ -128,7 +128,7 @@ impl UnionOperator {
             other => return other,
         };
         // A nest is not the shape a flat merge reassembles; hand it back untouched.
-        if codomain.as_ref().is_function() {
+        if codomain.as_ref().holds_a_level() {
             return Tiling::Function { domain, codomain };
         }
         let mut arms = match domain {
@@ -201,7 +201,7 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
             panic!("flat_merge: expected a collection arm, got {tile:?}");
         };
         assert!(
-            !codomain.is_function(),
+            !codomain.holds_a_level(),
             "flat_merge interleaves arms by key, which names one level"
         );
         if i == 0 {
@@ -385,7 +385,7 @@ impl TileProducer for UnionProducer {
                     ..
                 } => {
                     assert!(
-                        !codomain.is_function(),
+                        !codomain.holds_a_level(),
                         "a union concatenates arms into one domain, which names one level"
                     );
                     // Shift each deleted index into the combined domain's position space.

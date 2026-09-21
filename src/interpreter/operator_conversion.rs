@@ -4522,6 +4522,10 @@ fn result_extent(tiling: &Tiling) -> Extent {
         // descent stops at a `Scalar`, so a materialized collection — one cell holding a
         // whole map — is itself the result.
         Tiling::Function { codomain, .. } => result_extent(codomain),
+        // A fold's result is what it accumulates, so the descent goes on through it rather
+        // than stopping: an operation over a not-yet-extracted aggregation is typed at the
+        // accumulator, and `Sole`'s accumulator is an element with levels of its own.
+        Tiling::Aggregation { accumulator, .. } => result_extent(accumulator),
         t => panic!("unexpected tiling in result_extent: {t:?}"),
     }
 }
