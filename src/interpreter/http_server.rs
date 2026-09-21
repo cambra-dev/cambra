@@ -432,7 +432,6 @@ impl DataSink for HttpServerSharedState {
             debug!("HttpServerSharedState::process: expected a collection, got {tile:?}");
             return;
         };
-        let removed = deleted;
         let ColumnValue::UInts(indices) = domain else {
             debug!("HttpServerSharedState::process: expected UInt keys, got {domain:?}");
             return;
@@ -452,7 +451,7 @@ impl DataSink for HttpServerSharedState {
                 .zip(responses.iter())
                 .enumerate()
                 .filter_map(|(j, (idx, body))| {
-                    if removed.contains(j) {
+                    if deleted.contains(j) {
                         return None;
                     }
                     pending.remove(idx).map(|req| (req, body.clone()))

@@ -972,7 +972,7 @@ fn an_exact_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expec
 /// A binop over **two projections of one grouped row** — the shape that pins a fan-in's
 /// pairing depth.
 ///
-/// Its arms are both `String ⇦ [0,2] ⇦ Int`: identical below the grouping, so nothing about
+/// Its arms are both `String ⤇ [0,2] ⤇ Int`: identical below the grouping, so nothing about
 /// them says whether the pair belongs at the group or at the row. It belongs at the row,
 /// which is where they were applied, and only the ambient iteration says so. Collapsing the
 /// two function tilings into one nesting variant is what took that away: the sealed and

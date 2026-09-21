@@ -249,6 +249,31 @@ impl Tile {
 
     /// `merge`, knowing whether this tile is the whole value or sits under one.
     fn merge_part(&mut self, other: Tile, whole: bool) {
+        // A collection merges **by key**: the two sides' runs are matched per row and the
+        // values follow the keys. A key both sides delivered is one key whose group is the
+        // two groups merged, which is what makes this more than a concatenation — and what
+        // keeps every intermediate a well-formed tile, so nothing downstream ever reads a
+        // level holding one key twice.
+        if self.is_function() && other.is_function() {
+            let order = if whole {
+                // One row, and both describe it.
+                assert_eq!(self.rows(), 1, "a whole collection is its one row's group");
+                assert_eq!(other.rows(), 1, "a whole collection is its one row's group");
+                vec![RowSource::Both(0, 0)]
+            } else {
+                // New rows, which no key of a row already here can collide with.
+                (0..self.rows())
+                    .map(RowSource::Left)
+                    .chain((0..other.rows()).map(RowSource::Right))
+                    .collect()
+            };
+            *self = merged_rows(self, &other, &order);
+            debug_assert!(
+                !whole || validate_tile(self),
+                "Invalid tile after merge: {self:?}"
+            );
+            return;
+        }
         match (&mut *self, other) {
             // Append: handles both "unknown → known" (empty + non-empty) and the vectorized
             // case where a scalar holds one value per row.
@@ -269,44 +294,6 @@ impl Tile {
                 s_kind.accumulate(s_acc, &o_acc, 0, o_acc.rows());
                 let taken = std::mem::replace(s_term, ColumnValue::Units(0));
                 *s_term = apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), taken, &o_term);
-            }
-            (
-                Tile::Function {
-                    row_starts: s_starts,
-                    domain: s_domain,
-                    codomain: s_codomain,
-                    domain_predicate: s_pred,
-                    deleted: s_deleted,
-                },
-                Tile::Function {
-                    row_starts: o_starts,
-                    domain: o_domain,
-                    codomain: o_codomain,
-                    domain_predicate: o_pred,
-                    deleted: o_deleted,
-                },
-            ) => {
-                let seen = s_domain.len();
-                if whole {
-                    // One row, and both describe it: the keys run together.
-                    assert_eq!(
-                        s_starts.len(),
-                        1,
-                        "a whole collection is its one row's group"
-                    );
-                } else {
-                    // New rows, each starting past the keys already here.
-                    let mut shifted = o_starts;
-                    shifted.for_each_uint(|u| *u += seen);
-                    s_starts.append(shifted);
-                }
-                s_domain.append(o_domain);
-                s_codomain.merge_part(*o_codomain, false);
-                *s_pred = s_pred.union(&o_pred);
-                for key in o_deleted.iter() {
-                    s_deleted.insert(key + seen);
-                }
-                collapse_grown_groups(s_starts, s_domain, s_codomain, s_deleted);
             }
             // A record's fields are whole exactly when the record is: a record of whole
             // values merges field by whole field, and one sitting under a collection merges
@@ -1046,6 +1033,248 @@ pub fn nest_levels(
     built
 }
 
+/// Where one row of a merge's result comes from.
+///
+/// A merge reconciles two views of one value, so a row of the result is a row of the left
+/// view, a row of the right, or one row both of them delivered. That last case is what
+/// makes a merge more than a concatenation: the two contributions join.
+#[derive(Clone, Copy, Debug)]
+enum RowSource {
+    Left(usize),
+    Right(usize),
+    Both(usize, usize),
+}
+
+/// `left` and `right` standing over the rows `order` names, each row taking its content
+/// from whichever side delivered it.
+///
+/// The whole of a merge, at every level. A collection matches its two key runs per row and
+/// recurses into the matched groups, so a key both sides delivered becomes one key whose
+/// group is the two groups merged. Nothing is appended and then repaired, which is what
+/// lets every intermediate satisfy [`valid_over`]: there is no point at which a level holds
+/// a key twice, and no fixup pass to leave a record's fields disagreeing about their rows.
+fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
+    match (left, right) {
+        (Tile::Scalar(l), Tile::Scalar(r)) => Tile::Scalar(merged_column(l, r, order)),
+        (Tile::Record(l), Tile::Record(r)) => {
+            assert_eq!(l.len(), r.len(), "a record merges with its own shape");
+            Tile::Record(
+                l.iter()
+                    .map(|(field, tile)| {
+                        let other = r
+                            .get(field)
+                            .unwrap_or_else(|| panic!("Record missing field {field}"));
+                        (field.clone(), merged_rows(tile, other, order))
+                    })
+                    .collect(),
+            )
+        }
+        (
+            Tile::Function {
+                row_starts: l_starts,
+                domain: l_domain,
+                codomain: l_codomain,
+                domain_predicate: l_pred,
+                deleted: l_deleted,
+            },
+            Tile::Function {
+                row_starts: r_starts,
+                domain: r_domain,
+                codomain: r_codomain,
+                domain_predicate: r_pred,
+                deleted: r_deleted,
+            },
+        ) => {
+            let l_offsets = level_offsets(l_starts);
+            let r_offsets = level_offsets(r_starts);
+            // One entry per key of the result, naming which side's key column holds it.
+            // The rows of the level below are this level's keys, so the same list is what
+            // merges them.
+            let mut starts = Vec::with_capacity(order.len());
+            let mut keys: Vec<RowSource> = Vec::new();
+            for source in order {
+                starts.push(keys.len());
+                match source {
+                    RowSource::Left(row) => {
+                        let (from, to) = level_run(l_offsets, *row, l_domain.len());
+                        keys.extend((from..to).map(RowSource::Left));
+                    }
+                    RowSource::Right(row) => {
+                        let (from, to) = level_run(r_offsets, *row, r_domain.len());
+                        keys.extend((from..to).map(RowSource::Right));
+                    }
+                    RowSource::Both(l_row, r_row) => {
+                        let (l_from, l_to) = level_run(l_offsets, *l_row, l_domain.len());
+                        let (r_from, r_to) = level_run(r_offsets, *r_row, r_domain.len());
+                        // A key grows only where what it holds can. Under a scalar a
+                        // repeated key is one position delivered twice, so the two stay
+                        // apart for `validate_tile` to report: matching them would turn a
+                        // duplicate delivery into a silently lost value.
+                        if l_codomain.holds_a_level() {
+                            keys.extend(matched_keys(
+                                l_domain,
+                                l_from..l_to,
+                                r_domain,
+                                r_from..r_to,
+                            ));
+                        } else {
+                            keys.extend((l_from..l_to).map(RowSource::Left));
+                            keys.extend((r_from..r_to).map(RowSource::Right));
+                        }
+                    }
+                }
+            }
+            // A key a merge names sits in one of the two key columns, so picking it is a
+            // gather out of the two run together. A key both sides delivered is one key,
+            // and the two spellings are equal, so either serves.
+            let mut combined = l_domain.clone();
+            combined.append(r_domain.clone());
+            let offset = l_domain.len();
+            let picked: Vec<usize> = keys
+                .iter()
+                .map(|key| match key {
+                    RowSource::Left(i) | RowSource::Both(i, _) => *i,
+                    RowSource::Right(j) => offset + j,
+                })
+                .collect();
+            // A key is removed when every side that delivered it had removed it: one side
+            // still holding it is a key the consumer has not taken.
+            let deleted: BitSet = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| match key {
+                    RowSource::Left(i) => l_deleted.contains(*i),
+                    RowSource::Right(j) => r_deleted.contains(*j),
+                    RowSource::Both(i, j) => l_deleted.contains(*i) && r_deleted.contains(*j),
+                })
+                .map(|(at, _)| at)
+                .collect();
+            Tile::Function {
+                row_starts: ColumnValue::UInts(starts),
+                domain: combined.select_indices(picked.iter().copied(), picked.len()),
+                codomain: Box::new(merged_rows(l_codomain, r_codomain, &keys)),
+                domain_predicate: l_pred.union(r_pred),
+                deleted,
+            }
+        }
+        // An aggregation and a store carry their own completeness rather than standing over
+        // keys, so a row both sides deliver would have to be combined here rather than
+        // picked — which is the aggregate's own accumulate law and the store's merge, and
+        // is not written because no producer grows a key over either.
+        (Tile::Aggregation { .. }, Tile::Aggregation { .. })
+        | (Tile::Store { .. }, Tile::Store { .. }) => {
+            if !order
+                .iter()
+                .any(|source| matches!(source, RowSource::Both(..)))
+            {
+                return gathered_rows(left, right, order);
+            }
+            assert_eq!(
+                order.len(),
+                1,
+                "a row both sides deliver is combined by that value's own law — the \
+                 aggregate's accumulate, the store's merge — which reaches here only at \
+                 the whole value"
+            );
+            let mut taken = left.clone();
+            taken.merge_part(right.clone(), true);
+            taken
+        }
+        (l, r) => panic!("Incompatible tiles {l:?} and {r:?}"),
+    }
+}
+
+/// The rows `order` names, taken from whichever side holds each, with no combining — for
+/// the tiles whose rows are picked rather than merged.
+fn gathered_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
+    let l_rows: Vec<usize> = order
+        .iter()
+        .filter_map(|source| match source {
+            RowSource::Left(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    let r_rows: Vec<usize> = order
+        .iter()
+        .filter_map(|source| match source {
+            RowSource::Right(j) => Some(*j),
+            _ => None,
+        })
+        .collect();
+    if r_rows.is_empty() {
+        return left.select_rows(&l_rows);
+    }
+    if l_rows.is_empty() {
+        return right.select_rows(&r_rows);
+    }
+    let mut taken = left.select_rows(&l_rows);
+    taken.merge_part(right.select_rows(&r_rows), false);
+    taken
+}
+
+/// One column over the rows `order` names.
+///
+/// A column is empty or holds one value per row ([`valid_over`]), so a row both sides name
+/// is carried by at most one of them: the other delivered that row to grow what sits beside
+/// it in the record and left this column alone. Both carrying it is one position delivered
+/// twice, which the release contract forbids and for which there is no answer.
+fn merged_column(left: &ColumnValue, right: &ColumnValue, order: &[RowSource]) -> ColumnValue {
+    if left.is_empty() && right.is_empty() {
+        return left.clone();
+    }
+    let mut combined = left.clone();
+    combined.append(right.clone());
+    let offset = left.len();
+    // A row whose side carries no column contributes no value, which leaves the result
+    // short — the state `valid_over` reports rather than one this can repair.
+    let picked: Vec<usize> = order
+        .iter()
+        .filter_map(|source| match source {
+            RowSource::Left(i) => (!left.is_empty()).then_some(*i),
+            RowSource::Right(j) => (!right.is_empty()).then_some(offset + j),
+            RowSource::Both(i, j) => match (left.is_empty(), right.is_empty()) {
+                (false, true) => Some(*i),
+                (true, false) => Some(offset + j),
+                (true, true) => None,
+                (false, false) => panic!(
+                    "a regrown key restates a scalar beside it, which the release contract \
+                     forbids: {left:?} and {right:?}"
+                ),
+            },
+        })
+        .collect();
+    combined.select_indices(picked.iter().copied(), picked.len())
+}
+
+/// Two rows' key runs matched into the one run they describe.
+///
+/// The left run's order is kept and the keys only it holds stay where they are, because a
+/// merge **extends** what is already there; the right run's new keys follow. Keys are
+/// unique within a row ([`valid_over`]), so each matches at most one key on the other side
+/// and no ordering between the two runs is assumed — a producer that re-states an enclosing
+/// key delivers its runs interleaved rather than abutting.
+fn matched_keys(
+    l_domain: &ColumnValue,
+    l_run: std::ops::Range<usize>,
+    r_domain: &ColumnValue,
+    r_run: std::ops::Range<usize>,
+) -> Vec<RowSource> {
+    let right: HashMap<Value, usize> = r_run.clone().map(|j| (r_domain.index_at(j), j)).collect();
+    let mut matched: HashSet<usize> = HashSet::new();
+    let mut out = Vec::with_capacity(l_run.len() + r_run.len());
+    for i in l_run {
+        match right.get(&l_domain.index_at(i)) {
+            Some(j) => {
+                matched.insert(*j);
+                out.push(RowSource::Both(i, *j));
+            }
+            None => out.push(RowSource::Left(i)),
+        }
+    }
+    out.extend(r_run.filter(|j| !matched.contains(j)).map(RowSource::Right));
+    out
+}
+
 /// Whether `tile` is well formed as a whole value.
 ///
 /// Nothing pins the row count at the top level: a tile there carries its own rows, as a
@@ -1065,118 +1294,6 @@ pub fn validate_tile(tile: &Tile) -> bool {
         } => accumulator.rows() == terminal.len(),
         Tile::Function { row_starts, .. } => valid_over(tile, row_starts.len()),
         Tile::Store { .. } => valid_over(tile, 1),
-    }
-}
-
-/// Collapse a run of equal keys in one row into the single key it is.
-///
-/// A merge **extends** a collection, so a key it already holds is a group that grew
-/// rather than a second key: a collection delivered a row at a time re-states the row it
-/// is adding to, and the level below gains the new elements. Appending the key again
-/// would leave the level with a repeated key, which no collection admits
-/// ([`valid_over`]) and which a lookup inside the row would only find the first run of.
-///
-/// Only a level holding a further level can grow this way. Where it holds none, a repeated
-/// key is one position delivered twice — a release-contract violation rather than growth
-/// — and it is left alone so `valid_over` reports it.
-///
-/// A record between the two levels grows like any other: [`join_rows`] joins each field
-/// over the rows the key held, the collection fields by their runs and the scalar ones by
-/// having nothing to join.
-///
-/// The keys of one row run together and a row grows at its end, so a repeat is adjacent
-/// to what it extends; a repeat that is not is a collection whose rows interleave, which
-/// no producer emits.
-fn collapse_grown_groups(
-    row_starts: &mut ColumnValue,
-    domain: &mut ColumnValue,
-    codomain: &mut Tile,
-    deleted: &mut BitSet,
-) {
-    if !codomain.holds_a_level() {
-        return;
-    }
-    let ColumnValue::UInts(starts) = row_starts else {
-        return;
-    };
-    let boundaries: HashSet<usize> = starts.iter().copied().collect();
-    let grown: Vec<usize> = (1..domain.len())
-        .filter(|i| !boundaries.contains(i) && domain.index_at(*i) == domain.index_at(i - 1))
-        .collect();
-    if grown.is_empty() {
-        return;
-    }
-    let dropped: HashSet<usize> = grown.iter().copied().collect();
-    debug_assert!(
-        (1..domain.len()).all(|i| dropped.contains(&i)
-            || boundaries.contains(&i)
-            || (0..i).all(|j| dropped.contains(&j) || domain.index_at(j) != domain.index_at(i))),
-        "a key repeats a row's earlier key without extending it, so the rows interleave: \
-         {domain:?}"
-    );
-    // Each dropped key's group joins the one before it, which is the row of `codomain` just
-    // before: dropping that row's start is what joins the two runs, and the elements
-    // themselves do not move.
-    join_rows(codomain, &dropped, domain.len() - grown.len());
-    let keep: BitVec = (0..domain.len()).map(|i| !dropped.contains(&i)).collect();
-    domain.retain(&keep);
-    // This level's own row starts count keys, so each one drops by the repeats before it.
-    let ColumnValue::UInts(starts) = row_starts else {
-        unreachable!("checked above")
-    };
-    for start in starts.iter_mut() {
-        *start -= grown.iter().filter(|d| **d < *start).count();
-    }
-    let shifted: BitSet = deleted
-        .iter()
-        .filter(|k| !dropped.contains(k))
-        .map(|k| k - grown.iter().filter(|d| **d < k).count())
-        .collect();
-    *deleted = shifted;
-}
-
-/// Join each row `dropped` names into the row before it, which is what a level's regrown
-/// key does to the values standing under it.
-///
-/// Per level, because the rows stand where that level's keys did: a collection drops the
-/// row start that separated the two runs, and a record does it field by field, its fields
-/// standing over the same rows. A scalar holds one value per row and has nothing to join —
-/// a regrown key must not restate it, which is the release contract, so the only state
-/// consistent with growth is that the repeat never carried it.
-///
-/// **Joining two rows can grow a key one level further down**, so a collection re-collapses
-/// after it joins. Two keys that repeat were distinct while they sat in different rows, and
-/// [`collapse_grown_groups`] running under the merge saw them that way; the repeat only
-/// exists once this join puts them in one row. The recursion ends at the level whose values
-/// hold none.
-fn join_rows(codomain: &mut Tile, dropped: &HashSet<usize>, rows_after: usize) {
-    match codomain {
-        Tile::Function {
-            row_starts,
-            domain,
-            codomain,
-            deleted,
-            ..
-        } => {
-            let keep: BitVec = (0..row_starts.len())
-                .map(|i| !dropped.contains(&i))
-                .collect();
-            row_starts.retain(&keep);
-            collapse_grown_groups(row_starts, domain, codomain, deleted);
-        }
-        Tile::Record(fields) => fields
-            .values_mut()
-            .for_each(|field| join_rows(field, dropped, rows_after)),
-        Tile::Scalar(cv) => assert!(
-            cv.is_empty() || cv.len() == rows_after,
-            "a regrown key restates a scalar beside it, which the release contract forbids: \
-             {} values over {rows_after} keys",
-            cv.len()
-        ),
-        // An aggregation under a regrown key would be two accumulators for one key, which
-        // is `AggregateKind::accumulate`'s job and not written here because no producer
-        // regrows a key over one; a store is a whole value and never stands under a key.
-        other => todo!("joining {other:?} under a regrown key"),
     }
 }
 

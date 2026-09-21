@@ -65,11 +65,13 @@ equivalent tiles with some data released may.
 `Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
 
 A merge **extends** a collection, so a key it already holds is a group that grew rather than a
-second key, and the level below gains the new elements (`collapse_grown_groups`). A record
-between the two levels grows the same way: its fields stand over the keys the record does, so
-each is joined over the rows the key held — a collection field by its runs, a scalar field by
-having nothing to join. A scalar holds one value per key, so a regrown key that re-states one
-has delivered a position twice, which the release contract forbids and `join_rows` reports.
+second key. The two sides' key runs are matched per row and the matched groups merged
+(`merged_rows`), so the level below gains the new elements and nothing is appended and then
+repaired. A record between the two levels moves with the keys it stands under, its collection
+fields by their runs and its scalar fields by holding one value per key. A regrown key that
+re-states a scalar has delivered a position twice, which the release contract forbids and
+`merged_column` reports. A key grows only where what it holds can (`Tile::holds_a_level`):
+under a scalar a repeated key stays a repeat, for `validate_tile` to report.
 
 Tiles representing collections (`Function`) support logical deletes by storing a `BitSet` of deleted values.  These are set by filteriing operator like `Restrict` and compacted away by
 stateful operators like `Memo` and aggregation. A `Function` carries **one set per domain
@@ -116,7 +118,7 @@ Refines interest in a `Function` tiling:
 
 Against a `Function` the two compose into a level reference: `Domain` names the outermost
 level, and each enclosing `Codomain` steps one level in, so a tile of 𝑛 levels names its innermost
-under 𝑛−1 wrappers (`Tile::to_guard`, `guard_level`).
+under 𝑛−1 wrappers (`Tile::to_guard`).
 
 A `Record` between two levels is a level reference too, not a leaf. Its fields stand over the
 keys the record does, so a collection in one of them is a level under those keys, and a

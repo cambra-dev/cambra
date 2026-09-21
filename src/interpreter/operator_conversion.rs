@@ -1919,8 +1919,8 @@ fn convert_impl_inner(
         // `map_filter(p)`: filter the inner collections of a partition, per outer
         // key. The fed input is the curried collection, fanned to the value side and
         // the predicate exactly as `filter_values` fans its element stream — the
-        // difference is the shape, `Function` rather than `Function`,
-        // and so the domain the predicate selects on is the inner one.
+        // difference is the depth, a level under a level rather than one level, and
+        // so the domain the predicate selects on is the inner one.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::MapFilter) =>
         {
@@ -4959,7 +4959,7 @@ mod variant_ctor_tests {
         };
         assert_eq!(domain.len(), 1, "one-element scrutinee → one output row");
         let Tile::Scalar(cv) = *codomain else {
-            panic!("expected a Scalar values");
+            panic!("expected a scalar codomain");
         };
         cv.index_at(0)
     }
@@ -5248,7 +5248,7 @@ mod variant_ctor_tests {
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
         let Tile::Record(fields) = *codomain else {
-            panic!("expected a Record values, got {codomain:?}");
+            panic!("expected a record codomain, got {codomain:?}");
         };
         // Each row keeps its own outer `time` (10, 20) paired with its own commit
         // payload (1, 2) — proving the by-key co-iteration.
