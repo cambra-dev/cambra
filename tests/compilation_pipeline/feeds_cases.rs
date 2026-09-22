@@ -448,13 +448,15 @@ fn a_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i6
 /// reaches it, gated on a read-only scan so a program with nothing to erase keeps its
 /// node ids.
 ///
-/// Both halves are pinned: filtering on a value the channel carries, and filtering with a
-/// predicate that names a `let` bound outside the loop, which the erasure has to close
-/// over the same way the main tree's substitution does.
+/// Three shapes are pinned. The first filters on a value the channel carries. The second
+/// names a `let` bound outside the loop, which the erasure has to close over the same way
+/// the main tree's substitution does. The third filters a read that is itself filtered, so
+/// the refinement the eraser enters sits on an already-refined channel domain.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::literal("sum([x for x in out if x > 1])", 2)]
 #[case::names_an_outer_let("sum([x for x in out if x > n])", 2)]
+#[case::over_a_filtered_read("sum([x for x in [y for y in out if y > 0] if x > 1])", 2)]
 fn a_filtered_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i64) {
     let feed = indoc! {r"
         n = 1
@@ -469,7 +471,8 @@ fn a_filtered_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] exp
 /// The same filtered read **bound to a name** before it is consumed. The binding's
 /// declared type is a slot `walk_children_mut` does not reach either, so the erasure
 /// covers the binder slots alongside a node's own type and its annotation; without that
-/// the channel domain survives in the binding's predicate and the strict wall reports it.
+/// the channel domain survives in the binding's predicate and channelize's own
+/// `assert_no_type_residue` reports it.
 #[test]
 fn a_let_bound_filtered_comprehension_reads_a_feed_channel() {
     check_scalar(

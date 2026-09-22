@@ -114,8 +114,8 @@ use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
 use crate::ccl::{
-    BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, Refinement, Type, TypedBinding,
-    TypedExpr, TypedExprNode,
+    BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, PredicateId, Refinement, Type,
+    TypedBinding, TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
     provenance,
@@ -143,24 +143,15 @@ fn is_type_residue(ty: &Type) -> bool {
 
 /// `true` when `ty` carries channelization-erasable residue anywhere in it.
 ///
-/// Refinement **predicates** are walked alongside type structure, because a predicate
-/// holds channel types in its own node slots and [`erase_chan_domains_in_predicates`] is
-/// what erases them. A checker that stopped at the structure would pass a tree its own
-/// eraser is answerable for.
+/// [`slot_holds_type`] is the read-only mirror of [`erase_chan_domains_in_slot`], so the
+/// checker reaches exactly what the eraser is answerable for: type structure and the
+/// refinement predicates hanging off it.
 ///
 /// Debug-only: its sole consumer is the `assert_no_type_residue` invariant
 /// walk (the strict `typecheck` wall is the release-visible enforcement).
 #[cfg(debug_assertions)]
 fn has_type_residue(ty: &Type) -> bool {
-    fn in_structure(ty: &Type) -> bool {
-        if is_type_residue(ty) {
-            return true;
-        }
-        let mut found = false;
-        ty.walk_children(|t| found = found || in_structure(t));
-        found
-    }
-    in_structure(ty) || predicates_hold_type(ty, &is_type_residue)
+    slot_holds_type(ty, &is_type_residue, &mut HashSet::new())
 }
 
 /// Errors that can arise while channelizing `Defer`/`Feed`/`Define` nodes.
@@ -779,8 +770,22 @@ fn erase_chan_domains_in_type(
     changed
 }
 
+/// Whether `ty`'s own structure holds a type satisfying `hit`. Refinement predicates are
+/// not walked, which is the reach of [`erase_chan_domains_in_type`].
+fn structure_holds_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
+    if hit(ty) {
+        return true;
+    }
+    let mut found = false;
+    ty.walk_children(|c| found |= structure_holds_type(c, hit));
+    found
+}
+
 /// Whether any refinement predicate reachable from `ty` holds a type satisfying `hit` in
-/// one of its own node slots, at any depth of that slot.
+/// one of its own node slots. Such a slot is a slot like any other, so a refinement sitting
+/// in one contributes its predicate too, at whatever depth. That re-entry mirrors the one
+/// [`erase_chan_domains_in_predicates`] makes through [`erase_chan_domains_in_slot`], and
+/// `visited` dedups the predicate DAG across it.
 ///
 /// Read-only, and the two things that ask are the eraser and its checker: the gate on
 /// [`erase_chan_domains_in_predicates`] asks for a channel type, and [`has_type_residue`]
@@ -793,26 +798,32 @@ fn erase_chan_domains_in_type(
 /// [`walk_refined_predicates_mut`] because that helper clones before it can ask; a probe
 /// that ran on the shared term first belongs there, and every pass with a conditional
 /// predicate rewrite will want it.
-fn predicates_hold_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
-    fn in_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
-        if hit(ty) {
-            return true;
-        }
+fn predicates_hold_type(
+    ty: &Type,
+    hit: &dyn Fn(&Type) -> bool,
+    visited: &mut HashSet<PredicateId>,
+) -> bool {
+    fn in_expr(e: &Expr, hit: &dyn Fn(&Type) -> bool, visited: &mut HashSet<PredicateId>) -> bool {
         let mut found = false;
-        ty.walk_children(|c| found |= in_type(c, hit));
-        found
-    }
-    fn in_expr(e: &Expr, hit: &dyn Fn(&Type) -> bool) -> bool {
-        let mut found = false;
-        e.walk_type_slots(|t| found |= in_type(t, hit));
-        e.walk_children(|c| found |= in_expr(c, hit));
+        e.walk_type_slots(|t| found |= slot_holds_type(t, hit, visited));
+        e.walk_children(|c| found |= in_expr(c, hit, visited));
         found
     }
     let mut found = false;
-    walk_refined_predicates(ty, &mut HashSet::new(), &mut |pred, _| {
-        found |= in_expr(pred, hit);
+    walk_refined_predicates(ty, visited, &mut |pred, vis| {
+        found |= in_expr(pred, hit, vis);
     });
     found
+}
+
+/// Whether one type slot holds a type satisfying `hit`, structure and refinement predicates
+/// alike. The checker half of [`erase_chan_domains_in_slot`].
+fn slot_holds_type(
+    ty: &Type,
+    hit: &dyn Fn(&Type) -> bool,
+    visited: &mut HashSet<PredicateId>,
+) -> bool {
+    structure_holds_type(ty, hit) || predicates_hold_type(ty, hit, visited)
 }
 
 /// Erase channel types inside `ty`'s refinement **predicates**, which
@@ -825,43 +836,52 @@ fn predicates_hold_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
 /// (`src/ccl/design/type-inference.md`,
 /// "Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)").
 ///
+/// A predicate's own type slots go back through [`erase_chan_domains_in_slot`], so a
+/// refinement sitting in one has its predicate erased too. `walk_refined_predicates_mut`
+/// hands the callback the memo for exactly that re-entry.
+///
 /// `predicates` is the pass's one memo, so occurrences that shared a predicate term leave
 /// sharing it ([`PredMemo`]).
+///
+/// Returns whether anything was rewritten.
 fn erase_chan_domains_in_predicates(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
     kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
     predicates: &PredMemo<()>,
-) {
-    if !predicates_hold_type(ty, &is_channel_type) {
-        return;
+) -> bool {
+    if !predicates_hold_type(ty, &is_channel_type, &mut HashSet::new()) {
+        return false;
     }
-    walk_refined_predicates_mut(ty, predicates, &(), &mut |pred, _| {
+    walk_refined_predicates_mut(ty, predicates, &(), &mut |pred, memo| {
         fn go(
             e: &mut Expr,
             map: &HashMap<Name, Type>,
             kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+            memo: &PredMemo<()>,
         ) -> bool {
             let mut changed = false;
-            e.walk_type_slots_mut(|t| changed |= erase_chan_domains_in_type(t, map, kinds));
-            e.walk_children_mut(|c| changed |= go(c, map, kinds));
+            e.walk_type_slots_mut(|t| changed |= erase_chan_domains_in_slot(t, map, kinds, memo));
+            e.walk_children_mut(|c| changed |= go(c, map, kinds, memo));
             changed
         }
-        go(pred, map, kinds)
-    });
+        go(pred, map, kinds, memo)
+    })
 }
 
 /// Erase channel types from one type slot: its structure and its refinement predicates
-/// alike. Every slot the pass reaches — a node's type, a user annotation, a binder's
-/// declared type — needs both halves, and the strict wall checks both.
+/// alike. [`has_type_residue`] checks the same pair through [`slot_holds_type`], so the
+/// eraser and its checker cannot disagree about what a slot holds. Returns whether
+/// anything was rewritten.
 fn erase_chan_domains_in_slot(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
     kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
     predicates: &PredMemo<()>,
-) {
-    erase_chan_domains_in_type(ty, map, kinds);
-    erase_chan_domains_in_predicates(ty, map, kinds, predicates);
+) -> bool {
+    let mut changed = erase_chan_domains_in_type(ty, map, kinds);
+    changed |= erase_chan_domains_in_predicates(ty, map, kinds, predicates);
+    changed
 }
 
 /// whole-tree erasure — node types, user annotations, and
@@ -958,9 +978,9 @@ fn fun_domain(ty: &Type) -> Option<Type> {
 
 /// Debug-only invariant: after [`run`] on a typed input, no expression or
 /// binder slot may still carry a `Hole`, `Infer`, or `Feed` type — channelize
-/// erased the defer constructs, so their transient types must be gone too.
-/// (Refinement predicates are checked by the strict `typecheck` instead;
-/// walking them here would need the cycle guards it already has.)
+/// erased the defer constructs, so their transient types must be gone too. A slot's
+/// refinement predicates are part of it ([`has_type_residue`]), since
+/// [`erase_chan_domains_in_predicates`] is what clears them.
 #[cfg(debug_assertions)]
 fn assert_no_type_residue(expr: &Expr) {
     assert!(
