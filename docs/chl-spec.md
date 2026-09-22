@@ -227,7 +227,12 @@ type's arms are `` ` ``-tagged, and a refinement predicate — the one place a
 term appears inside `{…}` — is introduced by `where` (§6.4), which is exactly
 why the refinement separator moved off `|`.
 
-### 1.9 Semicolons
+### 1.9 Decorators
+
+`@` introduces a decorator on the line above a declaration. `LoadFrom` is the
+only one ([8.8 `@LoadFrom`](#88-loadfrom)), so `@` never appears in any other position.
+
+### 1.10 Semicolons
 
 `;` is a statement separator on a single line: `x = 1; y = 2` is two
 statements. A trailing `;` before a newline is allowed. Multiple
@@ -297,6 +302,7 @@ assign_target   ::= ident
                  |  assign_target ( "," assign_target )+ [ "," ]
 
 compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
+                 |  load_from_stmt
 
 if_stmt         ::= "if" expression ":" block
                     ( "elif" expression ":" block )*
@@ -313,6 +319,12 @@ with_stmt       ::= "with" [ ident "=" ] expression ":" block
 
 def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" [ "=>" expression ] ":" block
 param           ::= ident [ ":" expression ]
+
+-- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
+-- decorator and the declaration are one statement, which is why a declaration
+-- may carry an annotation and no value here and nowhere else.
+load_from_stmt  ::= "@" "LoadFrom" "(" ident ")" NEWLINE
+                    ident ( ":" | "<:" ) expression NEWLINE
 
 block           ::= NEWLINE INDENT statement+ DEDENT
 ```
@@ -3125,6 +3137,98 @@ Supporting decisions (same source):
   `tx`, which collides with "transmit"); operations `begin()` / `abort()`.
 - **Implicit *parameters* only — never implicit conversions**; given
   visibility stays explicit and resolution inspectable (hence `summon`).
+
+### 8.8 `@LoadFrom`
+
+`@LoadFrom(x)` decorates a declaration, binding it to the value the version this
+source replaces held for the mutable variable `x`, read once when the
+replacement takes over:
+
+```python
+# v1
+qty: Mut(Int, Txn) := 0
+
+# v2
+@LoadFrom(qty)
+qty_units: Int
+```
+
+This is the one declaration that carries an annotation and no value — the
+decorator is where the value comes from. A bare `y: T` elsewhere is a parse error
+([4. Statement semantics](#4-statement-semantics)). `LoadFrom` is the only decorator CHL has.
+
+A load is a declaration, so it appears where declarations do: the top level, or a
+`def` body. A `for` body and a `with begin():` block take statements rather than
+declarations and reject one. Inside a `def`, the name resolves to the variable
+that function's own instantiation declares before it resolves to a top-level one,
+the way a name resolves anywhere else.
+
+A load inside a `def` is refused where the version being replaced called that
+`def` more than once. Each call site declares its own variable of the loaded
+name, and the source tells the call sites apart only by the order they appear in;
+a reorder would move each site's value onto its neighbour with nothing in either
+version saying so. Binding each call site to a name — `a = f(…)` rather than a
+bare `f(…)` — tells them apart, and the load then resolves.
+
+`x` is a name, not an expression, and it is a variable the *previous* version
+declared: the version being compiled need not declare it, and retiring `qty`
+while seeding `qty_units` from it is the case the decorator exists for.
+
+**What it binds is an ordinary binding.** Nothing requires the declaration to be
+mutable. A version that only reads what its predecessor held declares nothing
+mutable at all; one that carries state forward names the binding in the
+initialiser of the variable that replaces it:
+
+```python
+@LoadFrom(qty)
+held: Int
+qty_units: Mut(Int, Txn) := held * 10000
+```
+
+**It is a snapshot, not a read.** The value is what the predecessor held at the
+swap, and is a constant from then on — not a dependency on `x` going forward. It
+is therefore not a read of a transactional variable and needs no `with begin():`
+block ([8.3 Reads](#83-reads)).
+
+**A variable may be declared, loaded, or both.** A variable the new version
+declares carries its value forward whether or not a `@LoadFrom` names it, which
+is the ordinary reload. The decorator is for the variable the new version
+declares under a different name, or retires. A version doing both — declaring `x`
+and loading from `x` — leaves `x` running on its own value and starts the new
+variable at a copy of it taken at the swap. The two are separate variables from
+then on, and neither reads the other.
+
+**The annotation states the shape.** The value the running program holds has to fit
+it, and the two forms ([Two annotation forms: exact and
+bounded](#two-annotation-forms-exact-and-bounded)) read here as they do at any other
+binder: `held: T` binds at `T`, and `held <: T` binds at the loaded value's own type
+with `T` as an upper bound.
+
+```python
+@LoadFrom(qty)
+held <: Map(String, Int)
+qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+```
+
+A comprehension over a map binds each value and keeps the keys, so that scales
+every quantity the predecessor held.
+
+**A running program is required today.** A source containing `@LoadFrom(x)` is an
+upgrade of a specific predecessor: compiled from nothing, it is an error naming
+`x`, and so is one naming a variable the running program does not hold. There is
+no `@LoadFrom(x, default)` — a default would turn that error back into a silent
+wrong answer.
+
+A live process is the only predecessor a version can be handed state from today.
+Durable state is **[Tentative]** ([design.md](design.md)), and a process
+restarting from a store on disk is the same migration against a predecessor that
+is not running; which predecessors a load may name is settled with durable state
+rather than here.
+
+**It is transitional.** The seeding happens once, so the decorator comes out in
+the next version. A name a version loads and does not declare is gone after that
+version, which is why recompiling a migrating source unchanged is refused: there
+is no longer anything of that name to load.
 
 ## 9. Sinks
 

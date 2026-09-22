@@ -163,9 +163,10 @@ pub enum Stmt {
 
     /// Annotated assignment: `target: ty = value` or `target <: ty = value`.
     ///
-    /// CHL (unlike Python) requires a value; bare annotations are a parse
-    /// error. The annotation type is itself an [`Expr`] (type expressions are
-    /// arbitrary expressions); interpretation lives in lowering.
+    /// CHL (unlike Python) requires a value; a bare annotation is a parse error
+    /// except under `@LoadFrom` ([`Stmt::LoadFrom`]), which supplies one. The
+    /// annotation type is itself an [`Expr`] (type expressions are arbitrary
+    /// expressions); interpretation lives in lowering.
     AnnAssign {
         target: Spanned<AssignTarget>,
         annotation: TypeAnnotation,
@@ -190,6 +191,26 @@ pub enum Stmt {
         target: Spanned<AssignTarget>,
         annotation: Option<TypeAnnotation>,
         value: Spanned<Expr>,
+    },
+
+    /// A declaration seeded from the version this source replaces:
+    ///
+    /// ```text
+    /// @LoadFrom(qty)
+    /// qty_units: Map(String, Int)
+    /// ```
+    ///
+    /// The only form in which a declaration carries an annotation and no value
+    /// — the decorator is where the value comes from, so nothing is missing.
+    /// A bare `y: T` is still a parse error
+    /// ([`Stmt::AnnAssign`](Stmt::AnnAssign)).
+    ///
+    /// `source` names a mutable variable of the **previous** version, which this
+    /// one need not declare; lowering resolves it against nothing in this scope.
+    LoadFrom {
+        target: Spanned<AssignTarget>,
+        annotation: TypeAnnotation,
+        source: Spanned<SmolStr>,
     },
 
     /// Defer-define statement: `target <<= value`.
