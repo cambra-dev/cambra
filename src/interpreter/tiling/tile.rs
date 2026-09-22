@@ -2001,6 +2001,60 @@ mod tests {
         assert_eq!(domain.index_at(0), Value::UInt(1));
     }
 
+    /// A `Sole` accumulator holds an *element*, so it carries whatever levels the element
+    /// has and a compaction has to reach them. The row count is what makes this more than
+    /// one more recursion: `terminal` has one bit per row, and a collection's rows are its
+    /// `row_starts`, which dropping keys rebuilds at the same length — so the accumulator
+    /// still stands over as many rows as there are bits, which is what [`validate_tile`]
+    /// asks of an aggregation.
+    #[test]
+    fn compacting_reaches_a_sole_accumulator() {
+        let mut accumulator = Tile::grouped(
+            ColumnValue::UInts(vec![0, 2]),
+            ColumnValue::from_uints(vec![100, 101, 200]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        accumulator.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(100)),
+        )));
+        let mut tile = Tile::Aggregation {
+            kind: AggregateKind::Sole,
+            accumulator: Box::new(accumulator),
+            terminal: ColumnValue::Bools(BitVec::from_elem(2, false)),
+        };
+        tile.compact();
+
+        let Tile::Aggregation { accumulator, .. } = &tile else {
+            panic!("expected an aggregation, got {tile:?}");
+        };
+        let Tile::Function {
+            row_starts,
+            domain,
+            deleted,
+            ..
+        } = accumulator.as_ref()
+        else {
+            panic!("expected a collection in the accumulator, got {accumulator:?}");
+        };
+        assert!(deleted.is_empty(), "the released key is gone, not deleted");
+        assert_eq!(
+            domain.clone().drain_to_value_iter().collect::<Vec<_>>(),
+            vec![Value::UInt(101), Value::UInt(200)],
+            "only the unreleased keys are left"
+        );
+        assert_eq!(
+            row_starts,
+            &ColumnValue::UInts(vec![0, 1]),
+            "the first row lost a key, so the second row's run now begins one earlier"
+        );
+        assert!(
+            validate_tile(&tile),
+            "the accumulator still stands over as many rows as `terminal` has bits"
+        );
+    }
+
     /// A merge **extends** a collection, so a key it already holds is that row's group
     /// growing rather than a second key. A collection delivered a row at a time re-states
     /// the row it is adding to, which is the only way a level gains elements under a key
@@ -2096,7 +2150,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_sealed_function_true_predicate_is_terminal() {
+    fn tile_function_true_predicate_is_terminal() {
         let tile = Tile::function(
             ColumnValue::Ints(vec![1]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
@@ -2107,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_sealed_function_false_predicate_not_terminal() {
+    fn tile_function_false_predicate_not_terminal() {
         let tile = Tile::function(
             ColumnValue::Ints(vec![]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
@@ -2147,7 +2201,7 @@ mod tests {
     }
 
     /// Two nested collections: usize keys over usize keys over an int value.
-    fn cf_uint_int(
+    fn two_level_uint_int(
         d1: Vec<usize>,
         offsets: Vec<usize>,
         d2: Vec<usize>,
@@ -2255,7 +2309,7 @@ mod tests {
     )]
     #[should_panic(expected = "Invalid collection")]
     fn a_first_start_above_zero_orphans_the_entries_before_it() {
-        cf_uint_int(
+        two_level_uint_int(
             vec![0, 1],
             vec![1, 2],
             vec![10, 11, 12],
@@ -2319,8 +2373,8 @@ mod tests {
         }
     }
 
-    /// Build a TileGuard for releasing domain2 values described by `pred` from a Function.
-    fn cf_release_guard(pred: Predicate) -> TileGuard {
+    /// Build a TileGuard for releasing the inner keys described by `pred` from a collection.
+    fn inner_release_guard(pred: Predicate) -> TileGuard {
         TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
             FunctionGuard::Domain(pred),
         ))))
@@ -2413,17 +2467,17 @@ mod tests {
     }
 
     #[test]
-    fn merge_curried_function_appends_with_correct_offsets() {
+    fn merging_two_levels_with_disjoint_keys_runs_the_groups_together() {
         // Group 0 (d1=0): d2=[10, 11], cod=[100, 110]
         // Group 1 (d1=1): d2=[12],     cod=[120]
-        let mut tile = cf_uint_int(
+        let mut tile = two_level_uint_int(
             vec![0],
             vec![0],
             vec![10, 11],
             vec![100, 110],
             Predicate::False,
         );
-        tile.merge(cf_uint_int(
+        tile.merge(two_level_uint_int(
             vec![1],
             vec![0],
             vec![12],
@@ -2432,9 +2486,9 @@ mod tests {
         ));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![0, 1],
-                vec![0, 2], // group 1 starts at index 2 in the combined domain2
+                vec![0, 2], // the second key's group starts at index 2 of the joined keys
                 vec![10, 11, 12],
                 vec![100, 110, 120],
                 Predicate::False,
@@ -2487,7 +2541,7 @@ mod tests {
     }
 
     #[test]
-    fn to_guard_sealed_function_wraps_domain_predicate() {
+    fn to_guard_one_level_wraps_domain_predicate() {
         let pred = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2]));
         let tile = fn_int(vec![1, 2], vec![10, 20], pred.clone());
         assert_eq!(
@@ -2497,8 +2551,8 @@ mod tests {
     }
 
     #[test]
-    fn to_guard_curried_function_uses_domain2_values() {
-        let tile = cf_uint_int(
+    fn to_guard_two_levels_uses_the_inner_keys() {
+        let tile = two_level_uint_int(
             vec![0],
             vec![0],
             vec![10, 11],
@@ -2506,7 +2560,7 @@ mod tests {
             Predicate::False,
         );
         let guard = tile.to_guard();
-        // The guard should cover domain2 values 10 and 11.
+        // The guard should cover inner keys 10 and 11.
         let TileGuard::Function(FunctionGuard::Codomain(inner)) = guard else {
             panic!("expected Codomain guard");
         };
@@ -2523,9 +2577,9 @@ mod tests {
     /// makes the distinction observable: naming a whole group's keys would release them in
     /// the open group too.
     #[test]
-    fn to_guard_curried_function_names_only_the_open_groups_keys() {
+    fn to_guard_two_levels_names_only_the_open_groups_keys() {
         // Groups 0 and 1, both keyed 10 and 11; the predicate calls group 0 whole.
-        let tile = cf_uint_int(
+        let tile = two_level_uint_int(
             vec![0, 1],
             vec![0, 2],
             vec![10, 11, 10, 11],
@@ -2559,8 +2613,8 @@ mod tests {
     /// guard is the domain half alone — which is what lets a consumer recognise it as
     /// universal where the predicate is.
     #[test]
-    fn to_guard_curried_function_whole_groups_name_no_keys() {
-        let tile = cf_uint_int(
+    fn to_guard_two_levels_whole_groups_name_no_keys() {
+        let tile = two_level_uint_int(
             vec![0],
             vec![0],
             vec![10, 11],
@@ -2578,12 +2632,12 @@ mod tests {
     }
 
     #[test]
-    fn to_guard_curried_function_empty_domain2_filters_codomain_arm() {
-        // When domain2 is empty its guard is Predicate::False (empty).  flatten_or must
-        // filter it out, leaving only the domain1 predicate as a plain Domain guard — not
+    fn to_guard_two_levels_empty_inner_filters_codomain_arm() {
+        // When the inner level is empty its guard is Predicate::False (empty).  flatten_or
+        // must filter it out, leaving only the outer predicate as a plain Domain guard — not
         // wrapped in an Or.
         let pred = Predicate::LessThanEq(Value::UInt(5));
-        let tile = cf_uint_int(vec![], vec![], vec![], vec![], pred.clone());
+        let tile = two_level_uint_int(vec![], vec![], vec![], vec![], pred.clone());
         let guard = tile.to_guard();
         // The codomain arm is empty → filtered; only the domain arm remains.
         let TileGuard::Function(FunctionGuard::Domain(result_pred)) = guard else {
@@ -2622,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_guarded_sealed_function_removes_matching_entries() {
+    fn remove_guarded_one_level_removes_matching_entries() {
         // Logically removes domain value 1 (index 0); physical arrays are unchanged.
         let pred = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
         let mut tile = fn_int(vec![1, 2], vec![10, 20], Predicate::True);
@@ -2648,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_guarded_sealed_function_full_release_clears() {
+    fn remove_guarded_one_level_full_release_clears() {
         let mut tile = fn_int(vec![1, 2], vec![10, 20], Predicate::True);
         let guard = tile.to_guard();
         tile.remove_guarded(guard);
@@ -2657,10 +2711,10 @@ mod tests {
     }
 
     #[test]
-    fn remove_guarded_curried_function_removes_matching_domain2() {
+    fn remove_guarded_two_levels_removes_matching_inner_keys() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
         // Logically removes d2=11 (flat index 1); physical arrays are unchanged.
-        let mut tile = cf_uint_int(
+        let mut tile = two_level_uint_int(
             vec![0, 1],
             vec![0, 2],
             vec![10, 11, 12],
@@ -2668,7 +2722,7 @@ mod tests {
             Predicate::False,
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![11]));
-        tile.remove_guarded(cf_release_guard(pred));
+        tile.remove_guarded(inner_release_guard(pred));
         let Tile::Function {
             codomain: groups, ..
         } = &tile
@@ -2697,10 +2751,10 @@ mod tests {
     }
 
     #[test]
-    fn remove_guarded_curried_function_prunes_empty_group() {
+    fn remove_guarded_two_levels_prunes_empty_group() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
         // Logically removes d2=10 (idx 0) and d2=11 (idx 1); physical arrays unchanged.
-        let mut tile = cf_uint_int(
+        let mut tile = two_level_uint_int(
             vec![0, 1],
             vec![0, 2],
             vec![10, 11, 12],
@@ -2708,7 +2762,7 @@ mod tests {
             Predicate::False,
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![10, 11]));
-        tile.remove_guarded(cf_release_guard(pred));
+        tile.remove_guarded(inner_release_guard(pred));
         let Tile::Function {
             codomain: groups, ..
         } = &tile
@@ -2727,9 +2781,9 @@ mod tests {
     /// `compact` is what takes its group with it. Marking the entries beneath it instead
     /// would leave a released group and a filtered-empty one the same shape.
     #[test]
-    fn remove_guarded_curried_function_domain_marks_the_named_group() {
+    fn remove_guarded_two_levels_domain_marks_the_named_group() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
-        let mut tile = cf_uint_int(
+        let mut tile = two_level_uint_int(
             vec![0, 1],
             vec![0, 2],
             vec![10, 11, 12],
@@ -2802,7 +2856,7 @@ mod tests {
     // ── round-trip: to_guard → remove_guarded ────────────────────────────────
 
     #[test]
-    fn round_trip_sealed_function_full_release() {
+    fn round_trip_one_level_full_release() {
         let mut tile = fn_int(vec![1, 2, 3], vec![10, 20, 30], Predicate::True);
         let guard = tile.to_guard();
         tile.remove_guarded(guard);
@@ -2813,10 +2867,10 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_curried_function_full_release() {
+    fn round_trip_two_levels_full_release() {
         // After logical deletion, to_guard() still sees all physical entries, so
         // the guard is unchanged (including deleted entries for complete source releasing).
-        let mut tile = cf_uint_int(
+        let mut tile = two_level_uint_int(
             vec![0, 1],
             vec![0, 2],
             vec![10, 11, 12],
@@ -2842,8 +2896,8 @@ mod tests {
 
     // ── Tile::retain_keys ─────────────────────────────────────────────────────
 
-    fn cf_three_groups() -> Tile {
-        cf_uint_int(
+    fn three_groups() -> Tile {
+        two_level_uint_int(
             vec![10, 20, 30],
             vec![0, 2, 5],
             vec![0, 1, 2, 3, 4, 5],
@@ -2854,24 +2908,24 @@ mod tests {
 
     #[test]
     fn retain_keys_keep_all_is_noop() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_elem(6, true));
-        assert_eq!(tile, cf_three_groups());
+        assert_eq!(tile, three_groups());
     }
 
     #[test]
     fn retain_keys_keep_none_leaves_every_group_empty() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_elem(6, false));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 0, 0],
                 vec![],
@@ -2883,15 +2937,15 @@ mod tests {
 
     #[test]
     fn retain_keys_keep_entire_first_group() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         // Keep positions 0,1 (group 10); groups 20 and 30 are left empty.
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i < 2));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 2, 2],
                 vec![0, 1],
@@ -2903,14 +2957,14 @@ mod tests {
 
     #[test]
     fn retain_keys_keep_entire_middle_group() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| (2..5).contains(&i)));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 0, 3],
                 vec![2, 3, 4],
@@ -2922,14 +2976,14 @@ mod tests {
 
     #[test]
     fn retain_keys_keep_entire_last_group() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i == 5));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 0, 0],
                 vec![5],
@@ -2941,14 +2995,14 @@ mod tests {
 
     #[test]
     fn retain_keys_drop_entire_middle_group() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| !(2..5).contains(&i)));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 2, 2],
                 vec![0, 1, 5],
@@ -2960,15 +3014,15 @@ mod tests {
 
     #[test]
     fn retain_keys_partial_mask_within_group() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         // One survivor in each of groups 10 and 20; group 30 keeps nothing.
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i == 1 || i == 3));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 1, 2],
                 vec![1, 3],
@@ -2980,15 +3034,15 @@ mod tests {
 
     #[test]
     fn retain_keys_partial_mask_empties_the_groups_it_clears() {
-        let mut tile = cf_three_groups();
+        let mut tile = three_groups();
         // Keep d2[2] and d2[4] (both in group 20); groups 10 and 30 are left empty.
         let Tile::Function { codomain, .. } = &mut tile else {
-            unreachable!("cf_three_groups is a collection of collections")
+            unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i == 2 || i == 4));
         assert_eq!(
             tile,
-            cf_uint_int(
+            two_level_uint_int(
                 vec![10, 20, 30],
                 vec![0, 0, 2],
                 vec![2, 4],

@@ -382,12 +382,12 @@ impl TileProducer for MapDomainProducer {
 pub struct Uncurry {
     /// Output tiling: `Function { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
     base: OperatorBase,
-    /// The curried-function input.
+    /// The two-level input.
     input: Box<dyn TileOperator>,
 }
 
 impl Uncurry {
-    /// Create an `Uncurry` operator that flattens a curried function into a function.
+    /// Create an `Uncurry` operator that flattens two collection levels into one.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         // Flattening pairs a collection with the one inside it, so it takes exactly that:
         // a collection whose values are a collection. A deeper one flattens a level at a
@@ -443,10 +443,10 @@ impl TileOperator for Uncurry {
     }
 }
 
-/// Producer for [`Uncurry`]: flattens a curried-function tile into a one-level tile with pair domain.
+/// Producer for [`Uncurry`]: flattens a two-level tile into a one-level tile with pair domain.
 struct UncurryProducer {
     base: ProducerBase,
-    /// The upstream producer whose curried function is flattened.
+    /// The upstream producer whose two levels are flattened.
     input: Box<dyn TileProducer>,
 }
 
@@ -721,17 +721,17 @@ impl TileProducer for FilterProducer {
 pub struct MapFilter {
     /// Output tiling, equal to the input's — filtering removes rows, not structure.
     base: OperatorBase,
-    /// The curried-function input whose inner collections are filtered.
+    /// The two-level input whose inner collections are filtered.
     input: Box<dyn TileOperator>,
-    /// A `Bool`-codomain curried function over the input's keys and inner domain.
+    /// A `Bool`-codomain two-level function over the input's keys and inner domain.
     predicate: Box<dyn TileOperator>,
 }
 
 impl MapFilter {
     /// Create a `MapFilter` retaining the inner-collection rows where `predicate` holds.
     ///
-    /// Panics unless both operands are curried functions: the whole point of this
-    /// operator is the inner domain, and a `Function` has no inner domain to
+    /// Panics unless both operands hold two levels: the whole point of this
+    /// operator is the inner domain, and a one-level collection has no inner domain to
     /// filter (use [`Filter`] or [`Restrict`]).
     pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
@@ -1001,7 +1001,7 @@ mod tests {
         // Expected expanded_domain1: [1, 1, 2]
         // Expected pair domain: Record with _0=[1,1,2] and _1=[10,20,30]
 
-        let curried_tile = Tile::function(
+        let two_level_tile = Tile::function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 2]),
@@ -1014,7 +1014,7 @@ mod tests {
             BitSet::new(),
         );
 
-        let curried_tiling = Tiling::function(
+        let two_level_tiling = Tiling::function(
             Extent::Base(BaseType::UInt),
             Tiling::function(
                 Extent::Base(BaseType::UInt),
@@ -1022,7 +1022,7 @@ mod tests {
             ),
         );
 
-        let input_producer = TestTileProducer::new(curried_tile, curried_tiling.clone());
+        let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling.clone());
 
         // Create UncurryProducer with the test producer as input
         let output_tiling = Tiling::function(
@@ -1119,7 +1119,7 @@ mod tests {
         // Expected expansion_indices: [0, 1, 2]
         // Expected expanded_domain1: [A, B, C]
 
-        let curried_tile = Tile::function(
+        let two_level_tile = Tile::function(
             ColumnValue::UInts(vec![100, 200, 300]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -1132,7 +1132,7 @@ mod tests {
             BitSet::new(),
         );
 
-        let curried_tiling = Tiling::function(
+        let two_level_tiling = Tiling::function(
             Extent::Base(BaseType::UInt),
             Tiling::function(
                 Extent::Base(BaseType::UInt),
@@ -1140,7 +1140,7 @@ mod tests {
             ),
         );
 
-        let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
+        let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling);
 
         let output_tiling = Tiling::function(
             Extent::Record(
@@ -1213,7 +1213,7 @@ mod tests {
         // Now, it should be transformed into a Record predicate with both
         // fields (_0 and _1) set to Predicate::True.
 
-        let curried_tile = Tile::function(
+        let two_level_tile = Tile::function(
             ColumnValue::UInts(vec![1, 2, 3]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -1226,7 +1226,7 @@ mod tests {
             BitSet::new(),
         );
 
-        let curried_tiling = Tiling::function(
+        let two_level_tiling = Tiling::function(
             Extent::Base(BaseType::UInt),
             Tiling::function(
                 Extent::Base(BaseType::UInt),
@@ -1234,7 +1234,7 @@ mod tests {
             ),
         );
 
-        let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
+        let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling);
 
         let output_tiling = Tiling::function(
             Extent::Record(
@@ -1282,7 +1282,7 @@ mod tests {
         // Now, it should be transformed into a Record predicate with both
         // fields (_0 and _1) set to Predicate::False.
 
-        let curried_tile = Tile::function(
+        let two_level_tile = Tile::function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1]),
@@ -1295,7 +1295,7 @@ mod tests {
             BitSet::new(),
         );
 
-        let curried_tiling = Tiling::function(
+        let two_level_tiling = Tiling::function(
             Extent::Base(BaseType::UInt),
             Tiling::function(
                 Extent::Base(BaseType::UInt),
@@ -1303,7 +1303,7 @@ mod tests {
             ),
         );
 
-        let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
+        let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling);
 
         let output_tiling = Tiling::function(
             Extent::Record(
@@ -1358,7 +1358,7 @@ mod tests {
         producer.get(producer.tiling().universal_guard())
     }
 
-    fn sealed_fn_tiling() -> Tiling {
+    fn one_level_tiling() -> Tiling {
         Tiling::function(
             Extent::Base(BaseType::Int),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
@@ -1375,7 +1375,7 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         );
-        let result = run_converse(tile, sealed_fn_tiling());
+        let result = run_converse(tile, one_level_tiling());
         let Tile::Function {
             domain,
             codomain: groups,
@@ -1417,7 +1417,7 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         );
-        let result = run_converse(tile, sealed_fn_tiling());
+        let result = run_converse(tile, one_level_tiling());
         let Tile::Function {
             codomain: groups, ..
         } = result
@@ -1445,7 +1445,7 @@ mod tests {
             Predicate::True,
             input_deleted,
         );
-        let result = run_converse(tile, sealed_fn_tiling());
+        let result = run_converse(tile, one_level_tiling());
         let Tile::Function {
             codomain: groups, ..
         } = result
@@ -1482,7 +1482,7 @@ mod tests {
             Predicate::True,
             input_deleted,
         );
-        let result = run_converse(tile, sealed_fn_tiling());
+        let result = run_converse(tile, one_level_tiling());
         let Tile::Function {
             codomain: groups, ..
         } = result

@@ -1834,7 +1834,7 @@ fn convert_impl_inner(
             Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
         }
 
-        // uncurry flattens a curried function into a function with a pair domain.
+        // uncurry flattens two collection levels into one with a pair domain.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Uncurry) =>
         {
@@ -1917,7 +1917,7 @@ fn convert_impl_inner(
         }
 
         // `map_filter(p)`: filter the inner collections of a partition, per outer
-        // key. The fed input is the curried collection, fanned to the value side and
+        // key. The fed input is the two-level collection, fanned to the value side and
         // the predicate exactly as `filter_values` fans its element stream — the
         // difference is the depth, a level under a level rather than one level, and
         // so the domain the predicate selects on is the inner one.
@@ -2629,7 +2629,7 @@ fn leaf_ambient<'a>(tilings: impl Iterator<Item = &'a Tiling>) -> usize {
         if i == 0 {
             ambient = levels.max(1);
         } else {
-            debug_assert_eq!(
+            assert_eq!(
                 levels.max(1),
                 ambient,
                 "a product's leaf components stand over one iteration, so they nest alike",

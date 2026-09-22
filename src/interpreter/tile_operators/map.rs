@@ -906,12 +906,12 @@ mod tests {
     }
 
     #[test]
-    fn map_result_producer_curried_function() {
+    fn map_result_producer_two_levels() {
         // Test MapResultProducer directly with unsorted domain input
         // This tests the actual MapResultProducer.get_impl implementation
 
         // Create a Function tile
-        let curried_fn_tile = Tile::function(
+        let two_level_fn_tile = Tile::function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 2]),
@@ -933,7 +933,7 @@ mod tests {
         );
 
         // Create a Function tile with unsorted domain
-        let sealed_fn_tile = Tile::function(
+        let one_level_fn_tile = Tile::function(
             ColumnValue::UInts(vec![2, 0, 1]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 0, 1]))),
             Predicate::True,
@@ -946,8 +946,8 @@ mod tests {
         );
 
         // Create test producers
-        let function_producer = TestTileProducer::new(curried_fn_tile, function_tiling);
-        let input_producer = TestTileProducer::new(sealed_fn_tile, input_tiling);
+        let function_producer = TestTileProducer::new(two_level_fn_tile, function_tiling);
+        let input_producer = TestTileProducer::new(one_level_fn_tile, input_tiling);
 
         // Create MapResultProducer and test it
         let output_tiling = Tiling::function(
@@ -1044,9 +1044,9 @@ mod tests {
     ///   Only 0 is true for `function`'s domain_predicate, so only the preimage of 0 in
     ///   `input` (i.e. {0}), should be true in the output domain_predicate.
     #[test]
-    fn map_result_producer_curried_function_domain_predicate() {
+    fn map_result_producer_two_levels_domain_predicate() {
         let f_pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
-        let curried_fn_tile = Tile::function(
+        let two_level_fn_tile = Tile::function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1]),
@@ -1066,7 +1066,7 @@ mod tests {
             ),
         );
 
-        let sealed_fn_tile = Tile::function(
+        let one_level_fn_tile = Tile::function(
             ColumnValue::UInts(vec![0, 1, 2, 3]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 2, 3]))),
             Predicate::True,
@@ -1086,8 +1086,8 @@ mod tests {
         );
         let mut map_result = MapResultProducer {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(sealed_fn_tile, input_tiling)),
-            function: Box::new(TestTileProducer::new(curried_fn_tile, function_tiling)),
+            input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
+            function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
         };
 
         let result = map_result.get(map_result.tiling().universal_guard());
@@ -1118,8 +1118,8 @@ mod tests {
 
     /// When f_domain_predicate is True the output domain_predicate should equal the input's.
     #[test]
-    fn map_result_producer_curried_function_domain_predicate_both_true() {
-        let curried_fn_tile = Tile::function(
+    fn map_result_producer_two_levels_domain_predicate_both_true() {
+        let two_level_fn_tile = Tile::function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1]),
@@ -1138,7 +1138,7 @@ mod tests {
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
         );
-        let sealed_fn_tile = Tile::function(
+        let one_level_fn_tile = Tile::function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1]))),
             Predicate::True,
@@ -1157,8 +1157,8 @@ mod tests {
         );
         let mut map_result = MapResultProducer {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(sealed_fn_tile, input_tiling)),
-            function: Box::new(TestTileProducer::new(curried_fn_tile, function_tiling)),
+            input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
+            function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
         };
         let result = map_result.get(map_result.tiling().universal_guard());
         let Tile::Function {

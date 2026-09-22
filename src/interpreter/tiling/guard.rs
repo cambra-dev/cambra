@@ -323,14 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn guard_intersect_sealed_function_universal_universal() {
+    fn guard_intersect_one_level_universal_universal() {
         let g = TileGuard::Function(FunctionGuard::Domain(Predicate::True))
             .intersect(&TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
         assert!(g.is_universal());
     }
 
     #[test]
-    fn guard_intersect_sealed_function_empty_dominates() {
+    fn guard_intersect_one_level_empty_dominates() {
         let g = TileGuard::Function(FunctionGuard::Domain(Predicate::True)).intersect(
             &TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
         );
@@ -534,13 +534,13 @@ mod tests {
     }
 
     #[test]
-    fn check_from_function_domain_matches_sealed_function_tiling() {
+    fn check_from_function_domain_matches_a_one_level_tiling() {
         assert!(domain_guard(Predicate::True).check_from(&scalar_function(int(), bool_ext())));
         assert!(domain_guard(Predicate::False).check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
-    fn check_from_function_codomain_matches_sealed_function_tiling() {
+    fn check_from_function_codomain_matches_a_one_level_tiling() {
         // A Codomain(Domain(_)) guard is valid against a Function whose
         // codomain is itself a function tiling.
         let nested = scalar_function(int(), bool_ext());
@@ -550,37 +550,37 @@ mod tests {
     }
 
     #[test]
-    fn check_from_function_codomain_scalar_against_sealed_function_tiling() {
+    fn check_from_function_codomain_scalar_against_a_one_level_tiling() {
         // Codomain(Scalar) is valid when the function's codomain is a scalar.
         let g = codomain_guard(TileGuard::Scalar(true));
         assert!(g.check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
-    fn check_from_function_codomain_wrong_shape_against_sealed_function_tiling() {
+    fn check_from_function_codomain_wrong_shape_against_a_one_level_tiling() {
         // Codomain(Aggregation) against a function with scalar codomain must fail.
         let g = codomain_guard(TileGuard::Aggregation(true));
         assert!(!g.check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
-    fn check_from_function_domain_matches_curried_function_tiling() {
-        assert!(domain_guard(Predicate::True).check_from(&curried(range(4), int(), int())));
+    fn check_from_function_domain_matches_a_two_level_tiling() {
+        assert!(domain_guard(Predicate::True).check_from(&two_level(range(4), int(), int())));
     }
 
     #[test]
-    fn check_from_function_codomain_domain_matches_curried_function_tiling() {
+    fn check_from_function_codomain_domain_matches_a_two_level_tiling() {
         // Codomain(Domain(_)) is the canonical way to address the inner domain of
         // a Function.
         let g = codomain_guard(domain_guard(Predicate::True));
-        assert!(g.check_from(&curried(range(4), int(), int())));
+        assert!(g.check_from(&two_level(range(4), int(), int())));
     }
 
     #[test]
-    fn check_from_function_codomain_scalar_rejects_curried_function_tiling() {
+    fn check_from_function_codomain_scalar_rejects_a_two_level_tiling() {
         // Codomain(Scalar) is not a valid guard shape for a Function.
         let g = codomain_guard(TileGuard::Scalar(true));
-        assert!(!g.check_from(&curried(range(4), int(), int())));
+        assert!(!g.check_from(&two_level(range(4), int(), int())));
     }
 
     #[test]

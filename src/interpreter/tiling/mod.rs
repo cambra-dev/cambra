@@ -47,9 +47,9 @@ pub(super) mod tests {
         Tiling::function(domain, Tiling::Scalar(codomain))
     }
 
-    /// A two-level curried tiling, the shape most callers want.
-    pub(crate) fn curried(domain1: Extent, domain2: Extent, codomain: Extent) -> Tiling {
-        Tiling::function(domain1, Tiling::function(domain2, Tiling::Scalar(codomain)))
+    /// A two-level tiling, the shape most callers want.
+    pub(crate) fn two_level(outer: Extent, inner: Extent, codomain: Extent) -> Tiling {
+        Tiling::function(outer, Tiling::function(inner, Tiling::Scalar(codomain)))
     }
 
     pub(crate) fn record_tiling(fields: &[(&str, Tiling)]) -> Tiling {

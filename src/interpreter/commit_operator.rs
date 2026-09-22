@@ -368,7 +368,7 @@ fn read_initial_scalar(
             // A **collection** init — a keyed mutable variable's seed. It arrives as the
             // function it is rather than as a scalar, and one store value is one
             // map, so it seeds as a single [`map_to_value`] cell. The seed is
-            // acyclic and sealed, so the whole map is present on the pull that
+            // acyclic and terminal, so the whole map is present on the pull that
             // yields it.
             Tile::Function {
                 domain,
@@ -2716,7 +2716,7 @@ impl DriverWindow {
         extent
     }
 
-    /// The window as the body's input tile, sealed once `done`.
+    /// The window as the body's input tile, terminal once `done`.
     ///
     /// [`compact`](Self::compact) has already dropped the released prefix, so
     /// every retained row is live: a re-pull within a round re-emits only what

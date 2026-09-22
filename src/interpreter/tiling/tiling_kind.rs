@@ -63,7 +63,7 @@ impl Tiling {
                 domain: Box::new(domain.clone()),
                 codomain: Box::new(codomain.extent()),
             },
-            // One arrow per collection, and the nesting is the tiling's own.
+            // One level per collection, and the nesting is the tiling's own.
             Tiling::Function { domain, codomain } => Extent::Function {
                 domain: Box::new(domain.clone()),
                 codomain: Box::new(codomain.extent()),
@@ -134,7 +134,7 @@ impl Tiling {
             }
             Tiling::Store { domain, codomain } => Some((domain.clone(), codomain.extent())),
             // Split this collection off the front; what is left is its values' extent,
-            // which for a deeper tiling is itself an arrow.
+            // which for a deeper tiling is itself a collection.
             Tiling::Function { domain, codomain } => Some((domain.clone(), codomain.extent())),
             _ => None,
         }
@@ -268,7 +268,7 @@ impl fmt::Display for Tiling {
             Tiling::Scalar(e) => write!(f, "{e:?}"),
             Tiling::Record(fields) => fmt_record(f, fields),
             Tiling::Store { domain, codomain } => write!(f, "Store({domain:?} → {codomain})"),
-            // One arrow per level rather than a nested `Fn(…)` each, which is how a curried
+            // One `→` per level rather than a nested `Fn(…)` each, which is how a curried
             // function reads.
             Tiling::Function { domain, codomain } => {
                 write!(f, "Fn({domain:?} → ")?;
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn tiling_extent_sealed_function() {
+    fn tiling_extent_one_level() {
         let t = scalar_function(int(), bool_ext());
         assert_eq!(
             t.extent(),
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn tiling_extent_lookup_function() {
-        let t = curried(range(4), int(), int());
+        let t = two_level(range(4), int(), int());
         assert_eq!(
             t.extent(),
             Extent::Function {
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn universal_guard_lookup_function() {
         assert!(
-            curried(int(), int(), bool_ext())
+            two_level(int(), int(), bool_ext())
                 .universal_guard()
                 .is_universal()
         );
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn empty_guard_lookup_function() {
-        assert!(curried(int(), int(), bool_ext()).empty_guard().is_empty());
+        assert!(two_level(int(), int(), bool_ext()).empty_guard().is_empty());
     }
 
     #[test]
@@ -380,14 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn universal_guard_sealed_function() {
+    fn universal_guard_one_level() {
         let g = scalar_function(int(), bool_ext()).universal_guard();
         assert!(g.is_universal());
         assert!(!g.is_empty());
     }
 
     #[test]
-    fn empty_guard_sealed_function() {
+    fn empty_guard_one_level() {
         let g = scalar_function(int(), bool_ext()).empty_guard();
         assert!(g.is_empty());
         assert!(!g.is_universal());
@@ -402,7 +402,7 @@ mod tests {
     // ── Tiling::codomain ──────────────────────────────────────────────────────
 
     #[test]
-    fn codomain_sealed_function() {
+    fn codomain_one_level() {
         let t = scalar_function(int(), bool_ext());
         assert_eq!(t.codomain(), Some(Tiling::Scalar(bool_ext())));
     }
@@ -424,9 +424,9 @@ mod tests {
     /// The codomain is what sits one level in, which for a chain is the collection below
     /// rather than the value at the bottom — applying a key yields the rest of the chain.
     #[test]
-    fn codomain_of_a_curried_function_is_the_level_below_it() {
+    fn codomain_of_two_levels_is_the_level_below_it() {
         assert_eq!(
-            curried(int(), bool_ext(), int()).codomain(),
+            two_level(int(), bool_ext(), int()).codomain(),
             Some(Tiling::function(bool_ext(), Tiling::Scalar(int())))
         );
     }
@@ -434,7 +434,7 @@ mod tests {
     // ── Tiling::domain_extent ─────────────────────────────────────────────────
 
     #[test]
-    fn domain_extent_sealed_function() {
+    fn domain_extent_one_level() {
         assert_eq!(
             scalar_function(int(), bool_ext()).domain_extent(),
             Some(int())
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn domain_extent_lookup_function() {
         assert_eq!(
-            curried(range(4), int(), bool_ext()).domain_extent(),
+            two_level(range(4), int(), bool_ext()).domain_extent(),
             Some(range(4))
         );
     }
@@ -474,11 +474,11 @@ mod tests {
     }
 
     /// Splitting takes one level off the front, so a deeper tiling's codomain is the
-    /// arrow that is left.
+    /// collection that is left.
     #[test]
-    fn split_function_extent_two_level_leaves_an_arrow() {
+    fn split_function_extent_two_level_leaves_a_collection() {
         assert_eq!(
-            curried(int(), bool_ext(), int()).split_function_extent(),
+            two_level(int(), bool_ext(), int()).split_function_extent(),
             Some((
                 int(),
                 Extent::Function {
@@ -526,18 +526,18 @@ mod tests {
     }
 
     #[test]
-    fn is_scalar_sealed_function_is_false() {
+    fn is_scalar_one_level_is_false() {
         assert!(!scalar_function(int(), bool_ext()).is_scalar());
     }
 
     #[test]
-    fn is_function_sealed() {
+    fn is_function_one_level() {
         assert!(scalar_function(int(), bool_ext()).has_domain());
     }
 
     #[test]
     fn is_function_lookup() {
-        assert!(curried(int(), bool_ext(), int()).has_domain());
+        assert!(two_level(int(), bool_ext(), int()).has_domain());
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn map_output_from_sealed_preserves_domain() {
+    fn map_output_from_one_level_preserves_domain() {
         let t = scalar_function(int(), bool_ext());
         let result = t.map_output(range(3));
         assert_eq!(result, Tiling::function(int(), Tiling::Scalar(range(3))));
@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_tile_sealed_function_is_empty() {
+    fn empty_tile_one_level_is_empty() {
         let tile = scalar_function(int(), bool_ext()).empty_tile();
         assert!(tile.is_empty());
         assert!(!tile.is_terminal());
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn empty_tile_lookup_function_is_empty() {
-        let tile = curried(int(), bool_ext(), int()).empty_tile();
+        let tile = two_level(int(), bool_ext(), int()).empty_tile();
         assert!(tile.is_empty());
         assert!(!tile.is_terminal());
     }
@@ -591,17 +591,17 @@ mod tests {
     }
 
     #[test]
-    fn display_sealed_function() {
+    fn display_one_level() {
         let s = scalar_function(int(), bool_ext()).to_string();
         assert!(s.contains("→"), "expected arrow in '{s}'");
     }
 
     #[test]
-    fn display_curried_function() {
+    fn display_two_levels() {
         // The whole rendering, not a substring: a `[` test passes on the range
         // domain whichever way the brackets fall, which is how an unbalanced
         // one survived here.
-        let s = curried(range(4), int(), bool_ext()).to_string();
+        let s = two_level(range(4), int(), bool_ext()).to_string();
         assert_eq!(s, "Fn({[0, 3]} → Int → Bool)");
     }
 

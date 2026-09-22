@@ -490,14 +490,14 @@ mod tests {
 
     // ── UnionProducer::release_impl ───────────────────────────────────────────
 
-    fn int_sealed_tiling() -> Tiling {
+    fn int_function_tiling() -> Tiling {
         Tiling::function(
             Extent::Base(BaseType::Int),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )
     }
 
-    fn int_sealed_tile() -> Tile {
+    fn int_function_tile() -> Tile {
         Tile::function(
             ColumnValue::Ints(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
@@ -534,7 +534,7 @@ mod tests {
         ))
     }
 
-    fn sealed_with_codomain(codomain: Extent) -> Box<dyn TileOperator> {
+    fn function_with_codomain(codomain: Extent) -> Box<dyn TileOperator> {
         Box::new(TilingOnly(Tiling::function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(codomain),
@@ -567,8 +567,8 @@ mod tests {
         ]);
         let op = UnionOperator::new(
             vec![
-                sealed_with_codomain(named_variant(&[("pos", Extent::Base(BaseType::Int))])),
-                sealed_with_codomain(named_variant(&[("neg", Extent::Base(BaseType::Int))])),
+                function_with_codomain(named_variant(&[("pos", Extent::Base(BaseType::Int))])),
+                function_with_codomain(named_variant(&[("neg", Extent::Base(BaseType::Int))])),
             ],
             merged.clone(),
         );
@@ -582,8 +582,8 @@ mod tests {
         ]));
         let op = UnionOperator::new(
             vec![
-                sealed_with_codomain(Extent::Base(BaseType::Int)),
-                sealed_with_codomain(Extent::Base(BaseType::String)),
+                function_with_codomain(Extent::Base(BaseType::Int)),
+                function_with_codomain(Extent::Base(BaseType::String)),
             ],
             positional.clone(),
         );
@@ -604,11 +604,11 @@ mod tests {
         let narrow = rec(&[("a", Extent::Base(BaseType::Int))]);
         let op = UnionOperator::new(
             vec![
-                sealed_with_codomain(rec(&[
+                function_with_codomain(rec(&[
                     ("a", Extent::Base(BaseType::Int)),
                     ("b", Extent::Base(BaseType::Int)),
                 ])),
-                sealed_with_codomain(narrow.clone()),
+                function_with_codomain(narrow.clone()),
             ],
             narrow.clone(),
         );
@@ -623,8 +623,8 @@ mod tests {
     fn codomain_of_agreeing_arms_keeps_their_tiling() {
         let op = UnionOperator::new(
             vec![
-                sealed_with_codomain(Extent::Base(BaseType::Int)),
-                sealed_with_codomain(Extent::Base(BaseType::Int)),
+                function_with_codomain(Extent::Base(BaseType::Int)),
+                function_with_codomain(Extent::Base(BaseType::Int)),
             ],
             Extent::Base(BaseType::Int),
         );
@@ -644,10 +644,10 @@ mod tests {
     fn differing_non_scalar_codomains_are_rejected_at_construction() {
         let nested = Box::new(TilingOnly(Tiling::function(
             Extent::Base(BaseType::UInt),
-            int_sealed_tiling(),
+            int_function_tiling(),
         ))) as Box<dyn TileOperator>;
         let _ = UnionOperator::new(
-            vec![sealed_with_codomain(Extent::Base(BaseType::Int)), nested],
+            vec![function_with_codomain(Extent::Base(BaseType::Int)), nested],
             Extent::Base(BaseType::Int),
         );
     }
@@ -778,11 +778,13 @@ mod tests {
     fn a_fully_released_arm_is_not_pulled_again() {
         use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
 
-        let arm_tiling = int_sealed_tiling();
+        let arm_tiling = int_function_tiling();
         let inputs: Vec<Box<dyn TileProducer>> = (0..2)
             .map(|_| {
-                Box::new(TestTileProducer::new(int_sealed_tile(), arm_tiling.clone()))
-                    as Box<dyn TileProducer>
+                Box::new(TestTileProducer::new(
+                    int_function_tile(),
+                    arm_tiling.clone(),
+                )) as Box<dyn TileProducer>
             })
             .collect();
         let union_tiling = Tiling::function(
@@ -871,13 +873,13 @@ mod tests {
             base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
             inputs: vec![
                 Box::new(SpyProducer {
-                    base: ProducerBase::new(0, &int_sealed_tiling()),
-                    tile: int_sealed_tile(),
+                    base: ProducerBase::new(0, &int_function_tiling()),
+                    tile: int_function_tile(),
                     log: log0.clone(),
                 }),
                 Box::new(SpyProducer {
-                    base: ProducerBase::new(1, &int_sealed_tiling()),
-                    tile: int_sealed_tile(),
+                    base: ProducerBase::new(1, &int_function_tiling()),
+                    tile: int_function_tile(),
                     log: log1.clone(),
                 }),
             ],

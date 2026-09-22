@@ -401,7 +401,7 @@ impl TileProducer for MapExtractAggregateProducer {
 /// Order two element paths lexicographically.
 ///
 /// One level's keys share a type, so comparing two paths compares like with like at every
-/// component and the order is total — which is what [`build_curried_from_paths`] needs, a
+/// component and the order is total — which is what [`build_levels_from_paths`] needs, a
 /// parent's children being contiguous only under one.
 ///
 /// [`Value`] is `PartialOrd` and not `Ord`, so that precondition is checked rather than
@@ -429,7 +429,7 @@ fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
 /// Each level nests inside the one above it, so a new key at a level starts its run of
 /// children where the level below has reached. The paths must arrive sorted: a parent's
 /// children are contiguous only then.
-fn build_curried_from_paths(
+fn build_levels_from_paths(
     paths: &[&[Value]],
     extents: &[Extent],
     codomain: Tile,
@@ -693,7 +693,7 @@ impl TileProducer for MapAggregateProducer {
             terminal: ColumnValue::Bools(terminal),
         };
         let paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
-        build_curried_from_paths(&paths, &extents, aggregation, domain_predicate)
+        build_levels_from_paths(&paths, &extents, aggregation, domain_predicate)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -725,7 +725,7 @@ mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{QuietSpy, ReleaseSpy};
     use crate::interpreter::{BaseType, Extent, Predicate, Tile};
-    fn int_sealed(domain: Vec<usize>, values: Vec<i64>) -> Tile {
+    fn int_function(domain: Vec<usize>, values: Vec<i64>) -> Tile {
         Tile::function(
             ColumnValue::from_uints(domain),
             Box::new(Tile::Scalar(ColumnValue::Ints(values))),
@@ -743,7 +743,7 @@ mod tests {
             Extent::uint_range(2),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let (spy, _released) = ReleaseSpy::new(int_sealed(vec![0, 1], vec![10, 20]), in_tiling);
+        let (spy, _released) = ReleaseSpy::new(int_function(vec![0, 1], vec![10, 20]), in_tiling);
         let tiling = Tiling::Aggregation {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
@@ -776,7 +776,7 @@ mod tests {
             Extent::uint_range(2),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let (spy, released) = ReleaseSpy::new(int_sealed(vec![0], vec![10]), in_tiling.clone());
+        let (spy, released) = ReleaseSpy::new(int_function(vec![0], vec![10]), in_tiling.clone());
         let tiling = Tiling::Aggregation {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),

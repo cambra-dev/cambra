@@ -751,7 +751,7 @@ impl TileProducer for FanOutProducer {
         // The match is total for a fan-out a recurrence reads, rather than a
         // shape test with a fallthrough. Every function tiling's empty and
         // universal guards are `Function(Domain(_))` (`Tiling::empty_guard`,
-        // including the curried case), which supplies both the seed each
+        // including a nested one), which supplies both the seed each
         // `release_guards` entry starts at and this fold's identity; `Domain` is
         // closed under the union and intersection applied to it; and both drives
         // release only `Domain` to an iteration source — `InductionDriver`
