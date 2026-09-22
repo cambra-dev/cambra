@@ -1882,9 +1882,10 @@ fn an_undriven_store_has_no_value_to_load() {
 /// instantiation declares.
 ///
 /// This is the address the chain exists for. `count_by`'s body is inlined into
-/// `a`'s definition, so the variable it declares is ``a`.`total`` and the load
-/// sits under ``a`.`held``. The search runs outward from the site's own chain,
-/// so it passes the binding the load seeds and stops at the instantiation's.
+/// `a`'s definition, so the variable it declares is `` `a`.`total` `` and the
+/// load sits under `` `a`.`held` ``. The search runs outward from the site's own
+/// chain, so it passes the binding the load seeds and stops at the
+/// instantiation's.
 #[test]
 fn a_load_inside_an_instantiation_reaches_its_own_variable() {
     let v1 = indoc! {r#"
@@ -1965,7 +1966,7 @@ fn a_top_level_load_does_not_reach_inside_an_instantiation() {
 ///
 /// A `@LoadFrom` lowers into the binding it seeds, which puts that binding's name
 /// on the site's own chain. Searching outward from the whole chain would make the
-/// innermost candidate ``held`.`qty`` — the variable inside `held`'s
+/// innermost candidate `` `held`.`qty` `` — the variable inside `held`'s
 /// instantiation, which is exactly the address
 /// [`a_top_level_load_does_not_reach_inside_an_instantiation`] says no source can
 /// name. Nothing is ever declared under a load's binding, its definition being

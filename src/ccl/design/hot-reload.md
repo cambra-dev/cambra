@@ -212,7 +212,7 @@ fail.
 ## The one guard: a version must be able to take over the state
 
 `LiveProgram::reload` compares the variables the running program holds against those the new version
-declares, read off its planned tree (`OpConversionContext::state_conflicts`). Five things are
+declares, read off its planned tree (`OpConversionContext::state_conflicts`). Six things are
 refused:
 
 - **A variable the new version no longer declares and does not load with `@LoadFrom`.** Its value
@@ -332,10 +332,10 @@ cannot disagree about what the binding chain at a point is. A declaration's addr
 enclosing it (`VarPath`); a site's is read off the same chain and then resolved outward, the way a
 name resolves in the source — the innermost enclosing chain holding a variable of that spelling
 wins. Outward means the site's own chain and the chains enclosing it, and never a chain below one of
-those: a load inside a stateful function's body finds the ``a`.`total`` of its own instantiation,
-while the same spelling written at the top level reaches nothing, ``a`.`total`` sitting under a
-binding the top level's chain does not contain. A diagnostic names the spelling alone, which is what
-the source contains.
+those: a load inside a stateful function's body finds the `` `a`.`total` `` of its own
+instantiation, while the same spelling written at the top level reaches nothing, `` `a`.`total` ``
+sitting under a binding the top level's chain does not contain. A diagnostic names the spelling
+alone, which is what the source contains.
 
 The target contributes no chain segment. A segment comes from descending into a binding's
 definition, and a load's definition is the leaf alone, so nothing is ever declared under the target
@@ -627,7 +627,7 @@ added to a loop whose other variables carry, which is the ordinary case and just
 producers had not released — `StreamBuffer::first_index_for_a_new_producer` is a released prefix
 plus one — and a kept operator holds what its retired consumers had not released. One condition,
 read off two mechanisms. What separates a term that can be built again from one that cannot is
-whether it reads a source at all, which is what `unrecomputable_nodes` answers.
+whether it reads a source at all, which is what `OpConversionContext::recomputable` answers.
 
 `unreadable_inputs` reports every variable that begins above its loop's input, in the reload's
 report and in `/diff` before that. Reported rather than refused, because there is nothing better

@@ -489,11 +489,30 @@ impl Inheritance {
     /// a variable currently holds. The two differ for a store the running
     /// program never drove: it declares its variables and holds no value for
     /// them.
+    ///
+    /// Indices run dense per chain and spelling, which is what lets
+    /// [`LoadFromSite::resolve`] read index `0` as declared-at-all and index `1`
+    /// as declared-more-than-once. No one place establishes that:
+    /// [`state_identities`] numbers a chain's declarations from `0` as it meets
+    /// them, [`OpConversionContext::bind_store`] gives every key that walk
+    /// addressed a [`KeyReadInfo`], and [`StoreReadInfo::carried_keys`] drops
+    /// only reply taps, which the walk addresses none of. The three meet here,
+    /// so the assertion is here.
     fn declared_paths(&self) -> HashSet<VarPath> {
-        self.stores()
+        let paths: HashSet<VarPath> = self
+            .stores()
             .flat_map(StoreReadInfo::carried_keys)
             .map(|(path, _)| path.clone())
-            .collect()
+            .collect();
+        debug_assert!(
+            paths.iter().all(|p| p.index == 0
+                || paths.contains(&VarPath {
+                    index: p.index - 1,
+                    ..p.clone()
+                })),
+            "declaration indices run dense per chain and spelling"
+        );
+        paths
     }
 }
 
@@ -3053,8 +3072,9 @@ pub struct VarPath {
 impl std::fmt::Display for VarPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Qualified the way the source reads, and the index only when it is
-        // doing work: an author recognizes ``a`.`n`` where ``n` (#0)`` says
-        // nothing, so the suffix appears only once a second variable needs it.
+        // doing work: an author recognizes `` `a`.`n` `` where `` `n` (#0) ``
+        // says nothing, so the suffix appears only once a second variable needs
+        // it.
         for binding in &self.chain {
             write!(f, "`{binding}`.")?;
         }
@@ -3302,7 +3322,7 @@ impl LoadFromSite {
     ///
     /// Resolved outward, the way scope resolves a name: the innermost enclosing
     /// chain that holds a variable of this spelling wins, so a `@LoadFrom(n)`
-    /// inside `a`'s definition finds ``a`.`n`` where there is one and the
+    /// inside `a`'s definition finds `` `a`.`n` `` where there is one and the
     /// top-level `n` otherwise. A declaration's chain is the bindings enclosing
     /// the declaration rather than the reference, so the site's own chain is
     /// where the search starts and not where it ends.
@@ -3331,7 +3351,8 @@ impl LoadFromSite {
             };
             // Indices are dense per chain and spelling, so the first is declared
             // wherever the chain declares the spelling at all, and the second
-            // only where it declares it more than once.
+            // only where it declares it more than once. Asserted where the set
+            // is built (`Inheritance::declared_paths`).
             if !declared.contains(&at(0)) {
                 continue;
             }
