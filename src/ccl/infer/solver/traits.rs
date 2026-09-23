@@ -679,7 +679,7 @@ impl TraitObligation {
         // product: the rows are homogeneous, and a wider one is a subtype, so the
         // upper-bound edge below admits `(𝐴, 𝐵, 𝐶)` against `(𝐴, 𝐵)` on its own.
         if let Some(settled) = self.structural.borrow().as_ref() {
-            return if product_fields(settled) == product_fields(product) {
+            return if product_shape(settled) == product_shape(product) {
                 Ok(())
             } else {
                 self.reject(pos, product)
@@ -1523,6 +1523,17 @@ pub(crate) fn product_fields(product: &Type) -> Vec<FieldKey> {
             .collect(),
         other => unreachable!("`product_fields` is reached only for a product, got {other:?}"),
     }
+}
+
+/// A product's fields in a canonical order, for deciding whether two products are the same
+/// shape.
+///
+/// `Type::Record` holds a `Vec` that no construction site orders, so two spellings of one
+/// record shape reach here with their fields in different orders.
+pub(crate) fn product_shape(product: &Type) -> Vec<FieldKey> {
+    let mut fields = product_fields(product);
+    fields.sort();
+    fields
 }
 
 /// A product's component types.

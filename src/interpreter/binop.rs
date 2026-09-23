@@ -194,9 +194,7 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
             ColumnValue::Bools(zip_bool_compare(op, l, r))
         }
         // A product compares **componentwise**, which is the whole of what makes one
-        // equatable (`src/ccl/design/type-inference.md`, "What the tables hold"). Both
-        // columns hold the same fields, the type having required the two operands to be one
-        // product, so a field one side lacks is a shape error rather than an inequality.
+        // equatable (`src/ccl/design/type-inference.md`, "What the tables hold").
         (
             BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),
             ColumnValue::Records(l),
@@ -209,28 +207,35 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
 /// Compare two record columns field by field, `Equals` conjoining the results and
 /// `NotEquals` disjoining them.
 ///
-/// **The fields both sides carry are the comparison.** Records are width-subtyped, so a
-/// value may arrive with columns the type at this position does not name — a wider record
-/// passed where a narrower one is declared keeps its extra columns at run time. Those are
-/// not part of the value being compared, and skipping them is what makes the two operand
-/// orders agree: reading a one-sided field as a fault aborted the process in one order
-/// while the other silently answered `equal`.
+/// **The fields both columns carry are the product the type names.** Typing rejects a
+/// comparison between two different products, so the two field sets differ only where
+/// width subtyping let a wider value reach a narrower position and the tiling kept the
+/// surplus column. A column the position's type does not name is not part of the value
+/// there, and the intersection reads the value at its type whichever operand carries it.
 ///
-/// The length is the shortest column on either side, since a column still filling is a
-/// column whose later positions have not been decided.
+/// The length is the shortest column the intersection reads, a column still filling being
+/// one whose later positions have not been decided. A surplus column is excluded from that
+/// minimum for the same reason it is excluded from the answer: its extent belongs to the
+/// wider value, and a short one would truncate a result the named fields already decided.
+///
+/// A value carrying exactly the fields its type names would retire the intersection. What
+/// keeps the surplus is inlining dropping the parameter's annotation — see the vault issue
+/// `type-checker-inlining-drops-a-narrowing-annotation`.
 fn compare_records(
     op: CompareKind,
     left: HashMap<String, ColumnValue>,
     right: &HashMap<String, ColumnValue>,
 ) -> BitVec {
     let rows = left
-        .values()
-        .map(ColumnValue::len)
-        .chain(right.values().map(ColumnValue::len))
+        .iter()
+        .filter(|(field, _)| right.contains_key(*field))
+        .flat_map(|(field, l)| [l.len(), right[field].len()])
         .min()
         .unwrap_or(0);
     let mut acc = BitVec::from_elem(rows, op == CompareKind::Equals);
     for (field, l) in left {
+        // A column only one side carries is the surplus of a wider value, not a field of
+        // the product being compared.
         let Some(r) = right.get(&field) else {
             continue;
         };

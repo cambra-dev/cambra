@@ -2663,7 +2663,7 @@ Growing `𝐹` above zero would not change this. Choosing between two functions 
 
 An obligation is a monotone fact, resolved as the graph fills in rather than by a sweep at the end of solving — the shape [`FunKindVar`](#46-data-vs-compute-functions) already uses for kinds. Each operand position carries a **candidate set** of instances that only ever shrinks; each associated type is deposited on its position as an ordinary lower bound once every surviving candidate agrees on it. Order therefore does not matter.
 
-A contribution arriving at a position is one of three things, and each has its own outcome:
+A contribution arriving at a position is one of four things, and each has its own outcome:
 
 | contribution | example | outcome |
 |---|---|---|

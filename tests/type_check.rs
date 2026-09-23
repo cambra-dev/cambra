@@ -302,12 +302,11 @@ fn negation_rejects_an_operand_with_no_instance() {
 
 /// A composite satisfies only a **structural** trait, and only where its components do.
 ///
-/// The tables have no row for a tuple, record or collection — but an absent row is
-/// not by itself a rejection, and for a while it was not one: a composite offers no
-/// base to narrow with, and a comparison has no associated type to leave unresolved,
-/// so `(1, 2) == (3, 4)` type-checked as `Bool` and failed in the interpreter. What
-/// decides it is the distinction between *not determined yet* and *determined, and
-/// not a base* (`Offered` in `src/ccl/infer/solver/traits.rs`): the second is answered
+/// The tables have no row for a tuple, record or collection, and an absent row is not by
+/// itself a rejection: a composite offers no base to narrow with, and a comparison has no
+/// associated type to leave unresolved, so nothing downstream would object either. What
+/// decides it is the distinction between *not determined yet* and *determined, and not a
+/// base* (`Offered` in `src/ccl/infer/solver/traits.rs`): the second is answered
 /// componentwise for `Equatable` ([`products_are_equatable_componentwise`]) and rejected
 /// for every other trait, and a collection has no components to answer with.
 #[rstest]
@@ -355,6 +354,10 @@ fn products_are_equatable_componentwise() {
         (
             "(a=1, b=2) == (a=1, c=2)",
             "different field names are different shapes",
+        ),
+        (
+            "(1, 2) == (a=1, b=2)",
+            "a tuple and a record share no field, so nothing pairs",
         ),
     ] {
         let errs = infer_program_err(program);
@@ -5673,20 +5676,36 @@ fn checked_lookup_on_a_set_is_membership_as_a_value() {
 #[test]
 fn a_product_keys_a_collection() {
     assert_eq!(
-        infer_program("m = map([((1, 2), 10), ((3, 4), 20)])\nm[(1, 2)]?").to_string(),
+        infer_program(indoc! {r#"
+            m = map([((1, 2), 10), ((3, 4), 20)])
+            m[(1, 2)]?
+        "#})
+        .to_string(),
         "{`none | `some{Int}}"
     );
     assert_eq!(
-        infer_program("m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])\nm[(a=1, b=2)]?").to_string(),
+        infer_program(indoc! {r#"
+            m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
+            m[(a=1, b=2)]?
+        "#})
+        .to_string(),
         "{`none | `some{Int}}"
     );
     assert_eq!(
-        infer_program("s = set([(1, 2), (3, 4)])\ns[(1, 2)]?").to_string(),
+        infer_program(indoc! {r#"
+            s = set([(1, 2), (3, 4)])
+            s[(1, 2)]?
+        "#})
+        .to_string(),
         "{`none | `some}"
     );
     // The key still owes the collection's key type.
     assert!(
-        !infer_program_err("m = map([((1, 2), 10), ((3, 4), 20)])\nm[1]?").is_empty(),
+        !infer_program_err(indoc! {r#"
+            m = map([((1, 2), 10), ((3, 4), 20)])
+            m[1]?
+        "#})
+        .is_empty(),
         "a bare Int key must not reach a pair-keyed map"
     );
     // A **wider** key is below that type, records being width-subtyped, so it types and
@@ -5695,7 +5714,11 @@ fn a_product_keys_a_collection() {
     // is the shape agreement the trait states, delivered incrementally at a keyed access
     // the way `Equatable` states it between two operands.
     assert_eq!(
-        infer_program("m = map([((1, 2), 10), ((3, 4), 20)])\nm[(1, 2, 3)]?").to_string(),
+        infer_program(indoc! {r#"
+            m = map([((1, 2), 10), ((3, 4), 20)])
+            m[(1, 2, 3)]?
+        "#})
+        .to_string(),
         "{`none | `some{Int}}",
         "a wider key types; it is the absent case at runtime"
     );

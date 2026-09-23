@@ -862,19 +862,31 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::map_over_tuples(
-    "m = map([((1, 2), 10), ((3, 4), 20)])\nsum([v for v in m])",
+    indoc! {r#"
+        m = map([((1, 2), 10), ((3, 4), 20)])
+        sum([v for v in m])
+    "#},
     Value::Int(30)
 )]
 #[case::map_over_records(
-    "m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])\nsum([v for v in m])",
+    indoc! {r#"
+        m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
+        sum([v for v in m])
+    "#},
     Value::Int(30)
 )]
 #[case::group_by_a_tuple(
-    "g = groupby([(1, 2), (1, 2), (3, 4)], \\x -> x)\nsum([sum([y.1 for y in grp]) for grp in g])",
+    indoc! {r#"
+        g = groupby([(1, 2), (1, 2), (3, 4)], \x -> x)
+        sum([sum([y.1 for y in grp]) for grp in g])
+    "#},
     Value::Int(8)
 )]
 #[case::group_by_a_record(
-    "g = groupby([(a=1, b=2), (a=1, b=2), (a=3, b=4)], \\x -> x)\nsum([sum([y.b for y in grp]) for grp in g])",
+    indoc! {r#"
+        g = groupby([(a=1, b=2), (a=1, b=2), (a=3, b=4)], \x -> x)
+        sum([sum([y.b for y in grp]) for grp in g])
+    "#},
     Value::Int(8)
 )]
 // A component every key shares, which is the ordinary shape of keyed data — every row
@@ -883,14 +895,26 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
 // a refinement at the invariant position (`src/ccl/design/type-inference.md`, "An
 // invariant position reads both sides however the walk reached it").
 #[case::map_over_tuples_sharing_a_component(
-    "m = map([((1, 2), 10), ((1, 4), 20)])\nsum([v for v in m])",
+    indoc! {r#"
+        m = map([((1, 2), 10), ((1, 4), 20)])
+        sum([v for v in m])
+    "#},
     Value::Int(30)
 )]
 #[case::map_over_records_sharing_a_field(
-    "m = map([((a=1, b=2), 10), ((a=1, b=4), 20)])\nsum([v for v in m])",
+    indoc! {r#"
+        m = map([((a=1, b=2), 10), ((a=1, b=4), 20)])
+        sum([v for v in m])
+    "#},
     Value::Int(30)
 )]
-#[case::one_entry_map_over_tuples("m = map([((1, 2), 10)])\nsum([v for v in m])", Value::Int(10))]
+#[case::one_entry_map_over_tuples(
+    indoc! {r#"
+        m = map([((1, 2), 10)])
+        sum([v for v in m])
+    "#},
+    Value::Int(10)
+)]
 fn a_product_keys_a_collection(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -900,10 +924,6 @@ fn a_product_keys_a_collection(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 #[case::present("(1, 2)", Value::Int(10))]
 #[case::absent("(9, 9)", Value::Int(0))]
-// A component every key shares: its type is that component's own singleton rather than the
-// join two distinct values would give, so this is the case that reads a refinement at the
-// invariant position.
-#[case::sharing_a_component("(1, 2)", Value::Int(10))]
 fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
     let code = indoc! {r#"
         m = map([((1, 2), 10), ((3, 4), 20)])
@@ -917,18 +937,20 @@ fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
     check_scalar(&code, expected);
 }
 
-/// A **wider** record compares on the fields the position's type names, whichever operand
-/// carries the extra one.
+/// A column the comparison's type does not name does not reach the answer, whichever
+/// operand carries it.
 ///
-/// Records are width-subtyped, so a value reaching a narrower position keeps its extra
-/// columns at run time. They are not part of the value at that type, and the two operand
-/// orders have to agree about that: reading a one-sided field as a fault aborted the process
-/// in one order while the other answered `equal` without it.
+/// Both operands here are `{a: Int, b: Int}`: typing rejects a comparison between two
+/// different products, and the annotation on `t` is what narrows the argument's type.
+/// The tiling does not narrow with it, so the wider argument's column `c` is still on
+/// the tile at the comparison, and `compare_records` reads the value at its type by
+/// excluding it. Both operand orders are pinned because a one-sided field aborted the
+/// process in one order and answered `equal` in the other.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::wider_on_the_left("t == (a=1, b=2)")]
 #[case::wider_on_the_right("(a=1, b=2) == t")]
-fn a_wider_record_compares_on_the_shared_fields(#[case] comparison: &str) {
+fn a_surplus_column_does_not_reach_the_comparison(#[case] comparison: &str) {
     let code = formatdoc! {r#"
         def f(t: {{a: Int, b: Int}}):
             {comparison}

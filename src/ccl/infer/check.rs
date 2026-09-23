@@ -207,19 +207,41 @@ impl Typing for CheckCtx {
                     .iter()
                     .map(|t| product_components(&strip_refinements(t)))
                     .collect();
-                // Paired on the fields every operand carries. Records are width-subtyped, so
-                // an operand may arrive wider than the position's type, and its extra
-                // columns are not part of the value there — the rule the runtime comparison
-                // follows too (`crate::interpreter::binop`'s `compare_records`).
-                let shared = shapes[0]
+                // The narrowest operand is the product the comparison reads: products are
+                // width-subtyped, so an operand wider than the position's type carries
+                // fields that are not part of the value there, and `compare_records` reads
+                // the same intersection at run time. Two shapes that are not nested pair
+                // nothing — a tuple and a record share no field at all — so without this
+                // the loop below would run zero times and answer `Ok` for a comparison
+                // inference refuses (`traits::narrow_product`). Inference settles one shape
+                // here; the shapes differ only after inlining drops a narrowing annotation
+                // (the vault issue `type-checker-inlining-drops-a-narrowing-annotation`).
+                let narrowest = shapes
                     .iter()
-                    .filter(|f| shapes.iter().all(|s| s.contains(f)));
-                for field in shared {
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.len())
+                    .map(|(i, _)| i)
+                    .expect("a trait has at least one operand");
+                if let Some(position) = shapes
+                    .iter()
+                    .position(|s| !shapes[narrowest].iter().all(|f| s.contains(f)))
+                {
+                    let located = self.raise(InferError::NoTraitInstance {
+                        trait_: trait_.to_string(),
+                        position: position as u8,
+                        found: Box::new((*operand_types[position]).clone()),
+                        accepted: vec![(*operand_types[narrowest]).clone()],
+                        at: at(),
+                    });
+                    self.errors.push(located);
+                    return Ok(assoc.map(|_| fresh_var(self.level)));
+                }
+                for field in &shapes[narrowest] {
                     let at_field: Vec<&Type> = shapes
                         .iter()
                         .zip(&components)
                         .map(|(s, c)| {
-                            let at = s.iter().position(|g| g == field).expect("shared field");
+                            let at = s.iter().position(|g| g == field).expect("nested shapes");
                             &c[at]
                         })
                         .collect();
