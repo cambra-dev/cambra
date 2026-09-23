@@ -312,27 +312,35 @@ impl CommitEngine {
     }
 }
 
-/// Why draining a computed-init producer yielded no value — distinguishes a
-/// genuinely empty init from one that never settled, so the caller can report
-/// the right diagnosis (the two are otherwise indistinguishable from a bare
-/// `None`).
+/// Why draining a computed-init producer yielded no value — a scalar that stayed
+/// empty told apart from a producer that yielded no scalar at all, so the panic
+/// names which (the two are otherwise indistinguishable from a bare `None`).
+///
+/// Both ends here are aborts, not reports: every caller of
+/// [`read_initial_scalar`] panics on either, a store's seed being something it
+/// has no way to carry on without.
 enum InitDrainFailure {
-    /// The producer yielded a scalar tile, but it was always empty: the init has
-    /// no value to seed (e.g. a read of an empty collection).
+    /// Every pull yielded an empty scalar.
+    ///
+    /// Two inits arrive here and the drain cannot tell them apart. One has no
+    /// value to give — a read of an empty collection. The other has one and had
+    /// not produced it within [`MAX_INIT_PULLS`]: a fold advances one position
+    /// per pull, so an init reading a fold over more positions than that yields
+    /// an empty scalar on every pull the bound allows.
     Empty,
-    /// The producer never yielded a non-empty scalar within the pull bound. For
-    /// an *acyclic* init that should resolve on the first pull, this means the
-    /// producer isn't converging (or isn't scalar-shaped) — a structural bug.
+    /// The producer yielded no scalar tile at all within the bound, so it is not
+    /// scalar-shaped or is not converging — a structural bug.
     Diverged,
 }
 
 /// Drain a scalar-valued producer to its single value — the tick-0 store value
 /// for a computed init. The producer is acyclic (it never reads the store), so a
 /// non-empty scalar appears on the first pull; the [`MAX_INIT_PULLS`] bound is a
-/// belt-and-braces guard against a producer that never yields. On failure,
-/// distinguishes a genuinely [`InitDrainFailure::Empty`] init (a scalar tile was
-/// produced but stayed empty) from a [`InitDrainFailure::Diverged`] one (no
-/// scalar tile settled within the bound).
+/// belt-and-braces guard against a producer that never yields — and a bound an
+/// init reading a fold over more than [`MAX_INIT_PULLS`] positions exceeds, since
+/// a fold advances one position per pull. On failure, an
+/// [`InitDrainFailure::Empty`] scalar is told apart from a
+/// [`InitDrainFailure::Diverged`] producer that yielded no scalar at all.
 ///
 /// Each pull past the first is preceded by a delivery, the alternation `src/main.rs`
 /// runs. A pull with nothing delivered between is not a step the runtime takes, and an
@@ -410,8 +418,9 @@ fn read_initial_scalar(
         }
         saw_empty_scalar = true;
     }
-    // A scalar that stayed empty across the bound is a genuinely empty init; a
-    // producer that never even yielded a scalar never settled.
+    // A scalar that stayed empty across the bound is an init with no value to
+    // give or one the bound cut short; a producer that never even yielded a
+    // scalar never settled.
     Err(if saw_empty_scalar {
         InitDrainFailure::Empty
     } else {
@@ -419,9 +428,12 @@ fn read_initial_scalar(
     })
 }
 
-/// Pull bound for [`read_initial_scalar`]: an acyclic scalar init resolves on the
-/// first pull, so a small margin is ample; exceeding it means the input isn't
-/// converging (the doc's "a couple of pulls" claim).
+/// Pull bound for [`read_initial_scalar`].
+///
+/// An init that computes nothing resolves on the first pull. One that reads a
+/// fold does not: a fold advances one position per pull, so an init over a
+/// collection of more than this many positions exceeds the bound and the drain
+/// aborts the process where the value it wanted was one more pull away.
 const MAX_INIT_PULLS: usize = 8;
 
 /// The watermark of a store tile's `frontier` predicate (the decode behind
@@ -915,7 +927,8 @@ impl TileOperator for CommitOperator {
             let value = read_initial_scalar(&mut *producer, scheduler).unwrap_or_else(|e| match e {
                 InitDrainFailure::Empty => panic!(
                     "CommitOperator: computed init op for key {key:?} produced an empty scalar \
-                     (no value to seed the tick-0 store)"
+                     on every one of {MAX_INIT_PULLS} pulls — either it has no value to seed \
+                     the tick-0 store, or it reads a fold longer than the bound"
                 ),
                 InitDrainFailure::Diverged => panic!(
                     "CommitOperator: computed init op for key {key:?} never settled to a scalar \
@@ -1338,8 +1351,9 @@ impl TileOperator for InductionStore {
             let value =
                 read_initial_scalar(&mut *producer, scheduler).unwrap_or_else(|e| match e {
                     InitDrainFailure::Empty => panic!(
-                        "InductionStore: init op for accumulator {key:?} produced an empty scalar \
-                     (no value to seed the accumulator)"
+                        "InductionStore: init op for accumulator {key:?} produced an empty \
+                     scalar on every one of {MAX_INIT_PULLS} pulls — either it has no value to \
+                     seed the accumulator, or it reads a fold longer than the bound"
                     ),
                     InitDrainFailure::Diverged => panic!(
                         "InductionStore: init op for accumulator {key:?} never settled to a scalar \
@@ -3241,7 +3255,7 @@ struct TransactDriverProducer {
     /// Absolute rather than a count of the columns the source currently offers:
     /// a column count names a position in a view, so it means nothing to a drive
     /// that did not emit it, and a replacement drive taking over a running
-    /// program would re-attempt every transaction the retired one committed.
+    /// program would re-attempt every transaction its predecessor committed.
     current: usize,
     /// The emitted rows — the attempts in flight, including superseded retries
     /// not yet reclaimed.

@@ -1285,8 +1285,8 @@ fn await_final_of_an_induction_accumulator_rejected() {
     );
 }
 
-/// `@LoadFrom` names a mutable variable of the previous version. The variable it
-/// names belongs to the version this source replaces, so there is nothing for an
+/// `@LoadFrom` names a mutable variable of the predecessor. The variable it
+/// names belongs to the predecessor, so there is nothing for an
 /// expression in that position to evaluate against.
 #[test]
 fn load_from_an_expression_rejected() {
@@ -1408,7 +1408,7 @@ fn load_from_without_a_predecessor_rejected() {
                     n := n + r
             await_final(n)
         "#},
-        "has no previous version to read from",
+        "has no predecessor to read from",
     );
 }
 

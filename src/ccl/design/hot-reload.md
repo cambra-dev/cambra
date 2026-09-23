@@ -13,16 +13,23 @@ is the mechanism that realizes them.
 Three questions decide the design:
 
 - **What may change.** Logic, freely. Endpoints, by addition and by removal. State, by addition — a
-  version may declare a variable the running program does not have, and it starts at its init.
-- **What may not.** The continuity of a value that already exists. A variable the running program
-  holds a value for must be one the new version still declares, at the same type, and one the source
-  tells apart from its siblings; otherwise the reload is refused and the running program is left
-  serving. See [The one guard](#the-one-guard-a-version-must-be-able-to-take-over-the-state).
+  version may declare a variable the predecessor does not have, and it starts at its init.
+- **What may not.** The continuity of a value that already exists. A variable the predecessor
+  holds a value for must be one the new version still declares or loads with `@LoadFrom`, at the
+  same type, and one the source tells apart from its siblings; otherwise the reload is refused and
+  the running program is left serving. See [The one
+  guard](#the-one-guard-a-version-must-be-able-to-take-over-the-state).
 - **What survives.** Every `Let` binding, `Transact` store and iteration input whose computation is
   unchanged, and every variable's value whether or not its store was rebuilt.
 
 The entry point is `LiveProgram::reload` in `src/live_program.rs`. Computing the difference between
 two programs is [diffing.md](diffing.md); this doc covers what a reload does with it.
+
+**The predecessor** is the version a reload replaces. One name, on both sides of the swap: the
+guard reads it before anything is torn down and conversion seeds from it afterwards, and a sentence
+that needed the tense would have to say which. **The running program** is the process rather than a
+version of it — it serves whichever version is installed, and a refused reload leaves it serving the
+one it had.
 
 ## How a reload works
 
@@ -58,7 +65,7 @@ after conversion, which relocates the root and leaves the root's recorded operat
 Conversion consults the correspondence at three places: every `Let` binding
 (`OpConversionContext::bind_let`), every store (`OpConversionContext::bind_store`) and every
 writer's iteration input (`OpConversionContext::iteration_input`). Each records what it built under
-the node it built it from, so the replacement finds the previous version's operator at its own
+the node it built it from, so the replacement finds the predecessor's operator at its own
 node's correspondent and branches the fan-out behind it instead of building one.
 
 A fan-out is what carries a producer across a version, and it is the only thing that can. It owns
@@ -146,7 +153,7 @@ That test is also what catches a kept region losing what it holds. Keeping a reg
 into it, so nothing inside reaches `bind_let`, `bind_store` or `iteration_input` to be recorded, and
 the next version would find nothing at those nodes. `OpConversionContext::keep_region` records it
 instead, by walking the kept subtree: the region corresponds `Content::Same` throughout, so what it
-holds is whatever the previous version recorded at a corresponding node.
+holds is whatever the predecessor recorded at a corresponding node.
 
 ## Stores are bindings too
 
@@ -211,7 +218,7 @@ fail.
 
 ## The one guard: a version must be able to take over the state
 
-`LiveProgram::reload` compares the variables the running program holds against those the new version
+`LiveProgram::reload` compares the variables the predecessor holds against those the new version
 declares, read off its planned tree (`OpConversionContext::state_conflicts`). Six things are
 refused:
 
@@ -229,7 +236,7 @@ refused:
   while one still present under a different variable has moved (`site_moved`). Refused rather than
   followed, because nothing in the source says which declaration the value belongs to — the refusal
   names both and says that binding each call site to a name is what makes the edit carry.
-- **A `@LoadFrom(x)` where the running program declares `x` more than once under one chain.** The
+- **A `@LoadFrom(x)` where the predecessor declares `x` more than once under one chain.** The
   same move with the load's own edit in the way. A load edits the body of every site it sits in, so
   no site's content survives for `site_moved` to match, and pairing the sites with the declarations
   by position would carry the swap unremarked. The remedy is the same one: naming each call site
@@ -237,7 +244,7 @@ refused:
 - **A `@LoadFrom(x)` naming a variable nothing holds.** There is nothing to read: a first
   compilation has no predecessor at all, and otherwise no variable of that spelling is in scope at
   that point in the version being replaced.
-- **A `@LoadFrom(x)` naming a variable the running program has decided no value for.** A store
+- **A `@LoadFrom(x)` naming a variable the predecessor has decided no value for.** A store
   nothing reads is never driven, so it declares its variables and hands on nothing. Reported apart
   from the refusal above because the name addresses a real variable and the source is right about
   where its value goes: what is missing is the value.
@@ -264,12 +271,12 @@ routes the pass bound against those the registry holds and unregisters the diffe
 address answers 404.
 
 A request that arrived before the unregister has no version left to answer it, and retirement
-answers it with the same 404. The source holding such a request outlives the route: a retired
-version's operators sit in the next compilation's inheritance and reach the source through it, so
-nothing else ends the client's wait. `DataSourceDomainExtentImpl::answer_in_flight` drains both
-stages a request waits at — the dispatcher's channel, before the source has accepted it, and the
-shared pending map, after — so the stage a request happened to reach does not decide what its client
-sees. `a_request_that_arrived_before_its_route_was_retired_is_answered` pins it.
+answers it with the same 404. The source holding such a request outlives the route: a predecessor's
+operators sit in the next compilation's inheritance and reach the source through it, so nothing else
+ends the client's wait. `DataSourceDomainExtentImpl::answer_in_flight` drains both stages a request
+waits at — the dispatcher's channel, before the source has accepted it, and the shared pending map,
+after — so the stage a request happened to reach does not decide what its client sees.
+`a_request_that_arrived_before_its_route_was_retired_is_answered` pins it.
 
 Retiring belongs to installing a version, not to compiling one, and it runs in `compile_program`
 rather than in `run_frontend` for that reason. A diff compiles the new version against the running
@@ -288,20 +295,24 @@ dispatcher thread and unblocks the thread on drop, so the thread's own shutdown 
 
 ## Seeding a variable from the value the predecessor held
 
-`@LoadFrom(x)` binds a declaration to the value the retired version held for the mutable variable
-`x`, so a version that renames or retires a variable can still take its value over
-([chl-spec §8.8](../../../docs/chl-spec.md#88-loadfrom) states the language rule). Silence still
-means inherit: a variable the new version declares under the same identity takes the value it held
-whether or not anything names it.
+`@LoadFrom(x)` binds a declaration to the value the predecessor held for the mutable variable `x`,
+so a version that renames or retires a variable can still take its value over ([8.8
+`@LoadFrom`](../../../docs/chl-spec.md#88-loadfrom) states the language rule, and
+`a_retired_variable_seeds_its_replacement` and
+`an_induction_accumulator_carries_into_its_replacement` pin the two domains). Silence still means
+inherit: a variable the new version declares under the same identity takes the value it held
+whether or not anything names it, and doing both leaves the two running on separate values
+(`a_loaded_variable_may_stay_declared`).
 
 Started from nothing, a source containing `@LoadFrom(x)` is a compile error naming `x`, so a version
-containing one is an upgrade of a specific predecessor. The predecessor today is the in-process
-`Inheritance`, which is what stops such a version being redeployed into a fresh environment, a new
-region, or CI. A durable store would be a second kind of predecessor, and durable state is
-[Sketched](../../../docs/design.md); which predecessors a load may name is settled there rather than
-here. The remedy meanwhile is the version the author needs anyway — the one with the migration taken
-out, which retires nothing further because a name loaded and not declared is gone after the version
-that loaded it.
+containing one is an upgrade of a specific predecessor
+(`a_version_loading_state_is_not_a_cold_start`, `a_migrating_version_does_not_reload_onto_itself`).
+The predecessor today is the in-process `Inheritance`, which is what stops such a version being
+redeployed into a fresh environment, a new region, or CI. A durable store would be a second kind of
+predecessor, and durable state is [Sketched](../../../docs/design.md); which predecessors a load may
+name is settled there rather than here. The remedy meanwhile is the version the author needs anyway
+— the one with the migration taken out, which retires nothing further because a name loaded and not
+declared is gone after the version that loaded it.
 
 Lowering erases the decorator: the statement becomes a `let` bound to `TypedExprNode::LoadFrom`, a
 leaf holding the source's own spelling and resolved at operator conversion. That is `Source`'s
@@ -314,12 +325,17 @@ A loaded value whose extent is a function is built with `Constant::collection`, 
 sealed function (`src/interpreter/design-operators.md`, "Tile Operators") rather than as a bindings
 table a consumer applies. Which of the two a value is cannot be read off the value, so the site
 holding it is the site that says. That is what lets a comprehension iterate a loaded collection, and
-so what makes a unit change on persisted state a declaration.
+so what makes a unit change on persisted state a declaration
+(`a_loaded_collection_is_transformed_into_its_replacement`,
+`a_loaded_record_valued_collection_is_transformed_into_its_replacement`). The guard holds the
+precondition that goes with it: a value at a function extent that tabulates nothing is refused
+before teardown, `Constant::collection` having nothing to tile and conversion no running program
+left to refuse on behalf of.
 
 ### Which variable a site addresses
 
 A site has two names in play. The **loaded spelling** is the `x` of `@LoadFrom(x)`, a variable of
-the retired version. The **target** is the binding the
+the predecessor. The **target** is the binding the
 decorated declaration introduces, a variable of the new version:
 
 ```python
@@ -328,20 +344,30 @@ qty_units: Int      # `qty_units` is the target
 ```
 
 `state_identities` assigns declarations and load sites their addresses in one walk, so the two
-cannot disagree about what the binding chain at a point is. A declaration's address is the chain
-enclosing it (`VarPath`); a site's is read off the same chain and then resolved outward, the way a
-name resolves in the source — the innermost enclosing chain holding a variable of that spelling
-wins. Outward means the site's own chain and the chains enclosing it, and never a chain below one of
-those: a load inside a stateful function's body finds the `` `a`.`total` `` of its own
-instantiation, while the same spelling written at the top level reaches nothing, `` `a`.`total` ``
-sitting under a binding the top level's chain does not contain. A diagnostic names the spelling
-alone, which is what the source contains.
+cannot disagree about what the binding chain at a point is. One walk per tree, rather than one per
+reload: the guard reads the planned tree and conversion reads the tree it builds from, and their
+answers agree because an address is the chain, the spelling and the position among siblings, none of
+which the walk's order decides.
+
+A declaration's address is the chain enclosing it (`VarPath`); a site's is read off the same chain
+and then resolved outward, the way a name resolves in the source — the innermost enclosing chain
+holding a variable of that spelling wins. Outward means the site's own chain and the chains
+enclosing it, and never a chain below one of those: a load inside a stateful function's body finds
+the `` `a`.`total` `` of its own instantiation, while the same spelling written at the top level
+reaches nothing, `` `a`.`total` `` sitting under a binding the top level's chain does not contain
+(`a_load_resolves_outward_through_the_bindings_around_it`,
+`a_load_inside_an_instantiation_reaches_its_own_variable`,
+`a_top_level_load_does_not_reach_inside_an_instantiation`). A branch is no segment either, so a load
+in an `if` or a `match` arm resolves against the chain around the branch
+(`a_load_reads_the_enclosing_chain_from_inside_a_branch`). A diagnostic names the spelling alone,
+which is what the source contains.
 
 The target contributes no chain segment. A segment comes from descending into a binding's
 definition, and a load's definition is the leaf alone, so nothing is ever declared under the target
-and a segment for it would address nothing. Pushing it would also move the search's innermost
-candidate onto a variable no source can mean: a predecessor that had declared the loaded spelling
-inside an instantiation bound to the target's own spelling.
+and a segment for it would address nothing (`a_load_is_not_addressed_under_the_binding_it_seeds`).
+Pushing it would also move the search's innermost candidate onto a variable no source can mean: a
+predecessor that had declared the loaded spelling inside an instantiation bound to the target's own
+spelling.
 
 A chain declaring the spelling once answers whichever site asks — one declaration of an enclosing
 scope, reached by a site per instantiation. A chain declaring it more than once is refused. Those
@@ -349,12 +375,17 @@ declarations are the anonymous call sites of one stateful function, told apart b
 and a load carries no position that confirms one: `site_moved` catches a declaration moving between
 such positions by the retired site's content, and a load has edited that content at every site it
 sits in. Pairing site 𝑖 with declaration 𝑖 would hand each site its neighbour's value on a reorder.
-Binding each call site to a name gives the load a chain that resolves, and the refusal says so.
+Binding each call site to a name gives the load a chain that resolves, and the refusal says so,
+naming every declaration the spelling reached (`a_load_inside_a_duplicated_body_is_refused`,
+`a_reordered_call_site_under_a_load_is_refused`).
 
-Resolution reads what the retired version **declared**, not what it currently holds a value for. A
-store the running program never drove holds no value while still being the variable the name means,
+Resolution reads what the predecessor **declared**, not what it currently holds a value for. A
+store the predecessor never drove holds no value while still being the variable the name means,
 so answering from the values would report such a name as addressing nothing and refuse the version
-for dropping a variable it says where to put.
+for dropping a variable it says where to put. A name no declaration answers is refused for reading
+what nothing holds, which is what a load naming a feed gets
+(`a_load_naming_a_feed_has_no_variable_to_read`), and a variable declared but never driven is
+refused for holding nothing rather than for being gone (`an_undriven_store_has_no_value_to_load`).
 
 ### A loaded value summarizes positions
 
@@ -368,14 +399,21 @@ Whether a rebuilt store resumes above the positions its seed summarizes or begin
 question about the seed rather than about the variable. An ordinary reload can answer it by
 identity, because a variable that carries its own value carries its own positions with it; a load
 breaks that coincidence, the target's identity being new while the value it starts at is one the
-retired version folded positions into. So `continues` reads the nodes the `@LoadFrom` leaf reaches
+predecessor folded positions into. So `continues` reads the nodes the `@LoadFrom` leaf reaches
 (`is_a_load`) as well.
 
 Answered per store rather than per key, because one store drives one position sequence: a key added
 beside one that resumes begins wherever that store resumes. What it resumes over follows
 [A variable that begins above its loop's input](#a-variable-that-begins-above-its-loops-input)
 unchanged: the kept iteration where the loop reads the same collection, a fresh fold of the whole
-collection where it reads another.
+collection where it reads another
+(`a_load_does_not_refold_the_positions_its_value_summarizes` sweeps both at every cut).
+
+Which is why a seed and the store it seeds are sequenced the same way. The two collections a pair of
+loops read need not be the same one — where they are the drive resumes, and where they are not the
+new collection folds whole on top of the seed. A commit count is neither: there is no source the two
+could correspond over, so nothing places it among a loop's items, and the guard refuses the crossing
+(`a_load_may_not_seed_a_store_over_another_domain`).
 
 ### Typing
 
@@ -409,7 +447,7 @@ holds a weak reference.
   a version; the subscriptions against it do not. A strong registration would keep every operator
   any version ever subscribed alive and being notified.
 - **Sink dispatch.** `SinkConsumer::detach` clears the producer slot at teardown. Dropping the
-  compiled outputs does not end a replaced version's dispatch on its own: an operator the next
+  compiled outputs does not end a predecessor's dispatch on its own: an operator the next
   version carries forward still holds the notification closure that reaches the old sink consumers,
   so they would keep being woken and keep writing to sinks the new version now owns. Clearing the
   slot also drops the operators behind it, which is what lets the fan-outs they subscribed to see
@@ -431,7 +469,7 @@ input chain does not. Two readers sit inside.
   hold it by `FanOut::recurrence_branch`. Either read happens only while the fan-out is pulling the
   chain the reader sits in, so the fan-out is alive for the whole of it.
 
-This is what frees a retired version's operators, and the release bookkeeping depends on their being
+This is what frees a predecessor's operators, and the release bookkeeping depends on their being
 freed: a source hands back a producer's release record from that producer's `Drop`, so one that
 outlives its version goes on constraining the agreement from where it stopped, and the next version
 is offered what the retired one already committed —
@@ -451,7 +489,7 @@ is offered what the retired one already committed —
 4. `GlobalContext::retire_version` moves the retiring conversion context's operators and stores into
    the next compilation's inheritance.
 5. Compile and subscribe the new version against the same registry, which now binds every endpoint
-   the retired version left open, and opens the ones it adds. This compile diffs its own tree
+   the predecessor left open, and opens the ones it adds. This compile diffs its own tree
    against the running version's (`compile_replacement`, `CompiledProgram::ast`) to get the
    correspondence reuse is keyed on.
 6. Notify each sink, so whatever is already available is pulled.
@@ -496,7 +534,7 @@ taken against either would name nodes the built graph was not built from.
 ## Rebuilding a store resumes it
 
 A rebuilt store does not restart its variables from the inits the source declares. Each one resumes
-from the value the retired version left it holding, so editing a loop changes what it does next
+from the value the predecessor left it holding, so editing a loop changes what it does next
 without discarding what it had accumulated. Editing how a guestbook formats an entry leaves the
 entries it already recorded as they were and formats the next one the new way.
 
@@ -572,7 +610,7 @@ Three things decide where a rebuilt store picks up, and only two of them are han
   The positions the predecessor decided are not re-decided and are not re-read: the resumed store
   seeds tick `0` with the value handed over, so a reader enumerating the whole collection reads that
   value for them. A fold caught partway is where this is visible — the elements below the swap keep
-  what the retired version decided and the rest are the new one's
+  what the predecessor decided and the rest are the new one's
   (`a_fold_interrupted_partway_resumes_at_the_position_it_reached`).
 
   A transaction's drive counts in its writer's iteration input and takes a kept one's position from
@@ -612,7 +650,7 @@ its input can offer are one question. The answer is per variable rather than per
 drives one position sequence, and a store's variables share it.
 
 A variable **carrying a value** has had every position that value summarizes folded into it. Its
-loop takes the iteration the retired version was running and starts one above what that iteration
+loop takes the iteration the predecessor was running and starts one above what that iteration
 released (`FanOut::released_position`), so no element is folded twice — which is compatibility,
 [semantics.md](/docs/operational-semantics/semantics.md#4-reload), property 1.
 
@@ -653,7 +691,7 @@ the input reads a source), and
 - **Reuse across a change of shape.** Reuse is all-or-nothing per node: the correspondence records
   `Content::Same` matches, so a term that changed at all is rebuilt whole. Nothing recognizes that
   an edited term still computes most of what it did.
-- **Run both versions.** The replaced version is dropped. Running two versions concurrently over
+- **Run both versions.** The predecessor is dropped. Running two versions concurrently over
   shared state is a separate model.
 - **Reuse at every node.** Reuse needs a fan-out at the node to be reused, because a fan-out is the
   only thing that carries a producer across a version, and one is placed where a `Let` already needs
@@ -686,6 +724,13 @@ Everything that leaves the state takeable. Measured across the shapes an edit ca
 | A variable moves to a loop over a fixed collection | Accepted; same as above — the value seeds and the collection folds on top of it |
 | The body of a loop over a fixed collection is edited | Accepted; the fold resumes at the position it had reached, so the new rule governs the elements left |
 | The collection itself is edited | Accepted; the edited collection is a different computation, so its iteration is rebuilt and the collection folded whole |
+| A variable is renamed and the new declaration loads it | Accepted; the new variable starts at a copy of the value taken at the swap, and the old name is not a drop, the source having said where its value goes |
+| A variable is declared and loaded from at once | Accepted; the old variable runs on its own value and the new one starts at a copy. They are separate variables from then on, and neither reads the other |
+| `@LoadFrom(x)` where no predecessor holds `x`, a cold start included | Refused, naming the spelling. There is no `@LoadFrom(x, default)`: a default turns the refusal back into a silent wrong answer |
+| `@LoadFrom(x)` where the predecessor declares `x` and never drove its store | Refused, saying the value is missing rather than the variable. A store nothing reads decides no value to hand on |
+| `@LoadFrom(x)` where the chain declares `x` more than once | Refused, naming every declaration the spelling reached and saying to bind each call site to a name. A load edits the body of every site it sits in, so no site's content survives to tell them apart |
+| `@LoadFrom(x)` annotated at a shape the predecessor does not hold `x` at | Refused, naming both shapes. The annotation is what the value is read at, so it states the whole of what is held rather than the part this version uses |
+| `@LoadFrom(x)` seeding a store whose positions are counted in another domain | Refused, naming both domains. A commit count is no place among a loop's items |
 
 A request a surviving route delivers is therefore answered by exactly one version, and a request
 buffered before the swap is answered after it: the buffer belongs to the source rather than to

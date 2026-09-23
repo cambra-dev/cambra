@@ -21,7 +21,7 @@ use crate::serving::{
 /// collection whole.
 ///
 /// The added loop starts at the value it declares, which summarizes no position,
-/// so the elements the running program has read are elements it still has to
+/// so the elements the predecessor has read are elements it still has to
 /// read. The collection is a list literal, so a fresh iteration over it is the
 /// same collection and the reload builds one.
 ///
@@ -177,12 +177,12 @@ fn a_loop_added_over_a_buildable_collection_reports_nothing() {
 ///
 /// The complement of
 /// `a_loop_that_cannot_read_its_collection_from_the_start_is_reported`, and what
-/// keeps the report from being incidental. There the previous version had a
+/// keeps the report from being incidental. There the predecessor had a
 /// store folding that input, so a correspondence names how far it got. Here it
 /// had a stateless loop over `/q`, which records nothing at that node — and the
 /// request already answered is just as gone. The report reads where the loop
 /// will begin off the source itself in that case ([`source_start`]), so which
-/// shape the previous version had does not decide whether the author is told.
+/// shape the predecessor had does not decide whether the author is told.
 ///
 /// `a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source` is the same
 /// reload, asserting what the two variables come to hold.
@@ -494,7 +494,7 @@ fn moving_a_program_to_another_port_keeps_its_state() {
 /// A transactional variable survives an edit to the writer that commits it.
 ///
 /// The commit store is rebuilt, because the edit is inside its recurrence, and
-/// resumes `latest` from the value the retired version had committed. The read
+/// resumes `latest` from the value the predecessor had committed. The read
 /// endpoint is untouched throughout, so a `GET` before any further write is
 /// asking the resumed store directly.
 ///
@@ -1109,7 +1109,7 @@ fn a_migrating_version_does_not_reload_onto_itself() {
     );
 }
 
-/// `@LoadFrom(x)` for a variable no running program holds is refused, and the
+/// `@LoadFrom(x)` for a variable no predecessor holds is refused, and the
 /// running program keeps serving.
 #[test]
 fn a_reload_may_not_load_a_variable_nothing_holds() {
@@ -1136,7 +1136,7 @@ fn a_reload_may_not_load_a_variable_nothing_holds() {
     assert_eq!(still_serving, vec!["bob"], "state intact");
 }
 
-/// Reading a loaded value at a type the running program does not hold it at is
+/// Reading a loaded value at a type the predecessor does not hold it at is
 /// refused, by the comparison a declaration gets.
 #[test]
 fn a_reload_may_not_load_a_variable_at_another_type() {
@@ -1284,7 +1284,7 @@ fn a_loaded_record_annotated_at_one_field_is_refused() {
     let rendered = format!("{errors:?}");
     assert!(
         rendered.contains("`@LoadFrom` reads `n`")
-            && rendered.contains("state the whole of what the running program holds"),
+            && rendered.contains("state the whole of what the predecessor holds"),
         "the rejection should name the site and the remedy: {rendered}",
     );
 
@@ -1301,7 +1301,7 @@ fn a_version_loading_state_is_not_a_cold_start() {
 
     let errors = LiveProgram::start(&mut ctx, &source("latest-write-migrated", port), &no_main)
         .err()
-        .expect("there is no previous version to read `latest` from");
+        .expect("there is no predecessor to read `latest` from");
     let rendered = format!("{errors:?}");
     assert!(
         rendered.contains("`@LoadFrom(latest)`")
@@ -1407,7 +1407,7 @@ fn a_map_valued_variable_carries_whole() {
 ///
 /// A comprehension over a map binds each value and keeps the domain, so scaling
 /// every quantity is a value-only transformation over the loaded collection.
-/// Both the seed's keys and the one the retired version wrote survive it.
+/// Both the seed's keys and the one the predecessor wrote survive it.
 #[test]
 fn a_loaded_collection_is_transformed_into_its_replacement() {
     // Whole units.
@@ -1443,7 +1443,7 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
         .expect("the migration is a declaration, and the compiler takes it");
 
     // `xrp` is absent: the writer's one position is committed into the value that
-    // was loaded, so it does not fire again. Its key is one the retired version
+    // was loaded, so it does not fire again. Its key is one the predecessor
     // never wrote, which is what makes a replay visible here rather than masked
     // by an overwrite landing on the same value.
     assert_eq!(
@@ -1453,7 +1453,7 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
             ("eth".to_string(), 10000),
             ("sol".to_string(), 30000),
         ],
-        "every quantity the retired version held is scaled, and nothing is replayed",
+        "every quantity the predecessor held is scaled, and nothing is replayed",
     );
 }
 
@@ -1553,7 +1553,7 @@ fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
     live.reload(&mut ctx, v2, &no_main)
         .expect("the migration is a declaration, and the compiler takes it");
 
-    // Every field of every entry the retired version held survives the transform,
+    // Every field of every entry the predecessor held survives the transform,
     // and `xrp` is absent for the same reason it is in the scalar-valued case: the
     // writer's one position is committed into the value that was loaded.
     assert_eq!(
@@ -1626,8 +1626,8 @@ fn a_collection_load_naming_nothing_is_refused() {
 ///
 /// The value carries whole or not at all, so what a migration may change is the
 /// units, not the type they are kept in. `held <: Map(String, String)` compiles
-/// and its comprehension typechecks; the refusal comes from the extent the running
-/// program holds `qty` at, which neither annotation mode reaches.
+/// and its comprehension typechecks; the refusal comes from the extent the
+/// predecessor holds `qty` at, which neither annotation mode reaches.
 #[test]
 fn a_bounded_annotation_does_not_weaken_a_collections_shape_check() {
     let v1 = indoc! {r#"
@@ -1818,7 +1818,7 @@ fn both_directions_of_refusal_are_reported_together() {
     );
 }
 
-/// A variable the running program declares but has decided no value for is not a
+/// A variable the predecessor declares but has decided no value for is not a
 /// variable a load can take, and saying so is not the same as saying it is gone.
 ///
 /// A store nothing reads is never driven, so it hands on nothing. The version is
@@ -2010,7 +2010,7 @@ fn a_load_is_not_addressed_under_the_binding_it_seeds() {
 /// A load does not make its loop re-read what the loaded value already counted,
 /// at any cut the fold admits.
 ///
-/// The value a load carries summarizes the positions the retired version folded
+/// The value a load carries summarizes the positions the predecessor folded
 /// into the variable it came from, so the store built around it continues a
 /// recurrence rather than beginning one — whatever the identity of the variable
 /// it seeds. Sweeping the cut pins that at every prefix rather than at one.
@@ -2093,7 +2093,7 @@ fn a_load_does_not_refold_the_positions_its_value_summarizes() {
     }
 }
 
-/// A version that stops declaring a variable the running program is holding a
+/// A version that stops declaring a variable the predecessor is holding a
 /// value for is rejected, and the running program keeps serving.
 ///
 /// This is the whole endpoint/state guard: dropping a value is the one outcome
@@ -2356,7 +2356,7 @@ fn two_transaction_groups_keep_their_state_apart() {
 ///
 /// What this pins is the count, not which version answers: the request is
 /// accepted by the listener and nothing pumps the scheduler until after the
-/// reload, so whether the retired version read it before going depends on the
+/// reload, so whether the predecessor read it before going depends on the
 /// dispatcher, and either way it must be answered and counted once. A replay
 /// would read `alice` twice, which the second assertion catches.
 ///
@@ -2368,7 +2368,7 @@ fn two_transaction_groups_keep_their_state_apart() {
 /// `two_loops_may_swap_which_source_they_read`,
 /// `a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source`, and
 /// `UIntStreamBuffer`'s unit tests. `a_version_installed_mid_fold_is_pulled_without_a_new_arrival`
-/// is the case where the retired version demonstrably decided a prefix first.
+/// is the case where the predecessor demonstrably decided a prefix first.
 #[test]
 fn a_request_that_arrived_before_the_swap_is_answered_after_it() {
     let port = reserve_test_port();
@@ -2379,7 +2379,7 @@ fn a_request_that_arrived_before_the_swap_is_answered_after_it() {
     // Long enough for the dispatcher thread to have taken the request off the
     // socket. Nothing has pumped, so no reply exists. One poll would finish this
     // request outright rather than catching it partway — `/sign` is one step —
-    // which is why establishing that the retired version decided a prefix needs
+    // which is why establishing that the predecessor decided a prefix needs
     // the twenty-element fold `a_version_installed_mid_fold_is_pulled_without_a_new_arrival`
     // uses.
     thread::sleep(Duration::from_millis(300));
@@ -2410,7 +2410,7 @@ fn a_request_that_arrived_before_the_swap_is_answered_after_it() {
 /// A request that arrived before its route was retired is answered 404.
 ///
 /// The regression this pins: a retired route's source is kept alive past the
-/// route by the handover the retired version's operators sit in, so
+/// route by the handover the predecessor's operators sit in, so
 /// a request already in flight was neither replied to nor dropped, and the
 /// client waited for the life of the process. Retirement answers it instead,
 /// with the same 404 the address now gives —
@@ -2588,7 +2588,7 @@ fn a_program_can_be_reloaded_repeatedly() {
 ///
 /// The record is handed back from the producer's `Drop`
 /// (`DataSourceDomainExtentImpl::retire_producer`), so this passes only while a
-/// retired version's operators are actually freed. Two back-edges used to keep
+/// predecessor's operators are actually freed. Two back-edges used to keep
 /// them alive: a fan-out's notification closure held its own shared state, and a
 /// store's driver and writer owned the fan-out whose input chain contains them
 /// (`FanHold`). `a_retired_producer_stops_holding_the_agreement` pins the
@@ -3166,7 +3166,7 @@ fn decided_by_the_new_version(reply: &str) -> Vec<bool> {
 /// reloaded term's terminal tile as each version restricted to the part of the
 /// extent it decided.
 /// Sweeping the cut pins that equation rather than one instance of it: at every
-/// one, each element is folded exactly once, the retired version decided a prefix,
+/// one, each element is folded exactly once, the predecessor decided a prefix,
 /// and the new version decided the rest.
 ///
 /// Drives the program's value directly rather than through a sink, because that
@@ -3239,9 +3239,9 @@ fn a_fold_interrupted_partway_resumes_at_the_position_it_reached() {
 /// An operator notifies from inside `subscribe` — an induction store does, to
 /// start its loop — and a sink consumer whose producer slot is not filled yet
 /// drops that notification. A first compile does not notice, because the source
-/// that has data reports it as new on the next poll. A replacement does: the
-/// version it replaces already took that report, so the request in flight here
-/// went unanswered until another arrived.
+/// that has data reports it as new on the next poll. A replacement does: its
+/// predecessor already took that report, so the request in flight here went
+/// unanswered until another arrived.
 ///
 /// Where the fold is cut is a property of one notification round rather than
 /// anything the language promises, so this pins the invariant — every element
@@ -3290,10 +3290,10 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
     // fold started is pulled", which the assertions above would still satisfy:
     // the single poll would have advanced nothing, every element would be the
     // new version's, and `resumed_at` would be `0`. The precondition it needs is
-    // that the retired version decided something.
+    // that the predecessor decided something.
     assert!(
         resumed_at > 0,
-        "the fold was caught partway, so the retired version decided a prefix: {value}",
+        "the fold was caught partway, so the predecessor decided a prefix: {value}",
     );
 }
 
@@ -3347,7 +3347,7 @@ fn a_filtered_fold_resumes_at_a_position_of_the_collection_it_filters() {
     let value = drive_main_to_terminal(&mut ctx, &mut live);
     assert_eq!(
         value, "rs!t!",
-        "the filter keeps `r`, `s` and `t`; the first is the retired version's and \
+        "the filter keeps `r`, `s` and `t`; the first is the predecessor's and \
          the rest are the new one's",
     );
 }
@@ -3866,10 +3866,10 @@ fn a_load_inside_a_duplicated_body_is_refused() {
     let rendered = format!("{errors:?}");
     assert!(
         rendered.contains(
-            "`@LoadFrom(total)` names several declarations that are told apart \
-                           only by where they appear"
+            "`@LoadFrom(total)` names `total`, `total` (#1), which are told apart only by \
+             where they appear"
         ),
-        "the refusal names the spelling, got {rendered}",
+        "the refusal names both declarations, got {rendered}",
     );
     assert!(
         rendered.contains("Bind each of those declarations to its own name"),
@@ -4025,7 +4025,7 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
 }
 
 /// A store this reload builds does not seed an accumulator from a binding the
-/// retired version released in full.
+/// predecessor released in full.
 ///
 /// `bind_let` rebuilds a binding whose subscribers released it in full, and this is
 /// the case that rebuild is for. `base` is read by the accumulator's init and by
@@ -4137,5 +4137,142 @@ fn an_exact_annotation_on_a_loaded_collection_names_what_differs() {
     assert!(
         rendered.contains("WitnessRef("),
         "and the divergence it quotes is the binder identity, got {rendered}",
+    );
+}
+
+/// A load may not seed a store whose positions are counted in another domain.
+///
+/// A store resumes above the positions its seed summarizes, so the seed has to
+/// have been counted in the sequence the store drives. A commit count is not a
+/// place among a loop's items: there is no source the two could correspond over,
+/// and so nothing that says where the loop should start.
+///
+/// The contrast is two loops, which is accepted at any pair of extents — where
+/// they read the same source the drive resumes, and where they do not the new
+/// source folds whole on top of the seed
+/// (`a_load_does_not_refold_the_positions_its_value_summarizes`).
+#[test]
+fn a_load_may_not_seed_a_store_over_another_domain() {
+    let v1 = indoc! {r#"
+        total: Mut(Int, Txn) := 0
+        for c in [1]:
+            with begin():
+                total := total + 5
+        await_final(total)
+    "#};
+    // `total` counts commits; `t` counts the items of `[1, 2, 3]`.
+    let v2 = indoc! {r#"
+        @LoadFrom(total)
+        held: Int
+        t := held
+        for x in [1, 2, 3]:
+            t := t + x
+        t
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 5);
+
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("a commit history cannot seed a loop accumulator");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom` seeds a store over the loop extent")
+            && rendered.contains("whose positions the predecessor counts in commit time"),
+        "the refusal should name both domains: {rendered}",
+    );
+    assert!(
+        rendered.contains("a commit history seeds a commit history"),
+        "the remedy should say what a seed may come from: {rendered}",
+    );
+}
+
+/// A `@LoadFrom` naming a feed is a load naming no variable.
+///
+/// A feed is not a mutable variable, so it declares none and the spelling
+/// addresses nothing — the same refusal a load naming a variable no predecessor
+/// ever declared gets, for the same reason.
+#[test]
+fn a_load_naming_a_feed_has_no_variable_to_read() {
+    let v1 = indoc! {r#"
+        out = defer()
+        n := 0
+        for x in [1, 2]:
+            n := n + x
+            out << n
+        n
+    "#};
+    let v2 = indoc! {r#"
+        @LoadFrom(out)
+        held: Int
+        n: Mut(Int, Txn) := held
+        for c in [1]:
+            with begin():
+                n := n + 1
+        await_final(n)
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 3);
+
+    let errors = live
+        .reload(&mut ctx, v2, &no_main)
+        .err()
+        .expect("`out` is a feed, so it is no variable to load");
+    let rendered = format!("{errors:?}");
+    assert!(
+        rendered.contains("`@LoadFrom(out)` has no variable to read"),
+        "the refusal should name the spelling: {rendered}",
+    );
+}
+
+/// A load in an `if` branch or a `match` arm resolves to the chain around it.
+///
+/// A branch is not a binding, so it contributes no chain segment and the load
+/// reads what the same spelling reads at the statement above it. Both spellings
+/// are accepted, and both read the value the predecessor holds.
+#[rstest]
+#[case::if_branch(
+    indoc! {r#"
+        if True:
+            @LoadFrom(q)
+            held: Int
+            held + 1
+        else:
+            0
+    "#}
+)]
+#[case::match_arm(
+    indoc! {r#"
+        d = `some(1)
+        match d:
+            case `some(v):
+                @LoadFrom(q)
+                held: Int
+                held + v
+            case `none(u):
+                0
+    "#}
+)]
+fn a_load_reads_the_enclosing_chain_from_inside_a_branch(#[case] tail: &str) {
+    const DECLARE: &str = indoc! {r#"
+        q: Mut(Int, Txn) := 7
+        for c in [1]:
+            with begin():
+                q := q + 1
+    "#};
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start(&mut ctx, &format!("{DECLARE}await_final(q)\n"), &no_main)
+        .expect("v1 compiles");
+    assert_eq!(drive_main_int(&mut ctx, &mut live), 8);
+
+    live.reload(&mut ctx, &format!("{DECLARE}{tail}"), &no_main)
+        .expect("a branch takes a declaration, and the load resolves outside it");
+    assert_eq!(
+        drive_main_int(&mut ctx, &mut live),
+        9,
+        "the branch reads what the predecessor holds for `q`",
     );
 }

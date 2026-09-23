@@ -192,7 +192,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         },
 
         // `@LoadFrom(x)` is typed by its context. The value it denotes belongs to
-        // the retired version of the program, which this compilation cannot see:
+        // the predecessor, which this compilation cannot see:
         // it is handed a `HashMap<VarPath, Value>` at operator conversion, long
         // after inference, and a runtime `Value` carries no CCL type to read a
         // shape off. So the node contributes a fresh variable and the expression

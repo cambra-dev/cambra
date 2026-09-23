@@ -444,8 +444,8 @@ impl SourceSinkRegistry {
     /// "this program no longer serves that" should look like from outside.
     ///
     /// A request that arrived before the retirement gets that same 404 rather
-    /// than waiting, because the source holding it outlives the route: a retired
-    /// version's operators reach it through the inheritance they are offered to
+    /// than waiting, because the source holding it outlives the route: a
+    /// predecessor's operators reach it through the inheritance they are offered to
     /// the next compilation in
     /// ([`DataSourceDomainExtentImpl::answer_in_flight`](crate::interpreter::DataSourceDomainExtentImpl::answer_in_flight)).
     fn retire_routes_absent_from(
@@ -639,7 +639,7 @@ impl GlobalContext {
     ///
     /// Call once the running operator graph has been dropped. Each operator a
     /// `Let` binding produced is offered to the next compilation by the identity
-    /// of the term it computes, and the replaced version's subscriptions to it
+    /// of the term it computes, and the predecessor's subscriptions to it
     /// are neutralized ([`OpConversionContext::into_inheritance`]). The source
     /// consumers the scheduler holds go the same way: a source handle outlives a
     /// version, the subscriptions against it do not.
@@ -684,12 +684,22 @@ impl GlobalContext {
         &mut self.inference
     }
 
-    /// Every variable the running program holds that `planned` cannot take over:
+    /// Every variable the predecessor holds that `planned` cannot take over:
     /// one it no longer declares, one it declares at a different type, and one
     /// whose value would move between two declarations the source tells apart
     /// only by where they appear. See [`StateConflict`].
     pub fn state_conflicts(&self, planned: &Expr) -> Vec<StateConflict> {
         self.conversion.state_conflicts(planned)
+    }
+
+    /// Both guard questions about `planned`, off one read of it — see
+    /// [`OpConversionContext::state_report`].
+    pub fn state_report(
+        &self,
+        previous: &Expr,
+        planned: &Expr,
+    ) -> (Vec<StateConflict>, Vec<UnreadablePrefix>) {
+        self.conversion.state_report(previous, planned)
     }
 
     /// Every variable `planned` declares whose loop begins above the beginning of
@@ -2180,7 +2190,7 @@ fn compile_version(
     // tree, so a store is built under the identity `state_conflicts` checked this
     // version against. Both conversion entries below need it.
     ctx.conversion_ctx().set_var_paths(&join_planned);
-    // Where each node of this tree stood in the version it replaces. Every
+    // Where each node of this tree stood in the predecessor. Every
     // decision to keep an operator rather than rebuild it is read off this.
     if let Some(previous) = previous {
         ctx.conversion_ctx()
@@ -2210,7 +2220,7 @@ fn compile_version(
         ops
     })
     .errs()?;
-    // Conversion is over, so what the retired version offered and this one did
+    // Conversion is over, so what the predecessor offered and this one did
     // not take is released here. Holding it any longer keeps the producers under
     // a rebuilt operator alive, and a source goes on retaining data for a
     // producer nobody reads.
@@ -2280,7 +2290,7 @@ fn compile_version(
             // a `SinkConsumer` whose slot is still empty drops those — so the work
             // already available when a version is installed needs a notification
             // of its own. A first compile is carried by the source reporting its
-            // data as new; a *replacement* is not, because the version it replaces
+            // data as new; a *replacement* is not, because the predecessor
             // has already taken that report, so without this a reload lands with
             // unfinished work and nothing pulls it until the next arrival.
             consumer_rc.borrow_mut().notify();

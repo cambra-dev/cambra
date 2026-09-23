@@ -579,7 +579,7 @@ pub enum TypedExprNode {
     /// the appropriate reader operator.
     Source(String),
 
-    /// The value the retired version of this program held for the mutable
+    /// The value the predecessor held for the mutable
     /// variable `x`, written `@LoadFrom(x)` on a declaration in the source.
     ///
     /// A leaf, like [`Self::Source`], and resolved the same way: the name

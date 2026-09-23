@@ -59,7 +59,7 @@ bob
     let after = exchange(&mut ctx, move || vec![http_post(port, "/sign", "carol")]);
     assert_eq!(
         after,
-        // The store is rebuilt, and resumes from the value the replaced version
+        // The store is rebuilt, and resumes from the value the predecessor
         // had reached: the entries it already recorded stand as they were, and
         // the new rule governs from here.
         vec!["alice\nbob\n- carol\n"],

@@ -770,8 +770,8 @@ pub(crate) fn fold(
     // nothing else, whatever its place in the order. Seeding those before the
     // sweep rather than at their place in it is what lets a row name one as an
     // upstream regardless of age: operator conversion rows an operator it took
-    // from the version it replaces against the node that version's replacement
-    // binds it at, and that node is younger than the operator by a whole
+    // from the predecessor against the node this version binds it at, and that
+    // node is younger than the operator by a whole
     // compile. Nothing else about the order relaxes — an id this fold produces
     // is still resolved before anything may name it.
     for &x in &vertices {
