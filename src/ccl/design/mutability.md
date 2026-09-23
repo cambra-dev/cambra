@@ -1209,14 +1209,21 @@ The value-`Case` positions ride the same union-of-restricts:
   one channel per arm — replacing `PartialFeedCaseUnsupported` for guard-only `Case`s. A
   scrutinee / pattern feed stays rejected there; a no-else partial feed is still blocked earlier
   at lowering (bare `if` as a value expression).
-
-  A conditional feed **inside a loop** takes the per-arm refined-source channels instead. One
+- **Loop-sourced conditional feeds** (`if c: good << i else: bad << i` in a `for` body) —
+  *implemented* (`channelize`): each feeding arm becomes a channel over the iteration source
+  restricted to that arm's first-match predicate, rather than the gated `Unit` lift above. One
   `Case` fans out once per deferred collection it feeds, and each pass leaves the arms it did
   not take (`channelize`'s `residual_after_fanout`), so two defers fed from complementary arms
   are two channels over one conditional. The fan-out reads a pattern arm through the
   tag-to-guard rewrite, which puts `variant_is` in the arm's refinement predicate and
   `variant_project` in its channel value; the rewrite runs on a copy, so the arm in the tree
   keeps its scrutinee and its pattern for the next defer's pass to read.
+
+  A conditional feed in a loop has **two representations**, chosen by whether the loop carries a
+  mutable variable. A loop that does reaches `mut_elim`, where a feed becomes a `__to_<defer>_<n>`
+  tap on the writer's decision record whose `fire` is the arm's guard conjunction
+  (`Name::defer_tap_field`), and the `Case` is never fanned out. A loop that does not has only the
+  per-arm channels above. Extending one leaves the other's cases uncovered.
 - **Comprehension over / with a conditional** — *implemented*. A conditional **element**
   (`[a if g(x) else b for x in xs]`) fans the source out by each arm's *element-dependent* gate —
   `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of filtered maps (`fan_out_element_case` in

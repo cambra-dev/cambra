@@ -515,15 +515,11 @@ fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
 /// in the `if`. A fan-out routing an arm's values into the sibling's channel fails here,
 /// which a symmetric read of the two would not.
 ///
-/// Both spellings are listed because the failure differed by spelling and the cause did
-/// not. A `match`'s arms carry patterns, so the whole `Case` reached the source-less
-/// path and was reported as `PartialFeedCaseUnsupported`; an `if`'s arms are guards, so
-/// the same path built a `Unit` gate whose predicate references the loop binder, which
-/// lambda elimination rejected as a non-dependent arrow over a dependent codomain.
-///
-/// The loop with an accumulator compiles either way — the tap on the writer decision is
-/// a different representation of a conditional feed — so these are the cases the per-arm
-/// channel representation owes.
+/// Both spellings are listed because they reach the fan-out by different routes: a
+/// `match`'s arms carry patterns and an `if`'s carry guards. The loop carries no
+/// accumulator, which is what leaves the per-arm channel as the only representation of
+/// this feed (`src/ccl/design/mutability.md`, "Value-selecting `Case` and conditional
+/// induction writes (partially implemented)").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::match_good("good", &[0usize], &[2i64])]

@@ -49,9 +49,9 @@
 //! ([`try_extract_fanout_feed`]). One `Case` fans out once per deferred collection
 //! it feeds, and each pass leaves the arms it did not take for the pass that will
 //! ([`residual_after_fanout`]), so two defers fed from complementary arms are two
-//! channels over one conditional. Only a *source-less* conditional feed (a feeding
-//! `Case` outside any iteration) is rejected, with
-//! `DeferError::PartialFeedCaseUnsupported` (see the `Case` arm of
+//! channels over one conditional. A feeding `Case` outside any iteration becomes a
+//! gated one-shot lift when its arms are guards; only a scrutinee / pattern one is
+//! rejected, with `DeferError::PartialFeedCaseUnsupported` (see the `Case` arm of
 //! [`extract_for_defer`]).
 //!
 //! # Vocabulary
@@ -184,8 +184,9 @@ pub enum DeferError {
     /// A feeding `Case` reached the generic structural recursion — a
     /// conditional feed with no enclosing iteration source to restrict per arm
     /// (the loop-sourced multi-arm case is fanned out at the `Compose` site via
-    /// [`try_extract_fanout_feed`]). A source-less conditional feed
-    /// has no refinement to hang the guard on, so it is rejected rather than
+    /// [`try_extract_fanout_feed`]). A guard-only one becomes a gated one-shot
+    /// lift there, over a `{Unit | π̂ᵢ}` driver; a scrutinee / pattern feed
+    /// cannot be gated by a boolean predicate, so it is rejected rather than
     /// miscompiled. The payload names the defer.
     PartialFeedCaseUnsupported(String),
 }
@@ -229,10 +230,8 @@ impl fmt::Display for DeferError {
 /// same `Case` with that defer's feed arms replaced by `Unit`, and every other arm
 /// left alone.
 ///
-/// A `Case` is fanned out once per defer it feeds, and each pass leaves the arms it
-/// did not take for the pass that will. Collapsing the whole body to `Unit` instead
-/// drops a sibling defer's feeds, which the cluster reports as
-/// [`DeferError::NoFeedOrDefine`].
+/// Collapsing the whole body to `Unit` instead drops a sibling defer's feeds, which
+/// the cluster reports as [`DeferError::NoFeedOrDefine`].
 ///
 /// Rebuilt from the **original** body rather than from the guard form
 /// [`try_extract_fanout_feed`] matched on, so a `match` keeps its scrutinee and its
@@ -293,21 +292,23 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
 /// ordinary arms here, so an `else` that feeds fans out just like a guard arm
 /// (its first-match predicate is `¬⋁ⱼ gⱼ`).
 ///
-/// **An arm feeding another deferred collection is a non-feeding arm here.** One
-/// `Case` fans out once per defer it feeds, each pass extracting its own arms and
-/// leaving the others standing ([`residual_after_fanout`]), so `if c: good << i else:
-/// bad << i` becomes one refined-source channel per defer. Reading such an arm as
-/// unfannable sends the whole `Case` to the generic handling, which reports
-/// [`DeferError::PartialFeedCaseUnsupported`] for a `match` and builds a source-less
-/// gate for an `if` — a gate whose predicate references the loop binder, which lambda
-/// elimination then rejects.
+/// **An arm feeding another deferred collection is a non-feeding arm here**, which is
+/// what leaves `if c: good << i else: bad << i` fannable for either defer.
 ///
 /// Returns each arm's `(guard, feed_value?)` in source order — `feed_value` is
 /// `None` for a non-feeding arm, whose guard still participates in later arms'
 /// predicate synthesis ([`synthesize_arm_predicate`]). Returns `None` (not
 /// fannable) if the trailing guard is not `true` or an arm body is neither a feed
-/// nor `Unit` — so a `Case` mixing feeds with other effects falls through to the
-/// generic handling rather than being silently collapsed.
+/// nor `Unit`.
+///
+/// A `None` on a loop-sourced `Case` has no clean rejection behind it. The generic
+/// handling has no iteration source, so it gates on `Unit` with a predicate over the
+/// loop binder, and the program then dies in compiler internals rather than on a
+/// diagnostic: [`DeferError::PartialFeedCaseUnsupported`] for a `match`, naming the
+/// wrong cause, and for an `if` either lambda elimination's rejection of the gate's
+/// dependent codomain or, when an arm body is itself a conditional, an inference abort
+/// naming an inference variable with no source span. Reaching the generic handling from
+/// a loop is therefore a defect wherever it happens, not a fallback.
 fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Option<Expr>)>> {
     // A `match` arm dispatches on a tag, so it reaches the fan-out as a
     // `Pattern` against a scrutinee. Convert it to the guard form first — the
@@ -2702,6 +2703,16 @@ fn extract_for_defer_impl(
                                     .count(),
                                 "the fan-out extracts and the residual erases the same arms"
                             );
+                            // Every feeding arm composes its own restriction onto a
+                            // clone of this prefix, so N defers off one conditional
+                            // compile to N restricted scans of the same source and N
+                            // evaluations of the guard — with a data source and a UDF
+                            // condition, one UDF call per defer per element. No
+                            // downstream pass collapses the shared prefix. That is the
+                            // accepted cost of giving each defer a channel whose domain
+                            // is its own arms' restriction: the restrictions are
+                            // disjoint by first-match, so there is no one domain the
+                            // arms could share a scan over.
                             let source_prefix = if new_elts.len() == 1 {
                                 new_elts[0].clone()
                             } else {
