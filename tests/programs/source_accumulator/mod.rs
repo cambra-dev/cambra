@@ -7,9 +7,9 @@
 //! never sees.
 //!
 //! Its operator graph is what `tests/inspector_goldens.rs` asserts: the loop's
-//! induction extent is the source's domain, so two `IterateExtent`s read the one
-//! source node — the chain that reads the source's values, and the
-//! `StoreDenseRead` trigger that folds the accumulator over the same extent.
+//! induction extent is the source's domain, so two `IterateExtent`s iterate
+//! stdin's domain. One heads the chain that reads the source's values, and one
+//! triggers the `StoreDenseRead` that folds the accumulator over the same extent.
 //! Every other source program in the gallery has only the first.
 
 use super::common::expect_stdin_program;

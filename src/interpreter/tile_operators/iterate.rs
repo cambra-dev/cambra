@@ -4,7 +4,6 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
 use crate::ccl::TagMap;
-use crate::interpreter::operator_graph::{InputTarget, source as source_edge};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, SharedConsumer,
     UnionArm, Value, scheduler::shared_consumer,
@@ -27,37 +26,10 @@ impl IterateExtent {
             domain: extent.clone(),
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
-        let op = Self {
+        Self {
             base: OperatorBase::new(tiling),
             extent,
-        };
-        op.record_source_reads();
-        op
-    }
-
-    /// Record this operator's read of every source its extent iterates.
-    ///
-    /// The scheduler wakes this operator when the source produces, so it reads
-    /// the source. Recording the read mints the source node this operator's edge
-    /// resolves to; the edge itself comes from `visit_inputs` like every other.
-    /// The read does not attribute that node ([`record_source_iteration`]).
-    ///
-    /// Driven by [`visit_inputs`](TileOperator::visit_inputs) rather than by its
-    /// own walk, so the reads recorded and the edges stated are one list. They
-    /// have to agree: the graph walk resolves each stated source by name and
-    /// asserts a node was minted for it.
-    ///
-    /// The expression comes from the ambient conversion recording, because this
-    /// operator holds no `NodeId` of its own.
-    ///
-    /// [`record_source_iteration`]: crate::interpreter::operator_graph::record_source_iteration
-    fn record_source_reads(&self) {
-        let expr = crate::ccl::provenance::currently_named();
-        self.visit_inputs(&mut |spec| {
-            if let InputTarget::Source(name) = spec.target {
-                crate::interpreter::operator_graph::record_source_iteration(name, expr);
-            }
-        });
+        }
     }
 
     fn add_all_source_handles(
@@ -74,21 +46,7 @@ impl IterateExtent {
 impl TileOperator for IterateExtent {
     impl_operator_base!();
 
-    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
-        // One edge per distinct source, not per reach: the edge says this
-        // operator reads that source, and it says it once. A source is one
-        // registered name, which is also how the graph walk resolves the edge.
-        let mut seen: Vec<String> = Vec::new();
-        self.extent.for_each_source(&mut |source| {
-            let source = source.borrow();
-            let name = source.get_id();
-            if seen.iter().any(|s| s == name) {
-                return;
-            }
-            seen.push(name.to_string());
-            visit(source_edge(name));
-        });
-    }
+    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
     fn subscribe(
         &mut self,

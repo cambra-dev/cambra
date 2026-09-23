@@ -126,14 +126,14 @@ impl Extent {
         found
     }
 
-    /// Every data source this extent reaches, in extent order, duplicates
-    /// included.
+    /// Every data source this extent reaches, duplicates included, with a
+    /// `Record`'s fields in map order.
     ///
     /// The compound arms are the iterable ones: a `Record` cross-product, a
     /// `Union` of arms, a `Restricted` base. Iterating an extent registers a
-    /// wake-up against each source here, states an input edge to each, and hands
-    /// each back its release record when the producer goes. All three read this
-    /// one answer, so no walk can reach an arm the others miss.
+    /// wake-up against each source here, decides from it whether to subscribe, and
+    /// hands each source back its release record when the producer goes. All
+    /// three read this one answer, so no walk can reach an arm the others miss.
     pub fn for_each_source(
         &self,
         f: &mut impl FnMut(&Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
@@ -141,10 +141,7 @@ impl Extent {
         match self {
             Extent::DataSourceDomain(source) => f(source),
             Extent::Record(fields) => {
-                // Canonical field order, not the `HashMap`'s: `visit_inputs`
-                // states these sources as edges, so a per-process order would put
-                // a different edge list on the wire for each run of one program.
-                for (_, field) in crate::util::record_fields_in_order(fields) {
+                for field in fields.values() {
                     field.for_each_source(f);
                 }
             }
@@ -542,45 +539,6 @@ mod tests {
     use super::*;
     use crate::ccl::FieldKey;
     use std::collections::HashMap;
-
-    /// A `Record`'s sources come out in canonical field order, whatever order
-    /// its `HashMap` happens to iterate in this process.
-    ///
-    /// `IterateExtent::visit_inputs` states these as edges, so `HashMap` order
-    /// would put a different `inputs` array on the wire for each run of one
-    /// program, and the cross-process determinism ratchet would start failing
-    /// with nothing in the diff to explain it. No gallery program reaches a
-    /// cross-product over two *distinct* sources, so this is the only thing that
-    /// holds the order.
-    #[test]
-    fn a_record_yields_its_sources_in_canonical_field_order() {
-        use crate::interpreter::{test_source::TestDataSource, tuple_field};
-
-        // Source names run counter to field order, so an alphabetical-by-source
-        // walk is distinguishable from a positional-by-field one.
-        let names = ["ee", "dd", "cc", "bb", "aa"];
-        let fields: HashMap<String, Extent> = names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let source = Rc::new(RefCell::new(TestDataSource::new(
-                    name,
-                    crate::ccl::Type::Base(BaseType::Int),
-                    Extent::Base(BaseType::Int),
-                )));
-                let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = source;
-                (tuple_field(i), Extent::DataSourceDomain(as_domain))
-            })
-            .collect();
-
-        let mut seen = Vec::new();
-        Extent::Record(fields).for_each_source(&mut |s| seen.push(s.borrow().get_id().to_string()));
-
-        assert_eq!(
-            seen, names,
-            "`_0`…`_4` in order, not the map's iteration order"
-        );
-    }
 
     // --- Display tests ---
 

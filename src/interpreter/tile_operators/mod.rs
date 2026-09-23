@@ -26,7 +26,7 @@ use log::trace;
 pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
     ccl::provenance::NodeId,
-    interpreter::operator_graph::{EdgeKind, InputEdgeSpec, InputTarget},
+    interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -142,8 +142,8 @@ pub trait TileOperator {
         }
         let mut children = Vec::new();
         self.visit_inputs(&mut |spec| {
-            if let (EdgeKind::Value { .. }, InputTarget::Operator(op)) = (spec.kind, spec.target) {
-                children.push((spec.role.to_string(), op.inspect(opts)));
+            if let EdgeKind::Value { .. } = spec.kind {
+                children.push((spec.role.to_string(), spec.target.inspect(opts)));
             }
         });
         children

@@ -4369,28 +4369,6 @@
       "kind": "operators",
       "nodes": [
         {
-          "label": "Source(stdin)",
-          "nodeId": 564,
-          "role": "source",
-          "tiling": null,
-          "spans": [
-            {
-              "start": 34,
-              "end": 41
-            },
-            {
-              "start": 77,
-              "end": 84
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.source"
-          },
-          "inputs": []
-        },
-        {
           "label": "IterateExtent",
           "nodeId": 546,
           "role": "operator",
@@ -4406,17 +4384,7 @@
             "nature": "machinery",
             "label": "opconv.convert"
           },
-          "inputs": [
-            {
-              "role": {
-                "kind": "named",
-                "name": "source"
-              },
-              "kind": "share",
-              "deferred": false,
-              "subscribed": 658
-            }
-          ]
+          "inputs": []
         },
         {
           "label": "MapResultWithSource",
@@ -4443,15 +4411,6 @@
               "kind": "value",
               "deferred": false,
               "subscribed": 546
-            },
-            {
-              "role": {
-                "kind": "named",
-                "name": "source"
-              },
-              "kind": "share",
-              "deferred": false,
-              "subscribed": 564
             }
           ]
         },
@@ -4637,17 +4596,7 @@
             "nature": "machinery",
             "label": "opconv.convert"
           },
-          "inputs": [
-            {
-              "role": {
-                "kind": "named",
-                "name": "source"
-              },
-              "kind": "share",
-              "deferred": false,
-              "subscribed": 658
-            }
-          ]
+          "inputs": []
         },
         {
           "label": "MapResultWithSource",
@@ -4674,15 +4623,6 @@
               "kind": "value",
               "deferred": false,
               "subscribed": 553
-            },
-            {
-              "role": {
-                "kind": "named",
-                "name": "source"
-              },
-              "kind": "share",
-              "deferred": false,
-              "subscribed": 564
             }
           ]
         },
@@ -5660,10 +5600,6 @@
           547
         ],
         [
-          214,
-          564
-        ],
-        [
           238,
           549
         ],
@@ -5682,10 +5618,6 @@
         [
           276,
           554
-        ],
-        [
-          276,
-          564
         ],
         [
           300,

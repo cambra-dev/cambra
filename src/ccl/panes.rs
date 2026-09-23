@@ -1115,18 +1115,16 @@ mod tests {
         }
     }
 
-    /// **The graph has both program boundaries**: a sink per compiled output, and
-    /// a source per registered data source that some expression reads.
+    /// **The graph has its output boundary**: a sink per compiled output.
     ///
-    /// Without them the graph begins and ends in the middle of nothing, and a
-    /// reader has no way to tell an output from an operator whose consumer the
-    /// capture missed. Both are pane nodes like any other, so each carries a
-    /// provenance row and resolves to a span.
+    /// Without it the graph ends in the middle of nothing, and a reader has no way
+    /// to tell an output from an operator whose consumer the capture missed. A
+    /// sink is a pane node like any other, so it carries a provenance row and
+    /// resolves to a span.
     #[test]
-    fn the_operator_graph_carries_its_boundary_nodes() {
+    fn the_operator_graph_carries_its_output_boundary() {
         use crate::interpreter::operator_graph::GraphNode;
 
-        let mut saw_a_source = false;
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let graph = &program.operator_graph;
@@ -1149,26 +1147,15 @@ mod tests {
                 .last()
                 .expect("the operator pane's projection");
             for node in graph.nodes() {
-                let (id, what) = match node {
-                    GraphNode::Source { id, name } => (*id, format!("source {name}")),
-                    GraphNode::Sink { id, name, .. } => (*id, format!("sink {name}")),
-                    GraphNode::Operator { .. } => continue,
+                let GraphNode::Sink { id, name: sink, .. } = node else {
+                    continue;
                 };
                 assert!(
-                    attribution.contains_key(&id),
-                    "{name}: {what} carries no attribution, so it resolves to no span",
+                    attribution.contains_key(id),
+                    "{name}: sink {sink} carries no attribution, so it resolves to no span",
                 );
             }
-
-            saw_a_source |= graph
-                .nodes()
-                .iter()
-                .any(|n| matches!(n, GraphNode::Source { .. }));
         }
-        assert!(
-            saw_a_source,
-            "no corpus program reads a data source, so the source-node path is unexercised",
-        );
     }
 
     /// Whether the subscription relation is acyclic, optionally with the edges

@@ -154,20 +154,18 @@ impl PaneNodes {
     }
 }
 
-/// One node of an operator pane: an operator, or one of the two program
-/// boundaries.
+/// One node of an operator pane: an operator, or the program's output boundary.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorNode {
-    /// What to show: the operator's type name, or `Source(name)` / `Sink(name)`
-    /// for a boundary.
+    /// What to show: the operator's type name, or `Sink(name)` for a boundary.
     pub label: String,
     /// The node's [`NodeId`](crate::ccl::provenance::NodeId) as a number, in the
     /// same space as an expression node's — an operator carries a `NodeId` so a
     /// pane pair spanning conversion is homogeneous like every other.
     pub node_id: u64,
-    /// Which of the three node kinds this is: `"operator"`, `"source"`,
-    /// `"sink"`. Data, not display policy.
+    /// Which of the two node kinds this is: `"operator"` or `"sink"`. Data, not
+    /// display policy.
     pub role: &'static str,
     /// The operator's output tiling, rendered, and `None` for a boundary node.
     pub tiling: Option<String>,
@@ -509,13 +507,6 @@ fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) ->
                     "operator",
                     Some(tiling.to_string()),
                     inputs.as_slice(),
-                ),
-                GraphNode::Source { id, name } => (
-                    *id,
-                    format!("Source({name})"),
-                    "source",
-                    None,
-                    [].as_slice(),
                 ),
                 GraphNode::Sink { id, name, input } => (
                     *id,
@@ -1305,7 +1296,7 @@ mod tests {
     /// No node claims one span twice. A node is visited once and its spans come
     /// from that one attribution, so a repeat would mean the attribution itself
     /// carries a duplicate.
-    /// **An operator node's own fields**: `role` says which of the three node
+    /// **An operator node's own fields**: `role` says which of the two node
     /// kinds it is, `tiling` is present for an operator and absent for a
     /// boundary, and `spans` is narrowest-first like an expression node's.
     ///
@@ -1331,9 +1322,9 @@ mod tests {
                         "operator {} ships no tiling",
                         node.label
                     ),
-                    "source" | "sink" => assert!(
+                    "sink" => assert!(
                         node.tiling.is_none(),
-                        "boundary node {} ships a tiling, which it has none of",
+                        "sink {} ships a tiling, which it has none of",
                         node.label
                     ),
                     other => panic!("unknown operator-node role {other:?} on {}", node.label),

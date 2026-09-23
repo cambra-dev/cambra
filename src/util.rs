@@ -6,49 +6,31 @@ use log::{debug, trace};
 
 use crate::interpreter::tuple_field;
 
-/// Whether every key is a dense `_0`…`_n` sequence, so the record is a
-/// positional tuple rather than a named one.
-fn is_tuple_record<V>(fields: &HashMap<String, V>) -> bool {
-    (0..fields.len()).all(|i| fields.contains_key(&tuple_field(i)))
-}
-
-/// A record's fields in canonical order: by position for a tuple, by name
-/// otherwise.
-///
-/// A `HashMap` iterates in an order that differs between processes, so whatever
-/// a record's fields reach — a rendered type, an operator's stated inputs —
-/// passes through here, or two runs of one program disagree about it.
-pub fn record_fields_in_order<V>(fields: &HashMap<String, V>) -> Vec<(&String, &V)> {
-    let mut ordered: Vec<(&String, &V)> = fields.iter().collect();
-    if is_tuple_record(fields) {
-        // Every key is `_<i>`, which is what makes the parse total.
-        ordered.sort_by_key(|(name, _)| name[1..].parse::<usize>().unwrap_or(usize::MAX));
-    } else {
-        ordered.sort_by_key(|(name, _)| *name);
-    }
-    ordered
-}
-
 /// Format a map of named fields as either a positional tuple or a named record.
 ///
 /// If every key is a dense `_0`…`_n` sequence, emits `{v0, v1, …}`; otherwise
-/// emits `{name: value, …}`. Both orders are [`record_fields_in_order`]'s.
+/// emits `{name: value, …}` with fields sorted alphabetically.
 pub fn fmt_record<V: std::fmt::Display>(
     f: &mut std::fmt::Formatter<'_>,
     fields: &HashMap<String, V>,
 ) -> std::fmt::Result {
-    let is_tuple = is_tuple_record(fields);
-    let strs: Vec<String> = record_fields_in_order(fields)
-        .into_iter()
-        .map(|(name, v)| {
-            if is_tuple {
-                format!("{v}")
-            } else {
-                format!("{name}: {v}")
-            }
-        })
-        .collect();
-    write!(f, "{{{}}}", strs.join(", "))
+    let is_tuple = (0..fields.len()).all(|i| fields.contains_key(&tuple_field(i)));
+    if is_tuple {
+        let mut ordered: Vec<(usize, &V)> = fields
+            .iter()
+            .map(|(k, v)| (k[1..].parse::<usize>().unwrap(), v))
+            .collect();
+        ordered.sort_by_key(|(i, _)| *i);
+        let strs: Vec<String> = ordered.iter().map(|(_, v)| format!("{v}")).collect();
+        write!(f, "{{{}}}", strs.join(", "))
+    } else {
+        let mut field_strs: Vec<String> = fields
+            .iter()
+            .map(|(name, v)| format!("{name}: {v}"))
+            .collect();
+        field_strs.sort();
+        write!(f, "{{{}}}", field_strs.join(", "))
+    }
 }
 
 /// Format the arms of a tagged sum in CHL's surface syntax:

@@ -105,7 +105,7 @@ const ALLOWED_NATURE = ["expansion", "machinery"];
 
 // An operator node's `role`, and an operator input edge's `kind` — the two
 // closed vocabularies of the operator pane.
-const ALLOWED_ROLE = ["operator", "source", "sink"];
+const ALLOWED_ROLE = ["operator", "sink"];
 const ALLOWED_EDGE_KIND = ["value", "share"];
 
 function describe(v: unknown): string {

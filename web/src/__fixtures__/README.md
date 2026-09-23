@@ -42,13 +42,13 @@ its type as a rendered string in `type` (`"Int"`, `"_"`).
 
 The **operator pane** (`operators`) holds the dataflow graph, in conversion
 order, and names no walk start. A walk begins at the nodes no `value` edge
-subscribes — a sink per compiled output, a fan input per share point, and a
-source per registered data source — which a consumer derives from `inputs`.
+subscribes — a sink per compiled output and a fan input per share point —
+which a consumer derives from `inputs`.
 Every node is reachable from there following `value` edges alone, which is the
 relation a consumer walks.
 
-A node carries `role` (`operator`, `source`, `sink`), a `tiling` for an operator
-and none for a boundary, and `inputs`: `{ role, kind, deferred, subscribed }`. An
+A node carries `role` (`operator`, `sink`), a `tiling` for an operator and none
+for a sink, and `inputs`: `{ role, kind, deferred, subscribed }`. An
 edge's `kind` is `value` for an exclusively owned input and `share` for one
 several consumers may reach; `deferred` marks a `value` edge wired through a
 `CycleSlot` after its consumer was constructed, which is when rather than how it
