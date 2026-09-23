@@ -32,26 +32,33 @@ pub enum ArithmeticKind {
 /// Integer exponentiation, the scalar behind [`ArithmeticKind::Pow`].
 ///
 /// A separate trait because `**` has no `*Assign` operator to bound
-/// [`zip_arithmetic`]'s element type by, and because the two element types
-/// differ on negative exponents: `usize` has none, and `i64`'s take the
-/// reciprocal.
-trait IntPow: Copy + MulAssign {
+/// [`zip_arithmetic`]'s element type by. The exponent is non-negative by typing, so the
+/// two element types differ only in whether that has to be stated: `usize` has no negative
+/// value to exclude.
+trait IntPow: Copy {
     /// The multiplicative identity, which seeds [`Self::raised`] and is what
     /// `a ** 0` yields for every `a`.
     const ONE: Self;
 
+    fn mul_wrapping(self, rhs: Self) -> Self;
+
     /// `self` raised to a non-negative `exponent`, by squaring, so the cost is
-    /// logarithmic in `exponent` and overflow arrives through the same `*` that
-    /// [`ArithmeticKind::Mul`] uses.
+    /// logarithmic in `exponent`.
+    ///
+    /// Wrapping, so both profiles answer the same. The release profile sets no
+    /// `overflow-checks`, and a plain `*` therefore panics on `2 ** 64` in debug and
+    /// answers `0` in release. `zip_arithmetic`'s `+ - * //` are still the plain
+    /// operators and still diverge that way — the vault issue
+    /// `interpreter-integer-arithmetic-divergences` carries the class.
     fn raised(mut self, mut exponent: u64) -> Self {
         let mut acc = Self::ONE;
         while exponent > 0 {
             if exponent & 1 == 1 {
-                acc *= self;
+                acc = acc.mul_wrapping(self);
             }
             exponent >>= 1;
             if exponent > 0 {
-                self *= self;
+                self = self.mul_wrapping(self);
             }
         }
         acc
@@ -63,19 +70,27 @@ trait IntPow: Copy + MulAssign {
 impl IntPow for i64 {
     const ONE: Self = 1;
 
+    fn mul_wrapping(self, rhs: Self) -> Self {
+        i64::wrapping_mul(self, rhs)
+    }
+
     fn int_pow(self, exponent: Self) -> Self {
         // The exponent is non-negative: `**` states `{Int | __elem >= 0}` of it
         // (`src/ccl/lower/exprs.rs`'s `pow_with_checked_exponent`), so a negative one is a
-        // type error and never arrives. That is what leaves this total — the reciprocal it
-        // used to compute divided by a magnitude that is zero for `0 ** -n`, and for a
-        // large `n` after `i64` overflow.
-        debug_assert!(exponent >= 0, "`**` states a non-negative exponent");
+        // type error and never arrives. Asserted in every profile rather than in debug
+        // alone: `unsigned_abs` would turn a negative exponent into a large positive one
+        // and answer, so proceeding past this is a wrong number rather than a crash.
+        assert!(exponent >= 0, "`**` states a non-negative exponent");
         self.raised(exponent.unsigned_abs())
     }
 }
 
 impl IntPow for usize {
     const ONE: Self = 1;
+
+    fn mul_wrapping(self, rhs: Self) -> Self {
+        usize::wrapping_mul(self, rhs)
+    }
 
     fn int_pow(self, exponent: Self) -> Self {
         self.raised(exponent as u64)
@@ -104,7 +119,7 @@ pub enum LogicKind {
 
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
 // slows it down by ~15%
-fn zip_arithmetic<T: IntPow + AddAssign<T> + SubAssign<T> + DivAssign<T>>(
+fn zip_arithmetic<T: IntPow + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssign<T>>(
     op: ArithmeticKind,
     mut l: Vec<T>,
     r: &[T],

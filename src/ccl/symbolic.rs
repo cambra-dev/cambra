@@ -51,8 +51,9 @@ enum Precedence {
     /// `*`, `//` — multiplicative operators share this level; they bind tighter
     /// than additive operators, matching standard arithmetic convention.
     Mul,
-    /// `**` — exponentiation, tighter than the multiplicative operators and the
-    /// only level whose operator groups to the right (see [`Associativity`]).
+    /// `**` — exponentiation, tighter than the multiplicative operators (see
+    /// [`binop_binding`] for the side it groups towards and its straddle of the unary
+    /// minus).
     Pow,
     /// `▷` chains — tighter than all binary operators so `x + y ▷ f` requires
     /// explicit parens: `(x + y) ▷ f`.
@@ -249,28 +250,15 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
 
         TypedExprNode::BinOp { left, op, right } => {
-            let op_prec = binop_prec(op);
+            let Binding {
+                own,
+                left: l,
+                right: r,
+            } = binop_binding(op);
             let sym = op.sym();
-            // The side the operator groups towards keeps a child of equal
-            // precedence unparenthesised; the other side parenthesises one, so
-            // the rendering re-parses with the grouping it was built from.
-            let (l_prec, r_prec) = match binop_assoc(op) {
-                Associativity::Left => (op_prec, op_prec.next_highest()),
-                Associativity::Right => (op_prec.next_highest(), op_prec),
-            };
-            // `**` **straddles the unary minus**: tighter than the one on its left, looser
-            // than the one on its right (`docs/chl-spec.md`, "2.3 Expression precedence").
-            // A level is one number, so it cannot say that — and at `next_highest` alone a
-            // negated *base* renders bare, where `-a ** b` reads back as `-(a ** b)`, the
-            // other tree. The exponent needs no such widening: a minus there is already
-            // tighter.
-            let l_prec = match op {
-                BinOpKind::Arithmetic(ArithmeticKind::Pow) => Precedence::Unary.next_highest(),
-                _ => l_prec,
-            };
-            let l = fmt(left, l_prec, opts);
-            let r = fmt(right, r_prec, opts);
-            (op_prec, format!("{l} {sym} {r}"))
+            let l = fmt(left, l, opts);
+            let r = fmt(right, r, opts);
+            (own, format!("{l} {sym} {r}"))
         }
 
         TypedExprNode::UnaryOp(op, operand) => match op {
@@ -702,50 +690,56 @@ fn fmt_lit(lit: &Lit) -> String {
     }
 }
 
-/// Return the precedence level for a binary operator.
-fn binop_prec(op: &BinOpKind) -> Precedence {
+/// The level a binary operator renders at, and the threshold each operand renders under.
+///
+/// One pair per operator rather than a level plus an associativity rule. The side an
+/// operator groups towards is the side whose threshold equals its own level, so
+/// associativity is a *shape* of the pair; and `**`'s straddle of the unary minus is the
+/// same pair stating two different levels, which one number and an associativity cannot
+/// say between them.
+struct Binding {
+    /// What the rendering binds at, for the enclosing position to decide against.
+    own: Precedence,
+    /// The threshold the left operand renders under.
+    left: Precedence,
+    /// The threshold the right operand renders under.
+    right: Precedence,
+}
+
+/// Return the binding powers of a binary operator.
+fn binop_binding(op: &BinOpKind) -> Binding {
+    // Groups to the left: the left operand keeps a child of the same level bare, and the
+    // right parenthesises one, so the rendering re-parses with the grouping it was built
+    // from.
+    let leftward = |own: Precedence| Binding {
+        own,
+        left: own,
+        right: own.next_highest(),
+    };
     match op {
         BinOpKind::BoolLogic(LogicKind::Or | LogicKind::Nor | LogicKind::Xor | LogicKind::Xnor) => {
-            Precedence::Or
+            leftward(Precedence::Or)
         }
-        BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => Precedence::And,
-        BinOpKind::Compare(_) => Precedence::Cmp,
+        BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => leftward(Precedence::And),
+        BinOpKind::Compare(_) => leftward(Precedence::Cmp),
         BinOpKind::Arithmetic(
             ArithmeticKind::Add | ArithmeticKind::AddRefined | ArithmeticKind::Sub,
         )
-        | BinOpKind::Concat => Precedence::Add,
-        BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
-        BinOpKind::Arithmetic(ArithmeticKind::Pow) => Precedence::Pow,
-    }
-}
-
-/// Which side of a binary operator holds a child of its own precedence without
-/// parentheses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Associativity {
-    Left,
-    Right,
-}
-
-/// Return the associativity of a binary operator.
-///
-/// `**` is the only one that groups to the right, matching CHL
-/// (`docs/chl-spec.md`, "2.3 Expression precedence"). Rendering it as if it
-/// grouped to the left would print `(a ** b) ** c` as `a ** b ** c`, which
-/// reads back as the other tree.
-fn binop_assoc(op: &BinOpKind) -> Associativity {
-    match op {
-        BinOpKind::Arithmetic(ArithmeticKind::Pow) => Associativity::Right,
-        BinOpKind::Arithmetic(
-            ArithmeticKind::Add
-            | ArithmeticKind::AddRefined
-            | ArithmeticKind::Sub
-            | ArithmeticKind::Mul
-            | ArithmeticKind::FloorDiv,
-        )
-        | BinOpKind::Concat
-        | BinOpKind::Compare(_)
-        | BinOpKind::BoolLogic(_) => Associativity::Left,
+        | BinOpKind::Concat => leftward(Precedence::Add),
+        BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => {
+            leftward(Precedence::Mul)
+        }
+        BinOpKind::Arithmetic(ArithmeticKind::Pow) => Binding {
+            own: Precedence::Pow,
+            // **`**` straddles the unary minus**: tighter than the one on its left, looser
+            // than the one on its right (`docs/chl-spec.md`, "2.3 Expression precedence").
+            // At `Pow.next_highest()` a negated *base* renders bare and `-a ** b` reads
+            // back as `-(a ** b)`, the other tree.
+            left: Precedence::Unary.next_highest(),
+            // Groups to the right, so the exponent keeps a `**` of its own bare, and a
+            // minus there is already tighter than this level.
+            right: Precedence::Pow,
+        },
     }
 }
 

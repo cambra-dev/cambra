@@ -2218,9 +2218,20 @@ fn compact_go(
             // Both stay under `st.collapse`, which suppresses the opposite side
             // walk-wide for [`compact_type_polarity_only`] — a caller whose question is
             // what reached the position, for which a demand is not an answer.
+            //
+            // The **discharged demand** is the third, and it reads refinements alone. A
+            // demand that survived solving is a fact about the value — the same reasoning
+            // the shape collapse's arm below states for the no-concrete case — so it holds
+            // of what the primary walk found and unions onto it. Without it a positive
+            // position whose shape the value settled drops the predicate its uses
+            // established, and a later check that re-derives the demand has nothing to
+            // discharge it against (`[2 ** x for x in [1, 2, 3]]`, where the source's
+            // element type is the join of three singletons and the exponent's use demands
+            // `{Int | __elem >= 0}`).
             let collapse = allow_fallback && no_concrete;
             let merge = !pol && (allow_fallback || (st.collapse && pos.invariant));
-            let read_opposite = collapse || merge;
+            let discharged = pol && allow_fallback && st.collapse;
+            let read_opposite = collapse || merge || discharged;
             let mut recovered: Option<CompactType> = None;
             if read_opposite {
                 for b in opposite_bounds.iter() {
@@ -2272,8 +2283,32 @@ fn compact_go(
                 // value side of a `case _:` demand is a producer and so closed, and the
                 // meet both closes the marker and intersects away a tag the demand does
                 // not name (`a_settled_negative_position_closes_an_open_child_demand`).
-                (Some(recovered), false) => {
+                (Some(recovered), false) if !pol => {
                     bound = CompactType::merge(pol, bound, recovered);
+                }
+                // A settled **positive** position takes the demands' refinements, and only
+                // where the value described itself with none. Merging would join, and a
+                // join intersects refinements ([`CompactType::merge_refinements`]), so the
+                // predicate the uses established would be dropped exactly where it has to
+                // survive.
+                //
+                // A value that described itself discharged the demand, so its own
+                // predicate entails it and recording the demand beside it states nothing
+                // further. The position that needs the demand is the one whose description
+                // the *join* emptied: three singletons meet at a bare `Int`, and the
+                // discharge that happened against each of them separately then has nothing
+                // left in the type to show for it.
+                (Some(recovered), false) => {
+                    let produced_none = bound
+                        .refinements
+                        .as_ref()
+                        .is_none_or(RefinementSet::is_empty);
+                    if let Some(demanded) = recovered.refinements.filter(|_| produced_none) {
+                        bound
+                            .refinements
+                            .get_or_insert_with(RefinementSet::default)
+                            .extend(demanded);
+                    }
                 }
                 (None, _) => {}
             }

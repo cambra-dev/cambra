@@ -469,23 +469,17 @@ fn a_let_bound_constant_returned_directly() {
     )
 }
 
-/// **This test pins a defect, not a decision — it should start failing when the
-/// defect is fixed.**
+/// A predicate the encoder cannot read is trusted at a pass boundary.
 ///
-/// `2` is not `0`, so inference admits the call: the argument's type
-/// is `Int@2`, which entails both written demands through the fallback. Planning's
-/// post-pass check then rejects the same call. Both predicates are point-free by
-/// then — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — which is outside the encoded
-/// fragment, so the deficit falls back to the structural matching the fallback
-/// exists to get past, and a well-typed program reports an internal invariant
-/// failure.
-///
-/// Widening the encoding past surface syntax retires this pin, as would checking
-/// against the pre-elimination predicate. Once it passes, the program evaluates
-/// `4 // 2`. The rejecting counterpart is `tests/programs/refinement/`.
+/// `2` is not `0`, so inference admits the call: the argument's type is `Int@2`, which
+/// entails the written demand through the semantic fallback. By planning both predicates
+/// are point-free — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — and outside the encoded
+/// fragment, so the post-pass deficit is undecided. Undecided there is discharged
+/// (`Derivation::trusts_an_unreadable_refinement`): the pass reconciles two spellings of
+/// one type and the encoder reads neither side, so a rejection would name the encoder's
+/// limit. The rejecting counterpart is `tests/programs/refinement/`.
 #[test]
-#[should_panic(expected = "produced an invalid tree: [Type mismatch")]
-fn refinements_that_survive_to_post_planning_check_are_rejected() {
+fn a_point_free_refinement_is_trusted_at_a_pass_boundary() {
     check_scalar(
         indoc! {r#"
             def no_zero_no_one_div(left: Int, right: {Int where _ != 0}):
@@ -767,7 +761,9 @@ fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
 /// annotation the program wrote; the mutable one panics at the post-inference boundary as
 /// an invalid tree, which reads as a compiler bug for a program that is simply rejected.
 ///
-/// Pinned on both, so the day the `Mut` form reports a user error the pin says so.
+/// Pinned on both, so the day the `Mut` form reports a user error the pin says so. What
+/// the `Mut` form dies on is its annotation's predicate variables, which nothing resolves;
+/// the plain form is rejected before reaching them.
 #[test]
 fn a_refined_map_key_no_key_satisfies() {
     check_compile_error(
@@ -786,7 +782,7 @@ fn a_refined_map_key_in_a_mut_annotation_reaches_the_boundary() {
 m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
 m
 "#,
-        "produced an invalid tree: [Type mismatch for collection domain",
+        "produced an invalid tree: [Unresolved inference variable",
     )
 }
 

@@ -576,33 +576,26 @@ pub(super) fn lower_binop(
     Ok(Expr::binop(left_expr, kind, right_expr))
 }
 
-/// `a ** b` with the exponent bound through a **non-negative annotation**.
+/// `a ** b` with the exponent carrying a **non-negative annotation**.
 ///
 /// `**` requires a non-negative exponent: a reciprocal has no integer value, so rather than
 /// give `a ** -n` one, the exponent has to carry `{Int | __elem >= 0}` and a program that
 /// cannot show it is rejected where it is written.
 ///
-/// TODO(check-time-smt): stated as an annotated binding rather than in the operator's own
-/// signature, because a demand made by the operator is re-derived by `Check`, which decides
-/// refinements structurally (`constrain_subtype`'s `SkipSmtScope`) and cannot discharge
-/// `{Int | __elem == 3} <: {Int | __elem >= 0}` the way inference does through the semantic
-/// fallback. An annotation is narrowed by inference, so `Check` compares the refinement
-/// against itself and matches. Fold this back into the operator's signature once `Check`
-/// raises its own queries.
-///
-/// The binding costs one thing worth naming: a `**` written *inside* a refinement predicate
-/// makes that predicate a `Let`, so it leaves the SMT fragment as a term rather than as an
-/// unencodable operator. `**` in a predicate was already undecidable — SMT-LIB has no
-/// integer exponentiation — so nothing that worked stops working, but the reason a reader
-/// meets changes, and folding this back into the signature restores it.
+/// TODO(pow-signature): stated on the exponent rather than in the operator's own signature,
+/// which needs two things this head has one of. `Check` now raises its own semantic queries
+/// (`CheckCtx`'s `ScopeEnv`), so a demand the operator makes is dischargeable at a pass
+/// boundary. What is still missing is somewhere to write it: `TraitInstance.args` is
+/// `&'static [BaseType]`, so an `Exponentiable` row carries a base and no predicate — the
+/// restriction its own doc comment states. Fold this back into the signature once a trait
+/// row can carry one.
 fn pow_with_checked_exponent(
     base: Expr,
-    exponent: Expr,
+    mut exponent: Expr,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
     const LABEL: &str = "lower.pow_exponent";
-    let binder = Name::fresh("__pow_exp");
     let predicate = Expr::binop(
         Expr::var(Name::elem()),
         BinOpKind::Compare(CompareKind::GreaterOrEq),
@@ -611,18 +604,14 @@ fn pow_with_checked_exponent(
     // Every node of the predicate, before it is sealed into a type slot where the tree walk
     // no longer reaches it.
     ctx.tag_predicate(&predicate, span, LABEL);
-    let non_negative = Type::refined_one(
+    // The node's own annotation, not a binding's: a binder would put a `Let` inside any
+    // refinement predicate a `**` is written in, where the demand belongs to the operand.
+    exponent.user_annotation = Some(Type::refined_one(
         Type::Base(BaseType::Int),
         Refinement::born(Rc::new(predicate)),
-    );
-    let read = ctx.tag_machinery(Expr::var(binder.clone()), span, LABEL);
-    let body = ctx.tag_machinery(
-        Expr::binop(base, BinOpKind::Arithmetic(ArithmeticKind::Pow), read),
-        span,
-        LABEL,
-    );
+    ));
     ctx.tag_machinery(
-        Expr::let_bind_annotated(binder, exponent, body, non_negative),
+        Expr::binop(base, BinOpKind::Arithmetic(ArithmeticKind::Pow), exponent),
         span,
         LABEL,
     )

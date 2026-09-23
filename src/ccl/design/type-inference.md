@@ -347,8 +347,9 @@ accepts. Records and atoms need no such split, being the same claim read from ei
 it — the uses state what they demand, the lower bounds what arrives — so the reading is their merge
 at the position's own polarity, which is one rule for every slot rather than one per shape. The
 collapse above is the *undetermined* case, and it replaces rather than merges because there is no
-settled structure for two sides to narrow jointly. A positive position is unaffected: its
-polarity-correct side is already the value's own facts, and a demand is not one. Merging is what
+settled structure for two sides to narrow jointly. A positive position takes no *shape* from the
+opposite side: its polarity-correct side is already the value's own facts. Its refinements are the
+exception, below. Merging is what
 makes an invariant [data domain](#data-domains-are-invariant) resolve to a single type where its
 two readings differ — `groupby([1], λ 𝑥 → 𝑥)`'s key variable carries `Int@1` below and `Int` above.
 That settles one position. Two spellings of one domain also have to be identified, which is what a
@@ -356,6 +357,18 @@ shared hole states ([A shared hole naming a domain states an
 equation](#a-shared-hole-naming-a-domain-states-an-equation)); without it the spelling that reaches
 the other only through the argument edge keeps the wider reading. Pinned by
 `a_negative_position_meets_both_sides` and `a_groupby_over_a_singleton_element_literal`.
+
+**A positive position takes a discharged demand's refinements.** A demand that survived solving is
+a fact about the value, so it holds of what the polarity-correct walk found — the reading the
+undetermined case above already states. It is unioned rather than merged, a positive merge being a
+join and a join intersecting refinements, and only where the value described itself with none: a
+value carrying its own predicate is what discharged the demand, so that predicate entails it and
+recording the demand beside it states nothing further. The position that needs the rule is the one
+whose description the join emptied. `[1, 2, 3]`'s three singletons meet at a bare `Int`, and the
+`{Int | __elem >= 0}` each of them discharged separately then has nothing left in the type to show
+for it — which is what made `[2 ** x for x in [1, 2, 3]]` type-check and then fail the
+post-inference wall, the mapped function's domain carrying a refinement the value reaching it did
+not. Pinned by `a_comprehension_exponent_compiles`.
 
 The meet reaches a **variant** in a child slot, where it intersects the tags and closes an open
 demand's marker — a `case _:` demand is open, and the value side is a producer and so closed.
@@ -1034,16 +1047,29 @@ Two environments implement the lookup, and a third suppresses the query:
   is on the variable's bounds, and unresolved the binder has no sort at all. A generalized
   binder's quantified variables stay uninstantiated; a polytype has no sort, so it is dropped
   rather than assumed wrong.
-- **`NoScope`** is the empty environment, what every caller outside emission supplies:
-  `constrain_subtype_under` (the post-inference check resolves no names, so it holds no binder
-  types) and `inline`'s discharge check, which runs over a tree whose binders it does not hold.
-  An empty scope only weakens what the fallback can prove, so it can reject what emission
-  admitted and never the reverse.
+- **Check** passes the lexical scope it maintains while walking the tree (`CheckCtx`'s
+  `binders`, pushed by `Typing::scoped` and `scoped_let`). It needs no positive reading: by the
+  time a pass boundary runs, every binder slot is settled, so the recorded type is already what
+  the value gave it. Without the lookup a demand naming a binder — `{Int | __elem == t + 3}` —
+  is undischargeable, and a well-typed program reports an internal invariant failure.
+- **`NoScope`** is the empty environment, what a caller holding no scope supplies: `inline`'s
+  discharge check, which runs over a tree whose binders it does not hold. An empty scope only
+  weakens what the fallback can prove, so it can reject what emission admitted and never the
+  reverse.
 - **`SkipSmtScope`** decides a deficit structurally, raising no query at all.
-  `constrain_subtype` supplies it, so the post-pass tree check reaches the fallback through
-  `constrain_subtype_under` and not through `Typing::constrain`. That split is caller policy
-  riding the scope trait rather than a third environment; the `ScopeEnv::is_skip_smt` doc names
-  the shape it wants instead.
+  `constrain_subtype` supplies it, for a caller relating two types built outside any program.
+  That is caller policy riding the scope trait rather than a third environment; the
+  `ScopeEnv::is_skip_smt` doc names the shape it wants instead.
+
+**What an undecided deficit means depends on the derivation.** A predicate outside the encoded
+fragment leaves the query undecided, and the live solve reads that as a mismatch: the demand is one
+nothing has established, and admitting it would let an unreadable predicate stand for a proof. A
+pass-boundary re-derivation reads it as discharged. It is reconciling two spellings of one type,
+and a predicate compiled to point-free form — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ ge)` — is exactly
+such a respelling, with the encoder reading neither side, so a rejection there names the encoder's
+limit rather than anything about the tree. `Derivation::trusts_an_unreadable_refinement` carries the
+split, and it is the same reading Check's `Lit` rule states for a literal: verify the base, trust
+the refinement.
 
 Dropping is the discipline throughout: a path with no sort, a predicate body outside the
 fragment, a name two binders disagree about. An assumption left out weakens the antecedent and

@@ -131,16 +131,14 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
 // `**` scales a constant without spelling out the zeroes.
 #[case("10 ** 8", Value::Int(100_000_000))]
-// A chain is not evaluated here: `**` answers a bare `Int`, which is not shown non-negative,
-// so it cannot be another `**`'s exponent. Right-associativity is the parser's, pinned by
-// `src/chl_parser/parser.rs`'s `power_precedence_and_associativity`.
+// Parenthesised, an inner `**` is a base rather than an exponent. The other grouping is
+// rejected (`an_exponent_not_shown_non_negative_is_rejected`'s `chain`).
 #[case("(2 ** 3) ** 2", Value::Int(64))]
 // Tighter than `*` on either side.
 #[case("2 * 3 ** 2", Value::Int(18))]
 #[case("3 ** 2 * 2", Value::Int(18))]
 // Tighter than the unary minus on its left: `-(2 ** 2)`.
 #[case("-2 ** 2", Value::Int(-4))]
-#[case("2 ** 0", Value::Int(1))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -158,10 +156,15 @@ fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 #[case::literal("2 ** -1")]
 #[case::zero_base("0 ** -1")]
-// Large enough that the old reciprocal overflowed `i64` on its way to dividing by zero.
-#[case::overflowing("2 ** -64")]
 // Not a literal, so nothing bounds it: an unrefined `Int` cannot show itself non-negative.
-#[case::unrefined("e = 0 - 1\n2 ** e")]
+#[case::unrefined(indoc! {r#"
+    e = 0 - 1
+    2 ** e
+"#})]
+// A `**` answers a bare `Int`, so a chain is rejected at the inner result rather than
+// parsed differently: right-associativity is the parser's, pinned by
+// `src/chl_parser/parser.rs`'s `power_precedence_and_associativity`.
+#[case::chain("2 ** 3 ** 2")]
 fn an_exponent_not_shown_non_negative_is_rejected(#[case] code: &str) {
     check_compile_error(code, "__elem >= 0");
 }
@@ -171,9 +174,53 @@ fn an_exponent_not_shown_non_negative_is_rejected(#[case] code: &str) {
 #[timeout(Duration::from_secs(10))]
 #[case::literal("2 ** 3", Value::Int(8))]
 #[case::zero("2 ** 0", Value::Int(1))]
+// `a ** 0` is `1` for every base, `0` included: the fold seeds at the identity and the
+// loop never runs.
+#[case::zero_to_the_zero("0 ** 0", Value::Int(1))]
 // The caller carries the proof, so the body needs none of its own.
-#[case::annotated_parameter("def f(e: {Int where _ >= 0}):\n    2 ** e\n\nf(3)", Value::Int(8))]
+#[case::annotated_parameter(
+    indoc! {r#"
+        def f(e: {Int where _ >= 0}):
+            2 ** e
+
+        f(3)
+    "#},
+    Value::Int(8)
+)]
 fn a_provably_non_negative_exponent_is_accepted(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The exponent's demand reaches a comprehension binder.
+///
+/// The source's elements each discharge `{Int | __elem >= 0}`, and the discharge survives
+/// the join onto the element read (`compact.rs`'s discharged-demand rule), so the mapped
+/// function's domain and the value reaching it agree at the pass boundary. Without that the
+/// program type-checks and the wall reports a compiler bug for it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::non_negative_elements("sum([2 ** x for x in [1, 2, 3]])", Value::Int(14))]
+fn a_comprehension_exponent_compiles(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A negative element is still rejected, and as a type error rather than at the wall.
+#[test]
+fn a_negative_comprehension_element_is_rejected_as_an_exponent() {
+    check_compile_error("sum([2 ** x for x in [1, 2, -3]])", "__elem >= 0");
+}
+
+/// Overflow **wraps**, in every profile.
+///
+/// The release profile sets no `overflow-checks`, so a plain `*` in `IntPow::raised` would
+/// panic here in debug and answer `0` in release. `zip_arithmetic`'s `+ - * //` still
+/// diverge that way — the vault issue `interpreter-integer-arithmetic-divergences` carries
+/// the class.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::past_the_width("2 ** 64", Value::Int(0))]
+#[case::the_sign_bit("2 ** 63", Value::Int(i64::MIN))]
+fn exponentiation_wraps(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 

@@ -96,10 +96,10 @@ pub enum ArithmeticKind {
     FloorDiv,
     /// Exponentiation (`**`).
     ///
-    /// A negative exponent takes the reciprocal through the same division `//`
-    /// performs: `a ** -n` is `1 // (a ** n)`, so it is undefined exactly where
-    /// division by zero is (`docs/chl-spec.md`, "3.3 Arithmetic and logical
-    /// operators").
+    /// The exponent is non-negative, which is what makes this total: lowering states
+    /// `{Int | __elem >= 0}` of it (`src/ccl/lower/exprs.rs`'s
+    /// `pow_with_checked_exponent`), so a negative one is a type error and never reaches
+    /// the interpreter.
     Pow,
 }
 

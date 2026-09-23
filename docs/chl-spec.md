@@ -389,15 +389,20 @@ noted:
 | 14 | `+` `-` | additive |
 | 15 | `*` `//` | multiplicative |
 | 16 | unary `-` | prefix |
-| 17 | `**` | exponentiation; *right*-associative |
+| 17 | `**` | exponentiation; *right*-associative. It **straddles** the unary `-` at 16 rather than sitting under it — see below |
 | 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold |
 | 19 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
 
-`**` binds tighter than the unary `-` on its left and looser than the one
-on its right: `-2 ** 2` is `-(2 ** 2)`, and `2 ** -1` parses without
-parentheses — and is then rejected for its exponent's sign, which is a
-typing rule and not a grammatical one. `**` groups to the right, so
-`2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+`**` binds tighter than the unary `-` on its left and looser than the one on
+its right, which is why one level cannot place it: `-2 ** 2` is `-(2 ** 2)`,
+and `2 ** -1` parses without parentheses. The second is then rejected for its
+exponent's sign, a typing rule and not a grammatical one.
+
+`**` groups to the right, so `2 ** 3 ** 2` parses as `2 ** (3 ** 2)`. That
+program does not compile: a `**` answers a bare `Int`, which shows nothing
+about its sign, so no `**` result is another one's exponent. Parenthesising
+the other way — `(2 ** 3) ** 2` — compiles, the grouping being what the
+rejection is about rather than the associativity.
 
 ```ebnf
 expression ::= lambda_expr | yield_expr | fun_type | feed_expr | pair

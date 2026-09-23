@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
+use crate::ccl::infer::solver::smt::ScopeEnv;
 use crate::ccl::infer::solver::{
-    ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+    ConstrainCache, Derivation, PolyScheme, constrain_subtype_in, fresh_var, prim,
     traits::{product_components, product_fields},
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -86,6 +87,13 @@ pub(super) struct CheckCtx {
     /// telescope and the record-time closure observation stays meaningful in
     /// both modes.
     telescope: Telescope,
+    /// The type each binder in lexical scope is bound at, innermost last.
+    ///
+    /// **What a query may assume about an in-scope binder**
+    /// (`src/ccl/design/type-inference.md`, "The scope a query runs in"). Check's
+    /// subtyping edge raises semantic queries, and a demand naming a binder — `{Int |
+    /// __elem == t + 3}` — is discharged only against what `t` is known to be.
+    binders: Vec<(Name, Type)>,
 }
 
 impl CheckCtx {
@@ -101,7 +109,16 @@ impl CheckCtx {
             witness_ctx: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
+            binders: Vec::new(),
         }
+    }
+
+    /// Run `f` with `name` bound at `ty`, restoring the scope afterwards.
+    fn with_binder<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.binders.push((name.clone(), ty.clone()));
+        let out = self.under_binder(name, f);
+        self.binders.pop();
+        out
     }
 
     /// The constraint cache every Check edge draws against, with both sides' Γ seeded
@@ -114,6 +131,24 @@ impl CheckCtx {
         let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
         cache.seed_context(&self.witness_ctx);
         cache
+    }
+}
+
+/// The lexical scope Check's semantic queries run in.
+///
+/// [`value_type`](crate::ccl::infer::solve::value_type) is not needed here: by the time
+/// Check runs every binder slot is settled, so the recorded type is the positive reading.
+impl ScopeEnv for CheckCtx {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.binders
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, ty)| ty.clone())
+    }
+
+    fn is_skip_smt(&self) -> bool {
+        false
     }
 }
 
@@ -336,18 +371,19 @@ impl Typing for CheckCtx {
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
         let mut cache = self.cache();
-        if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
+        let result = constrain_subtype_in(sub, sup, &mut cache, self);
+        if let Err(e) = result {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
         Ok(())
     }
 
-    fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
-        // Check trusts each `Var`/binder node's recorded `Type` rather than
-        // resolving names, so there is no name scope to maintain — only the
-        // telescope, for the variables minted under this binder.
-        self.under_binder(name, f)
+    fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        // A `Var` node's own recorded type is what its rule answers; the scope is for the
+        // semantic queries this mode's subtyping edge raises, which need what a binder
+        // named in a predicate is known to be.
+        self.with_binder(name, ty, f)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -365,12 +401,12 @@ impl Typing for CheckCtx {
     fn scoped_let<R>(
         &mut self,
         name: &Name,
-        _bound_ty: &Type,
+        bound_ty: &Type,
         _generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        // See `scoped`: no name scope, no generalization — telescope only.
-        self.under_binder(name, f)
+        // No generalization in Check; see `scoped` for what the scope is for.
+        self.with_binder(name, bound_ty, f)
     }
 
     fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
@@ -461,13 +497,15 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
         let mut cache = self.cache();
-        if let Err(e) = crate::ccl::infer::solver::constrain_subtype_under(
+        let result = crate::ccl::infer::solver::constrain_subtype_under(
             sub,
             sup,
             sub_binders,
             sup_binders,
             &mut cache,
-        ) {
+            self,
+        );
+        if let Err(e) = result {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
