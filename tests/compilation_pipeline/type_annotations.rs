@@ -118,6 +118,40 @@ f(4)
     )
 }
 
+/// `->` in type position builds a tuple, and the report names both spellings.
+///
+/// Nothing below the parser tells `Int -> Int` from `(Int, Int)` (`docs/chl-spec.md`,
+/// "2.4 Atoms"), so a function type written with the pair arrow arrives at lowering as a
+/// term product, and the message has to name the tuple type and the function type both.
+#[test]
+fn a_pair_arrow_in_type_position_names_both_spellings() {
+    check_compile_error(
+        indoc! {r#"
+            f: (Int -> Int) = \x -> x + 1
+            f(4)
+        "#},
+        "a function type with `=>`",
+    )
+}
+
+/// A `def`'s return annotation takes `=>`, and `->` there never reaches the message above.
+///
+/// `def_stmt` wants the arrow before the `:`, so the commonest miswriting of a function
+/// type is a parse error in the statement grammar rather than a lowering report about the
+/// annotation.
+#[test]
+fn a_pair_arrow_in_a_def_return_annotation_is_a_parse_error() {
+    check_compile_error(
+        indoc! {r#"
+            def f(x: Int) -> Int:
+                x + 1
+
+            f(4)
+        "#},
+        "found '->', expected '=>'",
+    )
+}
+
 #[test]
 fn function_type_in_value_position_is_rejected() {
     // `T => U` names a type; it is annotation-only, not a value.

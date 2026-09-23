@@ -145,10 +145,9 @@ type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 
 /// The full CHL expression grammar.
 ///
-/// The precedence ladder is `docs/chl-spec.md`, "2.3 Expression precedence", and the
-/// combinators below are that table read bottom-up — each level built from the one tighter
-/// than it. Stated there and not restated here: a third copy of one ladder is a third thing
-/// to renumber, and the one nearest the code is the one a reader trusts.
+/// The precedence ladder is `docs/chl-spec.md`, "2.3 Expression precedence". The
+/// combinators below are that table read bottom-up, each level built from the one tighter
+/// than it.
 fn expression<'src, I>() -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
@@ -184,10 +183,9 @@ where
         // could belong to either it or the outer one, and the greedy reading
         // leaves the outer `match` with no way to spell a later arm.
         //
-        // Restricting the *arm body* instead would not hold: a lambda body, a
-        // ternary else-branch, an `<<` right operand and a `=>` codomain each
-        // recurse into the whole `expr`, so an inner `match` reappears through
-        // any of them.
+        // Restricting the *arm body* instead would not hold: a lambda body and a `=>`
+        // codomain each recurse into the whole `expr`, so an inner `match` reappears
+        // through either of them.
         let oneline_match = just(Token::Match)
             .ignore_then(expr.clone())
             .then_ignore(just(Token::Colon))
@@ -924,43 +922,7 @@ where
         })
         .boxed();
 
-        // ---- Pair `k -> v` (single, not chainable) ------------------
-        //
-        // `a -> b` is the two-tuple `(a, b)` (`docs/chl-spec.md`, "2.4 Atoms"), so
-        // it builds the same `Expr::Tuple` the parenthesised spelling does and
-        // nothing below the parser tells the two apart: a map literal is an
-        // ordinary list of pairs, and `for k -> v in m` an ordinary tuple target.
-        //
-        // It binds tighter than `<<`, so `m << k -> v` feeds the entry `(k, v)`,
-        // and looser than the ternary, so `k -> v if c else w` pairs `k` with the
-        // whole conditional. Neither operand reaches the lambda level, so a lambda
-        // on either side takes parentheses. Not chainable, like `feed`: nothing
-        // associates a third component, so `a -> b -> c` is a parse error.
-        let pair = ternary
-            .clone()
-            .then(just(Token::Arrow).ignore_then(ternary.clone()).or_not())
-            .map_with(|(key, value), e| match value {
-                None => key,
-                Some(value) => Spanned::new(e.span(), Expr::Tuple(vec![key, value])),
-            })
-            .boxed();
-
-        // ---- Feed `x << y` (single, not chainable) -----------------
-        let feed = pair
-            .clone()
-            .then(just(Token::LShift).ignore_then(pair.clone()).or_not())
-            .map_with(|(lhs, rhs), e| match rhs {
-                None => lhs,
-                Some(value) => Spanned::new(
-                    e.span(),
-                    Expr::Feed {
-                        target: Box::new(lhs),
-                        value: Box::new(value),
-                    },
-                ),
-            });
-
-        // ---- Lambda / Yield (top-level expression forms) ------------
+        // ---- Lambda (a pair's value, and a top-level expression form) ---
         //
         // A lambda is `\params -> body`: `\` introduces the binders, `->`
         // separates them from the body. Params are bare identifiers here;
@@ -987,8 +949,70 @@ where
                         body: Box::new(body),
                     },
                 )
+            })
+            .boxed();
+
+        // ---- Pair `k -> v` (single, not chainable) ------------------
+        //
+        // `a -> b` builds the `Expr::Tuple` the parenthesised spelling builds
+        // (`docs/chl-spec.md`, "2.4 Atoms"), so nothing below the parser tells the two
+        // apart: a map literal is an ordinary list of pairs, and `for k -> v in m` an
+        // ordinary tuple target.
+        //
+        // The value also admits a lambda, which the ladder does not reach: a map of
+        // functions is the ordinary reason to write one, and the value is the last thing on
+        // the line, so there is nothing after it for the lambda body to swallow. The key
+        // cannot, a lambda there having the pair's own `->` as its binder terminator.
+        //
+        // A pair has two components, so a chain names nothing. Collecting the tail rather
+        // than taking one operand is what lets the third arrow report that instead of
+        // leaving `-> c` unconsumed for the enclosing bracket to reject.
+        let pair = ternary
+            .clone()
+            .then(
+                just(Token::Arrow)
+                    .ignore_then(choice((lambda.clone(), ternary.clone())))
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .validate(|(key, mut values), e, emitter| {
+                if values.is_empty() {
+                    return key;
+                }
+                // Reported rather than failed, so the arrow is what the diagnostic names. A
+                // failure here backtracks out of the whole expression production and the
+                // top-level `choice` reports "expected expression" at the second arrow.
+                if values.len() > 1 {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "`->` does not chain: a pair has two components. Parenthesise to \
+                         nest one pair inside another.",
+                    ));
+                    values.truncate(1);
+                }
+                Spanned::new(
+                    e.span(),
+                    Expr::Tuple(vec![key, values.pop().expect("a value")]),
+                )
+            })
+            .boxed();
+
+        // ---- Feed `x << y` (single, not chainable) -----------------
+        let feed = pair
+            .clone()
+            .then(just(Token::LShift).ignore_then(pair.clone()).or_not())
+            .map_with(|(lhs, rhs), e| match rhs {
+                None => lhs,
+                Some(value) => Spanned::new(
+                    e.span(),
+                    Expr::Feed {
+                        target: Box::new(lhs),
+                        value: Box::new(value),
+                    },
+                ),
             });
 
+        // ---- Yield (a top-level expression form) --------------------
         let yield_expr = just(Token::Yield)
             .ignore_then(expr.clone())
             .map_with(|value, e| Spanned::new(e.span(), Expr::Yield(Box::new(value))));
@@ -1715,6 +1739,72 @@ mod tests {
             matches!(else_expr.node, Expr::IfExp { .. }),
             "the else-branch is the nested conditional, got {:?}",
             else_expr.node
+        );
+    }
+
+    /// An `<<` right operand is a pair, and its left operand is the whole conditional.
+    ///
+    /// `<<` is looser than the ternary, so narrowing the else-branch to `ternary` regrouped
+    /// `1 if c else m << 2` from a conditional whose else-branch feeds to a feed whose
+    /// target is the conditional. That is the grouping the ladder states, and this is what
+    /// pins it.
+    #[test]
+    fn a_ternary_left_of_a_feed_is_the_whole_target() {
+        let Expr::Feed { target, value } = parse_e("1 if c else m << 2").node else {
+            panic!("expected a feed")
+        };
+        assert!(
+            matches!(target.node, Expr::IfExp { .. }),
+            "the target is the conditional, got {:?}",
+            target.node
+        );
+        assert!(
+            matches!(value.node, Expr::Lit(Lit::Int(2))),
+            "and the value is what follows `<<`, got {:?}",
+            value.node
+        );
+    }
+
+    /// A lambda is an else-branch only inside brackets.
+    ///
+    /// The else-branch is a `ternary`, which the lambda level sits above, so
+    /// `a if c else \x -> x` has no reading.
+    #[test]
+    fn a_lambda_else_branch_is_refused() {
+        assert!(
+            parse_expression(r"a if c else \x -> x")
+                .into_result()
+                .is_err(),
+            "a lambda is above the ternary, so it cannot be an else-branch"
+        );
+    }
+
+    /// A pair's **value** admits a lambda, so a map of functions is writable with the arrow.
+    #[test]
+    fn a_pair_value_admits_a_lambda() {
+        let Expr::List(items) = parse_e(r#"["inc" -> \x -> x + 1]"#).node else {
+            panic!("expected a list")
+        };
+        let Expr::Tuple(parts) = &items[0].node else {
+            panic!("the element is the entry pair, got {:?}", items[0].node)
+        };
+        assert!(
+            matches!(parts[1].node, Expr::Lambda { .. }),
+            "the value is the lambda, got {:?}",
+            parts[1].node
+        );
+    }
+
+    /// A chain of arrows reports the chain rather than the token after the second pair.
+    #[test]
+    fn a_pair_does_not_chain() {
+        let errs = parse_expression("a -> b -> c")
+            .into_result()
+            .expect_err("`->` does not chain");
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("does not chain")),
+            "the error names the chain, got {errs:#?}"
         );
     }
 

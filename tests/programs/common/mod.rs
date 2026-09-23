@@ -121,12 +121,12 @@ pub fn expect_compile_error(source: &str, needle: &str) {
 }
 
 /// As [`expect_compile_error`], and additionally that the report does **not** mention
-/// `cleared` — the construct this program used to stop at.
+/// `cleared` — a construct this program parses.
 ///
-/// A needle on its own cannot say a blocker moved. The renderer echoes the offending source
-/// line, so a needle taken from the program's own text matches whenever any error lands on
-/// that line, and a construct that regressed would keep the test green. Naming what must no
-/// longer appear is what makes the advance checkable.
+/// `cleared` is the load-bearing half. The renderer echoes the offending source line, so a
+/// needle taken from the program's own text matches whenever any error lands on that line,
+/// and `needle` on its own therefore cannot say a blocker moved. Naming what must no longer
+/// appear is what makes the advance checkable.
 pub fn expect_compile_error_past(source: &str, needle: &str, cleared: &str) {
     let msg = compile_error_message(source, needle);
     assert!(

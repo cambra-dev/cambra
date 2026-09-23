@@ -99,10 +99,11 @@
 //! `requires`, `with begin():` in value position, and the bare annotation
 //! `orders: Feed(…)`.
 //!
-//! `/stats`'s map comprehension over `groupby` parses in both files.  What it
-//! still needs is entry iteration: `for key -> g in groupby(…)` binds a pair only
-//! once a keyed collection iterates entries (`src/ccl/design/collections.md`,
-//! "Telling `Set` and `Map` apart [Open]").
+//! `/stats`'s rollup shape is pinned by `entry_pair_rollup_from_the_storefront` in
+//! `tests/chl_parser_roundtrip.rs`; recovery here stops before those lines, so this run
+//! says nothing about them.  What the rollup still needs is entry iteration:
+//! `for key -> g in groupby(…)` binds a pair only once a keyed collection iterates entries
+//! (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]").
 
 use super::common::expect_compile_error_past;
 

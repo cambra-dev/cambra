@@ -78,27 +78,9 @@ public entry points:
   `ParseResult`, `CATEGORIES`) live in the `parser/error.rs` submodule, re-exported
   from `parser.rs`.
 
-The grammar is precedence-climbed for binary operators. From lowest to
-highest precedence:
-
-1. `\x -> …` (lambda) / `yield`
-2. `=>` (function type)
-3. `<<` (feed)
-4. `->` (pair)
-5. ternary `a if b else c`
-6. `or`
-7. `and`
-8. `not`
-9. chained comparison (`==` `!=` `<` `<=` `>` `>=`)
-10. `|`
-11. `^`
-12. `&`
-13. `++`
-14. `+`, `-`
-15. `*`, `//`
-16. unary `-`
-17. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name` / `x.0`
-18. atom: literal, name, parenthesised, list, record, brace type, comprehension
+The grammar is precedence-climbed for binary operators, one combinator per level of
+[docs/chl-spec.md](../../docs/chl-spec.md), "2.3 Expression precedence", each built from the
+one tighter than it.
 
 Every position a bracket encloses — a list or tuple element, a call argument, a
 subscript index, a record field, a brace item, a refinement predicate, a

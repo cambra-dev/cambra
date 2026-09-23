@@ -370,7 +370,7 @@ noted:
 | 1 | `\x -> …` (lambda), `yield` | prefix forms; non-associative |
 | 2 | `=>` | function type; *right*-associative — the codomain is the whole expression to its right ([1.8 Operators and punctuation](#18-operators-and-punctuation)) |
 | 3 | `<<` | feed operator (right-associative is not meaningful — see [3.7 Feed operator `<<`](#37-feed-operator-)) |
-| 4 | `->` | pair; non-associative — `a -> b -> c` is a parse error ([2.4 Atoms](#24-atoms)) |
+| 4 | `->` | pair; non-associative — `a -> b -> c` is a parse error. The value admits a lambda, the key does not ([2.4 Atoms](#24-atoms)) |
 | 5 | `e₁ if cond else e₂` | ternary; *right*-associative |
 | 6 | `or` | short-circuit; n-ary flattening |
 | 7 | `and` | short-circuit; n-ary flattening |
@@ -385,11 +385,6 @@ noted:
 | 16 | unary `-` | prefix |
 | 17 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold |
 | 18 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
-
-The pair binds tighter than the feed and looser than the ternary, so
-`m << k -> v` feeds the entry `(k, v)` and `k -> v if c else w` pairs `k` with
-the whole conditional. Neither of its operands reaches the lambda, so a lambda
-on either side is parenthesised.
 
 ```ebnf
 expression ::= lambda_expr | yield_expr | fun_type | feed_expr | pair
@@ -444,6 +439,10 @@ binder ([4.6 `for` — iteration](#46-for--iteration)). Reading such a list as a
 `Map` is a separate step. The explicit constructor `map([…])` performs it today;
 the annotation and usage routes are **[Decided]** and unimplemented
 ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)).
+
+The value operand admits a lambda where the key does not, so `["inc" -> \x -> x + 1]`
+is a map of functions. A lambda on the key side would take the pair's own `->` as
+its binder terminator.
 
 A `{...}` literal is **type** syntax (§6.1), never a term-level value: bare
 identifier keys with `:` make a record type (`{x: T, y: U}`) and a colon-free
@@ -1049,6 +1048,14 @@ and by name for a record (`r.x`); neither is subscripted.
 lowering error. Finite maps are a collection literal `[k -> v, …]`, not a brace
 form; the literal parses, and `map([…])` is what reads it as a `Map`
 ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
+
+**A map literal has no syntactic identity.** `k -> v` is the two-tuple
+([2.4 Atoms](#24-atoms)), so `[k -> v, …]` and `[(k, v), …]` are one term and
+nothing tells a map literal from a list of pairs. Reading either as a `Map`
+without `map([…])` is therefore type-directed, and a duplicate-key check on one
+cannot be syntactic. That is the decision the erasure records rather than a
+consequence of it: a distinct node would make both syntactic, at the cost of two
+spellings for one value.
 
 **Empty forms.** `()` is the unit value (§3.1) — there is no zero-field product
 distinct from it, so it is equally what an "empty record" would denote. Its type
@@ -3397,18 +3404,15 @@ with parser-level support that lowering rejects:
   output cannot be materialized by the interpreter: it has no column
   representation, so `x = ()` compiles and then fails at runtime. This is a
   runtime gap, not a surface one.
-- **The term-level delimiter migration** — record values are `(f=1, …)`, and
-  `{…}` no longer denotes a term-level value (it is record-type / tuple-type /
-  unit syntax, [2.4 Atoms](#24-atoms)). The map literal `[k -> v, …]` parses; reading it
-  as a `Map`
-  without `map([…])` remains **[Decided]**. Earlier plans to spell the entries
-  `[k: v, …]`, `[k=v, …]`, or Unicode `[k ↦ v, …]` are superseded by the
-  map-literal decision.
+- **The term-level delimiter migration** — record values are `(f=1, …)`, and `{…}` no longer
+  denotes a term-level value (it is record-type / tuple-type / unit syntax,
+  [2.4 Atoms](#24-atoms)). The map literal `[k -> v, …]` parses; reading it as a `Map` without
+  `map([…])` remains **[Decided]**. Earlier plans to spell the entries `[k: v, …]`, `[k=v, …]`,
+  or Unicode `[k ↦ v, …]` are superseded by the map-literal decision.
 - **Map comprehensions** — `[k -> v for …]` parses as a comprehension of pairs
-  ([3.12 Comprehensions](#312-comprehensions)); reading the result as a `Map` follows the map-literal decision
-  above
-  and is **[Decided]**, unimplemented. The north-star `storefront` `/stats`
-  rollup uses it.
+  ([3.12 Comprehensions](#312-comprehensions)); reading the result as a `Map` follows the
+  map-literal decision above and is **[Decided]**, unimplemented. The north-star `storefront`
+  `/stats` rollup uses it.
 - **The target syntax at large** — the mutation and transaction
   **core is implemented** (`:=`, `with begin():`, `Mut(…, Txn)` mutable variables,
   feeds — §8), now spelled in the canonical target syntax: parenthesised type
@@ -3418,8 +3422,9 @@ with parser-level support that lowering rejects:
   three positions — type, term and pattern (§6.5, §3.15, §4.10). The remaining
   **Direction** notes are unimplemented: `rec` bindings (§4.3), destructuring
   patterns ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), membership `in`
-  ([3.4 Comparisons](#34-comparisons)), refinements ([6.4 Refinement syntax](#64-refinement-syntax)), the `Feed(_)`
-  forward-declaration surface (§3.7, §6.2), and
+  ([3.4 Comparisons](#34-comparisons)), refinements
+  ([6.4 Refinement syntax](#64-refinement-syntax)), the `Feed(_)` forward-declaration surface
+  (§3.7, §6.2), and
   transactions-as-contextual-parameters (§8.7). The north-star programs
   pin the target; the sequencing is tracked
 
