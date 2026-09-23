@@ -1113,10 +1113,10 @@ prices: Map(String, Int) = empty_map()
 seen: Set(String) = empty_map()
 ```
 
-`Set(K)` is `Map(K, unit)` ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so one
-term answers both annotations and the
-codomain is what tells the readings apart. The annotation is the only source for
-the two types — a keyed write constrains the value it writes, not the key type — so
+`Set(K)` is `Map(K, unit)`
+([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so one term
+answers both annotations and the codomain is what tells the readings apart. The annotation is the
+only source for the two types — a keyed write constrains the value it writes, not the key type — so
 an `empty_map()` nothing annotates is an error.
 
 > **Direction [Decided].** The literal forms migrate with the
@@ -1130,7 +1130,7 @@ an `empty_map()` nothing annotates is an error.
 > | finite map | `[k -> v, …]` — a collection of entry pairs (§2.4); `[ … ]` is the collection delimiter |
 > | `[1, 2, 3]` — list | same spelling, but shared across collection types: the literal can denote an `Array`, `List`, or `Set`, disambiguated by annotation or usage, with `list([…])` / `set([…])` constructors for explicitness (**[Tentative]** — §6.3) |
 > | empty record / unit | `()`, the unit value: with no fields there is nothing to tell a record from a tuple, so an empty record, an empty tuple, and unit coincide (§3.1, §6.6) |
-> | `[]` — empty list | same spelling; the empty **map** is `empty_map()` ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)) |
+> | `[]` — empty list | same spelling; the empty **map** is `empty_map()` (**[Tentative]** — the term asserts a witness kind the type language cannot leave open, and it answers a `Set` annotation only because `Set(K)` is `Map(K, unit)`, which §6.3 leaves open; [3.11 List, tuple, record literals](#311-list-tuple-record-literals)) |
 >
 > `{ … }` itself moves wholesale to the type level (§2.4, §6.1); no
 > term-level literal keeps braces.

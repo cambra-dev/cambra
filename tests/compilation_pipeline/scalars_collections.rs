@@ -115,6 +115,26 @@ fn empty_list_takes_its_element_type_from_the_use_site(
     check_scalar(code, expected);
 }
 
+// Two use sites that cannot both be satisfied is a **type error**, not a panic. The pin
+// takes the first upper bound that resolves concretely, and the rule it borrows —
+// `payload_pin`, from an unreachable arm's payload — has one demand to satisfy where a
+// reachable literal has as many as the program writes. Two annotations rather than two
+// operator reads: a trait obligation conflicts at emission, where an annotation's upper
+// bound waits for a lower bound that a literal with no elements never supplies.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_empty_literal_read_at_two_types_is_a_type_error() {
+    check_compile_error(
+        indoc! {r#"
+            xs = []
+            ints: List(Int) = box(xs)
+            strings: List(String) = box(xs)
+            1
+        "#},
+        "empty collection literal pinned to",
+    );
+}
+
 // A loop over the empty list runs its body zero times, leaving the accumulator at
 // its seed. The iteration binder's type is unobserved in the same way the element
 // type is, and nothing in the program names it.
@@ -141,8 +161,14 @@ fn a_loop_over_the_empty_list_keeps_its_seed() {
 // latter at a `unit` codomain — so one term answers both.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::map_annotation("m: Map(String, Int) = empty_map()\nsum([v for v in m])")]
-#[case::int_keys("m: Map(Int, Int) = empty_map()\nsum([v for v in m])")]
+#[case::map_annotation(indoc! {r#"
+    m: Map(String, Int) = empty_map()
+    sum([v for v in m])
+"#})]
+#[case::int_keys(indoc! {r#"
+    m: Map(Int, Int) = empty_map()
+    sum([v for v in m])
+"#})]
 fn an_empty_map_takes_its_types_from_the_annotation(#[case] code: &str) {
     check_scalar(code, Value::Int(0));
 }

@@ -98,7 +98,7 @@ A non-empty literal whose elements are themselves undetermined — `\x -> [x, x]
 has a value-free element type too, and there the variable is a type parameter the program left
 ambiguous; pinning it would accept a program that has no type.
 
-### The empty collection has no key morphism
+### The empty collection has no key morphism [Interim]
 
 `map([])` and `set([])` are rejected. A re-keying reads its key domain off the key morphism's
 image ([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)),
@@ -124,6 +124,19 @@ position is invariant and so pins to the argument's own type
 collection with no entries has no such type to offer — `box([])` against `Map(String, 𝑉)` collides
 on the domain, the empty index range `[0, 0)` being a `UIntRanges` domain rather than a key one —
 so the term names the sum itself and lets the annotation choose the witness.
+
+**What retires the term: a type-kind variable.** `empty_map()` asserts the witness kind —
+`SubtypesOf(𝐾)` where `[]` would be decided as `UIntRanges` — and it has to, because `TypeKind`
+carries no variable to leave the kind open. That absence is justified on `TypeKind::refuses`
+(`src/ccl/ty.rs`) by a premise this section is the counterexample to: membership is decidable from
+the classified type, so the only thing inference can be missing is that type. `[]` has a classified
+type and zero rows, so its kind is decided and no row witnesses it. Lifting that assumption is the
+one change that removes the term.
+
+The name is a second concession. `empty_map()` answers a `Set(𝐾)` annotation too, which works only
+because `Set(𝐾)` is `Map(𝐾, unit)` — see [Telling `Set` and `Map` apart
+[Open]](#telling-set-and-map-apart-open). A nominal type constructor, the candidate fix there,
+would force `empty_map()` and `empty_set()` apart.
 
 **The annotation is the only source.** A keyed write states its obligation on the value it writes,
 not on the collection's key type, so writes and reads leave both parameters open; an unannotated
