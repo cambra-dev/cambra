@@ -146,8 +146,9 @@ rewrites, in the order `run` performs them:
    partition dispatch through `converse`.
 3. **Constant folding** (`const_fold::fold_constants`) — a closed scalar computation becomes the
    literal it computes, which is what makes a collection literal's elements the compile-time values
-   op conversion reads.  `src/ccl/planning/const_fold.rs` states which shapes fold and which it
-   leaves.
+   op conversion reads.  The value comes from the kernel in `src/scalar_ops.rs`, called on a
+   one-element column, so the folded answer and the operator's are one implementation; what the
+   pass decides is the exclusion list, which `src/ccl/planning/const_fold.rs` states.
 4. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every
    position where op-conversion would compile with `input=None`.  At each site the pass picks the
    best implementation strategy:

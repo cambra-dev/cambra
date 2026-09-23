@@ -347,10 +347,10 @@ fn a_bare_groupby_tail_is_driven() {
     "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
-// Closed arithmetic reaches op conversion as the literal it computes, a whole chain of
-// it in one planning pass (`src/ccl/planning/const_fold.rs`). What these two used to pin
-// was the operator chain; the cases below whose operands include a binder keep `add`, `eq`
-// and `gt` in symbolic form, and `mul` is now pinned at run time instead, by
+// Closed arithmetic reaches op conversion as the literal it computes, a whole chain of it
+// in one planning pass (`src/ccl/planning/const_fold.rs`), so what these two pin is a
+// symbolic form with no operator left in it. The cases below keep `add`, `eq` and `gt`
+// because a binder is among their operands; `mul` is pinned at run time by
 // `scalars_collections.rs`'s `arithmetic_and_comparison_on_computed_operands`.
 #[case("1 + 2", "3:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case(

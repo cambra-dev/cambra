@@ -150,6 +150,55 @@ pub enum BinOpKind {
     Compare(CompareKind),
 }
 
+/// The runtime operator this one denotes.
+///
+/// `ccl` and `crate::scalar_ops` spell the operator set twice because the layering forbids
+/// `ccl` from depending upward on `interpreter`, and the kernel sits below both. This is the
+/// one place the two spellings meet: op-conversion takes it to build a `BinOp` operator, and
+/// `const_fold` takes it to fold a closed computation through the same kernel the operator
+/// will run.
+impl From<BinOpKind> for crate::scalar_ops::BinOpKind {
+    fn from(op: BinOpKind) -> Self {
+        use crate::scalar_ops as rt;
+        match op {
+            // `^+` and `+` compute the same sum, so they share one runtime operation; the
+            // refinement `^+` carries is spent by the time either caller runs.
+            BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => {
+                rt::BinOpKind::Arithmetic(rt::ArithmeticKind::Add)
+            }
+            BinOpKind::Arithmetic(ArithmeticKind::Sub) => {
+                rt::BinOpKind::Arithmetic(rt::ArithmeticKind::Sub)
+            }
+            BinOpKind::Arithmetic(ArithmeticKind::Mul) => {
+                rt::BinOpKind::Arithmetic(rt::ArithmeticKind::Mul)
+            }
+            BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => {
+                rt::BinOpKind::Arithmetic(rt::ArithmeticKind::FloorDiv)
+            }
+            BinOpKind::Arithmetic(ArithmeticKind::Pow) => {
+                rt::BinOpKind::Arithmetic(rt::ArithmeticKind::Pow)
+            }
+            BinOpKind::Concat => rt::BinOpKind::Concat,
+            BinOpKind::Compare(c) => rt::BinOpKind::Compare(match c {
+                CompareKind::Equals => rt::CompareKind::Equals,
+                CompareKind::NotEquals => rt::CompareKind::NotEquals,
+                CompareKind::Less => rt::CompareKind::Less,
+                CompareKind::LessOrEq => rt::CompareKind::LessOrEq,
+                CompareKind::Greater => rt::CompareKind::Greater,
+                CompareKind::GreaterOrEq => rt::CompareKind::GreaterOrEq,
+            }),
+            BinOpKind::BoolLogic(l) => rt::BinOpKind::BoolLogic(match l {
+                LogicKind::And => rt::LogicKind::And,
+                LogicKind::Nand => rt::LogicKind::Nand,
+                LogicKind::Or => rt::LogicKind::Or,
+                LogicKind::Nor => rt::LogicKind::Nor,
+                LogicKind::Xor => rt::LogicKind::Xor,
+                LogicKind::Xnor => rt::LogicKind::Xnor,
+            }),
+        }
+    }
+}
+
 impl BinOpKind {
     /// Returns the canonical infix symbol for this operator (e.g. `"+"`, `"and"`, `"<="`).
     ///

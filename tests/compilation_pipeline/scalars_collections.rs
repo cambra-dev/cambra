@@ -315,11 +315,67 @@ fn a_collection_reading_element_is_rejected() {
 /// The second way the fold declines: both operands are literals, and folding would answer
 /// a question `docs/chl-spec.md`, "3.3 Arithmetic and logical operators" (floor division)
 /// and the runtime (truncation toward zero) disagree on. Settling that disagreement is
-/// what makes this element foldable.
+/// what makes this element foldable (the vault issue
+/// `interpreter-integer-arithmetic-divergences`).
 #[test]
 #[should_panic(expected = "constant folding did not reduce this one")]
 fn a_negative_floor_division_element_is_rejected() {
     run_pipeline("sum([(0 - 7) // 2])");
+}
+
+/// An operation with **no result** is left for the runtime, which is where it faults.
+///
+/// Folding it would answer where the runtime does not: an overflowing `*` panics in a debug
+/// build, and `// 0` panics in both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::overflow("sum([9223372036854775807 * 2])")]
+#[case::division_by_zero("sum([1 // 0])")]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn an_element_with_no_result_is_rejected(#[case] code: &str) {
+    run_pipeline(code);
+}
+
+/// A **compound** constant is not substituted, so an element built from one stays a
+/// computation.
+///
+/// Replacing `expr.node` with a `Lit` mints nothing; substituting a tuple, a record or a
+/// variant copies nodes, and a copy needs minted `NodeId`s and a recording
+/// (`src/ccl/planning/const_fold.rs`, "What does not fold").
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn an_element_built_from_a_compound_constant_is_rejected() {
+    run_pipeline(indoc! {r"
+        p = (1, 2)
+        sum([p.0 + p.1])"});
+}
+
+/// The `discharged` guard skips the whole **subtree**, so an unrelated downstream `^+`
+/// stops an otherwise-foldable element compiling.
+///
+/// What makes `y`'s definition discharged is `z`, which reads it — so the same program with
+/// `z = y + 1` folds the element and answers 7. The guard is the module doc's bound at "What
+/// does not fold"; this narrows a gap rather than opening one, the element having been
+/// rejected before the pass existed.
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn a_downstream_refined_sum_stops_an_element_folding() {
+    run_pipeline(indoc! {r"
+        y = sum([1 + 2, 3])
+        z = y ^+ 1
+        z"});
+}
+
+/// The same program under `+`, which records nothing and leaves the definition foldable.
+#[test]
+fn an_unrefined_downstream_sum_leaves_the_element_foldable() {
+    check_scalar(
+        indoc! {r"
+            y = sum([1 + 2, 3])
+            z = y + 1
+            z"},
+        Value::Int(7),
+    );
 }
 
 // A UDF parameter annotated as an abstract collection is a *consumer* of a whole

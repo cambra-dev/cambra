@@ -26,14 +26,19 @@
 //! rather than exposing it, so no substitution crosses into a scope that rebinds the
 //! name.
 //!
-//! **Anything inside a definition the body's type discharges.** The recorded type of that
-//! `Let` was closed over the definition as it stands, and the post-planning wall re-runs the
-//! discharge over whatever is there by then, so a folded spelling either side of that
-//! comparison is two spellings of one value
-//! (`a_discharged_definition_survives_planning`). The whole subtree is skipped and not just
-//! the definition's own node, so a collection literal under such a definition keeps its
-//! unevaluated elements — and a downstream `^+`, which is what makes a binder discharged,
-//! can therefore stop a literal compiling that compiled under `+`.
+//! **Anything inside a definition the body's type discharges.** The post-planning wall
+//! compares recorded and reconstructed types with their refinements rather than by base, and
+//! a `Let` whose binder is free in its body's type has that binder discharged into the
+//! recorded type (`close_let_type` in `src/ccl/infer/check.rs`). The wall re-runs the
+//! discharge over whatever `bound_expr` holds by then, so folding the definition puts
+//! `{Int | __elem == 4}` against `{Int | __elem == 1 ^+ 3}` — one value, two spellings,
+//! compared structurally (`a_discharged_definition_survives_planning`). A definition no type
+//! records still folds, which is every case this pass exists for.
+//!
+//! The whole subtree is skipped and not just the definition's own node, so a collection
+//! literal under such a definition keeps its unevaluated elements — and a downstream `^+`,
+//! which is what makes a binder discharged, can therefore stop a literal compiling that
+//! compiled under `+` (`a_downstream_refined_sum_stops_an_element_folding`).
 //!
 //! **A string longer than [`MAX_FOLDED_STRING`].** Concatenation is the one fold whose
 //! result can be much larger than its operands, and a doubling chain is exponential in the
@@ -46,9 +51,12 @@
 //! recording.
 //!
 //! **A `//` whose two definitions disagree.** `docs/chl-spec.md`, "3.3 Arithmetic and
-//! logical operators" calls it floor division, and the runtime truncates toward zero. The
-//! two coincide for a non-negative dividend and a positive divisor, and the fold fires
-//! only there, so it holds whichever way the disagreement is settled.
+//! logical operators" calls it floor division, and the runtime truncates toward zero, so
+//! `(0 - 7) // 2` answers -3 where the spec says -4. The two coincide for a non-negative
+//! dividend and a positive divisor, and the fold fires only there, so it holds whichever way
+//! the disagreement is settled. The disagreement itself is the vault issue
+//! `interpreter-integer-arithmetic-divergences`; settling it in the runtime's favour would
+//! retire this exclusion.
 //!
 //! **An operation with no result**: integer overflow, and division by zero. Every
 //! arithmetic case goes through a guard or a `checked_*`, and declining leaves the
@@ -60,28 +68,14 @@
 //! detail"), so folding one occurrence of a predicate and not another would break the
 //! match. The folded node keeps its recorded type.
 //!
-//! **A definition the body's type discharges.** The post-planning wall compares recorded
-//! and reconstructed types with their refinements, not by base, and a `Let` whose binder is
-//! free in its body's type has that binder discharged into the recorded type
-//! (`close_let_type` in `src/ccl/infer/check.rs`). The wall re-runs the discharge over
-//! whatever `bound_expr` holds by then, so folding the definition puts `{Int | __elem == 4}`
-//! against `{Int | __elem == 1 ^+ 3}` — one value, two spellings, compared structurally.
-//! Such a definition is left alone and its binder exposes no literal. A definition no type
-//! records still folds, which is every case this pass exists for.
-//!
 //! # Agreement with the runtime
 //!
-//! Every folded operation must compute what
-//! [`apply_binop_column`](crate::interpreter::apply_binop_column) computes for the same
-//! operands. There are two implementations because `ccl` may not depend upward on
-//! `interpreter`, a rule stated at `builtin_to_binop` in
-//! `src/interpreter/operator_conversion.rs`. The exclusions above are the operations where
-//! agreement is not available.
-
-use std::cmp::Ordering;
+//! By construction: `eval_binop` calls the kernel in [`crate::scalar_ops`] on a one-element
+//! column, and that is the kernel the `BinOp` operator runs. There is one implementation,
+//! so there is nothing for a compile-time answer and a run-time one to disagree about, and
+//! the exclusions above are the whole of what this pass decides.
 
 use super::*;
-use crate::ccl::ArithmeticKind;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 
 /// Replace every closed scalar computation in `expr` with its value.
@@ -206,69 +200,90 @@ fn value_of(expr: &Expr, consts: &Consts) -> Option<Lit> {
 /// `Consts`, and it is cloned at every occurrence the substitution reaches.
 const MAX_FOLDED_STRING: usize = 64 * 1024;
 
+/// Fold one closed application, or decline.
+///
+/// **The runtime computes the value; this decides whether to ask.** The kernel
+/// [`crate::scalar_ops`] holds is the same one the `BinOp` operator will run, called here
+/// on a one-element column, so agreement is by construction rather than by two
+/// implementations being kept in step. What belongs to the fold is the exclusion list, and
+/// that is what [`runtime_answers`] is.
 fn eval_binop(op: BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
+    let rt = crate::scalar_ops::BinOpKind::from(op);
+    if !runtime_answers(rt, left, right) {
+        return None;
+    }
+    apply_one(rt, left, right)
+}
+
+/// Whether the runtime answers this application at all.
+///
+/// Each arm is one of the module doc's exclusions. Declining leaves the application in
+/// place, and the operator evaluates it as it would have.
+fn runtime_answers(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) -> bool {
+    use crate::scalar_ops::{ArithmeticKind as A, BinOpKind as B};
     match (op, left, right) {
-        // `^+` computes the sum `+` computes; they differ in the type the result takes,
-        // and the node keeps its recorded type through the fold.
-        (BinOpKind::Arithmetic(op), Lit::Int(l), Lit::Int(r)) => Some(Lit::Int(match op {
-            ArithmeticKind::Add | ArithmeticKind::AddRefined => l.checked_add(*r)?,
-            ArithmeticKind::Sub => l.checked_sub(*r)?,
-            ArithmeticKind::Mul => l.checked_mul(*r)?,
-            // Only where floor division and truncation coincide — see the module
-            // docs. The bound also excludes a zero divisor.
-            ArithmeticKind::FloorDiv if *l >= 0 && *r > 0 => l / r,
-            ArithmeticKind::FloorDiv => return None,
-            // The runtime raises by squaring through the same `*` that `Mul` uses
-            // (`IntPow::raised`), so folding an exponentiation that overflows would
-            // answer where the runtime does not. A negative exponent is the reciprocal
-            // `1 // (a ** n)`, undefined at `a == 0` exactly where division is, and is
-            // left to the runtime for the reason `FloorDiv` is.
-            ArithmeticKind::Pow => l.checked_pow(u32::try_from(*r).ok()?)?,
-        })),
-        (BinOpKind::Concat, Lit::String(l), Lit::String(r)) => {
-            // Bounded, because a chain of doublings is linear in the source and exponential
-            // in the result: thirty `s = s + s` lines reach a gigabyte, and the value is
-            // then copied into `Consts` and again at every occurrence it is read at. Above
-            // the cap the runtime builds it once, lazily, as it did before this pass.
-            (l.len() + r.len() <= MAX_FOLDED_STRING).then(|| Lit::String(format!("{l}{r}")))
+        (B::Arithmetic(a), Lit::Int(l), Lit::Int(r)) => match a {
+            A::Add => l.checked_add(*r).is_some(),
+            A::Sub => l.checked_sub(*r).is_some(),
+            A::Mul => l.checked_mul(*r).is_some(),
+            // Only where floor division and truncation coincide — see the module docs. The
+            // bound also excludes a zero divisor.
+            A::FloorDiv => *l >= 0 && *r > 0,
+            // Exponentiation has no no-result case: the runtime raises by squaring through
+            // `wrapping_mul`, so a result past `i64` is a wrapped value and the fold
+            // answers the same one. A negative exponent cannot arrive — `**` states
+            // `{Int | __elem >= 0}` of it (`src/ccl/lower/exprs.rs`) — and is excluded here
+            // because the kernel asserts on one rather than declining.
+            A::Pow => *r >= 0,
+        },
+        // Bounded, because a chain of doublings is linear in the source and exponential in
+        // the result: thirty `s = s + s` lines reach a gigabyte, and the value is then
+        // copied into `Consts` and again at every occurrence it is read at. Above the cap
+        // the runtime builds it once, lazily, as it did before this pass.
+        (B::Concat, Lit::String(l), Lit::String(r)) => l.len() + r.len() <= MAX_FOLDED_STRING,
+        // `unit` is excluded: the runtime has no comparison for it and panics, so folding
+        // one would answer a program the runtime refuses.
+        (B::Compare(_), Lit::Int(_), Lit::Int(_))
+        | (B::Compare(_), Lit::String(_), Lit::String(_))
+        | (B::Compare(_), Lit::Bool(_), Lit::Bool(_))
+        | (B::BoolLogic(_), Lit::Bool(_), Lit::Bool(_)) => true,
+        _ => false,
+    }
+}
+
+/// The kernel's answer for one pair, as a literal.
+///
+/// A one-element column in and the single position out. `None` is a pairing the kernel has
+/// no arm for, which [`runtime_answers`] has already excluded — kept as a `None` rather
+/// than an `unreachable!` because the two enumerations are separate matches.
+fn apply_one(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
+    use crate::scalar_ops as rt;
+    match (op, left, right) {
+        (rt::BinOpKind::Arithmetic(a), Lit::Int(l), Lit::Int(r)) => {
+            Some(Lit::Int(rt::zip_arithmetic(a, vec![*l], &[*r]).pop()?))
         }
-        (BinOpKind::Compare(op), _, _) => eval_compare(op, left, right).map(Lit::Bool),
-        (BinOpKind::BoolLogic(op), Lit::Bool(l), Lit::Bool(r)) => {
-            Some(Lit::Bool(eval_logic(op, *l, *r)))
+        (rt::BinOpKind::Concat, Lit::String(l), Lit::String(r)) => Some(Lit::String(
+            rt::zip_concat(vec![l.as_str().into()], &[r.as_str().into()])
+                .pop()?
+                .to_string(),
+        )),
+        (rt::BinOpKind::Compare(c), Lit::Int(l), Lit::Int(r)) => {
+            Some(Lit::Bool(rt::zip_compare(c, vec![*l], &[*r]).get(0)?))
         }
+        (rt::BinOpKind::Compare(c), Lit::String(l), Lit::String(r)) => Some(Lit::Bool(
+            rt::zip_compare(c, vec![l.as_str()], &[r.as_str()]).get(0)?,
+        )),
+        (rt::BinOpKind::Compare(c), Lit::Bool(l), Lit::Bool(r)) => Some(Lit::Bool(
+            rt::zip_bool_compare(c, bits(*l), &bits(*r)).get(0)?,
+        )),
+        (rt::BinOpKind::BoolLogic(g), Lit::Bool(l), Lit::Bool(r)) => Some(Lit::Bool(
+            rt::zip_bool_logic(g, bits(*l), &bits(*r)).get(0)?,
+        )),
         _ => None,
     }
 }
 
-/// Comparison over two literals of the same base.
-///
-/// `unit` is excluded: the runtime has no comparison for it and panics, so folding one
-/// would answer a program the runtime refuses.
-fn eval_compare(op: CompareKind, left: &Lit, right: &Lit) -> Option<bool> {
-    let ordering = match (left, right) {
-        (Lit::Int(l), Lit::Int(r)) => l.cmp(r),
-        (Lit::String(l), Lit::String(r)) => l.cmp(r),
-        // Boolean ordering is false < true, matching `zip_bool_compare`.
-        (Lit::Bool(l), Lit::Bool(r)) => l.cmp(r),
-        _ => return None,
-    };
-    Some(match op {
-        CompareKind::Equals => ordering == Ordering::Equal,
-        CompareKind::NotEquals => ordering != Ordering::Equal,
-        CompareKind::Less => ordering == Ordering::Less,
-        CompareKind::LessOrEq => ordering != Ordering::Greater,
-        CompareKind::Greater => ordering == Ordering::Greater,
-        CompareKind::GreaterOrEq => ordering != Ordering::Less,
-    })
-}
-
-fn eval_logic(op: LogicKind, left: bool, right: bool) -> bool {
-    match op {
-        LogicKind::And => left && right,
-        LogicKind::Nand => !(left && right),
-        LogicKind::Or => left || right,
-        LogicKind::Nor => !(left || right),
-        LogicKind::Xor => left ^ right,
-        LogicKind::Xnor => left == right,
-    }
+/// A one-position `BitVec`, the column shape the boolean kernels take.
+fn bits(b: bool) -> bit_vec::BitVec {
+    bit_vec::BitVec::from_elem(1, b)
 }
