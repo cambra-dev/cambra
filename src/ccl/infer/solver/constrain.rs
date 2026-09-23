@@ -1842,11 +1842,11 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             value,
             domain,
             history_kind,
-        } => Type::History {
-            value: Box::new(extrude_invariant(value, target_level, cache)),
-            domain: Box::new(extrude_invariant(domain, target_level, cache)),
-            history_kind: *history_kind,
-        },
+        } => Type::history(
+            extrude_invariant(domain, target_level, cache),
+            extrude_invariant(value, target_level, cache),
+            *history_kind,
+        ),
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&(tv.uid, pol)) {
                 return Type::Infer(Rc::clone(existing));
@@ -2677,11 +2677,7 @@ mod tests {
     /// collection `Fun { domain, value }` (unlike an `Overwrite`, which derefs to the
     /// scalar `value`); the invariant `constrain` arms treat it as that `Fun`.
     fn feed_ty(domain: Type, value: Type) -> Type {
-        Type::History {
-            value: Box::new(value),
-            domain: Box::new(domain),
-            history_kind: HistoryKind::Append,
-        }
+        Type::feed(domain, value)
     }
 
     #[test]
@@ -2887,12 +2883,11 @@ mod tests {
 
     // --- Mutable handles (`Type::History { kind: Overwrite }`) ---
 
-    fn mut_ty(value: Type, domain: Type) -> Type {
-        Type::History {
-            value: Box::new(value),
-            domain: Box::new(domain),
-            history_kind: HistoryKind::Overwrite,
-        }
+    /// A mutable variable over `domain` holding `value`. Argument order is
+    /// [`Type::mutable`]'s rather than the `Mut(value, domain)` rendering's, so the two
+    /// spellings on one line never disagree.
+    fn mut_ty(domain: Type, value: Type) -> Type {
+        Type::mutable(domain, value)
     }
 
     // There is no deref arm to test: a mutable variable mention that denotes its value is
@@ -2910,8 +2905,8 @@ mod tests {
         let (v0, d0, v1, d1) = (fresh_var(0), fresh_var(0), fresh_var(0), fresh_var(0));
         let mut cache = ConstrainCache::new();
         constrain_subtype(
-            &mut_ty(v0.clone(), d0.clone()),
-            &mut_ty(v1.clone(), d1.clone()),
+            &mut_ty(d0.clone(), v0.clone()),
+            &mut_ty(d1.clone(), v1.clone()),
             &mut cache,
         )
         .unwrap();
@@ -2936,7 +2931,7 @@ mod tests {
         // handle. A position that means the value says so itself — `emit_apply`
         // reads through the parameter's handle for a pass-by-reference argument,
         // and every other operand derefs at `emit::emit_value_read`.
-        let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
+        let m = mut_ty(prim(BaseType::UInt), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
         assert!(matches!(
             constrain_subtype(&prim(BaseType::Int), &m, &mut cache),

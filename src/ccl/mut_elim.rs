@@ -2473,11 +2473,7 @@ mod tests {
         // erasure has to reach carrying no history at all.
         let mut tree = Expr::mut_decl(
             x.clone(),
-            Type::History {
-                value: Box::new(int.clone()),
-                domain: Box::new(Type::Hole),
-                history_kind: HistoryKind::Overwrite,
-            },
+            Type::mutable(Type::Hole, int.clone()),
             init,
             stmt,
         );

@@ -684,11 +684,11 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
                 domain: id,
                 ..
             },
-        ) => Type::History {
-            value: Box::new(complete_annotation(av, iv)),
-            domain: Box::new(complete_annotation(ad, id)),
-            history_kind: *history_kind,
-        },
+        ) => Type::history(
+            complete_annotation(ad, id),
+            complete_annotation(av, iv),
+            *history_kind,
+        ),
         _ => ann.clone(),
     }
 }
@@ -1399,11 +1399,7 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
     // naming the defer binder, so every consumer types concretely against that
     // name (no `Infer` channel-domain residue) and `channelize` erases it to
     // the concrete channel domain by substitution.
-    Type::History {
-        value: Box::new(ctx.fresh()),
-        domain: Box::new(ctx.fresh()),
-        history_kind: crate::ccl::HistoryKind::Append,
-    }
+    Type::feed(ctx.fresh(), ctx.fresh())
 }
 
 /// Deref a mutable variable reference to its value type. A no-op on every other
@@ -1537,11 +1533,7 @@ fn constrain_into_feed<C: Typing>(
             // rule carries the contribution back to the caller's channel.
             let rho_value = ctx.fresh();
             let rho_domain = ctx.fresh();
-            let required = Type::History {
-                value: Box::new(rho_value.clone()),
-                domain: Box::new(rho_domain.clone()),
-                history_kind: crate::ccl::HistoryKind::Append,
-            };
+            let required = Type::feed(rho_domain.clone(), rho_value.clone());
             ctx.require_sub(target_ty, &required, &|| {
                 format!("feed target of {label} must be a feed handle")
             })?;
@@ -1725,14 +1717,10 @@ pub(super) fn emit_let<C: Typing>(
         } = &bound_ty
         && let Type::Infer(dv) = domain.as_ref()
     {
-        let handle = Type::History {
-            value: value.clone(),
-            domain: Box::new(Type::ChanDom(
-                binding.name.clone(),
-                crate::ccl::ChanLevel(dv.level),
-            )),
-            history_kind: crate::ccl::HistoryKind::Append,
-        };
+        let handle = Type::feed(
+            Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level)),
+            (**value).clone(),
+        );
         bound_expr.ty = handle.clone();
         handle
     } else {
