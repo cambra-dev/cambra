@@ -63,6 +63,16 @@ serde_json = "1"
 
 [profile.release]
 debug = "line-tables-only"
+
+# `dev`'s compile cost with `debug_assertions` off — the configuration a release
+# build compiles, without paying release codegen. `debug-assertions` is a codegen
+# flag rather than a runtime one, so this is its own build tree and shares no
+# artifacts with `debug`. Optimization is beside the point for what the gate that
+# uses it checks (`ci_test_no_assertions`), and stays at `dev`'s.
+[profile.no-assertions]
+inherits = "dev"
+debug-assertions = false
+overflow-checks = false
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something

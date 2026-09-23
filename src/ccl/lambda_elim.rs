@@ -1581,10 +1581,17 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // lattice via `cast`; the cast-wrapped-lambda arm below handles the
         // dependent case.)
         TypedExprNode::Lambda { param, body } => {
-            // Render the pre-elimination lambda only in debug builds — the
-            // string (and its `*body` clone) feeds just the assert below.
+            // Render the pre-elimination lambda only in debug builds — the string
+            // feeds just the assert below. Built as a `throwaway` over an
+            // id-preserving body copy, so the render mints nothing: a node minted
+            // here would advance the global id counter in debug builds alone, and
+            // every id the rest of the compile mints would differ from the release
+            // one for the same program.
             #[cfg(debug_assertions)]
-            let original = symbolic(&Expr::lambda(&param.name, param.ty.clone(), *body.clone()));
+            let original = symbolic(&Expr::throwaway(TypedExprNode::Lambda {
+                param: param.clone(),
+                body: Box::new(body.clone_preserving_ids()),
+            }));
             let mut result = elim_lambda_kinded(
                 ctx,
                 &param.name,

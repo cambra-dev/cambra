@@ -906,9 +906,13 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     // With the whole graph in its final state, re-check every read the walk
     // performed (skipped on the error path — a failed program's reads are
     // not expected to be stable).
+    // Under `run_debug_check` because the re-resolution rebuilds predicate terms
+    // it then drops: `NodeId` is a process-global counter, so minting for them
+    // would advance it in debug builds alone and one program would take two id
+    // sets.
     #[cfg(debug_assertions)]
     if ctx.errors.is_empty() {
-        assert_reads_stable(&ctx.reads);
+        crate::ccl::provenance::run_debug_check(|| assert_reads_stable(&ctx.reads));
     }
     ctx.errors
 }
