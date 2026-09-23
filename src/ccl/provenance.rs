@@ -1952,23 +1952,48 @@ fn rows_would_reach_the_table() -> bool {
         && ACTIVE_PHASE.with(|p| p.borrow().is_some())
 }
 
-thread_local! {
-    /// Depth counter for [`preserve_ids`]: non-zero means a clone in progress is
-    /// a **re-allocation of the same node**, not a duplication, so it must carry
-    /// the origin's id rather than mint one.
-    ///
-    /// A counter rather than a flag because the scopes nest — a preserving copy
-    /// of a tree recurses through `Clone` for every child.
-    static PRESERVING_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// A thread-local scope that nests, entered through a guard.
+///
+/// A depth rather than a flag because both scopes re-enter: a preserving copy of
+/// a tree recurses through `Clone` for every child, and a sealed check clones as
+/// it resolves. A guard rather than a decrement after the call because the depth
+/// has to fall on an unwind. Both scopes wrap assertions, an assertion that fires
+/// panics, and a depth left raised turns every later
+/// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) on that thread into a
+/// throwaway.
+trait ScopeDepth {
+    /// Enter the scope; it stays open until the returned guard drops.
+    fn enter(&'static self) -> DepthGuard;
+    /// Whether any scope is open on this thread.
+    fn is_open(&'static self) -> bool;
 }
 
-/// Guard returned by [`preserve_ids`]. Dropping it re-enables freshening.
-pub(crate) struct PreservingIds;
-
-impl Drop for PreservingIds {
-    fn drop(&mut self) {
-        PRESERVING_IDS.with(|c| c.set(c.get() - 1));
+impl ScopeDepth for std::thread::LocalKey<std::cell::Cell<usize>> {
+    fn enter(&'static self) -> DepthGuard {
+        self.with(|c| c.set(c.get() + 1));
+        DepthGuard(self)
     }
+
+    fn is_open(&'static self) -> bool {
+        self.with(std::cell::Cell::get) > 0
+    }
+}
+
+/// Guard returned by [`ScopeDepth::enter`]. Dropping it leaves the scope.
+#[must_use]
+pub(crate) struct DepthGuard(&'static std::thread::LocalKey<std::cell::Cell<usize>>);
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        self.0.with(|c| c.set(c.get() - 1));
+    }
+}
+
+thread_local! {
+    /// Depth of the enclosing [`preserve_ids`] scopes: non-zero means a clone in
+    /// progress is a **re-allocation of the same node**, not a duplication, so it
+    /// must carry the origin's id rather than mint one.
+    static PRESERVING_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Open a scope in which [`TypedExpr`](crate::ccl::expr::TypedExpr)'s `Clone`
@@ -1979,10 +2004,8 @@ impl Drop for PreservingIds {
 /// or [`run_debug_check`], never directly: the scope must cover the clone and
 /// nothing else, and a genuine duplication performed inside one would silently
 /// produce a duplicate id.
-#[must_use]
-pub(crate) fn preserve_ids() -> PreservingIds {
-    PRESERVING_IDS.with(|c| c.set(c.get() + 1));
-    PreservingIds
+pub(crate) fn preserve_ids() -> DepthGuard {
+    PRESERVING_IDS.enter()
 }
 
 /// Run `f` with id-preserving clones — a scope over a whole *rewrite region*,
@@ -2018,16 +2041,27 @@ pub(crate) fn preserving_ids<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+#[cfg(debug_assertions)]
 thread_local! {
     /// Depth of the enclosing [`run_debug_check`] scopes.
-    static SEALED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static SEALED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a [`run_debug_check`] scope is open on this thread, so
 /// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) builds a throwaway
 /// rather than minting.
+#[cfg(debug_assertions)]
 pub(crate) fn record_sealed() -> bool {
-    SEALED.with(std::cell::Cell::get) > 0
+    SEALED.is_open()
+}
+
+/// Never sealed in a build with assertions off: `run_debug_check` is the only
+/// thing that seals, and it does not exist there. `const` so that
+/// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) folds its throwaway
+/// branch away rather than reading a thread-local for every node it builds.
+#[cfg(not(debug_assertions))]
+pub(crate) const fn record_sealed() -> bool {
+    false
 }
 
 /// Run a debug-only check with the provenance record **sealed**: nothing `f`
@@ -2057,10 +2091,8 @@ pub(crate) fn record_sealed() -> bool {
 #[cfg(debug_assertions)]
 pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
     let _preserving = preserve_ids();
-    SEALED.with(|c| c.set(c.get() + 1));
-    let r = f();
-    SEALED.with(|c| c.set(c.get() - 1));
-    r
+    let _sealed = SEALED.enter();
+    f()
 }
 
 /// The id a clone of `origin` should carry, and the one place that decides.
@@ -2069,7 +2101,7 @@ pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
 /// [`on_copy`]. Inside a [`preserve_ids`] scope it returns `origin` unchanged
 /// and records nothing, because no new node came into being.
 pub(crate) fn copy_id(origin: NodeId) -> NodeId {
-    if PRESERVING_IDS.with(std::cell::Cell::get) > 0 {
+    if PRESERVING_IDS.is_open() {
         return origin;
     }
     let fresh = NodeId::fresh();
@@ -3483,6 +3515,38 @@ mod tests {
             a = Expr::lit(Lit::Int(7)).node_id();
         });
         assert_eq!(table.parents(a), &[named]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn panic_inside_a_debug_check_unwinds_without_leaving_the_record_sealed() {
+        // The scope wraps an assertion, so a panic out of it is the assertion
+        // doing its job. A seal left standing would make every later node on this
+        // thread a throwaway, and throwaways share one id, so the damage surfaces
+        // far from here.
+        assert!(!record_sealed(), "clean precondition");
+        let inside = std::cell::Cell::new(None);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_debug_check(|| {
+                inside.set(Some(Expr::lit(Lit::Int(1)).node_id()));
+                panic!("deliberate panic inside a debug check");
+            })
+        }));
+        assert!(caught.is_err(), "the panic propagated");
+        assert_eq!(
+            inside.get(),
+            Some(NodeId::PLACEHOLDER),
+            "the record was sealed while `f` ran"
+        );
+        assert!(
+            !record_sealed(),
+            "the guard's Drop unsealed the record on unwind"
+        );
+        assert_ne!(
+            Expr::lit(Lit::Int(2)).node_id(),
+            NodeId::PLACEHOLDER,
+            "a later mint takes a real id"
+        );
     }
 
     #[test]
