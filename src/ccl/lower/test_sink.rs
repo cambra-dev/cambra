@@ -1,51 +1,37 @@
 //! `test_sink` recognition: detecting the `out = test_sink()` shape.
 //!
-//! Test-only surface, deliberately absent from `docs/chl-spec.md`: it exists so a test can
-//! observe a program through a sink, the way a served program is observed, rather than
-//! through a trailing bare expression. A program someone writes has no reason to name it.
+//! Test-only surface, absent from `docs/chl-spec.md` and built only under `cfg(test)` or the
+//! `test-helpers` feature: it lets a test observe a program through a sink, the way a served
+//! program is observed, rather than through a trailing bare expression. Without it,
+//! `test_sink()` is an unbound name like any other.
 //!
 //! A test sink is a [`Defer`](crate::ccl::TypedExprNode::Defer) channel that is also a
-//! program output, so the surface is `defer()`'s plus the binding becoming a sink. The
-//! statement form is `identifier = test_sink()`, it takes no arguments, and it must appear
-//! in the top-level block, because that is where a program's outputs are declared. The
-//! binding name is the sink's name, which is the key
-//! [`sink_bindings`](super::LoweringContext::sink_bindings) already uses and the field name
-//! the program's tail record carries — so a harness registers a sink under that name with
+//! program output. The statement form is `identifier = test_sink()`, takes no arguments, and
+//! appears once per name in the top-level block, where a program's outputs are declared. The
+//! binding name is the sink's name. It is the key
+//! [`sink_bindings`](super::LoweringContext::sink_bindings) uses and the field name the
+//! program's tail record carries, so a test registers a sink under that name with
 //! [`GlobalContext::register_test_sink`](crate::ccl::context::GlobalContext::register_test_sink)
 //! before compiling and reads the handle it kept afterwards.
 //!
-//! The wiring — taking or creating the [`TestSink`](crate::interpreter::TestSink),
-//! registering it, and emitting the `Defer` `Let` — lives inline in
-//! [`lower_middle_stmt`](super::lower_middle_stmt); these helpers only classify and
-//! destructure.
+//! [`lower_middle_stmt`](super::lower_middle_stmt) does the wiring: it takes the registered
+//! [`TestSink`](crate::interpreter::TestSink), registers it, and emits the `Defer` `Let`.
+//! This module only recognizes the statement.
 
-use super::*;
 use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Spanned};
 
-/// Returns `true` when `target` is a single name and `value` is a no-argument call to
+/// The bound name, when `target` is a single name and `value` is a no-argument call to
 /// `test_sink`.
-pub(super) fn is_test_sink_assign(
+pub(super) fn test_sink_name(
     target: &Spanned<AssignTarget>,
     value: &Spanned<ChlExpr>,
-) -> bool {
-    if !matches!(target.node, AssignTarget::Name(_)) {
-        return false;
-    }
-    let ChlExpr::Call { func, args } = &value.node else {
-        return false;
+) -> Option<String> {
+    let AssignTarget::Name(name) = &target.node else {
+        return None;
     };
-    args.is_empty() && matches!(&func.node, ChlExpr::Name(id) if id == "test_sink")
-}
-
-/// Extract the bound name from a single-name target.
-pub(super) fn extract_test_sink_name(
-    target: &Spanned<AssignTarget>,
-) -> Result<String, LoweringError> {
-    match &target.node {
-        AssignTarget::Name(n) => Ok(n.to_string()),
-        _ => Err(LoweringError::unsupported(
-            target.span,
-            "test_sink must be assigned to a single name",
-        )),
-    }
+    let ChlExpr::Call { func, args } = &value.node else {
+        return None;
+    };
+    (args.is_empty() && matches!(&func.node, ChlExpr::Name(id) if id == "test_sink"))
+        .then(|| name.to_string())
 }
