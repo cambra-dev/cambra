@@ -384,6 +384,8 @@ fn lower_for_body_stmts_scoped(
                 value,
                 transparency,
             } => {
+                #[cfg(any(test, feature = "test-helpers"))]
+                refuse_nested_test_sink(target, value, stmt.span)?;
                 let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));

@@ -744,9 +744,15 @@ impl GlobalContext {
     ) -> Arc<crate::interpreter::TestSink> {
         let name = name.into();
         let sink = Arc::new(crate::interpreter::TestSink::default());
-        self.sources_and_sinks
-            .test_sinks
-            .insert(name.clone(), sink.clone());
+        // A second handle under one name would replace the first, which would then read
+        // nothing however the program runs.
+        assert!(
+            self.sources_and_sinks
+                .test_sinks
+                .insert(name.clone(), sink.clone())
+                .is_none(),
+            "test sink `{name}` registered twice"
+        );
         self.lowering.test_sinks.insert(name, sink.clone());
         sink
     }
