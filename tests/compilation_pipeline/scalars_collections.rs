@@ -574,10 +574,10 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
 // The same operators with one operand computed **per element**, so no constant reaches the
 // fold and the tile operator runs.
 //
-// Every case above folds to its result at compile time, which is what makes these
-// necessary: without them `apply_binop_column` is unexercised for these operators and a
-// divergence between the fold's arithmetic and the runtime's — the agreement
-// `src/ccl/planning/const_fold.rs` names as its central obligation — would ship green.
+// Every case above folds to its result at compile time. The fold and the `BinOp` operator
+// share one kernel (`src/scalar_ops.rs`), but only the operator reaches it through
+// `apply_binop_column`'s dispatch, so without these that dispatch is unexercised for these
+// operators.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("sum([1 for x in [1, 2, 3] if (x > 1) ^ True])", Value::Int(1))]
@@ -588,9 +588,8 @@ fn test_bool_ops_on_computed_operands(#[case] code: &str, #[case] expected: Valu
 }
 
 /// The arithmetic and comparison operators at **run time**, for the same reason as the
-/// booleans above: `test_arithmetic` and `test_compare` now fold to their answers, so
-/// without these nothing evaluates `apply_binop_column` on them and the two
-/// implementations could disagree unnoticed.
+/// booleans above: `test_arithmetic` and `test_compare` fold to their answers, so without
+/// these nothing reaches `apply_binop_column`'s dispatch for them.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::sub("sum([x - 1 for x in [1, 2, 3]])", Value::Int(3))]
