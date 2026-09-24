@@ -560,7 +560,7 @@ fn two_accumulators_both_written_with_constants() {
     "#});
 }
 
-/// The same overwrite over a source filtered to **nothing**. The writer's extent is then a
+/// The same overwrite over a source filtered to nothing. The writer's extent is then a
 /// declared superset of the positions the source has, and only the source operator knows the
 /// difference — so the accumulator keeps its seed rather than taking the write.
 #[test]

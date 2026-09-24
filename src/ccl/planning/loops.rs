@@ -249,10 +249,10 @@ fn is_constant_decision(decision: &Expr) -> bool {
 /// slot is wrapped in (`ccl_utils::make_iterate`) — and the engine still runs one position
 /// per element, feeding a position the body ignores.
 ///
-/// A refined extent is no exception, though it is where this is easiest to get wrong: the
-/// surviving positions are a runtime subset of the declared ones, and it is the source
-/// *operator* that carries them — planning stages the identity as `iterate ▷ (⟨p⟩ ▷ restrict)`,
-/// and the driver reads the positions that survives.
+/// A refined extent is no exception. Its surviving positions are a runtime subset of the
+/// declared ones, and the source operator carries them: planning wraps the identity in the
+/// `iterate` of a `restrict` by the extent's predicate, and the driver reads the positions
+/// that survive.
 fn constant_decision_writer(decision: Expr, site_dom: &Type, decision_ty: &Type) -> (Expr, Expr) {
     let mut source = Expr::builtin(Builtin::Id);
     source.ty = Type::data_fun(site_dom.clone(), site_dom.clone());
@@ -406,13 +406,7 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         .ty
         .codomain()
         .expect("letrec recognition: decision is a function");
-    // A writer whose decision uses neither a snapshot read nor the loop item
-    // (`flag := True`) elim-collapses to a constant function `⟨record⟩ ▷ const`
-    // — the snapshot scaffold (and with it the source term) is gone. The
-    // writer then has an empty read set, the const application itself as its
-    // (input-ignoring) body, and the identity over the site domain as its
-    // source: the engine still iterates one commit per site position, feeding
-    // a position the body ignores.
+    // `flag := True`: see `constant_decision_writer`.
     if is_constant_decision(&decision) {
         let (source, body) = constant_decision_writer(decision, site_dom, &decision_ty);
         return WriterSite {
@@ -676,7 +670,8 @@ fn collapse_snapshot_sources(
 ///
 /// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
 /// defaults record, under the accumulators\' own labels; the source off the
-/// snapshot\'s trailing slot. Reads of `__hist` in the letrec body
+/// snapshot\'s trailing slot. A constant decision has no compose to destructure and is
+/// recovered by [`constant_decision_writer`]. Reads of `__hist` in the letrec body
 /// (`__hist ≫ .writes ≫ .acc` extracts and `__hist ≫ .__to_<feed>` taps) become
 /// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
@@ -730,12 +725,14 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         let (source, body) = constant_decision_writer(*applied, &domain_ty, &decision_ty);
         (Vec::new(), source, body)
     } else {
-        split_decision_compose(*applied, &decision_ty)
+        let split = split_decision_compose(*applied, &decision_ty);
+        assert_eq!(
+            split.0.len(),
+            inits.len(),
+            "letrec recognition: snapshot slots must match the key inits"
+        );
+        split
     };
-    assert!(
-        prev_slots.is_empty() || prev_slots.len() == inits.len(),
-        "letrec recognition: a decision that reads snapshots reads one per key init"
-    );
     // The accumulator types come off the commit payload's `writes` record — what the
     // recurrence's own type declares it writes — rather than off the snapshot reads, of
     // which a constant decision makes none.
@@ -756,6 +753,15 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
                 })
         })
         .collect();
+    // `mut_elim` builds the `writes` record from the accumulators' own types, so where the
+    // decision reads snapshots the two agree slot by slot.
+    for (slot, acc_ty) in prev_slots.iter().zip(&acc_tys) {
+        assert_eq!(
+            slot.ty.codomain().as_ref(),
+            Some(acc_ty),
+            "letrec recognition: a snapshot slot reads the type its accumulator writes"
+        );
+    }
 
     // One store key per accumulator, under the name the program gave it.
     // `mut_elim` labels the write set by `field_key`, so the accumulators arrive
