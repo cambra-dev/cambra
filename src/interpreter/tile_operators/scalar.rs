@@ -375,7 +375,7 @@ impl TileProducer for VariantWrapProducer {
         // Either way the payload becomes a value: an arm rides its row as one, so a payload
         // carrying a collection materializes here rather than staying a level.
         let slot = if self.tiling().is_data_function() {
-            tile.values_at_mut(1)
+            tile.values_at_mut(CurryLevel::new(1))
         } else {
             &mut tile
         };
@@ -1132,7 +1132,7 @@ mod tests {
         let mut fan = Zip::new_at(
             (0..2).map(crate::interpreter::tuple_field).collect(),
             ops,
-            1,
+            CurryLevel::new(1),
         );
         let mut sched = Scheduler::new();
         let mut producer =
@@ -1201,8 +1201,9 @@ mod tests {
             payload_extent: Extent::Base(BaseType::Int),
         };
 
-        let prefix =
-            TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(0))));
+        let prefix = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(0),
+        )));
         producer.release(prefix.clone());
 
         assert_eq!(
@@ -1248,8 +1249,9 @@ mod tests {
             variant_extents: TagMap::from_arms(vec![(commit, Extent::Base(BaseType::Int))]),
         };
 
-        let prefix =
-            TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(0))));
+        let prefix = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(0),
+        )));
         producer.release(prefix.clone());
 
         assert_eq!(
