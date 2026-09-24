@@ -169,6 +169,24 @@ pub trait ScopeEnv {
     /// variable and answering means resolving it — there is no settled `Type` in
     /// the scope to hand out a borrow of.
     fn binder_type(&self, name: &Name) -> Option<Type>;
+
+    /// The **conditions** known to hold at the query: a branch guard, or a
+    /// guard's negation, for each conditional the query sits inside.
+    ///
+    /// A condition is a [`Refinement`] attached to no type. Its predicate is a
+    /// closed boolean term over the names in scope — it mentions
+    /// [`REFINEMENT_BINDER`](crate::ccl::REFINEMENT_BINDER) nowhere, because it
+    /// states a fact about the branch rather than about the value being refined.
+    ///
+    /// Enumerated, where a binder is looked up. What a condition says is not about
+    /// any one name, so there is nothing for a predicate to mention that would
+    /// pull it in. Every condition joins the antecedent, and the names a condition
+    /// reads are looked up like any other ([`Encode::leaf`]), so it brings its own
+    /// binders' refinements with it.
+    fn conditions(&self) -> &[Refinement] {
+        &[]
+    }
+
     /// Whether a subtyping comparison carrying this environment decides a
     /// refinement deficit structurally, without raising a query at all.
     ///
@@ -421,17 +439,41 @@ impl<'a> Encode<'a> {
         }
     }
 
-    /// `⋀Γ ∧ ⋀lhs ∧ ¬⋀rhs` — unsatisfiable exactly when the entailment holds.
+    /// `⋀Γ ∧ ⋀C ∧ ⋀lhs ∧ ¬⋀rhs` — unsatisfiable exactly when the entailment holds
+    /// under the scope's conditions `C`.
     fn query(&mut self, lhs: &[Refinement], rhs: &[Refinement]) -> Result<SExpr, SmtError> {
         self.declare_subject(lhs, rhs)?;
         let mut conjuncts = self.conjuncts(lhs)?;
         let goals = self.conjuncts(rhs)?;
         let goal = self.ctx.not(self.ctx.and_many(goals));
-        // Gathered after both sides are translated: `Γ` covers a binder first met
-        // in the goal as much as one the antecedent mentions.
+        conjuncts.append(&mut self.conditions());
+        // Gathered last: `Γ` covers a binder first met in the goal, or in a
+        // condition, as much as one the antecedent mentions.
         conjuncts.append(&mut self.assumptions);
         conjuncts.push(goal);
         Ok(self.ctx.and_many(conjuncts))
+    }
+
+    /// Every condition the scope holds, translated.
+    ///
+    /// Translated with no subject: a condition states a fact about the branch the
+    /// query sits in rather than about the value being refined, so nothing in it
+    /// addresses the query's subject and [`Encode::reroot`] has nothing to do.
+    ///
+    /// A condition outside the fragment is dropped rather than reported, on the
+    /// same ground [`Encode::assume_refinements`] drops one: leaving an assumption
+    /// out only weakens the antecedent, and a query the encoding can otherwise
+    /// translate must not fail because of the shape of a guard elsewhere in the
+    /// program.
+    fn conditions(&mut self) -> Vec<SExpr> {
+        // Copied out of `self` first: the reference is `'a`, so reading the
+        // conditions off it does not borrow the `&mut self` each translation takes.
+        let scope = self.scope;
+        scope
+            .conditions()
+            .iter()
+            .filter_map(|c| self.expr(&c.predicate).ok())
+            .collect()
     }
 
     /// Declare the constant the query's subject denotes.

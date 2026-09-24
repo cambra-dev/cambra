@@ -1528,6 +1528,11 @@ f(-1)
     )
 }
 
+/// Red on a gap outside conditionals: a `=> T` output annotation naming an
+/// unannotated parameter lands an upper bound mentioning `x` on `x`'s own
+/// inference variable, whose telescope is empty, and the record-time closure
+/// check rejects it. `def f(x) => {Int where _ >= x}: x` panics identically with
+/// no conditional in it, so the branch conditions are not what is missing.
 #[test]
 fn refined_ite_use_condition_external() {
     check_scalar(
@@ -1544,6 +1549,13 @@ f(-1)
     )
 }
 
+/// Red on the limit recorded in `src/ccl/design/type-inference.md`, "A branch
+/// guard holds in its branch": `x` is an unannotated parameter, so inside the
+/// arms its type is an unresolved variable with no SMT sort, and the demand a
+/// branch makes of it is an upper bound closed at `f(4)` — outside every
+/// condition. Deciding these needs the value's identity to reach the query
+/// (`{T | __elem == x}` at a use) or the edge to be decided where the condition
+/// and the resolved type are both live.
 #[test]
 fn refined_ite_use_condition_internal() {
     check_scalar(
@@ -1564,12 +1576,99 @@ def f(x):
     elif x == 4:
         h(x)
     elif x ^+ 1 == 4:
-        h(x ^= 1)
+        h(x ^+ 1)
     else:
         j(x)
 
 f(4)
 "#},
         Value::Int(4),
+    )
+}
+
+/// The `if` branch is typed knowing its guard: `k ^+ 1` carries
+/// `{Int | __elem == k ^+ 1}`, and `k >= 0` is the whole of what turns that into
+/// `g`'s `{Int | __elem >= 1}`.
+#[test]
+fn refined_ite_condition_decides_the_if_branch() {
+    check_scalar(
+        indoc! {r#"
+def g(x: {Int where _ >= 1}):
+    x
+
+def f(k: Int):
+    if k >= 0:
+        g(k ^+ 1)
+    else:
+        0
+
+f(5)
+"#},
+        Value::Int(6),
+    )
+}
+
+/// The `else` branch is typed knowing the guard **failed**: `¬(k >= 1)` is what
+/// bounds `k ^+ 1` above by `1`.
+#[test]
+fn refined_ite_negated_condition_decides_the_else_branch() {
+    check_scalar(
+        indoc! {r#"
+def g(x: {Int where _ <= 1}):
+    x
+
+def f(k: Int):
+    if k >= 1:
+        0
+    else:
+        g(k ^+ 1)
+
+f(-3)
+"#},
+        Value::Int(-2),
+    )
+}
+
+/// An `elif` chain's last arm assumes every earlier guard failed, so both bounds
+/// on `k ^+ 1` come from the arms above it.
+#[test]
+fn refined_ite_elif_chain_accumulates_negated_conditions() {
+    check_scalar(
+        indoc! {r#"
+def g(x: {Int where _ >= 1 and _ <= 10}):
+    x
+
+def f(k: Int):
+    if k < 0:
+        0
+    elif k > 9:
+        0
+    else:
+        g(k ^+ 1)
+
+f(4)
+"#},
+        Value::Int(5),
+    )
+}
+
+/// A branch assumes its own guard and not a sibling's: the `else` arm below has
+/// `¬(k >= 0)` to work with, which does not establish `k ^+ 1 >= 1`.
+#[test]
+fn refined_ite_else_branch_does_not_assume_the_guard() {
+    check_compile_error(
+        indoc! {r#"
+def g(x: {Int where _ >= 1}):
+    x
+
+def f(k: Int):
+    if k >= 0:
+        0
+    else:
+        g(k ^+ 1)
+
+f(-5)
+"#},
+        "Type mismatch for Apply",
     )
 }

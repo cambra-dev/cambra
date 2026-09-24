@@ -188,6 +188,11 @@ pub(super) struct InferCtx {
     /// never removed: a uniquified name denotes one binding, so the fact it
     /// records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The conditions holding at the current emission position — the branch
+    /// guards enclosing it, each in the form the branch makes true. Entered and
+    /// restored by [`Typing::assuming`](super::typing::Typing::assuming); read by
+    /// every query [`SolverScope`] carries.
+    conditions: Vec<Refinement>,
 }
 
 /// The environment a solver query runs in: the lexical scope at the query,
@@ -195,12 +200,15 @@ pub(super) struct InferCtx {
 ///
 /// Both halves answer one question — what is known about a name a predicate
 /// reads — and the scope stack answers it only while the binder is open, which
-/// is not where an opaque binder's uses are decided. Built per query from
-/// [`InferCtx`]'s two fields, so the borrow stays disjoint from the constraint
+/// is not where an opaque binder's uses are decided. The conditions answer a
+/// different question: what holds at this position, whichever names a predicate
+/// reads. Built per query from
+/// [`InferCtx`]'s fields, so the borrow stays disjoint from the constraint
 /// cache the same call mutates.
 pub(super) struct SolverScope<'a> {
     scopes: &'a ScopeStack<Name, Binding>,
     opaque_binders: &'a HashMap<Name, Type>,
+    conditions: &'a [Refinement],
 }
 
 impl ScopeEnv for SolverScope<'_> {
@@ -208,6 +216,9 @@ impl ScopeEnv for SolverScope<'_> {
         self.scopes
             .binder_type(name)
             .or_else(|| self.opaque_binders.get(name).and_then(value_type))
+    }
+    fn conditions(&self) -> &[Refinement] {
+        self.conditions
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -230,6 +241,7 @@ impl InferCtx {
             shared_holes: RefCell::new(HashMap::new()),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -520,6 +532,7 @@ impl Typing for InferCtx {
         let scope = SolverScope {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
+            conditions: &self.conditions,
         };
         constrain_subtype_in(sub, sup, &mut self.cache, &scope)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
@@ -542,6 +555,13 @@ impl Typing for InferCtx {
         );
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
+        r
+    }
+
+    fn assuming<R>(&mut self, condition: Refinement, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.conditions.push(condition);
+        let r = f(self);
+        self.conditions.pop();
         r
     }
 
@@ -740,6 +760,7 @@ impl Typing for InferCtx {
         let scope = SolverScope {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
+            conditions: &self.conditions,
         };
         constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).map_err(|_| {
             self.raise(InferError::AnnotationMismatch {
@@ -778,6 +799,7 @@ impl Typing for InferCtx {
             let scope = SolverScope {
                 scopes: &self.scopes,
                 opaque_binders: &self.opaque_binders,
+                conditions: &self.conditions,
             };
             constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).map_err(|_| {
                 self.raise(InferError::AnnotationMismatch {

@@ -115,6 +115,10 @@ pub(super) struct CheckCtx {
     /// Entries accumulate and are never removed — a uniquified name denotes one
     /// binding, so the fact it records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The conditions holding at the current position — the branch guards
+    /// enclosing it, each in the form the branch makes true. Entered and
+    /// restored by [`Typing::assuming`], exactly as emission holds them.
+    conditions: Vec<Refinement>,
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -125,6 +129,7 @@ pub(super) struct CheckCtx {
 struct CheckScope<'a> {
     scopes: &'a ScopeStack<Name, Type>,
     opaque_binders: &'a HashMap<Name, Type>,
+    conditions: &'a [Refinement],
 }
 
 impl ScopeEnv for CheckScope<'_> {
@@ -133,6 +138,9 @@ impl ScopeEnv for CheckScope<'_> {
             .lookup(name)
             .or_else(|| self.opaque_binders.get(name))
             .cloned()
+    }
+    fn conditions(&self) -> &[Refinement] {
+        self.conditions
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -154,6 +162,7 @@ impl CheckCtx {
             telescope: Telescope::empty(),
             scopes: ScopeStack::default(),
             opaque_binders: HashMap::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -162,6 +171,7 @@ impl CheckCtx {
         CheckScope {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
+            conditions: &self.conditions,
         }
     }
 
@@ -352,6 +362,13 @@ impl Typing for CheckCtx {
         self.scopes.bind(name, ty.clone());
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
+        r
+    }
+
+    fn assuming<R>(&mut self, condition: Refinement, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.conditions.push(condition);
+        let r = f(self);
+        self.conditions.pop();
         r
     }
 

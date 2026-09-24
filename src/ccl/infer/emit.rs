@@ -3,11 +3,12 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::cast_target_refinement;
+use crate::ccl::ccl_utils::{cast_target_refinement, synthesize_arm_predicate};
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
@@ -2164,15 +2165,35 @@ pub(super) fn emit_case<C: Typing>(
     // the argument *node*, not its type (mutability.md, "No aliasing: `Mut`
     // values are second-class (downward-only)").
     let result_ty = ctx.fresh();
+    // The guards of the preceding arms that dispatch on nothing else, in source
+    // order — what [`synthesize_arm_predicate`] complements an arm's own guard
+    // against to state the fact that selects it.
+    let mut prior_guards: Vec<Expr> = Vec::new();
     for b in branches.iter_mut() {
         let scope_info = b
             .pattern
             .as_ref()
             .map(|p| (p.binding.name.clone(), p.binding.ty.clone()));
+        let dispatches_on_tag = b.pattern.is_some();
         let body_ty = match scope_info {
-            Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
-            None => emit_case_branch(b, ctx)?,
+            Some((name, ty)) => {
+                ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, &prior_guards, ctx))?
+            }
+            None => emit_case_branch(b, &prior_guards, ctx)?,
         };
+        // **Only a tag-free arm's guard is complemented against.** An arm the
+        // scrutinee's tag also selects fails whenever that tag is absent, and no
+        // predicate here says which tag the scrutinee carries, so its guard
+        // failing claims nothing about the arms below it. Leaving it out costs a
+        // later arm an assumption; putting it in would let one assume a
+        // disjunction that does not hold.
+        if !dispatches_on_tag {
+            // A duplication with nothing being rewritten: the guard is copied so
+            // the arms below it can complement against it, and the copy joins no
+            // tree.
+            let _g = crate::ccl::provenance::copy_frame("infer.branch_condition");
+            prior_guards.push(b.guard.clone());
+        }
         ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
     }
     Ok(result_ty)
@@ -2180,20 +2201,43 @@ pub(super) fn emit_case<C: Typing>(
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
 /// body's type. The pattern binding (if any) is already in scope.
-fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, LocatedInferError> {
+///
+/// The body is typed under the fact that selects this arm —
+/// `gᵢ ∧ ¬g₀ ∧ … ∧ ¬gᵢ₋₁` over `prior`, the same first-match encoding every
+/// conditional fan-out downstream partitions its domain with
+/// ([`synthesize_arm_predicate`]). A refinement query raised under the body takes
+/// it as an antecedent (`src/ccl/design/type-inference.md`, "A branch guard holds
+/// in its branch"), which is what decides `if k >= 0: g(k ^+ 1)` against a
+/// `{Int | __elem >= 1}` domain.
+fn emit_case_branch<C: Typing>(
+    b: &mut Branch,
+    prior: &[Expr],
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
     let guard_ty = emit_value_read(&mut b.guard, ctx)?;
     // One-way: a guard must *be* a `Bool`, not be exactly `Bool`. A refined boolean
     // is still a boolean, and a refinement drops on the way up.
     ctx.require_sub(&guard_ty, &prim(BaseType::Bool), &|| {
         "Case guard".to_string()
     })?;
+    // The condition is a term built out of copies of the guards, and it joins no
+    // tree — it is read as an assumption and dropped — so the copies and the
+    // connectives above them are recorded as machinery under the `Case`.
+    let condition = {
+        let _g = crate::ccl::provenance::enter(
+            ctx.current_node(),
+            "infer.branch_condition",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        Refinement::born(Rc::new(synthesize_arm_predicate(&b.guard, prior)))
+    };
     // A **value** operand: the arms join, and rule 2 keeps `Mut` out of every
     // composite, so a mutable variable mention in an arm is a read. Letting the handle
     // through instead makes the join itself `Mut`-typed — `x if c else y` over two
     // mutable variables would denote a handle whose writer the compiler cannot trace, and
     // the position that catches that (`bump(x if c else y)`) reads the argument
     // *node*, not its type, precisely because the type is a value.
-    emit_value_read(&mut b.body, ctx)
+    ctx.assuming(condition, |ctx| emit_value_read(&mut b.body, ctx))
 }
 
 pub(super) fn emit_variant_ctor<C: Typing>(

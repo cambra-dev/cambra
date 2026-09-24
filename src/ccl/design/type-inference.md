@@ -1054,6 +1054,30 @@ Dropping is the discipline throughout: a path with no sort, a predicate body out
 fragment, a name two binders disagree about. An assumption left out weakens the antecedent and
 cannot make an invalid entailment provable.
 
+##### A branch guard holds in its branch
+
+`ScopeEnv` carries one further thing: the **conditions** holding at the query, a `Refinement`
+attached to no type for each conditional the query sits inside. `Typing::assuming` enters one
+around a `Case` arm's body, and its predicate is the arm's first-match gate
+`𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁` — `synthesize_arm_predicate`, the encoding every conditional fan-out
+downstream partitions its domain with. `def f(x): if x == 3: g(x) else: 0` types `g(x)` knowing
+`x == 3`.
+
+Every condition joins the antecedent, where a binder's refinements join it only when a predicate
+reads that binder. What a condition says is not about any one value, so there is nothing for a
+predicate to mention that would pull it in. The names a condition reads are looked up like any
+others, so a condition brings its own binders' refinements with it.
+
+Only a tag-free arm's guard is complemented against. An arm the scrutinee's tag also selects
+fails whenever that tag is absent, and no predicate here says which tag the scrutinee carries, so
+its guard failing claims nothing about the arms below it.
+
+An obligation the branch records rather than decides is decided without the condition. A demand
+on a binder's inference variable is an upper bound, closed when a value arrives — at the call
+site, not in the branch — so `def f(x): if x == 3: g(x) else: 0` records `?x <: Int@3` and
+decides it at `f(4)`, where no condition is live. The conditions reach the deficits a branch
+decides in place, which are the ones whose two sides are already concrete there.
+
 ##### The set is the representation, not just the reading
 
 `Type::Refinement` carries a `RefinementSet` — unordered, deduplicated, with set-semantic `Eq`/`Hash` — and `Type::refined` is the sole constructor, establishing two invariants: the set is non-empty, and the base is never itself a refinement. Nested layers flatten, so `{{𝑇 | 𝑝} | 𝑞}` is *unrepresentable* and "which layer is outermost" cannot be asked.

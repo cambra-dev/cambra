@@ -7,7 +7,7 @@ use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, Name, Type, TypedBinding};
+use crate::ccl::{Expr, Name, Refinement, Type, TypedBinding};
 
 /// The operations a typing rule needs from its surrounding pass.
 ///
@@ -123,6 +123,19 @@ pub(super) trait Typing {
     /// what a refinement query under the binder assumes about the name
     /// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized;
+
+    /// Run `f` with `condition` assumed to hold — the fact that selects the
+    /// branch `f` types.
+    ///
+    /// The condition is a [`Refinement`](crate::ccl::Refinement) attached to no
+    /// type, so it restricts no one value and every refinement query raised under
+    /// it takes it as an antecedent
+    /// ([`ScopeEnv::conditions`](super::solver::smt::ScopeEnv::conditions)).
+    /// Both modes hold it the same way: a stack entered here and restored on the
+    /// way out, success and error paths alike.
+    fn assuming<R>(&mut self, condition: Refinement, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized;
 
