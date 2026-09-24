@@ -6,80 +6,27 @@
 //! collection's keys are part of its value (a filter keeps its survivors' positions, a
 //! group-by is keyed by the group key), and the order entries arrive in is not.
 //!
-//! A case the two are known to disagree on is listed in [`KNOWN_DIVERGENT`] with the defect
-//! that causes it, so an unexplained disagreement stays distinguishable from a pinned one.
+//! A case the two are known to disagree on pins both answers, so a change to either side
+//! fails the pin.
 
-use std::collections::BTreeMap;
+#[path = "support/differential.rs"]
+mod differential;
 
-use cambra::ccl::context::{GlobalContext, compile_program};
-use cambra::interpreter::{Consumer, Value as TileValue};
 use chl_interp::{Collection, Value};
+use differential::{Compiled, run_compiled, run_interpreted};
 use indoc::indoc;
 
-/// Programs the compiler and the interpreter disagree on today, each with the defect that
-/// makes them disagree. Listed rather than omitted: a case nobody runs is a case whose
-/// status nothing reports.
-const KNOWN_DIVERGENT: &[(&str, &str)] = &[(
-    "collection feed lands flat",
-    "channelize takes the channel's domain from the contribution's own domain, so a \
-     collection fed at a non-iterated site is spliced into the channel instead of nesting \
-     under one key",
-)];
-
-/// Run `source` through the compiler, answering what sink `out` observed.
+/// What sink `out` observed under the compiler, for a program it compiles and completes.
 fn compiled(source: &str) -> Value {
-    const CAP: usize = 10_000;
-    let mut ctx = GlobalContext::default();
-    let sink = ctx.register_test_sink("out");
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let program = match compile_program(&mut ctx, source, consumer) {
-        Ok(p) => p,
-        Err(e) => panic!("compile failed: {e:?}"),
-    };
-    for _ in 0..CAP {
-        ctx.scheduler().check_for_notifications();
-        if program.done.try_recv().is_ok() {
-            break;
-        }
+    match run_compiled(source) {
+        Compiled::Value(v) => v,
+        other => panic!("the compiled program produced no value: {other}"),
     }
-    convert(sink.value().expect("the sink observed a value"))
 }
 
-/// Run `source` through the reference interpreter, answering what sink `out` observed.
+/// What sink `out` observed under the reference interpreter.
 fn interpreted(source: &str) -> Value {
-    let mut obs = chl_interp::run(source, BTreeMap::new()).expect("the interpreter ran");
-    obs.remove("out").expect("the program declares sink `out`")
-}
-
-/// Read a compiled value in the interpreter's domain.
-///
-/// The only real decision is `UInt`: a key the compiler numbers is the same key the
-/// interpreter numbers, and keeping two integer types apart here would make every
-/// positional collection differ for a reason that is about representation.
-fn convert(v: TileValue) -> Value {
-    match v {
-        TileValue::Int(i) => Value::Int(i),
-        TileValue::UInt(u) => Value::Int(u as i64),
-        TileValue::String(s) => Value::Str(s.to_string()),
-        TileValue::Bool(b) => Value::Bool(b),
-        TileValue::Unit => Value::Unit,
-        TileValue::Record(fields) => {
-            Value::Record(fields.into_iter().map(|(n, v)| (n, convert(v))).collect())
-        }
-        TileValue::Union { tag, inner } => Value::Variant {
-            tag: tag.to_string(),
-            payload: Box::new(convert(*inner)),
-        },
-        TileValue::Function(bindings) => Value::Collection(Collection::from_entries(
-            bindings
-                .into_iter()
-                .map(|b| (convert(b.input), convert(b.output)))
-                .collect(),
-        )),
-        TileValue::ComputableFunction(_) => {
-            panic!("a function value reached a sink, which cannot happen")
-        }
-    }
+    run_interpreted(source).expect("the interpreter ran")
 }
 
 /// Assert the two sides agree on `source`.
@@ -100,7 +47,7 @@ fn a_scalar_feed() {
 }
 
 #[test]
-fn arithmetic_and_comparison() {
+fn arithmetic() {
     agree(indoc! {r#"
         out = test_sink()
         out << (2 + 3) * 4 - 1
@@ -158,25 +105,33 @@ fn a_variant_feed() {
     "#});
 }
 
-/// The divergence is named rather than skipped, so its entry is what has to be deleted
-/// when the defect is fixed.
+/// A collection fed at a site that does not iterate nests under that site's one key. The
+/// compiler splices it into the channel instead: channelize takes the channel's domain from
+/// the contribution's own domain. Pinned at both answers.
 #[test]
-fn a_collection_feed_is_known_divergent() {
+fn a_collection_feed_lands_flat() {
     let source = indoc! {r#"
         out = test_sink()
         out << [x * 2 for x in [1, 2, 3]]
     "#};
-    let (c, i) = (compiled(source), interpreted(source));
-    assert_ne!(
-        c, i,
-        "the collection feed now agrees — delete its `KNOWN_DIVERGENT` entry"
+    let list = |xs: &[i64]| {
+        Value::Collection(Collection::from_list(
+            xs.iter().map(|x| Value::Int(*x)).collect(),
+        ))
+    };
+    assert_eq!(compiled(source), list(&[2, 4, 6]));
+    assert_eq!(
+        interpreted(source),
+        Value::Collection(Collection::from_entries(vec![(
+            Value::Unit,
+            list(&[2, 4, 6])
+        )]))
     );
-    assert_eq!(KNOWN_DIVERGENT.len(), 1, "one divergence is recorded");
 }
 
-// Until a collection can be fed (see `KNOWN_DIVERGENT`), a comprehension's result reaches a
-// sink only by being folded to a scalar first. These reach the comprehension, filter,
-// group-by and field-access machinery through that route.
+// A fed collection lands flat (see `a_collection_feed_lands_flat`), so these fold a
+// comprehension's result to a scalar before it reaches a sink. They reach the comprehension,
+// filter, group-by and field-access machinery through that route.
 
 #[test]
 fn a_comprehension_with_a_filter() {
@@ -222,24 +177,78 @@ fn a_correlated_comprehension_does_not_compile() {
             out << sum([y * x for y in [1, 2]])
     "#};
     // The interpreter has no trouble with it; the compiler is what stops.
-    interpreted(source);
-    let mut ctx = GlobalContext::default();
-    let _ = ctx.register_test_sink("out");
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let err = compile_program(&mut ctx, source, consumer)
-        .err()
-        .expect("the compiler rejects a correlated comprehension");
-    assert!(
-        format!("{err:?}").contains("non-combinator curry"),
-        "expected the curry conversion error, got: {err:?}"
-    );
+    assert_eq!(interpreted(source).to_string(), "[3, 6, 9]");
+    match run_compiled(source) {
+        Compiled::Rejected(err) => assert!(
+            err.contains("non-combinator curry"),
+            "expected the curry conversion error, got: {err}"
+        ),
+        other => panic!("expected the compiler to reject a correlated comprehension, got {other}"),
+    }
 }
 
 #[test]
 fn a_chained_comparison() {
     agree(indoc! {r#"
         out = test_sink()
-        out << 1 < 2
+        n = 2
+        out << 1 < n < 3
+    "#});
+}
+
+#[test]
+fn an_annotated_binding() {
+    agree(indoc! {r#"
+        x: Int = 7
+        out = test_sink()
+        out << x + 1
+    "#});
+}
+
+#[test]
+fn an_augmented_write_in_a_loop() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2, 3]:
+            acc += i
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// Group keys compared through the loop key, rather than folded away by an aggregate.
+/// Inference panics: the group key binder `__gb_k` escapes into a bound outside its scope.
+/// Pinned at the interpreter's answer and the compiler's panic.
+#[test]
+#[should_panic(expected = "open bound recorded")]
+fn a_loop_over_groups_panics_in_inference() {
+    let source = indoc! {r#"
+        sales = [
+            (region="east", amount=1),
+            (region="west", amount=2),
+            (region="east", amount=3),
+        ]
+        out = test_sink()
+        for g in groupby(sales, \r -> r.region):
+            out << sum([s.amount for s in g])
+    "#};
+    assert_eq!(
+        interpreted(source).to_string(),
+        r#"["east" -> 4, "west" -> 2]"#
+    );
+    compiled(source);
+}
+
+/// A site that never fires still makes the channel a union, because the tagging is fixed
+/// by the program text.
+#[test]
+fn an_untaken_feed_site_still_tags_the_channel() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2]:
+            out << x
+        for y in [x for x in [1] if x > 5]:
+            out << y
     "#});
 }
 
@@ -373,8 +382,8 @@ fn a_defer_channel_read_back() {
 }
 
 // ---------------------------------------------------------------------------
-// Transactions. A block is one commit record, at the next tick or none at all, and a
-// reply fed inside it is indexed by that tick rather than by the iteration.
+// Transactions. A block is one commit record, at the next commit time or none at all, and
+// a reply fed inside it is indexed by that commit time rather than by the iteration.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -389,9 +398,9 @@ fn an_in_block_reply_per_commit() {
     "#});
 }
 
-/// A guard no path takes is a denial: no write, no reply, no tick.
+/// A guard no path takes is a denial: no write, no reply, no commit time.
 #[test]
-fn a_denied_block_consumes_no_tick() {
+fn a_denied_block_takes_no_commit_time() {
     agree(indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
@@ -403,9 +412,9 @@ fn a_denied_block_consumes_no_tick() {
     "#});
 }
 
-/// Ticks are dense: the denied iteration leaves no gap.
+/// Commit times are dense: the denied iteration leaves no gap.
 #[test]
-fn ticks_are_dense_across_a_denial() {
+fn commit_times_are_dense_across_a_denial() {
     agree(indoc! {r#"
         out = test_sink()
         q: Mut(Int, Txn) := 0
@@ -456,13 +465,11 @@ fn two_stores_written_in_one_block() {
     "#});
 }
 
-/// Two writer sites on one store, each anchored to program start rather than to distinct
-/// source elements. Their commit order is not determined, so neither side is wrong
-/// whichever it picks — the interpreter serializes in source order because it has to pick
-/// something. Recorded rather than asserted: a program like this is outside what the
-/// differential can judge, and a generated corpus must not emit one.
+/// Two writer sites on one store. Their commits are unordered ("8.5 Ordering and
+/// concurrency"), so the interpreter refuses to judge the program; the compiler picks an
+/// order, and this checks only that it runs the program to completion.
 #[test]
-fn two_writer_sites_sharing_an_anchor_are_not_judgeable() {
+fn two_writer_sites_on_one_store_are_not_judged() {
     let source = indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
@@ -475,10 +482,75 @@ fn two_writer_sites_sharing_an_anchor_are_not_judgeable() {
                 pool := pool - r
                 out << pool
     "#};
-    // Both sides answer; the point is that agreement here would be luck.
-    let (c, i) = (compiled(source), interpreted(source));
-    println!("compiled:    {c}");
-    println!("interpreted: {i}");
+    compiled(source);
+    let refusal = run_interpreted(source).expect_err("the interpreter refuses");
+    assert!(refusal.contains("more than one `with` block"), "{refusal}");
+}
+
+/// Two stores, each written by its own loop. The two sides number commits differently, and a
+/// reply channel's keys have type `Txn`, so the comparison matches them by commit order.
+#[test]
+fn two_writer_sites_on_two_stores_agree_up_to_commit_time_numbering() {
+    agree(indoc! {r#"
+        out = test_sink()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                a := a + r
+        for r in [10, 20]:
+            with begin():
+                b := b + r
+                out << b
+    "#});
+}
+
+#[test]
+fn a_function_writing_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def bump(c: Mut(Int)):
+            c += 1
+
+        n := 1
+        bump(n)
+        bump(n)
+        out = test_sink()
+        out << n
+    "#});
+}
+
+/// A function captures the values of free names at its definition ("4.1 `def` — function
+/// definition"), so a later write to a captured mutable variable does not reach it. The
+/// compiler reads the variable's latest value instead. Pinned at both answers.
+#[test]
+fn a_captured_mutable_variable_is_read_late() {
+    let source = indoc! {r#"
+        c := 1
+
+        def f(n):
+            n + c
+
+        c := 5
+        out = test_sink()
+        out << f(0)
+    "#};
+    assert_eq!(compiled(source).to_string(), "[() -> 5]");
+    assert_eq!(interpreted(source).to_string(), "[() -> 1]");
+}
+
+/// A user function named like a builtin shadows it: the nearest binding wins ("3.2
+/// Names"). The compiler calls the builtin. Pinned at both answers.
+#[test]
+fn a_user_function_named_like_a_builtin_is_ignored() {
+    let source = indoc! {r#"
+        def sum(xs):
+            7
+
+        out = test_sink()
+        out << sum([1, 2])
+    "#};
+    assert_eq!(compiled(source).to_string(), "[() -> 3]");
+    assert_eq!(interpreted(source).to_string(), "[() -> 7]");
 }
 
 /// A channel fed from two places is a union of them, so its keys are tagged by which
@@ -498,7 +570,7 @@ fn two_feed_sites_tag_their_keys() {
 /// Aggregating a mutable collection that a keyed write has touched panics in `Aggregate`
 /// with `expected a collection, got Scalar(Variants([]))`. Minimised: the same store
 /// aggregates fine with no write, and a plain map literal aggregates fine, so the keyed
-/// write is what breaks it. The interpreter computes the answer; pinned at the panic.
+/// write is what breaks it. Pinned at the interpreter's answer and the compiler's panic.
 #[test]
 #[should_panic(expected = "Aggregate expected a collection")]
 fn aggregating_a_keyed_written_store_panics() {
@@ -509,7 +581,13 @@ fn aggregating_a_keyed_written_store_panics() {
         out = test_sink()
         out << sum(m)
     "#};
-    interpreted(source);
+    assert_eq!(
+        interpreted(source),
+        Value::Collection(Collection::from_entries(vec![(
+            Value::Unit,
+            Value::Int(19)
+        )]))
+    );
     compiled(source);
 }
 
@@ -521,4 +599,20 @@ fn a_seeded_mutable_collection_aggregates() {
         out = test_sink()
         out << sum(m)
     "#});
+}
+
+/// `//` is floor division ("3.3 Arithmetic and logical operators"). The runtime's integer
+/// kernel (`src/scalar_ops.rs`) truncates toward zero instead, which differs when
+/// the operands' signs differ. Pinned at both answers.
+#[test]
+fn floor_division_with_a_negative_divisor_truncates() {
+    let source = indoc! {r#"
+        out = test_sink()
+        n = -2
+        out << 7 // n
+    "#};
+    let at_unit =
+        |v: i64| Value::Collection(Collection::from_entries(vec![(Value::Unit, Value::Int(v))]));
+    assert_eq!(compiled(source), at_unit(-3));
+    assert_eq!(interpreted(source), at_unit(-4));
 }

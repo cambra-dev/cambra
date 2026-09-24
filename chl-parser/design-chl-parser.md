@@ -1,7 +1,7 @@
 # CHL Parser Design
 
 This document describes the design of the Cambra High-Level Language (CHL)
-parser in `src/chl_parser/`.
+parser in `chl-parser/`.
 
 Two properties shape it: **error recovery** — parsing continues past a local
 syntax error and reports *all* problems in a file, for an interactive UX — and
@@ -39,7 +39,7 @@ CHL source  ── logos lexer ──▶  raw token stream
                             CHL AST  ⇒  CCL lowering
 ```
 
-The pipeline is two distinct stages, both inside `src/chl_parser/`:
+The pipeline is two distinct stages, both inside `chl-parser/src/`:
 
 ### Stage 1 — Lexer (`lexer.rs`)
 

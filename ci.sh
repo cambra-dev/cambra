@@ -37,9 +37,8 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # reaches planning too, which recovers the order a nested filter's predicate
 # implies rather than reading it off the storage this reverses. Same argument as
 # `ci_clippy_lib`: a configuration nothing runs is a configuration that rots.
-# Every workspace member. `-p cambra` alone stopped covering the parser the moment it
-# became its own crate, and its 74 tests would have gone on passing by not running; a
-# member added later and left out of this list rots the same way.
+# Every workspace member: `-p cambra` alone does not reach the parser's or the
+# interpreter's tests, and a member left out of this list passes by not running.
 #
 # `--no-fail-fast` because the suite is many binaries: without it the first failing binary
 # ends the run and the rest never execute, so a red run reports the failure it found plus
@@ -54,7 +53,7 @@ ci_test() { cargo test -p cambra -p chl-parser -p chl-interp -q --no-fail-fast; 
 # Behavior that depends on *optimization* is out of scope, which is what lets
 # `profile.no-assertions` keep `dev`'s `opt-level` and this gate cost about what
 # `ci_test` costs.
-ci_test_no_assertions() { cargo test -p cambra -q --profile no-assertions; }
+ci_test_no_assertions() { cargo test -p cambra -p chl-parser -p chl-interp -q --no-fail-fast --profile no-assertions; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list
 # (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
