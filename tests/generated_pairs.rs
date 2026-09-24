@@ -1,32 +1,40 @@
-//! Generated pairs: every type-compatible (skeleton, filler) program, run through both
-//! oracles.
+//! Generated pairs: every type-compatible (skeleton, filler) program, run through both the
+//! compiler and the differential interpreter.
 //!
-//! Each compiler defect `tests/differential_interp.rs` pins is one feature inside
-//! another — a collection under a feed, a collection in a record field, a
-//! comprehension inside a loop, an aggregate over a keyed-written store. So the unit here
-//! is a **position** and what fills it, rather than a random term: a skeleton is a whole
-//! program with one hole, a filler is an expression that can sit in it, and the corpus is
-//! every pair whose types agree.
+//! A compiler defect is often one feature inside another: a collection under a feed, a
+//! record holding a collection, a comprehension inside a loop. So the unit here is a
+//! **position** and what fills it, rather than a random term: a skeleton is a whole program
+//! with one hole, a filler is an expression that can sit in it, and the grid is every pair
+//! whose types agree.
 //!
-//! Enumerated rather than sampled, which buys determinism: no seed, no flaky reproduction,
-//! and coverage that can be stated rather than estimated.
+//! The grid is enumerated rather than sampled, so a run is deterministic.
+//! `every_filler_and_binder_is_reached` holds the tables to generating at least one cell per
+//! filler, per skeleton and per skeleton binder.
 //!
-//! Two oracles run per program:
+//! Two checks run per program:
 //!
-//! - a panic, assertion or wall failure is a bug by construction, whatever the program;
+//! - a compiler panic, including a failed assertion or phase-boundary check, is a bug by
+//!   construction, whatever the program;
 //! - a disagreement between compiler and interpreter is a wrong answer.
 //!
 //! Outcomes are classified by mechanism: any `CompileError` is a rejection, whether its
 //! message states a gap or reports a compiler bug, and a sink the compiled program could not
-//! read counts as a panic. An interpreter refusal is a gap in the oracle, not in the
-//! compiler.
+//! read counts as a panic. An interpreter refusal is a gap in the differential interpreter, not
+//! in the compiler.
 //!
-//! Every outcome other than agreement is pinned in [`LEDGER`], by cell and cause, so a new
-//! failure, a changed cause and a newly passing cell all fail `enumerate_pairs`.
-//! `PAIRS_BLESS=1` rewrites the ledger from the run.
+//! Two tests run the grid:
+//!
+//! - `live_rows_agree` runs every cell of each skeleton in [`LIVE`], the rows known to agree
+//!   everywhere, and fails on any outcome other than agreement.
+//! - `full_grid` is ignored by default. It runs every cell and reports the failures grouped by
+//!   cause, with a count and sample cells, and names every fully agreeing row [`LIVE`] does not
+//!   list yet. A fix that makes a row agree moves it into [`LIVE`]:
+//!   `cargo test --test generated_pairs full_grid -- --ignored --nocapture`.
 
 #[path = "support/differential.rs"]
 mod differential;
+#[path = "support/panic_message.rs"]
+mod panic_message;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -34,9 +42,34 @@ use std::sync::Arc;
 
 use differential::{Compiled, run_compiled, run_interpreted};
 use indoc::indoc;
+use panic_message::panic_message;
 
-/// Every cell whose outcome is not agreement, one per line: `cell<TAB>kind<TAB>cause key`.
-const LEDGER: &str = include_str!("generated_pairs.ledger");
+/// The skeletons whose every cell agrees, so a change that breaks one of them fails
+/// `live_rows_agree`.
+const LIVE: &[&str] = &[
+    "aggregate_arg",
+    "binop_operand",
+    "bool_feed",
+    "comp_source",
+    "feed",
+    "function_arg",
+    "function_body",
+    "groupby_source",
+    "match_scrutinee",
+    "mut_init",
+    "record_coll_source",
+    "record_feed",
+    "record_feed_in_loop",
+    "record_field",
+    "record_projected",
+    "str_coll_source",
+    "str_loop_feed",
+    "string_feed",
+    "ternary_branch",
+    "tuple_component",
+    "txn_guard",
+    "variant_feed",
+];
 
 /// The types a hole can want and a filler can produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,15 +128,18 @@ enum Outcome {
     Agrees,
     /// The two sides computed different values.
     Disagrees(String),
-    /// The compiler panicked, tripped an assertion, or failed one of its own walls.
+    /// The compiler panicked, including a failed assertion or phase-boundary check, or the
+    /// program completed with a sink that could not state a value.
     CompilerPanics(String),
-    /// The compiler stated a gap.
+    /// The compiler answered a `CompileError`, whether it states a gap or reports a compiler
+    /// bug.
     CompilerRejects(String),
-    /// The interpreter does not cover the program.
-    OracleGap(String),
-    /// The interpreter itself crashed, which is a defect in the oracle rather than in the
-    /// compiler. Named separately so it can never be read as a compiler finding.
-    OraclePanics(String),
+    /// The interpreter does not cover the program. Carries the interpreter's reason and the
+    /// value the compiler produced, which the report shows beside the reason.
+    InterpreterGap(String, String),
+    /// The interpreter itself crashed, which is a defect in the differential interpreter rather
+    /// than in the compiler. Named separately so it can never be read as a compiler finding.
+    InterpreterPanics(String),
     /// The compiled program did not complete, so its sink holds a partial value.
     DidNotFinish,
 }
@@ -116,8 +152,8 @@ impl Outcome {
             Outcome::Disagrees(_) => "Disagrees",
             Outcome::CompilerPanics(_) => "CompilerPanics",
             Outcome::CompilerRejects(_) => "CompilerRejects",
-            Outcome::OracleGap(_) => "OracleGap",
-            Outcome::OraclePanics(_) => "OraclePanics",
+            Outcome::InterpreterGap(..) => "InterpreterGap",
+            Outcome::InterpreterPanics(_) => "InterpreterPanics",
             Outcome::DidNotFinish => "DidNotFinish",
         }
     }
@@ -128,8 +164,8 @@ impl Outcome {
             Outcome::Disagrees(d)
             | Outcome::CompilerPanics(d)
             | Outcome::CompilerRejects(d)
-            | Outcome::OracleGap(d)
-            | Outcome::OraclePanics(d) => d,
+            | Outcome::InterpreterGap(d, _)
+            | Outcome::InterpreterPanics(d) => d,
         }
     }
 }
@@ -169,6 +205,19 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             for q in {}:
                 out << q
+        "#}},
+        // A collection built from a loop binder, as a comprehension's source and as a nested
+        // loop's.
+        Skeleton { name: "comp_source_in_loop", hole: Ty::IntColl, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2]:
+                out << sum([q * 2 for q in {}])
+        "#}},
+        Skeleton { name: "loop_source_in_loop", hole: Ty::IntColl, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2]:
+                for q in {}:
+                    out << q
         "#}},
         Skeleton { name: "record_field", hole: Ty::Int, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -229,14 +278,14 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << picked
         "#}},
-        Skeleton { name: "ternary_branch", hole: Ty::Int, scope: &[], body: indoc! {r#"
+        Skeleton { name: "ternary_branch", hole: Ty::Int, scope: &[("n", Ty::Int)], body: indoc! {r#"
             out = test_sink()
             n = 5
             out << ({} if n > 3 else 0)
         "#}},
         // The store is in scope as well as the iteration: a filler reading it makes an
-        // in-context read before the write ("8.3 Reads"), and the reply after the write reads
-        // its own write.
+        // in-context read before the write (`docs/chl-spec.md`, "8.3 Reads"), and the reply
+        // after the write reads its own write.
         Skeleton { name: "txn_write_rhs", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
             out = test_sink()
             pool: Mut(Int, Txn) := 100
@@ -255,7 +304,7 @@ fn skeletons() -> Vec<Skeleton> {
                         pool := pool - r
                         out << pool
         "#}},
-        Skeleton { name: "txn_reply", hole: Ty::Int, scope: &[("r", Ty::Int)], body: indoc! {r#"
+        Skeleton { name: "txn_reply", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
             out = test_sink()
             pool: Mut(Int, Txn) := 100
             for r in [1, 2]:
@@ -270,7 +319,7 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << acc
         "#}},
-        Skeleton { name: "mut_write_rhs", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+        Skeleton { name: "mut_write_rhs", hole: Ty::Int, scope: &[("acc", Ty::Int), ("i", Ty::Int)], body: indoc! {r#"
             acc := 0
             for i in [1, 2]:
                 acc := acc + {}
@@ -306,9 +355,10 @@ fn skeletons() -> Vec<Skeleton> {
             for j in [10, 20]:
                 out << j
         "#}},
-        // Feeds a collection rather than folding it first. Its disagreement is the ledger's
-        // check on the comparison: a run with no disagreements at all would not say whether
-        // the comparison discriminates.
+        // Feeds a collection rather than folding it first. The compiled sink holds the
+        // elements and the interpreter one contribution holding the collection, and
+        // `the_comparison_discriminates` holds that disagreement: a grid with no
+        // disagreement at all would not say whether the comparison can see one.
         Skeleton { name: "feed_collection", hole: Ty::IntColl, scope: &[], body: indoc! {r#"
             out = test_sink()
             out << {}
@@ -325,6 +375,11 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << {}
         "#}},
+        Skeleton { name: "record_feed_in_loop", hole: Ty::Rec, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2]:
+                out << {}
+        "#}},
         Skeleton { name: "record_projected", hole: Ty::Rec, scope: &[], body: indoc! {r#"
             out = test_sink()
             r = {}
@@ -337,7 +392,7 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << acc
         "#}},
-        // A record binder: iterating records is the shape a rollup is written in.
+        // A record binder.
         Skeleton { name: "rec_comp_element", hole: Ty::Int, scope: &[("r", Ty::Rec)], body: indoc! {r#"
             out = test_sink()
             out << sum([{} for r in [(a=1, b=2), (a=3, b=4)]])
@@ -356,6 +411,11 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             for sv in ["a", "b"]:
                 out << {}
+        "#}},
+        Skeleton { name: "str_loop_guard", hole: Ty::Bool, scope: &[("sv", Ty::Str)], body: indoc! {r#"
+            out = test_sink()
+            for sv in ["a", "b"]:
+                out << (1 if {} else 0)
         "#}},
         Skeleton { name: "str_coll_source", hole: Ty::StrColl, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -526,6 +586,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_cmp", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "{b} > 1" },
         Filler { name: "binder_cmp_on_comp", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "sum([z2 for z2 in [1, 2]]) > {b}" },
         Filler { name: "str_binder_cmp", ty: Ty::Bool, needs: &[Ty::Str], decls: "", expr: "{b} == \"b\"" },
+        Filler { name: "str_binder_ternary", ty: Ty::Int, needs: &[Ty::Str], decls: "", expr: "(1 if {b} == \"b\" else 0)" },
 
         // --- strings
         Filler { name: "str_lit", ty: Ty::Str, needs: &[], decls: "", expr: "\"hi\"" },
@@ -587,7 +648,7 @@ fn fillers() -> Vec<Filler> {
 
         // --- terminal reads of the store in scope. One `await_final` per variable: a second
         // reference to it is a compile error, so a filler with two would test the rule
-        // rather than the compiler (chl-spec.md, "8.6 `await_final`").
+        // rather than the compiler (`docs/chl-spec.md`, "8.6 `await_final`").
         Filler { name: "terminal", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b})" },
         Filler { name: "terminal_arith", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b}) * 2 + 1" },
         Filler { name: "terminal_in_comp", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "sum([z2 + await_final({b}) for z2 in [1, 2]])" },
@@ -606,7 +667,7 @@ fn fillers() -> Vec<Filler> {
     ]
 }
 
-/// The names a filler writes its binder reads as, in scope order.
+/// The names a filler writes its binder reads as, in `needs` order.
 const PLACEHOLDERS: [&str; 2] = ["{b}", "{c}"];
 
 /// Every way this filler can sit in this hole: the types agree, and each binder the filler
@@ -638,8 +699,7 @@ fn placements(skeleton: &Skeleton, filler: &Filler) -> Vec<Vec<usize>> {
     out
 }
 
-/// A cell's name: the skeleton, the filler, and the binders the filler reads, so a
-/// skeleton gaining a binder adds cells without renaming the ones it had.
+/// A cell's name: the skeleton, the filler, and the binders the filler reads.
 fn cell_name(skeleton: &Skeleton, filler: &Filler, placement: &[usize]) -> String {
     if placement.is_empty() {
         return format!("{}/{}", skeleton.name, filler.name);
@@ -662,9 +722,9 @@ fn program(skeleton: &Skeleton, filler: &Filler, placement: &[usize]) -> String 
     }
 }
 
-/// Run one program through both oracles.
+/// Run one program through the compiler and the differential interpreter.
 ///
-/// The compiler runs whatever the interpreter said. A program the oracle cannot judge can
+/// The compiler runs whatever the interpreter said. A program the interpreter cannot judge can
 /// still crash the compiler, and a crash is a bug whether or not anything was going to
 /// compare the answer, so the compiler's verdict is taken first and the comparison only
 /// happens when both sides produced a value.
@@ -682,21 +742,24 @@ fn classify(source: &str) -> Outcome {
         Ok(Compiled::Value(c)) => c,
     };
     match interpreted {
-        Err(payload) => Outcome::OraclePanics(first_line(&panic_message(&*payload))),
-        Ok(Err(why)) => Outcome::OracleGap(why),
+        Err(payload) => Outcome::InterpreterPanics(first_line(&panic_message(&*payload))),
+        Ok(Err(why)) => Outcome::InterpreterGap(why, c.to_string()),
         Ok(Ok(i)) if c == i => Outcome::Agrees,
         Ok(Ok(i)) => Outcome::Disagrees(format!("compiled {c} vs interpreted {i}")),
     }
 }
 
-/// The key one cause is tallied and pinned under.
+/// The key the report groups one cause's cells under.
 ///
-/// A disagreement is keyed by the two values it renders, so a change to either answer
-/// fails the ledger. Any other detail is keyed by the message stem [`message_stem`]
-/// extracts.
+/// A disagreement is keyed by the two values it renders, and an interpreter gap by its message
+/// stem and the value the compiler produced. Any other detail is keyed by the message stem
+/// [`message_stem`] extracts, so the cells one defect fails group together.
 fn cause_key(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Disagrees(d) => d.clone(),
+        Outcome::InterpreterGap(why, compiled) => {
+            format!("{} / compiled {compiled}", message_stem(why))
+        }
         other => message_stem(other.detail()),
     }
 }
@@ -776,17 +839,7 @@ fn message_stem(detail: &str) -> String {
     format!("{variant}{}", words.join(" "))
 }
 
-/// The message a caught panic carried.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_else(|| "non-string panic".into())
-}
-
-/// The first line of a message, whole: the cause key is cut from it, and a cut taken before
-/// the key would split one cause wherever the cut lands.
+/// The first line of a message. [`message_stem`] bounds the key cut from it.
 fn first_line(msg: &str) -> String {
     msg.lines().next().unwrap_or("").trim().to_string()
 }
@@ -834,6 +887,55 @@ fn no_filler_binds_a_skeleton_binder() {
     }
 }
 
+/// A name is a cell's identity in a report, and a skeleton substitutes its filler once.
+#[test]
+fn names_are_unique_and_each_skeleton_has_one_hole() {
+    let mut names = std::collections::BTreeSet::new();
+    for s in &skeletons() {
+        assert!(names.insert(s.name), "two skeletons are named `{}`", s.name);
+        assert_eq!(
+            s.body.matches("{}").count(),
+            1,
+            "skeleton `{}` has other than one hole",
+            s.name
+        );
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for f in &fillers() {
+        assert!(names.insert(f.name), "two fillers are named `{}`", f.name);
+    }
+}
+
+/// Every filler sits in some hole, every skeleton has a cell, and every skeleton binder is
+/// read by some filler, so no row of either table is dead weight.
+#[test]
+fn every_filler_and_binder_is_reached() {
+    let (skeletons, fillers) = (skeletons(), fillers());
+    for f in &fillers {
+        assert!(
+            skeletons.iter().any(|s| !placements(s, f).is_empty()),
+            "filler `{}` fits no hole",
+            f.name
+        );
+    }
+    for s in &skeletons {
+        assert!(
+            fillers.iter().any(|f| !placements(s, f).is_empty()),
+            "skeleton `{}` has no cell",
+            s.name
+        );
+        for (i, (binder, _)) in s.scope.iter().enumerate() {
+            assert!(
+                fillers
+                    .iter()
+                    .any(|f| placements(s, f).iter().any(|p| p.contains(&i))),
+                "no filler reads `{binder}` in skeleton `{}`",
+                s.name
+            );
+        }
+    }
+}
+
 /// A filler names its binders through [`PLACEHOLDERS`], so it can read at most that many.
 #[test]
 fn no_filler_reads_more_binders_than_can_be_named() {
@@ -850,7 +952,7 @@ fn no_filler_reads_more_binders_than_can_be_named() {
 
 #[test]
 fn a_message_stem_drops_what_varies_per_program() {
-    let stem = |d: &str| message_stem(d);
+    let stem = message_stem;
     assert_eq!(
         stem(r#"[Conversion(Unsupported("unrecognised Var(i) in λ-free CCL"))]"#),
         stem(r#"[Conversion(Unsupported("unrecognised Var(q) in λ-free CCL"))]"#),
@@ -893,17 +995,15 @@ thread_local! {
     static CLASSIFYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[test]
-#[cfg_attr(
-    not(debug_assertions),
-    ignore = "the ledger records the verdicts of a build with `debug_assertions`: a debug-only \
-              check reports a defect at the stage that introduced it, and without one a later \
-              stage reports the same defect in its own words"
-)]
-fn enumerate_pairs() {
+/// Run every cell of the skeletons `rows` admits, and answer each cell's outcome.
+///
+/// Two pairs can spell one program (`feed/sum_lit` is `aggregate_arg/list_lit`); it runs once,
+/// and every cell that spells it takes its outcome, so a failure counts against every row it
+/// sits in.
+fn run_cells(rows: impl Fn(&Skeleton) -> bool) -> BTreeMap<String, Outcome> {
     // A panic inside `classify` is an outcome, so the default hook's backtrace is noise
     // there. Only those are silenced: the hook is process-wide, the other tests in this
-    // binary run concurrently, and this test's own assertions must still print.
+    // binary run concurrently, and a test's own assertions must still print.
     let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
         Arc::from(std::panic::take_hook());
     let show = std::env::var("PAIRS_SHOW_PANICS").is_ok();
@@ -915,83 +1015,116 @@ fn enumerate_pairs() {
     }));
 
     let (skeletons, fillers) = (skeletons(), fillers());
-    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut observed: BTreeMap<String, (&str, String)> = BTreeMap::new();
-    let mut details: BTreeMap<String, String> = BTreeMap::new();
-    let mut programs: BTreeMap<String, String> = BTreeMap::new();
-
-    for s in &skeletons {
+    let mut outcomes = BTreeMap::new();
+    let mut programs: BTreeMap<String, Outcome> = BTreeMap::new();
+    for s in skeletons.iter().filter(|s| rows(s)) {
         for f in &fillers {
             for placement in placements(s, f) {
                 let cell = cell_name(s, f, &placement);
                 let source = program(s, f, &placement);
-                // Two pairs can spell one program (`feed/sum_lit` is
-                // `aggregate_arg/list_lit`); it runs once, under the first cell's name.
-                if programs.insert(source.clone(), cell.clone()).is_some() {
-                    continue;
-                }
-                CLASSIFYING.set(true);
-                let outcome = classify(&source);
-                CLASSIFYING.set(false);
-                *tally.entry(outcome.kind()).or_default() += 1;
-                if outcome != Outcome::Agrees {
-                    details.insert(cell.clone(), outcome.detail().to_string());
-                    observed.insert(cell.clone(), (outcome.kind(), cause_key(&outcome)));
-                }
+                let outcome = programs
+                    .entry(source)
+                    .or_insert_with_key(|source| {
+                        CLASSIFYING.set(true);
+                        let outcome = classify(source);
+                        CLASSIFYING.set(false);
+                        outcome
+                    })
+                    .clone();
+                outcomes.insert(cell, outcome);
             }
         }
     }
 
     std::panic::set_hook(Box::new(move |info| previous(info)));
+    outcomes
+}
 
-    println!("\n=== {} pairs ===", programs.len());
+/// The comparison can see a disagreement: `feed_collection/list_lit` is one.
+#[test]
+fn the_comparison_discriminates() {
+    let (skeletons, fillers) = (skeletons(), fillers());
+    let s = skeletons
+        .iter()
+        .find(|s| s.name == "feed_collection")
+        .unwrap();
+    let f = fillers.iter().find(|f| f.name == "list_lit").unwrap();
+    let outcome = classify(&program(s, f, &[]));
+    assert!(
+        matches!(outcome, Outcome::Disagrees(_)),
+        "expected a disagreement, got {outcome:?}"
+    );
+}
+
+/// Every [`LIVE`] name is a skeleton, once.
+#[test]
+fn live_names_skeletons() {
+    let names: Vec<&str> = skeletons().iter().map(|s| s.name).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for live in LIVE {
+        assert!(
+            names.contains(live),
+            "`{live}` is in LIVE but is not a skeleton"
+        );
+        assert!(seen.insert(live), "`{live}` is in LIVE twice");
+    }
+}
+
+#[test]
+fn live_rows_agree() {
+    let failures: Vec<String> = run_cells(|s| LIVE.contains(&s.name))
+        .into_iter()
+        .filter(|(_, outcome)| *outcome != Outcome::Agrees)
+        .map(|(cell, outcome)| format!("{cell}\t{}\t{}", outcome.kind(), outcome.detail()))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "cells of a live row no longer agree:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The whole grid, for choosing what to fix next: the failures by cause, most cells first,
+/// and the rows that agree everywhere but are not yet [`LIVE`].
+#[test]
+#[ignore = "a report for prioritizing fixes, not a check: run with --ignored --nocapture"]
+fn full_grid() {
+    let outcomes = run_cells(|_| true);
+
+    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_cause: BTreeMap<(&str, String), Vec<&str>> = BTreeMap::new();
+    let mut failing_rows: BTreeMap<&str, usize> = BTreeMap::new();
+    for (cell, outcome) in &outcomes {
+        *tally.entry(outcome.kind()).or_default() += 1;
+        if *outcome != Outcome::Agrees {
+            by_cause
+                .entry((outcome.kind(), cause_key(outcome)))
+                .or_default()
+                .push(cell);
+            let row = cell.split('/').next().expect("a cell name has a skeleton");
+            *failing_rows.entry(row).or_default() += 1;
+        }
+    }
+
+    println!("\n=== {} cells ===", outcomes.len());
     for (kind, n) in &tally {
         println!("{kind:>16}: {n}");
     }
-
-    let rendered: String = observed
-        .iter()
-        .map(|(cell, (kind, cause))| format!("{cell}\t{kind}\t{cause}\n"))
-        .collect();
-    if std::env::var("PAIRS_BLESS").is_ok() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/generated_pairs.ledger");
-        std::fs::write(path, &rendered).expect("write the ledger");
-        return;
-    }
-
-    // Two-sided: a cell the ledger lacks is a new failure, a cell whose line differs failed
-    // differently, and a ledger line the run lacks is a cell that now agrees or is no longer
-    // generated.
-    let mut pinned: BTreeMap<&str, &str> = BTreeMap::new();
-    for line in LEDGER.lines() {
-        let (cell, rest) = line
-            .split_once('\t')
-            .unwrap_or_else(|| panic!("a ledger line is `cell<TAB>kind<TAB>cause`: {line}"));
-        assert!(
-            pinned.insert(cell, rest).is_none(),
-            "`{cell}` is in the ledger twice"
+    let mut causes: Vec<_> = by_cause.into_iter().collect();
+    causes.sort_by_key(|(_, cells)| std::cmp::Reverse(cells.len()));
+    println!("\n=== {} causes ===", causes.len());
+    for ((kind, cause), cells) in &causes {
+        let sample: Vec<&str> = cells.iter().take(3).copied().collect();
+        println!(
+            "{:>4} {kind:<15} {cause}\n       e.g. {}",
+            cells.len(),
+            sample.join(", ")
         );
     }
-    let mut drift = Vec::new();
-    for (cell, (kind, cause)) in &observed {
-        let now = format!("{kind}\t{cause}");
-        match pinned.get(cell.as_str()) {
-            None => drift.push(format!("new     {cell}\t{now}\n        {}", details[cell])),
-            Some(was) if *was != now => drift.push(format!(
-                "changed {cell}\n        was {was}\n        now {now}\n        {}",
-                details[cell]
-            )),
-            Some(_) => {}
-        }
-    }
-    for (cell, was) in &pinned {
-        if !observed.contains_key(*cell) {
-            drift.push(format!("gone    {cell}\t(was {was})"));
-        }
-    }
-    assert!(
-        drift.is_empty(),
-        "the grid drifted from tests/generated_pairs.ledger (PAIRS_BLESS=1 rewrites it):\n{}",
-        drift.join("\n")
-    );
+    let promotable: Vec<&str> = skeletons()
+        .iter()
+        .map(|s| s.name)
+        .filter(|n| !failing_rows.contains_key(n) && !LIVE.contains(n))
+        .collect();
+    println!("\n=== rows that agree everywhere but are not LIVE ===\n{promotable:?}");
 }

@@ -54,3 +54,7 @@ mod type_aliases;
 mod type_annotations;
 #[path = "compilation_pipeline/variants.rs"]
 mod variants;
+
+// Shared with the other test binaries that catch a panic, so it lives under `tests/support/`.
+#[path = "support/panic_message.rs"]
+mod panic_message;

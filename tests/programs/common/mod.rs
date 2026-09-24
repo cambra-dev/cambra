@@ -62,7 +62,6 @@
 //! ```
 
 use std::{
-    any::Any,
     cell::RefCell,
     io::Write,
     panic::{self, AssertUnwindSafe},
@@ -77,6 +76,8 @@ use cambra::{
         tile_operators::scalar_tile_to_column_value,
     },
 };
+
+use crate::panic_message::panic_message;
 
 // ---------------------------------------------------------------------------
 // Scalar programs
@@ -144,7 +145,7 @@ fn compile_error_message(source: &str, needle: &str) -> String {
         ),
         Err(payload) => payload,
     };
-    let msg = panic_payload_to_string(&payload);
+    let msg = panic_message(&*payload);
     assert!(
         msg.contains(needle),
         "expected panic to contain {needle:?}; got: {msg}",
@@ -391,18 +392,5 @@ pub fn tile_to_canonical(tile: Tile) -> String {
             }
         }
         other => panic!("result tile shape not yet supported by the programs harness: {other:?}"),
-    }
-}
-
-/// Extract a readable string from a `catch_unwind` payload.  Most compiler
-/// panics carry `String` or `&'static str`; anything else falls back to a
-/// placeholder so the test doesn't lose its diagnostic.
-fn panic_payload_to_string(payload: &Box<dyn Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
-        s.to_string()
-    } else {
-        "<non-string panic payload>".to_string()
     }
 }
