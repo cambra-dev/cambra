@@ -378,6 +378,12 @@ struct StoreReadInfo {
 /// at compile time.
 #[derive(Default)]
 pub struct OpConversionContext {
+    /// The level the node being converted sits at: how many levels of its input are the
+    /// iteration it is lifted over, rather than part of the element it takes. The AST
+    /// around the node sets it and no tiling is read for it
+    /// (`src/interpreter/design-operators.md`, "The level a node is converted at").
+    /// `None` until a root sets it; see [`Self::level`].
+    level: Option<CurryLevel>,
     /// Variable bindings in scope, innermost scope last.  Each binding
     /// carries a [`BindingKind`] so [`TypedExprNode::Var`] lookups can
     /// dispatch on it without inspecting tile-level types.
@@ -683,6 +689,14 @@ impl OpConversionContext {
     /// Create a new empty context with no registered sources.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The level the node being converted sits at ([`Self::level`](field@Self::level)).
+    ///
+    /// Level 1 where no root has set one: a conversion handed an input with nothing around
+    /// it is converted against that one stream.
+    fn level(&self) -> CurryLevel {
+        self.level.unwrap_or(CurryLevel::new(1))
     }
 
     /// Install what the tree about to be converted says about itself: the
@@ -1661,8 +1675,42 @@ fn convert_impl(
     // the other pass-level walks do (`lambda_elim`, `check`, `constrain`,
     // `channelize`).
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        convert_impl_inner(expr, input, ctx)
+        // A conversion with no input is a root: it starts a stream of its own, whose values
+        // stand at level 1 when it is a collection and at level 0 when it is a scalar.
+        let enclosing = input.is_none().then(|| {
+            ctx.level
+                .replace(CurryLevel::new(usize::from(expr.ty.is_collection())))
+        });
+        let converted = convert_impl_inner(expr, input, ctx);
+        if let Some(enclosing) = enclosing {
+            ctx.level = enclosing;
+        }
+        converted
     })
+}
+
+/// [`convert_impl`] with the node at `level`, restoring the enclosing level afterwards.
+fn convert_at(
+    expr: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    level: CurryLevel,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let enclosing = ctx.level.replace(level);
+    let converted = convert_impl(expr, input, ctx);
+    ctx.level = enclosing;
+    converted
+}
+
+/// [`convert_impl`] one level in from the enclosing node: what a node that lifts `expr`
+/// over the elements of its input's values converts it at.
+fn convert_lifted(
+    expr: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let level = CurryLevel::new(ctx.level().index() + 1);
+    convert_at(expr, input, level, ctx)
 }
 
 fn convert_impl_inner(
@@ -1791,15 +1839,10 @@ fn convert_impl_inner(
             if as_builtin(function) == Some(Builtin::Zip) =>
         {
             let input = expect_input(input, "zip")?;
-            // The arms are each applied to `input`, so the pair sits under `input`'s levels,
-            // less any an arm folds away: `(sum(g), max(g))` over grouped rows pairs at the
-            // groups' keys and not at the rows within them.
-            //
-            // TODO: the pairing depth is the zip's position in the AST, one level plus one per
-            // enclosing `map`, and belongs to op-conversion's context rather than to any
-            // tiling. Read off tilings, it over-counts where every arm keeps a level of the
-            // element: `(g, [s.qty for s in g])` pairs at the rows within each group.
-            let input_levels = input.tiling().levels();
+            // The pair sits at the level the zip is converted at. The arms' shapes cannot
+            // say: `(sum(g), max(g))` over grouped rows folds the rows within each group, and
+            // `(g, [s.qty for s in g])` keeps them, and both pair at the groups' keys.
+            let level = ctx.level();
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
@@ -1850,7 +1893,6 @@ fn convert_impl_inner(
                         };
                         ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
-                    let level = zip_level(input_levels, ops.iter().map(|op| op.tiling()));
                     Ok(zip_arms_at(ops, level))
                 }
                 TypedExprNode::Record(fields) => {
@@ -1866,7 +1908,6 @@ fn convert_impl_inner(
                         })
                         .collect();
                     let ops = ops?;
-                    let level = zip_level(input_levels, ops.iter().map(|(_, op)| op.tiling()));
                     Ok(zip_arms_named_at(ops, level))
                 }
                 other => Err(ConversionError::Unsupported(format!(
@@ -1876,12 +1917,12 @@ fn convert_impl_inner(
             }
         }
 
-        // Because MapResultToConst handles mapping at any depth of currying, map is a pass through and we just convert the argument
-        // and feed the input to to it.
+        // `map(𝑓)` applies 𝑓 to the elements of each value, so 𝑓 is converted one level in.
+        // The operators themselves apply at any depth, so the input passes straight through.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Map) =>
         {
-            convert_impl(argument, Some(expect_input(input, "map")?), ctx)
+            convert_lifted(argument, Some(expect_input(input, "map")?), ctx)
         }
 
         // converse translates 1:1 to the Converse operator
@@ -2384,7 +2425,8 @@ fn convert_impl_inner(
             };
             let inner = convert_impl(source, None, ctx)?;
             let pairs = Box::new(Product::new(outer, inner));
-            convert_impl(morphism, Some(pairs), ctx)
+            // The morphism runs once per pair, over the inner iteration `Product` appends.
+            convert_lifted(morphism, Some(pairs), ctx)
         }
 
         // **A correlated inner comprehension**: `curry(𝑔)` composed onto the outer collection,
@@ -2419,7 +2461,8 @@ fn convert_impl_inner(
             };
             let inner = ctx.extent_of(inner)?;
             let pairs = Box::new(Product::new(outer, Box::new(IterateExtent::new(inner))));
-            convert_impl(argument, Some(pairs), ctx)
+            // 𝑔 runs once per pair, over the inner iteration `Product` appends.
+            convert_lifted(argument, Some(pairs), ctx)
         }
 
         TypedExprNode::Apply { argument, function } => {
@@ -2670,22 +2713,15 @@ fn convert_impl_inner(
                     for (k, t) in variants {
                         variant_extents.push((k.clone(), ctx.extent_of(t)?));
                     }
-                    // The levels above the payload stand; the payload's
-                    // own are what becomes one union column. Its type says which is
-                    // which — the tiling cannot, since a collection of payloads and a
-                    // payload that is itself a collection are both collections.
-                    let payload_levels = expr
-                        .ty
-                        .domain()
-                        .map(|t| ctx.extent_of(&t))
-                        .transpose()?
-                        .map_or(0, |e| Tiling::from_extent(&e).levels());
-                    let level = CurryLevel::new(input.tiling().levels() - payload_levels);
+                    // The levels above the payload stand; the payload's own are what becomes
+                    // one union column. The tiling cannot say which is which, since a
+                    // collection of payloads and a payload that is itself a collection are
+                    // both collections, so the level is the one the wrap is converted at.
                     Ok(Box::new(VariantWrap::new_at(
                         input,
                         tag.clone(),
                         TagMap::from_arms(variant_extents),
-                        level,
+                        ctx.level(),
                     )))
                 }
                 // `box` has no runtime content — it introduces the sum at the type level, so
@@ -2812,8 +2848,9 @@ fn convert_impl_inner(
             let payload_op = convert_impl(payload, None, ctx)?;
             // Applied rather than composed: one payload becomes one variant value, and a
             // collection-valued payload is read as the collection of them it also looks like
-            // — the reading this form has always taken.
-            let level = CurryLevel::new(payload_op.tiling().levels().min(1));
+            // — the reading this form has always taken. The payload is a root, so that is
+            // the level it is converted at.
+            let level = CurryLevel::new(usize::from(payload.ty.is_collection()));
             Ok(Box::new(VariantWrap::new_at(
                 payload_op,
                 tag_key,
@@ -3065,12 +3102,6 @@ fn record_field<'a>(elt: &'a Expr, name: &str) -> Result<&'a Expr, ConversionErr
             symbolic(elt)
         ))
     })
-}
-
-/// The level a `zip`'s arms pair at: beneath `input_levels`, capped by the fewest levels any
-/// arm carries, since an arm that folds a level of the element has no level there to pair.
-fn zip_level<'a>(input_levels: usize, arms: impl Iterator<Item = &'a Tiling>) -> CurryLevel {
-    CurryLevel::new(arms.map(Tiling::levels).fold(input_levels, usize::min))
 }
 
 /// Whether two extents have the same constructor skeleton.
@@ -3569,7 +3600,8 @@ fn build_commit_store(
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no branch has finished.
         let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
-        let body_op = convert_impl(&w.body, Some(driver_fan.branch()), ctx)?;
+        // The body runs over the store's own domain, whatever the carrier sits in.
+        let body_op = convert_at(&w.body, Some(driver_fan.branch()), CurryLevel::new(1), ctx)?;
         // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
@@ -4512,9 +4544,10 @@ fn build_nested_induction_store(
     // The two levels this carrier recurs over, and the levels above it that it leaves
     // standing. Everything below reads the pair off the bottom of the source, so a carrier
     // inside a deeper nest pairs the loop it belongs to rather than the outermost one.
-    // The levels the enclosing context already stands over: its own depth less the row it
-    // is iterating, which is the level this carrier's source adds beneath it.
-    let above = enclosing_fan.branch().tiling().levels().saturating_sub(1);
+    // The levels the enclosing context already stands over: the level the carrier is
+    // converted at, less the row it is iterating, which is the level this carrier's source
+    // adds beneath it.
+    let above = ctx.level().enclosing().map_or(0, CurryLevel::index);
     let Some((standing, row_domain, inner_domain)) =
         split_nested_source(source_nested.tiling(), above)
     else {
@@ -4567,7 +4600,7 @@ fn build_nested_induction_store(
         // the body with it at an enclosing boundary, and the store folds a carry to it at
         // a position that writes nothing. One reader would leave the other disagreeing —
         // which is the shape of every "write between the loops" case.
-        let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(convert_impl(
+        let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(convert_lifted(
             &k.init,
             Some(pairs_fan.branch()),
             ctx,
@@ -4653,7 +4686,7 @@ fn build_nested_induction_store(
     ctx.iterations.push(OpenIteration {
         source: source_fan.clone(),
     });
-    let body = convert_impl(&w.body, Some(Box::new(driver)), ctx);
+    let body = convert_lifted(&w.body, Some(Box::new(driver)), ctx);
     ctx.iterations.pop();
     set_body(body?);
     Ok(StoreReadInfo {
@@ -4829,7 +4862,13 @@ resolves to the other's value",
         induction_extent.clone(),
         resumed_after,
     );
-    set_body(convert_impl(&w.body, Some(Box::new(driver)), ctx)?);
+    // The body runs over the store's own domain, whatever the carrier sits in.
+    set_body(convert_at(
+        &w.body,
+        Some(Box::new(driver)),
+        CurryLevel::new(1),
+        ctx,
+    )?);
     Ok(StoreReadInfo {
         fan,
         keys: keys_map,
@@ -5289,11 +5328,10 @@ fn union_operand_ops(
             // `Memo` the shared fed input so the fan's branches (one per arm) stay
             // consistent under a re-entrant pull — the transaction writer pulls the
             // body once per proposal.
-            // The level the arms are merged at is the fed input's levels minus the one they
-            // partition — the same reading `zip_arms_at` takes of its own input. A nested
-            // carrier's body runs under its enclosing row, so its partition merges one
-            // level in and leaves that row standing.
-            let level = CurryLevel::innermost_of(inp.tiling()).unwrap_or(CurryLevel::OUTERMOST);
+            // The arms partition the level the copairing is converted at, so they merge one
+            // level above it. A nested carrier's body is converted one level in, so its
+            // partition merges one level in and leaves the enclosing row standing.
+            let level = ctx.level().enclosing().unwrap_or(CurryLevel::OUTERMOST);
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
             let ops = operands
                 .iter()

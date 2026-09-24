@@ -726,6 +726,29 @@ than by a second list agreeing.  The pass walks the AST inserting
 layer) — `iterate ▷ (p ▷ restrict) ▷ …`, application rather than composition.
 Op-conversion never has to invent an iteration source on its own.
 
+### The level a node is converted at
+
+Every node is converted at a `CurryLevel`: how many levels of its input are the iteration it is
+lifted over, rather than part of the element it takes. The AST around the node sets it
+(`OpConversionContext::level`), and no operator's level is read off a tiling, because a tiling
+cannot tell a level the node iterates from a level inside the element it takes. Over grouped rows,
+`(sum(g), max(g))` and `(g, [s.qty for s in g])` both pair at the groups' keys, while their arms
+carry one level and two.
+
+| Node | Converts its children at |
+|---|---|
+| a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
+| `map(𝑓)` | 𝑓 one level in |
+| `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
+| a top-level carrier | its body at level 1, over the store's own domain |
+| a nested carrier | its source at the carrier's level, its seed and body one level in |
+| every other node, composition included | the level it is converted at |
+
+The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
+pairs at it. A composed `VariantWrap` wraps at it, and an applied one at its payload's root level.
+A fed copairing merges one level above it, and a nested carrier leaves standing the levels above
+its own row, one fewer than it.
+
 ### Iteration sources
 
 After planning, the only ways op-conversion learns about an iteration are via
