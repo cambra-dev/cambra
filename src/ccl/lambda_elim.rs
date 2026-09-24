@@ -59,15 +59,22 @@ use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 /// Errors that can occur during lambda elimination.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LambdaElimError {
-    /// A node kind inside a lambda body is not yet handled by the elimination
-    /// rules.  Currently: `Case`, `Loop`, and `HashJoin` refinements.
+    /// A node kind inside a lambda body is not handled by the elimination rules.
     Unsupported(String),
+    /// A list literal inside a lambda body has an element that reads the lambda's binder.
+    /// A list literal's elements are constants (`docs/chl-spec.md`, "3.11 List, tuple, record
+    /// literals"), and this one varies with the binder.
+    VaryingListElement { binder: Name },
 }
 
 impl std::fmt::Display for LambdaElimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsupported(msg) => write!(f, "lambda elimination: unsupported: {msg}"),
+            Self::VaryingListElement { binder } => write!(
+                f,
+                "a list element must be a constant, but this one varies with `{binder}`"
+            ),
         }
     }
 }
@@ -1129,33 +1136,27 @@ fn elim_lambda_impl(
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
         }
 
-        // List: the Tuple rule does not carry over, because a list's elements are rows of a
-        // collection rather than slots of a row. `Zip` is the *product* fanout —
-        // `zip : ((A → B), (A → C)) → (A → (B, C))` — and op-conversion combines its arms
-        // into a tuple or a record tile, both inside one row. Distributing a captured binder
-        // across list elements instead builds a **level**, and no former builds one: a `List`
-        // reaches op-conversion only as an indexed source `iterate` drives.
+        // List: a list literal's elements are constants (`docs/chl-spec.md`, "3.11 List,
+        // tuple, record literals"), and a body that reaches this arm has one that reads
+        // `param`. Lowering refuses every element that names a varying variable at its span
+        // (`lower::constant_lists`), so an element reaches here only through a call, and is
+        // refused without a span. Constant elements never get here: the Pi-const rule above
+        // returns the whole list as a constant.
         //
-        // So eliminating element-wise is not a partial answer but an ill-typed one. Every
-        // element comes back a morphism, so the node would carry the lambda's own type,
-        // `𝑋 ⇒ ([0, n-1] ⤇ 𝑉)`, while a list node is typed `[0, n-1] ⤇ (𝑋 ⇒ 𝑉)` — different
-        // domains, so the post-elim wall rejects it whatever the program. Stating the gap
-        // here reports it against the source instead, as the closed-element case already
-        // does at op-conversion ("a list element must be a constant").
-        //
-        // `docs/chl-spec.md`, "3.11 List, tuple, record literals" admits any expression as an
-        // element, so this is a gap against the spec and not a rule the language states.
+        // The Tuple rule would be ill-typed here, not merely unsupported. A list's elements are
+        // rows of a collection rather than slots of a row, and `Zip` is the product fanout,
+        // `zip : ((𝐴 ⇒ 𝐵), (𝐴 ⇒ 𝐶)) ⇒ (𝐴 ⇒ (𝐵, 𝐶))`. Every element would come back a
+        // function, so the node would carry the lambda's type `𝑋 ⇒ ([0, 𝑛-1] ⤇ 𝑉)` where a
+        // list node is typed `[0, 𝑛-1] ⤇ (𝑋 ⇒ 𝑉)`.
         TypedExprNode::List(elts) => {
-            debug_assert!(
-                elts.iter().any(|e| is_free(param, e)),
-                "a list no element of which reads `{param}` is a constant body, which the \
-                 constant rule above has already returned"
+            assert!(
+                elts.iter().any(|e| is_free_in_value(param, e)),
+                "a list no element of which reads `{param}` as a value is a constant body, \
+                 which the Pi-const rule above has already returned"
             );
-            Err(LambdaElimError::Unsupported(format!(
-                "a list element that varies with the enclosing binder `{param}`: building a \
-                 collection out of per-element computations needs a former that adds a level, \
-                 and only a list of constants is built today"
-            )))
+            Err(LambdaElimError::VaryingListElement {
+                binder: param.clone(),
+            })
         }
 
         // Desugar to input ▷ agg(kind), then elim_lambda the result

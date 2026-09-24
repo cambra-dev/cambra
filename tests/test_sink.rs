@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::Type;
-use cambra::ccl::context::{GlobalContext, compile_program};
+use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
 use cambra::interpreter::{
     BaseType, Consumer, Extent, Predicate, SinkReadError, TestDataSource, Value,
 };
@@ -511,24 +511,35 @@ fn a_sink_accumulates_across_two_deliveries() {
     );
 }
 
-/// Feeding a collection built from the loop variable, from inside the loop, does not compile:
-/// a list whose elements vary with the binder needs a former that adds a level, which
-/// `lambda_elim` states rather than building a tree its own post-pass check rejects. Not a
-/// sink defect — the same program through a plain `defer()` and a trailing expression is
-/// refused identically.
+/// A list literal's elements are constants ("3.11 List, tuple, record literals" in
+/// `docs/chl-spec.md`), so a list built from the loop variable is refused. Not a sink
+/// rule — the same program through a plain `defer()` and a trailing expression is refused
+/// identically.
 ///
 /// It leaves one feed case unmeasured — whether such a channel takes the loop's keys with a
 /// collection under each, or splices the contributions into one flat domain — so nothing
 /// downstream should assume either.
 #[test]
 fn a_collection_fed_from_inside_a_loop_does_not_compile() {
-    let err = compile_error(indoc! {r#"
+    let source = indoc! {r#"
         out = test_sink()
         for x in [1, 2]:
             out << [x, x * 10]
-    "#});
-    assert!(
-        err.contains("a list element that varies with the enclosing binder `x`"),
-        "expected the list-former gap, got: {err}"
+    "#};
+    let mut ctx = GlobalContext::default();
+    ctx.register_test_sink("out");
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let Err(errs) = compile_program(&mut ctx, source, consumer) else {
+        panic!("expected a compile error");
+    };
+    // Both elements vary, and each is refused at its own span.
+    let rendered = render_errors(&errs, "<test>", source);
+    assert_eq!(
+        rendered
+            .matches("a list element must be a constant, but this one varies with `x`")
+            .count(),
+        2,
+        "{rendered}"
     );
+    assert!(rendered.contains("out << [x, x * 10]"), "{rendered}");
 }
