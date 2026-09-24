@@ -42,6 +42,7 @@
 //! [`CommitEngine::attempt`] is called. There is no parallelism; serialization
 //! semantics are validated deterministically.
 
+use bit_set::BitSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ccl::F_WRITES;
@@ -705,6 +706,65 @@ enum ReleasedExtent {
     Nothing,
     Through(usize),
     All,
+}
+
+/// The tiling a store read hands out for `value_extent`, one level deeper when the value
+/// is a collection.
+///
+/// A store holds one value per key per tick, so a collection-valued key is a map in a cell.
+/// Handing its keys out as a level is what lets a consumer fold the elements directly,
+/// rather than reading a column of maps something downstream has to open first.
+pub(crate) fn read_tiling(position: Extent, value_extent: &Extent) -> Tiling {
+    Tiling::data_function(position, Tiling::from_extent(value_extent))
+}
+
+/// The tile for [`read_tiling`]: one value per position, opened to match
+/// [`Tiling::from_extent`].
+pub(crate) fn read_tile(
+    positions: ColumnValue,
+    values: Vec<Value>,
+    value_extent: &Extent,
+    domain_predicate: Predicate,
+) -> Tile {
+    Tile::data_function(
+        positions,
+        Box::new(stored_value_tile(values, value_extent)),
+        domain_predicate,
+        BitSet::new(),
+    )
+}
+
+/// One stored value per position, opened into the shape [`Tiling::from_extent`] declares.
+fn stored_value_tile(values: Vec<Value>, value_extent: &Extent) -> Tile {
+    match value_extent {
+        Extent::Function { domain, codomain } => open_row_collections(
+            &ColumnValue::from_values(values, value_extent),
+            domain,
+            codomain,
+        ),
+        Extent::Record(fields) if value_extent.holds_a_collection() => Tile::Record(
+            fields
+                .iter()
+                .map(|(name, extent)| {
+                    let column = values
+                        .iter()
+                        .map(|value| {
+                            let Value::Record(row) = value else {
+                                panic!("a record-valued store key holds a record per position, got {value:?}")
+                            };
+                            row.get(name)
+                                .unwrap_or_else(|| {
+                                    panic!("a stored record is missing field {name}")
+                                })
+                                .clone()
+                        })
+                        .collect();
+                    (name.clone(), stored_value_tile(column, extent))
+                })
+                .collect(),
+        ),
+        _ => Tile::Scalar(ColumnValue::from_values(values, value_extent)),
+    }
 }
 
 /// Encode a `Key ⇀ Value` map (a read set, write set, or store delta) as a
@@ -1609,10 +1669,7 @@ impl StoreValueStream {
         carry_forward: bool,
     ) -> Self {
         Self {
-            base: OperatorBase::new(Tiling::data_function(
-                Extent::Base(BaseType::UInt),
-                Tiling::Scalar(value_extent.clone()),
-            )),
+            base: OperatorBase::new(read_tiling(Extent::Base(BaseType::UInt), &value_extent)),
             store_op,
             key,
             value_extent,
@@ -1754,14 +1811,11 @@ impl TileProducer for StoreValueStreamProducer {
                 values.push(v);
             }
         }
-        Tile::data_function(
+        read_tile(
             ColumnValue::from_uints(ticks),
-            Box::new(Tile::Scalar(ColumnValue::from_values(
-                values,
-                &self.value_extent,
-            ))),
+            values,
+            &self.value_extent,
             domain_predicate.clone(),
-            bit_set::BitSet::new(),
         )
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1975,9 +2029,8 @@ impl StoreDenseRead {
             "StoreDenseRead source must be a Store, got {}",
             store_op.tiling()
         );
-        let tiling = Tiling::data_function(domain.clone(), Tiling::Scalar(value_extent.clone()));
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new(read_tiling(domain.clone(), &value_extent)),
             trigger,
             store_op,
             key,
@@ -2151,15 +2204,7 @@ impl TileProducer for StoreDenseReadProducer {
         } else {
             Predicate::from_column_value(&positions)
         };
-        Tile::data_function(
-            positions,
-            Box::new(Tile::Scalar(ColumnValue::from_values(
-                values,
-                &self.value_extent,
-            ))),
-            domain_predicate,
-            bit_set::BitSet::new(),
-        )
+        read_tile(positions, values, &self.value_extent, domain_predicate)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -2254,19 +2299,6 @@ pub struct AsOfField {
     pub value_extent: Extent,
 }
 
-/// One snapshot field's tile, in the form [`Tiling::from_extent`] gives its extent: a
-/// collection-valued field opens each row's map into that row's group.
-fn field_tile(value_extent: &Extent, values: Vec<Value>) -> Tile {
-    match value_extent {
-        Extent::Function { domain, codomain } => open_row_collections(
-            &ColumnValue::from_values(values, value_extent),
-            domain,
-            codomain,
-        ),
-        _ => Tile::Scalar(ColumnValue::from_values(values, value_extent)),
-    }
-}
-
 /// What an [`AsOf`] latches and emits per trigger position.
 #[derive(Clone)]
 enum AsOfOutput {
@@ -2355,7 +2387,15 @@ impl AsOf {
             "AsOf source must be a commit Store, got {}",
             source.tiling()
         );
-        let tiling = Tiling::data_function(b_ext.clone(), output.codomain_tiling());
+        // A single collection-valued mutable variable hands its keys out as a level, as
+        // every store read does ([`read_tiling`]). A snapshot record keeps its fields
+        // boxed: a level belongs to the tile, and a record field is a column.
+        let tiling = match &output {
+            AsOfOutput::Scalar { value_extent, .. } => read_tiling(b_ext.clone(), value_extent),
+            AsOfOutput::Record { .. } => {
+                Tiling::data_function(b_ext.clone(), output.codomain_tiling())
+            }
+        };
         Self {
             base: OperatorBase::new(tiling),
             trigger,
@@ -2456,27 +2496,31 @@ impl AsOfProducer {
                 cols[i].push(v.clone());
             }
         }
-        let codomain = match &self.output {
-            AsOfOutput::Scalar { value_extent, .. } => Tile::Scalar(ColumnValue::from_values(
+        let positions = ColumnValue::from_values(bs, &self.b_extent);
+        // Terminality rides with the trigger throughout: when no more requests will arrive
+        // (trigger terminal) the response set is complete.
+        match &self.output {
+            // A single mutable variable takes the shape every store read hands out, which
+            // for a collection is its keys as a level ([`read_tile`]).
+            AsOfOutput::Scalar { value_extent, .. } => read_tile(
+                positions,
                 cols.into_iter().next().unwrap_or_default(),
                 value_extent,
-            )),
-            AsOfOutput::Record { fields } => Tile::Record(
-                fields
-                    .iter()
-                    .zip(cols)
-                    .map(|(f, col)| (f.field.clone(), field_tile(&f.value_extent, col)))
-                    .collect(),
+                domain_predicate,
             ),
-        };
-        Tile::data_function(
-            ColumnValue::from_values(bs, &self.b_extent),
-            Box::new(codomain),
-            // Terminality rides with the trigger: when no more requests will
-            // arrive (trigger terminal) the response set is complete.
-            domain_predicate,
-            bit_set::BitSet::new(),
-        )
+            AsOfOutput::Record { fields } => Tile::data_function(
+                positions,
+                Box::new(Tile::Record(
+                    fields
+                        .iter()
+                        .zip(cols)
+                        .map(|(f, col)| (f.field.clone(), stored_value_tile(col, &f.value_extent)))
+                        .collect(),
+                )),
+                domain_predicate,
+                BitSet::new(),
+            ),
+        }
     }
 }
 
@@ -2762,17 +2806,25 @@ impl DriverWindow {
                     }
                 })
                 .collect();
-            Tile::Scalar(ColumnValue::from_values(column, ext))
+            stored_value_tile(column, ext)
         });
+        let positions: Vec<usize> = self.rows.iter().map(|r| r.position).collect();
+        let domain = ColumnValue::from_uints(positions);
         Tile::data_function(
-            ColumnValue::from_uints(self.rows.iter().map(|r| r.position).collect()),
+            domain.clone(),
             Box::new(Tile::Record(fields)),
+            // A row is final once it is emitted: it was built from one `(item, frontier)`
+            // pair and a retry at a moved frontier is a *fresh* position, so nothing here
+            // is revised. Reporting the emitted positions rather than `False` is what lets
+            // a fold over a field's own collection settle per row, instead of waiting for
+            // the whole drive to finish — which it cannot, since the drive is waiting on
+            // the decision that fold feeds.
             if done {
                 Predicate::True
             } else {
-                Predicate::False
+                Predicate::from_column_value(&domain)
             },
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 }
@@ -3448,11 +3500,16 @@ impl TileProducer for TransactDriverProducer {
 
 /// The body-input tiling both writers' drivers produce: `UInt → {_0…_{r-1}:
 /// read, _r: item}`.
+///
+/// Each field is opened the way every other store read is ([`Tiling::from_extent`]), so a
+/// collection-valued read reaches the body as a level rather than as a map in a cell — which
+/// is what lets the body iterate it. A write goes the other way: a store write is one value
+/// per key, so what the body computes materializes where it becomes the decision's payload.
 fn body_input_tiling(read_extents: &[Extent], item_extent: &Extent) -> Tiling {
     Tiling::data_function(
         Extent::Base(BaseType::UInt),
         Tiling::Record(body_input_fields(read_extents, item_extent, |_, ext| {
-            Tiling::Scalar(ext.clone())
+            Tiling::from_extent(ext)
         })),
     )
 }
@@ -3850,7 +3907,7 @@ impl TransactWriterProducer {
             } else {
                 Predicate::False
             },
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 
@@ -4297,7 +4354,7 @@ mod tests {
                     &value_extent(),
                 ))),
                 Predicate::True,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             );
             Self { tiling, tile }
         }
@@ -4475,7 +4532,7 @@ mod tests {
                 // exactly when its input is, as a compiled body's operator chain
                 // propagates it. The store reads this to close its frontier.
                 domain_predicate,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             )
         }
 
@@ -5781,7 +5838,7 @@ mod tests {
             } else {
                 Predicate::False
             },
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 
@@ -6467,7 +6524,7 @@ mod tests {
                 ColumnValue::from_uints(vec![]),
                 Box::new(Tile::Scalar(ColumnValue::from_ints(vec![]))),
                 Predicate::False,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             ),
         };
         let g = nonscalar.tiling().universal_guard();
@@ -6498,7 +6555,7 @@ mod tests {
                     ),
                     Box::new(codomain),
                     Predicate::True,
-                    bit_set::BitSet::new(),
+                    BitSet::new(),
                 ),
             };
             let g = source.tiling().universal_guard();
@@ -6676,7 +6733,7 @@ mod tests {
             ColumnValue::from_uints(vec![2, 0, 1]),
             Box::new(Tile::Scalar(ColumnValue::from_ints(vec![30, 10, 20]))),
             Predicate::True,
-            bit_set::BitSet::new(),
+            BitSet::new(),
         );
         assert_eq!(
             decode_source_positioned(&tile),

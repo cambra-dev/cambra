@@ -683,11 +683,11 @@ shape, for `Source`'s reason: the name addresses something the compilation is ha
 the tree computes. It is not a variable reference, so no scope resolution reaches it and `uniquify`
 leaves the spelling alone. The version that retires `x` has no binder for it to refer to.
 
-A loaded value whose extent is a function is built with `Constant::collection`, which tiles it as a
-one-level `DataFunction` (`src/interpreter/design-operators.md`, "Tile Operators") rather than as a
-bindings table a consumer applies. The value alone does not say which of the two it is, so the site
-holding it decides. That is what lets a comprehension iterate a loaded collection, and so what makes
-a unit change on persisted state a declaration.
+A loaded value whose extent is a function is built with `Constant::from_bindings`, which tiles it
+as a one-level `DataFunction` (`src/interpreter/design-operators.md`, "Tile Operators") rather than
+as a bindings table a consumer applies. The value alone does not say which of the two it is, so the
+site holding it decides. That is what lets a comprehension iterate a loaded collection, and so what
+makes a unit change on persisted state a declaration.
 
 ### Which variable a load site addresses
 

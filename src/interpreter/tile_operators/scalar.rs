@@ -12,76 +12,92 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-/// A tile operator that always produces the same value.
+/// A tile operator that always produces the same tile.
+///
+/// A constant is a tile at whatever shape its tiling names: a scalar for a literal value,
+/// and levels for a collection a literal writes out in full ([`Constant::collection`]).
 pub struct Constant {
-    /// The fixed value emitted on every `get`.
-    value: Value,
-    /// The extent (type) of the produced value.
-    pub extent: Extent,
-    /// `Tiling::Scalar` from [`Constant::new`], `Tiling::DataFunction` from
-    /// [`Constant::collection`].
+    /// The fixed tile emitted on every `get`.
+    tile: Tile,
     base: OperatorBase,
 }
 
 impl Constant {
-    /// Create a new `Constant` operator producing `value` as a single scalar.
+    /// A constant scalar.
     ///
     /// The extent is a *parameter* rather than derived from `value`, because a value
     /// does not determine one: a `Value::Union` knows the arm it occupies but not the
     /// arm set it belongs to, and a `Value::Function` binding table knows its own
     /// keys but not the domain they are drawn from. Every caller has the node's type,
     /// which does.
-    ///
-    /// A `Value::Function` at an [`Extent::Function`] is a scalar here too: a
-    /// bindings table standing in **function position** is one value the consumer
-    /// applies, which is what a list literal's table is
-    /// (`src/interpreter/operator_conversion.rs`, `compile_list_fn`). Tiling is not
-    /// derivable from the value's shape, so the caller that means a collection says
-    /// so by calling [`Constant::collection`] instead.
     pub fn new(value: Value, extent: Extent) -> Self {
-        Self {
-            base: OperatorBase::new(Tiling::Scalar(extent.clone())),
-            value,
-            extent,
-        }
+        Self::of(
+            Tile::Scalar(ColumnValue::single(value)),
+            Tiling::Scalar(extent),
+        )
     }
 
-    /// Create a `Constant` producing `bindings` as a **collection**: one tile
-    /// carrying the whole table, keyed by its own domain.
+    /// A constant collection: the table a list literal denotes, emitted as the tile it is
+    /// rather than as a column of materialized values something downstream has to open.
+    pub fn collection(tile: Tile, tiling: Tiling) -> Self {
+        Self::of(tile, tiling)
+    }
+
+    /// A constant **collection** over a bindings table: one level keyed by the table's own
+    /// domain.
     ///
-    /// Every operator downstream derives its tiling from its input's, so this is
-    /// what decides whether the table or its outputs are what a consumer iterates.
-    /// A comprehension over a loaded `Map` is the case that separates the two: at
-    /// the scalar tiling of [`Constant::new`] it transforms the table as one value
-    /// and the arithmetic under it meets a `Value::Function`, while here it
-    /// transforms each output and keeps the domain.
+    /// Every operator downstream derives its tiling from its input's, so this is what
+    /// decides whether the table or its outputs are what a consumer iterates. A
+    /// comprehension over a loaded `Map` is the case that separates the two: at the scalar
+    /// tiling of [`Constant::new`] it transforms the table as one value and the arithmetic
+    /// under it meets a `Value::Function`, while here it transforms each output and keeps
+    /// the domain.
     ///
     /// Which of the two a constant is cannot be read off the value, so the call site states
-    /// it. Two do: [`TypedExprNode::LoadFrom`](crate::ccl::TypedExprNode), whose extent comes
-    /// from the loaded value's own type, and `Builtin::EmptyMap`, whose comes from the
-    /// annotation that pinned it — both in `operator_conversion`.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless `bindings` is a `Value::Function` at an [`Extent::Function`].
-    /// A `Value::ComputableFunction` computes its outputs rather than tabulating
-    /// them, so it has no domain column to hand over and is not a collection.
-    pub fn collection(bindings: Value, extent: Extent) -> Self {
-        let (Value::Function(_), Extent::Function { domain, codomain }) = (&bindings, &extent)
+    /// it.
+    pub fn from_bindings(bindings: Value, extent: Extent) -> Self {
+        let (Value::Function(table), Extent::Function { domain, codomain }) = (&bindings, &extent)
         else {
             panic!(
                 "a collection constant is a bindings table at a function extent, got {bindings:?} \
                  at {extent}"
             );
         };
+        let (keys, values): (Vec<Value>, Vec<Value>) = table
+            .iter()
+            .map(|b| (b.input.clone(), b.output.clone()))
+            .unzip();
+        // `Predicate::True` because a constant is decided in full on the pull that yields it:
+        // the bindings are the whole collection, so there is no key it has yet to answer.
+        let tile = Tile::data_function(
+            ColumnValue::from_values(keys, domain),
+            Box::new(Tile::Scalar(ColumnValue::from_values(values, codomain))),
+            Predicate::True,
+            BitSet::new(),
+        );
         let tiling = Tiling::DataFunction {
             domain: (**domain).clone(),
             codomain: Box::new(Tiling::Scalar((**codomain).clone())),
         };
+        Self::of(tile, tiling)
+    }
+
+    fn of(tile: Tile, tiling: Tiling) -> Self {
+        debug_assert!(
+            tile.check_from(&tiling),
+            "a constant's tile is its tiling's: {tile:?} vs {tiling}"
+        );
         Self {
+            tile,
             base: OperatorBase::new(tiling),
-            value: bindings,
-            extent,
+        }
+    }
+
+    /// The single value, where this constant is a scalar holding one.
+    fn as_value(&self) -> Option<Value> {
+        match &self.tile {
+            Tile::Scalar(cv) if cv.len() == 1 => Some(cv.index_at(0)),
+            _ => None,
         }
     }
 }
@@ -90,7 +106,10 @@ impl TileOperator for Constant {
     impl_operator_base!();
 
     fn inspect_annotation(&self) -> Option<String> {
-        Some(self.value.to_string())
+        Some(match self.as_value() {
+            Some(v) => v.to_string(),
+            None => format!("{}", self.tiling()),
+        })
     }
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -104,101 +123,57 @@ impl TileOperator for Constant {
         consumer.notify();
         Box::new(ConstantProducer {
             base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling()),
-            value: self.value.clone(),
+            tile: self.tile.clone(),
             released: false,
-            table: None,
         })
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
-        if let Value::ComputableFunction(func) = &self.value {
-            match func {
-                FunctionDef::RecordField(f) => Some(vec![TilePathStep::Record(f.clone())]),
-                _ => None,
+        match self.as_value() {
+            Some(Value::ComputableFunction(FunctionDef::RecordField(f))) => {
+                Some(vec![TilePathStep::Record(f)])
             }
-        } else {
-            None
+            _ => None,
         }
     }
 }
 
 struct ConstantProducer {
     base: ProducerBase,
-    value: Value,
+    tile: Tile,
     released: bool,
-    /// The collection tile, built on the first pull that asks for one.
-    ///
-    /// What holding it saves is the `Value` to [`ColumnValue`] conversion: the
-    /// unzip into keys and values, and a `from_values` over each. The tile is
-    /// still cloned per pull, so the keys and values are re-cloned either way.
-    /// A constant's bindings table cannot change, and the obsolete guard that
-    /// does applies to the copy handed out.
-    table: Option<Tile>,
 }
 
 impl TileProducer for ConstantProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-        node.annotate(format!("{}", self.value))
+        node.annotate(format!("{}", self.tiling()))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // `Predicate::True` because a constant is decided in full on the pull that
-        // yields it: the bindings are the whole collection, so there is no key it
-        // has yet to answer. A consumer reading a partial domain as the whole one
-        // is what the predicate exists to prevent, and there is no partial state
-        // here to mistake.
-        if matches!(self.tiling(), Tiling::DataFunction { .. }) {
-            let table = match self.table.take() {
-                Some(table) => table,
-                None => {
-                    let Tiling::DataFunction { domain, codomain } = self.tiling() else {
-                        unreachable!("matched immediately above")
-                    };
-                    let Value::Function(bindings) = &self.value else {
-                        unreachable!(
-                            "a collection constant holds a bindings table — \
-                             `Constant::collection` is the only way to this tiling and \
-                             checks it"
-                        )
-                    };
-                    let (keys, values): (Vec<Value>, Vec<Value>) = bindings
-                        .iter()
-                        .map(|b| (b.input.clone(), b.output.clone()))
-                        .unzip();
-                    Tile::data_function(
-                        ColumnValue::from_values(keys, domain),
-                        Box::new(Tile::Scalar(ColumnValue::from_values(
-                            values,
-                            &codomain.extent(),
-                        ))),
-                        Predicate::True,
-                        BitSet::new(),
-                    )
-                }
-            };
-            let mut tile = table.clone();
-            self.table = Some(table);
-            // A collection's consumers release the keys they are done with, so the
-            // whole table is not what a later pull may return. `release` has already
-            // accumulated every guard into `obsolete_guard`, and returning released
-            // rows is what `get`'s post-condition forbids.
+        // A collection's consumers release the keys they are done with, so the whole
+        // table is not what a later pull may return. `release` has already accumulated
+        // every guard into `obsolete_guard`, and returning released rows is what `get`'s
+        // post-condition forbids.
+        if self.tiling().is_data_function() {
+            let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             return tile;
         }
         if self.released {
-            return self.tiling().empty_tile();
+            self.tiling().empty_tile()
+        } else {
+            self.tile.clone()
         }
-        Tile::Scalar(ColumnValue::single(self.value.clone()))
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // A collection is released a key at a time, and `get_impl` filters against
-        // the guard `release` accumulates, so there is nothing to record here. A
-        // scalar has one position and no way to name part of it, which is what
-        // makes its only release the whole of it.
-        if matches!(self.tiling(), Tiling::DataFunction { .. }) {
+        // A collection is released a key at a time, and `get_impl` filters against the
+        // guard `release` accumulates, so there is nothing to record here. A scalar has one
+        // position and no way to name part of it, which is what makes its only release the
+        // whole of it.
+        if self.tiling().is_data_function() {
             return;
         }
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
