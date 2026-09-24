@@ -393,11 +393,11 @@ pub struct SourceSinkRegistry {
     http_routes: HashMap<String, HttpRoute>,
     /// One listener per bound TCP port.
     shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
-    /// Test sinks the host holds a handle on, by binding name.
+    /// Test sinks a test holds a handle on, by binding name.
     ///
-    /// Registry state rather than per-pass state for the same reason a route is: the host's
-    /// handle outlives any one version, so a reloaded program writes to the sink its
-    /// predecessor did.
+    /// Registry state rather than per-pass state because every compilation seeds its
+    /// lowering from the registry, and the handle is minted before the first one.
+    #[cfg(any(test, feature = "test-helpers"))]
     test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 }
 
@@ -522,6 +522,7 @@ impl SourceSinkRegistry {
                 .map(|(n, r)| (n.clone(), r.route.clone())),
             self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
         );
+        #[cfg(any(test, feature = "test-helpers"))]
         lowering.adopt_test_sinks(self.test_sinks.iter().map(|(n, s)| (n.clone(), s.clone())));
         lowering
     }
@@ -733,16 +734,16 @@ impl GlobalContext {
 
     /// Supply the sink that `name = test_sink()` binds, and keep a handle on it.
     ///
-    /// A host reads a sink after the program runs but needs the handle before the program
-    /// is compiled, so the handle is minted here rather than during lowering. A program
-    /// whose `test_sink()` name was never supplied still compiles, against a sink nobody
-    /// holds.
+    /// A test reads a sink after the program runs but needs the handle before the program
+    /// is compiled, so the handle is minted here rather than during lowering. Lowering
+    /// refuses a `test_sink()` whose name was never registered.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn register_test_sink(
         &mut self,
         name: impl Into<String>,
     ) -> Arc<crate::interpreter::TestSink> {
         let name = name.into();
-        let sink = Arc::new(crate::interpreter::TestSink::new(name.clone()));
+        let sink = Arc::new(crate::interpreter::TestSink::default());
         self.sources_and_sinks
             .test_sinks
             .insert(name.clone(), sink.clone());

@@ -100,6 +100,7 @@ mod functions;
 mod http;
 mod loops;
 mod stmts;
+#[cfg(any(test, feature = "test-helpers"))]
 mod test_sink;
 mod transactions;
 
@@ -119,6 +120,7 @@ use functions::*;
 use http::*;
 use loops::*;
 use stmts::*;
+#[cfg(any(test, feature = "test-helpers"))]
 use test_sink::*;
 use transactions::*;
 
@@ -321,11 +323,12 @@ pub struct LoweringContext {
     /// whether to wrap the program tail in the sink-binding `Record`.
     pub(super) sink_bindings: HashMap<String, Arc<dyn DataSink>>,
 
-    /// Test sinks the host supplied before compiling, by binding name.
+    /// Test sinks registered before compiling, by binding name.
     ///
-    /// A host that wants to read a sink back needs the handle before the program that
-    /// writes to it exists. `test_sink()` takes its sink from here when the name is
-    /// present and mints a fresh one when it is not, so a program still runs standalone.
+    /// A test reads a sink back through a handle it holds before the program that writes
+    /// to it exists, so `test_sink()` binds the sink registered under its binding name and
+    /// refuses a name nothing registered.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(super) test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 
     /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
@@ -534,6 +537,15 @@ impl LoweringContext {
         self.shared_servers.extend(servers);
     }
 
+    /// Seed this context with the test sinks a registry holds.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn adopt_test_sinks(
+        &mut self,
+        test_sinks: impl IntoIterator<Item = (String, Arc<crate::interpreter::TestSink>)>,
+    ) {
+        self.test_sinks.extend(test_sinks);
+    }
+
     /// Drain all sources accumulated for this compilation.
     ///
     /// Returns every source that was either pre-registered (e.g. stdin, test
@@ -545,21 +557,12 @@ impl LoweringContext {
         std::mem::take(&mut self.sources)
     }
 
-    /// Adopt the test sinks a registry holds, so `test_sink()` binds the handle its host
-    /// already has rather than minting a second one.
-    pub fn adopt_test_sinks(
-        &mut self,
-        sinks: impl Iterator<Item = (String, Arc<crate::interpreter::TestSink>)>,
-    ) {
-        self.test_sinks.extend(sinks);
-    }
-
     /// Register a sink for the CCL binding named `name`.
     ///
-    /// Called during `http_serve` lowering: the responses binding is assigned a
+    /// Called during `http_serve` and `test_sink` lowering: the binding is assigned a
     /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
-    /// binding name so that the scheduler can subscribe an
-    /// `HttpServerSinkConsumer` to it after operator conversion.
+    /// binding name so that the scheduler can subscribe a consumer to it after
+    /// operator conversion.
     pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
         self.sink_bindings.insert(name.into(), sink);
     }

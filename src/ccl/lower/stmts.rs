@@ -511,8 +511,8 @@ pub(super) fn lower_block_value(
 /// `preceding` are the statements that come before `stmt` in the block
 /// `body` is the already-lowered expression for the rest of the block after `stmt`
 /// `outer_bindings` are the names already in scope above this block (e.g., function parameters)
-/// `is_top_level` is `false` inside if/else arms and function bodies; `http_serve` is only
-/// permitted at the top level of a program.
+/// `is_top_level` is `false` inside if/else arms and function bodies; `http_serve` and
+/// `test_sink` are only permitted at the top level of a program.
 pub(super) fn lower_middle_stmt(
     stmt: &Spanned<ChlStmt>,
     preceding: &[Spanned<ChlStmt>],
@@ -522,18 +522,11 @@ pub(super) fn lower_middle_stmt(
     is_top_level: bool,
 ) -> Result<Expr, LoweringError> {
     match &stmt.node {
-        // Special case: `requests, responses = http_serve(port, method, path)`.
-        //
-        // Lowers to:
-        //   let <requests> = Source("__http_requests_N") in
-        //   let <responses> = Defer              in
-        //   <body>
-        // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
-        // in general.
         // `out = test_sink()` — a `Defer` channel that is also a program output. The
         // binding name is the sink's name, so the tail record's field for it is the name
         // the program already wrote to.
-        ChlStmt::Assign { target, value } if is_test_sink_assign(target, value) => {
+        #[cfg(any(test, feature = "test-helpers"))]
+        ChlStmt::Assign { target, value } if let Some(name) = test_sink_name(target, value) => {
             if !is_top_level {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -541,12 +534,22 @@ pub(super) fn lower_middle_stmt(
                      not inside an if/else branch or function body",
                 ));
             }
-            let name = extract_test_sink_name(target)?;
-            let sink = ctx
-                .test_sinks
-                .get(&name)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(crate::interpreter::TestSink::new(name.clone())));
+            // A sink nothing registered has no reader, so writing to it would drop the
+            // program's output without a trace.
+            let Some(sink) = ctx.test_sinks.get(&name).cloned() else {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    format!("no test sink is registered under `{name}`"),
+                ));
+            };
+            // A second declaration would replace the first's binding, and the first's
+            // writes would reach no sink.
+            if ctx.sink_bindings.contains_key(&name) {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    format!("`{name}` is already declared as a sink"),
+                ));
+            }
             ctx.register_sink_binding(name.clone(), sink);
             let defer = ctx.tag_machinery(
                 Expr::new(TypedExprNode::Defer),
@@ -555,6 +558,14 @@ pub(super) fn lower_middle_stmt(
             );
             Ok(ctx.tag_image(Expr::let_bind(name, defer, body), stmt.span))
         }
+        // Special case: `requests, responses = http_serve(port, method, path)`.
+        //
+        // Lowers to:
+        //   let <requests> = Source("__http_requests_N") in
+        //   let <responses> = Defer              in
+        //   <body>
+        // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
+        // in general.
         ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
             if !is_top_level {
                 return Err(LoweringError::unsupported(

@@ -5,11 +5,15 @@
 //! HTTP response can be. A test observes programs of every shape, so this one reads a tile
 //! generically, and reports a shape it cannot read rather than writing nothing.
 //!
+//! A tile carries no types, so a key of type `Txn`, a commit time, reads as a `UInt` like an
+//! iteration position does. The sink's static type is the field named after it in the
+//! compiled program's type (`CompiledProgram::ast`), which is what tells the two apart.
+//!
 //! [`HttpServerSharedState`]: crate::interpreter::http_server::HttpServerSharedState
 
 use std::sync::Mutex;
 
-use crate::interpreter::{ColumnValue, DataSink, FuncBinding, Tile, Value};
+use crate::interpreter::{DataSink, FuncBinding, Tile, Value, validate_tile};
 
 /// Why a sink could not state what the program wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +33,8 @@ pub enum SinkReadError {
     /// "nothing" would be indistinguishable from a program that wrote nothing.
     NotASinkTiling(String),
     /// The tile contradicts its own shape (a column shorter than its row count, a
-    /// `row_starts` that runs backwards). An invariant break upstream, not a gap here.
+    /// `row_starts` that runs backwards, a key delivered twice). An invariant break
+    /// upstream, not a gap here.
     Malformed(String),
 }
 
@@ -48,10 +53,10 @@ impl std::fmt::Display for SinkReadError {
 ///
 /// [`crate::interpreter::sinks::SinkConsumer`] releases each tile after handing it over, so
 /// successive tiles carry disjoint parts of one value and this accumulates them with
-/// [`Tile::merge`] — the tiling's own combining operation, which rejects an overlap rather
-/// than double-counting it.
+/// [`Tile::merge`], the tiling's own combining operation. `merge` validates its result only
+/// in a debug build, so [`Self::value`] validates the accumulated tile before reading it.
+#[derive(Default)]
 pub struct TestSink {
-    name: String,
     // shared-state-ok: the observation boundary, not the operator graph. A sink is a
     // terminal consumer — nothing reads this back into the graph, so no value crosses it
     // between operators — and `DataSink::process` takes `&self`, so a cell is what lets a
@@ -60,23 +65,6 @@ pub struct TestSink {
 }
 
 impl TestSink {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            accumulated: Mutex::new(None),
-        }
-    }
-
-    /// The binding name this sink is registered under.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Everything written so far, as one tile.
-    pub fn tile(&self) -> Option<Tile> {
-        self.accumulated.lock().unwrap().clone()
-    }
-
     /// What the program wrote, once it is complete.
     pub fn value(&self) -> Result<Value, SinkReadError> {
         let guard = self.accumulated.lock().unwrap();
@@ -84,9 +72,10 @@ impl TestSink {
         if !tile.is_terminal() {
             return Err(SinkReadError::Incomplete);
         }
-        let mut rows = tile_rows(tile, 1)?;
-        debug_assert_eq!(rows.len(), 1, "a whole value is one row by construction");
-        Ok(rows.remove(0))
+        if !validate_tile(tile) {
+            return Err(SinkReadError::Malformed(format!("{tile:?}")));
+        }
+        Ok(tile_rows(tile, 1)?.remove(0))
     }
 }
 
@@ -106,6 +95,11 @@ impl DataSink for TestSink {
 fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
     match tile {
         Tile::Scalar(cv) => {
+            // An empty column is one that has not arrived ("not ready" in `valid_over`),
+            // not one that contradicts its row count.
+            if cv.is_empty() && rows > 0 {
+                return Err(SinkReadError::Incomplete);
+            }
             if cv.len() != rows {
                 return Err(SinkReadError::Malformed(format!(
                     "scalar column holds {} entries over {rows} rows",
@@ -137,45 +131,36 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
         // A collection groups rather than pairing: row `r` owns the key run
         // `row_starts[r] .. row_starts[r + 1]`, and the values tile is one row per key.
         Tile::DataFunction {
-            row_starts,
             domain,
             codomain,
             deleted,
             ..
         } => {
-            let starts = uint_column(row_starts, "row_starts")?;
-            if starts.len() != rows {
+            if tile.rows() != rows {
                 return Err(SinkReadError::Malformed(format!(
                     "row_starts holds {} entries over {rows} rows",
-                    starts.len()
+                    tile.rows()
                 )));
             }
             let value_rows = tile_rows(codomain, domain.len())?;
-            let mut out = Vec::with_capacity(rows);
-            for r in 0..rows {
-                let start = starts[r];
-                let end = starts.get(r + 1).copied().unwrap_or(domain.len());
-                if start > end || end > domain.len() {
-                    return Err(SinkReadError::Malformed(format!(
-                        "row {r} spans keys {start}..{end} of {}",
-                        domain.len()
-                    )));
-                }
-                let bindings = (start..end)
-                    .filter(|k| !deleted.contains(*k))
-                    .map(|k| FuncBinding {
-                        input: domain.index_at(k),
-                        output: value_rows[k].clone(),
-                    })
-                    .collect();
-                out.push(Value::Function(bindings));
-            }
-            Ok(out)
+            Ok((0..rows)
+                .map(|r| {
+                    let (start, end) = tile.row_run(r);
+                    let bindings = (start..end)
+                        .filter(|k| !deleted.contains(*k))
+                        .map(|k| FuncBinding {
+                            input: domain.index_at(k),
+                            output: value_rows[k].clone(),
+                        })
+                        .collect();
+                    Value::Function(bindings)
+                })
+                .collect())
         }
 
         // Neither reaches a sink: an aggregation is a fold in progress and a store is a step
         // function over commit time, and what a program writes out is the value each is read
-        // into. Naming them is what keeps a misrouted one from reading as an empty write.
+        // into.
         Tile::Aggregation { .. } => Err(SinkReadError::NotASinkTiling(
             "an aggregation accumulator".to_string(),
         )),
@@ -185,15 +170,83 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
     }
 }
 
-/// Read a column of row offsets as `usize`s.
-fn uint_column(cv: &ColumnValue, what: &str) -> Result<Vec<usize>, SinkReadError> {
-    (0..cv.len())
-        .map(|i| match cv.index_at(i) {
-            Value::UInt(u) => Ok(u),
-            Value::Int(n) if n >= 0 => Ok(n as usize),
-            other => Err(SinkReadError::Malformed(format!(
-                "{what} holds {other:?}, not an offset"
-            ))),
-        })
-        .collect()
+#[cfg(test)]
+mod tests {
+    use bit_set::BitSet;
+
+    use super::*;
+    use crate::interpreter::{ColumnValue, Predicate};
+
+    fn read(tile: Tile) -> Result<Value, SinkReadError> {
+        let sink = TestSink::default();
+        sink.process(&tile);
+        sink.value()
+    }
+
+    fn ints(v: Vec<i64>) -> Box<Tile> {
+        Box::new(Tile::Scalar(ColumnValue::from_ints(v)))
+    }
+
+    /// A collection of collections: row `r` of the inner level owns the key run its
+    /// `row_starts` entry opens.
+    #[test]
+    fn a_nested_collection_reads_each_row_s_run() {
+        let inner = Tile::grouped(
+            ColumnValue::UInts(vec![0, 2]),
+            ColumnValue::from_uints(vec![0, 1, 0]),
+            ints(vec![10, 11, 20]),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let outer = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(inner),
+            Predicate::True,
+            BitSet::new(),
+        );
+        assert_eq!(
+            read(outer).expect("a value").to_string(),
+            "Function [ Function [ 10, 11 ], Function [ 20 ] ]"
+        );
+    }
+
+    #[test]
+    fn a_deleted_key_is_skipped() {
+        let mut deleted = BitSet::new();
+        deleted.insert(1);
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            ints(vec![1, 2, 3]),
+            Predicate::True,
+            deleted,
+        );
+        assert_eq!(
+            read(tile).expect("a value").to_string(),
+            "Function [ u0 -> 1, u2 -> 3 ]"
+        );
+    }
+
+    #[test]
+    fn values_that_have_not_arrived_are_incomplete() {
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            ints(vec![]),
+            Predicate::True,
+            BitSet::new(),
+        );
+        assert_eq!(read(tile), Err(SinkReadError::Incomplete));
+    }
+
+    #[test]
+    fn a_column_longer_than_its_rows_is_malformed() {
+        // Built as the literal: the checked constructors refuse this tile.
+        let tile = Tile::DataFunction {
+            row_starts: ColumnValue::UInts(vec![0]),
+            domain: ColumnValue::from_uints(vec![0]),
+            codomain: ints(vec![1, 2]),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        };
+        assert!(matches!(read(tile), Err(SinkReadError::Malformed(_))));
+    }
 }
