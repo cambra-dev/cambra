@@ -156,11 +156,10 @@ fn test_conditional_variant_arms(#[case] code: &str, #[case] expected: Value) {
 //
 // A `match` lowers to the scrutinee-`Case` that variant elimination already
 // compiles, so it needs no IR node of its own. A scalar scrutinee (no enclosing
-// lambda) takes the **C-form** — the scrutinee enters by `const` over a one-shot
-// driver — *not* an eta-expansion `s ▷ (λ __scrut → match __scrut { … })`, which
-// would make the union's domain the scrutinee's and so require feeding an
-// input-less `iterate` (`src/ccl/design/lowering.md`, "A scalar match is the
-// C-form, gated by tag").
+// lambda) enters by `const` over a one-shot driver. An eta-expansion
+// `s ▷ (λ __scrut → match __scrut { … })` would make the union's domain the
+// scrutinee's and require feeding an input-less `iterate`; see
+// `src/ccl/design/lowering.md`, "Scalar match encoding".
 // ---------------------------------------------------------------------------
 
 #[rstest]

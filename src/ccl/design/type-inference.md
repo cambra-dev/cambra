@@ -1,115 +1,156 @@
 # Cambra's Inference Algorithm
 
-This document outlines the design, architecture, and nomenclature of Cambra's algebraic-subtyping inference engine. It details how the algorithm works, how information flows through the system, and where our implementation intentionally departs from the upstream academic reference—most notably by carrying refinements on the lattice and folding monomorphization into the coalesce walk.
-
-A [glossary](#7-glossary) at the end defines every term of art used below. The conceptual walkthrough in §1 introduces each term where it is first needed; the glossary is a quick-reference to consult afterward.
+Cambra infers CCL types with directional subtype constraints. This document specifies constraint
+emission, bound propagation, type materialization, and the handling of polymorphism and refinements.
+The [glossary](#7-glossary) defines the terms used in the implementation.
 
 ---
 
 ## 1. Algorithm Overview
 
-The type inference engine is based on Lionel Parreaux's *Simple Essence of Algebraic Subtyping* (ICFP 2020). It replaces standard Hindley-Milner (HM) unification with a constraint-graph solver that natively supports subtyping, Principal Types (the most general type for each term)[^1], and structural records.
+The solver follows Lionel Parreaux's *Simple Essence of Algebraic Subtyping* (ICFP 2020): it
+records subtype constraints as bounds on inference variables, then materializes types according to
+polarity. Cambra's implementation supports structural records and variants, refinements, and
+use-site specialization.
+The paper's principal-type result does not establish that every accepted Cambra expression has a
+representable principal `ccl::Type`; incompatible untagged alternatives are rejected here.[^1]
 
-Instead of generating equality constraints and resolving them via unification, the algorithm generates directional subtyping constraints written `constrain(lhs, rhs)`, read as "`lhs` must be a subtype of `rhs`" (`lhs <: rhs`). The CCL AST is traversed; each node emits a `ccl::Type` and constrains the resulting types against their expected positions. The solver operates **directly on `ccl::Type`** — there is no separate internal type representation; an inference unknown is a `Type::Infer` carrying mutable bounds (see below).
+Constraint emission traverses the CCL AST, writes a `ccl::Type` on each node, and relates produced
+types to expected types. The notation `constrain(lhs, rhs)` means `lhs <: rhs`; the code calls
+`constrain_subtype`. The solver works on `ccl::Type` itself. An unknown is `Type::Infer` with
+shared, mutable bounds, not a separate internal type language (`infer/emit.rs`,
+`infer/solver/constrain.rs`).
 
-### The Core Mechanism: Bounds and Recursive Constraints
+### Bounds and constraint propagation
 
-The entire algorithm revolves around managing **bounds** on type variables. "Variable" here always means a *type variable* — an inference unknown the solver is trying to pin down — not a program/term variable. Every unknown type is a `Type::Infer(Rc<InferVar>)`, where the shared `InferVar` carries a `level`, a stable identity (`uid`), and a `RefCell` of **lower bounds** and **upper bounds**. Because the `InferVar` is shared by `Rc`, recording a bound at one occurrence is immediately visible at every other occurrence of the same variable.
+The inference solver represents an unknown type with `Type::Infer(Rc<InferVar>)`. The shared
+`InferVar` lets every occurrence refer to the same unknown. It has an identity (`uid`), a level,
+and mutable lower and upper bounds, along with other inference state (`src/ccl/infer_var.rs`). In
+the explanation below, `constrain(lhs, rhs)` is shorthand for the directional subtype requirement
+`lhs <: rhs`; the implementation entry point is `constrain_subtype`, whose recursive engine is
+`constrain_go` (`src/ccl/infer/solver/constrain.rs`).
 
-The bound lists are populated by the `constrain` rule, which is where the informal phrase "a type flows into a variable" gets its precise meaning. When a term `x` is used in a position whose expected type is `T`, the solver emits `constrain(type(x), T)`:
+A bound records one side of a subtype fact. A lower bound `L` on an unknown `α` means `L <: α`; an
+upper bound `U` means `α <: U`. For example, when a type is required to fit an expected type, the
+solver checks the subtype relation between the produced type and that expectation. If the expected
+type is an inference variable, the produced type can become one of its lower bounds. If the
+produced type is a variable and the expectation is concrete, the expectation can become one of its
+upper bounds.
 
-* If `T` is a type variable `α`, then `constrain(type(x), α)` records `type(x)` as a **lower bound** of `α`. We say `type(x)` *flows into* `α`: a concrete type has arrived at `α` from below (`type(x) <: α`).
-* If `type(x)` is a type variable `β` and `T` is concrete, then `constrain(β, T)` records `T` as an **upper bound** of `β`. We say `β` *must flow into* `T`: `β` is required to be usable wherever a `T` is expected (`β <: T`).
+For ordinary compatible-level cases, adding a bound also checks the bounds already recorded on
+that variable, so the new relation is propagated transitively. With a variable on the left, the
+solver adds the right-hand type as an upper bound and recursively checks each existing lower bound
+against it. Those lower bounds must also be subtypes of the new upper bound. With a variable on
+the right, the solver adds the left-hand type as a lower bound and recursively checks it against
+each existing upper bound. The new lower bound must satisfy every upper-bound requirement already
+on the variable. This describes the principal bound-propagation work; dependent substitutions,
+refinements, and other solver behavior are outside this schematic account.
 
-So the two bound lists are just the two sides of recorded subtype facts:
+When both sides are variables at the same level, the left-variable arm takes precedence. For
+`v <: w`, it records `w` as an upper bound of `v`, then checks `v`'s existing lower bounds against
+`w`. It does not immediately add the reciprocal type-bound edge to `w`. Later traversal of the
+bounds graph during type compaction (`compact_type`) recovers transitive bounds. This same-level
+case is not a rule for every variable pair: different levels may select another branch or require
+extrusion and retry (`constrain_go` in `src/ccl/infer/solver/constrain.rs`).
 
-* **Lower bound of `α`:** a type `L` with `L <: α`. (Equivalently: every value of type `L` is a valid value of type `α`.)
-* **Upper bound of `α`:** a type `U` with `α <: U`. (Equivalently: every value of type `α` is a valid value of type `U`.)
+Constraint-order independence is an intended property: applying the same constraint set in
+different orders should either coalesce to equivalent variable types or reject in every order. The
+particular constraint that reports failure may depend on order. The explicit bound updates and
+later graph traversal are part of how the solver handles this property, but the algorithm
+description alone does not establish it for all inputs.
 
-When a new constraint involves a variable, the solver records the bound and then **recursively propagates** it to maintain transitivity. The propagation is symmetric across the two variable cases:
+Function-kind variables are separate from ordinary type inference variables. When two
+function-kind variables meet, `constrain_fun_kind` records their relation on both variables.
+Resolution follows the lower and upper kind relations, avoids revisiting nodes, and joins the
+information encountered (`constrain_fun_kind` in `src/ccl/infer/solver/constrain.rs`;
+`FunKindVar::resolved` in `src/ccl/ty.rs`). Deferring this join matters: copying only the pins known
+when a relation is created can miss pins that arrive later or through another related variable.
 
-* **LHS is a variable** — `constrain(Var, rhs)`: add `rhs` to `Var`'s upper bounds, then for each existing lower bound `ℓ` of `Var`, recurse `constrain(ℓ, rhs)`. (Everything that already flowed into `Var` must also be valid for `rhs`.)
-* **RHS is a variable** — `constrain(lhs, Var)` where `lhs` is not itself a variable: add `lhs` to `Var`'s lower bounds, then for each existing upper bound `u` of `Var`, recurse `constrain(lhs, u)`. (`lhs` must satisfy everything `Var` is already required to flow into.)
+The current kind information forms a lattice with `Unpinned` as bottom and `Conflict` as top.
+`Compute` and `Data` are incomparable; `Data` is below `Plain` and each `Sum(n)`. `Plain` conflicts
+with every `Sum(n)`, and sums with unequal arities conflict. Join is commutative, associative, and
+idempotent. Resolution also incorporates information from constructed collection widths
+(`built_over`), so following explicit kind relations is not its only input (`KindPin::join` and
+`FunKindVar::resolved` in `src/ccl/ty.rs`).
 
-This recursive propagation replaces the traditional "union-find" algorithm used in HM type inference.
+#### Constraint-order checks
 
-Note that propagation only sweeps the *existing* bounds on the side of the new bound — it does not
-eagerly transfer the other side's bounds onto the variable. For a variable-against-variable
-constraint `constrain(Var v, Var w)`, the LHS-variable arm fires (recording `w` as an upper bound of
-`v` and sweeping `v`'s lower bounds); the missing edges are recovered later by walking the bounds
-graph during simplification.
-
-**Bound arrival order does not change the answer.** Record-then-sweep makes that a property of the
-algorithm rather than of any one constraint, and one-sided var-var propagation is where it is least
-obvious: the edge records less than a symmetric rule would, and the difference is only recovered at
-simplification. `tests/constraint_order_fuzz.rs` states the property — the same constraint set applied in
-permuted orders coalesces every variable to the same type, or is rejected in every order — and
-checks it over 2000 generated sets, eight permutations each. Which constraint trips the rejection of
-an unsatisfiable set is order-relative and deliberately not part of the outcome: the last edge to
-arrive is the one that meets the already-recorded bounds, and emission order is fixed by the AST
-walk.
-
-**A kind pin is joined at the read, not at the edge.** `constrain_fun_kind`'s
-variable-against-variable arm records that the two kinds are the same unknown, and
-[`FunKindVar::resolved`] folds the join over everything that relation reaches. So a variable's kind is a function of the
-whole constraint set: a pin arriving after the edge crosses it, and so does one two edges away.
-Resolving
-at the edge instead — copying each side's pin onto the other — answers from the pins that happen to
-have arrived and drops the rest, and the two variables then coalesce to different function types
-depending on which constraint came first. `a_shared_kind_var_resolves_the_same_way_in_every_order`
-checks all 24 orders of the shape that exhibits it. The join is the flat semilattice
-`Unpinned < {Compute, Data} < Conflict`, whose commutativity, associativity and idempotence are what
-make the fold order-blind: every reader folds the same set, and no fold step reads a value a later
-step can change.
-
-The arm is unreachable from lowered CHL — nothing in the integration corpus or the unit suite hits
-it, since a kind variable is minted only by an elimination's demand and two demands meet at
-compaction rather than at a constraint. It is reached by generated type pairs, which is what
-`tests/constraint_order_fuzz.rs` supplies.
+The order-independence fuzz test compares a baseline with eight shuffled orders for each of 2,000
+generated constraint sets by default; `CAMBRA_FUZZ_N` configures the set count. This is evidence
+from coverage, not a proof for all inputs (`solving_is_independent_of_constraint_arrival_order` in
+`tests/constraint_order_fuzz.rs`). A separate test,
+`a_shared_kind_var_resolves_the_same_way_in_every_order`, checks all 24 permutations of one
+four-constraint case, demonstrating delayed kind propagation for that case rather than proving
+the general property.
 
 ### Positions and Polarity
 
-A **position** is a location within a type expression where another type sits. In `A → B`, both `A` (the domain) and `B` (the codomain) are positions; in `{x: T, …}`, each field type is a position. Each position has a **polarity** — positive or negative — determined by how it is reached from the outermost type:
+A **position** is a type's location within another type. A function domain and codomain are
+positions, as is each record or tuple field. Its **polarity** is determined by the path from the
+outermost type, which starts positive:
 
-* codomains preserve the current polarity,
-* domains flip it,
-* record/tuple field values preserve it.
+- A function codomain preserves polarity; its domain reverses it.
+- Record and tuple fields preserve polarity.
 
-The outermost type starts positive. So in `(A → B) → C`, the argument type `A` lands at a **positive** position: it sits inside the domain of a domain — two flips back to positive. Polarity is therefore *not* the same as "looks like an input vs. an output at the surface"; it is a property of the path to the position.
+In `(𝐴 ⇒ 𝐵) ⇒ 𝐶`, the path to `𝐴` crosses two domains.
+Its polarity is positive. Polarity follows the whole path through nested functions.
 
-Traditional subtyping models materialize explicit Union (`⊔`) and Intersection (`⊓`) types. The algorithm avoids constructing these inside the solver by leaning on polarity:
+Bounds have a union or intersection interpretation, but `ccl::Type` has no general untagged union
+or intersection constructor. Compaction merges compatible shapes at each position:
 
-* **Positive positions (outputs/results):** values the program produces. When a variable appears at a positive position, the type at that position is the *union* of its lower bounds. For example, if a function may return `Int` or `String`, the return variable has lower bounds `[Int, String]`, materializing to `Int ⊔ String`.
-* **Negative positions (inputs/arguments):** requirements imposed by a consumer. When a variable appears at a negative position, the type at that position is the *intersection* of its upper bounds. For example, a parameter passed to two functions expecting `Int` and `String` respectively has upper bounds `[Int, String]`, materializing to `Int ⊓ String` — the value must satisfy both.
+- At a positive occurrence, compaction reads the variable's lower bounds. Compatible record bounds
+  retain their common fields; variant bounds retain the tags either value may carry.
+- At a negative occurrence, it reads upper bounds. Compatible record requirements combine their
+  fields; variant requirements retain only tags acceptable to both consumers.
 
-Because lower and upper bounds are kept as raw lists rather than materialized union/intersection nodes, the solver never performs lattice arithmetic during inference; that work is deferred to coalesce time (see [Coalescing](#coalescing-from-bounds-to-types)).
+The solver stores bounds instead of constructing union or intersection nodes. `compact_type` merges
+their structural contributions, and `coalesce_compact` reports an `IncompatibleBounds` error if a
+position contains incompatible concrete shapes such as `Int` and `String` (see
+[Coalescing](#coalescing-from-bounds-to-types)).
 
 ### Levels, Schemes, and Let-Polymorphism
 
-To handle polymorphism safely, the algorithm distinguishes variables local to a function (which may take different types at different call sites) from variables belonging to an outer scope (which must stay consistent everywhere). It does this with **levels**, **schemes**, and **extrusion**.
+Levels distinguish variables local to a generalized function from variables captured from its
+surrounding scope. A `PolyScheme` freshens the former at each use and preserves the latter.
 
-Throughout this doc, **larger level numbers correspond to more deeply nested scopes**. The outermost scope is level 0; each nested `let` body adds 1. When we say "level higher than X" we always mean *numerically larger* — i.e. more deeply nested — never lexically more outer.
+Larger level numbers denote deeper generalization scopes. Emission enters a deeper level for the
+right-hand side of a generalized `let`; ordinary nesting does not by itself increment the level
+(`infer/context.rs`).
 
-* **Levels:** Every type variable is minted with an integer `level` recording the scope depth at which it was created. Outer-scope variables have smaller levels (e.g. `0`); variables minted inside nested `let` bodies have larger levels (e.g. `1`, `2`).
-* **Schemes (`PolyScheme`):** A `PolyScheme` records a **cutoff level** equal to the depth of the scope that defined the binding. Variables whose level is numerically *greater* than the cutoff — i.e. minted inside the let body, deeper than the defining scope — are the quantified ones; they get freshened at each use site.[^2] For example, inferring `def id(x): return x` yields a body `α → α` with `α` at level 1; instantiating at level 0 mints a fresh `β`, yielding `β → β`.
-* **Extrude:** A **level mismatch** occurs during `constrain(Var v, rhs)` (or the mirror case) when the other side contains a type variable whose level is numerically higher than `v`'s. The fast path that simply appends to `v`'s bounds is gated on `other.level ≤ v.level`, because recording an inner-scope (higher-level) variable directly as a bound of an outer-scope (lower-level) variable would let the inner variable escape its scope — unsound under let-polymorphism. **Extrude** is the recovery path: it walks the offending type and replaces each too-high variable with a fresh proxy at `v`'s level, linked back to the original through the polarity-appropriate bound so subtyping information still flows. The result is a level-clean copy safe to record as a bound of `v`.
+- Every inference variable records the level at which it was minted. A `PolyScheme` stores the
+  binding's cutoff level. Instantiation freshens variables above that cutoff and preserves
+  variables at or below it (`infer/solver/scheme.rs`).[^2]
+- Bound recording cannot place a deeper variable directly on a shallower variable's bounds.
+  **Extrusion** makes a proxy at the shallower level and relates it to the original with a
+  polarity-appropriate bound (`infer/solver/constrain.rs`).
 
-The level is now incremented when emitting a generalized `let`'s RHS (see §3.1), so variables minted there live at a deeper level and extrude can fire on a genuine level mismatch. Outside generalized lets everything still shares level 0.
+For a schematic `let id = λ x → x`, if `x` has type `α` above the binding cutoff, separate uses
+receive independent copies such as `β ⇒ β` and `γ ⇒ γ`. See
+[Let-Polymorphism is Freshening (Instantiation)](#31-let-polymorphism-is-freshening-instantiation)
+for the binding and specialization rules.
 
 ### Coalescing: From Bounds to Types
 
-The overview so far produces a graph of variables with bound lists. **Coalescing** is the step that turns that graph back into a concrete `ccl::Type`. Its rule is the polarity mapping made concrete:
+**Coalescing** resolves the bound graph into `ccl::Type` using
+`compact_type` → `simplify_type` → `coalesce_compact` (`infer/solve.rs`). For each variable,
+compaction first traverses bounds on the side selected by polarity:
 
-* at a **positive** occurrence of a variable, materialize the *union* of its lower bounds;
-* at a **negative** occurrence, materialize the *intersection* of its upper bounds.
+- Positive occurrences read lower bounds.
+- Negative occurrences read upper bounds.
 
-A variable with no bounds on the materializing side has no concrete content; it coalesces to a fresh `Type::Infer` placeholder. The full materialization runs as a three-step pipeline (`compact_type` → `simplify_type` → `coalesce_compact`) detailed in §2, Pass 2; the rule above is what those steps collectively implement.
+If that side supplies no concrete shape, compaction may read the opposite side at the position being
+materialized. This resolves a function domain from the argument type that flowed into it, for
+example. An unresolved position can remain `Type::Infer`; a structural collision is an error.
+Generalized definitions are materialized through their use-site specialization clones, which lets
+the output tree carry monomorphic types. See
+[Pass 2: Coalesce and Write-back](#pass-2-coalesce-and-write-back).
 
 ### Example: Bounding and Typing
 
-Grounding the theory before moving on, let's see how upper and lower bounds naturally form intersections and unions. We'll infer types for three small Python functions.
+The Python-like functions below are schematic constraint examples, not runnable CCL source. They
+show where bounds arise and which results Cambra can materialize.
 
-**1. Lower bounds become unions (outputs / positive polarity)**
+#### Incompatible lower bounds
 
 ```python
 def get_status(is_ready):
@@ -119,14 +160,14 @@ def get_status(is_ready):
         return "Wait"  # Type: String
 ```
 
-* **Inference:** The `if` condition constrains `is_ready` to `Bool`. The return value is a fresh variable `α`, so the function type is `Bool → α`.
-* **Bounds:** The two `return` statements emit `constrain(Int, α)` and `constrain(String, α)`; each adds its type to `α`'s lower-bound list: `α.lower = [Int, String]`.
-* **Coalesce:** `α` occupies the return slot — a *positive* position — so its lower bounds materialize as a union.
-* **Logical result type:** `Bool → (Int | String)`.
+The condition requires `is_ready: Bool`. If both branches feed one result variable `α`, the branch
+constraints give it lower bounds `Int` and `String`. The schematic algebraic result is
+`Bool ⇒ (Int ⊔ String)`. Cambra's `ccl::Type` has no such untagged union. Materializing the
+positive result position reports `IncompatibleBounds` (`infer/solver/coalesce.rs`). A tagged
+`Variant` can carry alternatives with a discriminator (see
+[Information Flow and Type Mapping](#4-information-flow-and-type-mapping)).
 
-*Current status:* Cambra's prototype raises an `IncompatibleBounds` error here rather than emitting the union (see [§4](#4-information-flow-and-type-mapping) and question Q3 in the review). A positive-position *untagged* union is also not productively *consumable*: an untagged sum has no syntactic discriminator to case-split on (a *tagged* `Variant` does — see §4). The principal type is real but has no productive consumer for an untagged primitive collision — so rejecting it is a coherent choice, not merely a missing feature.
-
-**2. Upper bounds become intersections (inputs / negative polarity)**
+#### Compatible upper bounds
 
 ```python
 def extract_info(user):
@@ -135,63 +176,67 @@ def extract_info(user):
     return name
 ```
 
-* **Inference:** The parameter `user` is a fresh variable `β`.
-* **Bounds:** Passing `user.name` into `capitalize()` and `user.age` into `math_add()` imposes structural requirements that flow contravariantly back into `β` as upper bounds: `β.upper = [{name: String}, {age: Int}]`.
-* **Coalesce:** `β` is an argument supplied by the caller — a *negative* position — so its upper bounds materialize as an intersection. For structural records, the intersection of `{name: String}` and `{age: Int}` is the combined record with both fields.
-* **Logical result type:** `{name: String, age: Int} → String`.
+Suppose `capitalize` requires `String` and `math_add` requires `Int`. The field uses impose record
+requirements on the parameter variable `β`: schematically,
+`β.upper = [{name: String}, {age: Int}]`. The parameter is negative in the function type, so
+compaction combines these compatible upper bounds into a record with both fields. The schematic
+result is `{name: String, age: Int} ⇒ String`. The concrete inference path also depends on whether
+the record's width is closed; an open record that remains unresolved is reported as
+`UnresolvedPartial` (`infer/solver/coalesce.rs`).
 
-**3. Unresolved polymorphism (and Cambra's current limitation)**
+#### A generalized identity function
 
 ```python
 def identity(x):
     return x
 ```
 
-* **Inference:** The parameter `x` is a fresh variable `α`; since the body just returns `x`, the type is `α → α`.
-* **Bounds:** `x` is never passed to another function (no upper bounds) and never assigned a concrete value (no lower bounds): `α.lower = []`, `α.upper = []`.
-* **Coalesce:** `α` has no concrete atoms. In pure algebraic subtyping this is fine — it is the principal, universally quantified type `∀α. α → α`.
-* **The Cambra position:** Cambra's public `ccl::Type` has no `Type::ForAll`. It uses level-based type variables for *implicit* polymorphism because that is efficient and meshes with the solver, and it lowers that polymorphism to concrete code by monomorphizing at use sites — the natural fit for an engine that wants concrete types on every node for codegen. An `identity` that is *let-bound and used at several types* is generalized, then specialized per distinct use type during the coalesce walk (see the roadmap above); one that is *never applied* is typechecked and then dropped (its definition is dead code — see [Typechecking a never-called definition](#typechecking-a-never-called-definition)). At every applied call site the function's domain is fixed to the value flowing in, pinning the type to that site — the monomorphic coalescing rule (see §2, Pass 1). This is a pragmatic choice, not a commitment never to *represent* polymorphism: explicit `∀`/Π types could coexist (the `cast`/`iterate` signatures already point that way — see §1, *Roadmap*).
+The body gives `x` and the result the same variable `α`, yielding `α ⇒ α` before a call
+constrains it. If bound as a qualifying `let`, this type becomes a `PolyScheme`. Each use receives
+a fresh instance. Coalescing creates a specialization for each distinct use-site instantiation and
+shares one when the specialization key matches (`infer/context.rs`, `infer/solve.rs`). An unused
+definition is still checked for errors before its specialization-free binding is removed (see
+[Typechecking a never-called definition](#typechecking-a-never-called-definition)). A use whose type
+remains unresolved can survive inference as `Type::Infer` and fail the strict post-inference check.
+`ccl::Type` has no `Type::ForAll`; implicit generalization is represented by `PolyScheme`, not by a
+first-class quantified type (`infer/solver/scheme.rs`).
 
 ### Roadmap and Current Prototype Status
 
-**Implemented today:**
+A `let` whose RHS is a `Lambda` generalizes when its type contains variables above the binding
+level and its function kind is not `Data` (`should_generalize` in `infer/context.rs`). Each use
+instantiates the scheme. During coalescing, `specialize_use` freshens a copy of the definition,
+pins it against the use's live type, and coalesces the copy. A `SpecKey` identifies uses that can
+share one specialization; the resolved type alone is not the key (see
+[Keying a specialization](#keying-a-specialization)). A collection-valued binding is not
+generalized (see
+[Generalizing a collection is filter pushdown](#generalizing-a-collection-is-filter-pushdown)).
 
-* **Let-polymorphism (functions).** A `let` whose RHS is a *function definition* is generalized:
-  the RHS is typed one level deeper, generalized into a `PolyScheme` at the binding site, and
-  instantiated freshly per use. Because Cambra targets fully-monomorphized output, generalization
-  is paired with **monomorphization**, integrated into the coalesce walk (`infer::specialize_use`):
-  a use of a generalized binding is specialized at first visit — clone +
-  `freshen_expr_type_slots`, a two-way pin against the use's *live* instantiation type, and a
-  re-entrant coalesce of the clone — and the binding's `let` rebuilds itself as the chain of
-  demanded specializations. Specialization is keyed on the use's **instantiation identity** (a
-  `SpecKey`, not a resolved type — see [Keying a specialization](#keying-a-specialization)), so
-  uses that instantiate the definition identically **share** one definition. So
-  `def f(x): x == x; f(1); f("foo")` type-checks and runs, a generator used at two element types
-  compiles to two cached specializations (see F2), and a generalized UDF used only inside
-  *another* generalized definition (poly-calls-poly) specializes by plain recursion — its use
-  becomes concrete inside each wrapper clone's re-entrant walk. Levels are live (extrude fires on
-  a genuine level mismatch). A `let` bound to a **collection** is not generalized, whatever its
-  RHS looks like — see
-  [Generalizing a collection is filter pushdown](#generalizing-a-collection-is-filter-pushdown).
-* **Two binder-annotation forms.** Exact `𝑥 : 𝑇` fixes the binder's type; bounded `𝑥 <: 𝑇` infers it under an upper bound. Both apply at `let` and at a function parameter, carried by `Type::BoundedHole` in annotation position and erased by `normalize_annotation`. See [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded).
-* **Tagged variants.** The dual of records, natively supporting sum types and pattern-match exhaustiveness inside the structural solver (see §4). Both named (a source-level `` `tag(…) ``) and positional (`++`-style) sums are handled.
-* **Lattice-carried refinements.** Refinements ride the lattice natively (compared by structural predicate equality) rather than being stitched on by a post-pass; see §4 and [`crate::ccl::infer::solver`]'s `# Refinements`.
-* **Dependent refinements (Pi types).** Refinement predicates may close over an outer binder; `Type::Fun` carries an optional Pi binder, the solver derives binder correspondences when constraining function types, and dependent application discharges the binder to its argument at coalesce. Group-by lookup `groupby(xs, key)(𝑘₀)` types as `{𝑖 | 𝑖 ▷ xs ▷ key == 𝑘₀} ⇒ 𝑉`. See §4.5.
+Exact `𝑥 : 𝑇` and bounded `𝑥 <: 𝑇` annotations apply to `let` and function parameters.
+A bounded annotation becomes a fresh inference variable with an upper bound. The
+`normalize_annotation` step erases the pre-inference `Type::BoundedHole` marker (see
+[Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
 
-**Implicit polymorphism, not `Type::ForAll`.** Cambra's `ccl::Type` has no `Type::ForAll`. The choice is *pragmatic*, not a philosophical ban on representing polymorphism: level-based type variables give implicit polymorphism that is efficient and meshes with the existing solver, and monomorphizing at use sites (integrated into the coalesce walk, above) is the natural way to lower it to the concrete-typed output codegen wants. This does **not** preclude *explicit* `∀`/Π types — the `cast` and `iterate` signatures in the pi-types work (`cast : (𝑇: Type) ⇒ {𝑈: Type | 𝑈 <: 𝑇} ⇒ 𝑇`) are quantified over `Type`, i.e. `∀`/Π under another name — and the two may well coexist. Implicit level-based polymorphism is simply the most natural mechanism for the inference engine *today*.
+Structural variants represent tagged alternatives, including named and positional sums. The
+solver handles their subtype relations and pattern-match requirements (see
+[Information Flow and Type Mapping](#4-information-flow-and-type-mapping)). Refinements also remain
+on the lattice: structural predicate equality matches them, and `smt_sub` can discharge a remaining
+entailment requirement within its supported fragment (see
+[Semantic entailment as a fallback](#semantic-entailment-as-a-fallback)). A function type may carry
+an optional Pi binder, allowing a result refinement to refer to its argument. Dependent
+application discharges that binder; group-by lookup uses this mechanism (see
+[Dependent refinements via Pi types](#45-dependent-refinements-via-pi-types)).
 
-**Not yet implemented:**
+Trait obligations for operators are implemented. Operator signatures state requirements such as
+`Addable` and `Comparable`, and the inference solver narrows their candidate instances before
+materialization (`infer/schemes.rs`, `infer/solver/traits.rs`). This is separate from a general
+nominal-type system.
 
-* **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. Does not block today's coverage; a natural next step.
-* **SMT-backed refinements outside linear integer arithmetic, and after `lambda_elim`.**
-  [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) discharges an
-  `Int`/`Bool` predicate in linear integer arithmetic to Z3 when structural matching leaves a
-  deficit. A deficit the encoder cannot read is decided structurally, as it was before the
-  fallback existed. The encoded fragment is over surface-syntax predicate shapes, and
-  `lambda_elim` rewrites every predicate point-free, so no check at or after that pass reaches
-  the fallback at all — the reach is inference and `inline`.
-
-*(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
+`ccl::Type` has no first-class explicit `∀` type. The SMT fallback handles linear integer
+arithmetic over supported `Int`/`Bool` predicate forms. A predicate it cannot encode falls back to
+the structural mismatch, and point-free predicates after `lambda_elim` do not reach that fallback
+(`infer/solver/smt.rs`, `infer/solver/constrain.rs`). These are limits of the implemented paths,
+not additional inference passes.
 
 ---
 
@@ -1662,8 +1707,8 @@ loses when readers are many and overlapping: `sum(g(1)) + sum(g(2)) + sum(g(3))`
 partition three times where one `Memo` serves all three. The choice is selectivity against reader
 count, and inference cannot make it — it runs before planning knows an extent, so the blanket
 refusal is the bounded-worst-case side until there is a cost model to consult. The same decision
-waits on the term side, where inlining a collection is
-[loop fusion](optimization.md#inlining-a-collection-is-loop-fusion).
+waits on the term side, where the inlining pass preserves
+[collection sharing](optimization.md#collection-sharing).
 
 ### Data domains are invariant
 

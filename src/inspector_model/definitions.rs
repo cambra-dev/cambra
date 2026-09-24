@@ -45,8 +45,8 @@
 //! rewrites `Var(p)` to `__arg_tuple_N ▷ .i` — so a use of one is not a `Var` and
 //! has no binder to share a uid with. It resolves through the projection's two
 //! spans instead: the `Apply` carries the occurrence and its `Proj` child carries
-//! the parameter's declaration (`src/ccl/design/ir.md`, "A substituted
-//! parameter's site rides its projection"). The bound name is read back from the
+//! the parameter's declaration (`src/ccl/design/ir.md`,
+//! "Source locations on substituted parameter projections"). The bound name is read back from the
 //! source at that declaration, because lowering substituted it out of the tree.
 
 use std::collections::HashMap;

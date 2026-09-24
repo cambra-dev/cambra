@@ -4459,8 +4459,8 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
 /// `TODO(refined-txn-body)`).
 ///
 /// This also blocks binding a multi-argument function's parameters rather than
-/// substituting them away — see `src/ccl/design/ir.md`, "A substituted
-/// parameter's site rides its projection". The two are one fix.
+/// substituting them away — see `src/ccl/design/ir.md`,
+/// "Source locations on substituted parameter projections". The two are one fix.
 #[test]
 fn let_binder_does_not_escape_into_result_refinement() {
     let ty = infer_program(indoc! {r#"

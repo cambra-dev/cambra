@@ -107,11 +107,10 @@ pub fn inline_capability_lambdas(expr: Expr) -> Expr {
 /// [`FunKind`](crate::ccl::ty::FunKind) is exactly the distinction — see
 /// `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions".
 ///
-/// Refusing the collection is a *policy*, not a structural bar: substituting one
-/// fuses the use site's pipeline into the source's, which is **loop fusion**.
-/// Whether that pays trades one materialization against N recomputations, and
-/// nothing here has the cost model to decide — see
-/// `src/ccl/design/optimization.md`, "Inlining a collection is loop fusion".
+/// Keeping a collection bound preserves sharing between its uses. Substituting
+/// it can enable fusion with a consumer, but also duplicates its expression at
+/// each use. This pass has no cost model to choose between those tradeoffs; see
+/// `src/ccl/design/optimization.md`, "Collection sharing".
 fn should_inline(bound_ty: &Type) -> bool {
     match bound_ty {
         Type::Fun { fun_kind, .. } => !matches!(fun_kind, crate::ccl::ty::FunKind::Data(..)),
