@@ -1129,13 +1129,33 @@ fn elim_lambda_impl(
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
         }
 
-        // List — treat like Tuple: eliminate param element-wise.
+        // List: the Tuple rule does not carry over, because a list's elements are rows of a
+        // collection rather than slots of a row. `Zip` is the *product* fanout —
+        // `zip : ((A → B), (A → C)) → (A → (B, C))` — and op-conversion combines its arms
+        // into a tuple or a record tile, both inside one row. Distributing a captured binder
+        // across list elements instead builds a **level**, and no former builds one: a `List`
+        // reaches op-conversion only as an indexed source `iterate` drives.
+        //
+        // So eliminating element-wise is not a partial answer but an ill-typed one. Every
+        // element comes back a morphism, so the node would carry the lambda's own type,
+        // `𝑋 ⇒ ([0, n-1] ⤇ 𝑉)`, while a list node is typed `[0, n-1] ⤇ (𝑋 ⇒ 𝑉)` — different
+        // domains, so the post-elim wall rejects it whatever the program. Stating the gap
+        // here reports it against the source instead, as the closed-element case already
+        // does at op-conversion ("a list element must be a constant").
+        //
+        // `docs/chl-spec.md`, "3.11 List, tuple, record literals" admits any expression as an
+        // element, so this is a gap against the spec and not a rule the language states.
         TypedExprNode::List(elts) => {
-            let elim_elts: Result<Vec<_>, _> = elts
-                .into_iter()
-                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
-                .collect();
-            Ok(Expr::list(elim_elts?).with_ty(result_ty))
+            debug_assert!(
+                elts.iter().any(|e| is_free(param, e)),
+                "a list no element of which reads `{param}` is a constant body, which the \
+                 constant rule above has already returned"
+            );
+            Err(LambdaElimError::Unsupported(format!(
+                "a list element that varies with the enclosing binder `{param}`: building a \
+                 collection out of per-element computations needs a former that adds a level, \
+                 and only a list of constants is built today"
+            )))
         }
 
         // Desugar to input ▷ agg(kind), then elim_lambda the result

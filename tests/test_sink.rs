@@ -511,20 +511,24 @@ fn a_sink_accumulates_across_two_deliveries() {
     );
 }
 
-/// Feeding a collection built from the loop variable, from inside the loop, produces a tree
-/// that fails the compiler's own post-lambda-elim typecheck. Not a sink defect: the same
-/// program through a plain `defer()` and a trailing expression panics identically.
+/// Feeding a collection built from the loop variable, from inside the loop, does not compile:
+/// a list whose elements vary with the binder needs a former that adds a level, which
+/// `lambda_elim` states rather than building a tree its own post-pass check rejects. Not a
+/// sink defect — the same program through a plain `defer()` and a trailing expression is
+/// refused identically.
 ///
 /// It leaves one feed case unmeasured — whether such a channel takes the loop's keys with a
 /// collection under each, or splices the contributions into one flat domain — so nothing
 /// downstream should assume either.
 #[test]
-#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
 fn a_collection_fed_from_inside_a_loop_does_not_compile() {
-    observe_one(indoc! {r#"
+    let err = compile_error(indoc! {r#"
         out = test_sink()
         for x in [1, 2]:
             out << [x, x * 10]
-    "#})
-    .expect("a value");
+    "#});
+    assert!(
+        err.contains("a list element that varies with the enclosing binder `x`"),
+        "expected the list-former gap, got: {err}"
+    );
 }
