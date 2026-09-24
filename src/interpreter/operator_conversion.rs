@@ -148,8 +148,19 @@ fn compile_let_binding(
         keys,
         writers,
         domain,
+        parameter,
     } = &bound_expr.node
     {
+        // A **nested** carrier — an inner loop's, whose components all take the enclosing
+        // body's parameter — has no realization here: the store builds one engine, and a
+        // nested carrier is one per enclosing row.
+        if parameter.is_some() {
+            return Err(ConversionError::Unsupported(
+                "a nested `for` loop that writes a mutable variable compiles to a carrier per \
+                 enclosing row, and only a top-level carrier is realized"
+                    .to_string(),
+            ));
+        }
         ctx.bind_store(&binding.name, bound_expr, keys, writers, domain)?;
         return Ok(input);
     }
