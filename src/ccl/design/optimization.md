@@ -132,21 +132,46 @@ When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bo
 
 ## Planning (`ccl/planning/`)
 
-`planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.  The pass does general iteration-site planning — hash-join planning is just one *specialised* strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  It performs two CCL-to-CCL rewrites and a final cleanup:
+`planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.
+The pass does general iteration-site planning — hash-join planning is just one *specialised*
+strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  Its CCL-to-CCL
+rewrites, in the order `run` performs them:
 
-1. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the partition dispatch through `converse`.
-2. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every position where op-conversion would compile with `input=None`.  At each site the pass picks the best implementation strategy:
+1. **Conditional-collection realization** (`conditionals::realize_conditional_collections`) — a
+   `Case` over collections becomes the gated union every later step then treats as an ordinary
+   collection.
+2. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises
+   the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒
+   V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the
+   partition dispatch through `converse`.
+3. **Constant folding** (`const_fold::fold_constants`) — a closed scalar computation becomes the
+   literal it computes, which is what makes a collection literal's elements the compile-time values
+   op conversion reads.  The value comes from the kernel in `src/scalar_ops.rs`, called on a
+   one-element column, so the folded answer and the operator's are one implementation; what the
+   pass decides is the exclusion list, which `src/ccl/planning/const_fold.rs` states.
+4. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every
+   position where op-conversion would compile with `input=None`.  At each site the pass picks the
+   best implementation strategy:
    - **Hash join** (`try_hash_join_rewrite` → `convert_loop_join` → `plan_loop_join` → `join_plan_to_expr`) when the site's domain is a refined tuple whose predicate decomposes into equality join conditions.  The emitted chain is itself iteration-bearing at its leaves (each `JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`), so no further marker is added.
    - **Iterate-then-restricts chain** (`wrap_with_iterate`'s fallback) — build the iteration source by *applying* one `restrict(p)` per refinement, in `ccl::application_order`, to a chain-head `Apply(true ▷ const, Iterate)`, then compose the value-producing body onto it, when the hash-join recogniser doesn't match.  `restrict` is a function transformer `(𝐷 ⤇ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⤇ 𝑇)` — applied, not composed — so each stage narrows the domain while preserving the value `𝑇`, and the chain stays well-typed (its honest second-order type would make a morphism-`Compose` ill-typed; `typecheck` rejects that).
+5. **Refinement-predicate compilation** (`compile_refinement_predicates`) — every remaining bare
+   predicate is normalized tree-wide to point-free form, reaching the consumer contracts that sit
+   outside any iteration site.
+6. **Per-group filter insertion** (`insert_map_filters`) — a refinement riding an inner collection's
+   domain becomes a `map_filter`.
 
 Hash-join planning is the *specialised* strategy at an iteration site; the uniform iterate-then-restricts chain is the default.
 
 The full pipeline inside `run`:
 
 ```
+let discharged = realize_conditional_collections(&mut expr);
 recognize_groupby_sites(&mut expr);
-let expr = simplify(expr);
-insert_iterate_markers(&mut expr);
+let mut expr = simplify(expr);
+fold_constants(&mut expr);
+insert_iterate_markers(&mut expr, &discharged);
+compile_refinement_predicates(&mut expr, &PredMemo::new());
+insert_map_filters(&mut expr);
 simplify(expr)
 ```
 
@@ -170,25 +195,52 @@ The recognizer matches the **pointful** predicate form ([type-inference.md §4.5
 #### 2-way join
 
 For two arms the transformation is straightforward:
-1. **Build side**: group by the build key using `converse` — yielding `key → (build_type → build_type)`
-2. **Probe side**: compose the probe key with the build side lookup — yielding `probe_type → (build_type → build_type)`
-3. **Materialise**: `▷ uncurry ▷ map_domain` flattens the curried result back to `(probe_type, build_type) → (probe_type, build_type)`, which is the same as what would have come out of the loop join.
+1. **Build side**: group by the build key using `converse` — yielding `key → (build_type →
+   build_type)`
+2. **Probe side**: compose the probe key with the build side lookup — yielding `probe_type →
+   (build_type → build_type)`
+3. **Materialise**: `▷ uncurry ▷ map_domain` flattens the curried result back to `(probe_type,
+   build_type) → (probe_type, build_type)`, which is the same as what would have come out of the
+   loop join.
 
 #### N-way join planning
 
 For `n ≥ 3` arms `plan_loop_join` constructs a left-deep binary hash-join tree using a five-step algorithm:
 
-1. **Split conditions** (`split_join_conditions`): decompose the pointful predicate (above) into equality join conditions — each side compiled to a combinator morphism over the tuple domain, where each key depends on exactly one arm — and *other predicates* that aren't equalities.  For each equality condition, `replace_tuple_project_with_id` strips the tuple projection, leaving a function of just the arm's own type.  Each non-equality predicate is paired with the set of arm indices it references (`collect_arms_used`), so it can be pushed to the right level later.
+1. **Split conditions** (`split_join_conditions`): decompose the pointful predicate (above) into
+   equality join conditions — each side compiled to a combinator morphism over the tuple domain,
+   where each key depends on exactly one arm — and *other predicates* that aren't equalities.  For
+   each equality condition, `replace_tuple_project_with_id` strips the tuple projection, leaving a
+   function of just the arm's own type.  Each non-equality predicate is paired with the set of arm
+   indices it references (`collect_arms_used`), so it can be pushed to the right level later.
 
-2. **Build spanning tree** (`spanning_tree_children`): treat each equality condition as an undirected edge `(arm_a, arm_b)` and run BFS from arm 0 over this graph.  Returns `children: Vec<Vec<usize>>` — the BFS spanning tree as an adjacency list — or `None` if the graph is disconnected (some arm has no join path to arm 0).
+2. **Build spanning tree** (`spanning_tree_children`): treat each equality condition as an
+   undirected edge `(arm_a, arm_b)` and run BFS from arm 0 over this graph.  Returns `children:
+   Vec<Vec<usize>>` — the BFS spanning tree as an adjacency list — or `None` if the graph is
+   disconnected (some arm has no join path to arm 0).
 
-3. **Build left-deep plan with predicate pushdown** (`build_join_plan`): walk the BFS children recursively, starting from arm 0.  For each child subtree, find a condition that *straddles* the accumulated probe side and the child's subtree, orient it probe/build, and fold it into a `JoinPlan::Hash`.  Any remaining straddling equality conditions become residual predicates at that node.  Non-equality predicates are pushed down greedily: predicates whose required arms are entirely within a child subtree are forwarded into that child's recursive call; predicates whose required arms span the current probe side are applied at the first join node where all required arms are present, after reindexing (`reindex_for_domain`) to match the flat output domain of the current node.  Single-arm predicates that depend only on a leaf arm are pushed all the way into the `JoinPlan::Loop` node's `predicate` field.  Returns `(JoinPlan, arm_order)` where `arm_order[i]` is the canonical arm index at output position `i`.
+3. **Build left-deep plan with predicate pushdown** (`build_join_plan`): walk the BFS children
+   recursively, starting from arm 0.  For each child subtree, find a condition that *straddles* the
+   accumulated probe side and the child's subtree, orient it probe/build, and fold it into a
+   `JoinPlan::Hash`.  Any remaining straddling equality conditions become residual predicates at
+   that node.  Non-equality predicates are pushed down greedily: predicates whose required arms are
+   entirely within a child subtree are forwarded into that child's recursive call; predicates whose
+   required arms span the current probe side are applied at the first join node where all required
+   arms are present, after reindexing (`reindex_for_domain`) to match the flat output domain of the
+   current node.  Single-arm predicates that depend only on a leaf arm are pushed all the way into
+   the `JoinPlan::Loop` node's `predicate` field.  Returns `(JoinPlan, arm_order)` where
+   `arm_order[i]` is the canonical arm index at output position `i`.
 
 4. **Emit CCL** (`join_plan_to_expr`): convert the `JoinPlan` tree to a CCL expression bottom-up.
    - `Loop { arms }` → `id` on the tuple type of those arms (or the single arm type)
    - `Hash { probe, build, … }` → the probe/build `converse`/`uncurry`/`map_domain` chain described above.  Additionally, for nested hash joins, we need to convert from the nested 2-tuple structure generated by the join tree back to a flat n-tuple structure, so a new `flatten_domain` combinator is inserted before the `map_domain` as needed.  `flatten_domain` allows for flattening up specific positions of a tuple of tuples.
 
-5. **Restore canonical order**: because BFS visit order depends on the order equality conditions appear in the AND expression, `arm_order` may not be `[0, 1, …, n-1]`.  When it differs, `convert_loop_join` appends `▷ ([perm] ▷ permute_domain) ▷ map_domain`, where `perm[j]` = the position of canonical arm `j` in `arm_order`.  This rewrites the domain from the BFS-induced tuple order back to the original `(T_0, T_1, …, T_{n-1})` order that the rest of the expression expects.
+5. **Restore canonical order**: because BFS visit order depends on the order equality conditions
+   appear in the AND expression, `arm_order` may not be `[0, 1, …, n-1]`.  When it differs,
+   `convert_loop_join` appends `▷ ([perm] ▷ permute_domain) ▷ map_domain`, where `perm[j]` = the
+   position of canonical arm `j` in `arm_order`.  This rewrites the domain from the BFS-induced
+   tuple order back to the original `(T_0, T_1, …, T_{n-1})` order that the rest of the expression
+   expects.
 
 For example, a three way join might end up looking like
 ```

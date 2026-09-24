@@ -12,15 +12,12 @@ use crate::{
         symbolic::symbolic,
     },
     interpreter::{
-        ArithmeticKind,
         BaseType,
         BinOpKind as InterpreterBinOp,
-        CompareKind,
         DataSourceDomainExtentImpl,
         Extent,
         FuncBinding,
         FunctionDef,
-        LogicKind,
         UnaryOpKind,
         Value,
         // The runtime commit engine. Its `TransactWriter` is the *operator*
@@ -2611,8 +2608,11 @@ fn compile_list_fn(
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
 /// The constant *value* formers, each recursing on its children so a constant
-/// nests: a literal, a tuple, a record, and a variant constructor. Anything else is
-/// a computation, which a list literal's element position cannot express.
+/// nests: a literal, a tuple, a record, and a variant constructor. A computation over
+/// them is already a literal by the time it arrives, planning having folded it
+/// (`src/ccl/planning/const_fold.rs` states which shapes it folds and which it leaves);
+/// what reaches the fallback arm is what the fold declined, and a list literal's element
+/// position cannot express it.
 fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
@@ -2645,9 +2645,13 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
             tag: FieldKey::Name(tag.as_str().into()),
             inner: Box::new(expr_to_value(payload)?),
         }),
+        // The element may well *be* a constant and still arrive here: what reaches this
+        // point is what constant folding declined. Saying only "is a computation" reads as
+        // a demand to write a constant where one is already written, so the message names
+        // the fold instead and leaves the enumeration to it.
         _ => Err(ConversionError::Unsupported(format!(
-            "a list element must be a constant — a literal, tuple, record or variant \
-             constructor — but this one is a computation: {}",
+            "a list element has to be a value here, and constant folding did not reduce \
+             this one: {}. See `src/ccl/planning/const_fold.rs`, \"What does not fold\"",
             symbolic(expr)
         ))),
     }
@@ -4430,39 +4434,14 @@ fn as_builtin(expr: &Expr) -> Option<Builtin> {
 
 /// Map a [`Builtin`] to an interpreter [`InterpreterBinOp`].
 ///
-/// Returns `None` for built-ins that are not binary operation combinators.
-///
-/// The interpreter has its own `BinOpKind` separate from
-/// [`crate::ccl::BinOpKind`] (the architecture forbids `ccl` from depending
-/// upward on `interpreter`); the variants are structurally identical, so this
-/// is just an enum-to-enum copy.
+/// Returns `None` for built-ins that are not binary operation combinators. The operator
+/// itself converts (`impl From<crate::ccl::BinOpKind>` in `src/ccl/ops.rs`); what this adds
+/// is the `Builtin` unwrap.
 fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
-    use crate::ccl::{ArithmeticKind as A, BinOpKind as B, CompareKind as C, LogicKind as L};
     let Builtin::BinOp(op) = b else {
         return None;
     };
-    Some(match op {
-        // `^+` and `+` compute the same sum, so they share one runtime operation;
-        // the refinement `^+` carries is spent by the time op-conversion runs.
-        B::Arithmetic(A::Add | A::AddRefined) => InterpreterBinOp::Arithmetic(ArithmeticKind::Add),
-        B::Arithmetic(A::Sub) => InterpreterBinOp::Arithmetic(ArithmeticKind::Sub),
-        B::Arithmetic(A::Mul) => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
-        B::Arithmetic(A::FloorDiv) => InterpreterBinOp::Arithmetic(ArithmeticKind::FloorDiv),
-        B::Arithmetic(A::Pow) => InterpreterBinOp::Arithmetic(ArithmeticKind::Pow),
-        B::Concat => InterpreterBinOp::Concat,
-        B::Compare(C::Equals) => InterpreterBinOp::Compare(CompareKind::Equals),
-        B::Compare(C::NotEquals) => InterpreterBinOp::Compare(CompareKind::NotEquals),
-        B::Compare(C::Less) => InterpreterBinOp::Compare(CompareKind::Less),
-        B::Compare(C::LessOrEq) => InterpreterBinOp::Compare(CompareKind::LessOrEq),
-        B::Compare(C::Greater) => InterpreterBinOp::Compare(CompareKind::Greater),
-        B::Compare(C::GreaterOrEq) => InterpreterBinOp::Compare(CompareKind::GreaterOrEq),
-        B::BoolLogic(L::And) => InterpreterBinOp::BoolLogic(LogicKind::And),
-        B::BoolLogic(L::Nand) => InterpreterBinOp::BoolLogic(LogicKind::Nand),
-        B::BoolLogic(L::Or) => InterpreterBinOp::BoolLogic(LogicKind::Or),
-        B::BoolLogic(L::Nor) => InterpreterBinOp::BoolLogic(LogicKind::Nor),
-        B::BoolLogic(L::Xor) => InterpreterBinOp::BoolLogic(LogicKind::Xor),
-        B::BoolLogic(L::Xnor) => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
-    })
+    Some(op.into())
 }
 
 /// Map a [`Builtin`] to a [`UnaryOpKind`].

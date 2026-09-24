@@ -258,6 +258,126 @@ fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
     check_compile_error(code, "Unresolved inference variable");
 }
 
+// A collection literal's elements are compile-time values, so an element written as a
+// scaled constant reaches op conversion only because planning folded it
+// (`src/ccl/planning/const_fold.rs`). The chain cases pin that one pass folds a whole
+// chain: each `let` binds the literal its own bound expression folded to.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum([1 + 2, 3])", Value::Int(6))]
+#[case(
+    "one_dollar = 100000000\nsum([500 * one_dollar])",
+    Value::Int(50_000_000_000)
+)]
+#[case("one = 100\nsum([one, 2])", Value::Int(102))]
+#[case(indoc! {r"
+    a = 2
+    b = a * 3
+    c = b + 1
+    sum([c])"}, Value::Int(7))]
+// A shadowing binder hides the constant rather than substituting through it: `x` in the
+// comprehension body is the element, not the 100 the outer `let` binds.
+#[case("x = 100\nsum([x * 2 for x in [1, 2, 3]])", Value::Int(12))]
+fn test_folded_collection_elements(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A definition the body's type **discharges** does not fold, and the program still runs.
+// `^+` records what it computed, so `x`'s definition ends up inside the refinement the
+// `let` carries; the post-planning wall re-runs that discharge over the definition the
+// tree holds by then and compares the two refinements structurally
+// (`src/ccl/planning/const_fold.rs`, "A definition the body's type discharges"). Folding
+// the definition leaves `4` on one side of that comparison and `1 ^+ 3` on the other.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_discharged_definition_survives_planning() {
+    check_scalar(
+        indoc! {r#"
+            x = 1 ^+ 3
+            y = x ^+ 2
+            y
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// An element the fold leaves alone is still rejected, which is what keeps the guard from
+/// accepting anything at all. Here the element reads a collection, and the fold stops at
+/// the scalar.
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn a_collection_reading_element_is_rejected() {
+    run_pipeline(indoc! {r"
+        xs = [1, 2]
+        sum([sum(xs), 3])"});
+}
+
+/// The second way the fold declines: both operands are literals, and folding would answer
+/// a question `docs/chl-spec.md`, "3.3 Arithmetic and logical operators" (floor division)
+/// and the runtime (truncation toward zero) disagree on. Settling that disagreement is
+/// what makes this element foldable (the vault issue
+/// `interpreter-integer-arithmetic-divergences`).
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn a_negative_floor_division_element_is_rejected() {
+    run_pipeline("sum([(0 - 7) // 2])");
+}
+
+/// An operation with **no result** is left for the runtime, which is where it faults.
+///
+/// Folding it would answer where the runtime does not: an overflowing `*` panics in a debug
+/// build, and `// 0` panics in both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::overflow("sum([9223372036854775807 * 2])")]
+#[case::division_by_zero("sum([1 // 0])")]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn an_element_with_no_result_is_rejected(#[case] code: &str) {
+    run_pipeline(code);
+}
+
+/// A **compound** constant is not substituted, so an element built from one stays a
+/// computation.
+///
+/// Replacing `expr.node` with a `Lit` mints nothing; substituting a tuple, a record or a
+/// variant copies nodes, and a copy needs minted `NodeId`s and a recording
+/// (`src/ccl/planning/const_fold.rs`, "What does not fold").
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn an_element_built_from_a_compound_constant_is_rejected() {
+    run_pipeline(indoc! {r"
+        p = (1, 2)
+        sum([p.0 + p.1])"});
+}
+
+/// The `discharged` guard skips the whole **subtree**, so an unrelated downstream `^+`
+/// stops an otherwise-foldable element compiling.
+///
+/// What makes `y`'s definition discharged is `z`, which reads it — so the same program with
+/// `z = y + 1` folds the element and answers 7. The guard is the module doc's bound at "What
+/// does not fold"; this narrows a gap rather than opening one, the element having been
+/// rejected before the pass existed.
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn a_downstream_refined_sum_stops_an_element_folding() {
+    run_pipeline(indoc! {r"
+        y = sum([1 + 2, 3])
+        z = y ^+ 1
+        z"});
+}
+
+/// The same program under `+`, which records nothing and leaves the definition foldable.
+#[test]
+fn an_unrefined_downstream_sum_leaves_the_element_foldable() {
+    check_scalar(
+        indoc! {r"
+            y = sum([1 + 2, 3])
+            z = y + 1
+            z"},
+        Value::Int(7),
+    );
+}
+
 // A UDF parameter annotated as an abstract collection is a *consumer* of a whole
 // collection, not a per-element map body. At a concrete call site the UDF inlines and
 // beta-reduces, so the abstract witness resolves to the argument's concrete domain and
@@ -448,6 +568,39 @@ fn test_compare(#[case] code: &str, #[case] expected: Value) {
 #[case("True and False", Value::Bool(false))]
 #[case("True or False", Value::Bool(true))]
 fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// The same operators with one operand computed **per element**, so no constant reaches the
+// fold and the tile operator runs.
+//
+// Every case above folds to its result at compile time. The fold and the `BinOp` operator
+// share one kernel (`src/scalar_ops.rs`), but only the operator reaches it through
+// `apply_binop_column`'s dispatch, so without these that dispatch is unexercised for these
+// operators.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum([1 for x in [1, 2, 3] if (x > 1) ^ True])", Value::Int(1))]
+#[case("sum([1 for x in [1, 2, 3] if (x > 1) & True])", Value::Int(2))]
+#[case("sum([1 for x in [1, 2, 3] if (x > 1) | False])", Value::Int(2))]
+fn test_bool_ops_on_computed_operands(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The arithmetic and comparison operators at **run time**, for the same reason as the
+/// booleans above: `test_arithmetic` and `test_compare` fold to their answers, so without
+/// these nothing reaches `apply_binop_column`'s dispatch for them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::sub("sum([x - 1 for x in [1, 2, 3]])", Value::Int(3))]
+#[case::mul("sum([x * 2 for x in [1, 2, 3]])", Value::Int(12))]
+#[case::floor_div("sum([x // 2 for x in [2, 4, 6]])", Value::Int(6))]
+#[case::pow("sum([x ** 2 for x in [1, 2, 3]])", Value::Int(14))]
+#[case::add("sum([x + 10 for x in [1, 2]])", Value::Int(23))]
+#[case::concat(r#"sum([1 for x in ["a", "b"] if x + "!" == "a!"])"#, Value::Int(1))]
+#[case::string_order(r#"sum([1 for x in ["a", "b"] if x < "b"])"#, Value::Int(1))]
+#[case::int_order("sum([1 for x in [1, 2, 3] if x >= 2])", Value::Int(2))]
+fn arithmetic_and_comparison_on_computed_operands(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
