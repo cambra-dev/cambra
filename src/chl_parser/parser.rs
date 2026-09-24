@@ -1020,11 +1020,11 @@ where
         // ---- Function type `T => U` (annotation-only; §4.1, §6) ------
         //
         // The loosest binary form, below `feed`. Right-associative: the codomain
-        // is the whole `expr`, so `A => B => C` is `A => (B => C)` — the same
-        // shape the ternary's else-branch uses. `=>` in a `def`'s return
-        // annotation is consumed at statement level before this runs, so that
-        // position is unaffected. The parser accepts any expression on either
-        // side; lowering reads a type here and rejects a `=>` used as a value.
+        // is the whole `expr`, so `A => B => C` is `A => (B => C)`. `=>` in a
+        // `def`'s return annotation is consumed at statement level before this
+        // runs, so that position is unaffected. The parser accepts any expression
+        // on either side; lowering reads a type here and rejects a `=>` used as a
+        // value.
         let fun_type = feed
             .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
             .map_with(|(domain, codomain), e| match codomain {
@@ -1705,9 +1705,9 @@ mod tests {
     /// A ternary on the **key** side of a pair is the key.
     ///
     /// `->` is looser than the ternary at both operands, so the conditional completes and
-    /// the arrow pairs it. An else-branch reaching the whole expression put the arrow inside
-    /// the conditional instead, reading `k if hot else base -> price` as a branch between a
-    /// scalar and a pair — two shapes no conditional relates.
+    /// the arrow pairs it. An else-branch reaching the whole expression would put the arrow
+    /// inside the conditional instead, reading `k if hot else base -> price` as a branch
+    /// between a scalar and a pair — two shapes no conditional relates.
     #[test]
     fn a_ternary_on_the_key_side_is_the_key() {
         let Expr::List(items) = parse_e("[k if hot else base -> price]").node else {

@@ -1927,9 +1927,8 @@ has two readings, and under the greedy one the outer `match` has no way to
 spell an arm after `` `p ``.
 
 Restricting the arm body instead of requiring the bracket does not hold: a
-lambda body, a ternary else-branch, an `<<` right operand and a `=>` codomain
-each take a whole expression, so an inner `match` reappears through any of
-them.
+lambda body and a `=>` codomain each take a whole expression, so an inner
+`match` reappears through either of them.
 
 The indented and one-line forms differ in the arm body and in nothing else:
 same arms, same partition rule, same value.
@@ -3413,20 +3412,17 @@ with parser-level support that lowering rejects:
   ([3.12 Comprehensions](#312-comprehensions)); reading the result as a `Map` follows the
   map-literal decision above and is **[Decided]**, unimplemented. The north-star `storefront`
   `/stats` rollup uses it.
-- **The target syntax at large** — the mutation and transaction
-  **core is implemented** (`:=`, `with begin():`, `Mut(…, Txn)` mutable variables,
-  feeds — §8), now spelled in the canonical target syntax: parenthesised type
-  application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
-  (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types
-  `{T, U}` writable in annotation position (§6.1), and variants writable in all
-  three positions — type, term and pattern (§6.5, §3.15, §4.10). The remaining
-  **Direction** notes are unimplemented: `rec` bindings (§4.3), destructuring
-  patterns ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), membership `in`
-  ([3.4 Comparisons](#34-comparisons)), refinements
-  ([6.4 Refinement syntax](#64-refinement-syntax)), the `Feed(_)` forward-declaration surface
-  (§3.7, §6.2), and
-  transactions-as-contextual-parameters (§8.7). The north-star programs
-  pin the target; the sequencing is tracked
+- **The target syntax at large** — the mutation and transaction **core is implemented** (`:=`,
+  `with begin():`, `Mut(…, Txn)` mutable variables, feeds — §8), now spelled in the canonical target
+  syntax: parenthesised type application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
+  (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types `{T, U}` writable in
+  annotation position (§6.1), and variants writable in all three positions — type, term and pattern
+  (§6.5, §3.15, §4.10). The remaining **Direction** notes are unimplemented: `rec` bindings (§4.3),
+  destructuring patterns ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), membership
+  `in` ([3.4 Comparisons](#34-comparisons)), refinements
+  ([6.4 Refinement syntax](#64-refinement-syntax)), the `Feed(_)` forward-declaration surface (§3.7,
+  §6.2), and transactions-as-contextual-parameters (§8.7). The north-star programs pin the target;
+  the sequencing is tracked
 
 When each lands, this spec will be updated alongside the lowering and
 the demo programs.
