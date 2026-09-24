@@ -1,7 +1,8 @@
 //! Running one program through the compiler and through the differential interpreter, each
 //! observed through the sink `out`, and reading both answers in the interpreter's domain.
 //!
-//! Compiled into the differential suite `tests/differential_interp.rs`.
+//! Compiled into the two differential suites: the hand-written cases
+//! (`tests/differential_interp.rs`) and the generated grid (`tests/generated_pairs.rs`).
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{GlobalContext, compile_program};
