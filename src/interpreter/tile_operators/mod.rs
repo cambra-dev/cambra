@@ -23,11 +23,13 @@ use std::{
 
 use log::trace;
 
-pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
+pub use crate::interpreter::tiling::{
+    CurryLevel, FunctionGuard, Predicate, Tile, TileGuard, Tiling,
+};
 use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
-    interpreter::{Consumer, Extent, Scheduler, validate_tile},
+    interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -312,6 +314,232 @@ impl Notified {
     }
 }
 
+/// One collection level of a tile, keyed in [`completion_view`]'s map by the record fields
+/// walked through to reach it and its collection depth. `complete` is the
+/// region of paths reaching this level the tile calls complete — its own statement, and
+/// the one above read a level further in, since a complete key is complete beneath.
+struct CompletionNode {
+    complete: Predicate,
+}
+
+/// One key or value of a tile, at the path that reaches it, so two outputs compare entry by
+/// entry. `complete` says whether the tile calls that path complete.
+struct Entry {
+    value: EntryValue,
+    complete: bool,
+}
+
+/// What sits at an entry's path: a key, a value, or what a store or an aggregation answers
+/// for one row. Compared by equality rather than by its `Debug` rendering, which prints a
+/// record's fields in hash order and so differs between equal values.
+#[derive(Debug, PartialEq)]
+enum EntryValue {
+    Key,
+    Value(Option<Value>),
+    Row(Tile),
+}
+
+type NodeKey = (Vec<String>, usize);
+type EntryKey = (Vec<String>, Vec<Value>);
+
+/// Flatten `tile` into its collection levels and the entries it holds.
+fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<EntryKey, Entry>) {
+    fn walk(
+        tile: &Tile,
+        label: &[String],
+        level: usize,
+        rows: &[Option<Vec<Value>>],
+        above: &Predicate,
+        nodes: &mut HashMap<NodeKey, CompletionNode>,
+        entries: &mut HashMap<EntryKey, Entry>,
+    ) {
+        match tile {
+            Tile::DataFunction {
+                row_starts,
+                domain,
+                codomain,
+                domain_predicate,
+                deleted,
+            } => {
+                let complete = match level {
+                    0 => domain_predicate.clone(),
+                    _ => {
+                        Predicate::qualified(above.clone(), Predicate::True).union(domain_predicate)
+                    }
+                };
+                let ColumnValue::UInts(starts) = row_starts else {
+                    unreachable!("a collection's row starts are positions")
+                };
+                let mut keys: Vec<Option<Vec<Value>>> = vec![None; domain.len()];
+                for (row, path) in rows.iter().enumerate() {
+                    let from = starts.get(row).copied().unwrap_or(domain.len());
+                    let to = starts.get(row + 1).copied().unwrap_or(domain.len());
+                    let Some(path) = path else { continue };
+                    for (key, slot) in keys.iter_mut().enumerate().take(to).skip(from) {
+                        if deleted.contains(key) {
+                            continue;
+                        }
+                        let mut at = path.clone();
+                        at.push(domain.index_at(key));
+                        entries.insert(
+                            (label.to_vec(), at.clone()),
+                            Entry {
+                                value: EntryValue::Key,
+                                complete: complete.contains_path(&at),
+                            },
+                        );
+                        *slot = Some(at);
+                    }
+                }
+                walk(codomain, label, level + 1, &keys, &complete, nodes, entries);
+                nodes.insert((label.to_vec(), level), CompletionNode { complete });
+            }
+            Tile::Record(fields) => {
+                for (field, field_tile) in fields {
+                    let mut label = label.to_vec();
+                    label.push(field.clone());
+                    walk(field_tile, &label, level, rows, above, nodes, entries);
+                }
+            }
+            Tile::Scalar(column) => {
+                for (row, path) in rows.iter().enumerate() {
+                    let Some(path) = path else { continue };
+                    if row >= column.len() {
+                        continue;
+                    }
+                    entries.insert(
+                        (label.to_vec(), path.clone()),
+                        Entry {
+                            value: EntryValue::Value(Some(column.index_at(row))),
+                            complete: level > 0 && above.contains_path(path),
+                        },
+                    );
+                }
+            }
+            // An aggregation is one accumulator per row, compared row by row. Beneath no
+            // level nothing is complete, and a row it has not reached holds nothing yet.
+            other if level > 0 => {
+                for (row, path) in rows.iter().enumerate().take(other.rows()) {
+                    let Some(path) = path else { continue };
+                    entries.insert(
+                        (label.to_vec(), path.clone()),
+                        Entry {
+                            value: EntryValue::Row(other.select_rows(&[row])),
+                            complete: above.contains_path(path),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut nodes, mut entries) = (HashMap::new(), HashMap::new());
+    walk(
+        tile,
+        &[],
+        0,
+        &[Some(Vec::new())],
+        &Predicate::False,
+        &mut nodes,
+        &mut entries,
+    );
+    (nodes, entries)
+}
+
+/// The paths reaching collection level `level` under record fields `label` that `guard`
+/// releases: a domain guard `d` codomain steps in names keys of level `d` and everything
+/// beneath them.
+fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
+    fn walk(guard: &TileGuard, label: &[String], depth: usize, level: usize) -> Predicate {
+        match guard {
+            TileGuard::Or(arms) => arms
+                .iter()
+                .map(|arm| walk(arm, label, depth, level))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+            TileGuard::Record(fields) => match label.split_first() {
+                Some((field, rest)) => fields
+                    .get(field)
+                    .map_or(Predicate::False, |g| walk(g, rest, depth, level)),
+                None => Predicate::False,
+            },
+            TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
+                walk(inner, label, depth + 1, level)
+            }
+            TileGuard::Function(FunctionGuard::Domain(pred)) if depth <= level => (depth..level)
+                .fold(pred.clone(), |region, _| {
+                    Predicate::qualified(region, Predicate::True)
+                }),
+            _ => Predicate::False,
+        }
+    }
+    walk(guard, label, 0, level)
+}
+
+/// Assert that `result` leaves unchanged everything `last` called complete, apart from
+/// removing what `released` has released since: the two rules of
+/// `src/interpreter/design-operators.md`, "The completeness contract".
+///
+/// A statement covers every path at its level, including paths under rows that have not
+/// arrived, so the second rule applies to them too: a key appearing under a row called
+/// complete before it arrived breaks it.
+pub(crate) fn assert_complete_region_unchanged(
+    name: &str,
+    last: &Tile,
+    result: &Tile,
+    released: &TileGuard,
+) {
+    let (last_nodes, last_entries) = completion_view(last);
+    let (result_nodes, result_entries) = completion_view(result);
+    for ((label, level), node) in &last_nodes {
+        let released_here = released_at(released, label, *level);
+        let promised = node.complete.minus(&released_here);
+        let kept = result_nodes
+            .get(&(label.clone(), *level))
+            .map_or(Predicate::False, |n| n.complete.clone());
+        assert!(
+            kept.subsumes(&promised),
+            "{name} withdrew completion at level {level} of {label:?}: it called {promised:?} \
+             complete, and now calls only {kept:?} complete"
+        );
+    }
+    let is_released = |label: &Vec<String>, path: &Vec<Value>| {
+        !path.is_empty() && released_at(released, label, path.len() - 1).contains_path(path)
+    };
+    // A release lets a region leave the output, and nothing more: what a producer still
+    // holds beneath a complete path, or adds beneath one, is checked whether or not a
+    // consumer has since released it. Exempting those would hide exactly the broken
+    // promise a consumer releases on.
+    for ((label, path), entry) in &last_entries {
+        if !entry.complete {
+            continue;
+        }
+        match result_entries.get(&(label.clone(), path.clone())) {
+            Some(now) if now.value == entry.value => {}
+            None if is_released(label, path) => {}
+            now => panic!(
+                "{name} changed {label:?} at {path:?}, which it had called complete: {:?} \
+                 then {:?}, in {last:?} then {result:?}, having released {released:?}",
+                entry.value,
+                now.map(|n| &n.value)
+            ),
+        }
+    }
+    for (label, path) in result_entries.keys() {
+        if last_entries.contains_key(&(label.clone(), path.clone())) || path.is_empty() {
+            continue;
+        }
+        let level = path.len() - 1;
+        let was_complete = last_nodes
+            .get(&(label.clone(), level))
+            .is_some_and(|n| n.complete.contains_path(path));
+        assert!(
+            !was_complete,
+            "{name} added {label:?} at {path:?}, beneath a path it had called complete: \
+             {last:?} then {result:?}"
+        );
+    }
+}
+
 /// Common identity and tiling state shared by every [`TileProducer`].
 ///
 /// Storing these together avoids repeating the same two fields and their
@@ -324,6 +552,9 @@ pub struct ProducerBase {
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
     pub(crate) notified: Notified,
+    /// The last tile `get` returned, for the debug check that the complete region never
+    /// changes ([`assert_complete_region_unchanged`]). Debug builds only; `None` in release.
+    pub(crate) last_output: Option<Tile>,
 }
 
 impl ProducerBase {
@@ -341,6 +572,7 @@ impl ProducerBase {
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
             notified,
+            last_output: None,
         }
     }
 }
@@ -450,6 +682,28 @@ pub trait TileProducer {
             self.tiling()
         );
         debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
+        if cfg!(debug_assertions) {
+            if let Some(last) = &self.base().last_output
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert_complete_region_unchanged(
+                        &self.name(),
+                        last,
+                        &result,
+                        self.obsolete_guard(),
+                    )
+                }))
+                .is_err()
+            {
+                panic!(
+                    "the violation above, in the producer tree:\n{}",
+                    crate::pretty_tree::render_with_max_depth(
+                        &self.inspect(&VizOptions::default()),
+                        Some(6)
+                    )
+                );
+            }
+            self.base_mut().last_output = Some(result.clone());
+        }
         assert!(
             result.check_from(self.tiling()),
             "{} produced {result:?}, which does not tile as {}",

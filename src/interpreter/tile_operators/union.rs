@@ -192,9 +192,11 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     // any other; boxing each row into a value could not carry one.
     let mut pairs: Vec<(Value, usize)> = Vec::new();
     let mut codomains: Option<Tile> = None;
-    let mut domain_predicate = Predicate::False;
+    // A key comes from whichever arm holds it, so it is complete once every arm calls it
+    // complete: an arm finished with a key it never held says nothing about its siblings.
+    let mut domain_predicate = Predicate::True;
     let mut offset = 0usize;
-    for (i, tile) in tiles.into_iter().enumerate() {
+    for tile in tiles {
         let Tile::DataFunction {
             domain,
             codomain,
@@ -205,9 +207,7 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         else {
             panic!("flat_merge: expected a collection arm, got {tile:?}");
         };
-        if i == 0 {
-            domain_predicate = dp;
-        }
+        domain_predicate = domain_predicate.intersect(&dp);
         let live: Vec<usize> = (0..domain.len())
             .filter(|r| !deleted.contains(*r))
             .collect();

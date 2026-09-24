@@ -72,7 +72,8 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
     let mut result = pull_laps(ctx.scheduler(), &mut **producer, 1024, Tile::is_terminal);
     assert!(
         result.is_terminal(),
-        "pipeline path: producer did not converge within 1024 iterations"
+        "pipeline path: producer stopped short of a terminal tile, quiescent or after 1024 \
+         laps: {result:?}"
     );
     result.compact();
     // Release everything, then pull once more: a released region must never come

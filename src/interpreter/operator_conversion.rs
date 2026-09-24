@@ -16,6 +16,7 @@ use crate::{
         BaseType,
         BinOpKind as InterpreterBinOp,
         ColumnValue,
+        CurryLevel,
         DataSourceDomainExtentImpl,
         Extent,
         FuncBinding,
@@ -39,7 +40,7 @@ use crate::{
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
             TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
-            level_count, zip_arms_at, zip_arms_named_at,
+            zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
     },
@@ -1691,7 +1692,7 @@ fn convert_impl_inner(
             // enclosing `map`, and belongs to op-conversion's context rather than to any
             // tiling. Read off tilings, it over-counts where every arm keeps a level of the
             // element: `(g, [s.qty for s in g])` pairs at the rows within each group.
-            let input_levels = level_count(input.tiling());
+            let input_levels = input.tiling().levels();
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
@@ -1737,8 +1738,8 @@ fn convert_impl_inner(
                         };
                         ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
-                    let ambient = zip_ambient(input_levels, ops.iter().map(|op| op.tiling()));
-                    Ok(zip_arms_at(ops, ambient))
+                    let level = zip_level(input_levels, ops.iter().map(|op| op.tiling()));
+                    Ok(zip_arms_at(ops, level))
                 }
                 TypedExprNode::Record(fields) => {
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
@@ -1754,8 +1755,8 @@ fn convert_impl_inner(
                         })
                         .collect();
                     let ops = ops?;
-                    let ambient = zip_ambient(input_levels, ops.iter().map(|(_, op)| op.tiling()));
-                    Ok(zip_arms_named_at(ops, ambient))
+                    let level = zip_level(input_levels, ops.iter().map(|(_, op)| op.tiling()));
+                    Ok(zip_arms_named_at(ops, level))
                 }
                 other => Err(ConversionError::Unsupported(format!(
                     "zip expects a Tuple or Record argument, got {:?}",
@@ -2898,10 +2899,10 @@ fn record_field<'a>(elt: &'a Expr, name: &str) -> Result<&'a Expr, ConversionErr
     })
 }
 
-/// The levels a `zip`'s arms pair under: `input_levels`, capped by the fewest any arm
-/// carries, since an arm that folds a level of the element has no level there to pair.
-fn zip_ambient<'a>(input_levels: usize, arms: impl Iterator<Item = &'a Tiling>) -> usize {
-    arms.map(level_count).fold(input_levels, usize::min)
+/// The level a `zip`'s arms pair at: beneath `input_levels`, capped by the fewest levels any
+/// arm carries, since an arm that folds a level of the element has no level there to pair.
+fn zip_level<'a>(input_levels: usize, arms: impl Iterator<Item = &'a Tiling>) -> CurryLevel {
+    CurryLevel::new(arms.map(Tiling::levels).fold(input_levels, usize::min))
 }
 
 /// Whether two extents have the same constructor skeleton.
@@ -2946,7 +2947,7 @@ fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
 /// A record extent is built by [`MakeRecord`] (`src/interpreter/design-operators.md`, "A
 /// product value is a record of tiles"). A function extent `𝐷 ⤇ {…}` is a collection of
 /// records, such as `Tuple([acc, i])` under a binop, which [`zip_arms_named_at`] pairs over
-/// the ambient iteration. Both arrive as the same node with the same operands, so the
+/// the shared iteration. Both arrive as the same node with the same operands, so the
 /// extent is the only thing that separates them.
 ///
 /// The built operator's extent is checked against the node's, and a disagreement is a
@@ -2961,8 +2962,8 @@ fn build_product(
     let product: Box<dyn TileOperator> = if matches!(want, Extent::Record(_)) {
         Box::new(MakeRecord::new_named(components))
     } else {
-        let ambient = leaf_ambient(components.iter().map(|(_, op)| op.tiling()));
-        zip_arms_named_at(components, ambient)
+        let level = leaf_level(components.iter().map(|(_, op)| op.tiling()));
+        zip_arms_named_at(components, level)
     };
     let got = product.tiling().extent();
     if !extent_shapes_agree(&got, &want) {
@@ -2974,25 +2975,25 @@ fn build_product(
     Ok(product)
 }
 
-/// The ambient iteration a product's **leaf** components stand over.
+/// The level a product's **leaf** components pair at: the values every level of theirs
+/// stands over ([`CurryLevel::values_of`]).
 ///
 /// A product former with no input compiles components that each carry their own iteration,
-/// so there is nothing to read the ambient off except the components themselves, and they
-/// must agree on it.
-fn leaf_ambient<'a>(tilings: impl Iterator<Item = &'a Tiling>) -> usize {
-    let mut ambient = 1;
-    for (i, t) in tilings.enumerate() {
-        let levels = level_count(t).max(1);
-        if i == 0 {
-            ambient = levels;
-        } else {
-            assert_eq!(
-                levels, ambient,
-                "a product's leaf components stand over one iteration, so they nest alike",
-            );
-        }
+/// so there is nothing to read the level off except the components themselves, and they
+/// must agree on it. Scalar components answer [`CurryLevel::OUTERMOST`], where
+/// [`zip_arms_named_at`] builds a record and reads no level.
+fn leaf_level<'a>(mut tilings: impl Iterator<Item = &'a Tiling>) -> CurryLevel {
+    let Some(first) = tilings.next().map(CurryLevel::values_of) else {
+        return CurryLevel::OUTERMOST;
+    };
+    for t in tilings {
+        assert_eq!(
+            CurryLevel::values_of(t),
+            first,
+            "a product's leaf components stand over one iteration, so they nest alike: {t}",
+        );
     }
-    ambient
+    first
 }
 
 /// Evaluate a constant CCL expression to a [`Value`].

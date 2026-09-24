@@ -211,7 +211,7 @@ fn test_datasource_named_record_join() {
         ),
     ]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
 
     src2.borrow_mut().add_data(&[
         (
@@ -230,7 +230,7 @@ fn test_datasource_named_record_join() {
         ),
     ]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();

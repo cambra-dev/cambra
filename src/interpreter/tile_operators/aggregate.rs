@@ -625,7 +625,7 @@ impl TileProducer for MapAggregateProducer {
              level: {input_tile:?}"
         );
         let parent_paths = input_tile.row_paths_at(depth);
-        let folded = input_tile.values_at(depth);
+        let folded = input_tile.values_at(CurryLevel::new(depth));
         let Tile::DataFunction { codomain, .. } = folded else {
             unreachable!("the loop breaks on a collection")
         };
@@ -867,11 +867,11 @@ mod tests {
 
     /// A per-key release **reaches the input**, which the case above cannot show.
     ///
-    /// The input's `domain_predicate` calls both groups whole without being `True`, so
-    /// [`Tile::to_guard`] answers a bounded `Domain` rather than the universal guard that
-    /// covers every later release. The only guard naming key 1 on its own is then the one
-    /// `release_impl` forwards. The input's own keys are this producer's accumulator key
-    /// set, so nothing else would reclaim the key.
+    /// The input's `domain_predicate` calls key 2's group whole and leaves key 1's open, so
+    /// [`Tile::to_guard`] names key 1 only through what its group holds, never the key
+    /// itself. The only guard naming key 1 is then the one `release_impl` forwards. The
+    /// input's own keys are this producer's accumulator key set, so nothing else would
+    /// reclaim the key.
     #[test]
     fn map_aggregate_forwards_a_per_key_release_to_an_open_input() {
         let key_extent = Extent::Base(BaseType::Int);
@@ -891,7 +891,7 @@ mod tests {
                 Predicate::False,
                 BitSet::new(),
             )),
-            Predicate::LessThanEq(Value::Int(2)),
+            Predicate::point(Value::Int(2)),
             BitSet::new(),
         );
         let (spy, released) = QuietSpy::new(tile, in_tiling.clone());

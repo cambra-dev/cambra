@@ -5,11 +5,13 @@
 
 use std::{collections::HashMap, hash::Hash};
 
+mod curry_level;
 mod guard;
 mod predicate;
 mod tile;
 mod tiling_kind;
 
+pub use curry_level::*;
 pub use guard::*;
 pub use predicate::*;
 pub use tile::*;

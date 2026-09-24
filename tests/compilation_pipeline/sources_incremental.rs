@@ -180,7 +180,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
@@ -190,7 +190,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source2
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -288,7 +288,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
@@ -298,7 +298,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source2
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -324,7 +324,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(30usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(30usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -365,11 +365,11 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(100))]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
     src2.borrow_mut()
         .add_data(&[(Value::UInt(10), Value::Int(100))]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -416,7 +416,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src2.borrow_mut()
         .add_data(&[(Value::UInt(20), Value::Int(100))]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -429,7 +429,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .add_data(&[(Value::UInt(2), Value::Int(100))]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(2usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(2usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());

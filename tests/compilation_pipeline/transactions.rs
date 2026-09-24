@@ -3032,7 +3032,7 @@ fn live_read_progresses_past_deny() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     src.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(0usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(0usize)));
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.

@@ -140,7 +140,10 @@ other's subscribers",
         self.wakeups.clone()
     }
 
-    pub fn check_for_notifications(&mut self) {
+    /// Deliver every pending notification — new data a source reports, then the wakes
+    /// queued during the last pull — and say whether anything was delivered.
+    pub fn check_for_notifications(&mut self) -> bool {
+        let mut delivered = false;
         self.source_handles
             .values_mut()
             .for_each(|(source, consumers)| {
@@ -150,6 +153,7 @@ other's subscribers",
                 if source.borrow_mut().check_for_new_data() {
                     for consumer in consumers.iter().filter_map(Weak::upgrade) {
                         consumer.borrow_mut().notify();
+                        delivered = true;
                     }
                 }
             });
@@ -158,12 +162,14 @@ other's subscribers",
         // operator mid-borrow (see [`WakeupQueue`]).
         for consumer in self.wakeups.take() {
             consumer.borrow_mut().notify();
+            delivered = true;
         }
+        delivered
     }
 }
 
-/// Deliver, then pull — `laps` times, stopping as soon as `done` accepts the tile.
-/// Returns the last tile pulled.
+/// Deliver, then pull — `laps` times, stopping as soon as `done` accepts the tile or the
+/// program is quiescent. Returns the last tile pulled.
 ///
 /// The alternation `src/main.rs` runs, and the one a test should write. A lap runs on any
 /// pull that reaches the store, so a loop that only pulls is not stalled by itself; what
@@ -180,12 +186,19 @@ pub fn pull_laps(
 ) -> crate::interpreter::Tile {
     let guard = producer.tiling().universal_guard();
     let mut tile = producer.tiling().empty_tile();
-    for _ in 0..laps {
-        scheduler.check_for_notifications();
-        tile = producer.get(guard.clone());
-        if done(&tile) {
-            break;
+    for lap in 0..laps {
+        let delivered = scheduler.check_for_notifications();
+        let pulled = producer.get(guard.clone());
+        if done(&pulled) {
+            return pulled;
         }
+        // Nothing was delivered and the pull answered what the last one did, so every
+        // operator saw what it saw before and nothing moves until an input changes: the
+        // laps left would only repeat this one.
+        if lap > 0 && !delivered && pulled == tile {
+            return pulled;
+        }
+        tile = pulled;
     }
     tile
 }

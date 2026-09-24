@@ -6,6 +6,7 @@ use std::{collections::HashMap, fmt};
 use bit_set::BitSet;
 use bit_vec::BitVec;
 
+use super::curry_level::CurryLevel;
 use crate::{
     ccl::AggregateKind,
     interpreter::{
@@ -252,13 +253,13 @@ impl Tiling {
         }
     }
 
-    /// The tiling `depth` levels in, which is `self` at depth 0 — the static counterpart of
-    /// [`Tile::values_at`].
-    pub fn values_at(&self, depth: usize) -> &Tiling {
-        match (depth, self) {
+    /// The tiling at `level`, which is `self` at [`CurryLevel::OUTERMOST`] — the static
+    /// counterpart of [`Tile::values_at`].
+    pub fn values_at(&self, level: CurryLevel) -> &Tiling {
+        match (level.index(), self) {
             (0, _) => self,
-            (_, Tiling::DataFunction { codomain, .. }) => codomain.values_at(depth - 1),
-            (_, other) => panic!("no level {depth} in {other}"),
+            (_, Tiling::DataFunction { codomain, .. }) => codomain.values_at(level.in_codomain()),
+            (_, other) => panic!("no {level} in {other}"),
         }
     }
 
@@ -269,6 +270,15 @@ impl Tiling {
         match self {
             Tiling::DataFunction { codomain, .. } => codomain.deepest_values(),
             other => other,
+        }
+    }
+
+    /// How many collection levels this tiling carries before its values — the number of
+    /// `⤇` in the curried data function `K₀ ⤇ … ⤇ V`.
+    pub fn levels(&self) -> usize {
+        match self {
+            Tiling::DataFunction { codomain, .. } => 1 + codomain.levels(),
+            _ => 0,
         }
     }
 
