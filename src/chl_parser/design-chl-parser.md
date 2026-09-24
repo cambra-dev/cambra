@@ -78,25 +78,9 @@ public entry points:
   `ParseResult`, `CATEGORIES`) live in the `parser/error.rs` submodule, re-exported
   from `parser.rs`.
 
-The grammar is precedence-climbed for binary operators. From lowest to
-highest precedence:
-
-1. `\x -> …` (lambda) / `yield`
-2. `<<` (feed)
-3. ternary `a if b else c`
-4. `or`
-5. `and`
-6. `not`
-7. chained comparison (`==` `!=` `<` `<=` `>` `>=`)
-8. `|`
-9. `^`
-10. `&`
-11. `++`
-12. `+`, `-`
-13. `*`, `//`
-14. unary `-`
-15. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name` / `x.0`
-16. atom: literal, name, parenthesised, list, record, brace type, comprehension
+The grammar is precedence-climbed for binary operators, one combinator per level of
+[docs/chl-spec.md](../../docs/chl-spec.md), "2.3 Expression precedence", each built from the
+one tighter than it.
 
 Every position a bracket encloses — a list or tuple element, a call argument, a
 subscript index, a record field, a brace item, a refinement predicate, a
@@ -149,12 +133,20 @@ Key shape choices:
 - **The function-type arrow `=>` is the loosest binary form.** `T => U` parses
   to `Expr::FunctionType`, a level below `feed` in the precedence chain. It is
   right-associative — `A => B => C` is `A => (B => C)` — because it takes the
-  whole expression to its right as the codomain, the same way the ternary's
-  else-branch does. A `def`'s return annotation consumes its `=>` at statement
-  level before the expression parser runs, so that position is unaffected and its
-  return type may itself be a function type. Lowering reads `Expr::FunctionType`
+  whole expression to its right as the codomain. A `def`'s return annotation
+  consumes its `=>` at statement level before the expression parser runs, so that
+  position is unaffected and its return type may itself be a function type. Lowering reads `Expr::FunctionType`
   as a `Type::Fun` in annotation position and rejects it as a value
   ([docs/chl-spec.md](../../docs/chl-spec.md), "6. Types (informal sketch)").
+- **The pair arrow `k -> v` has no node of its own.** `a -> b` builds the
+  `Expr::Tuple` the parenthesised spelling builds
+  ([docs/chl-spec.md](../../docs/chl-spec.md), "2.4 Atoms"), so a map literal is an
+  ordinary list of pairs, a map comprehension an ordinary comprehension of them,
+  and `for k -> v in m` an ordinary tuple target that `expr_to_assign_target`
+  already reads. It sits between `<<` and the ternary: `m << k -> v` feeds the
+  entry `(k, v)`, and `k -> v if c else w` pairs `k` with the whole conditional.
+  It does not chain, since nothing associates a third component, so
+  `a -> b -> c` is a parse error.
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.

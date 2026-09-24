@@ -284,12 +284,17 @@ fn check_map_entries(code: &str, mut expected: Vec<(Value, Value)>) {
     assert_eq!(got, expected, "keyed entries");
 }
 
+// The arrow cases spell with `k -> v` what the parenthesised cases spell with `(k, v)`:
+// the entry pair is the two-tuple (`docs/chl-spec.md`, "2.4 Atoms"), so both reach `map`
+// as the same list and nothing below the parser reads them differently.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case("map([(1, 10), (2, 20)])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
 #[case("map([(3, 30), (1, 10), (2, 20)])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20)), (Value::Int(3), Value::Int(30))])]
 #[case("map([('a', 1), ('b', 2)])", vec![(Value::String("a".into()), Value::Int(1)), (Value::String("b".into()), Value::Int(2))])]
 #[case("map([(1, 10)])", vec![(Value::Int(1), Value::Int(10))])]
+#[case::arrow_literal("map([1 -> 10, 2 -> 20])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
+#[case::arrow_comprehension("map([k -> k * 10 for k in [1, 2]])", vec![(Value::Int(1), Value::Int(10)), (Value::Int(2), Value::Int(20))])]
 fn test_map(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
     check_map_entries(code, expected);
 }

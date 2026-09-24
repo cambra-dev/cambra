@@ -117,6 +117,25 @@ pub fn expect_scalar(source: &str, expected: &str) {
 /// Fires for panics from any pipeline stage (lower, infer, lambda_elim,
 /// operator_conversion, …) — not just lowering.
 pub fn expect_compile_error(source: &str, needle: &str) {
+    let _ = compile_error_message(source, needle);
+}
+
+/// As [`expect_compile_error`], and additionally that the report does **not** mention
+/// `cleared` — a construct this program parses.
+///
+/// `cleared` is the load-bearing half. The renderer echoes the offending source line, so a
+/// needle taken from the program's own text matches whenever any error lands on that line,
+/// and `needle` on its own therefore cannot say a blocker moved. Naming what must no longer
+/// appear is what makes the advance checkable.
+pub fn expect_compile_error_past(source: &str, needle: &str, cleared: &str) {
+    let msg = compile_error_message(source, needle);
+    assert!(
+        !msg.contains(cleared),
+        "expected the report not to mention {cleared:?}, which this program now parses; got: {msg}",
+    );
+}
+
+fn compile_error_message(source: &str, needle: &str) -> String {
     let result = panic::catch_unwind(AssertUnwindSafe(|| run_to_tile(source)));
     let payload = match result {
         Ok(_) => panic!(
@@ -130,6 +149,7 @@ pub fn expect_compile_error(source: &str, needle: &str) {
         msg.contains(needle),
         "expected panic to contain {needle:?}; got: {msg}",
     );
+    msg
 }
 
 /// Assert that the program runs to completion but returns
