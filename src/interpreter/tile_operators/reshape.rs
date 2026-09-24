@@ -983,14 +983,22 @@ mod tests {
             input: Box::new(sender),
             permutation: vec![2usize, 0, 1],
         };
+        // Every field holds something: a record's fields are an AND, so a field naming
+        // nothing would make the whole guard empty, and `release` short-circuits an
+        // empty release rather than forwarding it — which tests the short-circuit
+        // instead of the permutation this case is about.
         let obsolete =
             TileGuard::Function(FunctionGuard::Domain(Predicate::Record(HashMap::from([
                 (tuple_field(0), Predicate::True),
-                (tuple_field(1), Predicate::False),
+                (tuple_field(1), Predicate::at_or_below(Value::Int(1))),
                 (tuple_field(2), Predicate::True),
             ]))));
         producer.release(obsolete);
-        let upstream = rx.recv().expect("release_impl did not send upstream guard");
+        // Bounded, so a release that never reaches the input fails this case rather than
+        // parking the whole suite on a channel nothing will send to.
+        let upstream = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("release_impl did not send upstream guard");
         let TileGuard::Function(FunctionGuard::Domain(Predicate::Record(fields))) = upstream else {
             panic!("expected Function/Domain/Record guard, got {upstream:?}");
         };
@@ -998,10 +1006,13 @@ mod tests {
         // `release_impl` calls permute_record(fields, permutation):
         //   upstream._0 ← downstream._2 = True
         //   upstream._1 ← downstream._0 = True
-        //   upstream._2 ← downstream._1 = False
+        //   upstream._2 ← downstream._1 = (-∞, 1]
         assert_eq!(fields[&tuple_field(0)], Predicate::True);
         assert_eq!(fields[&tuple_field(1)], Predicate::True);
-        assert_eq!(fields[&tuple_field(2)], Predicate::False);
+        assert_eq!(
+            fields[&tuple_field(2)],
+            Predicate::at_or_below(Value::Int(1))
+        );
     }
 
     // ── permute_result_correlation ────────────────────────────────────────────

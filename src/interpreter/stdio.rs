@@ -162,10 +162,10 @@ mod tests {
         assert_eq!(result, ColumnValue::from_uints(vec![0, 1, 2]));
     }
 
-    /// `Predicate::LessThanEq(i)` means indices `0..=i` are obsolete, so only
+    /// `Predicate::at_or_below(i)` means indices `0..=i` are obsolete, so only
     /// `(i+1)..ready_size` are returned.
     #[test]
-    fn test_get_elements_less_than_eq_returns_tail() {
+    fn test_get_elements_at_or_below_returns_tail() {
         let mut source = StdinDataSource::new();
         source.add("a".into());
         source.add("b".into());
@@ -174,7 +174,7 @@ mod tests {
         source
             .buf
             .releases
-            .record("p", &Predicate::LessThanEq(Value::UInt(1)));
+            .record("p", &Predicate::at_or_below(Value::UInt(1)));
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![2, 3]));
@@ -250,12 +250,12 @@ mod tests {
         assert_eq!("b", source.buf.get(1));
         assert_eq!(None, source.buf.get_opt(2));
         assert_eq!(
-            Predicate::LessThanEq(Value::UInt(1)),
+            Predicate::at_or_below(Value::UInt(1)),
             source.get_yield_predicate()
         );
         source.buf.release_index(0);
         assert_eq!(
-            Predicate::LessThanEq(Value::UInt(1)),
+            Predicate::at_or_below(Value::UInt(1)),
             source.get_yield_predicate()
         );
         assert_eq!(None, source.buf.get_opt(0));
@@ -265,19 +265,19 @@ mod tests {
         assert_eq!("b", source.buf.get(1));
         assert_eq!("c", source.buf.get(2));
         assert_eq!(
-            Predicate::LessThanEq(Value::UInt(2)),
+            Predicate::at_or_below(Value::UInt(2)),
             source.get_yield_predicate()
         );
         source.buf.release_index(1);
         assert_eq!(
-            Predicate::LessThanEq(Value::UInt(2)),
+            Predicate::at_or_below(Value::UInt(2)),
             source.get_yield_predicate()
         );
         assert_eq!(None, source.buf.get_opt(0));
         assert_eq!(None, source.buf.get_opt(1));
         assert_eq!("c", source.buf.get(2));
         assert_eq!(
-            Predicate::LessThanEq(Value::UInt(2)),
+            Predicate::at_or_below(Value::UInt(2)),
             source.get_yield_predicate()
         );
         source.buf.eof_reached = true;
@@ -305,7 +305,7 @@ mod tests {
         source.add("line2".into());
 
         // First release from producer A: index 0 is obsolete
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(0)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Verify producer_a's predicate is recorded
         assert!(
@@ -315,7 +315,7 @@ mod tests {
 
         // Second release from producer B: index 1 is obsolete
         // This should use union (OR) to accumulate with existing predicate, not overwrite
-        source.release("producer_b", Predicate::LessThanEq(Value::UInt(1)));
+        source.release("producer_b", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify both predicates are recorded
         assert!(
@@ -346,14 +346,14 @@ mod tests {
         source.add("line2".into());
 
         // First release from producer A: index 0
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(0)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Store the first predicate
         let pred_after_first = source.buf.releases.of("producer_a").cloned().unwrap();
 
         // Second release from producer A: index 1
         // This should use union with the existing predicate
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(1)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // The predicate should now be an OR of the two
         let pred_after_second = source.buf.releases.of("producer_a").cloned().unwrap();
