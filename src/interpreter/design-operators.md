@@ -355,7 +355,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
-- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
+- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ {key: value}`, held as per-tick write sets with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
@@ -379,7 +379,30 @@ A single-writer induction store is the degenerate no-conflict case of this same 
 
 ### The store is a changelog, not a function
 
-`CommitOperator`'s output is a [`Tile::Store`], not a `DataFunction`: each tick carries only *that tick's* write-set delta, and a tick absent from the changelog is **decided-absent** — its value holds from the latest earlier change. Consumers must therefore **fold** the store (`store_current` / `store_value_at`), never index it. That is what makes a mutable variable readable while its store is still live: the current value is defined at the decided frontier, with no need for the history to end. Terminality is a flag separate from the frontier watermark, so a terminal store with trailing carries is not undercounted.
+`CommitOperator`'s output is a [`Tile::Store`], not a `DataFunction`: each key carries only the ticks
+that wrote it, and a tick absent from a key's changelog is **decided-absent** — its value holds from
+the latest earlier change. Consumers must therefore **fold** the store (`store_current` /
+`store_value_at`), never index it. That is what makes a mutable variable readable while its store is
+still live: the current value is defined at the decided frontier, with no need for the history to
+end. Terminality is a flag separate from the frontier watermark, so a terminal store with trailing
+carries is not undercounted.
+
+### One changelog per key
+
+A `Tile::Store` holds a record with one field per store key — a mutable variable or a reply tap —
+and each field is that key's changelog, `Txn ⇀ V`. A tick whose write set names several keys is one
+tick in each of their changelogs, so a write set spanning different keys at different ticks is which
+changelogs hold a tick rather than an encoding of its own.
+
+The key space comes from the tiling, which names every key statically, so a key nothing has written
+is present with an empty changelog. Two consequences follow. A key carries its own value tiling,
+where one shared codomain could only name the union of what the keys hold. And two renders of one
+store carry the same fields, which is what lets `merge` append them field by field.
+
+A proposal's `reads` and `writes` still ride one `map_to_value` cell each. Their key sets are
+as static as the store's — a decision writes every carry key of the store consuming it, and a
+read set names every key its writer reads — so the cell is the representation they have rather
+than one their shape requires.
 
 ### The decision record
 
